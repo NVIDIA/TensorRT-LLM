@@ -1018,19 +1018,25 @@ class PyTorchModelEngine(ModelEngine):
                       len(position_ids) + len(generation_requests))))
         for request in generation_requests:
             if new_tokens_device is None or request.py_batch_idx is None:
-                input_ids.append(request.get_last_tokens(0))
+                # the request has no previous tensor:
+                # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
+                # (2) request.py_batch_idx is None, which means the request has no previous batch.
+                # the second condition includes dummy generation requests created for CUDA graph padding.
+                # the dummy generation requests should be at the end of generation_requests.
+                # skip adding their input_ids so that new_tokens_device can be aligned to the correct positions.
+                if not request.is_dummy:
+                    input_ids.append(request.get_last_tokens(0))
                 past_seen_token_num = request.max_beam_num_tokens - 1
             else:
+                # the request has previous tensor
+                previous_batch_indices.append(request.py_batch_idx)
                 past_seen_token_num = request.max_beam_num_tokens
+
             request_ids.append(request.py_request_id)
             position_ids.append(past_seen_token_num)
             num_cached_tokens_per_seq.append(past_seen_token_num)
             prompt_lengths.append(request.py_prompt_len)
             draft_lens.append(0)
-
-            # skip dummy generation requests created in CUDA graph mode
-            if request.py_batch_idx is not None and new_tokens_device is not None:
-                previous_batch_indices.append(request.py_batch_idx)
 
             request.py_batch_idx = batch_idx
             batch_idx += 1
