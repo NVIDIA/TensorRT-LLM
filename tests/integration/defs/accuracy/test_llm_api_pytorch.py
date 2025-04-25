@@ -267,7 +267,7 @@ class TestMixtral8x7B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(2)
-    @skip_pre_ada
+    @pytest.mark.skip_device_not_contain(["H100", "B200"])
     def test_fp8_tp2(self):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Mixtral-8x7B-Instruct-v0.1-fp8"
         with LLM(model_path, tensor_parallel_size=2) as llm:
@@ -279,7 +279,7 @@ class TestMixtral8x7B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(2)
-    @skip_pre_blackwell
+    @pytest.mark.skip_device_not_contain(["B200"])
     def test_nvfp4_tp2(self):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Mixtral-8x7B-Instruct-v0.1-fp4"
         with LLM(model_path, tensor_parallel_size=2) as llm:

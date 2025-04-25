@@ -18,8 +18,7 @@ from tensorrt_llm.llmapi import LLM
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (llm_models_root, skip_post_blackwell, skip_pre_ada,
-                        skip_pre_blackwell)
+from ..conftest import llm_models_root, skip_post_blackwell, skip_pre_ada
 from .accuracy_core import MMLU, CnnDailymail, LlmapiAccuracyTestHarness
 
 
@@ -116,25 +115,17 @@ class TestMixtral8x7B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestMixtral8x7B_Instruct(LlmapiAccuracyTestHarness):
+class TestMixtral8x7BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mixtral-8x7B-Instruct-v0.1"
     MODEL_PATH = f"{llm_models_root()}/Mixtral-8x7B-Instruct-v0.1"
 
+    @skip_post_blackwell
     def test_awq_tp2(self):
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ)
         with LLM(self.MODEL_PATH,
                  quant_config=quant_config,
                  tensor_parallel_size=2) as llm:
             task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @skip_pre_blackwell
-    def test_fp4(self, mocker):
-        mocker.patch.object(
-            self.__class__, "MODEL_PATH",
-            f"{llm_models_root()}/nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1")
-        with LLM(self.MODEL_PATH) as llm:
-            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
 

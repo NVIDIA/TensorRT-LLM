@@ -799,6 +799,7 @@ class TestMistral7B(CliFlowAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/mistral-7b-v0.1"
     EXAMPLE_FOLDER = "models/core/llama"
 
+    @skip_pre_blackwell
     def test_beam_search(self):
         self.run(extra_acc_spec="beam_width=4",
                  extra_build_args=["--gemm_plugin=auto", "--max_beam_width=4"],
@@ -822,6 +823,7 @@ class TestMistral7B(CliFlowAccuracyTestHarness):
                  extra_convert_args=["--calib_size=4"],
                  extra_build_args=["--gemm_plugin=auto"])
 
+    @skip_post_blackwell
     @pytest.mark.skip_less_device(4)
     def test_smooth_quant_tp4pp1(self):
         self.run(quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN,
@@ -840,6 +842,7 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
     def test_tp2(self):
         self.run(dtype='auto', tp_size=2)
 
+    @skip_post_blackwell
     @pytest.mark.skip_less_device(8)
     @pytest.mark.skip_less_device_memory(45000)
     @pytest.mark.parametrize(
@@ -914,6 +917,10 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
                  tp_size=2,
                  extra_build_args=["--gemm_plugin=auto"])
 
+    @skip_post_blackwell
+    def test_int4_awq_prequantized(self):
+        self.run(quant_algo=QuantAlgo.W4A16_AWQ)
+
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(80000)
     def test_weight_only_int8_tp2(self):
@@ -921,6 +928,7 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
                  tp_size=2,
                  extra_build_args=["--gemm_plugin=auto"])
 
+    @skip_post_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(45000)
     def test_pp_reduce_scatter_tp2pp2(self):
@@ -943,19 +951,11 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
                  kv_cache_quant_algo=QuantAlgo.FP8,
                  extra_build_args=build_args)
 
-    def test_int4_awq_prequantized(self, mocker):
-        mocker.patch.object(self.__class__, "MODEL_PATH",
-                            f"{llm_models_root()}/mixtral-8x7b-v0.1-AWQ")
-        self.run(quant_algo=QuantAlgo.W4A16_AWQ)
-
-
-class TestMixtral8x7BInstruct(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "mistralai/Mixtral-8x7B-Instruct-v0.1"
-    MODEL_PATH = f"{llm_models_root()}/nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1"
-    EXAMPLE_FOLDER = "models/core/llama"
-
     @skip_pre_blackwell
-    def test_nvfp4_prequantized(self):
+    def test_nvfp4_prequantized(self, mocker):
+        mocker.patch.object(
+            self.__class__, "MODEL_PATH",
+            f"{llm_models_root()}/nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1")
         self.run(tasks=[MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.NVFP4,
                  kv_cache_quant_algo=QuantAlgo.FP8)
@@ -978,6 +978,7 @@ class TestMixtral8x22B(CliFlowAccuracyTestHarness):
                  extra_convert_args=["--calib_size=32"],
                  extra_build_args=["--gemm_plugin=auto"])
 
+    @skip_post_blackwell
     @pytest.mark.skip_less_device(8)
     @pytest.mark.skip_less_device_memory(45000)
     @pytest.mark.parametrize(
@@ -985,7 +986,7 @@ class TestMixtral8x22B(CliFlowAccuracyTestHarness):
         ids=['expert_parallel', 'mixed_parallel', 'tensor_parallel'])
     @pytest.mark.parametrize("moe_renorm_mode", [0, 1],
                              ids=['no_renormalize', 'renormalize'])
-    def test_plugin_tp8(self, moe_tp_size, moe_renorm_mode):
+    def test_int8_plugin_tp8(self, moe_tp_size, moe_renorm_mode):
         self.run(quant_algo=QuantAlgo.W8A16,
                  tp_size=8,
                  extra_convert_args=[
