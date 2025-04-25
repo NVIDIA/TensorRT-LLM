@@ -48,7 +48,7 @@ class MetaInitException(RuntimeError):
 
 
 class MetaInitMode(TorchDispatchMode):
-    """ Context for skip random parameter initialization
+    """Context for skip random parameter initialization
 
     NN modules initialized under this context
     will place empty initialized parameters
@@ -64,6 +64,7 @@ class MetaInitMode(TorchDispatchMode):
     Once module is initialized, parameters that are on `meta` device,
     should be moved off to cpu or gpu.
     """
+
     aten = torch.ops.aten
     init_ops = {aten.empty.memory_format, aten.empty_like.default}
     random_init_ops = {
@@ -75,16 +76,16 @@ class MetaInitMode(TorchDispatchMode):
     def _has_meta_tensor(self, args, kwargs):
         if kwargs is None:
             kwargs = {}
-        meta = torch.device('meta')
+        meta = torch.device("meta")
         pred = lambda x: x.device == meta
-        return tree_any_only(torch.Tensor, pred, args) or \
-                tree_any_only(torch.Tensor, pred, kwargs)
+        return tree_any_only(torch.Tensor, pred, args) or tree_any_only(
+            torch.Tensor, pred, kwargs)
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if func in self.init_ops:
             if kwargs is None:
                 kwargs = {}
-            kwargs['device'] = torch.device('meta')
+            kwargs["device"] = torch.device("meta")
             return func(*args, **kwargs)
         elif func not in self.random_init_ops and self._has_meta_tensor(
                 args, kwargs):
@@ -130,9 +131,11 @@ def create_pipeline_interface_factory(keys: List[str], hidden_size: int,
         tensors = {
             key:
             # ones to avoid NaNs for DS, that cause hang in cuda graphs
-            torch.ones((num_input_ids, hidden_size),
-                       dtype=dtype,
-                       device=torch.cuda.current_device())
+            torch.ones(
+                (num_input_ids, hidden_size),
+                dtype=dtype,
+                device=torch.cuda.current_device(),
+            )
             for key in keys
         }
         return PipelineInterface(**tensors)
@@ -170,18 +173,20 @@ def build_pipeline_layers(layer_list,
                           missing_layer_fn=MissingDecoderLayer):
     layer_offset = layer_list[0]
     layers = [
-        layer_fn(layer_idx - layer_offset)  # local layer idx to attn_backend
-        if layer_idx in layer_list else missing_layer_fn()
+        (
+            layer_fn(layer_idx -
+                     layer_offset)  # local layer idx to attn_backend
+            if layer_idx in layer_list else missing_layer_fn())
         for layer_idx in range(num_hidden_layers)
     ]
     return nn.ModuleList(layers)
 
 
 def missing_layer_parameter(name: str, model: torch.nn.Module) -> bool:
-    """ Check if a layer parameter is missing if when pp is enabled.
-        A layer parameter is missing if either:
-            1. The model itself is a MissingLayer, or
-            2. It has a submodule that is a MissingLayer.
+    """Check if a layer parameter is missing if when pp is enabled.
+    A layer parameter is missing if either:
+        1. The model itself is a MissingLayer, or
+        2. It has a submodule that is a MissingLayer.
     """
     if isinstance(model, MissingLayer):
         return True
@@ -196,8 +201,7 @@ _model_to_missing_layer_names: Dict[int, List[str]] = {}
 
 
 def _get_missing_layer_names(model: torch.nn.Module) -> List[str]:
-    """ Get the missing layer names of a given model when pp is enabled.
-    """
+    """Get the missing layer names of a given model when pp is enabled."""
     model_id = id(model)
     if model_id in _model_to_missing_layer_names:
         return _model_to_missing_layer_names[model_id]
@@ -206,7 +210,7 @@ def _get_missing_layer_names(model: torch.nn.Module) -> List[str]:
     for name, module in model.named_modules():
         if isinstance(module, MissingLayer):
             # Add trailing dot to ensure exact prefix matching
-            missing_layer_names.append(name + '.')
+            missing_layer_names.append(name + ".")
 
     # Cache the result
     _model_to_missing_layer_names[model_id] = missing_layer_names
@@ -217,7 +221,7 @@ class PPInitCaller(type):
 
     def __call__(cls, *args, **kwargs):
         obj = type.__call__(cls, *args, **kwargs)
-        if getattr(obj, '_supports_pp', False):
+        if getattr(obj, "_supports_pp", False):
             obj.__pp_init__()
         return obj
 
@@ -283,7 +287,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         self.pp_layer_list = self.model_config.mapping.pp_layers(
             num_hidden_layers)
         decoder_layer_cls = self.layers[0].__class__
-        if hasattr(self, 'aux_stream_dict'):  # DeepseekV3
+        if hasattr(self, "aux_stream_dict"):  # DeepseekV3
             layer_fn = lambda layer_idx: decoder_layer_cls(
                 self.model_config, layer_idx, self.aux_stream_dict)
         else:
@@ -322,15 +326,21 @@ class DecoderModelForCausalLM(nn.Module,
                               Generic[TModel, TConfig],
                               metaclass=PostInitCaller):
 
-    def __init__(self, model: TModel, *, config: ModelConfig[TConfig],
-                 hidden_size: int, vocab_size: int):
+    def __init__(
+        self,
+        model: TModel,
+        *,
+        config: ModelConfig[TConfig],
+        hidden_size: int,
+        vocab_size: int,
+    ):
         super().__init__()
         self.model_config = config
         self.model = model
         self.pp_rank = config.mapping.pp_rank
         self.pp_size = config.mapping.pp_size
         # Check PP support during initialization
-        self._supports_pp = getattr(self.model, '_supports_pp', False)
+        self._supports_pp = getattr(self.model, "_supports_pp", False)
         if self.pp_size > 1 and not self._supports_pp:
             raise ValueError(
                 f"Model {type(self.model).__name__} has not enabled "
@@ -359,8 +369,9 @@ class DecoderModelForCausalLM(nn.Module,
 
                 # TODO smor- hack
                 if hasattr(config,
-                           'lora_config') and config.lora_config is not None:
+                           "lora_config") and config.lora_config is not None:
                     from tensorrt_llm.lora_manager import HfLoraLoader
+
                     lora_loader = HfLoraLoader(config.lora_config.lora_dir)
                     weight = lora_loader.lm_head
                     vocab_size = lora_loader.vocab_size
@@ -375,7 +386,7 @@ class DecoderModelForCausalLM(nn.Module,
                 )
 
                 if hasattr(config,
-                           'lora_config') and config.lora_config is not None:
+                           "lora_config") and config.lora_config is not None:
                     with torch.no_grad():
                         x = weight.to(self.lm_head.dtype).cuda()
                         self.lm_head.weight.data.copy_(x)
@@ -383,10 +394,12 @@ class DecoderModelForCausalLM(nn.Module,
             # use embedding weights in lm_head if tie word embedding is enabled
             if config.pretrained_config.tie_word_embeddings and not isinstance(
                     self.model.embed_tokens, MissingLayer):
-                assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
-                    "lm_head and vocab embedding should use the same TP size")
-                assert self.lm_head.tp_mode == self.model.embed_tokens.tp_mode, (
-                    "lm_head and vocab embedding should use the same TP mode")
+                assert (
+                    self.lm_head.tp_size == self.model.embed_tokens.tp_size
+                ), "lm_head and vocab embedding should use the same TP size"
+                assert (
+                    self.lm_head.tp_mode == self.model.embed_tokens.tp_mode
+                ), "lm_head and vocab embedding should use the same TP mode"
                 self.lm_head.weight = self.model.embed_tokens.weight
 
             self.logits_processor = LogitsProcessor()
@@ -404,17 +417,17 @@ class DecoderModelForCausalLM(nn.Module,
                             break
                 elif isinstance(module, Linear):
                     weight_mode = module.weights_loading_config.weight_mode
-                    prefix_name = '.'.join(name.split('.')[:-1])
+                    prefix_name = ".".join(name.split(".")[:-1])
                     if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
                         for n, q in quant_config_dict.items():
                             # gate_proj and up_proj share the same quant config
-                            if prefix_name + '.gate_proj' in n:
+                            if prefix_name + ".gate_proj" in n:
                                 module.quant_config = q
                                 break
                     elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
                         for n, q in quant_config_dict.items():
                             # q_proj, k_proj and v_proj share the same quant config
-                            if prefix_name + '.q_proj' in n:
+                            if prefix_name + ".q_proj" in n:
                                 module.quant_config = q
                                 break
                     else:
@@ -425,7 +438,7 @@ class DecoderModelForCausalLM(nn.Module,
                 elif isinstance(module, Attention):
                     for n, q in quant_config_dict.items():
                         # reuse q_proj quant config as the attention quant config
-                        if name + '.q_proj' in n:
+                        if name + ".q_proj" in n:
                             module.quant_config = q
                             break
                 # TODO: support MLA
@@ -519,8 +532,8 @@ class DecoderModelForCausalLM(nn.Module,
             return result
 
         params_map = {
-            'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
-            'gate_up_proj': ['gate_proj', 'up_proj']
+            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+            "gate_up_proj": ["gate_proj", "up_proj"],
         }
 
         for name, module in tqdm(list(self.named_modules()),
@@ -532,33 +545,31 @@ class DecoderModelForCausalLM(nn.Module,
                     continue
 
                 # Skip loading weights for embedding and lm_head if LoRA is enabled
-                if hasattr(self.model_config, 'lora_config'
-                           ) and self.model_config.lora_config is not None and (
-                               name == "model.embed_tokens"
-                               or name == "lm_head"):
+                if (hasattr(self.model_config, "lora_config")
+                        and self.model_config.lora_config is not None and
+                    (name == "model.embed_tokens" or name == "lm_head")):
                     continue
 
                 # Skip if parameter belongs to a missing layer
                 if missing_layer_parameter(name, self):
                     continue
 
-                names = name.split('.')
+                names = name.split(".")
                 # WAR: better solution is that llama has its own load_weights function.
-                if names[-1] == 'next_layer_layernorm':
+                if names[-1] == "next_layer_layernorm":
                     continue
                 if names[-1] in params_map:
                     module_weights = []
                     for new_name in params_map[names[-1]]:
-                        fw = filter_weights('.'.join(names[:-1] + [new_name]),
+                        fw = filter_weights(".".join(names[:-1] + [new_name]),
                                             weights)
-                        if new_name in ['k_proj', 'v_proj']:
+                        if new_name in ["k_proj", "v_proj"]:
                             fw = {
-                                k:
-                                duplicate_kv_weight(
+                                k: (duplicate_kv_weight(
                                     weight=v[:],
                                     head_dim=head_dim,
-                                    tensor_parallel_size=tp_size)
-                                if k in ["weight", "bias"] else v
+                                    tensor_parallel_size=tp_size,
+                                ) if k in ["weight", "bias"] else v)
                                 for k, v in fw.items()
                             }
 
@@ -566,7 +577,7 @@ class DecoderModelForCausalLM(nn.Module,
                     module.load_weights(weights=module_weights)
                 else:
                     module_weights = filter_weights(name, weights)
-                    if hasattr(module, 'load_weights'):
+                    if hasattr(module, "load_weights"):
                         module.load_weights(weights=[module_weights])
                     else:
                         for n, p in module._parameters.items():
@@ -575,16 +586,16 @@ class DecoderModelForCausalLM(nn.Module,
 
     def infer_max_seq_len(self) -> int:
         # Modified from tensorrt_llm/builder.py _init_max_seq_len
-        rope_scaling = getattr(self.config, 'rope_scaling', None)
+        rope_scaling = getattr(self.config, "rope_scaling", None)
         rope_factor = 1
         if rope_scaling is not None:
-            rope_type = rope_scaling.get('type', rope_scaling.get('rope_type'))
+            rope_type = rope_scaling.get("type", rope_scaling.get("rope_type"))
             if rope_type not in ("su", "longrope", "llama3", "yarn"):
-                rope_factor = rope_scaling.get('factor', 1.0)
+                rope_factor = rope_scaling.get("factor", 1.0)
 
         # Step 1: Find the upper bound of max_seq_len
         inferred_max_seq_len = 2048
-        if getattr(self.config, 'max_position_embeddings', None) is not None:
+        if getattr(self.config, "max_position_embeddings", None) is not None:
             inferred_max_seq_len = self.config.max_position_embeddings
 
         # Step 2: Scale max_seq_len with rotary scaling
@@ -592,7 +603,7 @@ class DecoderModelForCausalLM(nn.Module,
             inferred_max_seq_len = int(
                 math.ceil(inferred_max_seq_len * rope_factor))
             logger.warning(
-                f'max_seq_len is scaled to {inferred_max_seq_len} by rope scaling {rope_factor}'
+                f"max_seq_len is scaled to {inferred_max_seq_len} by rope scaling {rope_factor}"
             )
 
         # Step 3: Return the new max_seq_len
