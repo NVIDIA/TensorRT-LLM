@@ -72,7 +72,14 @@ l0_h100:
       backend: cpp
   tests:
   # ------------- CPP tests ---------------
-  - test_cpp.py::test_unit_tests[90]
+  - test_cpp.py::test_unit_tests[batch_manager-90]
+  - test_cpp.py::test_unit_tests[common-90]
+  - test_cpp.py::test_unit_tests[executor-90]
+  - test_cpp.py::test_unit_tests[kernels-90]
+  - test_cpp.py::test_unit_tests[layers-90]
+  - test_cpp.py::test_unit_tests[runtime-90]
+  - test_cpp.py::test_unit_tests[thop-90]
+  - test_cpp.py::test_unit_tests[utils-90]
   - test_cpp.py::test_model[fp8-llama-90]
   - test_cpp.py::test_model[t5-90]
   - test_cpp.py::test_benchmarks[t5-90]
