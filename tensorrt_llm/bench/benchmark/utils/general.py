@@ -136,6 +136,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         "use_cuda_graph": True,
         "enable_overlap_scheduler": True,
         "kv_cache_dtype": kv_cache_dtype,
+        "cuda_graph_max_batch_size": max_batch_size,
     }
     backend = params.get("backend", "pytorch")
 
