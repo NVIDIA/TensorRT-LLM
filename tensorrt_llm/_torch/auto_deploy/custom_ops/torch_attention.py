@@ -6,7 +6,6 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .torch_rope import apply_rotary_pos_emb_ds
 
 @torch.library.custom_op("attention::repeat_kv", mutates_args=())
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -199,22 +198,32 @@ def fused_mla_ref(
     value_states = value_states.transpose(1, 2).view(*bs_view, -1, v_head_dim).contiguous()
 
     if freqs_cis is not None:
-        cos = freqs_cis[0, ...]
-        sin = freqs_cis[1, ...]
-        for idx in range(seq_len.shape[0]):
-            (
-                q_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
-                k_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
-            ) = apply_rotary_pos_emb_ds(
-                q_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
-                k_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
+        cos_base = freqs_cis[0, ...]
+        sin_base = freqs_cis[1, ...]
+        for i in range(seq_len.shape[0]):
+            start = seq_start[i]
+            length = seq_len[i]
+            if q_len == 1:
+                idx = (input_pos[i] + length - 1).item()
+                pos_ids = torch.tensor(idx, device=cos_base.device)
+            else:
+                pos_ids = torch.arange(input_pos[i], input_pos[i] + length, device=cos_base.device)
+
+            cos = cos_base[pos_ids]  # [..., 1, head_dim]
+            sin = sin_base[pos_ids]
+            q_slice = q_pe[start : start + length]
+            k_slice = k_pe[start : start + length]
+
+            q_rot, k_rot = torch.ops.rope.torch_apply_rope_with_qk_interleaving(
+                q_slice,
+                k_slice,
                 cos,
                 sin,
-                torch.arange(input_pos[idx] + seq_len[idx])[-1]
-                if q_len == 1
-                else torch.arange(input_pos[idx] + seq_len[idx]),
                 -2,
             )
+
+            q_pe[start : start + length] = q_rot
+            k_pe[start : start + length] = k_rot
 
     query_states = k_pe.new_empty(*bs_view, num_heads, q_head_dim)  # [b*s,n,d]
     query_states[..., :qk_nope_head_dim] = q_nope
@@ -328,7 +337,9 @@ def fused_mla(
     k_nope, value_states = torch.split(kv, [qk_nope_head_dim, v_head_dim], dim=-1)
     kv_seq_len = value_states.shape[-2]
 
-    q_pe, k_pe = apply_rotary_pos_emb_ds(q_pe, k_pe, cos, sin, position_ids)
+    cos = cos[position_ids]
+    sin = sin[position_ids]
+    q_pe, k_pe = torch.ops.rope.torch_apply_rope_with_qk_interleaving(q_pe, k_pe, cos, sin)
 
     query_states = k_pe.new_empty(bs, num_heads, q_len, q_head_dim)
     query_states[:, :, :, :qk_nope_head_dim] = q_nope

@@ -84,12 +84,13 @@ def fused_flattened_mla_with_cache(
 
             # build position_ids
             if s == 1:
-                pos_ids = torch.tensor(input_pos[i] + length - 1, device=cos_base.device)
+                idx = (input_pos[i] + length - 1).item()
+                pos_ids = torch.tensor(idx, device=cos_base.device)
             else:
                 pos_ids = torch.arange(input_pos[i], input_pos[i] + length, device=cos_base.device)
 
-            cos = cos_base[pos_ids].unsqueeze(-2)  # [..., 1, head_dim]
-            sin = sin_base[pos_ids].unsqueeze(-2)
+            cos = cos_base[pos_ids]  # [..., 1, head_dim]
+            sin = sin_base[pos_ids]
             q_slice = q_pe[start : start + length]
             k_slice = k_pe[start : start + length]
 
@@ -98,6 +99,7 @@ def fused_flattened_mla_with_cache(
                 k_slice,
                 cos,
                 sin,
+                -2,
             )
 
             q_pe[start : start + length] = q_rot

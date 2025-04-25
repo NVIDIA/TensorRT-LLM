@@ -54,7 +54,7 @@ class RoPEModel(torch.nn.Module):
         num_kv_heads: int,
         variant: str = "explicit",  # "explicit" or "complex"
         mode: str = "match",  # "match" or "optimize"
-        layout: str = "BNSD",  # only for explicit variants
+        layout: str = "BNSD",  # "BNSD" or "BSND"
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -64,7 +64,7 @@ class RoPEModel(torch.nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = hidden_size // num_heads
-        self.layout = layout if variant == "explicit" else None
+        self.layout = layout
 
         self.linear_q = torch.nn.Linear(hidden_size, num_heads * self.head_dim)
         self.linear_k = torch.nn.Linear(hidden_size, num_kv_heads * self.head_dim)
@@ -92,7 +92,9 @@ class RoPEModel(torch.nn.Module):
             if self.mode == "match":
                 q_out, k_out = apply_rotary_pos_emb_explicit(q, k, cos, sin, unsq_dim)
             else:  # optimize
-                q_out, k_out = torch.ops.rope.torch_apply_explicit_rope(q, k, cos, sin, unsq_dim)
+                q_out, k_out = torch.ops.rope.torch_apply_rope_with_explicit_cos_sin(
+                    q, k, cos, sin, unsq_dim
+                )
 
             # revert layout and flatten
             if self.layout == "BNSD":
@@ -105,16 +107,30 @@ class RoPEModel(torch.nn.Module):
         else:  # complex variant
             q = q.view(b, s, self.num_heads, self.head_dim)
             k = k.view(b, s, self.num_kv_heads, self.head_dim)
+            if self.layout == "BNSD":
+                q = q.permute(0, 2, 1, 3).contiguous()
+                k = k.permute(0, 2, 1, 3).contiguous()
+                unsq_dim = 1
+            else:
+                unsq_dim = 2
+
             freqs = _precompute_freqs_cis_complex(s, self.head_dim, rope_theta=10000)
             freqs = freqs.to(x.device).unsqueeze(0).expand(b, -1, -1)
 
             if self.mode == "match":
-                q_out, k_out = apply_rotary_pos_emb_complex(q, k, freqs)
+                q_out, k_out = apply_rotary_pos_emb_complex(q, k, freqs, unsq_dim)
             else:
-                q_out, k_out = torch.ops.rope.torch_apply_complex_rope(q, k, freqs)
+                q_out, k_out = torch.ops.rope.torch_apply_rope_with_complex_freqs(
+                    q, k, freqs, unsq_dim
+                )
 
-            q_out = q_out.reshape(b, s, -1)
-            k_out = k_out.reshape(b, s, -1)
+            # revert layout and flatten
+            if self.layout == "BNSD":
+                q_out = q_out.permute(0, 2, 1, 3).reshape(b, s, -1)
+                k_out = k_out.permute(0, 2, 1, 3).reshape(b, s, -1)
+            else:
+                q_out = q_out.reshape(b, s, -1)
+                k_out = k_out.reshape(b, s, -1)
 
         out = torch.cat([q_out, k_out], dim=-1)
         return out.to(torch.float16) if self.mode == "match" else out
@@ -128,9 +144,10 @@ class RoPEModel(torch.nn.Module):
     [
         ("match", "explicit", "BNSD", 8, 16, 8, 8, 1e-3, 1e-3),
         ("match", "explicit", "BSND", 8, 16, 8, 4, 1e-2, 1e-2),
-        ("match", "complex", None, 8, 16, 8, 8, 1e-3, 1e-3),
-        ("match", "complex", None, 8, 16, 8, 4, 1e-3, 1e-3),
+        ("match", "complex", "BNSD", 8, 16, 8, 8, 1e-3, 1e-3),
+        ("match", "complex", "BSND", 8, 16, 8, 4, 1e-3, 1e-3),
         ("match_layout", "explicit", "BNSD", 4, 12, 8, 8, 1e-3, 1e-3),
+        ("match_layout", "complex", "BNSD", 4, 12, 8, 8, 1e-3, 1e-3),
         pytest.param(
             "optimize",
             "explicit",
@@ -146,8 +163,21 @@ class RoPEModel(torch.nn.Module):
             ),
         ),
         ("optimize", "explicit", "BSND", 4, 12, 8, 4, 1e-3, 1e-3),
-        ("optimize", "complex", None, 4, 12, 8, 8, 1e-3, 1e-3),
-        ("optimize", "complex", None, 4, 12, 8, 4, 1e-3, 1e-3),
+        pytest.param(
+            "optimize",
+            "complex",
+            "BNSD",
+            4,
+            12,
+            8,
+            8,
+            1e-3,
+            1e-3,
+            marks=pytest.mark.xfail(
+                reason="flashinfer op does not support BNSD layout", strict=True
+            ),
+        ),
+        ("optimize", "complex", "BSND", 4, 12, 8, 4, 1e-3, 1e-3),
     ],
 )
 @torch.inference_mode()
@@ -178,9 +208,9 @@ def test_rope_variants(
     if transformation == "match":
         fn = match_explicit_rope if variant == "explicit" else match_complex_rope
         check_op = (
-            torch.ops.rope.torch_apply_explicit_rope
+            torch.ops.rope.torch_apply_rope_with_explicit_cos_sin
             if variant == "explicit"
-            else torch.ops.rope.torch_apply_complex_rope
+            else torch.ops.rope.torch_apply_rope_with_complex_freqs
         )
 
         def checker(gm):
@@ -191,7 +221,13 @@ def test_rope_variants(
 
         def checker(gm):
             for n in gm.graph.nodes:
-                if is_op(n, torch.ops.rope.torch_apply_explicit_rope):
+                if is_op(
+                    n,
+                    {
+                        torch.ops.rope.torch_apply_rope_with_explicit_cos_sin,
+                        torch.ops.rope.torch_apply_rope_with_complex_freqs,
+                    },
+                ):
                     q_arg, k_arg, *rest = n.args
                     if not (
                         is_op(q_arg, torch.ops.aten.contiguous)
@@ -246,13 +282,14 @@ class DSRotaryEmbedding(torch.nn.Module):
 
 
 class DSModel(torch.nn.Module):
-    def __init__(self, hidden_size, max_seq, n_head, n_kv, layout="BNSD"):
+    def __init__(self, hidden_size, max_seq, n_head, n_kv, layout="BNSD", mode: str = "match"):
         super().__init__()
         self.hdim = hidden_size // n_head
         self.layout = layout
         self.q_lin = torch.nn.Linear(hidden_size, n_head * self.hdim)
         self.k_lin = torch.nn.Linear(hidden_size, n_kv * self.hdim)
         self.rotary = DSRotaryEmbedding(self.hdim, max_seq, base=10000, device="cuda")
+        self.mode = mode  # "match" or "optimize"
 
     def forward(self, x):
         b, s, _ = x.shape
@@ -268,7 +305,14 @@ class DSModel(torch.nn.Module):
         cos, sin = self.rotary(x, seq_len=s)
         # build position_ids [B, S]
         pos_ids = torch.arange(s, device=x.device).unsqueeze(0).expand(b, s)
-        q_out, k_out = apply_rotary_pos_emb_ds(q, k, cos, sin, pos_ids, unsqueeze_dim=unsq_dim)
+        if self.mode == "match":
+            q_out, k_out = apply_rotary_pos_emb_ds(q, k, cos, sin, pos_ids, unsqueeze_dim=unsq_dim)
+        else:
+            cos = cos[pos_ids]
+            sin = sin[pos_ids]
+            q_out, k_out = torch.ops.rope.torch_apply_rope_with_qk_interleaving(
+                q, k, cos, sin, unsq_dim
+            )
         if self.layout == "BNSD":
             # back to [B, S, N*D]
             q_out = q_out.permute(0, 2, 1, 3).reshape(b, s, -1)
@@ -282,21 +326,63 @@ class DSModel(torch.nn.Module):
         return {0: Dim("batch_size", max=8), 1: Dim("seq_len", max=16)}
 
 
-@pytest.mark.parametrize("layout,num_heads,num_kv_heads", [("BNSD", 8, 8), ("BSND", 8, 4)])
+@pytest.mark.parametrize(
+    "layout,num_heads,num_kv_heads,mode",
+    [
+        ("BNSD", 8, 8, "match"),
+        ("BSND", 8, 4, "match"),
+        ("BNSD", 8, 8, "optimize"),
+        ("BSND", 8, 4, "optimize"),
+    ],
+)
 @torch.inference_mode()
-def test_match_rope_deepseek(layout, num_heads, num_kv_heads):
+def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode):
     batch, seq, hid = 4, 12, 512
-    model = DSModel(hid, 16, num_heads, num_kv_heads, layout=layout).to("cuda", torch.float16)
+    model = DSModel(hid, 16, num_heads, num_kv_heads, layout=layout, mode=mode)
+    model = model.to("cuda", torch.float16)
+
     x = torch.randn(batch, seq, hid, device="cuda", dtype=torch.float16)
     dynamic_shapes = model.get_dynamic_shapes()
+
+    if mode == "match":
+        transform = match_explicit_rope
+
+        def checker(gm):
+            return any(
+                is_op(n, torch.ops.rope.torch_apply_rope_with_qk_interleaving)
+                for n in gm.graph.nodes
+            )
+
+    else:  # mode == "optimize"
+        transform = match_rope_layout
+
+        def checker(gm):
+            for n in gm.graph.nodes:
+                if is_op(n, torch.ops.rope.torch_apply_rope_with_qk_interleaving):
+                    q_arg, k_arg, *rest = n.args
+                    if not (
+                        is_op(q_arg, torch.ops.aten.contiguous)
+                        and is_op(k_arg, torch.ops.aten.contiguous)
+                    ):
+                        matched = False
+                        break
+
+                    old_q, old_k = extract_output_tuple(n, 2)
+                    if old_q is None or old_k is None:
+                        matched = False
+                        break
+                    q_transposed = any(is_op(u, torch.ops.aten.transpose) for u in old_q.users)
+                    k_transposed = any(is_op(u, torch.ops.aten.transpose) for u in old_k.users)
+                    matched = q_transposed and k_transposed
+
+                    # for BSND we expect that they were NOT transposed
+            return matched if layout == "BNSD" else not matched
 
     _ = run_test(
         model,
         x,
-        match_explicit_rope,
-        lambda gm: any(
-            is_op(n, torch.ops.rope.torch_apply_rope_with_qk_interleaving) for n in gm.graph.nodes
-        ),
+        transform,
+        checker,
         lambda num_p: num_p,
         atol=1e-3,
         rtol=1e-3,
