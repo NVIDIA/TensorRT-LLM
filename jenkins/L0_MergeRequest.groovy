@@ -128,18 +128,6 @@ def globalVars = [
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
 ]
-//["action_info"] = [
-//     "comment_html_url": githubData_comment_html_url,
-//     "comment_user_login": githubData_comment_user_login,
-//     "issue_number": githubData_issue_number,
-//     "issue_pull_request_html_url": githubData_issue_pull_request_html_url,
-//     "wrapper_job_name": env.JOB_NAME,
-//     "wrapper_job_url": env.BUILD_URL,
-//     "target_branch_name": prInfo.get("base", [:]).get("ref", ""),
-//     "target_branch_label": prInfo.get("base", [:]).get("label", ""),
-//     "source_branch_name": prInfo.get("head", [:]).get("ref", ""),
-//     "source_branch_label": prInfo.get("head", [:]).get("label", ""),
-// ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
 boolean enableUpdateGitlabStatus =
