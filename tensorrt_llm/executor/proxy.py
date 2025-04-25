@@ -11,7 +11,6 @@ import zmq.asyncio
 from tensorrt_llm.logger import logger
 
 from .._utils import mpi_rank
-from ..bindings import executor as tllm
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
@@ -23,7 +22,8 @@ from .postproc_worker import PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
-                    create_mpi_comm_session, get_spawn_proxy_process_env)
+                    create_mpi_comm_session, get_spawn_proxy_process_env,
+                    is_llm_response)
 from .worker import ExecutorBindingsWorker, worker_main
 
 __all__ = [
@@ -171,8 +171,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
             else:
                 queue.put(res)
 
-            if (isinstance(res, tllm.Response)
-                    and res.result.is_final) or isinstance(res, ErrorResponse):
+            if (is_llm_response(res) and res.result.is_final) or isinstance(
+                    res, ErrorResponse):
                 self._results.pop(client_id)
 
         res = res if isinstance(res, list) else [res]
