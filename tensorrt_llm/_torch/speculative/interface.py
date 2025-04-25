@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 
 import torch
 
+from ..._utils import get_sm_version
 from ..model_config import TConfig
 from ..pyexecutor.scheduler import ScheduledRequests
 
@@ -42,7 +43,9 @@ class SpeculativeDecodingMode(IntEnum):
         chunked context requests at the kernel level. Required for
         any spec dec mode that uses the SpecExecutor.
         """
-        return self.is_eagle3()
+
+        # Fixme: only blackwell supports eagle3 generation-phase kernels.
+        return self.is_eagle3() and get_sm_version() != 100
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":
