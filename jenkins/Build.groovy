@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@user/zhanruis/0421_for_info_link']) _
 
 import groovy.transform.Field
 
@@ -74,6 +74,18 @@ def BUILD_CONFIGS = [
     (TARNAME) : "llvm-TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;120-real",
   ],
+]
+
+@Field
+def GITHUB_PR_API_URL = "github_pr_api_url"
+@Field
+def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
+@Field
+def ACTION_INFO = "action_info"
+def globalVars = [
+    (GITHUB_PR_API_URL): null,
+    (CACHED_CHANGED_FILE_LIST): null,
+    (ACTION_INFO): null,
 ]
 
 // TODO: Move common variables to an unified location
@@ -585,7 +597,50 @@ def runLLMPackage(pipeline, archTriple, tarFileName, linuxPkgName)
     sh "cd ${llmPath} && ls -alh"
 }
 
-def launchStages(pipeline, cpu_arch, enableFailFast)
+def setupPipelineDescription(pipeline, globalVars) {
+    echo "currentBuild.description is: ${currentBuild.description}"
+    // 使用Groovy语法进行条件判断，不是Python语法
+    if (!globalVars[ACTION_INFO]) {
+        // 处理所有post merge 或者 gitlab 触发的情况，此时没有上游的wrapper job
+        globalVars[ACTION_INFO] = [
+            'trigger_info': "${currentBuild.description}<br/>Git Commit: ${env.gitlabCommit}<br/><br/>",
+            'parents': [],
+        ]
+    }
+    def startedByString = ""
+    def description = ""
+    // 使用Groovy的for-each循环语法
+    globalVars[ACTION_INFO]['parents'].each { parent ->
+        startedByString = """
+        <ul><li>
+            Started by: <a href="${parent['url']}" target="_blank">${parent['name']} #${parent['build_number']}</a> <a href="${parent['url'] + '/display/redirect'}" target="_blank">(Blue Ocean)</a>
+            ${startedByString}
+        </li></ul>"""
+        description = """
+            Sub Job Start: <a href=\"${env.BUILD_URL}\" target=\"_blank\">${env.JOB_NAME} #${env.BUILD_NUMBER}</a>
+                           <a href=\"${env.BUILD_URL}/display/redirect\" target=\"_blank\">(Blue Ocean)</a><br/>
+        """
+        trtllm_utils.appendBuildDescription(this, parent['name'], parent['build_number'], description)
+    }
+
+    globalVars[ACTION_INFO]['parents'] += [
+        [
+            'name': env.JOB_NAME,
+            'url': env.BUILD_URL,
+            'build_number': env.BUILD_NUMBER,
+        ]
+    ]
+
+    def newDescription = """
+    ${globalVars[ACTION_INFO]['trigger_info']}
+    ${startedByString}
+    """
+
+    echo "new description is: ${newDescription}"
+    currentBuild.description = newDescription
+}
+
+def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
 {
     stage("Show Environment") {
         sh "env | sort"
@@ -594,6 +649,18 @@ def launchStages(pipeline, cpu_arch, enableFailFast)
         echo "gitlabCommit: ${env.gitlabCommit}"
         echo "alternativeTRT: ${env.alternativeTRT}"
         echo "Using GitLab repo: ${LLM_REPO}. Commit: ${env.gitlabCommit}"
+
+        echo "env.globalVars is: ${env.globalVars}"
+        if (env.globalVars) {
+            def mp = readJSON text: env.globalVars, returnPojo: true
+            mp.each {
+                if (globalVars.containsKey(it.key)) {
+                    echo "globalVars setting ${it.key} = ${it.value}"
+                    globalVars[it.key] = it.value
+                }
+            }
+        }
+        setupPipelineDescription(pipeline, globalVars)
     }
 
     def wheelDockerImage = env.wheelDockerImage
@@ -710,7 +777,7 @@ pipeline {
     stages {
         stage("BuildJob") {
             steps {
-                launchStages(this, params.targetArch, params.enableFailFast)
+                launchStages(this, params.targetArch, params.enableFailFast, globalVars)
             }
         }
     } // stage

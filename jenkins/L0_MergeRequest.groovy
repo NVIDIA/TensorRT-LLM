@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@user/zhanruis/0421_for_info_link']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -121,10 +121,25 @@ String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
 def GITHUB_PR_API_URL = "github_pr_api_url"
 @Field
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
+@Field
+def ACTION_INFO = "action_info"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
+    (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
 ]
+//["action_info"] = [
+//     "comment_html_url": githubData_comment_html_url,
+//     "comment_user_login": githubData_comment_user_login,
+//     "issue_number": githubData_issue_number,
+//     "issue_pull_request_html_url": githubData_issue_pull_request_html_url,
+//     "wrapper_job_name": env.JOB_NAME,
+//     "wrapper_job_url": env.BUILD_URL,
+//     "target_branch_name": prInfo.get("base", [:]).get("ref", ""),
+//     "target_branch_label": prInfo.get("base", [:]).get("label", ""),
+//     "source_branch_name": prInfo.get("head", [:]).get("ref", ""),
+//     "source_branch_label": prInfo.get("head", [:]).get("label", ""),
+// ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
 boolean enableUpdateGitlabStatus =
@@ -750,7 +765,7 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
     return status
 }
 
-def launchStages(pipeline, reuseBuild, testFilter, enableFailFast)
+def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
     stages = [
         "Release Check": {
@@ -762,10 +777,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast)
             script {
                 stage("Build") {
                     def parameters = getCommonParameters()
+                    String globalVarsJson = writeJSON returnText: true, json: globalVars
                     parameters += [
                         'enableFailFast': enableFailFast,
                         'dockerImage': LLM_DOCKER_IMAGE,
                         'wheelDockerImage': LLM_ROCKYLINUX8_DOCKER_IMAGE,
+                        'globalVars': globalVarsJson,
                     ]
 
                     if (env.alternativeTRT) {
@@ -799,10 +816,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast)
                         parameters = getCommonParameters()
 
                         String testFilterJson = writeJSON returnText: true, json: testFilter
+                        String globalVarsJson = writeJSON returnText: true, json: globalVars
                         parameters += [
                             'enableFailFast': enableFailFast,
                             'testFilter': testFilterJson,
                             'dockerImage': LLM_DOCKER_IMAGE,
+                            'globalVars': globalVarsJson,
                         ]
 
                         if (env.alternativeTRT) {
@@ -855,9 +874,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast)
                 def stageName = "Build"
                 stage(stageName) {
                     def parameters = getCommonParameters()
+                    String globalVarsJson = writeJSON returnText: true, json: globalVars
                     parameters += [
                         'enableFailFast': enableFailFast,
                         "dockerImage": LLM_SBSA_DOCKER_IMAGE,
+                        'globalVars': globalVarsJson,
                     ]
 
                     if (env.alternativeTrtSBSA) {
@@ -892,10 +913,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast)
                         def parameters = getCommonParameters()
 
                         String testFilterJson = writeJSON returnText: true, json: testFilter
+                        String globalVarsJson = writeJSON returnText: true, json: globalVars
                         parameters += [
                             'enableFailFast': enableFailFast,
                             'testFilter': testFilterJson,
                             "dockerImage": LLM_SBSA_DOCKER_IMAGE,
+                            // 'globalVars': globalVarsJson,
                         ]
 
                         if (env.alternativeTrtSBSA) {
@@ -946,6 +969,49 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast)
     pipeline.parallel parallelJobs
 }
 
+def setupPipelineDescription(pipeline, globalVars) {
+    echo "currentBuild.description is: ${currentBuild.description}"
+    // 使用Groovy语法进行条件判断，不是Python语法
+    if (!globalVars[ACTION_INFO]) {
+        // 处理所有post merge 或者 gitlab 触发的情况，此时没有上游的wrapper job
+        globalVars[ACTION_INFO] = [
+            'trigger_info': "${currentBuild.description}<br/>Git Commit: ${env.gitlabCommit}<br/><br/>",
+            'parents': [],
+        ]
+    }
+    def startedByString = ""
+    def description = ""
+    // 使用Groovy的for-each循环语法
+    globalVars[ACTION_INFO]['parents'].each { parent ->
+        startedByString = """
+        <ul><li>
+            Started by: <a href="${parent['url']}" target="_blank">${parent['name']} #${parent['build_number']}</a> <a href="${parent['url'] + '/display/redirect'}" target="_blank">(Blue Ocean)</a>
+            ${startedByString}
+        </li></ul>"""
+        description = """
+            Sub Job Start: <a href=\"${env.BUILD_URL}\" target=\"_blank\">${env.JOB_NAME} #${env.BUILD_NUMBER}</a>
+                           <a href=\"${env.BUILD_URL}/display/redirect\" target=\"_blank\">(Blue Ocean)</a><br/>
+        """
+        trtllm_utils.appendBuildDescription(this, parent['name'], parent['build_number'], description)
+    }
+
+    globalVars[ACTION_INFO]['parents'] += [
+        [
+            'name': env.JOB_NAME,
+            'url': env.BUILD_URL,
+            'build_number': env.BUILD_NUMBER,
+        ]
+    ]
+
+    def newDescription = """
+    ${globalVars[ACTION_INFO]['trigger_info']}
+    ${startedByString}
+    """
+
+    echo "new description is: ${newDescription}"
+    currentBuild.description = newDescription
+}
+
 pipeline {
     agent {
         kubernetes createKubernetesPodConfig("", "agent")
@@ -990,6 +1056,8 @@ pipeline {
             {
                 script {
                     setupPipelineEnvironment(this, testFilter, globalVars)
+                    println globalVars
+                    setupPipelineDescription(this, globalVars)
                     echo "enableFailFast is: ${enableFailFast}"
                     echo "env.gitlabTriggerPhrase is: ${env.gitlabTriggerPhrase}"
                     println testFilter
@@ -1007,7 +1075,7 @@ pipeline {
                             }
                         }
                     } else {
-                        launchStages(this, reuseBuild, testFilter, enableFailFast)
+                        launchStages(this, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
             }

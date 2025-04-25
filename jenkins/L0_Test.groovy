@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@user/zhanruis/0421_for_info_link']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -133,6 +133,18 @@ def testFilter = [
     (ONLY_PYTORCH_FILE_CHANGED): false,
     (DEBUG_MODE): false,
     (AUTO_TRIGGER_TAG_LIST): [],
+]
+
+@Field
+def GITHUB_PR_API_URL = "github_pr_api_url"
+@Field
+def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
+@Field
+def ACTION_INFO = "action_info"
+def globalVars = [
+    (GITHUB_PR_API_URL): null,
+    (CACHED_CHANGED_FILE_LIST): null,
+    (ACTION_INFO): null,
 ]
 
 String getShortenedJobName(String path)
@@ -1618,12 +1630,22 @@ pipeline {
                         def mp = readJSON text: env.testFilter, returnPojo: true
                         mp.each {
                             if (testFilter.containsKey(it.key)) {
-                                echo "setting ${it.key} = ${it.value}"
+                                echo "testFilter setting ${it.key} = ${it.value}"
                                 testFilter[it.key] = it.value
                             }
                         }
                     }
                     println testFilter
+                    echo "env.globalVars is: ${env.globalVars}"
+                    if (env.globalVars) {
+                        def mp = readJSON text: env.globalVars, returnPojo: true
+                        mp.each {
+                            if (globalVars.containsKey(it.key)) {
+                                echo "globalVars setting ${it.key} = ${it.value}"
+                                globalVars[it.key] = it.value
+                            }
+                        }
+                    }
                 }
             }
         }
