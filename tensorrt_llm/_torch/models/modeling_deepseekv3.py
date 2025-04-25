@@ -38,6 +38,7 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 
@@ -345,6 +346,10 @@ class Deepseekv3MoE(nn.Module):
         config = model_config.pretrained_config
         self.top_k = top_k
         self.use_dp = model_config.mapping.enable_attention_dp
+        self.enable_alltoall = Deepseekv3MoE.should_enable_alltoall(
+            model_config, top_k)
+        if self.enable_alltoall:
+            MnnvlMemory.initialize()
         self.gate = DeepseekV3Gate(
             hidden_size,
             num_experts,
@@ -365,7 +370,8 @@ class Deepseekv3MoE(nn.Module):
             reduce_results=
             False,  # In both low‑latency and attention‑DP modes, FusedMoE skips the in‑op all‑reduce.
             model_config=model_config,
-            aux_stream=aux_stream_dict[AuxStreamType.MoeChunkingOverlap])
+            aux_stream=aux_stream_dict[AuxStreamType.MoeChunkingOverlap],
+            enable_alltoall=self.enable_alltoall)
 
         self.mapping = model_config.mapping
 
@@ -429,10 +435,29 @@ class Deepseekv3MoE(nn.Module):
 
         return shared_tp_size, shared_output_scale
 
+    @staticmethod
+    def should_enable_alltoall(model_config: ModelConfig, top_k: int) -> bool:
+        if not model_config.mapping.enable_attention_dp:
+            return False
+
+        if model_config.mapping.tp_size == 1:
+            return False
+
+        if not MnnvlMemory.supports_mnnvl():
+            return False
+
+        if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
+            return False
+
+        if model_config.mapping.moe_ep_size <= top_k:
+            return False
+
+        return True
+
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
                               all_rank_num_tokens, min_latency_mode):
         # max-throughput
-        if self.use_dp and self.mapping.tp_size > 1:
+        if self.use_dp and self.mapping.tp_size > 1 and not self.enable_alltoall:
             max_num_token = max(all_rank_num_tokens)
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
