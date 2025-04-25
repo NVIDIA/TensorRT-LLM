@@ -339,6 +339,7 @@ class KVCacheManager(BaseResourceManager):
                     if prepare_resource:
                         for _ in range(max_num_draft_tokens):
                             self.impl.add_token(req_id)
+            req.is_dummy = True
             requests.append(req)
         return requests
 
