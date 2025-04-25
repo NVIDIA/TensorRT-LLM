@@ -26,7 +26,7 @@ class MTPConfig(SpecConfig):
     # The number of max batch size
     max_batch_size: int = 8
 
-    use_relaxed_acceptance_for_thinking: bool = True
+    use_relaxed_acceptance_for_thinking: bool = False
     relaxed_topk: int = 1
     relaxed_delta: float = 0.
 
