@@ -164,4 +164,4 @@ l0_a30:
       backend: cpp
   tests:
   - test_cpp.py::test_model[-gpt_session-80]
-  - test_cpp.py::test_benchmarks[-gpt-80]
+  - test_cpp.py::test_benchmarks[gpt-80]
