@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/kernels/llama4GemmSwiGLU.h"
+#include "tensorrt_llm/kernels/llama4TiledGemmSwiGLU/fc13_swiglu_fp8.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/opUtils.h"
@@ -25,9 +26,9 @@
 #include <nvml.h>
 #include <torch/extension.h>
 
-// using namespace nvinfer1;
 using tensorrt_llm::kernels::llama4_fc_swiglu::llama4_fc_swiglu_fp8_op;
 using tensorrt_llm::kernels::llama4_fc_swiglu::llama4_fc_swiglu_bf16_op;
+using tensorrt_llm::kernels::llama4_fc_swiglu_tiled::llama4_fc_swiglu_tiled_fp8_op;
 
 namespace torch_ext
 {
@@ -69,8 +70,24 @@ public:
         return output;
     }
 
-    int initialize() noexcept
+    torch::Tensor run_tiled_fp8(
+        torch::Tensor inputA, torch::Tensor inputB, torch::Tensor in_scale, torch::Tensor out_scale_inv) noexcept
     {
+        auto stream = at::cuda::getCurrentCUDAStream(inputA.get_device());
+        auto num_tokens = inputA.size(0);
+        auto hidden_in = inputA.size(1);
+        auto hidden_out = inputB.size(1) / 2;
+        auto output = torch::empty(
+            {inputA.size(0), hidden_out}, torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(inputA.device()));
+
+        tensorrt_llm::kernels::llama4_fc_swiglu_tiled::llama4_fc_swiglu_tiled_fp8_op(num_tokens, hidden_in, hidden_out,
+            inputA.data_ptr(), inputB.data_ptr(), output.data_ptr(), in_scale.data_ptr(), out_scale_inv.data_ptr(),
+            stream);
+
+        return output;
+    }
+
+    int initialize() noexcept {
         return 0;
     }
 };
@@ -81,6 +98,11 @@ torch::Tensor llama4_fc_swiglu_fp8(
 {
     Llama4GemmSwiGLUOp op;
     return op.run_fp8(inputA, inputB, in_scale, out_scale_inv);
+}
+
+torch::Tensor llama4_fc_swiglu_tiled_fp8(torch::Tensor inputA, torch::Tensor inputB, torch::Tensor in_scale, torch::Tensor out_scale_inv) {
+    Llama4GemmSwiGLUOp op;
+    return op.run_tiled_fp8(inputA, inputB, in_scale, out_scale_inv);
 }
 
 torch::Tensor llama4_fc_swiglu_bf16(
@@ -95,11 +117,13 @@ torch::Tensor llama4_fc_swiglu_bf16(
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("llama4_fc_swiglu_fp8(Tensor inputA, Tensor inputB, Tensor in_scale, Tensor out_scale_inv) -> Tensor");
+    m.def("llama4_fc_swiglu_tiled_fp8(Tensor inputA, Tensor inputB, Tensor in_scale, Tensor out_scale_inv) -> Tensor");
     m.def("llama4_fc_swiglu_bf16(Tensor inputA, Tensor inputB, Tensor in_scale, Tensor out_scale_inv) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("llama4_fc_swiglu_fp8", &torch_ext::llama4_fc_swiglu_fp8);
+    m.impl("llama4_fc_swiglu_tiled_fp8", &torch_ext::llama4_fc_swiglu_tiled_fp8);
     m.impl("llama4_fc_swiglu_bf16", &torch_ext::llama4_fc_swiglu_bf16);
 }

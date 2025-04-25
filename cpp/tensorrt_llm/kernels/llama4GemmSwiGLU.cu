@@ -20,16 +20,6 @@
 namespace tensorrt_llm::kernels::llama4_fc_swiglu
 {
 
-struct __align__(8) aligned_fp8x8
-{
-    __align__(8) __nv_fp8x4_e4m3 data[2];
-};
-
-__device__ __forceinline__ float silu(float x)
-{
-    return x / (1.0f + __expf(-x));
-}
-
 // Hidden out is 2048 for MLP, and 1024 for shared expert.
 // This is the hand-optimized kernel by Po-Han.
 // fp8 in, fp8 out

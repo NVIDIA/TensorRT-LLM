@@ -344,7 +344,7 @@ class Linear(nn.Module):
                         position_ids,
                     )
                 elif self.use_llama4_fc_swiglu and inv_input_scale is not None:
-                    output = torch.ops.trtllm.llama4_fc_swiglu_fp8(
+                    output = torch.ops.trtllm.llama4_fc_swiglu_tiled_fp8(
                         qinput,
                         weight.t(),
                         self.combined_scale,
