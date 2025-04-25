@@ -347,8 +347,8 @@ class Llama4DecoderLayer(DecoderLayer):
         # self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp(
         # )
         # TODO: re-enable these fusions
-        self.fusion_config.PRE_MOE_FUSION = False
-        self.fusion_config.POST_MLP_FUSION = False
+        # self.fusion_config.PRE_MOE_FUSION = False
+        # self.fusion_config.POST_MLP_FUSION = False
 
         self.self_attn = Llama4Attention(
             model_config,
@@ -374,6 +374,9 @@ class Llama4DecoderLayer(DecoderLayer):
 
             # self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp(
             # )
+            self.fusion_config.PRE_MLP_FUSION = model_config.mapping.has_tp()
+            self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp()
+
         else:
             self.feed_forward = Llama4MoE(
                 num_experts=config.num_local_experts,
@@ -384,6 +387,10 @@ class Llama4DecoderLayer(DecoderLayer):
                 model_config=model_config,
                 aux_stream=aux_stream,
                 dtype=config.torch_dtype)
+
+            self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp()
+            self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp()
+
 
             # self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp(
             # )
