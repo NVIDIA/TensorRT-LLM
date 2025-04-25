@@ -417,7 +417,7 @@ class Llama4DecoderLayer(DecoderLayer):
                 self.next_layer_layernorm.variance_epsilon,
                 AllReduceFusionOp.MOE_ALLREDUCE_RESIDUAL_RMS_NORM,
             )
-        elif self.fusion_config.POST_MOE_FUSION or self.fusion_config.POST_MLP_FUSION:
+        elif (self.fusion_config.POST_MOE_FUSION or self.fusion_config.POST_MLP_FUSION) and self.next_layer_layernorm is not None:
             # fp8 POST_MOE_FUSION case might have illegal memory access issue. Disable it temporarily.
             if self.fusion_config.POST_MLP_FUSION and use_fp8_allreduce and self.next_attn is not None:
                 hidden_states, residual = self.post_quant_allreduce(
