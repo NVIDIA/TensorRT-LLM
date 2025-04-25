@@ -1,0 +1,807 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Disaggregated-Service (experimental) &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'advanced/disaggregated-service';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Overview" href="../performance/perf-overview.html" />
+    <link rel="prev" title="Speculative Sampling" href="speculative-decoding.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Disaggregated-Service (experimental)</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="disaggregated-service-experimental">
+<span id="disaggregated-service"></span><h1>Disaggregated-Service (experimental)<a class="headerlink" href="#disaggregated-service-experimental" title="Link to this heading">#</a></h1>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Note:
+This feature is currently experimental, and the related API is subjected to change in future versions.</p>
+</div>
+<p>Currently TRT-LLM supports <code class="docutils literal notranslate"><span class="pre">disaggregated-service</span></code>, where the context and generation phases of a request can run on different executors. TRT-LLM’s disaggregated service relies on the executor API, please make sure to read the <a class="reference internal" href="executor.html"><span class="std std-doc">executor page</span></a> before reading the document.</p>
+<p>For more information on disaggregated service in LLM inference, one can refer to papers such as <a class="reference external" href="https://arxiv.org/abs/2401.09670">DistServe</a>, <a class="reference external" href="https://arxiv.org/abs/2311.18677">SplitWise</a>.</p>
+<section id="usage">
+<h2>Usage<a class="headerlink" href="#usage" title="Link to this heading">#</a></h2>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="k">enum</span><span class="w"> </span><span class="k">class</span><span class="w"> </span><span class="nc">RequestType</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="n">REQUEST_TYPE_CONTEXT_AND_GENERATION</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="n">REQUEST_TYPE_CONTEXT_ONLY</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">    </span><span class="n">REQUEST_TYPE_GENERATION_ONLY</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span>
+<span class="p">};</span>
+</pre></div>
+</div>
+<p>The TRT-LLM executor can execute three types of requests: <code class="docutils literal notranslate"><span class="pre">REQUEST_TYPE_CONTEXT_AND_GENERATION</span></code>, <code class="docutils literal notranslate"><span class="pre">REQUEST_TYPE_CONTEXT_ONLY</span></code>, and <code class="docutils literal notranslate"><span class="pre">REQUEST_TYPE_GENERATION_ONLY</span></code>. An executor instance could execute the context phase of the context-only request or the generation phase of the generation-only request. When the executor completes the context phase of a context-only request, it maintains the corresponding KV cache, which will be requested by the executor for the subsequent generation-only request.</p>
+<p>Note that the environment variable <code class="docutils literal notranslate"><span class="pre">TRTLLM_USE_MPI_KVCACHE=1</span></code> should be set for <code class="docutils literal notranslate"><span class="pre">disaggregated-service</span></code>.</p>
+<p>Here are some key APIs to use disaggregated service:</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="n">Request</span><span class="w"> </span><span class="n">request</span><span class="p">{...};</span>
+
+<span class="n">request</span><span class="p">.</span><span class="n">setRequestType</span><span class="p">(</span><span class="n">tensorrt_llm</span><span class="o">::</span><span class="n">executor</span><span class="o">::</span><span class="n">RequestType</span><span class="o">::</span><span class="n">REQUEST_TYPE_CONTEXT_ONLY</span><span class="p">);</span>
+
+<span class="k">auto</span><span class="w"> </span><span class="n">contextRequestId</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">contextExecutor</span><span class="p">.</span><span class="n">enqueueRequest</span><span class="p">(</span><span class="n">request</span><span class="p">);</span>
+
+<span class="k">auto</span><span class="w"> </span><span class="n">contextResponses</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">contextExecutor</span><span class="p">.</span><span class="n">awaitResponses</span><span class="p">(</span><span class="n">contextRequestId</span><span class="p">);</span>
+
+<span class="k">auto</span><span class="w"> </span><span class="n">contextPhaseParams</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">contextResponses</span><span class="p">.</span><span class="n">back</span><span class="p">().</span><span class="n">getResult</span><span class="p">().</span><span class="n">contextPhaseParams</span><span class="p">.</span><span class="n">value</span><span class="p">();</span>
+
+<span class="n">request</span><span class="p">.</span><span class="n">setContextPhaseParams</span><span class="p">(</span><span class="n">contextPhaseParams</span><span class="p">);</span>
+
+<span class="n">request</span><span class="p">.</span><span class="n">setRequestType</span><span class="p">(</span><span class="n">tensorrt_llm</span><span class="o">::</span><span class="n">executor</span><span class="o">::</span><span class="n">RequestType</span><span class="o">::</span><span class="n">REQUEST_TYPE_GENERATION_ONLY</span><span class="p">);</span>
+
+<span class="k">auto</span><span class="w"> </span><span class="n">generationRequestId</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">generationExecutor</span><span class="p">.</span><span class="n">enqueueRequest</span><span class="p">(</span><span class="n">request</span><span class="p">);</span>
+
+<span class="k">auto</span><span class="w"> </span><span class="n">genResponses</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">generationExecutor</span><span class="p">.</span><span class="n">awaitResponses</span><span class="p">(</span><span class="n">generationRequestId</span><span class="p">);</span>
+</pre></div>
+</div>
+<p>The generationExecutor will require data such as KV cache from the corresponding contextExecutor based on the <code class="docutils literal notranslate"><span class="pre">contextPhaseParams</span></code> attached to the request, so please make sure that the corresponding contextExecutor is not shut down before getting the generationExecutor’s response.</p>
+<p>In the code example above, the <code class="docutils literal notranslate"><span class="pre">contextRequestId</span></code> assigned by the contextExecutor and the <code class="docutils literal notranslate"><span class="pre">generationRequestId</span></code> assigned by the generationExecutor are independent, it is the user’s responsibility to manage the mapping of the <code class="docutils literal notranslate"><span class="pre">requestId</span></code> for context-only requests to the <code class="docutils literal notranslate"><span class="pre">requestId</span></code> for generation-only requests. The <code class="docutils literal notranslate"><span class="pre">contextResponses</span></code> contains the first output token generated by the context phase, and the <code class="docutils literal notranslate"><span class="pre">genResponses</span></code> also contains the first output token generated by the contextExecutor,  so all output tokens can be obtained from generationExecutor’s responses.</p>
+<p><img alt="disaggregated-service usage" src="../_images/disaggregated-service_usage.png" /></p>
+<p>An <code class="docutils literal notranslate"><span class="pre">orchestrator</span></code> is required in <code class="docutils literal notranslate"><span class="pre">disaggregated-service</span></code> to manage multiple executor instances and route requests to different executors, TRT-LLM provides class <code class="docutils literal notranslate"><span class="pre">DisaggExecutorOrchestrator</span></code> in <code class="docutils literal notranslate"><span class="pre">cpp/include/tensorrt_llm/executor/disaggServerUtil.h</span></code> to launch multiple executor instances, however, <code class="docutils literal notranslate"><span class="pre">DisaggExecutorOrchestrator</span></code> only routes requests to executors in a simple round-robin policy, users need to implement their own orchestrator for disaggregated-service based on their usage scenario.</p>
+</section>
+<section id="example">
+<h2>Example<a class="headerlink" href="#example" title="Link to this heading">#</a></h2>
+<p>Please refer to <code class="docutils literal notranslate"><span class="pre">examples/cpp/executor/executorExampleDisaggregated.cpp</span></code></p>
+</section>
+<section id="benchmarks">
+<h2>Benchmarks<a class="headerlink" href="#benchmarks" title="Link to this heading">#</a></h2>
+<p>Please refer to <code class="docutils literal notranslate"><span class="pre">benchmarks/cpp/disaggServerBenchmark.cpp</span></code> and <code class="docutils literal notranslate"><span class="pre">benchmarks/cpp/README.md</span></code></p>
+</section>
+<section id="environment-variables">
+<h2>Environment Variables<a class="headerlink" href="#environment-variables" title="Link to this heading">#</a></h2>
+<p>TRT-LLM uses some environment variables to control the behavior of disaggregated service.</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_USE_MPI_KVCACHE</span></code>: Whether to use MPI to transfer KV cache. Currently, the default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_USE_UCX_KVCACHE</span></code>: Whether to use UCX to transfer KV cache. Currently, the default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>. To use disaggregated service, either <code class="docutils literal notranslate"><span class="pre">TRTLLM_USE_MPI_KVCACHE=1</span></code> or <code class="docutils literal notranslate"><span class="pre">TRTLLM_USE_UCX_KVCACHE=1</span></code> is required to be set.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_PARALLEL_CACHE_SEND</span></code>: If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, contextExecutor will attempt to send KV cache for multiple requests in parallel. The default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP</span></code>: If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, generationExecutor will not overlap KV cache transfer with model inference. The default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL</span></code>:  When the generation rank receives KV cache from multiple context ranks within a single context instance, it will receive KV cache from each rank sequentially. If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, the generation rank will receive KV cache from each rank within one context instance in parallel. The default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_REQUEST_KV_CACHE_CONCURRENT</span></code>: If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, generationExecutor prepares independent resources for each context executor to receive KV cache, requests whose KV cache are received from different context executors will be processed concurrently. If set to <code class="docutils literal notranslate"><span class="pre">0</span></code>, the generation executor will reuse the same resource to process KV cache transfer for each request sequentially, reducing the resources used by KV cache transmission and thereby lowering the risk of running out of memory. The default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER</span></code>: TRT-LLM typically copies non-contiguous data into a temporary buffer before sending KV cache. If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, TRT-LLM will attempt to directly transmit each KV cache block, eliminating extra copies. The default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE</span></code>: By default, TRT-LLM uses a <code class="docutils literal notranslate"><span class="pre">stream-ordered</span> <span class="pre">memory</span> <span class="pre">allocator</span></code> to allocate temporary buffers. If this environment variable is set to #Size, TRT-LLM will use <code class="docutils literal notranslate"><span class="pre">cudaMalloc</span></code> to allocate buffer of size #Size for KV cache transmission. The default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>. Users can set <code class="docutils literal notranslate"><span class="pre">TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=1GB</span></code> to allocate a 1 GB buffer with <code class="docutils literal notranslate"><span class="pre">cudaMalloc</span></code> for KV cache transmission.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_KVCACHE_TRANSFER_USE_ASYNC_BUFFER</span></code>: If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, TRT-LLM will use <code class="docutils literal notranslate"><span class="pre">cudaMallocAsync</span></code> to allocate buffers for KV cache transmission. The default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>. This environment variable only takes effect when <code class="docutils literal notranslate"><span class="pre">TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE</span></code> is greater than 0.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM</span></code>: The maximum number of concurrent KV cache sends. The default value is <code class="docutils literal notranslate"><span class="pre">4</span></code>. This environment variable only takes effect when <code class="docutils literal notranslate"><span class="pre">TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE</span></code> is greater than 0.</p></li>
+</ul>
+</section>
+<section id="troubleshooting-and-faq">
+<h2>Troubleshooting and FAQ<a class="headerlink" href="#troubleshooting-and-faq" title="Link to this heading">#</a></h2>
+<section id="general-faqs">
+<h3>General FAQs<a class="headerlink" href="#general-faqs" title="Link to this heading">#</a></h3>
+<p><em>Q. What are the limitations of disaggregated-service in TRT-LLM?</em></p>
+<p>A. Currently, only <code class="docutils literal notranslate"><span class="pre">decoder-only</span> <span class="pre">engine</span></code> and <code class="docutils literal notranslate"><span class="pre">beamWidth=1</span></code> are supported, and the KV cache at each layer of the model is required to be homogeneous, with the same data type and the same number of attention headers.</p>
+<p><em>Q. Is the engine used by disaggregated-service different from other engines?</em></p>
+<p>A. No. There are no special requirements for the arguments to build engine.</p>
+<p><em>Q. Do the engines used by the context executor and generation executor need to be the same?</em></p>
+<p>A. No. The engines used by context executor and generation executor can be different, and their parallelism can be heterogeneous, i.e., TP,PP can be different, and TRT-LLM will handle the heterogeneity of KV cache.</p>
+<p><em>Q. Does TRT-LLM support running multiple context executor instances and generation executor instances?</em></p>
+<p>A. Yes. TRT-LLM supports running multiple context executors and generation executors at the same time, and each executor can use different engine, but it is the user’s responsibility to route requests to different executors and  manage <code class="docutils literal notranslate"><span class="pre">requestId</span></code>.</p>
+<p><em>Q. Can an executor handle both context-only requests and generation-only requests?</em></p>
+<p>A. Yes, but it’s not recommended, TRT-LLM does not implement proper scheduling for the case where the executor handles mixed context-only requests and generation-only requests, it’s better to run context-only requests and generation-only requests on different executors.</p>
+<p><em>Q. Does disaggregated-service in TRT-LLM support multi-gpu and multi-node?</em></p>
+<p>A. Yes, it’s recommended that different executor use different GPUs . We support context-only executor and genertion-only executor run on same node or different nodes. The <code class="docutils literal notranslate"><span class="pre">participantIds</span></code> and <code class="docutils literal notranslate"><span class="pre">deviceIds</span></code> used by each executor need to be explicitly set by the user, and the <code class="docutils literal notranslate"><span class="pre">participantIds</span></code> of each executor must not be intersecting.</p>
+<p><em>Q. What’s the requirement for disaggregated-service in TRT-LLM?</em></p>
+<p>A. TRT-LLM requires <code class="docutils literal notranslate"><span class="pre">UCX</span></code>-backend <code class="docutils literal notranslate"><span class="pre">CUDA-aware</span> <span class="pre">MPI</span></code> currently, TRT-LLM implements KV cache transfer with <a class="reference external" href="https://docs.open-mpi.org/en/v5.0.x/tuning-apps/networking/cuda.html#how-do-i-build-open-mpi-with-cuda-aware-support"><code class="docutils literal notranslate"><span class="pre">CUDA-aware</span> <span class="pre">MPI</span></code></a>, and will support more communication components for KV cache transfer in future version.</p>
+</section>
+<section id="debugging-faqs">
+<h3>Debugging FAQs<a class="headerlink" href="#debugging-faqs" title="Link to this heading">#</a></h3>
+<p><em>Q. How to handle error <code class="docutils literal notranslate"><span class="pre">Disaggregated</span> <span class="pre">serving</span> <span class="pre">is</span> <span class="pre">not</span> <span class="pre">enabled,</span> <span class="pre">please</span> <span class="pre">check</span> <span class="pre">the</span> <span class="pre">configuration?</span></code></em></p>
+<p>A. please set the environment variables</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">export</span> <span class="n">TRTLLM_USE_MPI_KVCACHE</span><span class="o">=</span><span class="mi">1</span>
+</pre></div>
+</div>
+<p>or</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">export</span> <span class="n">TRTLLM_USE_UCX_KVCACHE</span><span class="o">=</span><span class="mi">1</span>
+</pre></div>
+</div>
+<p>When the environment variable <code class="docutils literal notranslate"><span class="pre">TRTLLM_USE_MPI_KVCACHE=1</span></code> is set, TRT-LLM will transfer the KV cache using <code class="docutils literal notranslate"><span class="pre">CUDA-aware</span> <span class="pre">MPI</span></code>. All executor processes involved must share the same MPI world communicator. Consequently, with <code class="docutils literal notranslate"><span class="pre">TRTLLM_USE_MPI_KVCACHE=1</span></code>, TRT-LLM only supports launching multiple executors via <code class="docutils literal notranslate"><span class="pre">MPI</span></code>. Additionally, the <code class="docutils literal notranslate"><span class="pre">CommunicationMode</span></code> for the executors must be set to <code class="docutils literal notranslate"><span class="pre">kLEADER</span></code> or <code class="docutils literal notranslate"><span class="pre">kORCHESTRATOR</span></code> with <code class="docutils literal notranslate"><span class="pre">SpawnProcesses=false</span></code> for the <code class="docutils literal notranslate"><span class="pre">disaggregated-service</span></code>. These restrictions do not apply when <code class="docutils literal notranslate"><span class="pre">TRTLLM_USE_UCX_KVCACHE=1</span></code> is set.</p>
+<p><em>Q. Why do some profiling tools show that TRT-LLM’s KV cache transfer does not utilize NVLink even on devices equipped with NVLink?</em></p>
+<p>A. Ensure TRT-LLM is running with <code class="docutils literal notranslate"><span class="pre">UCX</span></code>-backend <code class="docutils literal notranslate"><span class="pre">CUDA-aware</span> <span class="pre">MPI</span></code> , and check version of <code class="docutils literal notranslate"><span class="pre">UCX</span></code> with <code class="docutils literal notranslate"><span class="pre">ucx_info</span> <span class="pre">-v</span></code>.
+If the version of UCX &lt;=1.17, set the environment variables <code class="docutils literal notranslate"><span class="pre">UCX_RNDV_FRAG_MEM_TYPE=cuda</span></code> and <code class="docutils literal notranslate"><span class="pre">UCX_MEMTYPE_CACHE=n</span></code> to enable NVLink. For BlackWell architecture GPUs, UCX version &gt;=1.19 is required to enable NVLink.
+If the version of UCX &gt;=1.18, there are several ways to enable NVLink:</p>
+<ol class="arabic simple">
+<li><p>Set the environment variables <code class="docutils literal notranslate"><span class="pre">UCX_CUDA_COPY_ASYNC_MEM_TYPE=cuda</span></code>, <code class="docutils literal notranslate"><span class="pre">UCX_CUDA_COPY_DMABUF=no</span></code>, <code class="docutils literal notranslate"><span class="pre">UCX_MEMTYPE_CACHE=n</span></code> and <code class="docutils literal notranslate"><span class="pre">UCX_RNDV_PIPELINE_ERROR_HANDLING=y</span></code>.</p></li>
+<li><p>Set the environment variables <code class="docutils literal notranslate"><span class="pre">TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=$Size</span></code>, <code class="docutils literal notranslate"><span class="pre">UCX_MEMTYPE_CACHE=n</span></code> and <code class="docutils literal notranslate"><span class="pre">UCX_RNDV_PIPELINE_ERROR_HANDLING=y</span></code>. $Size represents the size of the buffer for KV cache transfer, which is recommended to be larger than the size of the KV cache for the longest request.</p></li>
+</ol>
+<p><em>Q. Does TRT-LLM support using GPU direct RDMA for inter-node KV Cache transfer?</em></p>
+<p>A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer, but it is not enabled by default. There are several ways to enable GPU direct RDMA:</p>
+<ol class="arabic simple">
+<li><p>Set the environment variables <code class="docutils literal notranslate"><span class="pre">UCX_RNDV_FRAG_MEM_TYPE=cuda</span></code>, <code class="docutils literal notranslate"><span class="pre">UCX_MEMTYPE_CACHE=n</span></code> and <code class="docutils literal notranslate"><span class="pre">UCX_RNDV_PIPELINE_ERROR_HANDLING=y</span></code>.</p></li>
+<li><p>Set the environment variables <code class="docutils literal notranslate"><span class="pre">TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=$Size</span></code>, <code class="docutils literal notranslate"><span class="pre">UCX_MEMTYPE_CACHE=n</span></code> and <code class="docutils literal notranslate"><span class="pre">UCX_RNDV_PIPELINE_ERROR_HANDLING=y</span></code>, $Size represents the size of the buffer for KV cache transfer, which is recommended to be larger than the size of the KV cache for the longest request.
+To achieve the optimal performance when using GPU direct RDMA, it is advisable to create CUDA context before MPI initialization when TRTLLM_USE_MPI_KVCACHE=1 is set. One possible approach is to rely on MPI environment variables to set the correct device before MPI initialization.</p></li>
+</ol>
+<p><em>Q. Are there any guidelines for performance tuning of KV cache transfer?</em></p>
+<p>A. Depending on the user’s use case, certain sets of environment variables can help avoid poor KV cache transfer performance.</p>
+<p>Environment Variable Set A</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">export</span> <span class="n">UCX_RNDV_FRAG_MEM_TYPES</span><span class="o">=</span><span class="n">cuda</span>
+<span class="n">export</span> <span class="n">UCX_MEMTYPE_CACHE</span><span class="o">=</span><span class="n">n</span>
+<span class="n">export</span> <span class="n">UCX_RNDV_PIPELINE_ERROR_HANDLING</span><span class="o">=</span><span class="n">y</span>
+</pre></div>
+</div>
+<p>This set allows KV cache transfers to utilize NVLink within nodes and GDRDMA between nodes.</p>
+<p>Environment Variable Set B</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">export</span> <span class="n">UCX_CUDA_COPY_ASYNC_MEM_TYPE</span><span class="o">=</span><span class="n">cuda</span>
+<span class="n">export</span> <span class="n">UCX_CUDA_COPY_DMABUF</span><span class="o">=</span><span class="n">no</span>
+<span class="n">export</span> <span class="n">UCX_MEMTYPE_CACHE</span><span class="o">=</span><span class="n">n</span>
+<span class="n">export</span> <span class="n">UCX_RNDV_PIPELINE_ERROR_HANDLING</span><span class="o">=</span><span class="n">y</span>
+</pre></div>
+</div>
+<p>Set B may provide slightly better performance on a single node compared to Set A. However, when transferring KV cache across multiple nodes, it may cause program instability.</p>
+<p>Environment Variable Set C</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>export TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=$Size
+export UCX_MEMTYPE_CACHE=n
+export UCX_RNDV_PIPELINE_ERROR_HANDLING=y
+</pre></div>
+</div>
+<p>Set C can achieve better performance than Sets A and B, both within and between nodes. However, if the KV cache size exceeds the specified $Size, performance may degrade.</p>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="speculative-decoding.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Speculative Sampling</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="../performance/perf-overview.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Overview</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#usage">Usage</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#example">Example</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmarks">Benchmarks</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#environment-variables">Environment Variables</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting-and-faq">Troubleshooting and FAQ</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#general-faqs">General FAQs</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#debugging-faqs">Debugging FAQs</a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

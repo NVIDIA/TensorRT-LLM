@@ -1,0 +1,1022 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Model Definition &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'architecture/core-concepts';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="TensorRT-LLM Checkpoint" href="checkpoint.html" />
+    <link rel="prev" title="TensorRT-LLM Architecture" href="overview.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Model Definition</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="model-definition">
+<span id="core-concepts"></span><h1>Model Definition<a class="headerlink" href="#model-definition" title="Link to this heading">#</a></h1>
+<p>TensorRT-LLM has a Model Definition API that can be used to define
+Large Language Models. This API is built on top of the powerful
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/index.html#">TensorRT Python API</a>
+to create graph representations of deep neural networks in TensorRT. To become
+familiar with the core concepts of the TensorRT API, refer to the
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/coreConcepts.html">Core Concepts</a>
+section of the TensorRT documentation before proceeding further.</p>
+<p>In TensorRT-LLM, the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/HEAD/tensorrt_llm/builder.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.Builder</span></code></a> class
+contains a
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Core/Builder.html#tensorrt.Builder"><code class="docutils literal notranslate"><span class="pre">tensorrt.Builder</span></code></a>
+object. That instance is used in the <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.Builder.create_network</span></code>
+method to create an instance of the
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/Network.html#tensorrt.INetworkDefinition"><code class="docutils literal notranslate"><span class="pre">tensorrt.INetworkDefinition</span></code></a>
+class. The <code class="docutils literal notranslate"><span class="pre">INetworkDefinition</span></code> object can then be populated using the free
+functions defined in the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/HEAD/tensorrt_llm/functional.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.functional</span></code></a>.</p>
+<p>A simple example of such a free function is <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.activation</span></code> that inserts a
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/Layers.html#tensorrt.IActivationLayer"><code class="docutils literal notranslate"><span class="pre">tensorrt.IActivationLayer</span></code></a>
+node in the graph of the model:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># In tensorrt_llm.functional:</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">activation</span><span class="p">(</span><span class="nb">input</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">act_type</span><span class="p">:</span> <span class="n">trt</span><span class="o">.</span><span class="n">ActivationType</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
+    <span class="n">layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_activation</span><span class="p">(</span><span class="nb">input</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">,</span> <span class="n">act_type</span><span class="p">)</span>   <span class="c1"># default_trtnet() -&gt; INetworkDefinition</span>
+    <span class="k">return</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>To make it even easier for users, a few of the most standard activation
+functions found in LLMs are derived from that function:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># In tensorrt_llm.functional:</span>
+
+<span class="n">relu</span>    <span class="o">=</span> <span class="n">partial</span><span class="p">(</span><span class="n">activation</span><span class="p">,</span> <span class="n">act_type</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">ActivationType</span><span class="o">.</span><span class="n">RELU</span><span class="p">)</span>
+<span class="n">sigmoid</span> <span class="o">=</span> <span class="n">partial</span><span class="p">(</span><span class="n">activation</span><span class="p">,</span> <span class="n">act_type</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">ActivationType</span><span class="o">.</span><span class="n">SIGMOID</span><span class="p">)</span>
+
+</pre></div>
+</div>
+<p>Specialized activation functions can be used to assemble more advanced
+functions such as the <code class="docutils literal notranslate"><span class="pre">silu</span></code> activation:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># In tensorrt_llm.functional:</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">silu</span><span class="p">(</span><span class="nb">input</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
+    <span class="k">return</span> <span class="nb">input</span> <span class="o">*</span> <span class="n">sigmoid</span><span class="p">(</span><span class="nb">input</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>When the TensorRT-LLM’s Model Definition API is utilized, a graph of the network is
+assembled.  The graph can later be traversed or transformed using the graph
+traversal API exposed by the
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/LayerBase.html#tensorrt.ILayer"><code class="docutils literal notranslate"><span class="pre">tensorrt.ILayer</span></code></a>
+class. That graph will also be optimized by TensorRT during the compilation of
+the engine, as explained in the next section.</p>
+</section>
+<section id="compilation">
+<h1>Compilation<a class="headerlink" href="#compilation" title="Link to this heading">#</a></h1>
+<p>Once populated, the instance of the
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/Network.html#tensorrt.INetworkDefinition"><code class="docutils literal notranslate"><span class="pre">tensorrt.INetworkDefinition</span></code></a>,
+can be compiled into an efficient engine by the
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Core/Builder.html#tensorrt.Builder"><code class="docutils literal notranslate"><span class="pre">tensorrt.Builder</span></code></a>
+In TensorRT-LLM, it is done through the <code class="docutils literal notranslate"><span class="pre">build_engine</span></code> member function of the
+<code class="docutils literal notranslate"><span class="pre">tensorrt_llm.Builder</span></code> class that calls the
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Core/Builder.html#tensorrt.Builder.build_serialized_network"><code class="docutils literal notranslate"><span class="pre">build_serialized_network</span></code></a>
+method of the
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Core/Builder.html#tensorrt.Builder"><code class="docutils literal notranslate"><span class="pre">tensorrt.Builder</span></code></a>
+object. That call, if everything works as expected, produces an instance of the
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/FoundationalTypes/HostMemory.html#tensorrt.IHostMemory"><code class="docutils literal notranslate"><span class="pre">tensorrt.IHostMemory</span></code></a>
+class. That object is an optimized TensorRT engine that can be stored as a
+binary file.</p>
+<section id="tensorrt-compiler">
+<h2>TensorRT Compiler<a class="headerlink" href="#tensorrt-compiler" title="Link to this heading">#</a></h2>
+<p>The TensorRT compiler can sweep through the graph to choose the best kernel for each operation and available GPU. Crucially, it can also identify patterns in the graph where multiple operations are good candidates for being fused into a single kernel. This reduces the required amount of memory movement and the overhead of launching multiple GPU kernels.</p>
+<p>TensorRT also compiles the graph of operations into a single <a class="reference external" href="https://developer.nvidia.com/blog/cuda-graphs/">CUDA Graph</a> that can be launched all at one time, further reducing the kernel launch overhead.</p>
+<p>The TensorRT compiler is extremely powerful for fusing layers and increasing execution speed, but there are some complex layer fusions—like <a class="reference external" href="https://arxiv.org/abs/2307.08691">FlashAttention</a> — that involve interleaving many operations together and which can’t be automatically discovered. For those, you can explicitly replace parts of the graph with <a class="reference internal" href="#plugins">plugins</a> at compile time.</p>
+</section>
+<section id="model-engine">
+<h2>Model Engine<a class="headerlink" href="#model-engine" title="Link to this heading">#</a></h2>
+<p>The engine file contains the information that you need for executing the model, but LLM usage in practice requires much more than a single forward pass through the model. TensorRT-LLM includes a highly optimized C++ runtime for executing built LLM engines and managing processes like sampling tokens from the model output, managing the KV cache, and batching requests together.</p>
+<p>You can use that runtime directly to execute the model locally, or you can use the TensorRT-LLM runtime backend for NVIDIA Triton Inference Server to serve the model for multiple users.</p>
+</section>
+<section id="weight-bindings">
+<h2>Weight Bindings<a class="headerlink" href="#weight-bindings" title="Link to this heading">#</a></h2>
+<p>TensorRT engines embed the network weights, that must be known for compilation.
+For that reason, the weights must be bound to parameters in the model
+definition before calling <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.Builder.build_engine</span></code>. It leads to code like:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># The Linear operator exposes two parameters (see tensorrt_llm/layers/linear.py):</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Linear</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">weight</span> <span class="o">=</span> <span class="n">Parameter</span><span class="p">(</span><span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">out_features</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">in_features</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">bias</span>   <span class="o">=</span> <span class="n">Parameter</span><span class="p">(</span><span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">out_features</span><span class="p">,</span> <span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+
+<span class="c1"># The parameters are bound to the weights before compiling the model. See examples/gpt/weight.py:</span>
+<span class="n">tensorrt_llm_gpt</span><span class="o">.</span><span class="n">layers</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">value</span> <span class="o">=</span> <span class="n">fromfile</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="n">tensorrt_llm_gpt</span><span class="o">.</span><span class="n">layers</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">bias</span><span class="o">.</span><span class="n">value</span>   <span class="o">=</span> <span class="n">fromfile</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Note that TensorRT can also
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#refitting-engine-c">refit</a>
+engines to update the weights after compilation. This feature is available to
+TensorRT-LLM users through the <code class="docutils literal notranslate"><span class="pre">refit_engine</span></code> method in the
+<code class="docutils literal notranslate"><span class="pre">tensorrt_llm.Builder</span></code> class.</p>
+</section>
+<section id="pattern-matching-and-fusion">
+<h2>Pattern-Matching and Fusion<a class="headerlink" href="#pattern-matching-and-fusion" title="Link to this heading">#</a></h2>
+<p>One of the key steps performed by TensorRT when it compiles the network graph
+is the fusion of operations. Fusion is a well-known technique to improve the
+efficiency when executing LLMs. It helps reduce the amount of data transferred
+between the memory (DRAM) and the compute cores (CUDA cores as well as Tensor
+Cores located on the <a class="reference external" href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#introduction">Streaming
+Multiprocessors</a>
+of a GPU). It also removes kernel launch overhead (each time a kernel is
+launched on the GPU, there is a small additional CPU cost that is called the
+launch overhead). A classical example is the fusion of the activation function
+with the matrix multiplication (matmul) that usually precedes it in the
+network.</p>
+<p>In TensorRT-LLM, when defining the model, such a sequence can be written as:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">c</span> <span class="o">=</span> <span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">matmul</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span>
+<span class="n">c</span> <span class="o">=</span> <span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">relu</span><span class="p">(</span><span class="n">c</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>During inference, if the above sequence is executed without fusion, the <code class="docutils literal notranslate"><span class="pre">c</span></code>
+tensor has to be written to global memory at the end of the <code class="docutils literal notranslate"><span class="pre">matmul</span></code>, read from
+that same memory in <code class="docutils literal notranslate"><span class="pre">relu</span></code> and written again after <code class="docutils literal notranslate"><span class="pre">relu</span></code>. If no other
+operation uses the intermediate values between <code class="docutils literal notranslate"><span class="pre">matmul</span></code> and <code class="docutils literal notranslate"><span class="pre">relu</span></code>, it is
+suboptimal.  That is why, during compilation, TensorRT will identify that
+pattern and automatically produce a GPU kernel that applies <code class="docutils literal notranslate"><span class="pre">relu</span></code> at the end
+of <code class="docutils literal notranslate"><span class="pre">matmul</span></code> without an intermediate step through global memory. With that
+optimization, the <code class="docutils literal notranslate"><span class="pre">c</span></code> tensor is written only once (after <code class="docutils literal notranslate"><span class="pre">relu</span></code>) instead of
+twice, and is not read between the two operations.</p>
+<p>The process of identifying the sequences of operations that can be fused is
+called <em>pattern-matching</em>. TensorRT has a powerful pattern-matching algorithm
+that can identify a lot of possible fusions. All the identified patterns are
+converted into more efficient kernels by an advanced kernel compiler.</p>
+</section>
+<section id="plugins">
+<h2>Plugins<a class="headerlink" href="#plugins" title="Link to this heading">#</a></h2>
+<p>The number of possible fusions is almost infinite and some useful fusions
+involve very advanced modifications of the graph. A well-known example
+is the <a class="reference external" href="https://arxiv.org/abs/2205.14135">Flash-Attention</a> technique to
+optimize the <a class="reference external" href="https://arxiv.org/abs/1706.03762">Multihead-Attention</a> block
+found in many LLMs. Flash-Attention requires modifications to the arithmetic
+performed in the sequence <code class="docutils literal notranslate"><span class="pre">BMM-Softmax-BMM</span></code> (where <code class="docutils literal notranslate"><span class="pre">BMM</span></code> stands for Batched
+Matrix-Matrix product) and the interleaving of the <code class="docutils literal notranslate"><span class="pre">for</span></code>-loops of the two
+batched matrix products.  That’s non-trivial and not necessarily something
+you can expect a compiler to “discover” on its own (or it might require the
+support for a <a class="reference external" href="https://en.wikipedia.org/wiki/Polytope_model">polyhedral
+model</a>).</p>
+<p>As a result, even if TensorRT has a powerful pattern-matching algorithm and
+supports a lot of possible fusions, there is always the risk that it cannot
+identify uncommon and/or very advanced patterns. To overcome that inevitable
+limitation, TensorRT offers a powerful mechanism known as
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Plugin/pyPlugin.html">plugins</a>.</p>
+<p>The plugins are nodes inserted in the network graph definition that map to user-defined
+GPU kernels. TensorRT-LLM uses a number of such plugins. They can be found in
+the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/HEAD//cpp/tensorrt_llm/plugins"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/plugins</span></code></a> directory.</p>
+<p>Plugins are written in C++ and follow a well-defined interface described in the
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#extending">Extending TensorRT with Custom Layers</a>
+section of the TensorRT
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html">Developer Guide</a>.
+When executed within a TensorRT engine, plugins trigger the execution of
+their encapsulated GPU kernels. A fairly simple example of plugins is the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/HEAD//cpp/tensorrt_llm/plugins/quantizeTensorPlugin"><code class="docutils literal notranslate"><span class="pre">QuantizeTensorPlugin</span></code></a> that
+triggers a CUDA kernel in the <code class="docutils literal notranslate"><span class="pre">QuantizeTensorPlugin::enqueue</span></code> member function:</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="c1">// In cpp/tensorrt_llm/plugins/quantizeTensorPlugin/quantizeTensorPlugin.cpp:</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">QuantizeTensorPlugin::enqueue</span><span class="p">(...)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">inputDesc</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">type</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">DataType</span><span class="o">::</span><span class="n">kFLOAT</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">invokeQuantization</span><span class="o">&lt;</span><span class="kt">float</span><span class="o">&gt;</span><span class="p">(...);</span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">invokeQuantization</span><span class="o">&lt;</span><span class="n">half</span><span class="o">&gt;</span><span class="p">(...);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="c1">// In cpp/tensorrt_llm/kernels/quantization.cu:</span>
+
+<span class="k">template</span><span class="w"> </span><span class="o">&lt;</span><span class="k">typename</span><span class="w"> </span><span class="nc">T</span><span class="o">&gt;</span>
+<span class="kt">void</span><span class="w"> </span><span class="n">invokeQuantization</span><span class="p">(...)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// The standard &lt;&lt;&lt; &gt;&gt;&gt; construct to launch CUDA kernels</span>
+<span class="w">    </span><span class="n">quantizedKernel</span><span class="o">&lt;&lt;&lt;</span><span class="n">grid</span><span class="p">,</span><span class="w"> </span><span class="n">block</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">stream</span><span class="o">&gt;&gt;&gt;</span><span class="p">(...);</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>For more details on how TensorRT-LLM implements the GPT Attention operator, see
+the <a class="reference internal" href="../advanced/gpt-attention.html"><span class="std std-doc">Multi-head, Multi-query and Group-query Attention</span></a> document.</p>
+</section>
+</section>
+<section id="runtime">
+<h1>Runtime<a class="headerlink" href="#runtime" title="Link to this heading">#</a></h1>
+<p>TensorRT-LLM includes an API to implement Python and C++ runtimes. The role of
+the runtime components is to load the TensorRT engines and drive their
+execution. Typically, for an auto-regressive model like GPT, the runtime is in
+charge of loading the engine that implements both the processing of the input
+sequence as well as the body of the generation loop. See the <a class="reference internal" href="../advanced/gpt-runtime.html"><span class="std std-doc">GPT C++
+Runtime</span></a> document for details on the C++ Runtime.</p>
+</section>
+<section id="multi-gpu-and-multi-node-support">
+<span id="multi-gpu-multi-node"></span><h1>Multi-GPU and Multi-Node Support<a class="headerlink" href="#multi-gpu-and-multi-node-support" title="Link to this heading">#</a></h1>
+<p>Even if TensorRT is designed for single-GPU systems, TensorRT-LLM adds the
+support for systems with multiple GPUs and nodes. It is enabled
+using TensorRT plugins that wrap communication primitives from the
+<a class="reference external" href="https://developer.nvidia.com/nccl">NCCL</a> library as well as a custom
+plugin that optimize the All-Reduce primitive in the presence of All-to-all
+connections between GPUs (through NVSwitch in DGX systems).</p>
+<p>The communication plugins can be found in
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/HEAD/cpp/tensorrt_llm/plugins/ncclPlugin">cpp/tensorrt_llm/plugins/ncclPlugin</a>
+and the multi-GPU functions are exposed in the TensorRT-LLM Model Definition API
+as:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># In tensorrt_llm/functional.py:</span>
+
+<span class="c1"># Collectives.</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">allreduce</span><span class="p">(</span><span class="n">tensor</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">group</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">allgather</span><span class="p">(</span><span class="n">tensor</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">group</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">gather_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
+
+<span class="c1"># Point-to-point communication primitives.</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">send</span><span class="p">(</span><span class="n">tensor</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">tgt</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">recv</span><span class="p">(</span><span class="n">tensor</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">src</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
+</pre></div>
+</div>
+<p>The multi-GPU support can be enabled through two different modes of model
+parallelism: Tensor Parallelism and Pipeline Parallelism. The former mode
+splits the different layers of a model across the GPUs. Each GPU runs the
+entire network and synchronizes with its siblings when needed. The Pipeline
+Parallelism distributes the different layers to the GPUs. Each GPU runs a
+subset of the entire model and communications happen at the boundary of those
+subsets of layers. Tensor Parallelism usually leads to more balanced executions
+but requires more memory bandwidth between the GPUs. Pipeline Parallelism
+reduces the need for high-bandwidth communication but may incur load-balancing
+issues and may be less efficient in terms of GPU utilization.</p>
+<section id="examples">
+<h2>Examples<a class="headerlink" href="#examples" title="Link to this heading">#</a></h2>
+<p>Here are examples of Llama 3.1 70B and Llama 3.1 405B showing how to perform multi-GPU and multi-node inference in TensorRT-LLM. The example of Llama 3.1 70B performs multi-GPU inference on a single node, while the example of Llama 3.1 405B performs multi-node inference.</p>
+<section id="llama-3-1-70b">
+<h3>Llama 3.1 70B<a class="headerlink" href="#llama-3-1-70b" title="Link to this heading">#</a></h3>
+<p>The following sample commands build an engine for running the Llama 3.1 70B model with tensor parallelism (TP=4) using 4 GPUs on a single node.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">folder_trt_llm</span><span class="o">=</span>../TensorRT-LLM
+<span class="nv">model_dir</span><span class="o">=</span>Llama-3.1-70B
+<span class="nv">ckpt_dir</span><span class="o">=</span>ckpt_llama_3.1_70b
+<span class="nv">engine_dir</span><span class="o">=</span>engine_llama_3.1_70b
+<span class="nv">dtype</span><span class="o">=</span>bfloat16
+<span class="nv">tp_size</span><span class="o">=</span><span class="m">4</span>
+<span class="nv">pp_size</span><span class="o">=</span><span class="m">1</span>
+<span class="nv">kv_cache_type</span><span class="o">=</span>paged
+<span class="nv">max_input_len</span><span class="o">=</span><span class="m">128</span>
+<span class="nv">max_output_len</span><span class="o">=</span><span class="m">128</span>
+<span class="nv">max_batch_size</span><span class="o">=</span><span class="m">4</span>
+<span class="nv">workers</span><span class="o">=</span><span class="k">$((</span><span class="w"> </span><span class="nv">tp_size</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nv">pp_size</span><span class="w"> </span><span class="k">))</span>
+
+python<span class="w"> </span><span class="si">${</span><span class="nv">folder_trt_llm</span><span class="si">}</span>/examples/llama/convert_checkpoint.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output_dir<span class="w"> </span><span class="si">${</span><span class="nv">ckpt_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model_dir<span class="w"> </span><span class="si">${</span><span class="nv">model_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dtype<span class="w"> </span><span class="si">${</span><span class="nv">dtype</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tp_size<span class="w"> </span><span class="si">${</span><span class="nv">tp_size</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--pp_size<span class="w"> </span><span class="si">${</span><span class="nv">pp_size</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--workers<span class="w"> </span><span class="si">${</span><span class="nv">workers</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--use_parallel_embedding
+
+trtllm-build<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output_dir<span class="w"> </span><span class="si">${</span><span class="nv">engine_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--checkpoint_dir<span class="w"> </span><span class="si">${</span><span class="nv">ckpt_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--gemm_plugin<span class="w"> </span><span class="si">${</span><span class="nv">dtype</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--gpt_attention_plugin<span class="w"> </span><span class="si">${</span><span class="nv">dtype</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kv_cache_type<span class="w"> </span><span class="si">${</span><span class="nv">kv_cache_type</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_input_len<span class="w"> </span><span class="si">${</span><span class="nv">max_input_len</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_seq_len<span class="w"> </span><span class="k">$((</span><span class="w"> </span><span class="nv">max_input_len</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nv">max_output_len</span><span class="w"> </span><span class="k">))</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_batch_size<span class="w"> </span><span class="si">${</span><span class="nv">max_batch_size</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--workers<span class="w"> </span><span class="si">${</span><span class="nv">workers</span><span class="si">}</span>
+</pre></div>
+</div>
+<p>The following sample commands perform inference using 4 GPUs on a single node by running <code class="docutils literal notranslate"><span class="pre">examples/run.py</span></code>.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">input_text</span><span class="o">=</span><span class="s2">&quot;Born in north-east France, Soyer trained as a&quot;</span>
+
+mpirun<span class="w"> </span>-n<span class="w"> </span><span class="k">$((</span><span class="w"> </span><span class="nv">tp_size</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nv">pp_size</span><span class="w"> </span><span class="k">))</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>python<span class="w"> </span><span class="si">${</span><span class="nv">folder_trt_llm</span><span class="si">}</span>/examples/run.py<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--engine_dir<span class="w"> </span><span class="si">${</span><span class="nv">engine_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--tokenizer_dir<span class="w"> </span><span class="si">${</span><span class="nv">model_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--input_text<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">input_text</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--max_output_len<span class="w"> </span><span class="si">${</span><span class="nv">max_output_len</span><span class="si">}</span>
+</pre></div>
+</div>
+</section>
+<section id="llama-3-1-405b">
+<h3>Llama 3.1 405B<a class="headerlink" href="#llama-3-1-405b" title="Link to this heading">#</a></h3>
+<p>The following sample commands build an engine for running the Llama 3.1 405B model with tensor parallelism (TP=16) on 2 nodes that each have 8 GPUs. Although the model runs on multiple nodes, you can build the engine on a single node.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">folder_trt_llm</span><span class="o">=</span>../TensorRT-LLM
+<span class="nv">model_dir</span><span class="o">=</span>Llama-3.1-405B
+<span class="nv">ckpt_dir</span><span class="o">=</span>ckpt_llama_3.1_405b
+<span class="nv">engine_dir</span><span class="o">=</span>engine_llama_3.1_405b
+<span class="nv">dtype</span><span class="o">=</span>bfloat16
+<span class="nv">tp_size</span><span class="o">=</span><span class="m">16</span>
+<span class="nv">pp_size</span><span class="o">=</span><span class="m">1</span>
+<span class="nv">kv_cache_type</span><span class="o">=</span>paged
+<span class="nv">max_input_len</span><span class="o">=</span><span class="m">128</span>
+<span class="nv">max_output_len</span><span class="o">=</span><span class="m">128</span>
+<span class="nv">max_batch_size</span><span class="o">=</span><span class="m">4</span>
+<span class="nv">workers</span><span class="o">=</span><span class="m">8</span>
+
+python<span class="w"> </span><span class="si">${</span><span class="nv">folder_trt_llm</span><span class="si">}</span>/examples/llama/convert_checkpoint.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output_dir<span class="w"> </span><span class="si">${</span><span class="nv">ckpt_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model_dir<span class="w"> </span><span class="si">${</span><span class="nv">model_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dtype<span class="w"> </span><span class="si">${</span><span class="nv">dtype</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tp_size<span class="w"> </span><span class="si">${</span><span class="nv">tp_size</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--pp_size<span class="w"> </span><span class="si">${</span><span class="nv">pp_size</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--workers<span class="w"> </span><span class="si">${</span><span class="nv">workers</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--use_parallel_embedding
+
+trtllm-build<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output_dir<span class="w"> </span><span class="si">${</span><span class="nv">engine_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--checkpoint_dir<span class="w"> </span><span class="si">${</span><span class="nv">ckpt_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--gemm_plugin<span class="w"> </span><span class="si">${</span><span class="nv">dtype</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--gpt_attention_plugin<span class="w"> </span><span class="si">${</span><span class="nv">dtype</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kv_cache_type<span class="w"> </span><span class="si">${</span><span class="nv">kv_cache_type</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_input_len<span class="w"> </span><span class="si">${</span><span class="nv">max_input_len</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_seq_len<span class="w"> </span><span class="k">$((</span><span class="w"> </span><span class="nv">max_input_len</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nv">max_output_len</span><span class="w"> </span><span class="k">))</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_batch_size<span class="w"> </span><span class="si">${</span><span class="nv">max_batch_size</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--workers<span class="w"> </span><span class="si">${</span><span class="nv">workers</span><span class="si">}</span>
+</pre></div>
+</div>
+<p>The following sample script, <code class="docutils literal notranslate"><span class="pre">launch_llama_3.1_405b.sh</span></code>, shows how to perform inference with Slurm on 2 nodes that each have 8 GPUs. If you use a different workload management software, the key concern is to run the <code class="docutils literal notranslate"><span class="pre">examples/run.py</span></code> command.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="ch">#!/bin/bash</span>
+<span class="c1">#SBATCH --account account</span>
+<span class="c1">#SBATCH --partition partition</span>
+<span class="c1">#SBATCH --job-name job-name</span>
+<span class="c1">#SBATCH --time 1:00:00</span>
+<span class="c1">#SBATCH --nodes 2</span>
+
+<span class="nv">folder_trt_llm</span><span class="o">=</span>../TensorRT-LLM
+<span class="nv">engine_dir</span><span class="o">=</span>engine_llama_3.1_405b
+<span class="nv">model_dir</span><span class="o">=</span>Llama-3.1-405B
+<span class="nv">max_output_len</span><span class="o">=</span><span class="m">128</span>
+
+<span class="nv">input_text</span><span class="o">=</span><span class="s2">&quot;Born in north-east France, Soyer trained as a&quot;</span>
+
+srun<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--ntasks-per-node<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--mpi<span class="w"> </span>pmix<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>python<span class="w"> </span><span class="si">${</span><span class="nv">folder_trt_llm</span><span class="si">}</span>/examples/run.py<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--engine_dir<span class="w"> </span><span class="si">${</span><span class="nv">engine_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--tokenizer_dir<span class="w"> </span><span class="si">${</span><span class="nv">model_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--input_text<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">input_text</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--max_output_len<span class="w"> </span><span class="si">${</span><span class="nv">max_output_len</span><span class="si">}</span>
+</pre></div>
+</div>
+<p>You can perform inference by running the script on the Slurm cluster.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sbatch<span class="w"> </span>launch_llama_3.1_405b.sh
+</pre></div>
+</div>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="overview.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">TensorRT-LLM Architecture</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="checkpoint.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">TensorRT-LLM Checkpoint</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#">Model Definition</a></li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#compilation">Compilation</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-compiler">TensorRT Compiler</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-engine">Model Engine</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#weight-bindings">Weight Bindings</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#pattern-matching-and-fusion">Pattern-Matching and Fusion</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#plugins">Plugins</a></li>
+</ul>
+</li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#runtime">Runtime</a></li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#examples">Examples</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#llama-3-1-70b">Llama 3.1 70B</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#llama-3-1-405b">Llama 3.1 405B</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

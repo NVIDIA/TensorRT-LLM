@@ -1,0 +1,852 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Run gpt-2b + LoRA using Executor / cpp runtime &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'advanced/lora';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Expert Parallelism in TensorRT-LLM" href="expert-parallelism.html" />
+    <link rel="prev" title="Graph Rewriting Module" href="graph-rewriting.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Run gpt-2b + LoRA using Executor / cpp runtime</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="run-gpt-2b-lora-using-executor-cpp-runtime">
+<span id="lora"></span><h1>Run gpt-2b + LoRA using Executor / cpp runtime<a class="headerlink" href="#run-gpt-2b-lora-using-executor-cpp-runtime" title="Link to this heading">#</a></h1>
+<p>First build a model with LoRA and inflight-batching enabled.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>git-lfs<span class="w"> </span>clone<span class="w"> </span>https://huggingface.co/qychen/luotuo-lora-7b-0.1
+git-lfs<span class="w"> </span>clone<span class="w"> </span>https://huggingface.co/kunishou/Japanese-Alpaca-LoRA-7b-v0
+<span class="nv">BASE_MODEL</span><span class="o">=</span>llama-7b-hf
+
+python<span class="w"> </span>examples/llama/convert_checkpoint.py<span class="w"> </span>--model_dir<span class="w"> </span><span class="si">${</span><span class="nv">BASE_MODEL</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output_dir<span class="w"> </span>/tmp/llama_7b/trt_ckpt/fp16/1-gpu/<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dtype<span class="w"> </span>float16
+
+trtllm-build<span class="w"> </span>--checkpoint_dir<span class="w"> </span>/tmp/llama_7b/trt_ckpt/fp16/1-gpu/<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output_dir<span class="w"> </span>/tmp/llama_7b_with_lora_qkv/trt_engines/fp16/1-gpu/<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--remove_input_padding<span class="w"> </span><span class="nb">enable</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--gpt_attention_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--context_fmha<span class="w"> </span><span class="nb">enable</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--paged_kv_cache<span class="w"> </span><span class="nb">enable</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--gemm_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--lora_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_input_len<span class="w"> </span><span class="m">512</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_seq_len<span class="w"> </span><span class="m">562</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--lora_dir<span class="w"> </span>Japanese-Alpaca-LoRA-7b-v0<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_lora_rank<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--lora_target_modules<span class="w"> </span><span class="s2">&quot;attn_q&quot;</span><span class="w"> </span><span class="s2">&quot;attn_k&quot;</span><span class="w"> </span><span class="s2">&quot;attn_v&quot;</span>
+</pre></div>
+</div>
+<p>To pass LoRAs into the cpp runtime they must be converted to the format below.
+The script below will convert a Hugging Face LoRA model to the correct NumPy tensor.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>tensorrt_llm/examples/hf_lora_convert.py<span class="w"> </span>-i<span class="w"> </span>Japanese-Alpaca-LoRA-7b-v0<span class="w"> </span>-o<span class="w"> </span>Japanese-Alpaca-LoRA-7b-v0-weights<span class="w"> </span>--storage-type<span class="w"> </span>float16
+python3<span class="w"> </span>tensorrt_llm/examples/hf_lora_convert.py<span class="w"> </span>-i<span class="w"> </span>luotuo-lora-7b-0.1<span class="w"> </span>-o<span class="w"> </span>luotuo-lora-7b-0.1-weights<span class="w"> </span>--storage-type<span class="w"> </span>float16
+</pre></div>
+</div>
+<p>Refer to the <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/lora.md">tensorrtllm_backend documentation</a> for a Multi-LoRA example using Triton.</p>
+<section id="lora-tensor-format-details">
+<h2>LoRA tensor format details<a class="headerlink" href="#lora-tensor-format-details" title="Link to this heading">#</a></h2>
+<p>To run inference using <code class="docutils literal notranslate"><span class="pre">Executor</span></code>, a <code class="docutils literal notranslate"><span class="pre">Request</span></code> must have a <code class="docutils literal notranslate"><span class="pre">LoraConfig</span></code> that contains a <code class="docutils literal notranslate"><span class="pre">task_id</span></code>, <code class="docutils literal notranslate"><span class="pre">weights</span></code> and <code class="docutils literal notranslate"><span class="pre">config</span></code> parameters.</p>
+<p><code class="docutils literal notranslate"><span class="pre">task_id</span></code> the unique task ID for the given LoRA.</p>
+<p>To perform inference with a specific LoRA for the first time, <code class="docutils literal notranslate"><span class="pre">task_id</span></code>, <code class="docutils literal notranslate"><span class="pre">weights</span></code>, and <code class="docutils literal notranslate"><span class="pre">config</span></code> must all be given. The LoRA will be cached, so that subsequent requests for the same task only require <code class="docutils literal notranslate"><span class="pre">task_id</span></code>.
+If the cache is full, the oldest LoRA will be evicted to make space for new ones. An error is returned if <code class="docutils literal notranslate"><span class="pre">task_id</span></code> is not cached.</p>
+<p><code class="docutils literal notranslate"><span class="pre">weights</span></code> contains the weights for all the LoRAs. Currently, this should include weights for all TP and PP ranks.
+The weights tensor has the shape <code class="docutils literal notranslate"><span class="pre">[num_lora_modules_layers,</span> <span class="pre">D</span> <span class="pre">x</span> <span class="pre">Hi</span> <span class="pre">+</span> <span class="pre">Ho</span> <span class="pre">x</span> <span class="pre">D</span> <span class="pre">]</span></code>. The last dimension holds the in / out adapter weights for the associated module (for example, <code class="docutils literal notranslate"><span class="pre">attn_qkv</span></code>) and model layer.</p>
+<p>Each of the in / out tensors are first flattened and then concatenated together in the format above.
+The first dimension (of size <code class="docutils literal notranslate"><span class="pre">num_lora_module_layers</span></code>) has an entry for each module-layer (that is, there is an entry for <code class="docutils literal notranslate"><span class="pre">attn_q</span> <span class="pre">layer1</span></code> and another for <code class="docutils literal notranslate"><span class="pre">attn_k</span> <span class="pre">layer1</span></code>).</p>
+<p><code class="docutils literal notranslate"><span class="pre">D=adapter_size</span> <span class="pre">(i.e.</span> <span class="pre">R</span> <span class="pre">value),</span> <span class="pre">Hi=hidden_size_in,</span> <span class="pre">Ho=hidden_size_out.</span></code></p>
+<p><code class="docutils literal notranslate"><span class="pre">config</span></code> is a configuration tensor which identifies the moduleId, layerId, and adapter size of each element of <code class="docutils literal notranslate"><span class="pre">LoraWeights</span></code>. It has the shape <code class="docutils literal notranslate"><span class="pre">[num_lora_modules_layers,</span> <span class="pre">3]</span></code>. The last dimension holds <code class="docutils literal notranslate"><span class="pre">[module_id,</span> <span class="pre">layer_idx,</span> <span class="pre">adapter_size</span> <span class="pre">D</span> <span class="pre">(i.e.</span> <span class="pre">R</span> <span class="pre">value)]</span></code>.</p>
+<p>This feature supports LoRAs as described in https://arxiv.org/pdf/2106.09685.pdf</p>
+<section id="example-lora-tensors">
+<h3>Example LoRA tensors<a class="headerlink" href="#example-lora-tensors" title="Link to this heading">#</a></h3>
+<p>Here is an example of <code class="docutils literal notranslate"><span class="pre">LoraWeights</span></code> and <code class="docutils literal notranslate"><span class="pre">LoraConfig</span></code> tensors for a model with tp=1, pp=1, 4 layers, and a hidden size of 4.
+The following tensors are for a LoRA which has a <code class="docutils literal notranslate"><span class="pre">q</span></code> and <code class="docutils literal notranslate"><span class="pre">k</span></code> adapter.</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="c1"># loraConfig</span>
+<span class="p">[</span>
+  <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">]</span>
+  <span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">4</span><span class="p">]</span>
+  <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">]</span>
+  <span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">4</span><span class="p">]</span>
+  <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">]</span>  <span class="c1"># Note that the final 2 layers only adapt `q`</span>
+  <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">8</span><span class="p">]</span>
+<span class="p">]</span>
+<span class="c1"># Note: The loraConfig tensor configures the loraWeights tensor.</span>
+<span class="c1">#       The contents of each row of loraWeights is specified be the corresponding row in loraConfig</span>
+
+<span class="c1"># loraWeights</span>
+<span class="c1"># Note: that &#39;in weights&#39; and &#39;out weights&#39; are &#39;A&#39; and &#39;B&#39; in the LoRA paper.</span>
+<span class="p">[</span>
+  <span class="p">[</span> <span class="o">&lt;</span><span class="mi">2</span> <span class="n">x</span> <span class="mi">4</span> <span class="ow">in</span> <span class="n">weights</span><span class="o">&gt;</span><span class="p">,</span> <span class="o">&lt;</span><span class="mi">4</span> <span class="n">x</span> <span class="mi">2</span> <span class="n">out</span> <span class="n">weights</span><span class="o">&gt;</span> <span class="o">&lt;</span><span class="n">padding</span><span class="o">&gt;</span> <span class="p">]</span>  <span class="c1"># `q` adapter for layer 0</span>
+  <span class="p">[</span> <span class="o">&lt;</span><span class="mi">4</span> <span class="n">x</span> <span class="mi">4</span> <span class="ow">in</span> <span class="n">weights</span><span class="o">&gt;</span><span class="p">,</span> <span class="o">&lt;</span><span class="mi">4</span> <span class="n">x</span> <span class="mi">4</span> <span class="n">out</span> <span class="n">weights</span><span class="o">&gt;</span> <span class="o">&lt;</span><span class="n">padding</span><span class="o">&gt;</span> <span class="p">]</span>  <span class="c1"># `k` adapter for layer 0</span>
+  <span class="p">[</span> <span class="o">&lt;</span><span class="mi">2</span> <span class="n">x</span> <span class="mi">4</span> <span class="ow">in</span> <span class="n">weights</span><span class="o">&gt;</span><span class="p">,</span> <span class="o">&lt;</span><span class="mi">4</span> <span class="n">x</span> <span class="mi">2</span> <span class="n">out</span> <span class="n">weights</span><span class="o">&gt;</span> <span class="o">&lt;</span><span class="n">padding</span><span class="o">&gt;</span> <span class="p">]</span>  <span class="c1"># `q` adapter for layer 1</span>
+  <span class="p">[</span> <span class="o">&lt;</span><span class="mi">4</span> <span class="n">x</span> <span class="mi">4</span> <span class="ow">in</span> <span class="n">weights</span><span class="o">&gt;</span><span class="p">,</span> <span class="o">&lt;</span><span class="mi">4</span> <span class="n">x</span> <span class="mi">4</span> <span class="n">out</span> <span class="n">weights</span><span class="o">&gt;</span> <span class="o">&lt;</span><span class="n">padding</span><span class="o">&gt;</span> <span class="p">]</span>  <span class="c1"># `k` adapter for layer 1</span>
+  <span class="p">[</span> <span class="o">&lt;</span><span class="mi">2</span> <span class="n">x</span> <span class="mi">4</span> <span class="ow">in</span> <span class="n">weights</span><span class="o">&gt;</span><span class="p">,</span> <span class="o">&lt;</span><span class="mi">4</span> <span class="n">x</span> <span class="mi">2</span> <span class="n">out</span> <span class="n">weights</span><span class="o">&gt;</span> <span class="o">&lt;</span><span class="n">padding</span><span class="o">&gt;</span> <span class="p">]</span>  <span class="c1"># `q` adapter for layer 2</span>
+  <span class="p">[</span> <span class="o">&lt;</span><span class="mi">8</span> <span class="n">x</span> <span class="mi">4</span> <span class="ow">in</span> <span class="n">weights</span><span class="o">&gt;</span><span class="p">,</span> <span class="o">&lt;</span><span class="mi">4</span> <span class="n">x</span> <span class="mi">8</span> <span class="n">out</span> <span class="n">weights</span><span class="o">&gt;</span>           <span class="p">]</span>  <span class="c1"># `q` adapter for layer 3. Note the final layer has a adapter size of 8</span>
+<span class="p">]</span>
+
+</pre></div>
+</div>
+</section>
+<section id="lora-module-id-mapping">
+<h3>LoRA Module id mapping<a class="headerlink" href="#lora-module-id-mapping" title="Link to this heading">#</a></h3>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>module name (as specified in <code class="docutils literal notranslate"><span class="pre">convert_checkpoint.py</span></code> scripts)</p></th>
+<th class="head"><p>module id</p></th>
+<th class="head"><p>description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>attn_qkv</p></td>
+<td><p>0</p></td>
+<td><p>compbined qkv adapter</p></td>
+</tr>
+<tr class="row-odd"><td><p>attn_q</p></td>
+<td><p>1</p></td>
+<td><p>q adapter</p></td>
+</tr>
+<tr class="row-even"><td><p>attn_k</p></td>
+<td><p>2</p></td>
+<td><p>k adapter</p></td>
+</tr>
+<tr class="row-odd"><td><p>attn_v</p></td>
+<td><p>3</p></td>
+<td><p>v adapter</p></td>
+</tr>
+<tr class="row-even"><td><p>attn_dense</p></td>
+<td><p>4</p></td>
+<td><p>adapter for the dense layer in attention</p></td>
+</tr>
+<tr class="row-odd"><td><p>mlp_h_to_4h</p></td>
+<td><p>5</p></td>
+<td><p>for llama2 adapter for gated mlp layer after attention / RMSNorm: up projection</p></td>
+</tr>
+<tr class="row-even"><td><p>mlp_4h_to_h</p></td>
+<td><p>6</p></td>
+<td><p>for llama2 adapter for gated mlp layer after attention / RMSNorm: down projection</p></td>
+</tr>
+<tr class="row-odd"><td><p>mlp_gate</p></td>
+<td><p>7</p></td>
+<td><p>for llama2 adapter for gated mlp later after attention / RMSNorm: gate</p></td>
+</tr>
+<tr class="row-even"><td><p>cross_attn_qkv</p></td>
+<td><p>8</p></td>
+<td><p>compbined qkv adapter for cross attention</p></td>
+</tr>
+<tr class="row-odd"><td><p>cross_attn_q</p></td>
+<td><p>9</p></td>
+<td><p>q adapter for cross attention</p></td>
+</tr>
+<tr class="row-even"><td><p>cross_attn_k</p></td>
+<td><p>10</p></td>
+<td><p>k adapter for cross attention</p></td>
+</tr>
+<tr class="row-odd"><td><p>cross_attn_v</p></td>
+<td><p>11</p></td>
+<td><p>v adapter for cross attention</p></td>
+</tr>
+<tr class="row-even"><td><p>cross_attn_dense</p></td>
+<td><p>12</p></td>
+<td><p>adapter for the dense layer in cross attention</p></td>
+</tr>
+<tr class="row-odd"><td><p>moe_h_to_4h</p></td>
+<td><p>13</p></td>
+<td><p>for mixtral adapter for expert mlp layer: up projection</p></td>
+</tr>
+<tr class="row-even"><td><p>moe_4h_to_h</p></td>
+<td><p>14</p></td>
+<td><p>for mixtral adapter for expert mlp layer: down projection</p></td>
+</tr>
+<tr class="row-odd"><td><p>moe_gate</p></td>
+<td><p>15</p></td>
+<td><p>for mixtral adapter for expert mlp layer: gate</p></td>
+</tr>
+<tr class="row-even"><td><p>moe_router</p></td>
+<td><p>16</p></td>
+<td><p>for mixtral adapter for expert router layer</p></td>
+</tr>
+<tr class="row-odd"><td><p>mlp_router</p></td>
+<td><p>17</p></td>
+<td><p>for qwen2-moe adapter for shared expert gate layer</p></td>
+</tr>
+<tr class="row-even"><td><p>mlp_gate_up</p></td>
+<td><p>18</p></td>
+<td><p>adapter for gated mlp layer after attention / RMSNorm: gate + up projection</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="loracache-configuration">
+<h3>LoraCache configuration<a class="headerlink" href="#loracache-configuration" title="Link to this heading">#</a></h3>
+<p>The core idea is that we will have a fixed size, 2-level LoRA cache in TRT-LLM. The higher level cache resides on the host and the lower level is on GPU (distinct from the existing KV cache). Sizes of both are user configurable.</p>
+<p>The CPU cache is configured to be a max size.  The GPU cache is configured to a percentage of free GPU memory after engine load. As requests come in LoRAs are stored in the host cache.</p>
+<p>As requests are scheduled for execution LoRAs are loaded into the GPU cache.</p>
+</section>
+<section id="lora-with-tensor-parallel">
+<h3>LoRA with tensor parallel<a class="headerlink" href="#lora-with-tensor-parallel" title="Link to this heading">#</a></h3>
+<p>The partition of tensor parallel for LoRA is special. There are two cases: <code class="docutils literal notranslate"><span class="pre">RowLinear</span></code> and <code class="docutils literal notranslate"><span class="pre">ColumnLinear</span></code>. Assume we have a linear layer and the input feature size is <code class="docutils literal notranslate"><span class="pre">K</span></code> and the output feature size is <code class="docutils literal notranslate"><span class="pre">N</span></code>. Then, the shape of the weight is <code class="docutils literal notranslate"><span class="pre">[K,</span> <span class="pre">N]</span></code>.</p>
+<p>First, consider this linear layer is a <code class="docutils literal notranslate"><span class="pre">ColumnLinear</span></code> layer. When we partition the weight, we split the weight by column with <code class="docutils literal notranslate"><span class="pre">tp_size</span></code>. Then, there are <code class="docutils literal notranslate"><span class="pre">tp_size</span></code> split weights and the shapes of these weights are <code class="docutils literal notranslate"><span class="pre">[K,</span> <span class="pre">N</span> <span class="pre">//</span> <span class="pre">tp_size]</span></code>. When we apply LoRA adapter on such <code class="docutils literal notranslate"><span class="pre">ColumnLinear</span></code> layer, the shapes of original two weights are <code class="docutils literal notranslate"><span class="pre">[K,</span> <span class="pre">lora_rank]</span></code> and <code class="docutils literal notranslate"><span class="pre">[lora_rank,</span> <span class="pre">N]</span></code>. So, we only partition the second weight and get <code class="docutils literal notranslate"><span class="pre">tp_size</span></code> split weights with shapes <code class="docutils literal notranslate"><span class="pre">[lora_rank,</span> <span class="pre">N</span> <span class="pre">//</span> <span class="pre">tp_size]</span></code>. For the first weight, each GPU maintains the same entire weight (with shape <code class="docutils literal notranslate"><span class="pre">[K,</span> <span class="pre">lora_rank]</span></code>).</p>
+<p>Next, consider this linear layer is a <code class="docutils literal notranslate"><span class="pre">RowLinear</span></code> layer. When we partition the weight, we split the weight by row with <code class="docutils literal notranslate"><span class="pre">tp_size</span></code>. Then, there are <code class="docutils literal notranslate"><span class="pre">tp_size</span></code> split weights and the shapes of these weights are <code class="docutils literal notranslate"><span class="pre">[K</span> <span class="pre">//</span> <span class="pre">tp_size,</span> <span class="pre">N]</span></code>. When we apply LoRA adapter on such <code class="docutils literal notranslate"><span class="pre">RowLinear</span></code> layer, the shapes of original two weights are <code class="docutils literal notranslate"><span class="pre">[K,</span> <span class="pre">lora_rank]</span></code> and <code class="docutils literal notranslate"><span class="pre">[lora_rank,</span> <span class="pre">N]</span></code>. So, we only partition the first weight and get <code class="docutils literal notranslate"><span class="pre">tp_size</span></code> split weights with shapes <code class="docutils literal notranslate"><span class="pre">[K</span> <span class="pre">//</span> <span class="pre">tp_size,</span> <span class="pre">lora_rank]</span></code>. For the second weight, each GPU maintains the same entire weight (with shape <code class="docutils literal notranslate"><span class="pre">[lora_rank,</span> <span class="pre">N]</span></code>).</p>
+</section>
+<section id="dora">
+<h3>DoRA<a class="headerlink" href="#dora" title="Link to this heading">#</a></h3>
+<p>TRTLLM supports DoRA as described in https://arxiv.org/abs/2402.09353 . To enable DoRA, you must add the additional <code class="docutils literal notranslate"><span class="pre">--dora_plugin</span> <span class="pre">enable</span></code> flag to the <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command.</p>
+<p>The DoRA scales must be normalized before they are submitted to TRTLLM in an inference request. The normalization requires the base model weights. To normalize your adapter you may use the script provided in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/examples/dora/normalize_weights.py</span></code>.</p>
+<p>When using DoRA, the format of <code class="docutils literal notranslate"><span class="pre">LoraWeights</span></code> and <code class="docutils literal notranslate"><span class="pre">LoraConfig</span></code> changes slightly.
+The shape of <code class="docutils literal notranslate"><span class="pre">LoraConfig</span></code> becomes <code class="docutils literal notranslate"><span class="pre">[module_id,</span> <span class="pre">layer_idx,</span> <span class="pre">adapter_size</span> <span class="pre">D</span> <span class="pre">(i.e.</span> <span class="pre">R</span> <span class="pre">value),</span> <span class="pre">is_dora]</span></code>, with <code class="docutils literal notranslate"><span class="pre">is_dora</span></code> a boolean flag that determines whether the supplied adapter contains DoRA scales or not. If the old config shape is used, it is assumed the adapter does not have DoRA scales.
+The shape of <code class="docutils literal notranslate"><span class="pre">LoraWeights</span></code> becomes <code class="docutils literal notranslate"><span class="pre">[num_lora_modules_layers,</span> <span class="pre">D</span> <span class="pre">x</span> <span class="pre">Hi</span> <span class="pre">+</span> <span class="pre">Ho</span> <span class="pre">x</span> <span class="pre">D</span> <span class="pre">+</span> <span class="pre">Ho]</span></code>, and the last <code class="docutils literal notranslate"><span class="pre">Ho</span></code> values are the DoRA scale vector.</p>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="graph-rewriting.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Graph Rewriting Module</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="expert-parallelism.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Expert Parallelism in TensorRT-LLM</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#lora-tensor-format-details">LoRA tensor format details</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#example-lora-tensors">Example LoRA tensors</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#lora-module-id-mapping">LoRA Module id mapping</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#loracache-configuration">LoraCache configuration</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#lora-with-tensor-parallel">LoRA with tensor parallel</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dora">DoRA</a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

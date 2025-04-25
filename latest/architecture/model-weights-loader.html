@@ -1,0 +1,940 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>TensorRT-LLM Model Weights Loader &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'architecture/model-weights-loader';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">TensorRT-LLM Model Weights Loader</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="tensorrt-llm-model-weights-loader">
+<h1>TensorRT-LLM Model Weights Loader<a class="headerlink" href="#tensorrt-llm-model-weights-loader" title="Link to this heading">#</a></h1>
+<section id="overview">
+<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h2>
+<p>The weights loader is designed for easily converting and loading external weight checkpoints into TensorRT-LLM models.</p>
+</section>
+<section id="workflow">
+<h2>Workflow<a class="headerlink" href="#workflow" title="Link to this heading">#</a></h2>
+<p>Weight checkpoints can be generated from all sources, and may have different naming and data layouts compared to TRT-LLM’s requirements. E.g.:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># HuggingFace LLaMA checkpoints</span>
+<span class="o">{</span>
+<span class="w">    </span><span class="s2">&quot;model.embed_tokens.weight&quot;</span>:<span class="w"> </span>torch.Tensor<span class="o">([</span>vocab_size,<span class="w"> </span>hidden_size<span class="o">])</span>
+<span class="w">    </span><span class="s2">&quot;model.layers.0.input_layernorm.weight&quot;</span>:<span class="w"> </span>torch.Tensor<span class="o">([</span>hidden_size<span class="o">])</span>,
+<span class="w">    </span><span class="s2">&quot;model.layers.0.mlp.down_proj.weight&quot;</span>:<span class="w"> </span>torch.Tensor<span class="o">([</span>hidden_size,<span class="w"> </span>inter_size<span class="o">])</span>,
+<span class="w">    </span><span class="s2">&quot;model.layers.0.mlp.gate_proj.weight&quot;</span>:<span class="w"> </span>torch.Tensor<span class="o">([</span>inter_size,<span class="w"> </span>hidden_size<span class="o">])</span>,
+<span class="w">    </span><span class="s2">&quot;model.layers.0.mlp.up_proj.weight&quot;</span>:<span class="w"> </span>torch.Tensor<span class="o">([</span>inter_size,<span class="w"> </span>hidden_size<span class="o">])</span>,
+<span class="w">    </span><span class="s2">&quot;model.layers.0.post_attention_layernorm.weight&quot;</span>:<span class="w"> </span>torch.Tensor<span class="o">([</span>hidden_size<span class="o">])</span>,
+<span class="w">    </span><span class="s2">&quot;model.layers.0.self_attn.q_proj.weight&quot;</span>:<span class="w"> </span>torch.Tensor<span class="o">([</span>hidden_size,<span class="w"> </span>hidden_size<span class="o">])</span>,
+<span class="w">    </span><span class="s2">&quot;model.layers.0.self_attn.k_proj.weight&quot;</span>:<span class="w"> </span>torch.Tensor<span class="o">([</span>hidden_size,<span class="w"> </span>hidden_size<span class="o">])</span>,
+<span class="w">    </span><span class="s2">&quot;model.layers.0.self_attn.v_proj.weight&quot;</span>:<span class="w"> </span>torch.Tensor<span class="o">([</span>hidden_size,<span class="w"> </span>hidden_size<span class="o">])</span>,
+<span class="w">    </span><span class="s2">&quot;model.layers.0.self_attn.o_proj.weight&quot;</span>:<span class="w"> </span>torch.Tensor<span class="o">([</span>hidden_size,<span class="w"> </span>hidden_size<span class="o">])</span>,
+<span class="w">    </span>...,
+<span class="o">}</span>
+<span class="c1"># TensorRT-LLM expected weights</span>
+<span class="o">{</span>
+<span class="w">    </span><span class="s2">&quot;transformer.vocab_embedding.weight&quot;</span>:<span class="w"> </span>torch.Tensor<span class="o">([</span>vocab_size,<span class="w"> </span>hidden_size<span class="o">])</span>
+<span class="w">    </span><span class="s2">&quot;transformer.layers.0.input_layernorm.weight&quot;</span>:<span class="w"> </span>torch.Tensor<span class="o">([</span>hidden_size<span class="o">])</span>,
+<span class="w">    </span><span class="s2">&quot;transformer.layers.0.mlp.down_proj.weight&quot;</span>:<span class="w"> </span>torch.Tensor<span class="o">([</span>hidden_size,<span class="w"> </span>inter_size<span class="o">])</span>,
+<span class="w">    </span><span class="s2">&quot;transformer.layers.0.mlp.gate_proj.weight&quot;</span>:<span class="w"> </span>torch.Tensor<span class="o">([</span>inter_size,<span class="w"> </span>hidden_size<span class="o">])</span>,
+<span class="w">    </span><span class="s2">&quot;transformer.layers.0.mlp.up_proj.weight&quot;</span>:<span class="w"> </span>torch.Tensor<span class="o">([</span>inter_size,<span class="w"> </span>hidden_size<span class="o">])</span>,
+<span class="w">    </span><span class="s2">&quot;transformer.layers.0.post_layernorm.weight&quot;</span>:<span class="w"> </span>torch.Tensor<span class="o">([</span>hidden_size<span class="o">])</span>,
+<span class="w">    </span><span class="s2">&quot;transformer.layers.0.attention.qkv.weight&quot;</span>:<span class="w"> </span>torch.Tensor<span class="o">([</span>hidden_size<span class="w"> </span>*<span class="w"> </span><span class="m">3</span>,<span class="w"> </span>hidden_size<span class="o">])</span>,<span class="w"> </span><span class="c1"># Different layout</span>
+<span class="w">    </span><span class="s2">&quot;transformer.layers.0.attention.dense.weight&quot;</span>:<span class="w"> </span>torch.Tensor<span class="o">([</span>hidden_size,<span class="w"> </span>hidden_size<span class="o">])</span>,
+<span class="w">    </span>...,
+<span class="o">}</span>
+</pre></div>
+</div>
+<p>Conversion means converting the dictionary of <code class="docutils literal notranslate"><span class="pre">{external_keys:external_weights}</span></code> into <code class="docutils literal notranslate"><span class="pre">{tllm_keys:tllm_weights}</span></code>, it includes changing the naming logic and data layouts, and is contains of the following parts:</p>
+<ol class="arabic simple">
+<li><p>Translate a TRT-LLM parameter name into external-format name(s).</p></li>
+<li><p>Loading tensor slice(s) according to the translated names.</p></li>
+<li><p>Postprocess the tensor(s) into target layout.</p></li>
+</ol>
+<section id="translator">
+<h3>Translator<a class="headerlink" href="#translator" title="Link to this heading">#</a></h3>
+<p>TRT-LLM parameter names are translated in units of sections divided by dots. E.g.:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>TensorRT-LLM key</p></th>
+<th class="head text-center"><p><code class="docutils literal notranslate"><span class="pre">transformer</span></code></p></th>
+<th class="head"><p>.</p></th>
+<th class="head text-center"><p><code class="docutils literal notranslate"><span class="pre">layers</span></code></p></th>
+<th class="head"><p>.</p></th>
+<th class="head text-center"><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></th>
+<th class="head"><p>.</p></th>
+<th class="head text-center"><p><code class="docutils literal notranslate"><span class="pre">attention</span></code></p></th>
+<th class="head"><p>.</p></th>
+<th class="head text-center"><p><code class="docutils literal notranslate"><span class="pre">dense</span></code></p></th>
+<th class="head"><p>.</p></th>
+<th class="head text-center"><p><code class="docutils literal notranslate"><span class="pre">weight</span></code></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>Translated external key</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">model</span></code></p></td>
+<td><p>.</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">layers</span></code></p></td>
+<td><p>.</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>.</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">self_attn</span></code></p></td>
+<td><p>.</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">o_proj</span></code></p></td>
+<td><p>.</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">weight</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The mapping between TRT-LLM keywords and HF keywords are described in <code class="docutils literal notranslate"><span class="pre">tllm_to_externel_key_dict</span></code> of <code class="docutils literal notranslate"><span class="pre">ModelWeightsLoader</span></code> class object. <br />
+If any of the mappings has one-to-multiple corresponding, the translated key will get multiplied accordingly. E.g.:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>TensorRT-LLM key and related keyword mapping</p></th>
+<th class="head text-center"><p>Translated external keys</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">transformer.layers.0.attention.qkv.weight</span></code><br><code class="docutils literal notranslate"><span class="pre">{&quot;qkv&quot;:[q_proj,</span> <span class="pre">k_proj,</span> <span class="pre">v_proj]}</span></code></p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">model.layers.0.self_attn.q_proj.weights</span></code><br><code class="docutils literal notranslate"><span class="pre">model.layers.0.self_attn.k_proj.weights</span></code><br><code class="docutils literal notranslate"><span class="pre">model.layers.0.self_attn.v_proj.weights</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">transformer.layers.0.mlp.fc.weight</span></code><br><code class="docutils literal notranslate"><span class="pre">{&quot;weight&quot;:[qweight,</span> <span class="pre">qzeros,</span> <span class="pre">scales]}</span></code></p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">model.layers.0.mlp.gate_proj.qweight</span></code><br><code class="docutils literal notranslate"><span class="pre">model.layers.0.mlp.gate_proj.qzeros</span></code><br><code class="docutils literal notranslate"><span class="pre">model.layers.0.mlp.gate_proj.scales</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The default <code class="docutils literal notranslate"><span class="pre">tllm_to_externel_key_dict</span></code> is based on HF LLaMA as:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">ModelWeightsLoader</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_dir</span><span class="p">,</span> <span class="n">customized_key_dict</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="p">{})</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="o">...</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tllm_to_externel_key_dict</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s2">&quot;transformer&quot;</span><span class="p">:</span> <span class="s2">&quot;model&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;vocab_embedding&quot;</span><span class="p">:</span> <span class="s2">&quot;embed_tokens&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;lm_head&quot;</span><span class="p">:</span> <span class="s2">&quot;lm_head&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;ln_f&quot;</span><span class="p">:</span> <span class="s2">&quot;norm&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;attention&quot;</span><span class="p">:</span> <span class="s2">&quot;self_attn&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;qkv&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;q_proj&quot;</span><span class="p">,</span> <span class="s2">&quot;k_proj&quot;</span><span class="p">,</span> <span class="s2">&quot;v_proj&quot;</span><span class="p">],</span>
+            <span class="s2">&quot;dense&quot;</span><span class="p">:</span> <span class="s2">&quot;o_proj&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;gate&quot;</span><span class="p">:</span> <span class="s2">&quot;up_proj&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;proj&quot;</span><span class="p">:</span> <span class="s2">&quot;down_proj&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;fc&quot;</span><span class="p">:</span> <span class="s2">&quot;gate_proj&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;input_layernorm&quot;</span><span class="p">:</span> <span class="s2">&quot;input_layernorm&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;post_layernorm&quot;</span><span class="p">:</span> <span class="s2">&quot;post_attention_layernorm&quot;</span><span class="p">,</span>
+        <span class="p">}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tllm_to_externel_key_dict</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">customized_key_dict</span><span class="p">)</span>
+        <span class="o">...</span>
+</pre></div>
+</div>
+<p>It can be updated through passing <code class="docutils literal notranslate"><span class="pre">customized_key_dict</span></code> when initializing <code class="docutils literal notranslate"><span class="pre">ModelWeightsLoader</span></code>.</p>
+<p>The dictionary will also get updated according to the layer classes. When iterating over parameters,
+if the layer class has attribute <code class="docutils literal notranslate"><span class="pre">tllm_to_externel_key_dict</span></code>, for keywords exist both in the default one and the layer-specified one,
+the weight loader will translate according to the layer attribute with higher priority.
+This can enable the support for different quantization precisions automatically.</p>
+</section>
+<section id="loading-function">
+<h3>Loading function<a class="headerlink" href="#loading-function" title="Link to this heading">#</a></h3>
+<p>The loading function can load an arbitrary tensor slice according to its <code class="docutils literal notranslate"><span class="pre">key</span></code>, <code class="docutils literal notranslate"><span class="pre">tp_size</span></code>, <code class="docutils literal notranslate"><span class="pre">tp_dim</span></code> and <code class="docutils literal notranslate"><span class="pre">tp_rank</span></code>.</p>
+<p>The template for loading function is as following.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">load_tensor</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">tp_size</span><span class="p">,</span> <span class="n">tp_dim</span><span class="p">,</span> <span class="n">tp_rank</span><span class="p">):</span>
+    <span class="c1"># Retrieve file pointer index</span>
+    <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">shard_map</span><span class="p">:</span>
+        <span class="n">ptr_idx</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">shard_map</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span>
+
+    <span class="c1"># Load tensor from the corresponding shard</span>
+    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">format</span> <span class="o">==</span> <span class="n">ModelWeightsFormat</span><span class="o">.</span><span class="n">SAFETENSORS</span><span class="p">:</span>
+        <span class="n">tensor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">shards</span><span class="p">[</span><span class="n">ptr_idx</span><span class="p">]</span><span class="o">.</span><span class="n">get_slice</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
+        <span class="n">tensor_shape</span> <span class="o">=</span> <span class="n">tensor</span><span class="o">.</span><span class="n">get_shape</span><span class="p">()</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="o">...</span>
+
+    <span class="c1"># Shard and return a tensor slice</span>
+    <span class="n">slice_shape</span> <span class="o">=</span> <span class="o">...</span>
+    <span class="k">return</span> <span class="n">tensor</span><span class="p">[</span><span class="n">slice_shape</span><span class="p">]</span>
+</pre></div>
+</div>
+<p>When initializing the <code class="docutils literal notranslate"><span class="pre">ModelWeightsLoader</span></code> object, the file format will be derived from <code class="docutils literal notranslate"><span class="pre">model_dir</span></code> through <code class="docutils literal notranslate"><span class="pre">detect_format</span></code>. The following formats are supported for now:</p>
+<ul class="simple">
+<li><p>Directory contains or file named <code class="docutils literal notranslate"><span class="pre">*.safetensors</span></code> (Recommended, has better performance)</p></li>
+<li><p>Directory contains or file named <code class="docutils literal notranslate"><span class="pre">*.bin</span></code></p></li>
+<li><p>Directory contains or file named <code class="docutils literal notranslate"><span class="pre">*.pth</span></code></p></li>
+</ul>
+<p>To support other formats or in-memory loaded models, the format need to be claimed in <code class="docutils literal notranslate"><span class="pre">ModelWeightsFormat</span></code>, <code class="docutils literal notranslate"><span class="pre">detect_format()</span></code>, <code class="docutils literal notranslate"><span class="pre">preload()</span></code> and <code class="docutils literal notranslate"><span class="pre">load_tensor()</span></code>.</p>
+</section>
+<section id="postprocessing-functions">
+<h3>Postprocessing functions<a class="headerlink" href="#postprocessing-functions" title="Link to this heading">#</a></h3>
+<p>After translation and loading, a TRT-LLM key will become a tensor or a list of tensors, which is the input of postprocessing functions. <br />
+Operations including QKV concatenating, MoE weight stacking and weight-only quantization can be handled here.
+The template of postprocessing function is:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Example for 1-1 weights mapping</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">CustomizedModuleA</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+        <span class="o">...</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tp_dim</span> <span class="o">=</span> <span class="mi">0</span>    <span class="c1"># Need to set or inherit from parent class</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">postprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tllm_key</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="n">weights</span> <span class="o">=</span> <span class="n">proc</span><span class="p">(</span><span class="n">weights</span><span class="p">)</span>
+        <span class="k">return</span> <span class="p">{</span><span class="n">tllm_key</span><span class="p">:</span> <span class="n">weights</span><span class="p">}</span>
+
+<span class="c1"># Example for multiple-multiple weights mapping</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">CustomizedModuleB</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+        <span class="o">...</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tp_dim</span> <span class="o">=</span> <span class="mi">0</span>    <span class="c1"># Need to set or inherit from parent class</span>
+        <span class="c1"># The default value of &quot;weights&quot; in tllm_to_externel_key_dict will be override</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tllm_to_externel_key_dict</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;weight&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;qweight&quot;</span><span class="p">,</span> <span class="s2">&quot;qzeros&quot;</span><span class="p">,</span> <span class="s2">&quot;scales&quot;</span><span class="p">]}</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">postprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tllm_key</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="c1"># Skipped the postprocess of zeros and weights_scaling_factor</span>
+        <span class="c1"># They are loaded in the postprocess of weight</span>
+        <span class="n">config</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;config&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="c1"># Passed through kwargs by default</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">tllm_key</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s2">&quot;weight&quot;</span><span class="p">):</span>
+            <span class="k">return</span> <span class="p">{}</span>
+        <span class="c1"># The order in weights is defined in tllm_to_externel_key_dict</span>
+        <span class="n">qweight</span><span class="p">,</span> <span class="n">qzeros</span><span class="p">,</span> <span class="n">scales</span> <span class="o">=</span> <span class="n">weights</span>
+        <span class="n">proccessed_weight</span><span class="p">,</span> <span class="n">proccessed_zeros</span> <span class="o">=</span> <span class="n">proc</span><span class="p">(</span><span class="n">qweight</span><span class="p">,</span> <span class="n">qzeros</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">num_heads</span><span class="p">)</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="n">tllm_key</span><span class="p">:</span> <span class="n">proccessed_weight</span><span class="p">,</span>
+            <span class="n">tllm_key</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s2">&quot;weight&quot;</span><span class="p">,</span> <span class="s2">&quot;zeros&quot;</span><span class="p">):</span> <span class="n">proccessed_zeros</span><span class="p">,</span>
+            <span class="n">tllm_key</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s2">&quot;weight&quot;</span><span class="p">,</span> <span class="s2">&quot;weights_scaling_factor&quot;</span><span class="p">):</span> <span class="n">scales</span><span class="p">,</span>
+        <span class="p">}</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="examples">
+<h2>Examples<a class="headerlink" href="#examples" title="Link to this heading">#</a></h2>
+<p>The <code class="docutils literal notranslate"><span class="pre">ModelWeightsLoader</span></code> class can support different models with the following levels:</p>
+<section id="natively-supported-models">
+<h3>Natively supported models<a class="headerlink" href="#natively-supported-models" title="Link to this heading">#</a></h3>
+<p>For models with native support, users can call the default weight loader without any other operations.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Using the model weights loader for LLaMA</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.models.model_weights_loader</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelWeightsLoader</span>
+<span class="n">loader</span> <span class="o">=</span> <span class="n">ModelWeightsLoader</span><span class="p">(</span><span class="n">external_checkpoint_dir</span><span class="p">)</span>
+<span class="n">loader</span><span class="o">.</span><span class="n">generate_tllm_weights</span><span class="p">(</span><span class="n">trtllm_model</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>For calibration-free quantization precisions, passing a properly quantized <code class="docutils literal notranslate"><span class="pre">trtllm_model</span></code> will let the weight loader load at the given precision accordingly. The configurations will be read from <code class="docutils literal notranslate"><span class="pre">trtllm_model.config</span></code> automatically. For now, LLaMA family models using the default <code class="docutils literal notranslate"><span class="pre">tllm_to_externel_key_dict</span></code> is supported natively.</p>
+</section>
+<section id="models-with-customized-key-names">
+<h3>Models with customized key names<a class="headerlink" href="#models-with-customized-key-names" title="Link to this heading">#</a></h3>
+<p>For models with different naming logic, users can still call the default weight loader with <code class="docutils literal notranslate"><span class="pre">customized_key_dict</span></code> specified.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Using the model weights loader for the LLM part of LLaVA</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.models.model_weights_loader</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelWeightsLoader</span>
+<span class="n">llava_dict</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;transformer&quot;</span><span class="p">:</span> <span class="s2">&quot;language_model.model&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;lm_head&quot;</span><span class="p">:</span> <span class="s2">&quot;language_model.lm_head&quot;</span>
+<span class="p">}</span>
+<span class="n">loader</span> <span class="o">=</span> <span class="n">ModelWeightsLoader</span><span class="p">(</span><span class="n">external_checkpoint_dir</span><span class="p">,</span> <span class="n">llava_dict</span><span class="p">)</span>
+<span class="n">loader</span><span class="o">.</span><span class="n">generate_tllm_weights</span><span class="p">(</span><span class="n">trtllm_model</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Users need to specify the different part from the default <code class="docutils literal notranslate"><span class="pre">tllm_to_externel_key_dict</span></code>. The loader still have support across different precisions.
+The support for LLaVA and Exaone is in <code class="docutils literal notranslate"><span class="pre">LLaMAForCausalLM.from_hugging_face()</span></code> of <a class="reference download internal" download="" href="../_downloads/408e9af6e2b04a79e78215bde246e8bc/model.py"><span class="xref download myst">model.py</span></a>, and can also be taken as examples.</p>
+</section>
+<section id="models-with-customized-weight-layout">
+<h3>Models with customized weight layout<a class="headerlink" href="#models-with-customized-weight-layout" title="Link to this heading">#</a></h3>
+<p>For models with different weight layout, users can write the conversion loop explicitly and do customized operations.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Using the model weights loader for BLOOM</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.models.model_weights_loader</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelWeightsLoader</span>
+<span class="n">bloom_dict</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;transformer&quot;</span><span class="p">:</span> <span class="s2">&quot;&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;layers&quot;</span><span class="p">:</span> <span class="s2">&quot;h&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;ln_f&quot;</span><span class="p">:</span> <span class="s2">&quot;ln_f&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;lm_head&quot;</span><span class="p">:</span> <span class="s2">&quot;word_embeddings&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;ln_embed&quot;</span><span class="p">:</span> <span class="s2">&quot;word_embeddings_layernorm&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;vocab_embedding&quot;</span><span class="p">:</span> <span class="s2">&quot;word_embeddings&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;attention&quot;</span><span class="p">:</span> <span class="s2">&quot;self_attention&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;qkv&quot;</span><span class="p">:</span> <span class="s2">&quot;query_key_value&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;dense&quot;</span><span class="p">:</span> <span class="s2">&quot;dense&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;fc&quot;</span><span class="p">:</span> <span class="s2">&quot;dense_h_to_4h&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;proj&quot;</span><span class="p">:</span> <span class="s2">&quot;dense_4h_to_h&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;post_layernorm&quot;</span><span class="p">:</span> <span class="s2">&quot;post_attention_layernorm&quot;</span><span class="p">,</span>
+<span class="p">}</span>
+<span class="n">loader</span> <span class="o">=</span> <span class="n">ModelWeightsLoader</span><span class="p">(</span><span class="n">external_checkpoint_dir</span><span class="p">,</span> <span class="n">bloom_dict</span><span class="p">)</span>
+<span class="c1"># See ModelWeightsLoader.generate_tllm_weights()</span>
+<span class="n">loader</span><span class="o">.</span><span class="n">update_key_mapping</span><span class="p">(</span><span class="n">trtllm_model</span><span class="p">)</span>
+<span class="n">tllm_weights</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="k">for</span> <span class="n">tllm_key</span><span class="p">,</span> <span class="n">_</span> <span class="ow">in</span> <span class="n">tqdm</span><span class="p">(</span><span class="n">trtllm_model</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">()):</span>
+    <span class="k">if</span> <span class="n">tllm_key</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s2">&quot;qkv&quot;</span><span class="p">):</span>
+        <span class="c1"># Passing the callable handle</span>
+        <span class="n">tllm_weights</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">loader</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">tllm_key</span><span class="p">,</span> <span class="n">preprocess</span><span class="o">=</span><span class="n">customized_preprocess</span><span class="p">))</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">tllm_weights</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">loader</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">tllm_key</span><span class="p">))</span>
+<span class="n">loader</span><span class="o">.</span><span class="n">fill</span><span class="p">(</span><span class="n">tllm_weights</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>This will apply <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> after <code class="docutils literal notranslate"><span class="pre">load_tensor()</span></code> and before <code class="docutils literal notranslate"><span class="pre">postprocess</span></code>, and demonstrates how to convert the loaded shard into default HF layout. The loader still have support for precisions quantized from FP16/BF16 (e.g. INT8-wo/INT4-wo), the other precisions may require special operations, and can be addressed inside the <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> function.
+The support for Qwen-1 is in <code class="docutils literal notranslate"><span class="pre">QWenForCausalLM.from_hugging_face()</span></code> of <a class="reference download internal" download="" href="../_downloads/b6815cf245cc7dc7a26a6f727fdc2dc4/model.py"><span class="xref download myst">model.py</span></a>, and can also be taken as example.</p>
+</section>
+<section id="fully-customized">
+<h3>Fully customized<a class="headerlink" href="#fully-customized" title="Link to this heading">#</a></h3>
+<p>If the model weights loader cannot satisfy the requirements, users can write the conversion loop totally on their own.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">tllm_weights</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="k">for</span> <span class="n">tllm_key</span><span class="p">,</span> <span class="n">param</span> <span class="ow">in</span> <span class="n">tqdm</span><span class="p">(</span><span class="n">trtllm_model</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">()):</span>
+    <span class="c1"># Load from external checkpoints</span>
+    <span class="c1"># The load_tensor() function can also be called here</span>
+    <span class="n">tensor</span> <span class="o">=</span> <span class="o">...</span>
+    <span class="c1"># Convert tensor and set the values according to the config</span>
+    <span class="k">if</span> <span class="n">trtllm_model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quantization</span><span class="o">.</span><span class="n">quant_algo</span> <span class="o">==</span> <span class="n">xxx</span><span class="p">:</span>
+        <span class="o">...</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="o">...</span>
+    <span class="n">param</span><span class="o">.</span><span class="n">value</span> <span class="o">=</span> <span class="n">tensor</span>
+</pre></div>
+</div>
+<p>In this mode, every precision require user’s own support.</p>
+</section>
+</section>
+<section id="trouble-shooting">
+<h2>Trouble shooting<a class="headerlink" href="#trouble-shooting" title="Link to this heading">#</a></h2>
+<p>The weights loader is an experimental feature for now, and is enabled for LLaMA family models and Qwen models by default.</p>
+<p>If users are encountered with failure caused by <code class="docutils literal notranslate"><span class="pre">ModelWeightsLoader</span></code>, a workaround is passing environmental variable <code class="docutils literal notranslate"><span class="pre">TRTLLM_DISABLE_UNIFIED_CONVERTER=1</span></code> to disable the model weights loader and fallback to the legacy path.</p>
+<p>This workaround will be removed in future version after the LLaMA/Qwen weights conversion is stable.</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#workflow">Workflow</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#translator">Translator</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#loading-function">Loading function</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#postprocessing-functions">Postprocessing functions</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#examples">Examples</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#natively-supported-models">Natively supported models</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#models-with-customized-key-names">Models with customized key names</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#models-with-customized-weight-layout">Models with customized weight layout</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fully-customized">Fully customized</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#trouble-shooting">Trouble shooting</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

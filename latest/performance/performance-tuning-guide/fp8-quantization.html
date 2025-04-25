@@ -1,0 +1,1027 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>FP8 Quantization &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'performance/performance-tuning-guide/fp8-quantization';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Useful Runtime Options" href="useful-runtime-flags.html" />
+    <link rel="prev" title="Deciding Model Sharding Strategy" href="deciding-model-sharding-strategy.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 current active has-children"><a class="reference internal" href="index.html">Performance Tuning Guide</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    
+    <li class="breadcrumb-item"><a href="index.html" class="nav-link">Performance Tuning Guide</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">FP8 Quantization</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="fp8-quantization">
+<span id="id1"></span><h1>FP8 Quantization<a class="headerlink" href="#fp8-quantization" title="Link to this heading">#</a></h1>
+<p>Quantization is a technique that allows models to run in lower precisions like int8 and fp8 while maintaining acceptable output quality. Running in lower precisions can greatly boost performance, significantly increasing throughput and decreasing latency. The tradeoff is a drop in output quality, but in many cases the output quality is still acceptable and many real world deployments utilize quantization. If you want to learn more about quantization refer to <a class="reference external" href="https://developer.nvidia.com/blog/mastering-llm-techniques-inference-optimization/">Mastering LLM Techniques - Inference Optimization</a></p>
+<p>This section walks through enabling fp8 quantization and highlight some fp8 quantization specific configuration options for boosting performance. It also continues the case study of Llama-3.3-70B split across 4 H100-sxm-80GB GPUs via tensor parallelism and showcase the effects of enabling these configuration options on performance.</p>
+<blockquote>
+<div><p>Disclaimer: While performance numbers shown here are real, they are only for demonstration purposes. Differences in environment, SKU, interconnect, and workload can all significantly affect performance and lead to your results differing from what is shown here.</p>
+</div></blockquote>
+<section id="enabling-quantization">
+<h2>Enabling Quantization<a class="headerlink" href="#enabling-quantization" title="Link to this heading">#</a></h2>
+<p>To enable quantization you need to configure the <code class="docutils literal notranslate"><span class="pre">QuantConfig</span></code> class and pass it to the <code class="docutils literal notranslate"><span class="pre">quant_config</span></code> parameter of the LLM class. At a minimum the <code class="docutils literal notranslate"><span class="pre">quant_algo</span></code> parameter, which sets the quantization algorithm (fp8, fp8 per token, int8awq, etc.) must be specified. You can find all supported quantization algorithms and other configurable options for <code class="docutils literal notranslate"><span class="pre">QuantConfig</span></code> in the LLM-API-&gt;Reference section of the docs. While it is not required if you are using weights/checkpoints from that are already quantized, if you are using an fp16 checkpoint then you also need to specify the calibration dataset that will be used to determine the quantization scales via <code class="docutils literal notranslate"><span class="pre">CalibConfig</span></code>. <code class="docutils literal notranslate"><span class="pre">CalibConfig</span></code> provides several options for setting the calibration dataset that can also be referenced in the LLM-API-&gt;Reference section of the docs. Although TensorRT-LLM supports several other types of quantization, this guide focuses on fp8.</p>
+<p>Here is an example of building and saving an fp8 engine from a bf16 checkpoint (Note that fp8 is supported only on devices with compute capability &gt; 8.9 - Ada, Hopper, Blackwell, and beyond):</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">BuildConfig</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">QuantConfig</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="p">,</span> <span class="n">CalibConfig</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+
+    <span class="n">quant_config</span> <span class="o">=</span> <span class="n">QuantConfig</span><span class="p">(</span><span class="n">quant_algo</span><span class="o">=</span><span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">)</span>
+
+    <span class="n">calib_config</span> <span class="o">=</span> <span class="n">CalibConfig</span><span class="p">(</span>
+        <span class="n">calib_batches</span><span class="o">=</span><span class="mi">512</span><span class="p">,</span>
+        <span class="n">calib_batch_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">calib_max_seq_length</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span>
+        <span class="n">tokenizer_max_seq_length</span><span class="o">=</span><span class="mi">4096</span>
+    <span class="p">)</span>
+
+    <span class="n">build_config</span> <span class="o">=</span> <span class="n">BuildConfig</span><span class="p">(</span>
+        <span class="n">max_num_tokens</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span>
+        <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">512</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_paged_context_fmha</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">multiple_profiles</span> <span class="o">=</span> <span class="kc">True</span>
+
+    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
+        <span class="n">model</span><span class="o">=</span><span class="s2">&quot;/path/to/Llama-3.3-70B&quot;</span><span class="p">,</span>
+        <span class="n">tensor_parallel_size</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+        <span class="n">pipeline_parallel_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">build_config</span><span class="o">=</span><span class="n">build_config</span><span class="p">,</span>
+        <span class="n">quant_config</span><span class="o">=</span><span class="n">quant_config</span><span class="p">,</span>
+        <span class="n">calib_config</span><span class="o">=</span><span class="n">calib_config</span>
+    <span class="p">)</span>
+
+    <span class="n">llm</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="s2">&quot;baseline_fp8_engine&quot;</span><span class="p">)</span>
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+    <span class="n">main</span><span class="p">()</span>
+</pre></div>
+</div>
+<p>For an example of how to build an fp8 engine using the <a class="reference internal" href="benchmarking-default-performance.html#building-and-saving-engines-via-cli"><span class="std std-ref">TensorRT-LLM CLI workflow</span></a> flow see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">TensorRT-LLM LLaMA examples</a>. In short you first run <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/quantization"><code class="docutils literal notranslate"><span class="pre">examples/quantization/quantize.py</span></code></a> to quantize and convert the model checkpoint to TensorRT-LLM format and then use <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>.</p>
+<blockquote>
+<div><p><em><strong>Note: While quantization aims to preserve model accuracy this is not guaranteed and it is extremely important you check that the quality of outputs remains sufficient after quantization.</strong></em></p>
+</div></blockquote>
+</section>
+<section id="fp8-baseline-performance">
+<h2>FP8 “Baseline” Performance<a class="headerlink" href="#fp8-baseline-performance" title="Link to this heading">#</a></h2>
+<p>Benchmarking the engine produced by the example above yielded the following performance results. Note that we enabled some of the build flags we mentioned <a class="reference internal" href="useful-build-time-flags.html"><span class="std std-doc">earlier</span></a> (multiple profiles, paged_context_fmha) and also tuned max batch size and max num tokens. This is done to give a sense of what performance is achievable if you tune an fp8 engine but exclude options that have been tailored for quantization. We recommend disabling the gemm plugin for quantized engines which is why it is not included here (it is off by default). Reduce fusion has a quantization specific optimization that will be covered later. For the remainder of this page we will refer to this setup as the “baseline” numbers for fp8.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric</p></th>
+<th class="head"><p>Value</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Token Throughput (tokens/sec)</p></td>
+<td><p>3389.5305</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request Throughput (req/sec)</p></td>
+<td><p>1.6550</p></td>
+</tr>
+<tr class="row-even"><td><p>Average Time To First Token (ms)</p></td>
+<td><p>96.1597</p></td>
+</tr>
+<tr class="row-odd"><td><p>Average Inter-Token Latency (ms)</p></td>
+<td><p>12.4248</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="quantized-kv-cache">
+<h2>Quantized KV-Cache<a class="headerlink" href="#quantized-kv-cache" title="Link to this heading">#</a></h2>
+<p>By default the KV-Cache is not quantized but TensorRT-LLM supports quantizing the KV-Cache to further improve performance. However, quantizing the model more aggressively also increases the risk of model output quality degrading so it is important to check that when using this feature.</p>
+<section id="enabling-quantized-kv-cache">
+<h3>Enabling Quantized KV Cache<a class="headerlink" href="#enabling-quantized-kv-cache" title="Link to this heading">#</a></h3>
+<p>The LLM-API exposes the quantization algorithm to be used for kv cache via the <code class="docutils literal notranslate"><span class="pre">kv_cache_quant_algo</span></code> field in <code class="docutils literal notranslate"><span class="pre">QuantConfig</span></code>. To enable fp8 kv cache, you would modify <code class="docutils literal notranslate"><span class="pre">QuantConfig</span></code> as such:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">quant_config</span> <span class="o">=</span> <span class="n">QuantConfig</span><span class="p">(</span><span class="n">quant_algo</span><span class="o">=</span><span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">,</span>
+                           <span class="n">kv_cache_quant_algo</span><span class="o">=</span><span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>If you are using the <a class="reference internal" href="benchmarking-default-performance.html#building-and-saving-engines-via-cli"><span class="std std-ref">CLI flow for building engines</span></a> pass <code class="docutils literal notranslate"><span class="pre">--kv_cache_dtype</span> <span class="pre">fp8</span></code> to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/quantization"><code class="docutils literal notranslate"><span class="pre">examples/quantization/quantize.py</span></code></a>.</p>
+</section>
+<section id="performance-with-quantized-kv-cache">
+<h3>Performance with Quantized KV Cache<a class="headerlink" href="#performance-with-quantized-kv-cache" title="Link to this heading">#</a></h3>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric</p></th>
+<th class="head"><p>Baseline</p></th>
+<th class="head"><p>FP8 KV-Cache ON</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Token Throughput (tokens/sec)</p></td>
+<td><p>3389.5305</p></td>
+<td><p>5299.6372</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request Throughput (req/sec)</p></td>
+<td><p>1.6550</p></td>
+<td><p>2.5877</p></td>
+</tr>
+<tr class="row-even"><td><p>Average Time To First Token (ms)</p></td>
+<td><p>96.1597</p></td>
+<td><p>97.1287</p></td>
+</tr>
+<tr class="row-odd"><td><p>Average Inter-Token Latency (ms)</p></td>
+<td><p>12.4248</p></td>
+<td><p>12.5496</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+</section>
+<section id="reduce-norm-fusion-with-user-buffers-for-llama-models">
+<h2>Reduce Norm Fusion with User Buffers for Llama Models<a class="headerlink" href="#reduce-norm-fusion-with-user-buffers-for-llama-models" title="Link to this heading">#</a></h2>
+<p>The <a class="reference internal" href="useful-build-time-flags.html#reduce-norm-fusion-plugin-for-llama-models"><span class="std std-ref">Reduce Norm Fusion</span></a> feature is supported for fp8. An additional optimization called “User Buffers” is also supported for fp8 models. The user buffer feature aims to eliminate extra copies from the local buffer to the shared buffer in the communication kernel, leading to improved end-to-end performance.</p>
+<section id="enabling-reduce-norm-fusion-with-user-buffers">
+<h3>Enabling Reduce Norm Fusion with User Buffers<a class="headerlink" href="#enabling-reduce-norm-fusion-with-user-buffers" title="Link to this heading">#</a></h3>
+<p>To enable reduce norm fusion with user buffers, add the following lines below <code class="docutils literal notranslate"><span class="pre">BuildConfig</span></code>’s initialization</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">reduce_fusion</span> <span class="o">=</span> <span class="kc">True</span>
+<span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">user_buffer</span> <span class="o">=</span> <span class="kc">True</span>
+</pre></div>
+</div>
+<p>If you are using the <a class="reference internal" href="benchmarking-default-performance.html#building-and-saving-engines-via-cli"><span class="std std-ref">CLI flow for building engines</span></a> pass <code class="docutils literal notranslate"><span class="pre">--reduce_fusion</span> <span class="pre">enable</span></code> and <code class="docutils literal notranslate"><span class="pre">--user_buffer</span> <span class="pre">enable</span></code> to <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> to enable the feature.</p>
+<blockquote>
+<div><p>Note: You must have enabled <code class="docutils literal notranslate"><span class="pre">reduce_fusion</span></code> in order to enable <code class="docutils literal notranslate"><span class="pre">user_buffer</span></code></p>
+</div></blockquote>
+</section>
+<section id="performance-with-reduce-norm-fusion-user-buffers">
+<h3>Performance with Reduce Norm Fusion + User Buffers:<a class="headerlink" href="#performance-with-reduce-norm-fusion-user-buffers" title="Link to this heading">#</a></h3>
+<p>Reduce Norm Fusion + User Buffer ON: Same engine previously referred to as FP8 KV-Cache ON.</p>
+<p>Reduce Norm Fusion + User Buffer ON: Previous example with reduce fusion and user buffers enabled. Max-num tokens set to 16384 and max-batch size set to 512 after tuning.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric</p></th>
+<th class="head"><p>Reduce Norm Fusion + User Buffer OFF</p></th>
+<th class="head"><p>Reduce Norm Fusion + User Buffer ON</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Token Throughput (tokens/sec)</p></td>
+<td><p>5299.6372</p></td>
+<td><p>5980.7842</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request Throughput (req/sec)</p></td>
+<td><p>2.5877</p></td>
+<td><p>2.9203</p></td>
+</tr>
+<tr class="row-even"><td><p>Average Time To First Token (ms)</p></td>
+<td><p>97.1287</p></td>
+<td><p>82.2679</p></td>
+</tr>
+<tr class="row-odd"><td><p>Average Inter-Token Latency (ms)</p></td>
+<td><p>12.5496</p></td>
+<td><p>12.6975</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+</section>
+<section id="gemm-swiglu-fusion-in-gated-mlp">
+<h2>GEMM + SwiGLU Fusion in Gated-MLP<a class="headerlink" href="#gemm-swiglu-fusion-in-gated-mlp" title="Link to this heading">#</a></h2>
+<p>The GEMM + SwiGLU fusion in Gated-MLP combines two Matmul operations and one SwiGLU operation into a single kernel. Currently this is only supported for FP8 precision on Hopper. While this fusion improves performance, it can slightly reduce accuracy in FP8 PTQ because one quantization scaling factor is discarded.</p>
+<p>We recommend enabling this feature for large models running on Hopper with FP8 precision.We do not recommend enabling this feature for very small workloads or if the
+accuracy loss is unacceptable.</p>
+<section id="enabling-gemm-swiglu-fusion">
+<h3>Enabling GEMM + SwiGLU Fusion<a class="headerlink" href="#enabling-gemm-swiglu-fusion" title="Link to this heading">#</a></h3>
+<p>To enable the GEMM + SwiGLU fusion, add the following lines below <code class="docutils literal notranslate"><span class="pre">BuildConfig</span></code>’s initialization</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gemm_swiglu_plugin</span> <span class="o">=</span> <span class="s1">&#39;fp8&#39;</span>
+</pre></div>
+</div>
+<p>For small batch size cases where latency is important, you can replace the above line with</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">low_latency_gemm_swiglu_plugin</span> <span class="o">=</span> <span class="s1">&#39;fp8&#39;</span>
+</pre></div>
+</div>
+<p>If you are using the <a class="reference internal" href="benchmarking-default-performance.html#building-and-saving-engines-via-cli"><span class="std std-ref">CLI flow for building engines</span></a> pass <code class="docutils literal notranslate"><span class="pre">--gemm_swiglu_plugin=fp8</span></code> or <code class="docutils literal notranslate"><span class="pre">--low_latency_gemm_swiglu_plugin=fp8</span></code> for the low latency case (only include one or the other) to <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>.</p>
+</section>
+<section id="performance-with-gemm-swiglu-fusion">
+<h3>Performance with GEMM + SwiGLU Fusion<a class="headerlink" href="#performance-with-gemm-swiglu-fusion" title="Link to this heading">#</a></h3>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric</p></th>
+<th class="head"><p>GEMM + SwiGLU fusion OFF</p></th>
+<th class="head"><p>GEMM + SwiGLU fusion ON</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Token Throughput (tokens/sec)</p></td>
+<td><p>5980.7842</p></td>
+<td><p>5976.7977</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request Throughput (req/sec)</p></td>
+<td><p>2.9203</p></td>
+<td><p>2.9184</p></td>
+</tr>
+<tr class="row-even"><td><p>Average Time To First Token (ms)</p></td>
+<td><p>82.2679</p></td>
+<td><p>81.8841</p></td>
+</tr>
+<tr class="row-odd"><td><p>Average Inter-Token Latency (ms)</p></td>
+<td><p>12.6975</p></td>
+<td><p>11.7031</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>In this case, the GEMM + SwiGLU plugin performs almost equivalently to when it was disabled. The throughput drop is within run to run variance and the TTFT and ITL improvements are slight. However, we found that when paired with the low latency gemm plugin discussed next, enabling this feature was necessary for getting the maximum throughput.</p>
+</section>
+</section>
+<section id="low-latency-gemm-plugin">
+<h2>Low Latency GEMM Plugin<a class="headerlink" href="#low-latency-gemm-plugin" title="Link to this heading">#</a></h2>
+<p>Previously we mentioned the <a class="reference internal" href="useful-build-time-flags.html#gemm-plugin"><span class="std std-ref">GEMM Plugin</span></a> feature. Although it has fp8 support we recommend disabling it (by default it is disabled). However for low-latency scenarios in fp8 we recommend trying the low latency GEMM plugin to see if it is effective for your workload.</p>
+<section id="enabling-low-latency-gemm-plugin">
+<h3>Enabling Low Latency GEMM plugin<a class="headerlink" href="#enabling-low-latency-gemm-plugin" title="Link to this heading">#</a></h3>
+<p>To enable the low latency GEMM plugin, add the following lines below <code class="docutils literal notranslate"><span class="pre">BuildConfig</span></code>’s initialization</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">low_latency_gemm_plugin</span> <span class="o">=</span> <span class="s1">&#39;fp8&#39;</span>
+</pre></div>
+</div>
+<p>If you are using the <a class="reference internal" href="benchmarking-default-performance.html#building-and-saving-engines-via-cli"><span class="std std-ref">CLI flow for building engines</span></a> pass <code class="docutils literal notranslate"><span class="pre">--low_latency_gemm_plugin=fp8</span></code> to <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> to enable the feature. Again, <strong>we recommend disabling the gemm plugin for fp8</strong> so if you are passing <code class="docutils literal notranslate"><span class="pre">--gemm_plugin=fp8</span></code> to <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> we recommend removing that.</p>
+</section>
+<section id="performance-with-low-latency-gemm-plugin">
+<h3>Performance with Low Latency GEMM plugin<a class="headerlink" href="#performance-with-low-latency-gemm-plugin" title="Link to this heading">#</a></h3>
+<p>Low Latency GEMM ON: Same configuration as previous example but with low latency GEMM plugin enabled. Max num tokens was set to 16384 and max-batch size was set to 512 after tuning.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric</p></th>
+<th class="head"><p>Low Latency GEMM OFF</p></th>
+<th class="head"><p>Low Latency GEMM ON</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Token Throughput (tokens/sec)</p></td>
+<td><p>5976.7977</p></td>
+<td><p>6049.1625</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request Throughput (req/sec)</p></td>
+<td><p>2.9184</p></td>
+<td><p>2.9537</p></td>
+</tr>
+<tr class="row-even"><td><p>Average Time To First Token (ms)</p></td>
+<td><p>81.8841</p></td>
+<td><p>88.0162</p></td>
+</tr>
+<tr class="row-odd"><td><p>Average Inter-Token Latency (ms)</p></td>
+<td><p>11.7031</p></td>
+<td><p>10.8225</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>In this case, enabling the low-latency gemm plugin actually provided a meaningful boost to throughput. Additionally it also improved ITL but at the expense of TTFT. Furthermore, when used without the gemm+swiglu fusion, performance was actually worse than with out the plugin turned on. This suggests that for this workload the low-latency gemm plugin was choosing a worse kernel for the gemm right before the swiglu, but once that was handled by the gemm+swiglu fusion custom kernel, the rest of the kernels the low-latency gemm plugin was choosing was better than the baseline, resulting in improved performance. This underscores the importance of benchmarking different settings as the impact of this plugin is highly workload dependent. If possible some grid searching can be useful for extremely performance sensitive workloads</p>
+</section>
+</section>
+<section id="conclusion">
+<h2>Conclusion<a class="headerlink" href="#conclusion" title="Link to this heading">#</a></h2>
+<p>Overall leveraging quantization can provide significant uplifts in performance. Here are the performance uplifts from our tuned fp8 model as compared to the tuned fp16 numbers we reached in the <a class="reference internal" href="tuning-max-batch-size-and-max-num-tokens.html"><span class="std std-doc">previous page of guide</span></a></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric</p></th>
+<th class="head"><p>Tuned FP16 Model</p></th>
+<th class="head"><p>Tuned FP8 Model</p></th>
+<th class="head"><p>% Improvement</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Token Throughput (tokens/sec)</p></td>
+<td><p>2474.2581</p></td>
+<td><p>6049.1625</p></td>
+<td><p>144.48</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request Throughput (req/sec)</p></td>
+<td><p>1.2081</p></td>
+<td><p>2.9537</p></td>
+<td><p>144.49</p></td>
+</tr>
+<tr class="row-even"><td><p>Average Time To First Token (ms)</p></td>
+<td><p>147.5742</p></td>
+<td><p>88.0162</p></td>
+<td><p>40.36</p></td>
+</tr>
+<tr class="row-odd"><td><p>Average Inter-Token Latency (ms)</p></td>
+<td><p>14.6852</p></td>
+<td><p>10.8225</p></td>
+<td><p>26.30</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Additionally, compared to the fp8 baseline numbers (the baseline numbers had some degree of tuning, see <a class="reference internal" href="#fp8-baseline-performance"><span class="std std-ref">Baseline Performance</span></a> for details), we received the following performance uplifts from enabling the flags discussed above:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric</p></th>
+<th class="head"><p>Baseline FP8 Model</p></th>
+<th class="head"><p>Tuned FP8 Model</p></th>
+<th class="head"><p>% Improvement</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Token Throughput (tokens/sec)</p></td>
+<td><p>3389.5305</p></td>
+<td><p>6049.1625</p></td>
+<td><p>78.47</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request Throughput (req/sec)</p></td>
+<td><p>1.6550</p></td>
+<td><p>2.9537</p></td>
+<td><p>78.47</p></td>
+</tr>
+<tr class="row-even"><td><p>Average Time To First Token (ms)</p></td>
+<td><p>96.1597</p></td>
+<td><p>88.0162</p></td>
+<td><p>8.47</p></td>
+</tr>
+<tr class="row-odd"><td><p>Average Inter-Token Latency (ms)</p></td>
+<td><p>12.4248</p></td>
+<td><p>10.8225</p></td>
+<td><p>12.90</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>As mentioned previously, the caveat with leveraging quantization are potential drops in accuracy, and we strongly recommend having a way to test whether model output quality is acceptable before attempting to use quantization. That said, many real world cases successfully use quantization and the significant performance boosts it enables are often worth the effort to see if it is a fit.</p>
+<section id="summary-of-configuration-option-recommendations">
+<h3>Summary of Configuration Option Recommendations:<a class="headerlink" href="#summary-of-configuration-option-recommendations" title="Link to this heading">#</a></h3>
+<ol class="arabic simple">
+<li><p>Quantized KV-cache: Typically provides significant throughput boost. We recommend turning it on as long as output quality is still acceptable with the feature enabled.</p></li>
+<li><p>Reduce fusion + user buffers: This feature is only supported on fp8 Llama and Mistral/Mixtral models. Effectiveness is workload dependent so we recommend turning it on and benchmarking to check.</p></li>
+<li><p>Gemm + Swiglu Plugin: This feature is only supported on fp8 models with Swiglu operators like Llama, Mixtral etc. Like reduce fusion effectiveness is workload dependent and we recommend sanity checking effectiveness. Has increased risk of affecting accuracy since it drops a quantization scale.</p></li>
+<li><p>Low-Latency GEMM plugin: Effectiveness is workload dependent so we recommend turning it on and benchmarking. Effectiveness can be affected by other flags as we saw in our case study, so if possible benchmarking various combinations of configuration options is ideal.</p></li>
+</ol>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="deciding-model-sharding-strategy.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Deciding Model Sharding Strategy</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="useful-runtime-flags.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Useful Runtime Options</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#enabling-quantization">Enabling Quantization</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#fp8-baseline-performance">FP8 “Baseline” Performance</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#quantized-kv-cache">Quantized KV-Cache</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#enabling-quantized-kv-cache">Enabling Quantized KV Cache</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-with-quantized-kv-cache">Performance with Quantized KV Cache</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reduce-norm-fusion-with-user-buffers-for-llama-models">Reduce Norm Fusion with User Buffers for Llama Models</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#enabling-reduce-norm-fusion-with-user-buffers">Enabling Reduce Norm Fusion with User Buffers</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-with-reduce-norm-fusion-user-buffers">Performance with Reduce Norm Fusion + User Buffers:</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gemm-swiglu-fusion-in-gated-mlp">GEMM + SwiGLU Fusion in Gated-MLP</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#enabling-gemm-swiglu-fusion">Enabling GEMM + SwiGLU Fusion</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-with-gemm-swiglu-fusion">Performance with GEMM + SwiGLU Fusion</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#low-latency-gemm-plugin">Low Latency GEMM Plugin</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#enabling-low-latency-gemm-plugin">Enabling Low Latency GEMM plugin</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-with-low-latency-gemm-plugin">Performance with Low Latency GEMM plugin</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#conclusion">Conclusion</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#summary-of-configuration-option-recommendations">Summary of Configuration Option Recommendations:</a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
