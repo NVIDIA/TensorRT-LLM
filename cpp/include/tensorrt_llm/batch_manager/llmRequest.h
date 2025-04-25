@@ -2084,7 +2084,7 @@ public:
     using TokenExtraIdType = Base::TokenExtraIdType;
     using VecTokenExtraIds = Base::VecTokenExtraIds;
 
-    // 45 parameters, 45 parameters in Base class constructor
+    // 46 parameters, 46 parameters in Base class constructor
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -2132,7 +2132,7 @@ public:
     {
     }
 
-    // 45 parameters, 45 parameters in Base class constructor
+    // 46 parameters, 46 parameters in Base class constructor
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
