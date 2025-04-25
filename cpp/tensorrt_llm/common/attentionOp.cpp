@@ -2297,8 +2297,8 @@ int AttentionOp::initialize() noexcept
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
 
     // Pre-check whether the head size is supported by MMHA.
-    // Support head size == 72 only for fmha kernels (in Cross Attention), so skip pre-check here.
-    if (getHeadSize() == 72 && mCrossAttention)
+    // Support head size == 72 only for fmha kernels, so skip pre-check here.
+    if (getHeadSize() == 72)
     {
         ;
     }
