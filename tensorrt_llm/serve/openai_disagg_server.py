@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
+from tensorrt_llm.llmapi.disagg_utils import RouterConfig
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
                                                 CompletionRequest,
@@ -38,13 +39,13 @@ class OpenAIDisaggServer:
                  gen_servers: List[str] = None,
                  req_timeout_secs: int = 180,
                  server_start_timeout_secs: int = 180,
-                 ctx_router_type: str = "round_robin",
-                 gen_router_type: str = "round_robin"):
+                 ctx_router_config: Optional[RouterConfig] = None,
+                 gen_router_config: Optional[RouterConfig] = None):
 
         self.ctx_servers = ctx_servers
         self.gen_servers = gen_servers
-        self.ctx_router = create_router(ctx_router_type, ctx_servers)
-        self.gen_router = create_router(gen_router_type, gen_servers)
+        self.ctx_router = create_router(ctx_router_config, ctx_servers)
+        self.gen_router = create_router(gen_router_config, gen_servers)
 
         if (len(self.gen_servers) == 0):
             raise ValueError("At least one generation server must be provided")
