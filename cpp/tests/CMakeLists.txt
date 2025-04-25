@@ -73,8 +73,6 @@ add_subdirectory(unit_tests)
 
 add_gtest(mpiUtilsTest runtime/mpiUtilsTest.cpp)
 
-add_gtest(loraManagerTest runtime/loraManagerTest.cpp)
-add_gtest(loraCacheTest runtime/loraCacheTest.cpp)
 add_gtest(gptDecoderTest runtime/gptDecoderTest.cpp)
 add_gtest(gptDecoderBatchedTest runtime/gptDecoderBatchedTest.cpp)
 add_gtest(gptSessionTest runtime/gptSessionTest.cpp)

@@ -301,19 +301,23 @@ def run_model_benchmarks(root_dir, build_dir, cpp_resources_dir, python_exe,
 
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
-def test_unit_tests(build_google_tests, build_dir, lora_setup):
+@pytest.mark.parametrize("test_group", [
+    "batch_manager", "common", "executor", "kernels", "layers", "runtime",
+    "thop", "utils"
+])
+def test_unit_tests(build_google_tests, test_group, build_dir, lora_setup):
+
+    xml_name = f"results-unit-tests-{test_group}.xml"
 
     # Discover and run the actual gtests
     ctest_command = [
         "ctest",
         "--output-on-failure",
+        "--test-dir",
+        f"{build_dir}/tests/unit_tests/{test_group}",
         "--output-junit",
-        "results-unit-tests.xml",
+        f"{build_dir}/{xml_name}",
     ]
-
-    excluded_tests = list(_cpp.generate_excluded_model_tests())
-
-    ctest_command.extend(["-E", "|".join(excluded_tests)])
 
     parallel = _cpp.default_test_parallel
     if parallel_override := _os.environ.get("LLM_TEST_PARALLEL_OVERRIDE", None):
