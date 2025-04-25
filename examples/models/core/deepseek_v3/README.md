@@ -568,7 +568,7 @@ pytorch_backend_config:
 ```
 
 ### KV Cache Reuse
-KV cache reuse is supported for MLA on SM90 and SM100. It is enabled by default and does not support FP8 KV cache right now. Due to extra operations like memcpy and GEMMs, performance may have regression in some cases. Users could pass `KvCacheConfig(enable_block_reuse=False)` to LLM API to disable it.
+KV cache reuse is supported for MLA on SM90 and SM100. It is enabled by default and does not support FP8 KV cache right now. Due to extra operations like memcpy and GEMMs, GPU memory consumption may be higher and the E2E performance may have regression in some cases. Users could pass `KvCacheConfig(enable_block_reuse=False)` to LLM API to disable it.
 
 ## Notes and Troubleshooting
 
