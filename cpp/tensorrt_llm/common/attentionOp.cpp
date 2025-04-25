@@ -2412,7 +2412,7 @@ int AttentionOp::initialize() noexcept
         fmhaParams.numTokensPerBlock = mTokensPerBlock;
         fmhaParams.headSize = mHeadSize;
         fmhaParams.headSizeV = mHeadSize;
-        if (mIsMLAEnabled)
+        if (mIsMLAEnabled && !mIsGenerationMLA)
         {
             // Context attention of MLA is different
             fmhaParams.numKvHeads = mNumHeads;
@@ -2472,10 +2472,9 @@ int AttentionOp::initialize() noexcept
                 // Instantiate the mTllmGenFMHARunner used for MLA
                 mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(qDataType, kvDataType, outputDataType));
             }
-            else
+            else if (mIsGenerationMLA && !mUseFlashMLA)
             {
-                // Construct the fmha runner.
-                // FP8 Generation MLA also uses context FMHA.
+                // Construct the fmha runner for generation.
                 if (mFP8GenerationMLA)
                 {
                     data_type = DATA_TYPE_E4M3;
@@ -2517,13 +2516,17 @@ int AttentionOp::initialize() noexcept
                 TLLM_CHECK_WITH_INFO(
                     mDecoderFMHARunner->isFmhaSupported(), "Deepseek should be supported by fmha in generation part.");
             }
-
-            TLLM_CHECK_WITH_INFO(
-                mFmhaDispatcher->isSupported(), "Deepseek should be supported by fmha in context part.");
+            if (!mIsGenerationMLA)
+            {
+                TLLM_CHECK_WITH_INFO(
+                    mFmhaDispatcher->isSupported(), "Deepseek should be supported by fmha in context part.");
+            }
         }
 
         // Fall back to unfused MHA kernels if not supported.
-        mEnableContextFMHA = mFmhaDispatcher->isSupported();
+        // Generation MLA reuses the context FMHA code path so set mEnableContextFMHA to true.
+        // However, do not check mFmhaDispatcher which is not used for generation MLA.
+        mEnableContextFMHA = mIsGenerationMLA || mFmhaDispatcher->isSupported();
 
         // Only FMHA supports custom mask currently.
         TLLM_CHECK_WITH_INFO(
@@ -2690,6 +2693,7 @@ std::string AttentionOp::toString() const
     ss << "mFMHAForceFP32Acc: " << std::boolalpha << mFMHAForceFP32Acc << std::endl;
     ss << "mSM: " << mSM << std::endl;
     ss << "mUseTllmGen: " << mUseTllmGen << std::endl;
+    ss << "mIsGenerationMLA: " << std::boolalpha << mIsGenerationMLA << std::endl;
     ss << "mUseFlashMLA: " << mUseFlashMLA << std::endl;
     ss << "mMultiProcessorCount: " << mMultiProcessorCount << std::endl;
     ss << "mMaxSharedMemoryPerBlockOptin: " << mMaxSharedMemoryPerBlockOptin << std::endl;
