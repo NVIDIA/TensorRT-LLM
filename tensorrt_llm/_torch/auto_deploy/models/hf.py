@@ -2,7 +2,7 @@
 
 import json
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Optional
 
 import torch
@@ -17,6 +17,31 @@ from transformers.modeling_utils import load_sharded_checkpoint, load_state_dict
 from ..custom_ops.attention_interface import CacheConfig, PositionalEmbeddingConfig
 from ..utils.logger import ad_logger
 from .factory import ModelFactory, ModelFactoryRegistry
+
+
+@contextmanager
+def load_state_dict_with_assign():
+    """
+    Context manager that temporarily patches torch.nn.Module.load_state_dict
+    to use assign=True, which directly replaces parameters in the model with those
+    from the loaded state_dict, maintaining their data type and device placement.
+    """
+    # Save the original load_state_dict method
+    original_load_state_dict = torch.nn.Module.load_state_dict
+
+    # Define and apply the patched version
+    def load_state_dict_with_assign(*args, **kwargs):
+        return original_load_state_dict(*args, **kwargs, assign=True)
+
+    # Apply the patch
+    torch.nn.Module.load_state_dict = load_state_dict_with_assign
+
+    try:
+        # Allow the context body to execute
+        yield
+    finally:
+        # Restore the original method, even if an exception occurred
+        torch.nn.Module.load_state_dict = original_load_state_dict
 
 
 def _to_maybe_empty(model: nn.Module, device: DeviceLikeType):
@@ -161,7 +186,8 @@ class HFFactory(ModelFactory):
         # sharded checkpoint
         if os.path.isfile(os.path.join(ckpt_path, "model.safetensors.index.json")):
             _to_maybe_empty(model, device="cpu")
-            load_sharded_checkpoint(model, ckpt_path, strict=False)
+            with load_state_dict_with_assign():
+                load_sharded_checkpoint(model, ckpt_path, strict=False)
             return
 
         # look for a single file in the directory ending with .safetensors or .pt/.pth
@@ -178,7 +204,8 @@ class HFFactory(ModelFactory):
         else:
             raise ValueError(f"No checkpoint found in {ckpt_path}")
 
-        model.load_state_dict(state_dict, strict=False, assign=True)
+        with load_state_dict_with_assign():
+            model.load_state_dict(state_dict, strict=False)
 
     def _load_quantization_config(self):
         assert self.ckpt_path
