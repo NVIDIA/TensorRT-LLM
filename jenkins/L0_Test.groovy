@@ -1625,27 +1625,11 @@ pipeline {
                 script {
                     echo "enableFailFast is: ${params.enableFailFast}"
                     echo "env.testFilter is: ${env.testFilter}"
-                    if (env.testFilter)
-                    {
-                        def mp = readJSON text: env.testFilter, returnPojo: true
-                        mp.each {
-                            if (testFilter.containsKey(it.key)) {
-                                echo "testFilter setting ${it.key} = ${it.value}"
-                                testFilter[it.key] = it.value
-                            }
-                        }
-                    }
+                    testFilter = trtllm_utils.updateMapWithJson(this, testFilter, env.testFilter, "testFilter")
                     println testFilter
                     echo "env.globalVars is: ${env.globalVars}"
-                    if (env.globalVars) {
-                        def mp = readJSON text: env.globalVars, returnPojo: true
-                        mp.each {
-                            if (globalVars.containsKey(it.key)) {
-                                echo "globalVars setting ${it.key} = ${it.value}"
-                                globalVars[it.key] = it.value
-                            }
-                        }
-                    }
+                    globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
+                    globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
                 }
             }
         }

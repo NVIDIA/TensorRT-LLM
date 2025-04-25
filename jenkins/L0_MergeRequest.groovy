@@ -918,7 +918,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'enableFailFast': enableFailFast,
                             'testFilter': testFilterJson,
                             "dockerImage": LLM_SBSA_DOCKER_IMAGE,
-                            // 'globalVars': globalVarsJson,
+                            'globalVars': globalVarsJson,
                         ]
 
                         if (env.alternativeTrtSBSA) {
@@ -969,49 +969,6 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     pipeline.parallel parallelJobs
 }
 
-def setupPipelineDescription(pipeline, globalVars) {
-    echo "currentBuild.description is: ${currentBuild.description}"
-    // 使用Groovy语法进行条件判断，不是Python语法
-    if (!globalVars[ACTION_INFO]) {
-        // 处理所有post merge 或者 gitlab 触发的情况，此时没有上游的wrapper job
-        globalVars[ACTION_INFO] = [
-            'trigger_info': "${currentBuild.description}<br/>Git Commit: ${env.gitlabCommit}<br/><br/>",
-            'parents': [],
-        ]
-    }
-    def startedByString = ""
-    def description = ""
-    // 使用Groovy的for-each循环语法
-    globalVars[ACTION_INFO]['parents'].each { parent ->
-        startedByString = """
-        <ul><li>
-            Started by: <a href="${parent['url']}" target="_blank">${parent['name']} #${parent['build_number']}</a> <a href="${parent['url'] + '/display/redirect'}" target="_blank">(Blue Ocean)</a>
-            ${startedByString}
-        </li></ul>"""
-        description = """
-            Sub Job Start: <a href=\"${env.BUILD_URL}\" target=\"_blank\">${env.JOB_NAME} #${env.BUILD_NUMBER}</a>
-                           <a href=\"${env.BUILD_URL}/display/redirect\" target=\"_blank\">(Blue Ocean)</a><br/>
-        """
-        trtllm_utils.appendBuildDescription(this, parent['name'], parent['build_number'], description)
-    }
-
-    globalVars[ACTION_INFO]['parents'] += [
-        [
-            'name': env.JOB_NAME,
-            'url': env.BUILD_URL,
-            'build_number': env.BUILD_NUMBER,
-        ]
-    ]
-
-    def newDescription = """
-    ${globalVars[ACTION_INFO]['trigger_info']}
-    ${startedByString}
-    """
-
-    echo "new description is: ${newDescription}"
-    currentBuild.description = newDescription
-}
-
 pipeline {
     agent {
         kubernetes createKubernetesPodConfig("", "agent")
@@ -1057,7 +1014,7 @@ pipeline {
                 script {
                     setupPipelineEnvironment(this, testFilter, globalVars)
                     println globalVars
-                    setupPipelineDescription(this, globalVars)
+                    globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
                     echo "enableFailFast is: ${enableFailFast}"
                     echo "env.gitlabTriggerPhrase is: ${env.gitlabTriggerPhrase}"
                     println testFilter

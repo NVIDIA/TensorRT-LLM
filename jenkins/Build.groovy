@@ -597,49 +597,6 @@ def runLLMPackage(pipeline, archTriple, tarFileName, linuxPkgName)
     sh "cd ${llmPath} && ls -alh"
 }
 
-def setupPipelineDescription(pipeline, globalVars) {
-    echo "currentBuild.description is: ${currentBuild.description}"
-    // 使用Groovy语法进行条件判断，不是Python语法
-    if (!globalVars[ACTION_INFO]) {
-        // 处理所有post merge 或者 gitlab 触发的情况，此时没有上游的wrapper job
-        globalVars[ACTION_INFO] = [
-            'trigger_info': "${currentBuild.description}<br/>Git Commit: ${env.gitlabCommit}<br/><br/>",
-            'parents': [],
-        ]
-    }
-    def startedByString = ""
-    def description = ""
-    // 使用Groovy的for-each循环语法
-    globalVars[ACTION_INFO]['parents'].each { parent ->
-        startedByString = """
-        <ul><li>
-            Started by: <a href="${parent['url']}" target="_blank">${parent['name']} #${parent['build_number']}</a> <a href="${parent['url'] + '/display/redirect'}" target="_blank">(Blue Ocean)</a>
-            ${startedByString}
-        </li></ul>"""
-        description = """
-            Sub Job Start: <a href=\"${env.BUILD_URL}\" target=\"_blank\">${env.JOB_NAME} #${env.BUILD_NUMBER}</a>
-                           <a href=\"${env.BUILD_URL}/display/redirect\" target=\"_blank\">(Blue Ocean)</a><br/>
-        """
-        trtllm_utils.appendBuildDescription(this, parent['name'], parent['build_number'], description)
-    }
-
-    globalVars[ACTION_INFO]['parents'] += [
-        [
-            'name': env.JOB_NAME,
-            'url': env.BUILD_URL,
-            'build_number': env.BUILD_NUMBER,
-        ]
-    ]
-
-    def newDescription = """
-    ${globalVars[ACTION_INFO]['trigger_info']}
-    ${startedByString}
-    """
-
-    echo "new description is: ${newDescription}"
-    currentBuild.description = newDescription
-}
-
 def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
 {
     stage("Show Environment") {
@@ -651,16 +608,8 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         echo "Using GitLab repo: ${LLM_REPO}. Commit: ${env.gitlabCommit}"
 
         echo "env.globalVars is: ${env.globalVars}"
-        if (env.globalVars) {
-            def mp = readJSON text: env.globalVars, returnPojo: true
-            mp.each {
-                if (globalVars.containsKey(it.key)) {
-                    echo "globalVars setting ${it.key} = ${it.value}"
-                    globalVars[it.key] = it.value
-                }
-            }
-        }
-        setupPipelineDescription(pipeline, globalVars)
+        globalVars = trtllm_utils.updateMapWithJson(pipeline, globalVars, env.globalVars, "globalVars")
+        globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(pipeline, globalVars[ACTION_INFO])
     }
 
     def wheelDockerImage = env.wheelDockerImage
