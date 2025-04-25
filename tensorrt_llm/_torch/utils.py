@@ -197,7 +197,7 @@ def get_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
         num_token_buckets.append(m)
         m //= 2
 
-    return num_token_buckets
+    return tuple(num_token_buckets)
 
 
 def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:

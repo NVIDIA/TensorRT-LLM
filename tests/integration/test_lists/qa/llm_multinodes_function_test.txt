@@ -12,5 +12,6 @@ examples/test_llama.py::test_llm_llama_v3_1_2nodes_8gpus[llama-3.1-405b-fp8-disa
 examples/test_llama.py::test_llm_llama_v3_1_2nodes_8gpus[llama-3.1-405b-fp8-disable_fp8-tp8pp2-infer]
 examples/test_mixtral.py::test_llm_mixtral_2nodes_8gpus[Mixtral-8x22B-v0.1-plugin-renormalize-tensor_parallel-build]
 examples/test_mixtral.py::test_llm_mixtral_2nodes_8gpus[Mixtral-8x22B-v0.1-plugin-renormalize-tensor_parallel-infer]
+test_e2e.py::test_ptp_quickstart_advanced_deepseek_v3_2nodes_8gpus[DeepSeek-V3-DeepSeek-V3]
 test_e2e.py::test_openai_multinodes_chat_tp16pp1
 test_e2e.py::test_openai_multinodes_chat_tp8pp2
