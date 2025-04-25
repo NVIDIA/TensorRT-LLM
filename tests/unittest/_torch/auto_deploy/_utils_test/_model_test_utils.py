@@ -245,13 +245,15 @@ def apply_rotary_pos_emb_complex(
     xq: torch.Tensor,
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,  # Expected shape: (B, seq, head_dim//2) and complex dtype.
+    unsqueeze_dim: int = 2,
 ):
     # Reshape the inputs to pair the last dimension.
     xq_complex = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_complex = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     # Multiply with frequencies. Note that freqs_cis is expected to broadcast with an extra head dim.
-    xq_out = torch.view_as_real(xq_complex * freqs_cis[:, :, None, :]).flatten(3)
-    xk_out = torch.view_as_real(xk_complex * freqs_cis[:, :, None, :]).flatten(3)
+    freqs = freqs_cis.unsqueeze(unsqueeze_dim)
+    xq_out = torch.view_as_real(xq_complex * freqs).flatten(3)
+    xk_out = torch.view_as_real(xk_complex * freqs).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
