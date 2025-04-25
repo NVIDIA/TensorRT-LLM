@@ -1608,15 +1608,15 @@ class PyExecutor:
         for request in scheduled_requests.context_requests:
             request.move_to_next_context_chunk()
             if request.get_context_remaining_length() == 0:
-                request.state = LlmRequestState.GENERATION_IN_PROGRESS
+                request.set_state(LlmRequestState.GENERATION_IN_PROGRESS)
             if request.is_dummy:
-                request.state = LlmRequestState.GENERATION_COMPLETE
+                request.set_state(LlmRequestState.GENERATION_COMPLETE)
 
     def _update_request_states_star_attention(
             self, scheduled_requests: ScheduledRequests):
         for request in scheduled_requests.context_requests:
             if request.ctx_iters >= len(request.ctx_blocks) - 2:
-                request.state = LlmRequestState.GENERATION_IN_PROGRESS
+                request.set_state(LlmRequestState.GENERATION_IN_PROGRESS)
             request.ctx_iters += 1
 
         for request in scheduled_requests.generation_requests:
@@ -1728,7 +1728,8 @@ class PyExecutor:
                     # Explicitly add the last token so get_last_tokens() returns
                     # the right value
                     new_request.add_new_token(input_tokens[-1], beam_idx)
-                    new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
+                    new_request.set_state(
+                        LlmRequestState.GENERATION_IN_PROGRESS)
                     draft_batch.generation_requests.append(new_request)
                 else:
                     new_request = LlmRequest(
@@ -1853,7 +1854,7 @@ class PyExecutor:
         error_msg = error_msg or "error"
         for request in self.active_requests:
             req_id = request.py_request_id
-            request.state = LlmRequestState.GENERATION_COMPLETE
+            request.set_state(LlmRequestState.GENERATION_COMPLETE)
             self._terminate_request(request)
             error_responses[req_id] = ExecutorResponse(
                 req_id, error_msg, client_id=request.py_client_id)

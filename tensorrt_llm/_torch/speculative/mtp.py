@@ -186,7 +186,7 @@ class MTPDecoder(TorchDecoder):
                                             num_tokens: int, beam_idx: int):
         if self._meet_max_token_stop_criteria(request,
                                               num_tokens + self.draft_len):
-            request.state = LlmRequestState.GENERATION_COMPLETE
+            request.set_state(LlmRequestState.GENERATION_COMPLETE)
             request.set_finished_reason(FinishReason.LENGTH, beam_idx)
 
     def update_requests(self, decoder_state: DecoderState) -> None:
@@ -207,7 +207,7 @@ class MTPDecoder(TorchDecoder):
                 idx += 1
                 continue
 
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
+            if request.get_state() != LlmRequestState.GENERATION_COMPLETE:
                 new_token = new_tokens_list[idx][0]
                 num_tokens = request.add_new_token(new_token, beam_idx)
                 should_stop = self._handle_stop_criteria(
@@ -224,7 +224,7 @@ class MTPDecoder(TorchDecoder):
             assert not request.py_return_context_logits, "return_context_logits not implemented for MTPDecoder"
             assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPDecoder"
             assert not request.py_return_log_probs, "return_log_probs not implemented for MTPDecoder"
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
+            if request.get_state() != LlmRequestState.GENERATION_COMPLETE:
                 new_tokens = new_tokens_list[idx]
                 num_new_tokens = new_tokens_lens_list[idx]
                 should_stop = False
