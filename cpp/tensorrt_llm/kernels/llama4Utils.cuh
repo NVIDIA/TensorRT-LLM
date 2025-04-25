@@ -53,6 +53,21 @@ constexpr int VEC_SIZE = 8;
 
 } // namespace llama4_fc_swiglu
 
+namespace llama4_fc_swiglu_tiled
+{
+
+constexpr int BLOCK_SIZE = 128;
+constexpr int WARP_SIZE = 32;
+
+// Use 8 for now, which results in LDG.64.
+constexpr int VEC_SIZE = 8;
+
+constexpr bool ENABLE_ACQBULK = 1;
+constexpr bool ENABLE_PREFETCH = 0;
+constexpr bool ENABLE_PREEXIT = 0;
+
+} // namespace llama4_fc_swiglu_tiled
+
 __device__ __forceinline__ float2 ffma2(float2 x, float2 y, float2 acc)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000))
@@ -60,6 +75,11 @@ __device__ __forceinline__ float2 ffma2(float2 x, float2 y, float2 acc)
 #else
     return make_float2(x.x * y.x + acc.x, x.y * y.y + acc.y);
 #endif
+}
+
+__device__ __forceinline__ float silu(float x)
+{
+    return x / (1.0f + __expf(-x));
 }
 
 struct __align__(8) aligned_fp8x8
