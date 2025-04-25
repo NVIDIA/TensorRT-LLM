@@ -98,28 +98,8 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-# Copied from https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py#L339
-@torch.inference_mode()
-def apply_rotary_pos_emb_ds(q, k, cos, sin, position_ids, unsqueeze_dim=1):
-    """
-    RoPE implementation by DeepSeek:
-    Apply rotary positional embeddings by interleaving Q/K ,
-    indexing cos/sin tables with position_ids, and returning rotated q, k.
-    cos:  [seq_len, head_dim]
-    sin:  [seq_len, head_dim]
-    """
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-
-    q = q.unflatten(-1, (-1, 2)).transpose(-1, -2).reshape_as(q)
-    k = k.unflatten(-1, (-1, 2)).transpose(-1, -2).reshape_as(k)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-@torch.library.custom_op("rope::torch_apply_explicit_rope", mutates_args=())
-def torch_apply_explicit_rope(
+@torch.library.custom_op("rope::torch_apply_rope_with_explicit_cos_sin", mutates_args=())
+def torch_apply_rope_with_explicit_cos_sin(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -138,18 +118,19 @@ def torch_apply_explicit_rope(
     return q_embed, k_embed
 
 
-@torch_apply_explicit_rope.register_fake
-def torch_apply_explicit_rope_fake(
+@torch_apply_rope_with_explicit_cos_sin.register_fake
+def torch_apply_rope_with_explicit_cos_sin_fake(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return q, k
 
 
-@torch.library.custom_op("rope::torch_apply_complex_rope", mutates_args=())
-def torch_apply_complex_rope(
+@torch.library.custom_op("rope::torch_apply_rope_with_complex_freqs", mutates_args=())
+def torch_apply_rope_with_complex_freqs(
     xq: torch.Tensor,
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,  # shape [B, S, head_dim//2]
+    unsqueeze_dim: int = 2,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Reference PyTorch implementation of interleaved (complex) RoPE:
@@ -159,26 +140,25 @@ def torch_apply_complex_rope(
     """
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    xq_out = torch.view_as_real(xq_ * freqs_cis[:, :, None, :]).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis[:, :, None, :]).flatten(3)
+    freqs = freqs_cis.unsqueeze(unsqueeze_dim)
+    xq_out = torch.view_as_real(xq_ * freqs).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
-@torch_apply_complex_rope.register_fake
-def torch_apply_complex_rope_fake(
+@torch_apply_rope_with_complex_freqs.register_fake
+def torch_apply_rope_with_complex_freqs_fake(
     xq: torch.Tensor,
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,  # shape [B, S, head_dim//2]
+    unsqueeze_dim: int = 2,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return xq, xk
 
 
 @torch.library.custom_op("rope::torch_apply_rope_with_qk_interleaving", mutates_args=())
 def torch_apply_rope_with_qk_interleaving(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     DeepSeek-style RoPE: interleaves Q/K channels and returns rotated (q_embed, k_embed).
@@ -186,6 +166,8 @@ def torch_apply_rope_with_qk_interleaving(
     - Frequencies are provided as separate `cos` and `sin` tensors of shape
         [B, S, 1, D] or [B*S, 1, D] or [B, 1, S, D] matching input shape.
     """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
     # Rewrite below code to accept 3D input:
     # b, h, s, d = q.shape
     # q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
@@ -200,6 +182,6 @@ def torch_apply_rope_with_qk_interleaving(
 
 @torch_apply_rope_with_qk_interleaving.register_fake
 def torch_apply_rope_with_qk_interleaving_fake(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return q, k
