@@ -44,11 +44,13 @@ public:
     std::optional<int> assignBufferIndexForRecv();
     void freeBufferIndexForRecv(std::optional<int> bufferId);
 
-    std::pair<std::vector<runtime::ITensor::SharedPtr>, size_t> getOrAllocateSendBuffers(std::optional<int> bufferId,
-        int targetNum, size_t targetBufferSize, runtime::BufferManager const& bufferManagerToUse);
+    std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateSendBuffers(
+        std::optional<int> bufferId, int targetNum, size_t targetBufferSize,
+        runtime::BufferManager const& bufferManagerToUse);
 
-    std::pair<std::vector<runtime::ITensor::SharedPtr>, size_t> getOrAllocateRecvBuffers(std::optional<int> bufferId,
-        int targetNum, size_t targetBufferSize, runtime::BufferManager const& bufferManagerToUse);
+    std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateRecvBuffers(
+        std::optional<int> bufferId, int targetNum, size_t targetBufferSize,
+        runtime::BufferManager const& bufferManagerToUse);
 
     runtime::ITensor::SharedPtr getSendBuffer(std::optional<int> bufferId);
     runtime::ITensor::SharedPtr getRecvBuffer(std::optional<int> bufferId);
@@ -63,20 +65,20 @@ private:
         std::atomic<int> mConcurrence = 0;
     };
 
-    std::pair<std::vector<runtime::ITensor::SharedPtr>, size_t> getOrAllocateBuffers(std::optional<int> bufferId,
+    std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateBuffers(std::optional<int> bufferId,
         int targetNum, size_t targetBufferEleSize, runtime::BufferManager const& bufferManagerToUse,
         ConcurrenceResource& concurrenceResource);
 
     void allocateBuffer();
-    std::optional<int> assignBufferIndex(ConcurrenceResource& resource, size_t bufferCount, bool onlyUseAsyncBuffer);
+    std::optional<int> assignBufferIndex(ConcurrenceResource& resource, size_t bufferCount, bool onlyUseDynamicBuffer);
     void freeBufferIndex(
-        ConcurrenceResource& resource, std::optional<int> bufferId, size_t bufferCount, bool onlyUseAsyncBuffer);
+        ConcurrenceResource& resource, std::optional<int> bufferId, size_t bufferCount, bool onlyUseDynamicBuffer);
 
     size_t mPreAllocBufferSize;
     size_t mRecvBufferCount;
     size_t mSendBufferCount;
     size_t mTransferBufferSize;
-    bool mOnlyUseAsyncBuffer;
+    bool monlyUseDynamicBuffer;
     size_t mBufferEleSize;
     nvinfer1::DataType mDataType;
     ConcurrenceResource mConcurrenceSendResource;

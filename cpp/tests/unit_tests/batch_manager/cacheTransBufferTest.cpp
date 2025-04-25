@@ -31,6 +31,7 @@ protected:
     void SetUpCacheTransBuffer(int numLayers, int numHeads, int sizePerHead, int tokensPerBlock, CacheType cacheType,
         std::optional<size_t> maxNumTokens)
     {
+        setenv("TRTLLM_USE_UCX_KVCACHE", "1", 1);
         // Initialize KVCacheManager with required parameters
         auto hiddenSize = numHeads * sizePerHead;
         auto constexpr maxBlocksPerSeq = 10;
@@ -322,10 +323,11 @@ TEST_F(CacheTransBufferTest, TestForNullOptAndNoneTransSize)
         auto bufferManager = tensorrt_llm::runtime::BufferManager{std::make_shared<CudaStream>()};
         auto targetNum = 2;
         auto targetSize = 1024;
-        auto [sendBuffers, bufferCoverTargetNum]
+        auto [sendBuffers, bufferCoverTargetNum, onlyUseDynamicBuffer]
             = mTransBufferManager->getOrAllocateSendBuffers(bufferId3, targetNum, targetSize, bufferManager);
         EXPECT_EQ(sendBuffers.size(), targetNum);
         EXPECT_EQ(bufferCoverTargetNum, targetNum);
+        EXPECT_EQ(onlyUseDynamicBuffer, true);
         mTransBufferManager->freeBufferIndexForSend(bufferId3);
         EXPECT_EQ(sendBuffers.at(0)->getSize(), targetSize);
 
@@ -366,11 +368,11 @@ TEST_F(CacheTransBufferTest, TestForNullOptAndDefaultTransSize)
         auto bufferManager = tensorrt_llm::runtime::BufferManager{std::make_shared<CudaStream>()};
         auto targetNum = 2;
         auto targetSize = 1024;
-        auto [sendBuffers, bufferCoverTargetNum]
+        auto [sendBuffers, bufferCoverTargetNum, onlyUseDynamicBuffer]
             = mTransBufferManager->getOrAllocateSendBuffers(bufferId3, targetNum, targetSize, bufferManager);
         EXPECT_EQ(sendBuffers.size(), targetNum);
         EXPECT_EQ(bufferCoverTargetNum, targetNum);
-
+        EXPECT_EQ(onlyUseDynamicBuffer, false);
         EXPECT_EQ(mTransBufferManager->getSendBuffer(bufferId3)->getSizeInBytes(), defaultTransSize);
         mTransBufferManager->freeBufferIndexForSend(bufferId3);
         EXPECT_EQ(sendBuffers.at(0)->getSize(), targetSize);
@@ -380,20 +382,22 @@ TEST_F(CacheTransBufferTest, TestForNullOptAndDefaultTransSize)
         auto bufferId4 = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId4.has_value());
         EXPECT_EQ(bufferId4.value(), 0);
-        auto [sendBuffers2, bufferCoverTargetNum2]
+        auto [sendBuffers2, bufferCoverTargetNum2, onlyUseDynamicBuffer2]
             = mTransBufferManager->getOrAllocateSendBuffers(bufferId4, targetNum, targetSize, bufferManager);
         EXPECT_EQ(sendBuffers2.size(), targetNum);
         EXPECT_EQ(bufferCoverTargetNum2, targetNum / 2);
+        EXPECT_EQ(onlyUseDynamicBuffer2, false);
         mTransBufferManager->freeBufferIndexForSend(bufferId4);
 
         targetSize = defaultTransSize / 4 / 8;
         auto bufferId5 = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId5.has_value());
         EXPECT_EQ(bufferId5.value(), 0);
-        auto [sendBuffers3, bufferCoverTargetNum3]
+        auto [sendBuffers3, bufferCoverTargetNum3, onlyUseDynamicBuffer3]
             = mTransBufferManager->getOrAllocateSendBuffers(bufferId5, targetNum, targetSize, bufferManager);
         EXPECT_EQ(sendBuffers3.size(), targetNum);
         EXPECT_EQ(bufferCoverTargetNum3, targetNum);
+        EXPECT_EQ(onlyUseDynamicBuffer3, false);
         mTransBufferManager->freeBufferIndexForSend(bufferId5);
         exit(testing::Test::HasFailure() ? 1 : 0);
     }

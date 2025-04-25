@@ -422,7 +422,7 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                 {
                     cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
                     TLLM_CHECK(cacheBufferId.has_value());
-                    auto [recvSplitCachestmp, bufferCoverTargetNumtmp]
+                    auto [recvSplitCachestmp, bufferCoverTargetNumtmp, onlyUseDynamicBuffer]
                         = mCacheTransBufferManager->getOrAllocateRecvBuffers(
                             cacheBufferId, targetNum, targetBufferSize, bufferManager);
                     bufferCoverTargetNum = bufferCoverTargetNumtmp;

@@ -45,7 +45,7 @@ CacheTransBufferManager::CacheTransBufferManager(
         / tokensPerBlock;
     mTransferBufferSize = maxNumTokens.has_value() ? maxNumTokens.value() * kvCachePerToken
                                                    : common::getEnvMemSizeForKVCacheTransferBuffer();
-    mOnlyUseAsyncBuffer = mTransferBufferSize == 0;
+    monlyUseDynamicBuffer = mTransferBufferSize == 0;
     mRecvBufferCount = common::getEnvRequestKVCacheConcurrent() ? common::getEnvKVCacheRecvBufferCount() : 1;
     mSendBufferCount = common::getEnvParallelCacheSend() ? common::getEnvKVCacheSendMaxConcurrenceNum() : 1;
     mPreAllocBufferSize = mTransferBufferSize * (mRecvBufferCount + mSendBufferCount);
@@ -54,7 +54,7 @@ CacheTransBufferManager::CacheTransBufferManager(
         "mSendBufferCount:%ld,mTransferBufferSize:%ld, mPreAllocBufferSize:%ld",
         maxNumTokens.has_value() ? maxNumTokens.value() : 0, mRecvBufferCount, mSendBufferCount, mTransferBufferSize,
         mPreAllocBufferSize);
-    bool to_allocate = common::getEnvUseMPIKvCache() || common::getEnvUseMPIKvCache();
+    bool to_allocate = common::getEnvUseMPIKvCache() || common::getEnvUseUCXKvCache();
 
     TLLM_CHECK_WITH_INFO(to_allocate, "CacheTransBufferManager: to_allocate is false");
     allocateBuffer();
@@ -63,7 +63,7 @@ CacheTransBufferManager::CacheTransBufferManager(
 size_t CacheTransBufferManager::preAllocBufferSize(
     std::optional<size_t> maxNumTokens, std::optional<size_t> kvCacheSizePerToken)
 {
-    bool to_allocate = common::getEnvUseMPIKvCache() || common::getEnvUseMPIKvCache();
+    bool to_allocate = common::getEnvUseMPIKvCache() || common::getEnvUseUCXKvCache();
     if (!to_allocate)
     {
         return 0;
@@ -85,32 +85,32 @@ size_t CacheTransBufferManager::preAllocBufferSize(
 
 std::optional<int> CacheTransBufferManager::assignBufferIndexForSend()
 {
-    return assignBufferIndex(mConcurrenceSendResource, mSendBufferCount, mOnlyUseAsyncBuffer);
+    return assignBufferIndex(mConcurrenceSendResource, mSendBufferCount, monlyUseDynamicBuffer);
 }
 
 void CacheTransBufferManager::freeBufferIndexForSend(std::optional<int> bufferId)
 {
-    freeBufferIndex(mConcurrenceSendResource, bufferId, mSendBufferCount, mOnlyUseAsyncBuffer);
+    freeBufferIndex(mConcurrenceSendResource, bufferId, mSendBufferCount, monlyUseDynamicBuffer);
 }
 
 std::optional<int> CacheTransBufferManager::assignBufferIndexForRecv()
 {
-    return assignBufferIndex(mConcurrenceRecvResource, mRecvBufferCount, mOnlyUseAsyncBuffer);
+    return assignBufferIndex(mConcurrenceRecvResource, mRecvBufferCount, monlyUseDynamicBuffer);
 }
 
 void CacheTransBufferManager::freeBufferIndexForRecv(std::optional<int> bufferId)
 {
-    freeBufferIndex(mConcurrenceRecvResource, bufferId, mRecvBufferCount, mOnlyUseAsyncBuffer);
+    freeBufferIndex(mConcurrenceRecvResource, bufferId, mRecvBufferCount, monlyUseDynamicBuffer);
 }
 
-std::pair<std::vector<runtime::ITensor::SharedPtr>, size_t> CacheTransBufferManager::getOrAllocateSendBuffers(
+std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBufferManager::getOrAllocateSendBuffers(
     std::optional<int> bufferId, int targetNum, size_t targetBufferSize,
     runtime::BufferManager const& bufferManagerToUse)
 {
     return getOrAllocateBuffers(bufferId, targetNum, targetBufferSize, bufferManagerToUse, mConcurrenceSendResource);
 }
 
-std::pair<std::vector<runtime::ITensor::SharedPtr>, size_t> CacheTransBufferManager::getOrAllocateRecvBuffers(
+std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBufferManager::getOrAllocateRecvBuffers(
     std::optional<int> bufferId, int targetNum, size_t targetBufferSize,
     runtime::BufferManager const& bufferManagerToUse)
 {
@@ -119,7 +119,7 @@ std::pair<std::vector<runtime::ITensor::SharedPtr>, size_t> CacheTransBufferMana
 
 runtime::ITensor::SharedPtr CacheTransBufferManager::getSendBuffer(std::optional<int> bufferId)
 {
-    TLLM_CHECK(bufferId.has_value() || mOnlyUseAsyncBuffer);
+    TLLM_CHECK(bufferId.has_value() || monlyUseDynamicBuffer);
     if (bufferId.has_value())
     {
         TLLM_CHECK(static_cast<size_t>(bufferId.value()) < mSendBufferCount);
@@ -131,7 +131,7 @@ runtime::ITensor::SharedPtr CacheTransBufferManager::getSendBuffer(std::optional
 
 runtime::ITensor::SharedPtr CacheTransBufferManager::getRecvBuffer(std::optional<int> bufferId)
 {
-    TLLM_CHECK(bufferId.has_value() || mOnlyUseAsyncBuffer);
+    TLLM_CHECK(bufferId.has_value() || monlyUseDynamicBuffer);
     if (bufferId.has_value())
     {
         TLLM_CHECK(static_cast<size_t>(bufferId.value()) < mRecvBufferCount);
@@ -141,11 +141,11 @@ runtime::ITensor::SharedPtr CacheTransBufferManager::getRecvBuffer(std::optional
     return nullptr;
 }
 
-std::pair<std::vector<runtime::ITensor::SharedPtr>, size_t> CacheTransBufferManager::getOrAllocateBuffers(
+std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBufferManager::getOrAllocateBuffers(
     std::optional<int> bufferId, int targetNum, size_t targetBufferEleSize,
     runtime::BufferManager const& bufferManagerToUse, ConcurrenceResource& concurrenceResource)
 {
-    TLLM_CHECK(bufferId.has_value() || mOnlyUseAsyncBuffer);
+    TLLM_CHECK(bufferId.has_value() || monlyUseDynamicBuffer);
     std::vector<runtime::ITensor::SharedPtr> retSplitCaches;
     size_t bufferCoverTargetNum = std::min(
         static_cast<size_t>(targetNum), mTransferBufferSize / (targetBufferEleSize * common::getDTypeSize(mDataType)));
@@ -178,18 +178,18 @@ std::pair<std::vector<runtime::ITensor::SharedPtr>, size_t> CacheTransBufferMana
                 runtime::ITensor::makeShape({static_cast<int64_t>(targetBufferEleSize)}), mDataType));
         }
     }
-    if (mOnlyUseAsyncBuffer)
+    if (monlyUseDynamicBuffer)
     {
         bufferCoverTargetNum = targetNum;
     }
-    return std::make_pair(retSplitCaches, bufferCoverTargetNum);
+    return std::make_tuple(retSplitCaches, bufferCoverTargetNum, monlyUseDynamicBuffer);
 }
 
 void CacheTransBufferManager::allocateBuffer()
 {
-    if (mOnlyUseAsyncBuffer)
+    if (monlyUseDynamicBuffer)
     {
-        TLLM_LOG_INFO("mOnlyUseAsyncBuffer: true");
+        TLLM_LOG_INFO("monlyUseDynamicBuffer: true");
         return;
     }
     mBufferEleSize = mTransferBufferSize / common::getDTypeSize(mDataType);
@@ -225,9 +225,9 @@ void CacheTransBufferManager::allocateBuffer()
 }
 
 std::optional<int> CacheTransBufferManager::assignBufferIndex(
-    ConcurrenceResource& resource, size_t bufferCount, bool onlyUseAsyncBuffer)
+    ConcurrenceResource& resource, size_t bufferCount, bool onlyUseDynamicBuffer)
 {
-    if (onlyUseAsyncBuffer)
+    if (onlyUseDynamicBuffer)
     {
         return std::nullopt;
     }
@@ -252,9 +252,9 @@ std::optional<int> CacheTransBufferManager::assignBufferIndex(
 }
 
 void CacheTransBufferManager::freeBufferIndex(
-    ConcurrenceResource& resource, std::optional<int> bufferId, size_t bufferCount, bool onlyUseAsyncBuffer)
+    ConcurrenceResource& resource, std::optional<int> bufferId, size_t bufferCount, bool onlyUseDynamicBuffer)
 {
-    if (onlyUseAsyncBuffer)
+    if (onlyUseDynamicBuffer)
     {
         return;
     }
