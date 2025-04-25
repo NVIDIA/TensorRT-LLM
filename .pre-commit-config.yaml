@@ -1,7 +1,7 @@
 default_install_hook_types: [pre-commit, commit-msg]
 repos:
 -   repo: https://github.com/pycqa/isort
-    rev: 5.12.0
+    rev: 6.0.1
     hooks:
     -   id: isort
 -   repo: https://github.com/Lucas-C/pre-commit-hooks.git
@@ -14,7 +14,7 @@ repos:
     -   id: yapf
         exclude: ".*/auto_deploy/.*"
 -   repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.1.0
+    rev: v5.0.0
     hooks:
     -   id: check-added-large-files
         exclude: |
@@ -48,14 +48,14 @@ repos:
         - tomli
         args: ['--config', 'pyproject.toml']
 -   repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v16.0.0
+    rev: v20.1.0
     hooks:
     -   id: clang-format
         types_or: [c++, c, cuda]
         exclude: |
             (?x)^(.*cubin.cpp$ | .*_cubin.h)$
 -   repo: https://github.com/cheshirekow/cmake-format-precommit
-    rev: v0.6.10
+    rev: v0.6.13
     hooks:
     -   id: cmake-format
 -   repo: https://github.com/codespell-project/codespell
@@ -67,7 +67,7 @@ repos:
         # add ignore words list
         args: ["-L", "Mor,ans"]
 -   repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.9.4
+    rev: v0.11.7
     hooks:
     -   id: ruff
         args: [--fix, --exit-non-zero-on-fix]
@@ -75,7 +75,7 @@ repos:
     -   id: ruff-format
         files: ".*/auto_deploy/.*"
 -   repo: https://github.com/executablebooks/mdformat
-    rev: 0.7.17
+    rev: 0.7.22
     hooks:
     -   id: mdformat
         additional_dependencies:

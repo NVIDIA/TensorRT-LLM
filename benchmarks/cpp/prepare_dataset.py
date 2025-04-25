@@ -31,12 +31,13 @@ class RootArgs(BaseModel):
     task_id: int
     std_out: bool
     rand_task_id: Optional[Tuple[int, int]]
+    export_format: str
 
-    @field_validator('tokenizer')
+    @field_validator("tokenizer")
     def get_tokenizer(cls,
                       v: str) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
         try:
-            tokenizer = AutoTokenizer.from_pretrained(v, padding_side='left')
+            tokenizer = AutoTokenizer.from_pretrained(v, padding_side="left")
         except EnvironmentError as e:
             raise ValueError(
                 f"Cannot find a tokenizer from the given string because of {e}\nPlease set tokenizer to the directory that contains the tokenizer, or set to a model name in HuggingFace."
@@ -51,48 +52,65 @@ class RootArgs(BaseModel):
     required=True,
     type=str,
     help=
-    "Tokenizer dir for the model run by gptManagerBenchmark, or the model name from HuggingFace."
+    "Tokenizer dir for the model run by gptManagerBenchmark, or the model name from HuggingFace.",
 )
-@click.option("--output",
-              type=str,
-              help="Output json filename.",
-              default="preprocessed_dataset.json")
+@click.option(
+    "--output",
+    type=str,
+    help="Output json filename.",
+    default="preprocessed_dataset.json",
+)
 @click.option(
     "--stdout",
     is_flag=True,
     help="Print output to stdout with a JSON dataset entry on each line.",
-    default=False)
-@click.option("--random-seed",
-              required=False,
-              type=int,
-              help="random seed for token_ids",
-              default=420)
+    default=False,
+)
+@click.option(
+    "--random-seed",
+    required=False,
+    type=int,
+    help="random seed for token_ids",
+    default=420,
+)
 @click.option("--task-id", type=int, default=-1, help="LoRA task id")
 @click.option("--rand-task-id",
               type=int,
               default=None,
               nargs=2,
               help="Random LoRA Tasks")
-@click.option("--log-level",
-              default="info",
-              type=click.Choice(['info', 'debug']),
-              help="Logging level.")
+@click.option(
+    "--log-level",
+    default="info",
+    type=click.Choice(["info", "debug"]),
+    help="Logging level.",
+)
+@click.option(
+    "--export-format",
+    default="gpt-manager-benchmark",
+    type=click.Choice(["gpt-manager-benchmark", "tllm-bench"]),
+    help=
+    "Sets the export format so that the dataset can be consumed by your target benchmarking entrypoint.",
+)
 @click.pass_context
-def cli(ctx, **kwargs):
+def cli(ctx: click.Context, **kwargs):
     """This script generates dataset input for gptManagerBenchmark."""
-    if kwargs['log_level'] == 'info':
+    if kwargs["log_level"] == "info":
         logging.basicConfig(level=logging.INFO)
-    elif kwargs['log_level'] == 'debug':
+    elif kwargs["log_level"] == "debug":
         logging.basicConfig(level=logging.DEBUG)
     else:
         raise ValueError(f"Unsupported logging level {kwargs['log_level']}")
 
-    ctx.obj = RootArgs(tokenizer=kwargs['tokenizer'],
-                       output=kwargs['output'],
-                       std_out=kwargs['stdout'],
-                       random_seed=kwargs['random_seed'],
-                       task_id=kwargs['task_id'],
-                       rand_task_id=kwargs['rand_task_id'])
+    ctx.obj = RootArgs(
+        tokenizer=kwargs["tokenizer"],
+        output=kwargs["output"],
+        std_out=kwargs["stdout"],
+        random_seed=kwargs["random_seed"],
+        task_id=kwargs["task_id"],
+        rand_task_id=kwargs["rand_task_id"],
+        export_format=kwargs["export_format"],
+    )
 
 
 cli.add_command(dataset)
