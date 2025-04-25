@@ -493,8 +493,8 @@ class ReportUtility:
             f"Total Latency (ms):                               {perf['total_latency_ms']:.4f}\n"
             f"Average request latency (ms):                     {perf['avg_request_latency_ms']:.4f}\n"
             # Output Throughput includes context/first token.
-            f"Per User Output Throughput [w/ context] (tps/user): {perf['output_throughput_per_user_tok_s']:.4f}\n"
-            f"Per GPU Output Throughput (tps/gpu):                {perf['output_throughput_per_gpu_tok_s']:.4f}\n"
+            f"Per User Output Throughput [w/ ctx] (tps/user):   {perf['output_throughput_per_user_tok_s']:.4f}\n"
+            f"Per GPU Output Throughput (tps/gpu):              {perf['output_throughput_per_gpu_tok_s']:.4f}\n"
         )
 
         if streaming:
