@@ -16,11 +16,13 @@
 
 def _check_mpi_environment():
     import os
-    has_mpirun = "OMPI_COMM_WORLD_RANK" in os.environ
+    has_mpi = any(var in os.environ
+                  for var in ["OMPI_COMM_WORLD_RANK", "OMPI_APP_CTX_NUM_PROCS"])
     has_pmix = "PMIX_RANK" in os.environ
-    if has_pmix and not has_mpirun:
+    if has_pmix and not has_mpi:
         raise RuntimeError(
-            "PMIx is detected, but OMPI_COMM_WORLD_RANK is not set. "
+            f"PMIx is detected (PMIX_RANK={os.environ['PMIX_RANK']}), "
+            "but OMPI_COMM_WORLD_RANK is not set. "
             "Please use mpirun to launch the program.")
 
 
