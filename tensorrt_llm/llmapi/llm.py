@@ -10,6 +10,9 @@ from typing import Any, List, Literal, Optional, Sequence, Union
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
+from tensorrt_llm.inputs.data import TextPrompt
+from tensorrt_llm.inputs.registry import DefaultInputProcessor
+
 from .. import bindings as tllm
 from .._utils import global_mpi_rank, nvtx_range_debug
 from ..bindings import executor as tllm
@@ -308,6 +311,16 @@ class LLM:
         inputs = prompt_inputs(inputs)
         if queries is not None:
             queries = prompt_inputs(queries)
+
+        if not inputs.get("prompt") and inputs.get(
+                "prompt_token_ids") and not isinstance(self.input_processor,
+                                                       DefaultInputProcessor):
+            # VLMs need to process/tokenize the prompt in their own way
+            prompt = self.tokenizer.decode(inputs['prompt_token_ids'])
+            inputs = TextPrompt(
+                prompt=prompt,
+                multi_modal_data=inputs.get("multi_modal_data"),
+                mm_processor_kwargs=inputs.get("mm_processor_kwargs"))
 
         query_token_ids = None
         prompt_tuning_config = None
