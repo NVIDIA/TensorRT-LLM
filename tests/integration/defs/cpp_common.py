@@ -41,22 +41,6 @@ include_test_map = {
 }
 
 
-def generate_excluded_model_tests() -> Generator[str, None, None]:
-    yield "Gpt[^j]"
-    yield "GptExecutor"
-    yield "Gptj"
-    yield "Llama"
-    yield "ChatGlm"
-    yield "Medusa"
-    yield "Eagle"
-    yield "ExplicitDraftTokensDecoding"
-    yield "Mamba"
-    yield "RecurrentGemma"
-    yield "Encoder"
-    yield "EncDec"
-    yield "SpeculativeDecoding"
-
-
 def generate_included_model_tests(
         test_list: List[str]) -> Generator[str, None, None]:
 
