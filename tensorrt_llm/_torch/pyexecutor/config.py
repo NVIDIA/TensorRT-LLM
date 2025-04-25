@@ -79,6 +79,8 @@ class PyTorchConfig:
     # from the model checkpoint.
     load_format: Union[str, LoadFormat] = 'auto'
 
+    enable_pure_python_scheduler = False
+
     def _convert_load_format(self) -> None:
         if isinstance(self.load_format, LoadFormat):
             return

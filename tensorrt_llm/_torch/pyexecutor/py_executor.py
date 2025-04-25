@@ -179,6 +179,7 @@ class PyExecutor:
         self.resource_manager = resource_manager
         self.scheduler = scheduler
         self.model_engine = model_engine
+        self.enable_pure_python_scheduler = model_engine.pytorch_backend_config.enable_pure_python_scheduler
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.decoder = decoder
         self.dist = dist
@@ -1197,6 +1198,10 @@ class PyExecutor:
             new_requests = _get_from_request_queue(
                 self.request_queue, timeout,
                 total_max_num_active_requests - total_num_active_requests)
+
+            if self.enable_pure_python_scheduler:
+                for req in new_requests:
+                    req.py_path = True
 
         new_requests = self._broadcast_new_requests(new_requests)
 

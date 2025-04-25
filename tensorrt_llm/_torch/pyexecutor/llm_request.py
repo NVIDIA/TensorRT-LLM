@@ -230,6 +230,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             stop_words_list=torch.tensor(stop_words_list, dtype=torch.int32)
             if stop_words_list else None,
             **kwargs)
+        self.py_path = False
         self.py_client_id = client_id
         self.py_request_id = self.request_id
         self.py_end_id = self.end_id
@@ -256,6 +257,20 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                   return_logits_device_memory, self.streaming,
                                   return_log_probs, return_context_logits,
                                   return_generation_logits)
+
+        self.py_state = int(self.state)
+
+    def set_state(self, value):
+        if self.py_path:
+            self.py_state = value
+        else:
+            self.state = value
+
+    def get_state(self):
+        if self.py_path:
+            return self.py_state
+        else:
+            return self.state
 
     def create_response(
             self,
