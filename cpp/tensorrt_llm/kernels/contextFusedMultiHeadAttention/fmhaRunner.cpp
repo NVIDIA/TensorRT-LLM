@@ -396,9 +396,9 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
 
         // Now we have SM90 generation MLA kernels. These treatments are only for context MLA and non SM90 generation
         // MLA.
-        bool isFP8GenerationMLA = mFixedParams.dataType == DATA_TYPE_E4M3
+        bool isFP8GenerationMLAOnHopper = mFixedParams.dataType == DATA_TYPE_E4M3
             && (mFixedParams.headSize == 576 && mFixedParams.headSizeV == 512) && isSm90;
-        if (!isFP8GenerationMLA)
+        if (!isFP8GenerationMLAOnHopper)
         {
             mLaunchParams.granular_tiling = true;
             // Even on SM90, we use ampere-style kernel, will be optimized later

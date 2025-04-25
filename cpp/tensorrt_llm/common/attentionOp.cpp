@@ -2284,8 +2284,8 @@ int AttentionOp::initialize() noexcept
     if (mFP8GenerationMLA)
     {
         TLLM_CHECK_WITH_INFO(mIsMLAEnabled, "FP8 Generation MLA cannot be enabled because MLA is not supported.");
-        TLLM_CHECK_WITH_INFO(
-            mSM == 90 || mSM == 100, "FP8 Generation MLA is supported on Hopper or Blackwell architecture.");
+        TLLM_CHECK_WITH_INFO(mSM == 90 || mSM == 100 || mSM == 120,
+            "FP8 Generation MLA is supported on Hopper or Blackwell architecture.");
     }
 
     // Check requirements for FP4 output.
