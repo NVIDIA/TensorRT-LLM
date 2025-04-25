@@ -4,21 +4,23 @@ import torch
 from torch import nn
 from transformers import MistralConfig
 
+from tensorrt_llm._torch.attention_backend import AttentionMetadata
+from tensorrt_llm._torch.attention_backend.interface import (
+    PositionalEmbeddingParams, RopeParams)
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
+                                                       DecoderModelForCausalLM,
+                                                       register_auto_model,
+                                                       support_pp)
+from tensorrt_llm._torch.modules.attention import Attention
+from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
+from tensorrt_llm._torch.modules.embedding import Embedding
+from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+from tensorrt_llm._torch.modules.linear import TensorParallelMode
+from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
+from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm.functional import PositionEmbeddingType
-
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..distributed import ParallelConfig, TensorParallelMode
-from ..model_config import ModelConfig
-from ..modules.attention import Attention
-from ..modules.decoder_layer import DecoderLayer
-from ..modules.embedding import Embedding
-from ..modules.gated_mlp import GatedMLP
-from ..modules.rms_norm import RMSNorm
-from ..modules.rotary_embedding import RotaryEmbedding
-from ..speculative import SpecMetadata
-from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             register_auto_model, support_pp)
 
 
 class MistralAttention(Attention):
@@ -138,15 +140,9 @@ class MistralModel(DecoderModel):
             config.vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_rank=model_config.mapping.tp_rank,
-                tensor_parallel_size=model_config.mapping.tp_size,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                pipeline_parallel_size=model_config.mapping.pp_size,
-                parallel_rank=model_config.mapping.rank,
-                gather_output=True,
-                gpus_per_node=model_config.mapping.gpus_per_node,
-            ),
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            gather_output=True,
         )
         self.layers = nn.ModuleList([
             MistralDecoderLayer(
