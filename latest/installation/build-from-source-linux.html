@@ -1,0 +1,858 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Building from Source Code on Linux &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'installation/build-from-source-linux';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Installing on Grace Hopper" href="grace-hopper.html" />
+    <link rel="prev" title="Installing on Linux" href="linux.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="linux.html">Installing on Linux</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Building from Source Code on Linux</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="building-from-source-code-on-linux">
+<span id="build-from-source-linux"></span><h1>Building from Source Code on Linux<a class="headerlink" href="#building-from-source-code-on-linux" title="Link to this heading">#</a></h1>
+<p>This document provides instructions for building TensorRT-LLM from source code on Linux. Building from source code is necessary if you want the best performance or debugging capabilities, or if the <a class="reference external" href="https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html">GNU C++11 ABI</a> is required.</p>
+<section id="prerequisites">
+<h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h2>
+<p>Use <a class="reference external" href="https://www.docker.com">Docker</a> to build and run TensorRT-LLM. Instructions to install an environment to run Docker containers for the NVIDIA platform can be found <a class="reference external" href="https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html">here</a>.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># TensorRT-LLM uses git-lfs, which needs to be installed in advance.</span>
+apt-get<span class="w"> </span>update<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>apt-get<span class="w"> </span>-y<span class="w"> </span>install<span class="w"> </span>git<span class="w"> </span>git-lfs
+git<span class="w"> </span>lfs<span class="w"> </span>install
+
+git<span class="w"> </span>clone<span class="w"> </span>https://github.com/NVIDIA/TensorRT-LLM.git
+<span class="nb">cd</span><span class="w"> </span>TensorRT-LLM
+git<span class="w"> </span>submodule<span class="w"> </span>update<span class="w"> </span>--init<span class="w"> </span>--recursive
+git<span class="w"> </span>lfs<span class="w"> </span>pull
+</pre></div>
+</div>
+</section>
+<section id="building-a-tensorrt-llm-docker-image">
+<h2>Building a TensorRT-LLM Docker Image<a class="headerlink" href="#building-a-tensorrt-llm-docker-image" title="Link to this heading">#</a></h2>
+<p>There are two options to create a TensorRT-LLM Docker image. The approximate disk space required to build the image is 63 GB.</p>
+<section id="option-1-build-tensorrt-llm-in-one-step">
+<h3>Option 1: Build TensorRT-LLM in One Step<a class="headerlink" href="#option-1-build-tensorrt-llm-in-one-step" title="Link to this heading">#</a></h3>
+<p>TensorRT-LLM contains a simple command to create a Docker image. Note that if you plan to develop on TensorRT-LLM, we recommend using <a class="reference internal" href="#option-2-build-tensorrt-llm-step-by-step">Option 2: Build TensorRT-LLM Step-By-Step</a>.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>release_build
+</pre></div>
+</div>
+<p>You can add the <code class="docutils literal notranslate"><span class="pre">CUDA_ARCHS=&quot;&lt;list</span> <span class="pre">of</span> <span class="pre">architectures</span> <span class="pre">in</span> <span class="pre">CMake</span> <span class="pre">format&gt;&quot;</span></code> optional argument to specify which architectures should be supported by TensorRT-LLM. It restricts the supported GPU architectures but helps reduce compilation time:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Restrict the compilation to Ada and Hopper architectures.</span>
+make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>release_build<span class="w"> </span><span class="nv">CUDA_ARCHS</span><span class="o">=</span><span class="s2">&quot;89-real;90-real&quot;</span>
+</pre></div>
+</div>
+<p>After the image is built, the Docker container can be run.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>release_run
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">make</span></code> command supports the <code class="docutils literal notranslate"><span class="pre">LOCAL_USER=1</span></code> argument to switch to the local user account instead of <code class="docutils literal notranslate"><span class="pre">root</span></code> inside the container.  The examples of TensorRT-LLM are installed in the <code class="docutils literal notranslate"><span class="pre">/app/tensorrt_llm/examples</span></code> directory.</p>
+<p>Since TensorRT-LLM has been built and installed, you can skip the remaining steps.</p>
+</section>
+<section id="option-2-build-tensorrt-llm-step-by-step">
+<h3>Option 2: Build TensorRT-LLM Step-by-Step<a class="headerlink" href="#option-2-build-tensorrt-llm-step-by-step" title="Link to this heading">#</a></h3>
+<p>If you are looking for more flexibility, TensorRT-LLM has commands to create and run a development container in which TensorRT-LLM can be built.</p>
+<section id="create-the-container">
+<h4>Create the Container<a class="headerlink" href="#create-the-container" title="Link to this heading">#</a></h4>
+<p><strong>On systems with GNU <code class="docutils literal notranslate"><span class="pre">make</span></code></strong></p>
+<ol class="arabic">
+<li><p>Create a Docker image for development. The image will be tagged locally with <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/devel:latest</span></code>.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>build
+</pre></div>
+</div>
+</li>
+<li><p>Run the container.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>run
+</pre></div>
+</div>
+<p>If you prefer to work with your own user account in that container, instead of <code class="docutils literal notranslate"><span class="pre">root</span></code>, add the <code class="docutils literal notranslate"><span class="pre">LOCAL_USER=1</span></code> option.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>run<span class="w"> </span><span class="nv">LOCAL_USER</span><span class="o">=</span><span class="m">1</span>
+</pre></div>
+</div>
+</li>
+</ol>
+<p><strong>On systems without GNU <code class="docutils literal notranslate"><span class="pre">make</span></code></strong></p>
+<ol class="arabic">
+<li><p>Create a Docker image for development.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>build<span class="w"> </span>--pull<span class="w">  </span><span class="se">\</span>
+<span class="w">            </span>--target<span class="w"> </span>devel<span class="w"> </span><span class="se">\</span>
+<span class="w">            </span>--file<span class="w"> </span>docker/Dockerfile.multi<span class="w"> </span><span class="se">\</span>
+<span class="w">            </span>--tag<span class="w"> </span>tensorrt_llm/devel:latest<span class="w"> </span><span class="se">\</span>
+<span class="w">            </span>.
+</pre></div>
+</div>
+</li>
+<li><p>Run the container.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--ipc<span class="o">=</span>host<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span>--gpus<span class="o">=</span>all<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--volume<span class="w"> </span><span class="si">${</span><span class="nv">PWD</span><span class="si">}</span>:/code/tensorrt_llm<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--workdir<span class="w"> </span>/code/tensorrt_llm<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>tensorrt_llm/devel:latest
+</pre></div>
+</div>
+<p>Note: please make sure to set <code class="docutils literal notranslate"><span class="pre">--ipc=host</span></code> as a docker run argument to avoid <code class="docutils literal notranslate"><span class="pre">Bus</span> <span class="pre">error</span> <span class="pre">(core</span> <span class="pre">dumped)</span></code>.</p>
+</li>
+</ol>
+<p>Once inside the container, follow the next steps to build TensorRT-LLM from source.</p>
+</section>
+</section>
+</section>
+<section id="build-tensorrt-llm">
+<h2>Build TensorRT-LLM<a class="headerlink" href="#build-tensorrt-llm" title="Link to this heading">#</a></h2>
+<section id="option-1-full-build-with-c-compilation">
+<h3>Option 1: Full Build with C++ Compilation<a class="headerlink" href="#option-1-full-build-with-c-compilation" title="Link to this heading">#</a></h3>
+<p>The following command compiles the C++ code and packages the compiled libraries along with the Python files into a wheel. When developing C++ code, you need this full build command to apply your code changes.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># To build the TensorRT-LLM code.</span>
+python3<span class="w"> </span>./scripts/build_wheel.py
+</pre></div>
+</div>
+<p>Once the wheel is built, install it by:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>./build/tensorrt_llm*.whl
+</pre></div>
+</div>
+<p>Alternatively, you can use editable installation, which is convenient if you also develop Python code.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.
+</pre></div>
+</div>
+<p>By default, <code class="docutils literal notranslate"><span class="pre">build_wheel.py</span></code> enables incremental builds. To clean the build
+directory, add the <code class="docutils literal notranslate"><span class="pre">--clean</span></code> option:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>./scripts/build_wheel.py<span class="w"> </span>--clean
+</pre></div>
+</div>
+<p>It is possible to restrict the compilation of TensorRT-LLM to specific CUDA
+architectures. For that purpose, the <code class="docutils literal notranslate"><span class="pre">build_wheel.py</span></code> script accepts a
+semicolon separated list of CUDA architecture as shown in the following
+example:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Build TensorRT-LLM for Ampere.</span>
+python3<span class="w"> </span>./scripts/build_wheel.py<span class="w"> </span>--cuda_architectures<span class="w"> </span><span class="s2">&quot;80-real;86-real&quot;</span>
+</pre></div>
+</div>
+<p>To use the C++ benchmark scripts under <a class="reference internal" href="#/benchmarks/cpp/"><span class="xref myst">benchmark/cpp</span></a>, for example <code class="docutils literal notranslate"><span class="pre">gptManagerBenchmark.cpp</span></code>, add the <code class="docutils literal notranslate"><span class="pre">--benchmarks</span></code> option:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>./scripts/build_wheel.py<span class="w"> </span>--benchmarks
+</pre></div>
+</div>
+<p>Refer to the <a class="reference internal" href="../reference/support-matrix.html#support-matrix-hardware"><span class="std std-ref">Hardware</span></a> section for a list of architectures.</p>
+<section id="building-the-python-bindings-for-the-c-runtime">
+<h4>Building the Python Bindings for the C++ Runtime<a class="headerlink" href="#building-the-python-bindings-for-the-c-runtime" title="Link to this heading">#</a></h4>
+<p>The C++ Runtime, in particular, <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> can be exposed to Python via bindings. This feature can be turned on through the default build options.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>./scripts/build_wheel.py
+</pre></div>
+</div>
+<p>After installing, the resulting wheel as described above, the C++ Runtime bindings will be available in
+the <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.bindings</span></code> package. Running <code class="docutils literal notranslate"><span class="pre">help</span></code> on this package in a Python interpreter will provide on overview of the
+relevant classes. The associated unit tests should also be consulted for understanding the API.</p>
+<p>This feature will not be enabled when <a class="reference internal" href="#link-with-the-tensorrt-llm-c++-runtime"><span class="xref myst"><code class="docutils literal notranslate"><span class="pre">building</span> <span class="pre">only</span> <span class="pre">the</span> <span class="pre">C++</span> <span class="pre">runtime</span></code></span></a>.</p>
+</section>
+<section id="linking-with-the-tensorrt-llm-c-runtime">
+<h4>Linking with the TensorRT-LLM C++ Runtime<a class="headerlink" href="#linking-with-the-tensorrt-llm-c-runtime" title="Link to this heading">#</a></h4>
+<p>The <code class="docutils literal notranslate"><span class="pre">build_wheel.py</span></code> script will also compile the library containing the C++ runtime of TensorRT-LLM. If Python support and <code class="docutils literal notranslate"><span class="pre">torch</span></code> modules are not required, the script provides the option <code class="docutils literal notranslate"><span class="pre">--cpp_only</span></code> which restricts the build to the C++ runtime only.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>./scripts/build_wheel.py<span class="w"> </span>--cuda_architectures<span class="w"> </span><span class="s2">&quot;80-real;86-real&quot;</span><span class="w"> </span>--cpp_only<span class="w"> </span>--clean
+</pre></div>
+</div>
+<p>This is particularly useful to avoid linking problems which may be introduced by particular versions of <code class="docutils literal notranslate"><span class="pre">torch</span></code> related to the <a class="reference external" href="https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html">dual ABI support of GCC</a>. The option <code class="docutils literal notranslate"><span class="pre">--clean</span></code> will remove the build directory before building. The default build directory is <code class="docutils literal notranslate"><span class="pre">cpp/build</span></code>, which may be overridden using the option
+<code class="docutils literal notranslate"><span class="pre">--build_dir</span></code>. Run <code class="docutils literal notranslate"><span class="pre">build_wheel.py</span> <span class="pre">--help</span></code> for an overview of all supported options.</p>
+<p>The shared library can be found in the following location:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>cpp/build/tensorrt_llm/libtensorrt_llm.so
+</pre></div>
+</div>
+<p>In addition, link against the library containing the LLM plugins for TensorRT.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so
+</pre></div>
+</div>
+</section>
+<section id="supported-c-header-files">
+<h4>Supported C++ Header Files<a class="headerlink" href="#supported-c-header-files" title="Link to this heading">#</a></h4>
+<p>When using TensorRT-LLM, you need to add the <code class="docutils literal notranslate"><span class="pre">cpp</span></code> and <code class="docutils literal notranslate"><span class="pre">cpp/include</span></code> directories to the project’s include paths.  Only header files contained in <code class="docutils literal notranslate"><span class="pre">cpp/include</span></code> are part of the supported API and may be directly included. Other headers contained under <code class="docutils literal notranslate"><span class="pre">cpp</span></code> should not be included directly since they might change in future versions.</p>
+</section>
+</section>
+<section id="option-2-python-only-build-without-c-compilation">
+<h3>Option 2: Python-Only Build without C++ Compilation<a class="headerlink" href="#option-2-python-only-build-without-c-compilation" title="Link to this heading">#</a></h3>
+<p>If you only need to modify Python code, it is possible to package and install TensorRT-LLM without compilation.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Package TensorRT-LLM wheel.</span>
+<span class="nv">TRTLLM_USE_PRECOMPILED</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>pip<span class="w"> </span>wheel<span class="w"> </span>.<span class="w"> </span>--no-deps<span class="w"> </span>--wheel-dir<span class="w"> </span>./build
+
+<span class="c1"># Install TensorRT-LLM wheel.</span>
+pip<span class="w"> </span>install<span class="w"> </span>./build/tensorrt_llm*.whl
+</pre></div>
+</div>
+<p>Alternatively, you can use editable installation for convenience during Python development.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">TRTLLM_USE_PRECOMPILED</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.
+</pre></div>
+</div>
+<p>Setting <code class="docutils literal notranslate"><span class="pre">TRTLLM_USE_PRECOMPILED=1</span></code> enables downloading a prebuilt wheel of the version specified in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/version.py</span></code>, extracting compiled libraries into your current directory, thus skipping C++ compilation.</p>
+<p>You can specify a custom URL or local path for downloading using <code class="docutils literal notranslate"><span class="pre">TRTLLM_PRECOMPILED_LOCATION</span></code>. For example, to use version 0.16.0 from PyPI:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">TRTLLM_PRECOMPILED_LOCATION</span><span class="o">=</span>https://pypi.nvidia.com/tensorrt-llm/tensorrt_llm-0.16.0-cp312-cp312-linux_x86_64.whl<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.
+</pre></div>
+</div>
+<section id="known-limitations">
+<h4>Known Limitations<a class="headerlink" href="#known-limitations" title="Link to this heading">#</a></h4>
+<p>Currently, our released TensorRT-LLM wheel packages are linked against public PyTorch hosted on PyPI, which disables C++11 ABI support. However, the Docker image built previously is based on an NGC container where PyTorch has C++11 ABI enabled; see <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch">NGC PyTorch container page</a>. Therefore, we recommend performing a full build inside this container.</p>
+<p>When using <code class="docutils literal notranslate"><span class="pre">TRTLLM_PRECOMPILED_LOCATION</span></code>, ensure that your wheel is compiled based on the same version of C++ code as your current directory; any discrepancies may lead to compatibility issues.</p>
+</section>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="linux.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Installing on Linux</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="grace-hopper.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Installing on Grace Hopper</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#building-a-tensorrt-llm-docker-image">Building a TensorRT-LLM Docker Image</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#option-1-build-tensorrt-llm-in-one-step">Option 1: Build TensorRT-LLM in One Step</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#option-2-build-tensorrt-llm-step-by-step">Option 2: Build TensorRT-LLM Step-by-Step</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#create-the-container">Create the Container</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#build-tensorrt-llm">Build TensorRT-LLM</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#option-1-full-build-with-c-compilation">Option 1: Full Build with C++ Compilation</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#building-the-python-bindings-for-the-c-runtime">Building the Python Bindings for the C++ Runtime</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#linking-with-the-tensorrt-llm-c-runtime">Linking with the TensorRT-LLM C++ Runtime</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#supported-c-header-files">Supported C++ Header Files</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#option-2-python-only-build-without-c-compilation">Option 2: Python-Only Build without C++ Compilation</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#known-limitations">Known Limitations</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

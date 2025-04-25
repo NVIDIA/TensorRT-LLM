@@ -1,0 +1,11 @@
+Online Serving Examples
+=================================
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Scripts
+
+   curl_chat_client
+   curl_completion_client
+   openai_chat_client
+   openai_completion_client

@@ -1,0 +1,814 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Executor API &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'advanced/executor';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Graph Rewriting Module" href="graph-rewriting.html" />
+    <link rel="prev" title="C++ GPT Runtime" href="gpt-runtime.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Executor API</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="executor-api">
+<span id="executor"></span><h1>Executor API<a class="headerlink" href="#executor-api" title="Link to this heading">#</a></h1>
+<p>TensorRT-LLM includes a high-level C++ API called the Executor API which allows you to execute requests
+asynchronously, with in-flight batching, and without the need to define callbacks.</p>
+<p>A software component (referred to as “the client” in the text that follows) can interact
+with the executor using the API defined in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/HEAD/cpp/include/tensorrt_llm/executor/executor.h"><code class="docutils literal notranslate"><span class="pre">executor.h</span></code></a> file.
+For details about the API, refer to the <span class="xref std std-ref">_cpp_gen/executor.rst</span>.</p>
+<p>The following sections provide an overview of the main classes defined in the Executor API.</p>
+<section id="api">
+<h2>API<a class="headerlink" href="#api" title="Link to this heading">#</a></h2>
+<section id="the-executor-class">
+<h3>The Executor Class<a class="headerlink" href="#the-executor-class" title="Link to this heading">#</a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">Executor</span></code> class is responsible for receiving requests from the client, and providing responses for those requests. The executor is constructed by providing a path to a directory containing the TensorRT-LLM engine or buffers containing the engine and the model JSON configuration. The client can create requests and enqueue those requests for execution using the <code class="docutils literal notranslate"><span class="pre">enqueueRequest</span></code> or <code class="docutils literal notranslate"><span class="pre">enqueueRequests</span></code> methods of the <code class="docutils literal notranslate"><span class="pre">Executor</span></code> class. Enqueued requests will be scheduled for execution by the executor, and multiple independent requests can be batched together at every iteration of the main execution loop (a process often referred to as continuous batching or iteration-level batching). Responses for a particular request can be awaited for by calling the <code class="docutils literal notranslate"><span class="pre">awaitResponses</span></code> method, and by providing the request id. Alternatively, responses for any requests can be awaited for by omitting to provide the request id when calling <code class="docutils literal notranslate"><span class="pre">awaitResponses</span></code>. The <code class="docutils literal notranslate"><span class="pre">Executor</span></code> class also allows to cancel requests using the <code class="docutils literal notranslate"><span class="pre">cancelRequest</span></code> method and to obtain per-iteration and per-request statistics using the <code class="docutils literal notranslate"><span class="pre">getLatestIterationStats</span></code>.</p>
+</section>
+<section id="the-request-class">
+<h3>The Request Class<a class="headerlink" href="#the-request-class" title="Link to this heading">#</a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">Request</span></code> class is used to define properties of the request, such as the input token ids and the maximum number of tokens to generate. The <code class="docutils literal notranslate"><span class="pre">streaming</span></code> parameter can be used to indicate if the request should generate a response for each new generated tokens (<code class="docutils literal notranslate"><span class="pre">streaming</span> <span class="pre">=</span> <span class="pre">true</span></code>) or only after all tokens have been generated (<code class="docutils literal notranslate"><span class="pre">streaming</span> <span class="pre">=</span> <span class="pre">false</span></code>). Other mandatory parameters of the request include the sampling configuration (defined by the <code class="docutils literal notranslate"><span class="pre">SamplingConfig</span></code> class) which contains parameters controlling the decoding process and the output configuration (defined by the <code class="docutils literal notranslate"><span class="pre">OutputConfig</span></code> class) which controls what information should be included in the <code class="docutils literal notranslate"><span class="pre">Result</span></code> for a particular response.</p>
+<p>Optional parameters can also be provided when constructing a request such as a list of bad words, a list of stop words, a client id, or configurations objects for prompt tuning, LoRA, or speculative decoding, or a number of sequences to generate for example.</p>
+</section>
+<section id="the-response-class">
+<h3>The Response Class<a class="headerlink" href="#the-response-class" title="Link to this heading">#</a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">awaitResponses</span></code> method of the <code class="docutils literal notranslate"><span class="pre">Executor</span></code> class returns a vector of responses. Each response contains the request id associated with this response, and also contains either an error or a <code class="docutils literal notranslate"><span class="pre">Result</span></code>. Check if the response has an error by using the <code class="docutils literal notranslate"><span class="pre">hasError</span></code> method before trying to obtain the <code class="docutils literal notranslate"><span class="pre">Result</span></code> associated with this response using the <code class="docutils literal notranslate"><span class="pre">getResult</span></code> method.</p>
+</section>
+<section id="the-result-class">
+<h3>The Result Class<a class="headerlink" href="#the-result-class" title="Link to this heading">#</a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">Result</span></code> class holds the result for a given request. It contains a Boolean parameter called <code class="docutils literal notranslate"><span class="pre">isFinal</span></code> that indicates if this is the last <code class="docutils literal notranslate"><span class="pre">Result</span></code> that will be returned for the given request id. It also contains the generated tokens. If the request is configured with <code class="docutils literal notranslate"><span class="pre">streaming</span> <span class="pre">=</span> <span class="pre">false</span></code> and <code class="docutils literal notranslate"><span class="pre">numReturnSequences</span> <span class="pre">=</span> <span class="pre">1</span></code>, a single response will be returned, the <code class="docutils literal notranslate"><span class="pre">isFinal</span></code> Boolean will be set to <code class="docutils literal notranslate"><span class="pre">true</span></code> and all generated tokens will be included in the <code class="docutils literal notranslate"><span class="pre">outputTokenIds</span></code>. If <code class="docutils literal notranslate"><span class="pre">streaming</span> <span class="pre">=</span> <span class="pre">true</span></code> and <code class="docutils literal notranslate"><span class="pre">numReturnSequences</span> <span class="pre">=</span> <span class="pre">1</span></code> is used, a <code class="docutils literal notranslate"><span class="pre">Result</span></code> will include one or more tokens (depending on the request <code class="docutils literal notranslate"><span class="pre">returnAllGeneratedTokens</span></code> parameter) except the last result and the <code class="docutils literal notranslate"><span class="pre">isFinal</span></code> flag will be set to <code class="docutils literal notranslate"><span class="pre">true</span></code> for the last result associated with this request.</p>
+<p>The request <code class="docutils literal notranslate"><span class="pre">numReturnSequences</span></code> parameter controls the number of output sequences to generate for each prompt. When this option is used, the Executor will return at least <code class="docutils literal notranslate"><span class="pre">numReturnSequences</span></code> responses for each request, each containing one Result. In beam search (<code class="docutils literal notranslate"><span class="pre">beamWidth</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>), the number of beams to be returned will be limited by <code class="docutils literal notranslate"><span class="pre">numReturnSequences</span></code> and the <code class="docutils literal notranslate"><span class="pre">sequenceIndex</span></code> attribute of the <code class="docutils literal notranslate"><span class="pre">Result</span></code> class will always be zero. Otherwise, in sampling (<code class="docutils literal notranslate"><span class="pre">beamWidth</span> <span class="pre">=</span> <span class="pre">1</span></code>), the <code class="docutils literal notranslate"><span class="pre">sequenceIndex</span></code> attribute indicates the index of the generated sequence in the result (<code class="docutils literal notranslate"><span class="pre">0</span> <span class="pre">&lt;=</span> <span class="pre">sequenceIndex</span> <span class="pre">&lt;</span> <span class="pre">numReturnSequences</span></code>). It contains a Boolean parameter called <code class="docutils literal notranslate"><span class="pre">isSequenceFinal</span></code> that indicates if this is the last result for the sequence and also contains a Boolean parameter <code class="docutils literal notranslate"><span class="pre">isFinal</span></code> that indicates when all sequences for the request have been generated. When <code class="docutils literal notranslate"><span class="pre">numReturnSequences</span> <span class="pre">=</span> <span class="pre">1</span></code>, <code class="docutils literal notranslate"><span class="pre">isFinal</span></code> is identical to <code class="docutils literal notranslate"><span class="pre">isSequenceFinal</span></code>.</p>
+<p>Here is an example that shows how a subset of 3 responses might look like for <code class="docutils literal notranslate"><span class="pre">numReturnSequences</span> <span class="pre">=</span> <span class="pre">3</span></code>:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">Response</span> <span class="mi">1</span><span class="p">:</span> <span class="n">requestId</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="n">Result</span> <span class="k">with</span> <span class="n">sequenceIndex</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">isSequenceFinal</span> <span class="o">=</span> <span class="n">false</span><span class="p">,</span> <span class="n">isFinal</span> <span class="o">=</span> <span class="n">false</span>
+<span class="n">Response</span> <span class="mi">2</span><span class="p">:</span> <span class="n">requestId</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="n">Result</span> <span class="k">with</span> <span class="n">sequenceIndex</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="n">isSequenceFinal</span> <span class="o">=</span> <span class="n">true</span><span class="p">,</span>  <span class="n">isFinal</span> <span class="o">=</span> <span class="n">false</span>
+<span class="n">Response</span> <span class="mi">3</span><span class="p">:</span> <span class="n">requestId</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="n">Result</span> <span class="k">with</span> <span class="n">sequenceIndex</span> <span class="o">=</span> <span class="mi">2</span><span class="p">,</span> <span class="n">isSequenceFinal</span> <span class="o">=</span> <span class="n">false</span><span class="p">,</span> <span class="n">isFinal</span> <span class="o">=</span> <span class="n">false</span>
+</pre></div>
+</div>
+<p>In this example, each response contains one result for different sequences. The <code class="docutils literal notranslate"><span class="pre">isSequenceFinal</span></code> flag of the second Result is set to true, indicating that it is the last result for <code class="docutils literal notranslate"><span class="pre">sequenceIndex</span> <span class="pre">=</span> <span class="pre">1</span></code>, however, the isFinal flag of each Response is set to false because sequences 0 and 2 are not completed.</p>
+</section>
+<section id="sending-requests-with-different-beam-widths">
+<h3>Sending Requests with Different Beam Widths<a class="headerlink" href="#sending-requests-with-different-beam-widths" title="Link to this heading">#</a></h3>
+<p>The executor can process requests with different beam widths if the following conditions are met:</p>
+<ul class="simple">
+<li><p>The model was built with a <code class="docutils literal notranslate"><span class="pre">max_beam_width</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>.</p></li>
+<li><p>The executor is configured with a <code class="docutils literal notranslate"><span class="pre">maxBeamWidth</span> <span class="pre">&gt;</span> <span class="pre">1</span></code> (the configured <code class="docutils literal notranslate"><span class="pre">maxBeamWidth</span></code> must be less than or equal to the model’s <code class="docutils literal notranslate"><span class="pre">max_beam_width</span></code>).</p></li>
+<li><p>The requested beam widths are less than or equal to the configured <code class="docutils literal notranslate"><span class="pre">maxBeamWidth</span></code>.</p></li>
+</ul>
+<p>The executor may schedule successive requests with the same beam width at the same time. For successive requests with two different beam widths, <code class="docutils literal notranslate"><span class="pre">x</span></code> and <code class="docutils literal notranslate"><span class="pre">y</span></code>, requests with beam width <code class="docutils literal notranslate"><span class="pre">y</span></code> are not scheduled until all requests with beam width <code class="docutils literal notranslate"><span class="pre">x</span></code> have been processed.
+This allows the runtime to reconfigure itself for a new beam width when no requests are in flight. The reconfiguration happens automatically each time requests with a different beam width than currently configured are detected. Waiting for previous requests to finish and reconfiguring the runtime may cause significant overhead and reduce overall throughput.</p>
+</section>
+<section id="controlling-output-with-logits-post-processor">
+<h3>Controlling output with Logits Post-Processor<a class="headerlink" href="#controlling-output-with-logits-post-processor" title="Link to this heading">#</a></h3>
+<p>Optionally, you can alter the logits produced by the network by providing an instance of <code class="docutils literal notranslate"><span class="pre">Executor::LogitsPostProcessorConfig</span></code>. For instance, this feature can be used to generate JSON formatted output. <a class="reference internal" href="../_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor25LogitsPostProcessorConfigE" title="tensorrt_llm::executor::LogitsPostProcessorConfig"><code class="xref cpp cpp-class docutils literal notranslate"><span class="pre">Executor::LogitsPostProcessorConfig</span></code></a> specifies a map of named callbacks in the following form</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="n">std</span><span class="o">::</span><span class="n">unordered_map</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="p">,</span><span class="w"> </span><span class="n">function</span><span class="o">&lt;</span><span class="n">Tensor</span><span class="p">(</span><span class="n">IdType</span><span class="p">,</span><span class="w"> </span><span class="n">Tensor</span><span class="o">&amp;</span><span class="p">,</span><span class="w"> </span><span class="n">BeamTokens</span><span class="w"> </span><span class="k">const</span><span class="o">&amp;</span><span class="p">,</span><span class="w"> </span><span class="n">StreamPtr</span><span class="w"> </span><span class="k">const</span><span class="o">&amp;</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">optional</span><span class="o">&lt;</span><span class="n">IdType</span><span class="o">&gt;</span><span class="p">)</span><span class="o">&gt;&gt;</span>
+</pre></div>
+</div>
+<p>The map key is the name associated with that logits post-processing callback. Each request can then specify the name of the logits post-processor to use for that particular request, if any.</p>
+<p>The first argument to the callback is the request id, second is the logits tensor, third are the tokens produced by the request so far, fourth is the operation stream used by the logits tensor, and last one is an optional client id. The callback returns a modified tensor of logits. Multiple requests can share same client id and callback can use different logic based on client id.</p>
+<p>You must use the stream to access the logits tensor. For example, to perform an addition with a bias tensor, the addition operation is enqueued on that stream. Alternatively, you can call <code class="docutils literal notranslate"><span class="pre">stream-&gt;synchronize()</span></code>, however, that will slow down the entire execution pipeline.</p>
+<p>The executor also includes a <a class="reference internal" href="../_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor26LogitsPostProcessorBatchedE" title="tensorrt_llm::executor::LogitsPostProcessorBatched"><code class="xref cpp cpp-class docutils literal notranslate"><span class="pre">LogitsPostProcessorBatched</span></code></a> method that enables altering logits of multiple requests in a batch. The batched method allows further optimizations and reduces callback overheads.</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">IdType</span><span class="o">&gt;</span><span class="w"> </span><span class="k">const</span><span class="o">&amp;</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">Tensor</span><span class="o">&gt;&amp;</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">reference_wrapper</span><span class="o">&lt;</span><span class="n">BeamTokens</span><span class="w"> </span><span class="k">const</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="k">const</span><span class="o">&amp;</span><span class="p">,</span><span class="w"> </span><span class="n">StreamPtr</span><span class="w"> </span><span class="k">const</span><span class="o">&amp;</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">optional</span><span class="o">&lt;</span><span class="n">IdType</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="k">const</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span>
+</pre></div>
+</div>
+<p>A single batched callback can be specified in <code class="docutils literal notranslate"><span class="pre">LogitsPostProcessorConfig</span></code>. Each request can opt to apply this callback by specifying the name of the logits post-processor as <code class="docutils literal notranslate"><span class="pre">Request::kBatchedPostProcessorName</span></code>.</p>
+<p>Note: Neither callback variant is supported with the <code class="docutils literal notranslate"><span class="pre">STATIC</span></code> batching type for the moment.</p>
+<p>In a multi-GPU run, the callback is invoked on all ranks in the first tensor-parallel group, by default. To ensure correct execution, replicate the client-side state that is accessed by the callback on these ranks. If replication is expensive or infeasible, use <code class="docutils literal notranslate"><span class="pre">LogitsPostProcessorConfig::setReplicate(false)</span></code> to invoke the callback only on rank 0. The executor broadcasts the sampled tokens internally to ensure correct execution.</p>
+</section>
+<section id="structured-output-with-guided-decoding">
+<h3>Structured output with guided decoding<a class="headerlink" href="#structured-output-with-guided-decoding" title="Link to this heading">#</a></h3>
+<p>Guided decoding controls the generation outputs to be amenable to pre-defined structured formats, e.g., JSON or XML. Currently, guided decoding is supported with the <a class="reference external" href="https://github.com/mlc-ai/xgrammar">XGrammar</a> backend.</p>
+<p>To enable guided decoding, a valid instance of <code class="docutils literal notranslate"><span class="pre">GuidedDecodingConfig</span></code> must be provided when constructing <code class="docutils literal notranslate"><span class="pre">Executor</span></code>. <code class="docutils literal notranslate"><span class="pre">GuidedDecodingConfig</span></code> should be constructed with some tokenizer information, including <code class="docutils literal notranslate"><span class="pre">encodedVocab</span></code>, <code class="docutils literal notranslate"><span class="pre">tokenizerStr</span></code> (optional) and <code class="docutils literal notranslate"><span class="pre">stopTokenIds</span></code> (optional). Given a Hugging Face tokenizer, these can be extracted by:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">encoded_vocab</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">get_vocab</span><span class="p">()</span>
+<span class="n">encoded_vocab</span> <span class="o">=</span> <span class="p">[</span><span class="n">token</span> <span class="k">for</span> <span class="n">token</span><span class="p">,</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">encoded_vocab</span><span class="o">.</span><span class="n">items</span><span class="p">(),</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">x</span><span class="p">[</span><span class="mi">1</span><span class="p">])]</span>
+<span class="n">tokenizer_str</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">backend_tokenizer</span><span class="o">.</span><span class="n">to_str</span><span class="p">()</span>
+<span class="n">stop_token_ids</span> <span class="o">=</span> <span class="p">[</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">eos_token_id</span><span class="p">]</span>
+</pre></div>
+</div>
+<p>Refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/HEAD/tensorrt_llm/llmapi/tokenizer.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/llmapi/tokenizer.py</span></code></a> for more details. You may dump these materials to disk, and reload them to C++ runtime for use.</p>
+<p>Each request can be optionally specified with a <code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams</span></code>, which defines the desired structured format. Currently, it supports four types:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams::GuideType::kJSON</span></code>: The generated text is amenable to JSON format;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams::GuideType::kJSON_SCHEMA</span></code>: The generated text is amenable to JSON format with additional restrictions;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams::GuideType::kREGEX</span></code>: The generated text is amenable to regular expression;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams::GuideType::kEBNF_GRAMMAR</span></code>: The generated text is amenable to the extended Backus-Naur form (EBNF) grammar.</p></li>
+</ul>
+<p>The latter three types should be used with the schema/regex/grammar provided to <code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams</span></code>.</p>
+</section>
+<section id="obtaining-arbitrary-output-tensors">
+<h3>Obtaining Arbitrary Output Tensors<a class="headerlink" href="#obtaining-arbitrary-output-tensors" title="Link to this heading">#</a></h3>
+<p>The executor API gives the user the possibility to read the arbitrary outputs from the model. For example, it is possible to obtain hidden states or logits.</p>
+<section id="mark-tensors-as-output">
+<h4>Mark Tensors As Output<a class="headerlink" href="#mark-tensors-as-output" title="Link to this heading">#</a></h4>
+<p>For a tensor to be obtainable using this feature, it needs to be marked as an output in the model definition (e.g. add <code class="docutils literal notranslate"><span class="pre">topk_logits.mark_output(&quot;TopKLogits&quot;)</span></code>) before building the TRT engine.</p>
+</section>
+<section id="configure-the-executor">
+<h4>Configure The Executor<a class="headerlink" href="#configure-the-executor" title="Link to this heading">#</a></h4>
+<p>Assuming the TensorRT engine you are planning to use has a tensor named <code class="docutils literal notranslate"><span class="pre">TopKLogits</span></code> marked as output, you should then configure the <code class="docutils literal notranslate"><span class="pre">Executor</span></code> to read from this output tensor by passing its name to the <code class="docutils literal notranslate"><span class="pre">ExecutorConfig</span></code> configuration object:</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="k">auto</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="n">executorConfig</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ExecutorConfig</span><span class="p">{};</span>
+
+<span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">executor</span><span class="o">::</span><span class="n">AdditionalModelOutput</span><span class="o">&gt;</span><span class="w"> </span><span class="n">additionalOutputs</span><span class="p">{</span>
+<span class="w">    </span><span class="n">executor</span><span class="o">::</span><span class="n">AdditionalModelOutput</span><span class="p">{</span><span class="s">&quot;TopKLogits&quot;</span><span class="p">,</span><span class="w"> </span><span class="cm">/*whether or not to get the output for the context too */</span><span class="w"> </span><span class="nb">true</span><span class="p">}};</span>
+<span class="n">executorConfig</span><span class="p">.</span><span class="n">setAdditionalModelOutputs</span><span class="p">(</span><span class="n">additionalOutputs</span><span class="p">);</span>
+
+<span class="c1">// ... set more configuration options if needed</span>
+<span class="c1">// ... create the `Executor` instance</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="request-additional-output">
+<h3>Request Additional Output<a class="headerlink" href="#request-additional-output" title="Link to this heading">#</a></h3>
+<p>Construct a request to enqueue in the executor to query this tensor output:</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="n">executor</span><span class="o">::</span><span class="n">Request</span><span class="w"> </span><span class="n">request</span><span class="p">{</span><span class="n">requestTokens</span><span class="p">,</span><span class="w"> </span><span class="n">parameters</span><span class="p">.</span><span class="n">maxOutputLength</span><span class="p">,</span><span class="w"> </span><span class="nb">true</span><span class="p">,</span><span class="w"> </span><span class="n">executor</span><span class="o">::</span><span class="n">SamplingConfig</span><span class="p">{},</span>
+<span class="w">    </span><span class="n">executor</span><span class="o">::</span><span class="n">OutputConfig</span><span class="p">{</span><span class="nb">false</span><span class="p">,</span><span class="w"> </span><span class="nb">false</span><span class="p">,</span><span class="w"> </span><span class="nb">false</span><span class="p">,</span><span class="w"> </span><span class="nb">true</span><span class="p">,</span><span class="w"> </span><span class="nb">false</span><span class="p">,</span><span class="w"> </span><span class="nb">false</span><span class="p">,</span><span class="w"> </span><span class="n">additionalOutputs</span><span class="p">}};</span>
+<span class="n">executor</span><span class="p">.</span><span class="n">enqueueRequest</span><span class="p">(</span><span class="n">request</span><span class="p">);</span>
+</pre></div>
+</div>
+<p>The output can be found at the <code class="docutils literal notranslate"><span class="pre">additionalOutputs</span></code> property of each response.</p>
+<section id="note-on-context-outputs">
+<h4>Note on context outputs<a class="headerlink" href="#note-on-context-outputs" title="Link to this heading">#</a></h4>
+<p>If KV cache reuse is enabled, context outputs will not contain outputs for the part of the context that has been reused. This part of the outputs can only be obtained from the prior request with the same prefix that generated this part of the KV cache.</p>
+</section>
+</section>
+</section>
+<section id="c-executor-api-example">
+<h2>C++ Executor API Example<a class="headerlink" href="#c-executor-api-example" title="Link to this heading">#</a></h2>
+<p>Two C++ examples are provided that shows how to use the Executor API and can be found in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/HEAD/examples/cpp/executor/"><code class="docutils literal notranslate"><span class="pre">examples/cpp/executor</span></code></a> folder.</p>
+</section>
+<section id="python-bindings-for-the-executor-api">
+<h2>Python Bindings for the Executor API<a class="headerlink" href="#python-bindings-for-the-executor-api" title="Link to this heading">#</a></h2>
+<p>Python bindings for the Executor API are also available to use the Executor API from Python. The Python bindings are defined in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/HEAD/cpp/tensorrt_llm/pybind/executor/bindings.cpp">bindings.cpp</a> and once built, are available in package <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.bindings.executor</span></code>. Running <code class="docutils literal notranslate"><span class="pre">'help('tensorrt_llm.bindings.executor')</span></code> in a Python interpreter will provide an overview of the classes available.</p>
+<p>In addition, three Python examples are provided to demonstrate how to use the Python bindings to the Executor API for single and multi-GPU models. They can be found in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/HEAD/examples/bindings"><code class="docutils literal notranslate"><span class="pre">examples/bindings</span></code></a>.</p>
+</section>
+<section id="in-flight-batching-with-the-triton-inference-server">
+<h2>In-flight Batching with the Triton Inference Server<a class="headerlink" href="#in-flight-batching-with-the-triton-inference-server" title="Link to this heading">#</a></h2>
+<p>A Triton Inference Server C++ <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend">backend</a> is provided with TensorRT-LLM that
+includes the mechanisms needed to serve models using in-flight batching. That
+backend is also a good starting example of how to implement in-flight batching using
+the TensorRT-LLM C++ Executor API.</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="gpt-runtime.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">C++ GPT Runtime</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="graph-rewriting.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Graph Rewriting Module</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#api">API</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#the-executor-class">The Executor Class</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#the-request-class">The Request Class</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#the-response-class">The Response Class</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#the-result-class">The Result Class</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#sending-requests-with-different-beam-widths">Sending Requests with Different Beam Widths</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#controlling-output-with-logits-post-processor">Controlling output with Logits Post-Processor</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#structured-output-with-guided-decoding">Structured output with guided decoding</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#obtaining-arbitrary-output-tensors">Obtaining Arbitrary Output Tensors</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#mark-tensors-as-output">Mark Tensors As Output</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#configure-the-executor">Configure The Executor</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#request-additional-output">Request Additional Output</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#note-on-context-outputs">Note on context outputs</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#c-executor-api-example">C++ Executor API Example</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#python-bindings-for-the-executor-api">Python Bindings for the Executor API</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#in-flight-batching-with-the-triton-inference-server">In-flight Batching with the Triton Inference Server</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
