@@ -7,9 +7,9 @@ from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
                                  MTPDecodingConfig)
 
 example_prompts = [
-    # "Hello, my name is",
-    # "The president of the United States is",
-    # "The capital of France is",
+    "Hello, my name is",
+    "The president of the United States is",
+    "The capital of France is",
     "The future of AI is",
 ]
 
