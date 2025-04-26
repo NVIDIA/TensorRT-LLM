@@ -938,7 +938,7 @@ class Llama4InputProcessor(InputProcessor):
             # for fuse_input_embeds
             token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
             return token_ids.tolist(), {
-                "prompt_tuning_config": [mm_embeds, None, None]
+                "mm_embedding": [mm_embeds, None, None]
             }
         else:
             return processed["input_ids"].squeeze().tolist(), {}
