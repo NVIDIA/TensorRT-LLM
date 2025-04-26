@@ -1187,7 +1187,7 @@ class TestMoE(unittest.TestCase):
             np.ascontiguousarray(
                 torch_to_numpy(
                     torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
-                        scale_factor.view(torch.uint8).cpu().contiguous()).view(
+                        scale_factor.view(torch.uint8).contiguous()).view(
                             scale_factor.dtype).reshape(
                                 scale_factor.shape).view(torch.uint8))))
         moe_weight_wrapper.activation_global_scaling_factor.value = np.array(

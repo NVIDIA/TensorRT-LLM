@@ -12,9 +12,11 @@ import safetensors
 import torch
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
-from tensorrt_llm._utils import nvtx_range, release_gc, trace_func
+from tensorrt_llm._utils import (nvtx_range, release_gc, torch_dtype_to_str,
+                                 trace_func)
 from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.logger import logger
+from tensorrt_llm.lora_manager import LoraConfig, LoraModelConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
@@ -229,6 +231,7 @@ class PyTorchModelEngine(ModelEngine):
         dist: Optional[MPIDist] = None,
         spec_config: Optional[SpecConfig] = None,
         guided_decoding_config: Optional[GuidedDecodingConfig] = None,
+        lora_config: Optional[LoraConfig] = None,
     ):
         self.ub_buffers = None
         self.batch_size = batch_size
@@ -259,10 +262,11 @@ class PyTorchModelEngine(ModelEngine):
             model_path,
             mapping=self.mapping,
             attn_backend=attn_backend,
+            moe_backend=pytorch_backend_config.moe_backend,
             load_format=pytorch_backend_config.load_format,
             max_num_tokens=max_num_tokens,
             moe_max_num_tokens=pytorch_backend_config.moe_max_num_tokens,
-        )
+            lora_config=lora_config)
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
@@ -367,6 +371,15 @@ class PyTorchModelEngine(ModelEngine):
         # kv cache manager. Can be changed to support multiple model engines
         # with different KV cache managers.
         self.kv_cache_manager_key = KV_CACHE_MANAGER_KEY
+        self.lora_model_config: Optional[LoraModelConfig] = None
+
+    def set_lora_model_config(self, lora_target_modules: list[str],
+                              trtllm_modules_to_hf_modules: dict[str, str]):
+        self.lora_model_config = LoraModelConfig(
+            lora_target_modules=lora_target_modules,
+            trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
+            hidden_size=self.model.config.hidden_size,
+            dtype=torch_dtype_to_str(self.model.config.torch_dtype))
 
     def warmup(self, resource_manager: ResourceManager) -> None:
         kv_cache_manager = resource_manager.get_resource_manager(
@@ -520,7 +533,7 @@ class PyTorchModelEngine(ModelEngine):
                                 # No KV cache space!
                                 continue
                             logger.info(
-                                f"Run warmup for batch size={bs}, pure {'context' if num_tokens_per_request is not None else 'generation'} phase"
+                                f"Run warmup for batch size={bs}, pure {'context' if num_tokens_per_request > 1 else 'generation'} phase"
                             )
                             self.forward(
                                 batch,
@@ -576,12 +589,7 @@ class PyTorchModelEngine(ModelEngine):
                              extra_model_inputs=_create_extra_inputs(bs, 1))
                 torch.cuda.synchronize()
 
-    def _set_up_attn_metadata(self,
-                              kv_cache_manager: KVCacheManager,
-                              is_dummy_forward: bool = False):
-        # is_dummy_forward is used to indicate whether the forward is
-        # a dummy forward for memory estimation OR
-        # a real forward w.o. kv cache
+    def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
         if kv_cache_manager is None:
             return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,
@@ -589,8 +597,7 @@ class PyTorchModelEngine(ModelEngine):
                 kv_cache_manager=None,
                 mapping=self.mapping,
                 runtime_features=self.attn_runtime_features,
-                enable_flash_mla=self.model.model_config.enable_flash_mla,
-                is_dummy_attention=is_dummy_forward)
+                enable_flash_mla=self.model.model_config.enable_flash_mla)
 
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -756,26 +763,36 @@ class PyTorchModelEngine(ModelEngine):
         return self._cuda_graphs[batch_size]
 
     def __del__(self) -> None:
-        if self.ub_buffers:
+        if getattr(self, 'ub_buffers', None):
             for u in self.ub_buffers:
                 ub.ub_deallocate(u.addr)
         # Release model weights.
         release_gc()
 
-    def _load_model(self, checkpoint_dir: str, load_format: LoadFormat,
-                    max_num_tokens: int, moe_max_num_tokens: int, **kwargs):
+    def _load_model(self,
+                    checkpoint_dir: str,
+                    load_format: LoadFormat,
+                    max_num_tokens: int,
+                    moe_max_num_tokens: int,
+                    lora_config: Optional[LoraConfig] = None,
+                    **kwargs):
         config = ModelConfig.from_pretrained(checkpoint_dir,
                                              trust_remote_code=True,
                                              **kwargs)
         config.spec_config = self.spec_config
         config.max_num_tokens = max_num_tokens
         config.moe_max_num_tokens = moe_max_num_tokens
+        config.lora_config = lora_config
 
         validate_and_set_kv_cache_quant(
             config, self.pytorch_backend_config.kv_cache_dtype)
         num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
         if num_layers > 0:
             config.pretrained_config.num_hidden_layers = num_layers
+            for sub_config in ["text_config", "vision_config"]:
+                if hasattr(config.pretrained_config, sub_config):
+                    getattr(config.pretrained_config,
+                            sub_config).num_hidden_layers = num_layers
 
         with timing("Model init total"):
             try:
@@ -1152,6 +1169,9 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.prepare()
 
+        lora_params = self._get_lora_params_from_requests(
+            scheduled_requests, attn_metadata)
+
         inputs = {
             'attn_metadata': attn_metadata,
             'input_ids': self.input_ids_cuda[:total_num_tokens],
@@ -1161,6 +1181,9 @@ class PyTorchModelEngine(ModelEngine):
             'multi_modal_data': multi_modal_data,
             'mrope_config': mrope_config
         }
+
+        if bool(lora_params):
+            inputs['lora_params'] = lora_params
 
         if spec_metadata is not None:
             total_draft_lens = sum(draft_lens)
@@ -1282,7 +1305,7 @@ class PyTorchModelEngine(ModelEngine):
             all_rank_num_tokens = self.dist.allgather(attn_metadata.num_tokens)
             attn_metadata.all_rank_num_tokens = all_rank_num_tokens
         # this is for no cache attention, not for dummy attention
-        if not attn_metadata.is_dummy_attention and attn_metadata.kv_cache_manager is None:
+        if attn_metadata.kv_cache_manager is None:
             assert isinstance(
                 attn_metadata,
                 (VanillaAttentionMetadata, TrtllmAttentionMetadata)
@@ -1291,6 +1314,9 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.request_ids = request_ids
             attn_metadata.prepare()
 
+        lora_params = self._get_lora_params_from_requests(
+            scheduled_requests, attn_metadata)
+
         inputs = {
             'attn_metadata': attn_metadata,
             'input_ids': self.input_ids_cuda[:num_tokens],
@@ -1298,6 +1324,9 @@ class PyTorchModelEngine(ModelEngine):
             'inputs_embeds': None,
             'multi_modal_data': multi_modal_data
         }
+
+        if bool(lora_params):
+            inputs['lora_params'] = lora_params
 
         if spec_metadata is not None:
             total_draft_lens = sum(draft_lens)
@@ -1568,6 +1597,128 @@ class PyTorchModelEngine(ModelEngine):
             'inputs_embeds': None
         }, gather_ids if is_spec_decode else None
 
+    def _get_lora_params_from_requests(self,
+                                       scheduled_requests: ScheduledRequests,
+                                       attn_metadata: AttentionMetadata):
+        '''
+        lora_params: dict
+        {
+            layer_id: dict
+            {
+                module_id: dict
+                {
+                    adapter_size: torch tensor: int
+                    is_dora: torch tensor: bool
+                    weight_pointers: torch tensor: int64
+                }
+            }
+        }
+        '''
+        lora_params = {}
+        tmp_lora_params = {}
+
+        request_list = []
+        for request in scheduled_requests.context_requests:
+            request_list.append(request)
+        for request in scheduled_requests.generation_requests:
+            request_list.append(request)
+
+        # trace all requests to get the union set of the lora params
+        for request in request_list:
+            if request.py_lora_task_layer_module_configs is None:
+                continue
+
+            for module in request.py_lora_task_layer_module_configs:
+                module_id = module.moduleId
+                layer_id = module.layerId
+                adapter_size = module.adapterSize
+                is_dora = module.scalingVecPointer == 0
+                weights_in_pointer = module.weightsInPointer
+                weights_out_pointer = module.weightsOutPointer
+                scaling_vec_pointer = module.scalingVecPointer
+                if weights_in_pointer is None:
+                    weights_in_pointer = 0
+                if weights_out_pointer is None:
+                    weights_out_pointer = 0
+                if scaling_vec_pointer is None:
+                    scaling_vec_pointer = 0
+
+                if layer_id not in lora_params:
+                    lora_params[layer_id] = {}
+                if module_id not in lora_params[layer_id]:
+                    lora_params[layer_id][module_id] = {}
+
+                if 'adapter_size' not in lora_params[layer_id][module_id]:
+                    lora_params[layer_id][module_id]['adapter_size'] = []
+                if 'is_dora' not in lora_params[layer_id][module_id]:
+                    lora_params[layer_id][module_id]['is_dora'] = []
+                if 'weight_pointers' not in lora_params[layer_id][module_id]:
+                    lora_params[layer_id][module_id]['weight_pointers'] = []
+
+                tmp_lora_params[
+                    f'{request.py_request_id}_{layer_id}_{module_id}_adapter_size'] = [
+                        adapter_size
+                    ]
+                tmp_lora_params[
+                    f'{request.py_request_id}_{layer_id}_{module_id}_is_dora'] = [
+                        is_dora
+                    ]
+                tmp_lora_params[
+                    f'{request.py_request_id}_{layer_id}_{module_id}_weights_pointer'] = [
+                        weights_in_pointer, weights_out_pointer,
+                        scaling_vec_pointer
+                    ]
+
+        for request in request_list:
+            # Need to set default values for this case
+            if request.py_lora_task_layer_module_configs is None:
+                for layer_id in lora_params:
+                    for module_id in lora_params[layer_id]:
+                        lora_params[layer_id][module_id]['adapter_size'].append(
+                            0)
+                        lora_params[layer_id][module_id]['is_dora'].append(
+                            False)
+                        lora_params[layer_id][module_id]['weight_pointers'] += [
+                            0, 0, 0
+                        ]
+
+            else:
+                for layer_id in lora_params:
+                    for module_id in lora_params[layer_id]:
+                        if f'{request.py_request_id}_{layer_id}_{module_id}_adapter_size' not in tmp_lora_params:
+                            lora_params[layer_id][module_id][
+                                'adapter_size'].append(0)
+                            lora_params[layer_id][module_id]['is_dora'].append(
+                                False)
+                            lora_params[layer_id][module_id][
+                                'weight_pointers'] += [0, 0, 0]
+                        else:
+                            lora_params[layer_id][module_id][
+                                'adapter_size'] += tmp_lora_params[
+                                    f'{request.py_request_id}_{layer_id}_{module_id}_adapter_size']
+                            lora_params[layer_id][module_id][
+                                'is_dora'] += tmp_lora_params[
+                                    f'{request.py_request_id}_{layer_id}_{module_id}_is_dora']
+                            lora_params[layer_id][module_id][
+                                'weight_pointers'] += tmp_lora_params[
+                                    f'{request.py_request_id}_{layer_id}_{module_id}_weights_pointer']
+
+        for layer_id in lora_params:
+            for module_id in lora_params[layer_id]:
+                lora_params[layer_id][module_id][
+                    'adapter_size'] = torch.IntTensor(
+                        lora_params[layer_id][module_id]['adapter_size'])
+                lora_params[layer_id][module_id][
+                    'weight_pointers'] = torch.LongTensor(
+                        lora_params[layer_id][module_id]['weight_pointers'])
+
+        if bool(lora_params):
+            lora_params['host_request_types'] = attn_metadata.host_request_types
+            lora_params['prompt_lens_cpu'] = attn_metadata.prompt_lens_cpu
+            lora_params['num_seqs'] = attn_metadata.num_seqs
+
+        return lora_params
+
     @nvtx_range("_prepare_inputs")
     def _prepare_inputs(
             self,
@@ -1596,14 +1747,12 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests: ScheduledRequests,
                 resource_manager: ResourceManager,
                 new_tensors_device: Optional[Dict[str, torch.Tensor]] = None,
-                extra_model_inputs: Optional[Dict[str, Any]] = None,
-                is_dummy_forward: bool = False):
+                extra_model_inputs: Optional[Dict[str, Any]] = None):
 
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
 
-        attn_metadata = self._set_up_attn_metadata(kv_cache_manager,
-                                                   is_dummy_forward)
+        attn_metadata = self._set_up_attn_metadata(kv_cache_manager)
         if self.spec_config is not None:
             spec_resource_manager = resource_manager.get_resource_manager(
                 'spec_resource_manager')
@@ -1688,13 +1837,11 @@ class PyTorchModelEngine(ModelEngine):
             # We can insert other CPU computation between them in the future.
             if self.mapping.is_last_pp_rank(
             ) and self.guided_decoder is not None:
-                guided_decoder_resource_manager = resource_manager.get_resource_manager(
-                    "guided_decoder_resource_manager")
-                self.guided_decoder.build(scheduled_requests,
-                                          guided_decoder_resource_manager)
+                seq_slot_manager = resource_manager.get_resource_manager(
+                    "seq_slot_manager")
+                self.guided_decoder.build(scheduled_requests, seq_slot_manager)
                 self.guided_decoder.execute(scheduled_requests,
-                                            outputs['logits'],
-                                            guided_decoder_resource_manager)
+                                            outputs['logits'], seq_slot_manager)
 
             return outputs
 

@@ -9,7 +9,7 @@ git-lfs clone https://huggingface.co/qychen/luotuo-lora-7b-0.1
 git-lfs clone https://huggingface.co/kunishou/Japanese-Alpaca-LoRA-7b-v0
 BASE_MODEL=llama-7b-hf
 
-python examples/llama/convert_checkpoint.py --model_dir ${BASE_MODEL} \
+python examples/models/core/llama/convert_checkpoint.py --model_dir ${BASE_MODEL} \
     --output_dir /tmp/llama_7b/trt_ckpt/fp16/1-gpu/ \
     --dtype float16
 

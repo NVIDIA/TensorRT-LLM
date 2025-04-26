@@ -1,15 +1,22 @@
 import copy
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+from PIL.Image import Image
 from torch import nn
-from transformers import Llama4Config, LlamaConfig
+from transformers import (AutoProcessor, Llama4Config, Llama4VisionModel,
+                          LlamaConfig)
+from transformers.modeling_utils import load_sharded_checkpoint
+from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, DeepseekAllReduce)
 from tensorrt_llm._torch.pipeline_interface import PipelineInterface
 from tensorrt_llm.functional import PositionEmbeddingType
 
+from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
+                       register_input_processor)
+from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
@@ -26,6 +33,7 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
+from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, MissingLayer,
                              register_auto_model, support_pp,
@@ -369,6 +377,7 @@ class Llama4DecoderLayer(DecoderLayer):
                 bias=getattr(config, "mlp_bias", False),
                 dtype=config.torch_dtype,
                 config=model_config,
+                layer_idx=layer_idx,
             )
 
             # self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp(
@@ -519,6 +528,7 @@ class LlamaDecoderLayer(DecoderLayer):
             bias=config.mlp_bias,
             dtype=config.torch_dtype,
             config=model_config,
+            layer_idx=layer_idx,
         )
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -555,7 +565,7 @@ class LlamaDecoderLayer(DecoderLayer):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, **kwargs)
         if spec_metadata is not None:
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
                                                       hidden_states, residual)
@@ -588,7 +598,8 @@ class Eagle3LlamaAttention(LlamaAttention):
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
             quant_config=model_config.get_quant_config(),
-            skip_create_weights=model_config.skip_create_weights,
+            skip_create_weights_in_init=model_config.
+            skip_create_weights_in_init,
         )
 
 
@@ -689,6 +700,7 @@ class Llama4Model(DecoderModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         pipeline_interface: Optional[PipelineInterface] = None,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params=None,
     ) -> torch.Tensor:
         if self.model_config.mapping.is_first_pp_rank():
             if (input_ids is None) ^ (inputs_embeds is not None):
@@ -716,6 +728,7 @@ class Llama4Model(DecoderModel):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                lora_params=lora_params,
             )
 
         if self.model_config.mapping.is_last_pp_rank():
@@ -732,14 +745,31 @@ class LlamaModel(DecoderModel):
         config = self.model_config.pretrained_config
         self.padding_idx = config.pad_token_id
 
+        vocab_size = config.vocab_size
+        # TODO smor- hack
+        if hasattr(model_config,
+                   'lora_config') and model_config.lora_config is not None:
+            from tensorrt_llm.lora_manager import HfLoraLoader
+            lora_loader = HfLoraLoader(model_config.lora_config.lora_dir)
+            weight = lora_loader.embed_tokens
+            # TODO smor - need to split tp matrix here
+            vocab_size = lora_loader.vocab_size
+
         self.embed_tokens = Embedding(
-            config.vocab_size,
+            vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
             mapping=model_config.mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             gather_output=True,
         )
+
+        if hasattr(model_config,
+                   'lora_config') and model_config.lora_config is not None:
+            with torch.no_grad():
+                x = weight.to(self.embed_tokens.dtype)
+                self.embed_tokens.weight.data.copy_(x)
+
         self.layers = nn.ModuleList([
             LlamaDecoderLayer(
                 model_config,
@@ -758,6 +788,7 @@ class LlamaModel(DecoderModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         pipeline_interface: Optional[PipelineInterface] = None,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params=None,
     ) -> torch.Tensor:
         if self.model_config.mapping.is_first_pp_rank():
             if (input_ids is None) ^ (inputs_embeds is not None):
@@ -783,6 +814,7 @@ class LlamaModel(DecoderModel):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                lora_params=lora_params,
             )
 
         if self.model_config.mapping.is_last_pp_rank():
@@ -805,15 +837,13 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                          vocab_size=model_config.pretrained_config.vocab_size)
 
 
-@register_auto_model("Llama4ForConditionalGeneration")
-class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
-                                                             Llama4Config]):
+@register_auto_model("Llama4ForCausalLM")
+class Llama4ForCausalLM(DecoderModelForCausalLM[LlamaModel, Llama4Config]):
 
     def __init__(
         self,
         model_config: ModelConfig[Llama4Config],
     ):
-        # TODO: figure out a better way to handle multimodality.
         model_config = copy.copy(model_config)
         architectures = model_config.pretrained_config.architectures
         model_config.pretrained_config = model_config.pretrained_config.text_config
@@ -822,6 +852,15 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
+
+    def infer_max_seq_len(self):
+        # TODO: increase to support 10M context length. There are two blockers
+        # right now:
+        # 1. We need to implement chunked attention.
+        # 2. CUDA graph warmup will crash when the cached context is that long.
+        # This only affects the TRTLLM backend; flashinfer is fine. It is
+        # most likely an issue with the kernel.
+        return 8192
 
     def load_weights(self, weights: Dict):
         new_weights = {}
@@ -841,6 +880,82 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
             elif not isinstance(self.model.layers[idx + 1], MissingLayer):
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+
+
+class Llama4InputProcessor(InputProcessor):
+
+    def __init__(self, model_path, model_config, tokenizer):
+        self.processor = AutoProcessor.from_pretrained(model_path,
+                                                       use_fast=True)
+        self.model_config = model_config
+        self.tokenizer = tokenizer
+        self.vocab_size = model_config.text_config.vocab_size
+        self.image_token_index = model_config.image_token_index
+
+        self.encoder = nn.ModuleDict({
+            "vision_model":
+            Llama4VisionModel(model_config.vision_config),
+            "multi_modal_projector":
+            Llama4MultiModalProjector(model_config)
+        }).cuda()
+        load_sharded_checkpoint(self.encoder, model_path, strict=False)
+
+    @torch.inference_mode()
+    def __call__(
+        self, inputs: TextPrompt, sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        text_prompt, mm_data = inputs.get("prompt"), inputs.get(
+            "multi_modal_data")
+        images, do_rescale = None, True
+
+        if mm_data and mm_data.get("image"):
+            images = mm_data["image"]
+            img_type = type(mm_data["image"][0])
+            do_rescale = (img_type == Image)
+            assert all(isinstance(img, img_type) for img in mm_data["image"])
+
+        # preprocess images and insert image tokens
+        processed = self.processor(text=text_prompt,
+                                   images=images,
+                                   return_tensors="pt",
+                                   device="cuda",
+                                   do_rescale=do_rescale,
+                                   add_special_tokens=False)
+        if images:
+            token_ids, pixel_values = processed["input_ids"].squeeze(
+            ), processed["pixel_values"]
+            mm_embeds = self.encoder.vision_model(
+                pixel_values.float().cuda()).last_hidden_state.flatten(0, 1)
+            mm_embeds = self.encoder.multi_modal_projector(mm_embeds)
+            # for fuse_input_embeds
+            token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
+            return token_ids.tolist(), {
+                "prompt_tuning_config": [mm_embeds, None, None]
+            }
+        else:
+            return processed["input_ids"].squeeze().tolist(), {}
+
+
+@register_auto_model("Llama4ForConditionalGeneration")
+@register_input_processor(Llama4InputProcessor)
+class Llama4ForConditionalGeneration(Llama4ForCausalLM):
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        return_context_logits: Optional[bool] = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        mm_embed = kwargs.get("multi_modal_data", [])
+        input_ids, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
+                                                     input_ids, mm_embed)
+        logits = super().forward(attn_metadata, input_ids, position_ids,
+                                 inputs_embeds, return_context_logits)
+        return logits
 
 
 @register_auto_model("MistralForCausalLM")
@@ -898,15 +1013,9 @@ class Eagle3LlamaDraftModel(DecoderModel):
                 config.vocab_size,
                 config.hidden_size,
                 dtype=config.torch_dtype,
-                parallel_config=ParallelConfig(
-                    tensor_parallel_rank=model_config.mapping.tp_rank,
-                    tensor_parallel_size=model_config.mapping.tp_size,
-                    tensor_parallel_mode=TensorParallelMode.COLUMN,
-                    pipeline_parallel_size=model_config.mapping.pp_size,
-                    parallel_rank=model_config.mapping.rank,
-                    gather_output=True,
-                    gpus_per_node=model_config.mapping.gpus_per_node,
-                ),
+                mapping=model_config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=True,
             )
         else:
             # Shared with target model.

@@ -10,6 +10,9 @@ from typing import Any, List, Literal, Optional, Sequence, Union
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
+from tensorrt_llm.inputs.data import TextPrompt
+from tensorrt_llm.inputs.registry import DefaultInputProcessor
+
 from .. import bindings as tllm
 from .._utils import global_mpi_rank, nvtx_range_debug
 from ..bindings import executor as tllm
@@ -309,6 +312,16 @@ class LLM:
         if queries is not None:
             queries = prompt_inputs(queries)
 
+        if not inputs.get("prompt") and inputs.get(
+                "prompt_token_ids") and not isinstance(self.input_processor,
+                                                       DefaultInputProcessor):
+            # VLMs need to process/tokenize the prompt in their own way
+            prompt = self.tokenizer.decode(inputs['prompt_token_ids'])
+            inputs = TextPrompt(
+                prompt=prompt,
+                multi_modal_data=inputs.get("multi_modal_data"),
+                mm_processor_kwargs=inputs.get("mm_processor_kwargs"))
+
         query_token_ids = None
         prompt_tuning_config = None
         mrope_config = None
@@ -581,7 +594,8 @@ class LLM:
                 num_postprocess_workers=self.args.num_postprocess_workers,
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
-            is_llm_executor=True)
+            is_llm_executor=True,
+            lora_config=self.args.lora_config)
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
         if self.args.skip_tokenizer_init:
@@ -594,8 +608,17 @@ class LLM:
         if self.runtime_context is not None:
             return self.runtime_context.tokenizer
 
+        # TODO smor- need to look more on this
+        # what should be chose as the tokenizer? the adapter or the base model?
+        # what happens if we have multiple adapters?
+        if hasattr(
+                self.args, "backend"
+        ) and self.args.backend == "pytorch" and self.args.lora_config is not None:
+            tokenizer_path = self.args.lora_config.lora_dir[0]
+        else:
+            tokenizer_path = self.args.model
         return ModelLoader.load_hf_tokenizer(
-            self.args.model,
+            tokenizer_path,
             trust_remote_code=self.args.trust_remote_code,
             use_fast=self.args.tokenizer_mode != 'slow')
 

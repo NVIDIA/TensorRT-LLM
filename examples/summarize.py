@@ -536,7 +536,8 @@ def main(args):
                 enable_chunked_context=args.enable_chunked_context,
                 multi_block_mode=args.multi_block_mode,
                 cuda_graph_mode=args.cuda_graph_mode,
-                gather_generation_logits=args.eval_ppl)
+                gather_generation_logits=args.eval_ppl,
+                use_gpu_direct_storage=args.use_gpu_direct_storage)
         runner_kwargs.update(
             enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
         if args.prompt_lookup_config is not None:
@@ -867,6 +868,10 @@ if __name__ == '__main__':
         help=
         "evaluate.load('rouge') will attempt to pull rouge package from HF. Use cached rouge can avoid network outage of host or HF."
     )
+    parser.add_argument("--use_gpu_direct_storage",
+                        default=False,
+                        action="store_true",
+                        help="Use GPUDirect Storage (GDS) to load the engine")
     parser = add_common_args(parser)
     args = parser.parse_args()
 

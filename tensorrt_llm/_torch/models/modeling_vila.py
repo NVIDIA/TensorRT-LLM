@@ -1093,8 +1093,8 @@ class VilaInputProcessor(InputProcessor):
         (3) passed input_ids and mm_embed via LlmRequest's prompt_token_ids and prompt_embedding_table fields respectively. LlmRequests can be inflight batched, and the mm_embed is passed to LLM model as `multi_modal_data` which is List[torch.Tensor] for batched requests.
         """
 
-        text_prompt = inputs["prompt"]
-        mm_data = inputs["multi_modal_data"]
+        text_prompt, mm_data = inputs.get("prompt"), inputs.get(
+            "multi_modal_data", {})
         mm_processor_kwargs = inputs.get("mm_processor_kwargs", {})
 
         text_prompt = _apply_chat_template(text_prompt, self.conv_mode,
@@ -1167,7 +1167,8 @@ class VilaModel(PreTrainedModel):
             mm_embed
         ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
 
-        input_ids, inputs_embeds = fuse_input_embeds(self, input_ids, mm_embed)
+        input_ids, inputs_embeds = fuse_input_embeds(
+            self.llm.model.embed_tokens, input_ids, mm_embed)
         logits = self.llm.forward(attn_metadata=attn_metadata,
                                   input_ids=input_ids,
                                   position_ids=position_ids,

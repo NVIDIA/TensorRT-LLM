@@ -41,9 +41,9 @@ public:
         std::optional<std::vector<SizeType32>> deviceIds = std::nullopt, bool normalizeLogProbs = true,
         bool enableChunkedContext = true,
         PeftCacheManagerConfig const& peftCacheManagerConfig = PeftCacheManagerConfig{},
-        executor::DecodingConfig decodingConfig = executor::DecodingConfig{}, float gpuWeightsPercent = 1,
-        std::optional<SizeType32> maxBeamWidth = std::nullopt, std::optional<SizeType32> maxBatchSize = std::nullopt,
-        std::optional<SizeType32> maxNumTokens = std::nullopt,
+        executor::DecodingConfig decodingConfig = executor::DecodingConfig{}, bool useGpuDirectStorage = false,
+        float gpuWeightsPercent = 1, std::optional<SizeType32> maxBeamWidth = std::nullopt,
+        std::optional<SizeType32> maxBatchSize = std::nullopt, std::optional<SizeType32> maxNumTokens = std::nullopt,
         executor::SchedulerConfig schedulerConfig = executor::SchedulerConfig{},
         executor::ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig
         = executor::ExtendedRuntimePerfKnobConfig{},
@@ -53,7 +53,7 @@ public:
         std::optional<executor::GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         bool isLeaderInOrchMode = false,
         std::optional<std::vector<executor::AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
-        bool gatherGenerationLogits = false)
+        bool gatherGenerationLogits = false, bool promptTableOffloading = false)
         : kvCacheConfig{std::move(kvCacheConfig)}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(std::move(deviceIds))
@@ -61,6 +61,7 @@ public:
         , enableChunkedContext{enableChunkedContext}
         , peftCacheManagerConfig(peftCacheManagerConfig)
         , decodingConfig(std::move(decodingConfig))
+        , useGpuDirectStorage(useGpuDirectStorage)
         , gpuWeightsPercent(gpuWeightsPercent)
         , maxBeamWidth(maxBeamWidth)
         , maxBatchSize(maxBatchSize)
@@ -74,6 +75,7 @@ public:
         , isLeaderInOrchMode{isLeaderInOrchMode}
         , additionalModelOutputs{std::move(additionalModelOutputs)}
         , gatherGenerationLogits{gatherGenerationLogits}
+        , promptTableOffloading{promptTableOffloading}
     {
         if (guidedDecodingConfig)
         {
@@ -87,12 +89,12 @@ public:
             executorConfig.getNormalizeLogProbs(), executorConfig.getEnableChunkedContext(),
             PeftCacheManagerConfig(executorConfig.getPeftCacheConfig().value_or(executor::PeftCacheConfig())),
             executorConfig.getDecodingConfig().value_or(executor::DecodingConfig{}),
-            executorConfig.getGpuWeightsPercent(), executorConfig.getMaxBeamWidth(), executorConfig.getMaxBatchSize(),
-            executorConfig.getMaxNumTokens(), executorConfig.getSchedulerConfig(),
-            executorConfig.getExtendedRuntimePerfKnobConfig(), executorConfig.getDebugConfig(),
-            executorConfig.getMaxSeqIdleMicroseconds(), executorConfig.getSpecDecConfig(),
-            executorConfig.getGuidedDecodingConfig(), isLeaderInOrchMode, executorConfig.getAdditionalModelOutputs(),
-            executorConfig.getGatherGenerationLogits())
+            executorConfig.getUseGpuDirectStorage(), executorConfig.getGpuWeightsPercent(),
+            executorConfig.getMaxBeamWidth(), executorConfig.getMaxBatchSize(), executorConfig.getMaxNumTokens(),
+            executorConfig.getSchedulerConfig(), executorConfig.getExtendedRuntimePerfKnobConfig(),
+            executorConfig.getDebugConfig(), executorConfig.getMaxSeqIdleMicroseconds(),
+            executorConfig.getSpecDecConfig(), executorConfig.getGuidedDecodingConfig(), isLeaderInOrchMode,
+            executorConfig.getAdditionalModelOutputs(), executorConfig.getGatherGenerationLogits())
     {
     }
 
@@ -106,6 +108,8 @@ public:
     bool enableChunkedContext;
     PeftCacheManagerConfig peftCacheManagerConfig;
     executor::DecodingConfig decodingConfig;
+    // Use GDS to load the engines?
+    bool useGpuDirectStorage;
     // Percentage of weights on the gpu at runtime
     float gpuWeightsPercent;
     std::optional<SizeType32> maxBeamWidth;
@@ -122,6 +126,8 @@ public:
     bool isLeaderInOrchMode;
     std::optional<std::vector<executor::AdditionalModelOutput>> additionalModelOutputs;
     bool gatherGenerationLogits;
+    // Whether to offload the prompt table to CPU and prefetching to GPU
+    bool promptTableOffloading;
 };
 
 } // namespace tensorrt_llm::batch_manager

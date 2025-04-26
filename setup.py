@@ -104,8 +104,10 @@ else:
     ]
 
 package_data += [
-    'bindings/*.pyi', 'tools/plugin_gen/templates/*',
-    'bench/build/benchmark_config.yml'
+    'bindings/*.pyi',
+    'tools/plugin_gen/templates/*',
+    'bench/build/benchmark_config.yml',
+    'evaluate/lm_eval_tasks/**/*',
 ]
 
 
