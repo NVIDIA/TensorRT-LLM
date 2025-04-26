@@ -372,6 +372,12 @@ std::map<SizeType32, SizeType32> BlockManager::blocksPerWindowSize(
     SizeType32 totalBlocks, std::map<SizeType32, std::vector<SizeType32>> const& uniqueWindowSizeToLayers)
 {
     TLLM_CHECK(totalBlocks > 0);
+    if (uniqueWindowSizeToLayers.size() == 1)
+    {
+        auto const onlyWindowSize = (*uniqueWindowSizeToLayers.cbegin()).first;
+        return {{onlyWindowSize, totalBlocks}};
+    }
+
     std::map<SizeType32, SizeType32> windowSizeToContribution;
 
     for (auto const& [windowSize, layers] : uniqueWindowSizeToLayers)
@@ -481,7 +487,6 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
         auto const temporaryAttentionWindow = manager.calculateTemporaryAttentionWindow(tempAttentionWindowInputs);
         // Consider the temporaryAttentionWindow when allocating blocks.
         auto const maxBlocksPerSeq = tc::ceilDiv(maxTokenNum + temporaryAttentionWindow, tokensPerBlock);
-        TLLM_LOG_INFO("Max KV cache pages per sequence: %d [window size=%d]", maxBlocksPerSeq, windowSize);
         mWindowSizeToMetadata[windowSize] = WindowSizeMetadata{absolutePoolsOffset, numPools, maxTokenNum,
             maxBlocksPerSeq, manager.getMaxNumBlocks(), temporaryAttentionWindow};
         TLLM_LOG_DEBUG(
@@ -496,16 +501,6 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
         "Iteration order of window sizes between mWindowBlockManagers and mWindowSizeToMetadata *must* be ensured. "
         "Maybe you tried changing either of them to an std::unordered_map?");
 }
-
-namespace
-{
-inline SizeType32 digits(SizeType32 number)
-{
-    TLLM_CHECK(number > 0);
-    return static_cast<SizeType32>(std::log10(number)) + 1;
-}
-
-} // namespace
 
 WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 windowSize,
     std::vector<SizeType32> const& managedLayers, std::vector<SizeType32> const& numKvHeadsPerLayer,
@@ -532,13 +527,15 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mReusedUniqueBlocks{0}
     , mMissedBlocks{0}
     , mKVFactor{mCacheType == CacheType::kSELFKONLY ? 1 : 2}
-    , mLogPrefix{tensorrt_llm::common::fmtstr("BlockManager[windowSize=%*u]", digits(windowSize), mWindowSize)}
+    , mLogPrefix{tensorrt_llm::common::fmtstr("BlockManager[windowSize=%u]", mWindowSize)}
     , mReusedTokens{0.0}
     , mTotalInputTokens{0.0}
     , mEnableHashKey{enableHashKey}
     , mEnablePartialReuse{enablePartialReuse}
     , mCopyOnPartialReuse{copyOnPartialReuse}
 {
+    TLLM_LOG_INFO("%s - Number of blocks in KV cache primary pool: %d", mLogPrefix.c_str(), blocksInPrimaryPool);
+    TLLM_LOG_INFO("%s - Number of blocks in KV cache secondary pool: %d", mLogPrefix.c_str(), blocksInSecondaryPool);
     std::map<SizeType32, SizeType32> numLayersPerPool;
 
     for (auto const layerIdx : managedLayers)
@@ -1567,7 +1564,7 @@ void KVCacheManager::allocatePools(bool useUvm)
     mBlockManager.allocatePools(useUvm);
     auto const numPools = mBlockManager.getNumPools();
 
-    if (tc::Logger::getLogger()->getLevel() == tc::Logger::INFO)
+    if (tc::Logger::getLogger()->getLevel() <= tc::Logger::INFO)
     {
         uint64_t cacheSizeBytes = 0;
         for (SizeType32 poolIdx = 0; poolIdx < numPools; poolIdx++)
