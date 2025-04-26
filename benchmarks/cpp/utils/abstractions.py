@@ -26,6 +26,8 @@ class MultimodalSample(BaseModel):
     output_len: int
 
 
+# An alias for the union of the samples types.
+# TODO (jdebache): use explicit `type` alias (https://peps.python.org/pep-0613/) when `yapf` starts supporting Python 3.12.
 Sample = TextSample | MultimodalSample
 
 
@@ -69,31 +71,53 @@ class TllmBenchExportFormat(BaseModel):
     output_file_path: str
 
 
+# An alias for the union of the export formats.
+# TODO (jdebache): use explicit `type` alias (https://peps.python.org/pep-0613/) when `yapf` starts supporting Python 3.12.
 ExportFormat = GptManagerBenchmarkExportFormat | TllmBenchExportFormat
 
 
 class UniformLengthDistribution(BaseModel):
+    """
+    A length distribution that is uniform between a minimum and maximum length.
+    """
+
     min_len: int
     max_len: int
 
 
 class NormalLengthDistribution(BaseModel):
+    """
+    A length distribution that is a normal distribution between with the given mean and standard deviation.
+    """
+
     mean: int
     std_dev: int
 
 
+# An alias for the union of the length distributions.
+# TODO (jdebache): use explicit `type` alias (https://peps.python.org/pep-0613/) when `yapf` starts supporting Python 3.12.
 LengthDistribution = UniformLengthDistribution | NormalLengthDistribution
 
 
 class UniformTaskIdDistribution(BaseModel):
+    """
+    A task ID distribution that is uniform between a minimum and maximum task ID.
+    """
+
     min_id: int
     max_id: int
 
 
 class ConstantTaskIdDistribution(BaseModel):
+    """
+    A task ID distribution that is a constant task ID, e.g. all samples have the same task ID.
+    """
+
     task_id: int
 
 
+# An alias for the union of the task ID distributions.
+# TODO (jdebache): use explicit `type` alias (https://peps.python.org/pep-0613/) when `yapf` starts supporting Python 3.12.
 TaskIdDistribution = UniformTaskIdDistribution | ConstantTaskIdDistribution
 
 
