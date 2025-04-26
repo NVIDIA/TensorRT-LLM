@@ -23,6 +23,7 @@ import random
 import sys
 import time
 from importlib.metadata import version
+from typing import Optional
 
 import numpy as np
 import torch
@@ -112,6 +113,7 @@ KV_QUANT_CFG_CHOICES = {
 
 def quant_cfg_choices():
     import modelopt.torch.quantization as mtq
+
     QUANT_CFG_CHOICES = {
         "int8_sq": mtq.INT8_SMOOTHQUANT_CFG,
         "fp8": mtq.FP8_DEFAULT_CFG,
@@ -167,10 +169,10 @@ MODEL_NAME_PATTERN_MAP = {
     "GraniteForCausalLM": "granite",
     "GraniteMoeForCausalLM": "granitemoe",
     "T5": "t5",
-    "Bart": "bart"
+    "Bart": "bart",
 }
 
-MULTIMODAL_DATASETS = ['scienceqa', 'science_qa']
+MULTIMODAL_DATASETS = ["scienceqa", "science_qa"]
 
 
 class _CustomDataset(torch.utils.data.Dataset):
@@ -224,7 +226,7 @@ def get_tokenizer(ckpt_path, max_seq_length=2048, model_type=None):
             # qwen use token id 151643 as pad and 151643 and 151645 as eos tokens
             tokenizer.eos_token = [
                 tokenizer.convert_ids_to_tokens(151643),
-                tokenizer.convert_ids_to_tokens(151645)
+                tokenizer.convert_ids_to_tokens(151645),
             ]
             tokenizer.pad_token = tokenizer.convert_ids_to_tokens(151643)
         else:
@@ -252,9 +254,10 @@ def get_processor(ckpt_path, max_seq_length=2048, model_type=None, device=None):
                 151643)
         else:
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
-    assert processor.tokenizer.pad_token is not None, f"Pad token for {model_type} cannot be set!"
+    assert (processor.tokenizer.pad_token
+            is not None), f"Pad token for {model_type} cannot be set!"
 
-    if model_type == 'mllama':
+    if model_type == "mllama":
         processor = MllamaImageProcessor(processor, device)
     return processor
 
@@ -263,9 +266,10 @@ def _get_vila_model(model_dir):
     sys.path.append(model_dir + "/../VILA")
     from llava.model import LlavaLlamaConfig, LlavaLlamaModel  # noqa
     from transformers import AutoModel
+
     model = AutoModel.from_pretrained(
         model_dir,
-        device_map='auto',
+        device_map="auto",
         trust_remote_code=True,
     )
     return model.llm
@@ -275,6 +279,7 @@ def get_hf_config(ckpt_path):
     if "mpt" in ckpt_path:
         # MPT-7B cannot get initialized from AutoConfig
         from transformers import MptConfig
+
         return MptConfig.from_pretrained(ckpt_path)
     else:
         return AutoConfig.from_pretrained(ckpt_path, trust_remote_code=True)
@@ -283,23 +288,27 @@ def get_hf_config(ckpt_path):
 def _get_llava_qwen_model(model_dir, dtype, device):
     if "hf" in model_dir:
         from transformers import LlavaOnevisionForConditionalGeneration
+
         model = LlavaOnevisionForConditionalGeneration.from_pretrained(
             model_dir, torch_dtype=dtype, device_map=device)
         model = model.language_model
     else:
         from llava.model.builder import load_pretrained_model
+
         _, model, _, _ = load_pretrained_model(model_dir,
                                                None,
-                                               'llava_qwen',
+                                               "llava_qwen",
                                                torch_dtype=dtype,
                                                device_map=device)
     return model
 
 
-def get_model(ckpt_path: str,
-              dtype: str = 'bfloat16',
-              device: str = 'cuda',
-              device_map: str = "auto"):
+def get_model(
+    ckpt_path: str,
+    dtype: str = "bfloat16",
+    device: str = "cuda",
+    device_map: str = "auto",
+):
     logger.info(f"Initializing model from {ckpt_path}")
     # Note: VILA model is not in public HF model zoo yet. We need to explicitly import from the git repo
     hf_config = get_hf_config(ckpt_path)
@@ -308,15 +317,19 @@ def get_model(ckpt_path: str,
     model_cls = AutoModelForCausalLM
     if hf_config.model_type == "llava":
         from transformers import LlavaForConditionalGeneration
+
         model_cls = LlavaForConditionalGeneration
     elif hf_config.model_type == "mpt":
         from transformers import MptForCausalLM
+
         model_cls = MptForCausalLM
-    elif hf_config.model_type == 'mllama':
+    elif hf_config.model_type == "mllama":
         from transformers import MllamaForConditionalGeneration
+
         model_cls = MllamaForConditionalGeneration
-    elif hf_config.model_type == 'qwen2_vl':
+    elif hf_config.model_type == "qwen2_vl":
         from transformers import Qwen2VLForConditionalGeneration
+
         model_cls = Qwen2VLForConditionalGeneration
 
     if "vila" in ckpt_path:
@@ -325,27 +338,34 @@ def get_model(ckpt_path: str,
         model = _get_llava_qwen_model(ckpt_path, dtype, device)
     elif hf_config.model_type == "glm":
         from transformers import AutoModelForSeq2SeqLM
-        model = AutoModelForSeq2SeqLM.from_pretrained(ckpt_path,
-                                                      device_map="cuda",
-                                                      torch_dtype=torch_dtype,
-                                                      trust_remote_code=True)
+
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            ckpt_path,
+            device_map="cuda",
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+        )
     elif model_type_is_enc_dec(hf_config.model_type):
         from transformers import AutoModelForSeq2SeqLM
-        model = AutoModelForSeq2SeqLM.from_pretrained(ckpt_path,
-                                                      device_map=device,
-                                                      torch_dtype=torch_dtype,
-                                                      trust_remote_code=True)
+
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            ckpt_path,
+            device_map=device,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+        )
         model = EncDecModelWrapper(hf_model=model)
     else:
         model = model_cls.from_pretrained(
             ckpt_path,
             device_map=device_map if device != "cpu" else "cpu",
             torch_dtype="auto",
-            trust_remote_code=True)
+            trust_remote_code=True,
+        )
         if hf_config.model_type in ["llava", "internvl_chat"]:
             model = model.language_model
         elif hf_config.model_type == "qwen2_vl":
-            #WAR for Qwen2-VL because its lm_head is outside of LLM
+            # WAR for Qwen2-VL because its lm_head is outside of LLM
             lm_head = model.lm_head
             model = model.model
             model.lm_head = lm_head
@@ -372,23 +392,26 @@ def get_model_type(model):
     return None
 
 
-def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
-                         tokenizer=None,
-                         batch_size=1,
-                         calib_size=512,
-                         block_size=512,
-                         device=None,
-                         include_labels=False):
+def get_calib_dataloader(
+    dataset_name_or_dir="cnn_dailymail",
+    tokenizer=None,
+    batch_size=1,
+    calib_size=512,
+    block_size=512,
+    device=None,
+    include_labels=False,
+):
     logger.info("Loading calibration dataset")
     if dataset_name_or_dir == "pileval":
         dataset = load_dataset(
             "json",
             data_files="https://the-eye.eu/public/AI/pile/val.jsonl.zst",
             split="train",
-            trust_remote_code=True)
+            trust_remote_code=True,
+        )
         dataset = dataset["text"][:calib_size]
-    elif "scienceqa" in dataset_name_or_dir.lower(
-    ) or "science_qa" in dataset_name_or_dir.lower():
+    elif ("scienceqa" in dataset_name_or_dir.lower()
+          or "science_qa" in dataset_name_or_dir.lower()):
         if os.path.isdir(dataset_name_or_dir):
             dataset = load_dataset(dataset_name_or_dir,
                                    split="train",
@@ -426,21 +449,27 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
             is_multimodal = True
     if is_multimodal:
         # Apply the preprocessing function to the dataset
-        processed_dataset = dataset.map(tokenizer.preprocess_function,
-                                        batched=False,
-                                        remove_columns=dataset.column_names)
+        processed_dataset = dataset.map(
+            tokenizer.preprocess_function,
+            batched=False,
+            remove_columns=dataset.column_names,
+        )
 
         # Create DataLoader with the custom collate function
-        calib_dataloader = DataLoader(processed_dataset,
-                                      batch_size=batch_size,
-                                      shuffle=False,
-                                      collate_fn=tokenizer.collate_function)
+        calib_dataloader = DataLoader(
+            processed_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=tokenizer.collate_function,
+        )
     else:
-        batch_encoded = tokenizer.batch_encode_plus(dataset,
-                                                    return_tensors="pt",
-                                                    padding=True,
-                                                    truncation=True,
-                                                    max_length=block_size)
+        batch_encoded = tokenizer.batch_encode_plus(
+            dataset,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=block_size,
+        )
         if device:
             batch_encoded = batch_encoded.to(device)
 
@@ -522,10 +551,11 @@ def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
         logger.info("Starting mixed precision quantization...")
 
         from packaging import version as v
+
         opt_kwargs = {}
-        modelopt_version = version('nvidia-modelopt')
+        modelopt_version = version("nvidia-modelopt")
         if v.parse(modelopt_version) > v.parse("0.21"):
-            opt_kwargs['disabled_layers'] = ["*lm_head*"]
+            opt_kwargs["disabled_layers"] = ["*lm_head*"]
 
         model, search_history = mtq.auto_quantize(
             model,
@@ -541,7 +571,8 @@ def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
                 len(calib_dataloader), 128 // batch_size
             ),  # Limit the number of score steps to avoid long calibration time
             verbose=True,
-            **opt_kwargs)
+            **opt_kwargs,
+        )
         mtq.print_quant_summary(model)
 
         # We need to explicitly calibrate for kv cache quantization
@@ -553,7 +584,7 @@ def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
                     "*output_quantizer": {
                         "num_bits": (4, 3),
                         "axis": None,
-                        "enable": True
+                        "enable": True,
                     }
                 },
             )
@@ -578,17 +609,24 @@ def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
     return model
 
 
-def combine_medusa_weight(tp_size, pp_size, base_model_output_dir,
-                          num_medusa_heads, num_medusa_layers, max_draft_len,
-                          medusa_hidden_act, medusa_model_dir,
-                          quant_medusa_head):
+def combine_medusa_weight(
+    tp_size,
+    pp_size,
+    base_model_output_dir,
+    num_medusa_heads,
+    num_medusa_layers,
+    max_draft_len,
+    medusa_hidden_act,
+    medusa_model_dir,
+    quant_medusa_head,
+):
 
     with open(f"{medusa_model_dir}/config.json", "r") as fp:
         medusa_config = json.load(fp)
 
-    num_medusa_heads_from_config = medusa_config.get('medusa_num_heads',
+    num_medusa_heads_from_config = medusa_config.get("medusa_num_heads",
                                                      num_medusa_heads)
-    num_medusa_layers = medusa_config.get('medusa_num_layers',
+    num_medusa_layers = medusa_config.get("medusa_num_layers",
                                           num_medusa_layers)
     if num_medusa_heads is None:
         num_medusa_heads = num_medusa_heads_from_config
@@ -604,11 +642,14 @@ def combine_medusa_weight(tp_size, pp_size, base_model_output_dir,
                           pp_size=pp_size)
         # 1. Load medusa weight for each rank
         from tensorrt_llm.models.medusa.weight import load_medusa_hf
-        medusa_weights = load_medusa_hf(medusa_path=medusa_model_dir,
-                                        num_medusa_heads=num_medusa_heads,
-                                        num_medusa_layers=num_medusa_layers,
-                                        mapping=mapping,
-                                        dtype="float16")
+
+        medusa_weights = load_medusa_hf(
+            medusa_path=medusa_model_dir,
+            num_medusa_heads=num_medusa_heads,
+            num_medusa_layers=num_medusa_layers,
+            mapping=mapping,
+            dtype="float16",
+        )
         # 2. Load base model safetensors (after quant)
         base_model_weights = load_file(
             f"{base_model_output_dir}/rank{rank}.safetensors")
@@ -619,62 +660,65 @@ def combine_medusa_weight(tp_size, pp_size, base_model_output_dir,
                   f"{base_model_output_dir}/rank{rank}.safetensors")
 
     # 4. Add medusa config into config.json
-    with open(f"{base_model_output_dir}/config.json", 'r') as f:
+    with open(f"{base_model_output_dir}/config.json", "r") as f:
         base_model_config = json.load(f)
         f.close()
 
-    with open(f"{base_model_output_dir}/config.json", 'w') as f:
-        base_model_config['architecture'] = "MedusaForCausalLM"
-        base_model_config['quantization']['exclude_modules'] = [
-            'lm_head',
-            '*router',
-            '*vocab_embedding',
-            '*position_embedding',
-            '*block_embedding',
+    with open(f"{base_model_output_dir}/config.json", "w") as f:
+        base_model_config["architecture"] = "MedusaForCausalLM"
+        base_model_config["quantization"]["exclude_modules"] = [
+            "lm_head",
+            "*router",
+            "*vocab_embedding",
+            "*position_embedding",
+            "*block_embedding",
         ]
         if not quant_medusa_head:
-            base_model_config['quantization']['exclude_modules'].append(
-                '*medusa_heads*')
+            base_model_config["quantization"]["exclude_modules"].append(
+                "*medusa_heads*")
 
-        base_model_config['max_draft_len'] = max_draft_len
-        base_model_config['num_medusa_heads'] = num_medusa_heads
-        base_model_config['num_medusa_layers'] = num_medusa_layers
+        base_model_config["max_draft_len"] = max_draft_len
+        base_model_config["num_medusa_heads"] = num_medusa_heads
+        base_model_config["num_medusa_layers"] = num_medusa_layers
         json.dump(base_model_config, f, indent=4)
 
     torch.cuda.empty_cache()
     logger.info("Combine medusa heads' weight, done.")
 
 
-def quantize_and_export(*,
-                        model_dir,
-                        device,
-                        calib_dataset,
-                        dtype,
-                        qformat,
-                        kv_cache_dtype,
-                        calib_size,
-                        batch_size,
-                        calib_max_seq_length,
-                        awq_block_size,
-                        output_dir,
-                        tp_size,
-                        pp_size,
-                        cp_size,
-                        seed,
-                        tokenizer_max_seq_length,
-                        num_medusa_heads=None,
-                        num_medusa_layers=None,
-                        max_draft_len=None,
-                        medusa_hidden_act=None,
-                        medusa_model_dir=None,
-                        quant_medusa_head=None,
-                        auto_quantize_bits=None,
-                        device_map="auto",
-                        quantize_lm_head=False):
-    '''
-        Load model from the model_dir, call Modelopt to quantize the model, and then export
-        the quantized model as TRT-LLM checkpoint
-    '''
+def quantize_and_export(
+    *,
+    model_dir: str,
+    device: str,
+    calib_dataset: str,
+    dtype: str,
+    qformat: str,
+    kv_cache_dtype: Optional[str],
+    calib_size: int,
+    batch_size: int,
+    calib_max_seq_length: int,
+    awq_block_size: int,
+    output_dir: str,
+    tp_size: int,
+    pp_size: int,
+    cp_size: int,
+    seed: int,
+    tokenizer_max_seq_length: int,
+    num_medusa_heads: Optional[int] = None,
+    num_medusa_layers: Optional[int] = None,
+    max_draft_len: Optional[int] = None,
+    medusa_hidden_act: Optional[str] = None,
+    medusa_model_dir: Optional[str] = None,
+    quant_medusa_head: Optional[bool] = None,
+    auto_quantize_bits: Optional[bool] = None,
+    device_map: str = "auto",
+    quantize_lm_head: bool = False,
+    export_format: str = "tensorrt_llm",
+):
+    """
+    Load model from the model_dir, call Modelopt to quantize the model, and then export
+    the quantized model as TRT-LLM checkpoint
+    """
     try:
         import modelopt  # noqa
     except ImportError as e:
@@ -684,7 +728,8 @@ def quantize_and_export(*,
         raise e
 
     import modelopt.torch.quantization as mtq
-    from modelopt.torch.export import export_tensorrt_llm_checkpoint
+    from modelopt.torch.export import (export_hf_checkpoint,
+                                       export_tensorrt_llm_checkpoint)
 
     from tensorrt_llm.models.convert_utils import infer_dtype
 
@@ -700,20 +745,24 @@ def quantize_and_export(*,
                 ), "Quantization supports only one quantization format."
 
     hf_config = get_hf_config(model_dir)
-    dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
+    dtype = infer_dtype(dtype, getattr(hf_config, "torch_dtype", None))
 
     model = get_model(model_dir, dtype, device=device, device_map=device_map)
     model_type = get_model_type(model)
     is_enc_dec = model_type_is_enc_dec(model_type)
     if "vila" in model_dir:
-        tokenizer = get_tokenizer(model_dir + "/llm",
-                                  max_seq_length=tokenizer_max_seq_length,
-                                  model_type=model_type)
+        tokenizer = get_tokenizer(
+            model_dir + "/llm",
+            max_seq_length=tokenizer_max_seq_length,
+            model_type=model_type,
+        )
     elif model_type == "mllama":
-        tokenizer = get_processor(model_dir,
-                                  max_seq_length=tokenizer_max_seq_length,
-                                  model_type=model_type,
-                                  device=device)
+        tokenizer = get_processor(
+            model_dir,
+            max_seq_length=tokenizer_max_seq_length,
+            model_type=model_type,
+            device=device,
+        )
     else:
         tokenizer = get_tokenizer(model_dir,
                                   max_seq_length=tokenizer_max_seq_length,
@@ -769,7 +818,7 @@ def quantize_and_export(*,
             if model_type == "gemma" and "int8_sq" in qformat:
                 quant_cfg["algorithm"] = {"method": "smoothquant", "alpha": 0.5}
 
-            if qformat == 'fp8' and quantize_lm_head:
+            if qformat == "fp8" and quantize_lm_head:
                 print_rank_0("Quantizing lm_head layer")
                 del quant_cfg["quant_cfg"]["*lm_head*"]
 
@@ -801,25 +850,27 @@ def quantize_and_export(*,
         # Move meta tensor back to device before exporting.
         remove_hook_from_module(model, recurse=True)
 
-        QUANT_ALGO = {
-            "int8": "INT8",
-            "int8_sq": "W8A8_SQ_PER_CHANNEL",
-            "fp8": "FP8",
-            "int4_awq": "W4A16_AWQ",
-            "w4a8_awq": "W4A8_AWQ",
-        }
-
-        if model_type == 'mllama':
+        if model_type == "mllama":
             model = model.language_model
 
-        export_tensorrt_llm_checkpoint(
-            model.hf_model if is_enc_dec else model,
-            model_type,
-            getattr(torch, dtype),
-            export_dir=export_path,
-            inference_tensor_parallel=tp_size,
-            inference_pipeline_parallel=pp_size,
-        )
+        match export_format:
+            case "tensorrt_llm":
+                export_tensorrt_llm_checkpoint(
+                    model.hf_model if is_enc_dec else model,
+                    model_type,
+                    getattr(torch, dtype),
+                    export_dir=export_path,
+                    inference_tensor_parallel=tp_size,
+                    inference_pipeline_parallel=pp_size,
+                )
+            case "hf":
+                export_hf_checkpoint(
+                    model=model,
+                    dtype=getattr(torch, dtype),
+                    export_dir=export_path,
+                )
+            case _:
+                raise ValueError(f"Unsupported export format: {export_format}")
 
         export_paths = []
         tensorrt_llm_configs = []
@@ -854,15 +905,15 @@ def quantize_and_export(*,
                     tensorrt_llm_config["quantization"]["quant_algo"] = None
 
             # HF uses rope_scaling while tensorrt_llm uses rotary_scaling
-            if hasattr(model.config, "rope_scaling"
-                       ) and "rotary_scaling" not in tensorrt_llm_config:
+            if (hasattr(model.config, "rope_scaling")
+                    and "rotary_scaling" not in tensorrt_llm_config):
                 tensorrt_llm_config["rotary_scaling"] = getattr(
                     model.config, "rope_scaling")
             with open(f"{export_path}/config.json", "w") as f:
                 json.dump(tensorrt_llm_config, f, indent=4)
 
             # Workaround for Modelopt 0.9.x fp8_kv_cache knob issue
-            if qformat in ['fp8', 'nvfp4'] and kv_cache_dtype is None:
+            if qformat in ["fp8", "nvfp4"] and kv_cache_dtype is None:
                 with open(f"{export_path}/config.json", "r") as f:
                     tensorrt_llm_config = json.load(f)
                 tensorrt_llm_config["quantization"][
@@ -871,13 +922,14 @@ def quantize_and_export(*,
                     json.dump(tensorrt_llm_config, f, indent=4)
 
             # Workaround for qwen version
-            if model_type == 'qwen' or model_type == 'qwen2_vl':
+            if model_type == "qwen" or model_type == "qwen2_vl":
                 with open(f"{export_path}/config.json", "r") as f:
                     tensorrt_llm_config = json.load(f)
                 qwen_config = AutoConfig.from_pretrained(model_dir,
                                                          trust_remote_code=True)
                 try:
                     from transformers import LlavaOnevisionConfig
+
                     if isinstance(qwen_config, LlavaOnevisionConfig):
                         qwen_config = qwen_config.text_config
                 except:
@@ -893,27 +945,25 @@ def quantize_and_export(*,
                     json.dump(tensorrt_llm_config, f, indent=4)
 
             # Set rotary parameters correctly for chatglm.
-            if model_type == 'chatglm':
+            if model_type == "chatglm":
                 rotary_base = 10000.0
                 rotary_embedding_scaling = None
-                chatglm_config = AutoConfig.from_pretrained(
-                    model_dir, trust_remote_code=True)
-                chatglm_version = tensorrt_llm_config['chatglm_version']
-                rope_ratio = tensorrt_llm_config.get('rope_ratio', 1.0)
-                if chatglm_version == 'chatglm2':
+                chatglm_version = tensorrt_llm_config["chatglm_version"]
+                rope_ratio = tensorrt_llm_config.get("rope_ratio", 1.0)
+                if chatglm_version == "chatglm2":
                     if rope_ratio > 1:
                         rotary_embedding_scaling = {
-                            'type': 'linear',
-                            'factor': rope_ratio
+                            "type": "linear",
+                            "factor": rope_ratio,
                         }
-                elif chatglm_version == 'chatglm3':
+                elif chatglm_version == "chatglm3":
                     rotary_base *= rope_ratio
 
                 with open(f"{export_path}/config.json", "r") as f:
                     tensorrt_llm_config = json.load(f)
-                tensorrt_llm_config['rotary_base'] = rotary_base
-                tensorrt_llm_config['rotary_scaling'] = rotary_embedding_scaling
-                tensorrt_llm_config['rotary_pct'] = 0.5
+                tensorrt_llm_config["rotary_base"] = rotary_base
+                tensorrt_llm_config["rotary_scaling"] = rotary_embedding_scaling
+                tensorrt_llm_config["rotary_pct"] = 0.5
                 with open(f"{export_path}/config.json", "w") as f:
                     json.dump(tensorrt_llm_config, f, indent=4)
 
@@ -928,11 +978,11 @@ def quantize_and_export(*,
                 with open(f"{export_path}/config.json", "w") as f:
                     json.dump(tensorrt_llm_config, f, indent=4)
 
-            if model_type == 'gptnext':
+            if model_type == "gptnext":
                 with open(f"{export_path}/config.json", "r") as f:
                     tensorrt_llm_config = json.load(f)
-                if tensorrt_llm_config['max_position_embeddings'] is None:
-                    tensorrt_llm_config['max_position_embeddings'] = getattr(
+                if tensorrt_llm_config["max_position_embeddings"] is None:
+                    tensorrt_llm_config["max_position_embeddings"] = getattr(
                         model.config, "n_positions", None)
                 with open(f"{export_path}/config.json", "w") as f:
                     json.dump(tensorrt_llm_config, f, indent=4)
@@ -940,14 +990,22 @@ def quantize_and_export(*,
             # Workaround for combining medusa head
             # TODO: move these integration into modelopt to avoid redundant reading and writing
             if medusa_model_dir is not None:
-                combine_medusa_weight(tp_size, pp_size, export_path,
-                                      num_medusa_heads, num_medusa_layers,
-                                      max_draft_len, medusa_hidden_act,
-                                      medusa_model_dir, quant_medusa_head)
+                combine_medusa_weight(
+                    tp_size,
+                    pp_size,
+                    export_path,
+                    num_medusa_heads,
+                    num_medusa_layers,
+                    max_draft_len,
+                    medusa_hidden_act,
+                    medusa_model_dir,
+                    quant_medusa_head,
+                )
 
             # Workaround for mllama
-            if model_type == 'mllama':
+            if model_type == "mllama":
                 from tensorrt_llm.models.mllama.config import MLLaMAConfig
+
                 config = MLLaMAConfig.from_hugging_face(
                     model_dir,
                     dtype=dtype,
@@ -993,22 +1051,27 @@ def unwrap_model(model, module_instances=None):
     return unwrapped_model
 
 
-def get_nemo_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
-                              batch_size=64,
-                              calib_size=512,
-                              max_sequence_length=512):
+def get_nemo_calib_dataloader(
+    dataset_name_or_dir="cnn_dailymail",
+    batch_size=64,
+    calib_size=512,
+    max_sequence_length=512,
+):
     if dataset_name_or_dir == "pileval":
         dataset = load_dataset(
             "json",
             data_files="https://the-eye.eu/public/AI/pile/val.jsonl.zst",
             split="train",
-            trust_remote_code=True)
+            trust_remote_code=True,
+        )
         text_column = "text"
     elif "wikitext" in dataset_name_or_dir:
-        dataset = load_dataset(dataset_name_or_dir,
-                               "wikitext-103-v1",
-                               split="train",
-                               trust_remote_code=True)
+        dataset = load_dataset(
+            dataset_name_or_dir,
+            "wikitext-103-v1",
+            split="train",
+            trust_remote_code=True,
+        )
         text_column = "text"
     elif "cnn_dailymail" in dataset_name_or_dir:
         dataset = load_dataset(dataset_name_or_dir,
@@ -1037,11 +1100,26 @@ def get_nemo_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
         yield batch
 
 
-def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
-                             calib_tp_size, calib_pp_size, dtype, qformat,
-                             kv_cache_dtype, calib_size, batch_size,
-                             calib_max_seq_length, awq_block_size, output_dir,
-                             tp_size, pp_size, cp_size, seed):
+def quantize_nemo_and_export(
+    *,
+    nemo_ckpt_path,
+    decoder_type,
+    calib_dataset,
+    calib_tp_size,
+    calib_pp_size,
+    dtype,
+    qformat,
+    kv_cache_dtype,
+    calib_size,
+    batch_size,
+    calib_max_seq_length,
+    awq_block_size,
+    output_dir,
+    tp_size,
+    pp_size,
+    cp_size,
+    seed,
+):
     try:
         import modelopt  # noqa
     except ImportError as e:
@@ -1074,16 +1152,17 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
 
     # dtype is used for non-quantized layers
     supported_dtype = ["auto", "float16", "bfloat16"]
-    assert dtype in supported_dtype, f"{dtype} not supported. Supported dtypes are {supported_dtype}"
+    assert (dtype in supported_dtype
+            ), f"{dtype} not supported. Supported dtypes are {supported_dtype}"
 
-    if dtype == 'auto':
-        dtype = model_cfg.get('precision', None)
+    if dtype == "auto":
+        dtype = model_cfg.get("precision", None)
         if dtype is None:
-            dtype = 'float16'
-        elif 'bf16' in dtype or 'bfloat16' in dtype:
-            dtype = 'bfloat16'
+            dtype = "float16"
+        elif "bf16" in dtype or "bfloat16" in dtype:
+            dtype = "bfloat16"
         else:
-            dtype = 'float16'
+            dtype = "float16"
         logger.info(f"Specified dtype 'auto'; inferred dtype {dtype!r}.")
     torch_dtype = getattr(torch, dtype)
 
@@ -1099,12 +1178,12 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
 
     # trainer required for restoring model parallel models
     trainer_config = {
-        'devices': calib_tp_size * calib_pp_size,
-        'num_nodes': 1,
-        'accelerator': 'gpu',
-        'logger': False,
-        'precision': model_cfg.precision,
-        'enable_checkpointing': False,
+        "devices": calib_tp_size * calib_pp_size,
+        "num_nodes": 1,
+        "accelerator": "gpu",
+        "logger": False,
+        "precision": model_cfg.precision,
+        "enable_checkpointing": False,
     }
     trainer = Trainer(strategy=NLPDDPStrategy(), **trainer_config)
     connector = NLPSaveRestoreConnector()
@@ -1135,19 +1214,19 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
         model.trainer.strategy.setup_environment()
 
     inference_config = {
-        'greedy': False,
-        'top_k': 0,
-        'top_p': 0.9,
-        'temperature': 1.0,
-        'add_BOS': True,
-        'tokens_to_generate': 30,
-        'all_probs': False,
-        'repetition_penalty': 1.2,
-        'min_tokens_to_generate': 0,
-        'compute_logprob': False,
-        'batch_size': batch_size,
-        'max_context_length': calib_max_seq_length,
-        'strategy': GPTModelTextGenerationStrategy(model),
+        "greedy": False,
+        "top_k": 0,
+        "top_p": 0.9,
+        "temperature": 1.0,
+        "add_BOS": True,
+        "tokens_to_generate": 30,
+        "all_probs": False,
+        "repetition_penalty": 1.2,
+        "min_tokens_to_generate": 0,
+        "compute_logprob": False,
+        "batch_size": batch_size,
+        "max_context_length": calib_max_seq_length,
+        "strategy": GPTModelTextGenerationStrategy(model),
     }
     model.set_inference_config(inference_config)
 
@@ -1232,8 +1311,10 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
             elif qformat == "int8_sq":
                 maxbound = 127
             model = mtq.postprocess_amax(
-                model, "*input_quantizer",
-                lambda amax: torch.clamp(amax, min=0.01 * maxbound))
+                model,
+                "*input_quantizer",
+                lambda amax: torch.clamp(amax, min=0.01 * maxbound),
+            )
 
         if torch.distributed.get_rank() == 0:
             mtq.print_quant_summary(model)
