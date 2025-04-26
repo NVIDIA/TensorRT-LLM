@@ -1,10 +1,11 @@
 from enum import Enum
 from typing import List
 
-from evaluator import equal_group
 from transformers import AutoTokenizer
 
 from tensorrt_llm.scaffolding import Controller, GenerationTask
+
+from .evaluator import equal_group
 
 
 class DynasorGenerationController(Controller):

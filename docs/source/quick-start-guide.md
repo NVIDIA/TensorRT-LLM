@@ -92,7 +92,7 @@ For examples and command syntax, refer to the [trtllm-serve](commands/trtllm-ser
 (quick-start-guide-compile)=
 ### Compile the Model into a TensorRT Engine
 
-Use the [Llama model definition](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama) from the `examples/llama` directory of the GitHub repository.
+Use the [Llama model definition](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama) from the `examples/models/core/llama` directory of the GitHub repository.
 The model definition is a minimal example that shows some of the optimizations available in TensorRT-LLM.
 
 ```console
@@ -104,7 +104,7 @@ make -C docker release_run LOCAL_USER=1
 huggingface-cli login --token *****
 
 # Convert the model into TensorRT-LLM checkpoint format
-cd examples/llama
+cd examples/models/core/llama
 pip install -r requirements.txt
 pip install --upgrade transformers # Llama 3.1 requires transformer 4.43.0+ version.
 python3 convert_checkpoint.py --model_dir Meta-Llama-3.1-8B-Instruct --output_dir llama-3.1-8b-ckpt
@@ -117,7 +117,7 @@ trtllm-build --checkpoint_dir llama-3.1-8b-ckpt \
 
 When you create a model definition with the TensorRT-LLM API, you build a graph of operations from [NVIDIA TensorRT](https://developer.nvidia.com/tensorrt) primitives that form the layers of your neural network. These operations map to specific kernels; prewritten programs for the GPU.
 
-In this example, we included the `gpt_attention` plugin, which implements a FlashAttention-like fused attention kernel, and the `gemm` plugin, that performs matrix multiplication with FP32 accumulation. We also called out the desired precision for the full model as FP16, matching the default precision of the weights that you downloaded from Hugging Face. For more information about plugins and quantizations, refer to the [Llama example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama) and {ref}`precision` section.
+In this example, we included the `gpt_attention` plugin, which implements a FlashAttention-like fused attention kernel, and the `gemm` plugin, that performs matrix multiplication with FP32 accumulation. We also called out the desired precision for the full model as FP16, matching the default precision of the weights that you downloaded from Hugging Face. For more information about plugins and quantizations, refer to the [Llama example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama) and {ref}`precision` section.
 
 ### Run the Model
 

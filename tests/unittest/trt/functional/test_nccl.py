@@ -27,8 +27,8 @@ from utils.util import create_session, run_session, unittest_name_func
 
 import tensorrt_llm
 from tensorrt_llm import Mapping, Tensor
-from tensorrt_llm.functional import (AllReduceConfig, AllReduceParams,
-                                     AllReduceStrategy, allreduce)
+from tensorrt_llm.functional import (AllReduceParams, AllReduceStrategy,
+                                     allreduce)
 from tensorrt_llm.plugin.plugin import current_all_reduce_helper
 
 
@@ -55,20 +55,13 @@ class TestCommunicationPlugin(unittest.TestCase):
         product(["bfloat16", 'float16', "float32"], [
             AllReduceStrategy.NCCL, AllReduceStrategy.ONESHOT,
             AllReduceStrategy.TWOSHOT
-        ], [
-            AllReduceConfig(0),
-            AllReduceConfig.PUSH_MODE,
-            AllReduceConfig.USE_MEMCPY,
         ], [64 * 70000, 64 * 70, 64])),
                           name_func=unittest_name_func)
     def test_allreduce(self, dtype: str, strategy: AllReduceStrategy,
-                       config: AllReduceConfig, size: int):
+                       size: int):
 
         if self.world_size == 1:
             pytest.skip("Skip single GPU NCCL")
-
-        if strategy == AllReduceStrategy.NCCL and config != AllReduceConfig(0):
-            pytest.skip("NCCL with specific config discarded")
 
         workspace = None
 
@@ -101,10 +94,10 @@ class TestCommunicationPlugin(unittest.TestCase):
 
             current = x
             for i in range(inner_loop):
-                current = allreduce(current,
-                                    self.mapping.tp_group,
-                                    all_reduce_params=AllReduceParams(
-                                        strategy=strategy, config=config))
+                current = allreduce(
+                    current,
+                    self.mapping.tp_group,
+                    all_reduce_params=AllReduceParams(strategy=strategy))
 
             current.mark_output('output', dtype)
 

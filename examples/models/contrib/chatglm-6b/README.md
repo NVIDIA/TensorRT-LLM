@@ -29,7 +29,7 @@ This document explains how to build the [ChatGLM-6B](https://huggingface.co/THUD
 The TensorRT-LLM ChatGLM implementation can be found in [`tensorrt_llm/models/chatglm/model.py`](../../tensorrt_llm/models/chatglm/model.py).
 The TensorRT-LLM ChatGLM example code is located in [`examples/models/contrib/chatglm-6b`](./). There is one main file:
 
-* [`examples/glm-4-9b/convert_checkpoint.py`](../../../glm-4-9b/convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format.
+* [`examples/models/core/glm-4-9b/convert_checkpoint.py`](../../../glm-4-9b/convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format.
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
@@ -103,4 +103,4 @@ cp chatglm_6b/tokenization_chatglm.py chatglm_6b/tokenization_chatglm.py-backup
 cp tokenization_chatglm.py chatglm_6b
 ```
 
-For more example codes, please refer to the [examples/glm-4-9b/README.md](../../../glm-4-9b/README.md).
+For more example codes, please refer to the [examples/models/core/glm-4-9b/README.md](../../../glm-4-9b/README.md).

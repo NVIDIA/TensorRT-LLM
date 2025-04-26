@@ -3,7 +3,7 @@
 This document shows how to build and run a [EXAONE](https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct) model in TensorRT-LLM.
 
 The TensorRT-LLM EXAONE implementation is based on the LLaMA model. The implementation can be found in [llama/model.py](../../../../tensorrt_llm/models/llama/model.py).
-See the LLaMA example [`examples/llama`](../llama) for details.
+See the LLaMA example [`examples/models/core/llama`](../llama) for details.
 
 - [EXAONE](#exaone)
   - [Support Matrix](#support-matrix)
@@ -211,4 +211,4 @@ python ../../../summarize.py \
     --engine_dir trt_engines/exaone/fp16/1-gpu
 ```
 
-For more examples see [`examples/llama/README.md`](../llama/README.md)
+For more examples see [`examples/models/core/llama/README.md`](../llama/README.md)

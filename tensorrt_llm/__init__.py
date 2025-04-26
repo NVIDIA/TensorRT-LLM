@@ -14,6 +14,18 @@
 # limitations under the License.
 
 
+def _check_mpi_environment():
+    import os
+    has_mpi = any(var in os.environ
+                  for var in ["OMPI_COMM_WORLD_RANK", "OMPI_APP_CTX_NUM_PROCS"])
+    has_pmix = "PMIX_RANK" in os.environ
+    if has_pmix and not has_mpi:
+        raise RuntimeError(
+            f"PMIx is detected (PMIX_RANK={os.environ['PMIX_RANK']}), "
+            "but OMPI_COMM_WORLD_RANK is not set. "
+            "Please use mpirun to launch the program.")
+
+
 def _add_trt_llm_dll_directory():
     import platform
     on_windows = platform.system() == "Windows"
@@ -25,6 +37,7 @@ def _add_trt_llm_dll_directory():
             Path(sysconfig.get_paths()['purelib']) / "tensorrt_llm" / "libs")
 
 
+_check_mpi_environment()
 _add_trt_llm_dll_directory()
 
 import sys
@@ -36,12 +49,10 @@ import tensorrt_llm.runtime as runtime
 import tensorrt_llm.tools as tools
 
 from ._common import _init, default_net, default_trtnet, precision
-# Disable flake8 on the line below because mpi_barrier is not used in tensorrt_llm project
-# but may be called in dependencies (such as examples)
-from ._utils import mpi_barrier  # NOQA
-from ._utils import str_dtype_to_torch  # NOQA
+from ._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
-                     mpi_rank, mpi_world_size, set_mpi_comm, str_dtype_to_trt,
+                     mpi_barrier, mpi_comm, mpi_rank, mpi_world_size,
+                     set_mpi_comm, str_dtype_to_torch, str_dtype_to_trt,
                      torch_dtype_to_trt)
 from .auto_parallel import AutoParallelConfig, auto_parallel
 from .builder import BuildConfig, Builder, BuilderConfig, build
@@ -69,6 +80,7 @@ __all__ = [
     'local_mpi_rank',
     'local_mpi_size',
     'mpi_barrier',
+    'mpi_comm',
     'mpi_rank',
     'set_mpi_comm',
     'mpi_world_size',
@@ -79,6 +91,9 @@ __all__ = [
     'net_guard',
     'Network',
     'Mapping',
+    'MnnvlMemory',
+    'MnnvlMoe',
+    'MoEAlltoallInfo',
     'PluginBase',
     'Builder',
     'BuilderConfig',

@@ -115,6 +115,8 @@ def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
 @Field
 def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
 @Field
+def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
+@Field
 def DEBUG_MODE = "debug"
 @Field
 def testFilter = [
@@ -130,6 +132,7 @@ def testFilter = [
     (MULTI_GPU_FILE_CHANGED): false,
     (ONLY_PYTORCH_FILE_CHANGED): false,
     (DEBUG_MODE): false,
+    (AUTO_TRIGGER_TAG_LIST): [],
 ]
 
 String getShortenedJobName(String path)
@@ -279,7 +282,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         targetCould = "kubernetes"
 
         // The following GPU types doesn't support dynamic driver flashing.
-        if (type == "b100-ts2" || type.contains("dgx-h100") || type.contains("dgx-h200") || type == "gh200" ) {
+        if (type.contains("dgx-h100") || type.contains("dgx-h200") || type in ["b100-ts2", "gh200", "rtx-5080", "rtx-5090"]) {
             selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
@@ -614,6 +617,12 @@ def renderTestDB(testContext, llmSrc, stageName) {
         // At this point, all tests will be run
         // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
     }
+    if (stageName.contains("-DeepSeek-")) {
+        makoArgs += ["auto_trigger=deepseek"]
+    } else {
+        makoArgs += ["auto_trigger=others"]
+    }
+
     def makoOpts = getMakoOpts(scriptPath, makoArgs)
 
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
@@ -1178,8 +1187,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 {
     def dockerArgs = "-v /mnt/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
     turtleConfigs = [
-        "DGX_H100-4_GPUs-PyTorch-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
-        "DGX_H100-4_GPUs-PyTorch-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
+        "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_H100-4_GPUs-PyTorch-Others-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-TensorRT-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
         "DGX_H100-4_GPUs-TensorRT-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
@@ -1199,6 +1208,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A30-TensorRT-2": ["a30", "l0_a30", 2, 4],
         "A30-TensorRT-3": ["a30", "l0_a30", 3, 4],
         "A30-TensorRT-4": ["a30", "l0_a30", 4, 4],
+        "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
         "A100X-TensorRT-1": ["a100x", "l0_a100", 1, 4],
         "A100X-TensorRT-2": ["a100x", "l0_a100", 2, 4],
         "A100X-TensorRT-3": ["a100x", "l0_a100", 3, 4],
@@ -1219,12 +1229,16 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 2],
         "B200_PCIe-TensorRT-1": ["b100-ts2", "l0_b200", 1, 2],
         "B200_PCIe-TensorRT-2": ["b100-ts2", "l0_b200", 2, 2],
+        "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
+        "RTX5080-TensorRT-1": ["rtx-5080", "l0_gb203", 1, 2],
+        "RTX5080-TensorRT-2": ["rtx-5080", "l0_gb203", 2, 2],
         // Currently post-merge test stages only run tests with "stage: post_merge" mako
         // in the test-db. This behavior may change in the future.
         "A10-TensorRT-[Post-Merge]-1": ["a10", "l0_a10", 1, 2],
         "A10-TensorRT-[Post-Merge]-2": ["a10", "l0_a10", 2, 2],
         "A30-TensorRT-[Post-Merge]-1": ["a30", "l0_a30", 1, 2],
         "A30-TensorRT-[Post-Merge]-2": ["a30", "l0_a30", 2, 2],
+        "A30-CPP-[Post-Merge]-1": ["a30", "l0_a30", 1, 1],
         "A100X-TensorRT-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
         "A100X-TensorRT-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
         "L40S-TensorRT-[Post-Merge]-1": ["l40s", "l0_l40s", 1, 2],
@@ -1454,6 +1468,19 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     // Check if the multi GPU related file has changed or not. If changed, add multi GPU test stages.
     if (testFilter[(MULTI_GPU_FILE_CHANGED)]) {
         parallelJobsFiltered += multiGpuJobs
+    }
+
+    if (testFilter[(AUTO_TRIGGER_TAG_LIST)] != null) {
+        echo "AUTO_TRIGGER_TAG_LIST mode is true. Auto trigger tags: ${testFilter[(AUTO_TRIGGER_TAG_LIST)].join(', ')}."
+        def autoTriggerTagStages = [:]
+        for (tag in testFilter[(AUTO_TRIGGER_TAG_LIST)]) {
+            autoTriggerTagStages += parallelJobs.findAll { it.key.contains(tag) }
+        }
+        parallelJobsFiltered += autoTriggerTagStages
+        if (autoTriggerTagStages.size() > 0) {
+            echo "Auto trigger will force run stages: ${autoTriggerTagStages.keySet().join(', ')}."
+        }
+        println parallelJobsFiltered.keySet()
     }
 
     // Check --post-merge, post-merge or TRT dependency testing pipelines.

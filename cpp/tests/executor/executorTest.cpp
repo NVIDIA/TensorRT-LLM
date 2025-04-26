@@ -207,7 +207,7 @@ TEST_F(GptExecutorTest, ReturnAcceptedTokenLogits)
 
     // Enable kv cache reuse of executorConfig
     bool enableBlockReuse = true;
-    FloatType freeGpuMemoryFraction = 0.5;
+    FloatType freeGpuMemoryFraction = 0.4;
     auto kvCacheConfig
         = KvCacheConfig(enableBlockReuse, std::nullopt, std::nullopt, std::nullopt, freeGpuMemoryFraction);
     executorConfig.setKvCacheConfig(kvCacheConfig);

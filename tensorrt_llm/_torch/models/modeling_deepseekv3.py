@@ -38,6 +38,7 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 
@@ -345,6 +346,10 @@ class Deepseekv3MoE(nn.Module):
         config = model_config.pretrained_config
         self.top_k = top_k
         self.use_dp = model_config.mapping.enable_attention_dp
+        self.enable_alltoall = Deepseekv3MoE.should_enable_alltoall(
+            model_config, top_k)
+        if self.enable_alltoall:
+            MnnvlMemory.initialize()
         self.gate = DeepseekV3Gate(
             hidden_size,
             num_experts,
@@ -365,7 +370,8 @@ class Deepseekv3MoE(nn.Module):
             reduce_results=
             False,  # In both low‑latency and attention‑DP modes, FusedMoE skips the in‑op all‑reduce.
             model_config=model_config,
-            aux_stream=aux_stream_dict[AuxStreamType.MoeChunkingOverlap])
+            aux_stream=aux_stream_dict[AuxStreamType.MoeChunkingOverlap],
+            enable_alltoall=self.enable_alltoall)
 
         self.mapping = model_config.mapping
 
@@ -429,10 +435,29 @@ class Deepseekv3MoE(nn.Module):
 
         return shared_tp_size, shared_output_scale
 
+    @staticmethod
+    def should_enable_alltoall(model_config: ModelConfig, top_k: int) -> bool:
+        if not model_config.mapping.enable_attention_dp:
+            return False
+
+        if model_config.mapping.tp_size == 1:
+            return False
+
+        if not MnnvlMemory.supports_mnnvl():
+            return False
+
+        if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
+            return False
+
+        if model_config.mapping.moe_ep_size <= top_k:
+            return False
+
+        return True
+
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
                               all_rank_num_tokens, min_latency_mode):
         # max-throughput
-        if self.use_dp and self.mapping.tp_size > 1:
+        if self.use_dp and self.mapping.tp_size > 1 and not self.enable_alltoall:
             max_num_token = max(all_rank_num_tokens)
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
@@ -466,7 +491,8 @@ class Deepseekv3MoE(nn.Module):
             assert not self.use_dp
 
         def _compute_shared_output():
-            shared_output = self.shared_experts(hidden_states)
+            shared_output = self.shared_experts(hidden_states_fp4
+                                                or hidden_states)
             if self.shared_output_scale is not None:
                 shared_output *= self.shared_output_scale
             return shared_output
@@ -624,6 +650,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             )
         return mlp_tp_size
 
+    def _enable_latency_mode(self, num_tokens: int):
+        return num_tokens <= 128 and self.fusion_config.POST_MOE_FUSION and self.is_nvfp4 and self.model_config.moe_backend == 'CUTLASS'
+
     def forward(
         self,
         position_ids: torch.LongTensor,
@@ -650,9 +679,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         using_prev_fusion = self.deepseek_allreduce_disabled or hidden_states.size(
             0) > 128
 
-        min_latency_mode = True if hidden_states.size(
-            0
-        ) <= 128 and self.fusion_config.POST_MOE_FUSION and self.is_nvfp4 and self.model_config.moe_backend == 'CUTLASS' else False
+        min_latency_mode = self._enable_latency_mode(hidden_states.size(0))
 
         if self.fusion_config.PRE_MOE_FUSION:
             # Custom AR Fusion for DeepseekV3
@@ -675,7 +702,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                             self.mlp.experts.fc31_input_scale
                         ],
                         self.post_attention_layernorm.variance_epsilon,
-                        AllReduceFusionOp.RESIDUAL_RMS_NORM_AND_QUANT_NVFP4,
+                        AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
                     )
                     hidden_states_fp4 = Fp4QuantizedTensor(
                         hidden_states_act, hidden_states_sf)
@@ -830,7 +857,8 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             config.hidden_size,
             bias=False,
             dtype=config.torch_dtype,
-            skip_create_weights=model_config.skip_create_weights,
+            skip_create_weights_in_init=model_config.
+            skip_create_weights_in_init,
         )
 
         self.shared_head = DeepseekV3MTPHead(model_config)
@@ -1093,7 +1121,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 attn_metadata,
                 True,
             )
-            # get accepetd tokens and next draft tokens
+            # get accepted tokens and next draft tokens
             return self.mtp_worker(
                 input_ids=input_ids,
                 position_ids=position_ids,

@@ -809,14 +809,9 @@ def test_llm_mistral_quantization_4gpus_llmapi(llama_example_root,
     threshold = 55 if 'int4' in quant else 60
 
     mmlu_cmd = [
-        f"{llama_example_root}/../../../mmlu_llmapi.py",
-        f"--data_dir={mmlu_dataset_root}",
-        f"--hf_model_dir={llm_mistral_model_root}",
-        f"--engine_dir={engine_dir}",
-        "--backend=tensorrt",
-        "--check_accuracy",
-        f"--accuracy_threshold={threshold}",
-        f"--tp_size={tp_size}",
+        "trtllm-eval", f"--model={engine_dir}",
+        f"--tokenizer={llm_mistral_model_root}", f"--tp_size={tp_size}",
+        "--backend=tensorrt", "mmlu", f"--dataset_path={mmlu_dataset_root}",
+        "--check_accuracy", f"--accuracy_threshold={threshold}"
     ]
-
-    venv_check_call(llm_venv, mmlu_cmd)
+    check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
