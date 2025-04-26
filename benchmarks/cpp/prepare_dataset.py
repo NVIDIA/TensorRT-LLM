@@ -12,14 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import logging
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import click
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from transformers import AutoTokenizer
 from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
+from utils.abstractions import (ConstantTaskIdDistribution,
+                                UniformTaskIdDistribution)
 from utils.prepare_real_data import dataset
 from utils.prepare_synthetic_data import token_norm_dist, token_unif_dist
 
@@ -28,10 +31,11 @@ class RootArgs(BaseModel):
     tokenizer: str
     output: str
     random_seed: int
-    task_id: int
+    task_id: int = None
     std_out: bool
-    rand_task_id: Optional[Tuple[int, int]]
+    rand_task_id: Optional[Tuple[int, int]] = None
     export_format: str
+    task_id_distribution: Any = None
 
     @field_validator("tokenizer")
     def get_tokenizer(cls,
@@ -44,6 +48,27 @@ class RootArgs(BaseModel):
             )
         tokenizer.pad_token = tokenizer.eos_token
         return tokenizer
+
+    @model_validator(mode="after")
+    def get_task_id_distribution(self) -> "RootArgs":
+        # Check that exactly one of task_id or rand_task_id is set
+        if (self.task_id is None and self.rand_task_id is None) or (
+                self.task_id is not None and self.rand_task_id is not None):
+            raise ValueError(
+                "Exactly one of 'task_id' or 'rand_task_id' must be specified")
+
+        # Set the task_id_distribution based on which field is set
+        if self.task_id is not None:
+            # Use constant distribution with the specific task_id
+            self.task_id_distribution = ConstantTaskIdDistribution(
+                task_id=self.task_id)
+        else:
+            # Use uniform distribution within the rand_task_id range
+            min_id, max_id = self.rand_task_id
+            self.task_id_distribution = UniformTaskIdDistribution(min_id=min_id,
+                                                                  max_id=max_id)
+
+        return self
 
 
 @click.group()

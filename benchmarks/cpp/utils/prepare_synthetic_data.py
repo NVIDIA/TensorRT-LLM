@@ -104,7 +104,8 @@ def token_unif_dist(root_args, **kwargs):
             max_id=root_args.task_id,
         ),
         kwargs["num_requests"],
-        random_source,
+        task_id_distribution=root_args.task_id_distribution,
+        random_source=random_source,
     )
 
     export_workload_from_args(root_args, workload)

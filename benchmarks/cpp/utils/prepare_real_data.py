@@ -86,7 +86,6 @@ def validate_output_len_dist(
     "--output-len-dist",
     type=str,
     default=None,
-    callback=validate_output_len_dist,
     help=
     "Output length distribution. Default will be the length of the golden output from the dataset. Format: <output_len_mean>,<output_len_stdev>. E.g. 100,10 will randomize the output length with mean=100 and variance=10.",
 )
@@ -98,14 +97,15 @@ def dataset(root_args, **kwargs):
         for k, v in kwargs.items() if k.startswith("dataset_")
     })
     random_source = random.Random(root_args.random_seed)
-    output_length_distribution = validate_output_len_dist(
-        root_args.output_len_dist, )
+    output_length_distribution = (validate_output_len_dist(
+        kwargs["output_len_dist"]) if kwargs["output_len_dist"] else None)
     workload = generate_real_dataset(
         dataset_config,
         root_args.tokenizer,
-        root_args.max_input_len,
+        kwargs["max_input_len"],
         output_length_distribution,
-        root_args.num_requests,
+        root_args.task_id_distribution,
+        kwargs["num_requests"],
         random_source,
     )
     export_workload_from_args(root_args, workload)
