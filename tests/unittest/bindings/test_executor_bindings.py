@@ -1087,10 +1087,13 @@ def test_request():
     request = trtllm.Request(**kwargs)
     for k, v in kwargs.items():
         if "config" not in k:
-            if k == "multimodal_embedding":  # only handle multimodal_embedding since it's a 2D tensor
-                assert (getattr(request, k) == v).all()
+            attr_value = getattr(request, k)
+            if isinstance(
+                    attr_value, torch.Tensor
+            ):  # only handle multimodal_embedding since it's a 2D tensor
+                assert (attr_value == v).all()
             else:
-                assert getattr(request, k) == v
+                assert attr_value == v
     assert isinstance(request.sampling_config, trtllm.SamplingConfig)
     assert isinstance(request.output_config, trtllm.OutputConfig)
     assert isinstance(request.external_draft_tokens_config,
