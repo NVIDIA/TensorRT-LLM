@@ -1632,12 +1632,16 @@ TrtGptModelInflightBatching::prepareBuffers(
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(prepareBuffers);
 
-    auto& runtimeBuffers = *mBuffers[bufferId];
+    auto& runtimeBuffers = *mBuffers.at(bufferId);
+
+    auto allNewTokens = mWorldConfig.isLastPipelineParallelRank()
+        ? RuntimeBuffers::OptionalRef<runtime::ITensor const>(mDecoder->getDecoderState().getAllNewTokens())
+        : std::nullopt;
 
     auto [optProfileId, inputMap, outputMap] = runtimeBuffers.prepareStep(contextRequests, generationRequests,
         mOperatingBeamWidth, getMaxAttentionWindow(), *mDecoderBuffers, mKvCacheManager.get(),
         mCrossKvCacheManager.get(), mRnnStateManager.get(), mPeftTables[bufferId], *mRuntime, mModelConfig,
-        mWorldConfig, getGatherGenerationLogits(), isTrtOverlap(), mDecoder->getDecoderState().getAllNewTokens());
+        mWorldConfig, getGatherGenerationLogits(), isTrtOverlap(), allNewTokens);
 
     mRuntime->setInputTensors(optProfileId, inputMap);
     mRuntime->setOutputTensors(optProfileId, outputMap);
