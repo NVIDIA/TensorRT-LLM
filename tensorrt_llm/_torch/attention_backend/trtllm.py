@@ -80,7 +80,6 @@ class TrtllmAttentionWrapper:
             head_dim (int): The size of each attention head (hidden_size // num_heads).
             num_kv_heads (int): The number of kv heads. Defaults to num_heads if None.
             pos_embd_params (PositionalEmbeddingParams): Optional parameters defining how positional embedding should be applied.
-            quant_config (QuantConfig): Optional quantization configuration. If None, no quantization is applied.
         """
         rope_params = None
         if pos_embd_params is not None:
@@ -126,7 +125,7 @@ class TrtllmAttentionWrapper:
         self.kwargs = {}
         self.kwargs.update(kwargs)
 
-    def create_weights(self, quant_config: Optional[QuantConfig] = None):
+    def update_quant_config(self, quant_config: Optional[QuantConfig] = None):
         quant_config = quant_config or QuantConfig()
         self.quant_mode = int(quant_config.layer_quant_mode)
 
@@ -623,16 +622,17 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config
-        self.wrapper.create_weights(self.quant_config)
+        self.wrapper.update_quant_config(self.quant_config)
 
         self.has_fp8_qdq = self.has_fp8_kv_cache = self.has_nvfp4 = False
         if self.quant_config is not None:
+            self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
+            )
+
             self.has_fp8_qdq = self.quant_config.layer_quant_mode.has_fp8_qdq()
             self.has_fp8_block_wise = self.quant_config.layer_quant_mode.has_fp8_block_scales(
             )
             self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
-            self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
-            )
             self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
 
     def forward(
@@ -661,15 +661,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             or metadata.runtime_features.cache_reuse
             or metadata.runtime_features.has_speculative_draft_tokens
         ) if metadata.runtime_features else False
-
-        if use_paged_context_fmha and self.has_fp8_kv_cache:
-            # NOTE: W4A8_AWQ can be included too, exclude for now since
-            # we don't use int4 in PyTorch
-            if not (self.has_fp8_qdq or self.has_nvfp4
-                    or self.has_fp8_block_wise):
-                raise RuntimeError(
-                    "When FP8 KV cache is being used, paged context FMHA cannot be used without "
-                    "FP8 attention.")
 
         num_seqs = metadata.num_seqs
         self.wrapper.plan(
