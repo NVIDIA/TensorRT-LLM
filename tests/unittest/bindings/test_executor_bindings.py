@@ -1088,9 +1088,7 @@ def test_request():
     for k, v in kwargs.items():
         if "config" not in k:
             attr_value = getattr(request, k)
-            if isinstance(
-                    attr_value, torch.Tensor
-            ):  # only handle multimodal_embedding since it's a 2D tensor
+            if isinstance(attr_value, torch.Tensor):
                 assert (attr_value == v).all()
             else:
                 assert attr_value == v
