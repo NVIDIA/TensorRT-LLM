@@ -821,12 +821,17 @@ public:
         mNumKvHeadsPerCrossAttentionLayer = headsPerLayer;
     }
 
-    [[nodiscard]] SizeType32 getSumLocalKvHeads(
-        SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0, bool isCrossAttention = false) const
+    [[nodiscard]] SizeType32 getSumLocalKvHeads(SizeType32 pipelineParallelism = 1,
+        SizeType32 pipelineParallelismRank = 0, bool isCrossAttention = false,
+        std::vector<SizeType32> const& managedLayers) const
     {
-        auto [cbegin, cend]
+        auto const [cbegin, cend]
             = getNumKvHeadsPerLayerLocalRange(pipelineParallelism, pipelineParallelismRank, isCrossAttention);
-        auto const sumLocalHeads = std::reduce(cbegin, cend);
+        auto const localLayers = std::vector<SizeType32>(cbegin, cend);
+        std::set<SizeType32> managedLayersSet(managedLayers.begin(), managedLayers.end());
+        std::remove_if(localLayers.begin(), localLayers.end(),
+            [&managedLayersSet](SizeType32 layerIdx) { return managedLayersSet.count(layerIdx); });
+        auto const sumLocalHeads = std::reduce(localLayers.begin(), localLayers.end());
         return sumLocalHeads;
     }
 

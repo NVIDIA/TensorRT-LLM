@@ -255,42 +255,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     }
     if (mModelConfig.isTransformerBased() && modelConfig.isKVCacheEnabled())
     {
-        auto const [blocksInPrimaryPool, blocksInSecondaryPool]
-            = BaseKVCacheManager::calculateMaxNumBlocks(optionalParams.kvCacheConfig, mModelConfig.getKvDataType(),
-                mModelConfig, mWorldConfig, mRuntime->getBufferManager());
-        if (mModelConfig.useCrossAttention())
-        {
-            TLLM_CHECK_WITH_INFO(optionalParams.kvCacheConfig.crossKvCacheFraction.has_value(),
-                "Must set crossKvCacheFraction for encoder-decoder model");
-            auto const crossKvCacheFraction = optionalParams.kvCacheConfig.crossKvCacheFraction.value();
-            auto selfCacheSizePerToken
-                = kv_cache_manager::KVCacheManager::calculateCacheSizePerToken(mModelConfig, mWorldConfig, false);
-            auto crossCacheSizePerToken
-                = kv_cache_manager::KVCacheManager::calculateCacheSizePerToken(mModelConfig, mWorldConfig, true);
-            mKvCacheManager = createKvCacheManager(optionalParams.kvCacheConfig,
-                blocksInPrimaryPool * (1.0f - crossKvCacheFraction),
-                blocksInSecondaryPool * (1.0f - crossKvCacheFraction), KvCacheType::kSELF);
-            auto const numCrossBlocks
-                = (float) blocksInPrimaryPool * crossKvCacheFraction * selfCacheSizePerToken / crossCacheSizePerToken;
-            auto const numCrossSecondaryBlocks
-                = (float) blocksInSecondaryPool * crossKvCacheFraction * selfCacheSizePerToken / crossCacheSizePerToken;
-            mCrossKvCacheManager = createKvCacheManager(
-                optionalParams.kvCacheConfig, numCrossBlocks, numCrossSecondaryBlocks, KvCacheType::kCROSS);
-            TLLM_LOG_INFO("This is an Encoder-Decoder model, set %0.1f cross KV cache fraction based on the config.",
-                crossKvCacheFraction);
-            TLLM_LOG_INFO("Number of blocks in self KV cache primary pool: %d, in cross KV cache primary pool: %d",
-                (SizeType32) (blocksInPrimaryPool * (1.0f - crossKvCacheFraction)), (SizeType32) (numCrossBlocks));
-            TLLM_LOG_INFO("Number of blocks in self KV cache secondary pool: %d, in cross KV cache secondary pool: %d",
-                (SizeType32) (blocksInSecondaryPool * (1.0f - crossKvCacheFraction)),
-                (SizeType32) (numCrossSecondaryBlocks));
-        }
-        else
-        {
-            TLLM_CHECK_WITH_INFO(!optionalParams.kvCacheConfig.crossKvCacheFraction.has_value(),
-                "Do not set crossKvCacheFraction for decoder-only model");
-            mKvCacheManager = createKvCacheManager(
-                optionalParams.kvCacheConfig, blocksInPrimaryPool, blocksInSecondaryPool, KvCacheType::kSELF);
-        }
+        mKvCacheManager = createKvCacheManager(optionalParams.kvCacheConfig, KvCacheType::kSELF);
 
         mCacheTransceiver
             = CacheTransceiverFactory::createCacheTransceiver(mKvCacheManager.get(), mModelConfig, mWorldConfig);
@@ -559,8 +524,7 @@ void TrtGptModelInflightBatching::adjustMaxAttentionWindow(SizeType32 numPrimary
 }
 
 std::shared_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::createKvCacheManager(
-    KvCacheConfig const& kvCacheConfig, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
-    KvCacheType kvCacheType)
+    KvCacheConfig const& kvCacheConfig, KvCacheType kvCacheType)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     bool isCrossAttention = kvCacheType == KvCacheType::kCROSS;
@@ -618,9 +582,9 @@ std::shared_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     auto const enableBlockReuse = kvCacheType == KvCacheType::kSELF ? kvCacheConfig.enableBlockReuse : false;
 
     auto kvCacheManager = std::make_shared<KVCacheManager>(numKvHeadsPerLayer, sizePerHead, tokensPerBlock,
-        blocksInPrimaryPool, blocksInSecondaryPool, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec,
-        tempAttentionWindowInputs, kvDtype, getSinkTokenLen(), mRuntime->getStreamPtr(), std::nullopt, enableBlockReuse,
-        kvCacheConfig.onboardBlocks, kvCacheType, kvCacheConfig.secondaryOffloadMinPriority,
+        getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, tempAttentionWindowInputs, kvDtype,
+        getSinkTokenLen(), mRuntime->getStreamPtr(), std::nullopt, enableBlockReuse, kvCacheConfig.onboardBlocks,
+        kvCacheType, kvCacheConfig.secondaryOffloadMinPriority,
         kvCacheConfig.eventBufferMaxSize > 0
             ? std::make_unique<kv_cache_manager::KVCacheEventManager>(kvCacheConfig.eventBufferMaxSize)
             : nullptr,
