@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Welcome to TensorRT-LLM’s Documentation! &#8212; TensorRT-LLM</title>
+    <title>Quick Start Guide &#8212; TensorRT-LLM</title>
   
   
   
@@ -47,7 +47,7 @@
     <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="_static/copybutton.js?v=65e89d2a"></script>
-    <script>DOCUMENTATION_OPTIONS.pagename = 'index';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'quick-start-guide';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
@@ -58,7 +58,8 @@
     <link rel="icon" href="_static/favicon.png"/>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
-    <link rel="next" title="Overview" href="overview.html" />
+    <link rel="next" title="Key Features" href="key-features.html" />
+    <link rel="prev" title="Overview" href="overview.html" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -119,7 +120,7 @@
     
   
 
-<a class="navbar-brand logo" href="#">
+<a class="navbar-brand logo" href="index.html">
   
   
   
@@ -230,7 +231,7 @@
     
   
 
-<a class="navbar-brand logo" href="#">
+<a class="navbar-brand logo" href="index.html">
   
   
   
@@ -308,9 +309,9 @@
      aria-label="Table of Contents">
   <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
   <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
-<ul class="nav bd-sidenav">
+<ul class="current nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="overview.html">Overview</a></li>
-<li class="toctree-l1"><a class="reference internal" href="quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="key-features.html">Key Features</a></li>
 <li class="toctree-l1"><a class="reference internal" href="torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="release-notes.html">Release Notes</a></li>
@@ -470,7 +471,31 @@
           <div class="bd-content">
             <div class="bd-article-container">
               
-              <div class="bd-header-article d-print-none"></div>
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Quick Start Guide</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
               
               
               
@@ -478,281 +503,178 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="welcome-to-tensorrt-llm-s-documentation">
-<h1>Welcome to TensorRT-LLM’s Documentation!<a class="headerlink" href="#welcome-to-tensorrt-llm-s-documentation" title="Link to this heading">#</a></h1>
-<div class="toctree-wrapper compound" id="getting-started">
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+  <section id="quick-start-guide">
+<span id="id1"></span><h1>Quick Start Guide<a class="headerlink" href="#quick-start-guide" title="Link to this heading">#</a></h1>
+<p>This is the starting point to try out TensorRT-LLM. Specifically, this Quick Start Guide enables you to quickly get setup and send HTTP requests using TensorRT-LLM.</p>
+<section id="llm-api">
+<h2>LLM API<a class="headerlink" href="#llm-api" title="Link to this heading">#</a></h2>
+<p>The LLM API is a Python API designed to facilitate setup and inference with TensorRT-LLM directly within Python. It enables model optimization by simply specifying a HuggingFace repository name or a model checkpoint. The LLM API streamlines the process by managing checkpoint conversion, engine building, engine loading, and model inference, all through a single Python object.</p>
+<p>Here is a simple example to show how to use the LLM API with TinyLlama.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
+<span class="linenos"> 2</span>
+<span class="linenos"> 3</span>
+<span class="linenos"> 4</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+<span class="linenos"> 5</span>
+<span class="linenos"> 6</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos"> 7</span>        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
+<span class="linenos"> 8</span>        <span class="s2">&quot;The president of the United States is&quot;</span><span class="p">,</span>
+<span class="linenos"> 9</span>        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
+<span class="linenos">10</span>        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
+<span class="linenos">11</span>    <span class="p">]</span>
+<span class="linenos">12</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
+<span class="linenos">13</span>
+<span class="linenos">14</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">)</span>
+<span class="linenos">15</span>
+<span class="linenos">16</span>    <span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+<span class="linenos">17</span>
+<span class="linenos">18</span>    <span class="c1"># Print the outputs.</span>
+<span class="linenos">19</span>    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">:</span>
+<span class="linenos">20</span>        <span class="n">prompt</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">prompt</span>
+<span class="linenos">21</span>        <span class="n">generated_text</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span>
+<span class="linenos">22</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">generated_text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="linenos">23</span>
+<span class="linenos">24</span>
+<span class="linenos">25</span><span class="c1"># The entry point of the program need to be protected for spawning processes.</span>
+<span class="linenos">26</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+<span class="linenos">27</span>    <span class="n">main</span><span class="p">()</span>
+</pre></div>
+</div>
+<p>You can also directly load TensorRT Model Optimizer’s <a class="reference external" href="https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4">quantized checkpoints on Hugging Face</a> in the LLM constructor.
+To learn more about the LLM API, check out the <a class="reference internal" href="llm-api/index.html"><span class="doc std std-doc">API Introduction</span></a> and <a class="reference internal" href="#llm-api-examples/index"><code class="xref myst docutils literal notranslate"><span class="pre">llm-api-examples/index</span></code></a>.</p>
+</section>
+<section id="deploy-with-trtllm-serve">
+<span id="id2"></span><h2>Deploy with trtllm-serve<a class="headerlink" href="#deploy-with-trtllm-serve" title="Link to this heading">#</a></h2>
+<p>You can use the <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> command to start an OpenAI compatible server to interact with a model.
+To start the server, you can run a command like the following example:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span>
+</pre></div>
+</div>
+<p>After the server starts, you can access familiar OpenAI endpoints such as <code class="docutils literal notranslate"><span class="pre">v1/chat/completions</span></code>.
+You can run inference such as the following example:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Accept: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">        &quot;model&quot;: &quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;,</span>
+<span class="s1">        &quot;messages&quot;:[{&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: &quot;You are a helpful assistant.&quot;},</span>
+<span class="s1">                    {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Where is New York? Tell me in a single sentence.&quot;}],</span>
+<span class="s1">        &quot;max_tokens&quot;: 32,</span>
+<span class="s1">        &quot;temperature&quot;: 0</span>
+<span class="s1">    }&#39;</span>
+</pre></div>
+</div>
+<p><em>Example Output</em></p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;chatcmpl-ef648e7489c040679d87ed12db5d3214&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;object&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;chat.completion&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;created&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1741966075</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;model&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;choices&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;index&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;message&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;role&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;assistant&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;content&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;New York is a city in the northeastern United States, located on the eastern coast of the state of New York.&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;tool_calls&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[]</span>
+<span class="w">      </span><span class="p">},</span>
+<span class="w">      </span><span class="nt">&quot;logprobs&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;finish_reason&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;stop&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;stop_reason&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;usage&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;prompt_tokens&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">43</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;total_tokens&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">69</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;completion_tokens&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">26</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>For examples and command syntax, refer to the <a class="reference internal" href="commands/trtllm-serve.html"><span class="std std-doc">trtllm-serve</span></a> section.</p>
+</section>
+<section id="model-definition-api">
+<h2>Model Definition API<a class="headerlink" href="#model-definition-api" title="Link to this heading">#</a></h2>
+<section id="prerequisites">
+<h3>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h3>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="overview.html">Overview</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="overview.html#about-tensorrt-llm">About TensorRT-LLM</a></li>
-<li class="toctree-l2"><a class="reference internal" href="overview.html#what-can-you-do-with-tensorrt-llm">What Can You Do With TensorRT-LLM?</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="quick-start-guide.html">Quick Start Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#llm-api">LLM API</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#deploy-with-trtllm-serve">Deploy with trtllm-serve</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#model-definition-api">Model Definition API</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#next-steps">Next Steps</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#related-information">Related Information</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="key-features.html">Key Features</a></li>
-<li class="toctree-l1"><a class="reference internal" href="torch.html">PyTorch Backend</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="torch.html#quick-start">Quick Start</a></li>
-<li class="toctree-l2"><a class="reference internal" href="torch.html#quantization">Quantization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="torch.html#developer-guide">Developer Guide</a></li>
-<li class="toctree-l2"><a class="reference internal" href="torch.html#key-components">Key Components</a></li>
-<li class="toctree-l2"><a class="reference internal" href="torch.html#known-issues">Known Issues</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="release-notes.html">Release Notes</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-18-1">TensorRT-LLM Release 0.18.1</a></li>
-<li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-18-0">TensorRT-LLM Release 0.18.0</a></li>
-<li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-17-0">TensorRT-LLM Release 0.17.0</a></li>
-<li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-16-0">TensorRT-LLM Release 0.16.0</a></li>
-<li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-15-0">TensorRT-LLM Release 0.15.0</a></li>
-<li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-14-0">TensorRT-LLM Release 0.14.0</a></li>
-<li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-13-0">TensorRT-LLM Release 0.13.0</a></li>
-<li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-12-0">TensorRT-LLM Release 0.12.0</a></li>
-<li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-11-0">TensorRT-LLM Release 0.11.0</a></li>
-<li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-10-0">TensorRT-LLM Release 0.10.0</a></li>
-<li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-9-0">TensorRT-LLM Release 0.9.0</a></li>
-<li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-8-0">TensorRT-LLM Release 0.8.0</a></li>
-<li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-7-1">TensorRT-LLM Release 0.7.1</a></li>
-</ul>
-</li>
-</ul>
+<li><p>This quick start uses the Meta Llama 3.1 model. This model is subject to a particular <a class="reference external" href="https://llama.meta.com/llama-downloads/">license</a>. To download the model files, agree to the terms and <a class="reference external" href="https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct?clone=true">authenticate with Hugging Face</a>.</p></li>
+<li><p>Complete the <a class="reference internal" href="installation/linux.html"><span class="std std-doc">installation</span></a> steps.</p></li>
+<li><p>Pull the weights and tokenizer files for the chat-tuned variant of the Llama 3.1 8B model from the <a class="reference external" href="https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct">Hugging Face Hub</a>.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">git clone https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct</span>
+</pre></div>
 </div>
-<div class="toctree-wrapper compound" id="installation">
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="installation/linux.html">Installing on Linux</a></li>
-<li class="toctree-l1"><a class="reference internal" href="installation/build-from-source-linux.html">Building from Source Code on Linux</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="installation/build-from-source-linux.html#prerequisites">Prerequisites</a></li>
-<li class="toctree-l2"><a class="reference internal" href="installation/build-from-source-linux.html#building-a-tensorrt-llm-docker-image">Building a TensorRT-LLM Docker Image</a></li>
-<li class="toctree-l2"><a class="reference internal" href="installation/build-from-source-linux.html#build-tensorrt-llm">Build TensorRT-LLM</a></li>
-</ul>
 </li>
-<li class="toctree-l1"><a class="reference internal" href="installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
+</section>
+<section id="compile-the-model-into-a-tensorrt-engine">
+<span id="quick-start-guide-compile"></span><h3>Compile the Model into a TensorRT Engine<a class="headerlink" href="#compile-the-model-into-a-tensorrt-engine" title="Link to this heading">#</a></h3>
+<p>Use the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">Llama model definition</a> from the <code class="docutils literal notranslate"><span class="pre">examples/llama</span></code> directory of the GitHub repository.
+The model definition is a minimal example that shows some of the optimizations available in TensorRT-LLM.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp"># </span>From<span class="w"> </span>the<span class="w"> </span>root<span class="w"> </span>of<span class="w"> </span>the<span class="w"> </span>cloned<span class="w"> </span>repository,<span class="w"> </span>start<span class="w"> </span>the<span class="w"> </span>TensorRT-LLM<span class="w"> </span>container
+<span class="go">make -C docker release_run LOCAL_USER=1</span>
+
+<span class="gp"># </span>Log<span class="w"> </span><span class="k">in</span><span class="w"> </span>to<span class="w"> </span>huggingface-cli
+<span class="gp"># </span>You<span class="w"> </span>can<span class="w"> </span>get<span class="w"> </span>your<span class="w"> </span>token<span class="w"> </span>from<span class="w"> </span>huggingface.co/settings/token
+<span class="go">huggingface-cli login --token *****</span>
+
+<span class="gp"># </span>Convert<span class="w"> </span>the<span class="w"> </span>model<span class="w"> </span>into<span class="w"> </span>TensorRT-LLM<span class="w"> </span>checkpoint<span class="w"> </span>format
+<span class="go">cd examples/llama</span>
+<span class="go">pip install -r requirements.txt</span>
+<span class="go">pip install --upgrade transformers # Llama 3.1 requires transformer 4.43.0+ version.</span>
+<span class="go">python3 convert_checkpoint.py --model_dir Meta-Llama-3.1-8B-Instruct --output_dir llama-3.1-8b-ckpt</span>
+
+<span class="gp"># </span>Compile<span class="w"> </span>model
+<span class="go">trtllm-build --checkpoint_dir llama-3.1-8b-ckpt \</span>
+<span class="go">    --gemm_plugin float16 \</span>
+<span class="go">    --output_dir ./llama-3.1-8b-engine</span>
+</pre></div>
 </div>
-<div class="toctree-wrapper compound">
-</div>
-<div class="toctree-wrapper compound">
-</div>
-<div class="toctree-wrapper compound">
-</div>
-<div class="toctree-wrapper compound">
-</div>
-<div class="toctree-wrapper compound">
-</div>
-<div class="toctree-wrapper compound" id="architecture">
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="architecture/overview.html">TensorRT-LLM Architecture</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="architecture/overview.html#model-weights">Model Weights</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="architecture/core-concepts.html">Model Definition</a></li>
-<li class="toctree-l1"><a class="reference internal" href="architecture/core-concepts.html#compilation">Compilation</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="architecture/core-concepts.html#tensorrt-compiler">TensorRT Compiler</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture/core-concepts.html#model-engine">Model Engine</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture/core-concepts.html#weight-bindings">Weight Bindings</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture/core-concepts.html#pattern-matching-and-fusion">Pattern-Matching and Fusion</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture/core-concepts.html#plugins">Plugins</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="architecture/core-concepts.html#runtime">Runtime</a></li>
-<li class="toctree-l1"><a class="reference internal" href="architecture/core-concepts.html#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="architecture/core-concepts.html#examples">Examples</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="architecture/checkpoint.html">TensorRT-LLM Checkpoint</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="architecture/checkpoint.html#overview">Overview</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture/checkpoint.html#prepare-the-tensorrt-llm-checkpoint">Prepare the TensorRT-LLM Checkpoint</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture/checkpoint.html#build-checkpoint-into-tensorrt-engine">Build Checkpoint into TensorRT Engine</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture/checkpoint.html#make-evaluation">Make Evaluation</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="architecture/workflow.html">TensorRT-LLM Build Workflow</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="architecture/workflow.html#overview">Overview</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture/workflow.html#conversion-apis">Conversion APIs</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture/workflow.html#quantization-apis">Quantization APIs</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture/workflow.html#build-apis">Build APIs</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture/workflow.html#cli-tools">CLI Tools</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="architecture/add-model.html">Adding a Model</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="architecture/add-model.html#step-1-write-modeling-part">Step 1. Write Modeling Part</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture/add-model.html#step-2-implement-weight-conversion">Step 2. Implement Weight Conversion</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture/add-model.html#step-3-register-new-model">Step 3. Register New Model</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture/add-model.html#step-4-verify-new-model">Step 4. Verify New Model</a></li>
-<li class="toctree-l2"><a class="reference internal" href="architecture/add-model.html#reference">Reference</a></li>
-</ul>
-</li>
-</ul>
-</div>
-<div class="toctree-wrapper compound" id="advanced">
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="advanced/gpt-attention.html#important-note">Important Note</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/gpt-attention.html#padded-and-packed-tensors">Padded and Packed Tensors</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/gpt-attention.html#context-and-generation-phases">Context and Generation Phases</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/gpt-attention.html#in-flight-batching">In-flight Batching</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/gpt-attention.html#chunked-context">Chunked Context</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/gpt-attention.html#kv-cache">KV Cache</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/gpt-attention.html#int8-fp8-kv-caches">INT8/FP8 KV Caches</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/gpt-attention.html#sliding-window-attention-cyclic-rolling-buffer-kv-cache">Sliding Window Attention, Cyclic (Rolling Buffer) KV Cache</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/gpt-attention.html#streamingllm">StreamingLLM</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/gpt-attention.html#beam-search">Beam-Search</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/gpt-attention.html#input-qkv-tensor">Input QKV tensor</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/gpt-runtime.html">C++ GPT Runtime</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="advanced/gpt-runtime.html#overview">Overview</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/gpt-runtime.html#the-session">The Session</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/gpt-runtime.html#in-flight-batching-support">In-flight Batching Support</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/gpt-runtime.html#know-issues-and-future-changes">Know Issues and Future Changes</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/executor.html">Executor API</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="advanced/executor.html#api">API</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/executor.html#c-executor-api-example">C++ Executor API Example</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/executor.html#python-bindings-for-the-executor-api">Python Bindings for the Executor API</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/executor.html#in-flight-batching-with-the-triton-inference-server">In-flight Batching with the Triton Inference Server</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/graph-rewriting.html">Graph Rewriting Module</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="advanced/graph-rewriting.html#when-to-use-graph-rewriting">When to Use Graph Rewriting?</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/graph-rewriting.html#graph-rewriting-apis">Graph Rewriting APIs</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/graph-rewriting.html#classical-workflow">Classical Workflow</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="advanced/lora.html#lora-tensor-format-details">LoRA tensor format details</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="advanced/expert-parallelism.html#mixture-of-experts-moe">Mixture of Experts (MoE)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/expert-parallelism.html#tensor-parallel-vs-expert-parallel">Tensor Parallel vs Expert Parallel</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/expert-parallelism.html#how-to-enable">How to Enable</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/kv-cache-reuse.html">KV cache reuse</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="advanced/kv-cache-reuse.html#how-to-enable-kv-cache-reuse">How to enable kv cache reuse</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/kv-cache-reuse.html#performance-expectations">Performance expectations</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/kv-cache-reuse.html#situations-that-can-prevent-kv-cache-reuse">Situations that can prevent kv cache reuse</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/kv-cache-reuse.html#offloading-to-host-memory">Offloading to host memory</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/speculative-decoding.html">Speculative Sampling</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="advanced/speculative-decoding.html#about-speculative-sampling">About Speculative Sampling</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/speculative-decoding.html#performance-improvements">Performance Improvements</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/speculative-decoding.html#draft-target-model">Draft-Target-Model</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/speculative-decoding.html#prompt-lookup-decoding">Prompt-Lookup-Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/speculative-decoding.html#medusa">Medusa</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/speculative-decoding.html#redrafter">ReDrafter</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/speculative-decoding.html#eagle">EAGLE</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/speculative-decoding.html#lookahead-decoding">Lookahead Decoding</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="advanced/disaggregated-service.html#usage">Usage</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/disaggregated-service.html#example">Example</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/disaggregated-service.html#benchmarks">Benchmarks</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/disaggregated-service.html#environment-variables">Environment Variables</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/disaggregated-service.html#troubleshooting-and-faq">Troubleshooting and FAQ</a></li>
-</ul>
-</li>
-</ul>
-</div>
-<div class="toctree-wrapper compound" id="performance">
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="performance/perf-overview.html">Overview</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-overview.html#known-issues">Known Issues</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-overview.html#throughput-measurements">Throughput Measurements</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-overview.html#reproducing-benchmarked-results">Reproducing Benchmarked Results</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-overview.html#online-serving-measurements">Online Serving Measurements</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="performance/perf-benchmarking.html">Benchmarking</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#before-benchmarking">Before Benchmarking</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#throughput-benchmarking">Throughput Benchmarking</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#low-latency-benchmark">Low Latency Benchmark</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#summary">Summary</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/index.html#prerequisite-knowledge">Prerequisite Knowledge</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/index.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="performance/perf-analysis.html">Performance Analysis</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-analysis.html#feature-descriptions">Feature Descriptions</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-analysis.html#usage">Usage</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-analysis.html#coordinating-with-nvidia-nsight-systems-launch">Coordinating with NVIDIA Nsight Systems Launch</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-analysis.html#examples">Examples</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-analysis.html#profiling-a-single-ifb-iteration-executing-on-a-single-rank-of-a-multi-gpu-model">Profiling a single IFB iteration executing on a single rank of a multi-GPU model</a></li>
-</ul>
-</li>
-</ul>
-</div>
-<div class="toctree-wrapper compound" id="reference">
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="reference/troubleshooting.html">Troubleshooting</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="reference/troubleshooting.html#installation-errors">Installation Errors</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/troubleshooting.html#debug-on-unit-tests">Debug on Unit Tests</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/troubleshooting.html#debug-on-e2e-models">Debug on E2E Models</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/troubleshooting.html#debug-execution-errors">Debug Execution Errors</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/troubleshooting.html#tips">Tips</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="reference/support-matrix.html">Support Matrix</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="reference/support-matrix.html#models">Models</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/support-matrix.html#hardware">Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/support-matrix.html#software">Software</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="reference/precision.html">Numerical Precision</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="reference/precision.html#fp32-fp16-and-bf16">FP32, FP16 and BF16</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/precision.html#quantization-and-dequantization-q-dq">Quantization and Dequantization (Q/DQ)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/precision.html#int8-smoothquant-w8a8">INT8 SmoothQuant (W8A8)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/precision.html#int4-and-int8-weight-only-w4a16-and-w8a16">INT4 and INT8 Weight-Only (W4A16 and W8A16)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/precision.html#gptq-and-awq-w4a16">GPTQ and AWQ (W4A16)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/precision.html#fp8-hopper">FP8 (Hopper)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/precision.html#nvfp4-blackwell">NVFP4 (Blackwell)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/precision.html#support-matrix">Support matrix</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/precision.html#technical-detail-the-quantmode-flags">Technical Detail: The <code class="docutils literal notranslate"><span class="pre">QuantMode</span></code> Flags</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="reference/memory.html">Memory Usage of TensorRT-LLM</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="reference/memory.html#understand-inference-time-gpu-memory-usage">Understand inference time GPU memory usage</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/memory.html#memory-pool">Memory pool</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/memory.html#known-issues">Known Issues</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/memory.html#faq">FAQ</a></li>
-</ul>
-</li>
-</ul>
-</div>
-<div class="toctree-wrapper compound">
+<p>When you create a model definition with the TensorRT-LLM API, you build a graph of operations from <a class="reference external" href="https://developer.nvidia.com/tensorrt">NVIDIA TensorRT</a> primitives that form the layers of your neural network. These operations map to specific kernels; prewritten programs for the GPU.</p>
+<p>In this example, we included the <code class="docutils literal notranslate"><span class="pre">gpt_attention</span></code> plugin, which implements a FlashAttention-like fused attention kernel, and the <code class="docutils literal notranslate"><span class="pre">gemm</span></code> plugin, that performs matrix multiplication with FP32 accumulation. We also called out the desired precision for the full model as FP16, matching the default precision of the weights that you downloaded from Hugging Face. For more information about plugins and quantizations, refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">Llama example</a> and <a class="reference internal" href="reference/precision.html#precision"><span class="std std-ref">Numerical Precision</span></a> section.</p>
+</section>
+<section id="run-the-model">
+<h3>Run the Model<a class="headerlink" href="#run-the-model" title="Link to this heading">#</a></h3>
+<p>Now that you have the model engine, run the engine and perform inference.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">python3 ../run.py --engine_dir ./llama-3.1-8b-engine  --max_output_len 100 --tokenizer_dir Meta-Llama-3.1-8B-Instruct --input_text &quot;How do I count to nine in French?&quot;</span>
+</pre></div>
 </div>
 </section>
-<section id="indices-and-tables">
-<h1>Indices and tables<a class="headerlink" href="#indices-and-tables" title="Link to this heading">#</a></h1>
+<section id="deploy-with-triton-inference-server">
+<h3>Deploy with Triton Inference Server<a class="headerlink" href="#deploy-with-triton-inference-server" title="Link to this heading">#</a></h3>
+<p>To create a production-ready deployment of your LLM, use the <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend">Triton Inference Server backend for TensorRT-LLM</a> to leverage the TensorRT-LLM C++ runtime for rapid inference execution and include optimizations like in-flight batching and paged KV caching. Triton Inference Server with the TensorRT-LLM backend is available as a <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/containers/tritonserver/tags">pre-built container through NVIDIA NGC</a>.</p>
+<ol class="arabic simple">
+<li><p>Clone the TensorRT-LLM backend repository:</p></li>
+</ol>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">cd ..</span>
+<span class="go">git clone https://github.com/triton-inference-server/tensorrtllm_backend.git</span>
+<span class="go">cd tensorrtllm_backend</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="2">
+<li><p>Refer to <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/llama.md">End to end workflow to run llama 7b</a> in the TensorRT-LLM backend repository to deploy the model with Triton Inference Server.</p></li>
+</ol>
+</section>
+</section>
+<section id="next-steps">
+<h2>Next Steps<a class="headerlink" href="#next-steps" title="Link to this heading">#</a></h2>
+<p>In this Quick Start Guide, you:</p>
 <ul class="simple">
-<li><p><a class="reference internal" href="genindex.html"><span class="std std-ref">Index</span></a></p></li>
-<li><p><a class="reference internal" href="py-modindex.html"><span class="std std-ref">Module Index</span></a></p></li>
-<li><p><a class="reference internal" href="search.html"><span class="std std-ref">Search Page</span></a></p></li>
+<li><p>Saw an example of the LLM API</p></li>
+<li><p>Learned about deploying a model with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></p></li>
+<li><p>Learned about the Model Definition API</p></li>
 </ul>
+<p>For more examples, refer to:</p>
+<ul class="simple">
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples">examples/</a> for showcases of how to run a quick benchmark on latest LLMs.</p></li>
+</ul>
+</section>
+<section id="related-information">
+<h2>Related Information<a class="headerlink" href="#related-information" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/performance/performance-tuning-guide/index.html">Best Practices Guide</a></p></li>
+<li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html">Support Matrix</a></p></li>
+</ul>
+</section>
 </section>
 
 
@@ -765,12 +687,21 @@
                 <footer class="prev-next-footer d-print-none">
                   
 <div class="prev-next-area">
-    <a class="right-next"
+    <a class="left-prev"
        href="overview.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Overview</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="key-features.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Overview</p>
+        <p class="prev-next-title">Key Features</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -795,12 +726,18 @@
   </div>
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
-<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#">Welcome to TensorRT-LLM’s Documentation!</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#llm-api">LLM API</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#deploy-with-trtllm-serve">Deploy with trtllm-serve</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-definition-api">Model Definition API</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#compile-the-model-into-a-tensorrt-engine">Compile the Model into a TensorRT Engine</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#run-the-model">Run the Model</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#deploy-with-triton-inference-server">Deploy with Triton Inference Server</a></li>
 </ul>
 </li>
-<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#indices-and-tables">Indices and tables</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#next-steps">Next Steps</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#related-information">Related Information</a></li>
 </ul>
-
   </nav></div>
 
 </div></div>

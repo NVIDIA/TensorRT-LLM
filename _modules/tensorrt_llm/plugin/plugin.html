@@ -1,0 +1,1433 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>tensorrt_llm.plugin.plugin &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/plugin/plugin';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../../../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../search.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    
+    <li class="breadcrumb-item"><a href="../../index.html" class="nav-link">Module code</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">tensorrt_llm.plugin.plugin</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <h1>Source code for tensorrt_llm.plugin.plugin</h1><div class="highlight"><pre>
+<span></span><span class="c1"># SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &amp; AFFILIATES. All rights reserved.</span>
+<span class="c1"># SPDX-License-Identifier: Apache-2.0</span>
+<span class="c1">#</span>
+<span class="c1"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="c1"># you may not use this file except in compliance with the License.</span>
+<span class="c1"># You may obtain a copy of the License at</span>
+<span class="c1">#</span>
+<span class="c1"># http://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="c1">#</span>
+<span class="c1"># Unless required by applicable law or agreed to in writing, software</span>
+<span class="c1"># distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="c1"># See the License for the specific language governing permissions and</span>
+<span class="c1"># limitations under the License.</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">argparse</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">ctypes</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">platform</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">OrderedDict</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">asdict</span><span class="p">,</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">fields</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">IntEnum</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">textwrap</span><span class="w"> </span><span class="kn">import</span> <span class="n">dedent</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Tuple</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">trt</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">.._ipc_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">IpcMemory</span><span class="p">,</span> <span class="n">can_access_peer</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">get_sm_version</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..bindings.internal.runtime</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">lamport_initialize</span><span class="p">,</span>
+                                         <span class="n">lamport_initialize_all</span><span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..mapping</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
+
+<span class="n">TRT_LLM_PLUGIN_NAMESPACE</span> <span class="o">=</span> <span class="s1">&#39;tensorrt_llm&#39;</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">plugin_lib_path</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+    <span class="n">project_dir</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="vm">__file__</span><span class="p">)</span><span class="o">.</span><span class="n">parent</span><span class="o">.</span><span class="n">parent</span><span class="o">.</span><span class="n">absolute</span><span class="p">()</span>
+    <span class="n">dyn_lib</span> <span class="o">=</span> <span class="s2">&quot;libnvinfer_plugin_tensorrt_llm.so&quot;</span> <span class="k">if</span> <span class="n">platform</span><span class="o">.</span><span class="n">system</span><span class="p">(</span>
+    <span class="p">)</span> <span class="o">!=</span> <span class="s2">&quot;Windows&quot;</span> <span class="k">else</span> <span class="s2">&quot;nvinfer_plugin_tensorrt_llm.dll&quot;</span>
+    <span class="k">return</span> <span class="nb">str</span><span class="p">(</span><span class="n">project_dir</span><span class="o">.</span><span class="n">joinpath</span><span class="p">(</span><span class="s2">&quot;libs&quot;</span><span class="p">,</span> <span class="n">dyn_lib</span><span class="p">))</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_load_plugin_lib</span><span class="p">():</span>
+    <span class="n">on_windows</span> <span class="o">=</span> <span class="n">platform</span><span class="o">.</span><span class="n">system</span><span class="p">()</span> <span class="o">==</span> <span class="s2">&quot;Windows&quot;</span>
+    <span class="n">winmode</span> <span class="o">=</span> <span class="mi">0</span> <span class="k">if</span> <span class="n">on_windows</span> <span class="k">else</span> <span class="kc">None</span>
+    <span class="n">handle</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">CDLL</span><span class="p">(</span><span class="n">plugin_lib_path</span><span class="p">(),</span>
+                         <span class="n">mode</span><span class="o">=</span><span class="n">ctypes</span><span class="o">.</span><span class="n">RTLD_GLOBAL</span><span class="p">,</span>
+                         <span class="n">winmode</span><span class="o">=</span><span class="n">winmode</span><span class="p">)</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">handle</span><span class="o">.</span><span class="n">initTrtLlmPlugins</span><span class="o">.</span><span class="n">argtypes</span> <span class="o">=</span> <span class="p">[</span><span class="n">ctypes</span><span class="o">.</span><span class="n">c_void_p</span><span class="p">,</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_char_p</span><span class="p">]</span>
+        <span class="n">handle</span><span class="o">.</span><span class="n">initTrtLlmPlugins</span><span class="o">.</span><span class="n">restype</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_bool</span>
+    <span class="k">except</span> <span class="ne">AttributeError</span> <span class="k">as</span> <span class="n">err</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ImportError</span><span class="p">(</span><span class="s1">&#39;TensorRT-LLM Plugin is unavailable&#39;</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">err</span>
+
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">assert</span> <span class="n">handle</span><span class="o">.</span><span class="n">initTrtLlmPlugins</span><span class="p">(</span>
+            <span class="kc">None</span><span class="p">,</span> <span class="n">TRT_LLM_PLUGIN_NAMESPACE</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s1">&#39;utf-8&#39;</span><span class="p">))</span>
+    <span class="k">except</span> <span class="ne">OSError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+        <span class="n">windows_err</span> <span class="o">=</span> <span class="s2">&quot;&quot;&quot;</span>
+<span class="s2">        The error above may be caused by an outdated Microsoft Visual C++ Redistributable Version.</span>
+<span class="s2">        Please install the latest MSVC from the link below and re-launch.</span>
+
+<span class="s2">        https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170#latest-microsoft-visual-c-redistributable-version</span>
+<span class="s2">        &quot;&quot;&quot;</span>
+        <span class="n">err_msg</span> <span class="o">=</span> <span class="n">dedent</span><span class="p">(</span><span class="n">windows_err</span> <span class="k">if</span> <span class="n">on_windows</span> <span class="k">else</span> <span class="s2">&quot;Unknown error&quot;</span><span class="p">)</span>
+        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="n">err_msg</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">e</span>
+    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">e</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">ContextFMHAType</span><span class="p">(</span><span class="n">IntEnum</span><span class="p">):</span>
+    <span class="n">disabled</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># FP16 I/O, FP16 Accumulation</span>
+    <span class="n">enabled</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="c1"># FP16 I/O, FP32 Accumulation</span>
+    <span class="n">enabled_with_fp32_acc</span> <span class="o">=</span> <span class="mi">2</span>
+
+
+<span class="n">DEFAULT_PLUGIN_DTYPE_OPTIONS</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="s2">&quot;float16&quot;</span><span class="p">,</span> <span class="s2">&quot;float32&quot;</span><span class="p">,</span> <span class="s2">&quot;bfloat16&quot;</span><span class="p">,</span> <span class="s2">&quot;int32&quot;</span><span class="p">,</span> <span class="kc">None</span>
+<span class="p">]</span>
+<span class="n">PLUGIN_DTYPE_OPTIONS_MAP</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;gemm_swiglu_plugin&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span>
+    <span class="s2">&quot;gemm_plugin&quot;</span><span class="p">:</span>
+    <span class="p">[</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="s2">&quot;float16&quot;</span><span class="p">,</span> <span class="s2">&quot;float32&quot;</span><span class="p">,</span> <span class="s2">&quot;bfloat16&quot;</span><span class="p">,</span> <span class="s2">&quot;int32&quot;</span><span class="p">,</span> <span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="s2">&quot;nvfp4&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span>
+    <span class="s2">&quot;low_latency_gemm_plugin&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span>
+    <span class="s2">&quot;low_latency_gemm_swiglu_plugin&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span>
+    <span class="s2">&quot;gemm_allreduce_plugin&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;float16&quot;</span><span class="p">,</span> <span class="s2">&quot;bfloat16&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span>
+<span class="p">}</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_make_plugin_property</span><span class="p">(</span><span class="n">field_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">field_type</span><span class="p">:</span> <span class="nb">type</span><span class="p">):</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">bind</span><span class="p">(</span><span class="n">field_name</span><span class="p">):</span>
+        <span class="n">storage_name</span> <span class="o">=</span> <span class="sa">f</span><span class="s1">&#39;_</span><span class="si">{</span><span class="n">field_name</span><span class="si">}</span><span class="s1">&#39;</span>
+
+        <span class="nd">@property</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">prop</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+            <span class="n">field_value</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">storage_name</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">field_name</span> <span class="o">!=</span> <span class="s1">&#39;dtype&#39;</span> <span class="ow">and</span> <span class="n">field_value</span> <span class="o">==</span> <span class="s1">&#39;auto&#39;</span><span class="p">:</span>
+                <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">return</span> <span class="n">field_value</span>
+
+        <span class="nd">@prop</span><span class="o">.</span><span class="n">setter</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">prop</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">field_type</span> <span class="ow">is</span> <span class="nb">bool</span><span class="p">:</span>
+                <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">bool</span><span class="p">),</span> \
+                    <span class="sa">f</span><span class="s2">&quot;Plugin </span><span class="si">{</span><span class="n">field_name</span><span class="si">}</span><span class="s2"> expects </span><span class="si">{</span><span class="n">field_type</span><span class="si">}</span><span class="s2">, got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">value</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="k">elif</span> <span class="n">field_type</span> <span class="ow">in</span> <span class="p">(</span><span class="nb">str</span><span class="p">,</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]):</span>
+                <span class="n">plugin_dtype_options</span> <span class="o">=</span> <span class="n">DEFAULT_PLUGIN_DTYPE_OPTIONS</span>
+                <span class="k">if</span> <span class="n">field_name</span> <span class="ow">in</span> <span class="n">PLUGIN_DTYPE_OPTIONS_MAP</span><span class="p">:</span>
+                    <span class="n">plugin_dtype_options</span> <span class="o">=</span> <span class="n">PLUGIN_DTYPE_OPTIONS_MAP</span><span class="p">[</span><span class="n">field_name</span><span class="p">]</span>
+                <span class="k">assert</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">plugin_dtype_options</span><span class="p">,</span> \
+                    <span class="sa">f</span><span class="s2">&quot;Plugin </span><span class="si">{</span><span class="n">field_name</span><span class="si">}</span><span class="s2"> expects values in </span><span class="si">{</span><span class="n">plugin_dtype_options</span><span class="si">}</span><span class="s2">, got </span><span class="si">{</span><span class="n">value</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="k">if</span> <span class="n">field_name</span> <span class="o">==</span> <span class="s1">&#39;dtype&#39;</span><span class="p">:</span>
+                <span class="k">assert</span> <span class="n">value</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;auto&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span> \
+                    <span class="s2">&quot;Plugin dtype cannot be auto or None&quot;</span>
+            <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">storage_name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Set </span><span class="si">{</span><span class="n">field_name</span><span class="si">}</span><span class="s2"> to </span><span class="si">{</span><span class="n">value</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">prop</span>
+
+    <span class="k">return</span> <span class="n">bind</span><span class="p">(</span><span class="n">field_name</span><span class="p">)</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">PluginConfigMeta</span><span class="p">(</span><span class="nb">type</span><span class="p">):</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__new__</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">bases</span><span class="p">,</span> <span class="n">attrs</span><span class="p">):</span>
+        <span class="k">for</span> <span class="n">storage_name</span><span class="p">,</span> <span class="n">field_type</span> <span class="ow">in</span> <span class="n">attrs</span><span class="p">[</span><span class="s1">&#39;__annotations__&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">assert</span> <span class="n">storage_name</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s1">&#39;_&#39;</span><span class="p">)</span>
+            <span class="n">field_name</span> <span class="o">=</span> <span class="n">storage_name</span><span class="o">.</span><span class="n">lstrip</span><span class="p">(</span><span class="s1">&#39;_&#39;</span><span class="p">)</span>
+            <span class="n">attrs</span><span class="p">[</span><span class="n">field_name</span><span class="p">]</span> <span class="o">=</span> <span class="n">_make_plugin_property</span><span class="p">(</span><span class="n">field_name</span><span class="p">,</span> <span class="n">field_type</span><span class="p">)</span>
+        <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__new__</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">bases</span><span class="p">,</span> <span class="n">attrs</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="PluginConfig">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">slots</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">PluginConfig</span><span class="p">(</span><span class="n">metaclass</span><span class="o">=</span><span class="n">PluginConfigMeta</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;The config that manages plugin-related options.</span>
+
+<span class="sd">    There are two option categories:</span>
+<span class="sd">    * Plugin options (typically with xxx_plugin naming). These options can be assigned with:</span>
+<span class="sd">        * &quot;float16&quot;/&quot;bfloat16&quot;/&quot;float32&quot;/&quot;int32&quot;, which means the plugin is enabled with the specified precision; (Some plugins only support limited dtype, i.e., gemm_swiglu_plugin and low_latency_gemm_swiglu_plugin only supports fp8 now)</span>
+<span class="sd">        * &quot;auto&quot;, which means the plugin is enabled with the precision of `dtype` field (the `dtype` field must be same to model dtype, i.e., the one in PretrainedConfig);</span>
+<span class="sd">        * None, which means the plugin is disabled.</span>
+<span class="sd">    * Other features. These options can be assigned with boolean:</span>
+<span class="sd">        * True, which means the plugin is enabled;</span>
+<span class="sd">        * False, which means the plugin is disabled.</span>
+
+<span class="sd">    Note: All the fields should use a prefix &quot;_&quot;; PluginConfigMeta will wrap each field as a property.</span>
+<span class="sd">    This ensures the fields can only be assigned with allowed values.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">_dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;float16&quot;</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+
+    <span class="c1"># Plugins</span>
+    <span class="n">_bert_attention_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The plugin that uses efficient kernels and enables an in-place update of the KV cache for attention layer of BERT-like encoder models.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_gpt_attention_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The plugin that uses efficient kernels and enables an in-place update of the KV cache for attention layer of GPT-like decoder models.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The GEMM plugin that utilizes NVIDIA cuBLASLt to perform GEMM operations. &quot;</span>
+            <span class="s2">&quot;Note: it&#39;s only affective for non-quantized gemm operations (except FP8).&quot;</span>
+            <span class="s2">&quot;Note: For FP8, it also requires same calibration in checkpoint.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_explicitly_disable_gemm_plugin</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">_gemm_swiglu_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The GEMM + SwiGLU fusion in Gated-MLP combines two Matmul operations and &quot;</span>
+            <span class="s2">&quot;one SwiGLU operation into a single kernel. Currently this is only supported for FP8 precision on Hopper.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_fp8_rowwise_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The quantized GEMM for fp8, which uses per token dynamic scales for &quot;</span>
+            <span class="s2">&quot;activation and per channel static scales for weights.&quot;</span>
+            <span class="s2">&quot;Note: It also requires same calibration in checkpoint.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_qserve_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The quantized GEMM from [QServe](https://arxiv.org/abs/2405.04532), &quot;</span>
+            <span class="s2">&quot;which employs 4-bit quantization for weights and 8-bit quantization for activations.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_identity_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The identity plugin simply copies inputs to outputs, it&#39;s used mostly for debugging purpose.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_nccl_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The NCCL plugin wraps NCCL operators to support multi-GPU and even multi-nodes.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_lora_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                                        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                                        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;help&quot;</span><span class="p">:</span> <span class="s2">&quot;Enable LoRA.&quot;</span><span class="p">})</span>
+    <span class="n">_dora_plugin</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                               <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                               <span class="n">metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;help&quot;</span><span class="p">:</span> <span class="s2">&quot;Enable DoRA.&quot;</span><span class="p">})</span>
+    <span class="n">_weight_only_groupwise_quant_matmul_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable weight-only groupwise quantization matmul operators.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_weight_only_quant_matmul_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;help&quot;</span><span class="p">:</span> <span class="s2">&quot;Enable weight-only quantization matmul operators.&quot;</span><span class="p">})</span>
+    <span class="n">_smooth_quant_plugins</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span> <span class="s2">&quot;Enable a group of plugins to support smooth quantization.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_smooth_quant_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable plugin that supports smooth quantization gemm kernels.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_layernorm_quantization_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable plugin that supports layernorm quantization kernels.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_rmsnorm_quantization_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span> <span class="s2">&quot;Enable plugin that supports rmsnorm quantization kernels.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_quantize_per_token_plugin</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span> <span class="s2">&quot;Enable plugin that supports per-token quantization.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_quantize_tensor_plugin</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span> <span class="s2">&quot;Enable plugin that supports per-tensor quantization.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_moe_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable some customized kernels to speed up the MoE layer of MoE models.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_mamba_conv1d_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable customized kernels to speed up conv1d operator for Mamba.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_low_latency_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The GEMM plugin that optimized specially for low latency scenarios.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_low_latency_gemm_swiglu_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The GEMM + SwiGLU fusion plugin that optimized specially for low latency scenarios.&quot;</span>
+        <span class="p">})</span>
+
+    <span class="n">_gemm_allreduce_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;help&quot;</span><span class="p">:</span> <span class="s2">&quot;The GEMM + AllReduce kernel fusion plugin.&quot;</span><span class="p">})</span>
+
+    <span class="c1"># Features</span>
+    <span class="n">_context_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable the fused multi-head attention during the context phase, &quot;</span>
+            <span class="s2">&quot;will trigger a kernel that performs the MHA/MQA/GQA block using a single kernel.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_bert_context_fmha_fp32_acc</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable the FP32 accumulator for context FMHA in the bert_attention_plugin. &quot;</span>
+            <span class="s2">&quot;If disabled, FP16 is used, better performance but potentially worse accuracy is expected.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_paged_kv_cache</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable paged KV cache, which helps manage memory for the KV cache more efficiently, &quot;</span>
+            <span class="s2">&quot;and usually leads to an increase in the batch size and an improved efficiency.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_remove_input_padding</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Pack different tokens together, which reduces both the amount of computations and memory consumption.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_norm_quant_fusion</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Fuse the LayerNorm and quantization kernels into a single kernel, &quot;</span>
+            <span class="s2">&quot;resulting in improved end-to-end performance.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_reduce_fusion</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Fuse the ResidualAdd and LayerNorm kernels after AllReduce into a single kernel, &quot;</span>
+            <span class="s2">&quot;resulting in improved end-to-end performance.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_user_buffer</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Eliminate extra copies from the local buffer to the shared buffer &quot;</span>
+            <span class="s2">&quot;in the communication kernel, leading to improved end-to-end performance. &quot;</span>
+            <span class="s2">&quot;This feature must be enabled with `--reduce_fusion enable` and &quot;</span>
+            <span class="s2">&quot;is currently only supported for the FP8 LLAMA model.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_tokens_per_block</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Define how many tokens are contained in each paged kv cache block.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_use_paged_context_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Allow advanced features like KV cache reuse and chunked context.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_use_fp8_context_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;When FP8 quantization is activated, the attention can be further accelerated by enabling FP8 Context FMHA&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_fuse_fp4_quant</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span> <span class="s2">&quot;Whether to fuse FP4 quantization into attention kernel.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_multiple_profiles</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enables multiple TensorRT optimization profiles in the built engines, &quot;</span>
+            <span class="s2">&quot;will benefits the performance especially when GEMM plugin is disabled, &quot;</span>
+            <span class="s2">&quot;because more optimization profiles help TensorRT have more chances to select better kernels. &quot;</span>
+            <span class="s2">&quot;Note: This feature increases engine build time but no other adverse effects are expected.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_paged_state</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable paged state, which helps manage memory for the RNN state more efficiently.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_streamingllm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable [StreamingLLM](https://arxiv.org/abs/2309.17453), which uses a window attention to perform efficient and stable LLM on long texts.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_manage_weights</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable TensorRT-LLM managed weights to speed up engine building process.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_use_fused_mlp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable horizontal fusion in Gated-MLP that combines two Matmul &quot;</span>
+            <span class="s2">&quot;operations into a single one followed by a separate SwiGLU kernel.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_pp_reduce_scatter</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable a pipeline parallelism optimization with &quot;</span>
+            <span class="s2">&quot;ReduceScatter + AllGather targeting large MoE models.&quot;</span>
+        <span class="p">})</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">update_from_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
+        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">config</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
+            <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
+                <span class="n">value_to_be_update</span> <span class="o">=</span> <span class="n">config</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
+                <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">),</span>
+                              <span class="nb">bool</span><span class="p">)</span> <span class="ow">or</span> <span class="n">name</span> <span class="o">==</span> <span class="s1">&#39;paged_kv_cache&#39;</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="n">value_to_be_update</span> <span class="o">==</span> <span class="s2">&quot;enable&quot;</span><span class="p">:</span>
+                        <span class="n">value_to_be_update</span> <span class="o">=</span> <span class="kc">True</span>
+                    <span class="k">elif</span> <span class="n">value_to_be_update</span> <span class="o">==</span> <span class="s2">&quot;disable&quot;</span><span class="p">:</span>
+                        <span class="n">value_to_be_update</span> <span class="o">=</span> <span class="kc">False</span>
+                <span class="k">elif</span> <span class="n">value_to_be_update</span> <span class="o">==</span> <span class="s2">&quot;disable&quot;</span><span class="p">:</span>
+                    <span class="n">value_to_be_update</span> <span class="o">=</span> <span class="kc">None</span>
+                <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value_to_be_update</span><span class="p">)</span>
+
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
+        <span class="n">plugin_config</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">()</span>
+        <span class="n">plugin_config</span><span class="o">.</span><span class="n">update_from_dict</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">plugin_config</span>
+
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_arguments</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">args</span><span class="p">:</span> <span class="n">argparse</span><span class="o">.</span><span class="n">Namespace</span><span class="p">):</span>
+        <span class="n">args</span> <span class="o">=</span> <span class="nb">vars</span><span class="p">(</span><span class="n">args</span><span class="p">)</span>
+        <span class="n">obj</span> <span class="o">=</span> <span class="bp">cls</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">args</span><span class="p">)</span>
+
+        <span class="c1"># We want to know if the user explicitly disabled the gemm_plugin</span>
+        <span class="c1"># because nvfp4 gemm uses plugin by default currently</span>
+        <span class="k">if</span> <span class="s1">&#39;gemm_plugin&#39;</span> <span class="ow">in</span> <span class="n">args</span> <span class="ow">and</span> <span class="n">args</span><span class="p">[</span><span class="s1">&#39;gemm_plugin&#39;</span><span class="p">]</span> <span class="o">==</span> <span class="s1">&#39;disable&#39;</span><span class="p">:</span>
+            <span class="n">obj</span><span class="o">.</span><span class="n">_explicitly_disable_gemm_plugin</span> <span class="o">=</span> <span class="kc">True</span>
+
+        <span class="k">return</span> <span class="n">obj</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="n">config</span> <span class="o">=</span> <span class="n">asdict</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span>
+        <span class="c1"># Remove prefix &quot;_&quot; of the storage name</span>
+        <span class="n">config</span> <span class="o">=</span> <span class="p">{</span><span class="n">key</span><span class="o">.</span><span class="n">lstrip</span><span class="p">(</span><span class="s1">&#39;_&#39;</span><span class="p">):</span> <span class="n">value</span> <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">config</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
+        <span class="k">return</span> <span class="n">config</span>
+
+<div class="viewcode-block" id="PluginConfig.to_legacy_setting">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig.to_legacy_setting">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_legacy_setting</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&#39;&#39;&#39;Legacy setting means that all of the plugins and features are</span>
+<span class="sd">        disabled, this is needed for the legacy `build.py` script, which will be</span>
+<span class="sd">        migrated to the centralized building script `tensorrt_llm/commands/build.py`.</span>
+
+<span class="sd">        After the migration is done, this function may or may not be deleted.</span>
+<span class="sd">        &#39;&#39;&#39;</span>
+        <span class="k">for</span> <span class="n">field</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+            <span class="c1"># Remove prefix &quot;_&quot; of the storage name</span>
+            <span class="n">field_name</span> <span class="o">=</span> <span class="n">field</span><span class="o">.</span><span class="n">name</span><span class="o">.</span><span class="n">lstrip</span><span class="p">(</span><span class="s1">&#39;_&#39;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">field_name</span> <span class="o">==</span> <span class="s1">&#39;dtype&#39;</span><span class="p">:</span>
+                <span class="k">continue</span>
+            <span class="k">if</span> <span class="n">field</span><span class="o">.</span><span class="n">type</span> <span class="ow">in</span> <span class="p">(</span><span class="nb">str</span><span class="p">,</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]):</span>
+                <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field_name</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">elif</span> <span class="n">field</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="nb">bool</span> <span class="ow">or</span> <span class="n">field_name</span> <span class="o">==</span> <span class="s1">&#39;paged_kv_cache&#39;</span><span class="p">:</span>
+                <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field_name</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="n">unsupported_plugins</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="c1"># bert_attention_plugin is handled within BertAttention</span>
+            <span class="mi">100</span><span class="p">:</span> <span class="p">[</span>
+                <span class="s1">&#39;gemm_swiglu_plugin&#39;</span><span class="p">,</span> <span class="s1">&#39;fp8_rowwise_gemm_plugin&#39;</span><span class="p">,</span>
+                <span class="s1">&#39;low_latency_gemm_plugin&#39;</span><span class="p">,</span> <span class="s1">&#39;low_latency_gemm_swiglu_plugin&#39;</span><span class="p">,</span>
+                <span class="s1">&#39;bert_context_fmha_fp32_acc&#39;</span>
+            <span class="p">]</span>
+        <span class="p">}</span>
+        <span class="n">sm</span> <span class="o">=</span> <span class="n">get_sm_version</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">sm</span> <span class="ow">in</span> <span class="n">unsupported_plugins</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">plugin</span> <span class="ow">in</span> <span class="n">unsupported_plugins</span><span class="p">[</span><span class="n">sm</span><span class="p">]:</span>
+                <span class="n">val</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">plugin</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">val</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">val</span> <span class="o">!=</span> <span class="kc">False</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">plugin</span><span class="si">}</span><span class="s2">=</span><span class="si">{</span><span class="n">val</span><span class="si">}</span><span class="s2"> is not supported on SM </span><span class="si">{</span><span class="n">sm</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">context_fmha_type</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">bert_context_fmha_fp32_acc</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">ContextFMHAType</span><span class="o">.</span><span class="n">enabled_with_fp32_acc</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">context_fmha</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">ContextFMHAType</span><span class="o">.</span><span class="n">enabled</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">ContextFMHAType</span><span class="o">.</span><span class="n">disabled</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">is_context_fmha_enabled</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">context_fmha_type</span> <span class="o">!=</span> <span class="n">ContextFMHAType</span><span class="o">.</span><span class="n">disabled</span>
+
+    <span class="nd">@context_fmha_type</span><span class="o">.</span><span class="n">setter</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">context_fmha_type</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">value</span> <span class="o">==</span> <span class="n">ContextFMHAType</span><span class="o">.</span><span class="n">disabled</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">context_fmha</span> <span class="o">=</span> <span class="kc">False</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">bert_context_fmha_fp32_acc</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">context_fmha</span> <span class="o">=</span> <span class="kc">True</span>
+            <span class="k">if</span> <span class="n">value</span> <span class="o">==</span> <span class="n">ContextFMHAType</span><span class="o">.</span><span class="n">enabled</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">bert_context_fmha_fp32_acc</span> <span class="o">=</span> <span class="kc">False</span>
+            <span class="k">elif</span> <span class="n">value</span> <span class="o">==</span> <span class="n">ContextFMHAType</span><span class="o">.</span><span class="n">enabled_with_fp32_acc</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">bert_context_fmha_fp32_acc</span> <span class="o">=</span> <span class="kc">True</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_smooth_quant_plugins</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">smooth_quant_gemm_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rmsnorm_quantization_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">layernorm_quantization_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">quantize_per_token_plugin</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">quantize_tensor_plugin</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_qserve_plugins</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">qserve_gemm_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rmsnorm_quantization_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">quantize_per_token_plugin</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_fp8_rowwise_quant_plugins</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">fp8_rowwise_gemm_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rmsnorm_quantization_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="c1"># self.layernorm_quantization_plugin = dtype</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">quantize_per_token_plugin</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">quantize_tensor_plugin</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_context_fmha</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">context_fmha_type</span><span class="o">=</span><span class="n">ContextFMHAType</span><span class="o">.</span><span class="n">enabled</span><span class="p">):</span>
+        <span class="k">assert</span> <span class="nb">type</span><span class="p">(</span><span class="n">context_fmha_type</span><span class="p">)</span> <span class="o">==</span> <span class="n">ContextFMHAType</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">context_fmha_type</span> <span class="o">=</span> <span class="n">context_fmha_type</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">enable_paged_kv_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tokens_per_block</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">32</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">paged_kv_cache</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">=</span> <span class="n">tokens_per_block</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_nccl_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">nccl_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="n">init_all_reduce_helper</span><span class="p">()</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_lora_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">lora_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_dora_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">enable</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dora_plugin</span> <span class="o">=</span> <span class="n">enable</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
+
+<span class="c1"># Only plugin configs in this list will be exposed as `trtllm-build` arguments,</span>
+<span class="c1"># others are automatically enabled when needed, no need for users to control.</span>
+<span class="n">cli_plugin_args</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="c1"># Plugins</span>
+    <span class="s2">&quot;bert_attention_plugin&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;gpt_attention_plugin&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;gemm_plugin&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;gemm_swiglu_plugin&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;fp8_rowwise_gemm_plugin&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;lora_plugin&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;dora_plugin&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;moe_plugin&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;mamba_conv1d_plugin&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;nccl_plugin&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;low_latency_gemm_plugin&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;low_latency_gemm_swiglu_plugin&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;gemm_allreduce_plugin&quot;</span><span class="p">,</span>
+
+    <span class="c1"># Features</span>
+    <span class="s2">&quot;context_fmha&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;bert_context_fmha_fp32_acc&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;remove_input_padding&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;tokens_per_block&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;use_paged_context_fmha&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;use_fp8_context_fmha&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;fuse_fp4_quant&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;multiple_profiles&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;paged_state&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;streamingllm&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;norm_quant_fusion&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;reduce_fusion&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;user_buffer&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;use_fused_mlp&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;pp_reduce_scatter&quot;</span><span class="p">,</span>
+<span class="p">]</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">add_plugin_argument</span><span class="p">(</span><span class="n">parser</span><span class="p">:</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">):</span>
+    <span class="n">plugin_config</span> <span class="o">=</span> <span class="n">PluginConfig</span><span class="p">()</span>
+    <span class="k">for</span> <span class="n">field</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">(</span><span class="n">plugin_config</span><span class="p">):</span>
+        <span class="c1"># Remove prefix &quot;_&quot; of the storage name</span>
+        <span class="n">field_name</span> <span class="o">=</span> <span class="n">field</span><span class="o">.</span><span class="n">name</span><span class="o">.</span><span class="n">lstrip</span><span class="p">(</span><span class="s1">&#39;_&#39;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">field_name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">cli_plugin_args</span><span class="p">:</span>
+            <span class="k">continue</span>
+        <span class="k">if</span> <span class="n">field</span><span class="o">.</span><span class="n">metadata</span> <span class="ow">and</span> <span class="s2">&quot;help&quot;</span> <span class="ow">in</span> <span class="n">field</span><span class="o">.</span><span class="n">metadata</span><span class="p">:</span>
+            <span class="n">help_message</span> <span class="o">=</span> <span class="n">field</span><span class="o">.</span><span class="n">metadata</span><span class="p">[</span><span class="s2">&quot;help&quot;</span><span class="p">]</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">AttributeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Please add help message for </span><span class="si">{</span><span class="n">field_name</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">field</span><span class="o">.</span><span class="n">type</span> <span class="ow">in</span> <span class="p">(</span><span class="nb">str</span><span class="p">,</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]):</span>
+            <span class="n">plugin_dtype_options</span> <span class="o">=</span> <span class="n">DEFAULT_PLUGIN_DTYPE_OPTIONS</span>
+            <span class="k">if</span> <span class="n">field_name</span> <span class="ow">in</span> <span class="n">PLUGIN_DTYPE_OPTIONS_MAP</span><span class="p">:</span>
+                <span class="n">plugin_dtype_options</span> <span class="o">=</span> <span class="n">PLUGIN_DTYPE_OPTIONS_MAP</span><span class="p">[</span><span class="n">field_name</span><span class="p">]</span>
+            <span class="k">if</span> <span class="n">field_name</span> <span class="o">==</span> <span class="s2">&quot;gemm_plugin&quot;</span><span class="p">:</span>
+                <span class="n">default</span> <span class="o">=</span> <span class="n">field</span><span class="o">.</span><span class="n">default</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">default</span> <span class="o">=</span> <span class="n">field</span><span class="o">.</span><span class="n">default</span> <span class="k">if</span> <span class="n">field</span><span class="o">.</span><span class="n">default</span> <span class="k">else</span> <span class="s2">&quot;disable&quot;</span>
+            <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span>
+                <span class="s2">&quot;--&quot;</span> <span class="o">+</span> <span class="n">field_name</span><span class="p">,</span>
+                <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">,</span>
+                <span class="n">default</span><span class="o">=</span><span class="n">default</span><span class="p">,</span>
+                <span class="n">choices</span><span class="o">=</span><span class="p">[</span><span class="n">x</span> <span class="k">if</span> <span class="n">x</span> <span class="k">else</span> <span class="s2">&quot;disable&quot;</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">plugin_dtype_options</span><span class="p">],</span>
+                <span class="n">help</span><span class="o">=</span><span class="n">help_message</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">field</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="nb">bool</span><span class="p">:</span>
+            <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span>
+                <span class="s2">&quot;--&quot;</span> <span class="o">+</span> <span class="n">field_name</span><span class="p">,</span>
+                <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">,</span>
+                <span class="n">default</span><span class="o">=</span><span class="s2">&quot;enable&quot;</span> <span class="k">if</span> <span class="n">field</span><span class="o">.</span><span class="n">default</span> <span class="k">else</span> <span class="s2">&quot;disable&quot;</span><span class="p">,</span>
+                <span class="n">choices</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;enable&quot;</span><span class="p">,</span> <span class="s2">&quot;disable&quot;</span><span class="p">],</span>
+                <span class="n">help</span><span class="o">=</span><span class="n">help_message</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">&quot;--&quot;</span> <span class="o">+</span> <span class="n">field_name</span><span class="p">,</span>
+                                <span class="nb">type</span><span class="o">=</span><span class="n">field</span><span class="o">.</span><span class="n">type</span><span class="p">,</span>
+                                <span class="n">default</span><span class="o">=</span><span class="n">field</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
+                                <span class="n">help</span><span class="o">=</span><span class="n">help_message</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">parser</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">force_all_reduce_deterministic</span><span class="p">():</span>
+    <span class="k">return</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;FORCE_DETERMINISTIC&quot;</span><span class="p">,</span> <span class="s2">&quot;0&quot;</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;1&quot;</span> <span class="ow">or</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span>
+        <span class="s2">&quot;FORCE_ALL_REDUCE_DETERMINISTIC&quot;</span><span class="p">,</span> <span class="s2">&quot;0&quot;</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;1&quot;</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">CustomAllReduceHelper</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Globally visible class to help usage of custom_all_reduce plugin.</span>
+<span class="sd">        Provides the following utilities:</span>
+
+<span class="sd">        workspace: Tensor</span>
+<span class="sd">            When using CUSTOM or AUTO mode, a tensor containing pointers to memory</span>
+<span class="sd">            visible to all GPUs. It should be 3 pointers per TP rank -</span>
+<span class="sd">            ptr to data buffer, ptr to barriers in, ptr to barriers out.</span>
+<span class="sd">            It must be initialized using IpcMemory class.</span>
+
+<span class="sd">        Usage:</span>
+<span class="sd">            - Set custom_all_reduce_helper.workspace with the required tensor.</span>
+<span class="sd">              Then, each instance of allreduce will reference that tensor automatically.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">POINTERS_PER_RANK</span> <span class="o">=</span> <span class="mi">7</span>
+    <span class="n">POINTERS_OF_COUNTER</span> <span class="o">=</span> <span class="mi">2</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">workspace</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_workspace_tensor</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                             <span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span>
+                             <span class="n">num_profiles</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">..functional</span><span class="w"> </span><span class="kn">import</span> <span class="n">Tensor</span>
+        <span class="n">workspace_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">POINTERS_PER_RANK</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">POINTERS_OF_COUNTER</span>
+
+        <span class="n">dim_range</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">num_profiles</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">dim_range</span> <span class="o">=</span> <span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;all_reduce_size&#39;</span><span class="p">,</span>
+                                      <span class="p">[</span><span class="n">workspace_size</span><span class="p">]</span> <span class="o">*</span> <span class="n">num_profiles</span><span class="p">)])</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">workspace</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+            <span class="n">name</span><span class="o">=</span><span class="s1">&#39;all_reduce_workspace&#39;</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span>
+            <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="n">workspace_size</span><span class="p">],</span>
+            <span class="n">dim_range</span><span class="o">=</span><span class="n">dim_range</span><span class="p">,</span>
+        <span class="p">)</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">max_workspace_size_auto</span><span class="p">(</span><span class="n">tp_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">force_all_reduce_deterministic</span><span class="p">():</span>
+            <span class="n">workspace_size</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;FORCE_ALLREDUCE_KERNEL_WORKSPACE_SIZE&quot;</span><span class="p">,</span>
+                                       <span class="s2">&quot;1000000000&quot;</span><span class="p">)</span>
+            <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">workspace_size</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">tp_size</span> <span class="o">&lt;=</span> <span class="mi">2</span><span class="p">:</span>
+            <span class="k">return</span> <span class="mi">16_000_000</span>
+        <span class="k">return</span> <span class="mi">8_000_000</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">allocate_workspace</span><span class="p">(</span><span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span>
+                           <span class="n">size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">IpcMemory</span><span class="p">],</span> <span class="s2">&quot;torch.tensor&quot;</span><span class="p">]:</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+        <span class="c1"># Force pull mode and disable lamport when force deterministic is enabled, for reducing device memory usage.</span>
+        <span class="n">force_deterministic</span> <span class="o">=</span> <span class="n">force_all_reduce_deterministic</span><span class="p">()</span>
+        <span class="n">is_p2p_supported</span> <span class="o">=</span> <span class="n">can_access_peer</span><span class="p">(</span><span class="n">mapping</span><span class="p">)</span>
+        <span class="n">ipc_buffers_size</span> <span class="o">=</span> <span class="n">size</span> <span class="k">if</span> <span class="n">force_deterministic</span> <span class="k">else</span> <span class="n">size</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
+        <span class="n">ipc_buffers_ping</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">ipc_buffers_size</span><span class="p">,</span>
+                                     <span class="n">is_p2p_supported</span><span class="p">)</span>
+        <span class="n">ipc_buffers_pong</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">ipc_buffers_size</span><span class="p">,</span>
+                                     <span class="n">is_p2p_supported</span><span class="p">)</span>
+        <span class="n">ipc_barriers_in</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span>
+            <span class="n">mapping</span><span class="p">,</span> <span class="n">IpcMemory</span><span class="o">.</span><span class="n">IPC_BARRIERS_SIZE_PER_GPU</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span>
+            <span class="n">is_p2p_supported</span><span class="p">)</span>
+        <span class="n">ipc_barriers_out</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span>
+            <span class="n">mapping</span><span class="p">,</span> <span class="n">IpcMemory</span><span class="o">.</span><span class="n">IPC_BARRIERS_SIZE_PER_GPU</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span>
+            <span class="n">is_p2p_supported</span><span class="p">)</span>
+        <span class="n">lamport_buffers_size</span> <span class="o">=</span> <span class="mi">1</span> <span class="k">if</span> <span class="n">force_deterministic</span> <span class="k">else</span> <span class="n">size</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
+        <span class="n">lamport_buffers_0</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">lamport_buffers_size</span><span class="p">,</span>
+                                      <span class="n">is_p2p_supported</span><span class="p">)</span>
+        <span class="n">lamport_buffers_1</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">lamport_buffers_size</span><span class="p">,</span>
+                                      <span class="n">is_p2p_supported</span><span class="p">)</span>
+        <span class="n">lamport_buffers_2</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">lamport_buffers_size</span><span class="p">,</span>
+                                      <span class="n">is_p2p_supported</span><span class="p">)</span>
+        <span class="c1"># TODO: it seems we may need to initialize lamport buffers for all tp groups</span>
+        <span class="c1"># just like its cpp counterpart (AllReduceBuffers::AllReduceBuffers()) does.</span>
+        <span class="k">if</span> <span class="n">is_p2p_supported</span><span class="p">:</span>
+            <span class="n">lamport_initialize_all</span><span class="p">(</span>
+                <span class="n">lamport_buffers_0</span><span class="o">.</span><span class="n">local_ptr</span><span class="p">,</span>
+                <span class="n">lamport_buffers_1</span><span class="o">.</span><span class="n">local_ptr</span><span class="p">,</span>
+                <span class="n">lamport_buffers_2</span><span class="o">.</span><span class="n">local_ptr</span><span class="p">,</span>
+                <span class="n">size</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="n">buffers</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">ipc_buffers_ping</span><span class="p">,</span> <span class="n">ipc_buffers_pong</span><span class="p">,</span> <span class="n">ipc_barriers_in</span><span class="p">,</span>
+            <span class="n">ipc_barriers_out</span><span class="p">,</span> <span class="n">lamport_buffers_0</span><span class="p">,</span> <span class="n">lamport_buffers_1</span><span class="p">,</span>
+            <span class="n">lamport_buffers_2</span>
+        <span class="p">]</span>
+
+        <span class="k">return</span> <span class="n">buffers</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>
+            <span class="n">ipc_buffers_ping</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span> <span class="n">ipc_buffers_pong</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span>
+            <span class="n">ipc_barriers_in</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span> <span class="n">ipc_barriers_out</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span>
+            <span class="n">lamport_buffers_0</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span> <span class="n">lamport_buffers_1</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span>
+            <span class="n">lamport_buffers_2</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">+</span> <span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span>
+            <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cpu&quot;</span><span class="p">)</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">allocate_allreduce_fusion_workspace</span><span class="p">(</span>
+            <span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span>
+            <span class="n">size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">IpcMemory</span><span class="p">],</span> <span class="s2">&quot;torch.tensor&quot;</span><span class="p">]:</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+        <span class="n">is_p2p_supported</span> <span class="o">=</span> <span class="n">can_access_peer</span><span class="p">(</span><span class="n">mapping</span><span class="p">)</span>
+        <span class="n">ipc_buffers_size</span> <span class="o">=</span> <span class="n">size</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
+        <span class="n">ipc_buffers</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">ipc_buffers_size</span><span class="p">,</span> <span class="n">is_p2p_supported</span><span class="p">)</span>
+        <span class="n">ipc_barriers</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="mi">256</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+                                 <span class="n">is_p2p_supported</span><span class="p">)</span>
+        <span class="n">lamport_buffers_size</span> <span class="o">=</span> <span class="n">size</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
+        <span class="n">lamport_buffers</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="mi">3</span> <span class="o">*</span> <span class="n">lamport_buffers_size</span><span class="p">,</span>
+                                    <span class="n">is_p2p_supported</span><span class="p">)</span>
+        <span class="n">rank</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">.</span><span class="n">rank</span>
+        <span class="n">tp_rank</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span>
+        <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="n">tp_rank</span> <span class="ow">and</span> <span class="n">is_p2p_supported</span><span class="p">:</span>
+            <span class="n">lamport_initialize</span><span class="p">(</span>
+                <span class="n">lamport_buffers</span><span class="o">.</span><span class="n">local_ptr</span><span class="p">,</span>
+                <span class="mi">3</span> <span class="o">*</span> <span class="n">lamport_buffers_size</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="n">flag_buffer</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">lamport_buffers_size</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span>
+                                   <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int</span><span class="p">,</span>
+                                   <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">)</span>
+        <span class="n">buffers</span> <span class="o">=</span> <span class="p">[</span><span class="n">ipc_buffers</span><span class="p">,</span> <span class="n">ipc_barriers</span><span class="p">,</span> <span class="n">lamport_buffers</span><span class="p">,</span> <span class="n">flag_buffer</span><span class="p">]</span>
+
+        <span class="k">return</span> <span class="n">buffers</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>
+            <span class="n">ipc_buffers</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span> <span class="n">ipc_barriers</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span>
+            <span class="n">lamport_buffers</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span> <span class="p">[</span><span class="n">flag_buffer</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">()],</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span>
+            <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">)</span>
+
+
+<span class="n">custom_all_reduce_helper</span> <span class="o">=</span> <span class="kc">None</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">init_all_reduce_helper</span><span class="p">():</span>
+    <span class="k">global</span> <span class="n">custom_all_reduce_helper</span>
+    <span class="n">custom_all_reduce_helper</span> <span class="o">=</span> <span class="n">CustomAllReduceHelper</span><span class="p">()</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">current_all_reduce_helper</span><span class="p">():</span>
+    <span class="k">global</span> <span class="n">custom_all_reduce_helper</span>
+    <span class="k">assert</span> <span class="n">custom_all_reduce_helper</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;You must call `init_all_reduce_helper` first&quot;</span>
+    <span class="k">return</span> <span class="n">custom_all_reduce_helper</span>
+</pre></div>
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+<div class="bd-sidebar-secondary"></div>
+
+
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
