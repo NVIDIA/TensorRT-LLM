@@ -66,7 +66,6 @@ class RootArgs(BaseModel):
     help=
     "Print output to stdout with a JSON dataset entry on each line. Deprecated.Prefer using / extending --export-format instead when your goal is to export a dataset for tllm-bench or a new benchmarking entrypoint.",
     default=False,
-    deprecated=True,
 )
 @click.option(
     "--random-seed",

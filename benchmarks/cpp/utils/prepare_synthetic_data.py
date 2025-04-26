@@ -1,9 +1,11 @@
 import random
 
 import click
-from abstractions import UniformLengthDistribution, UniformTaskIdDistribution
-from export import export_workload_from_args
-from generate import generate_synthetic_text_dataset
+from utils.abstractions import (NormalLengthDistribution,
+                                UniformLengthDistribution,
+                                UniformTaskIdDistribution)
+from utils.export import export_workload_from_args
+from utils.generate import generate_synthetic_text_dataset
 
 
 @click.command()
@@ -35,13 +37,13 @@ def token_norm_dist(root_args, **kwargs):
     random_source = random.Random(root_args.random_seed)
     workload = generate_synthetic_text_dataset(
         root_args.tokenizer,
-        UniformLengthDistribution(
-            min_len=kwargs["input_min"],
-            max_len=kwargs["input_max"],
+        NormalLengthDistribution(
+            mean=kwargs["input_mean"],
+            std_dev=kwargs["input_stdev"],
         ),
-        UniformLengthDistribution(
-            min_len=kwargs["output_min"],
-            max_len=kwargs["output_max"],
+        NormalLengthDistribution(
+            mean=kwargs["output_mean"],
+            std_dev=kwargs["output_stdev"],
         ),
         UniformTaskIdDistribution(
             min_id=root_args.task_id,

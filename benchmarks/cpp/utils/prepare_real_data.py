@@ -3,10 +3,10 @@ import re
 from typing import Optional
 
 import click
-from abstractions import (DatasetConfig, LengthDistribution,
-                          NormalLengthDistribution)
-from export import export_workload_from_args
-from generate import generate_real_dataset
+from utils.abstractions import (DatasetConfig, LengthDistribution,
+                                NormalLengthDistribution)
+from utils.export import export_workload_from_args
+from utils.generate import generate_real_dataset
 
 
 def validate_output_len_dist(

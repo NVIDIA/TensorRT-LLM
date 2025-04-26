@@ -2,8 +2,8 @@ import json
 import os
 from typing import Any, Dict
 
-from abstractions import (ExportFormat, GptManagerBenchmarkExportFormat,
-                          TllmBenchExportFormat, Workload)
+from utils.abstractions import (ExportFormat, GptManagerBenchmarkExportFormat,
+                                TllmBenchExportFormat, Workload)
 
 
 def _safe_create_parent_dir(file_path: str) -> None:

@@ -3,14 +3,15 @@ import random
 import tempfile
 from typing import List, Optional, Tuple
 
-from abstractions import (ConstantTaskIdDistribution, DatasetConfig,
-                          LengthDistribution, MultimodalSample,
-                          NormalLengthDistribution, TaskIdDistribution,
-                          TextSample, UniformLengthDistribution,
-                          UniformTaskIdDistribution, Workload, create_workload)
 from datasets import IterableDataset, load_dataset
 from PIL import Image
 from transformers import AutoTokenizer
+from utils.abstractions import (ConstantTaskIdDistribution, DatasetConfig,
+                                LengthDistribution, MultimodalSample,
+                                NormalLengthDistribution, TaskIdDistribution,
+                                TextSample, UniformLengthDistribution,
+                                UniformTaskIdDistribution, Workload,
+                                create_workload)
 
 
 def _generate_lengths_uniform(
@@ -30,8 +31,9 @@ def _generate_lengths_normal(
     random_source: random.Random,
 ) -> Tuple[int, ...]:
     return tuple(
-        random_source.gauss(normal_length_distribution.mean,
-                            normal_length_distribution.std_dev)
+        int(
+            random_source.gauss(normal_length_distribution.mean,
+                                normal_length_distribution.std_dev))
         for _ in range(num_reqs))
 
 
