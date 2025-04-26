@@ -1941,7 +1941,8 @@ class PyTorchModelEngine(ModelEngine):
                                        scheduled_requests: ScheduledRequests,
                                        outputs: dict):
         """Apply logit post processors (in-place modify outputs Tensors) if any."""
-        if not (self.mapping.is_last_pp_rank() and self.mapping.tp_rank == 0):
+
+        if not (self.mapping.is_last_pp_rank()):
             return
 
         if not isinstance(outputs, dict) or "logits" not in outputs:

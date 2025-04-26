@@ -998,7 +998,7 @@ class MyLogitsProcessor(LogitsProcessor):
             logits[..., self.biased_word_id] = 0
 
 
-def tinyllama_logits_processor_test_harness(backend: str, **llm_kwargs):
+def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
     sampling_params = SamplingParams(
@@ -1015,9 +1015,8 @@ def tinyllama_logits_processor_test_harness(backend: str, **llm_kwargs):
 
 @force_ampere
 @pytest.mark.part0
-@pytest.mark.parametrize("backend", [None, 'pytorch'])
-def test_tinyllama_logits_processor(backend: str):
-    tinyllama_logits_processor_test_harness(backend)
+def test_tinyllama_logits_processor():
+    tinyllama_logits_processor_test_harness()
 
 
 class MyBatchedLogitsProcessor(BatchedLogitsProcessor):

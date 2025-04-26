@@ -9,7 +9,8 @@ from .test_llm import (get_model_path, global_kvcache_config, llama_model_path,
                        llm_get_stats_test_harness, prompts,
                        run_llm_abort_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
-                       tinyllama_guided_decoding_test_harness)
+                       tinyllama_guided_decoding_test_harness,
+                       tinyllama_logits_processor_test_harness)
 from utils.util import force_ampere
 # isort: on
 
@@ -18,6 +19,11 @@ from utils.util import force_ampere
 def test_tinyllama_guided_decoding():
     pytest.skip(reason="https://nvbugs/5240350")
     tinyllama_guided_decoding_test_harness(backend="pytorch")
+
+
+@force_ampere
+def test_tinyllama_logits_processor():
+    tinyllama_logits_processor_test_harness(backend="pytorch")
 
 
 @pytest.mark.parametrize("return_context_logits, use_overlap", [

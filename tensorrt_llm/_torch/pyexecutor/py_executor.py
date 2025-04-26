@@ -1167,39 +1167,18 @@ class PyExecutor:
 
         # broadcast within first tp group before send/recv chain to other tp groups
         if self.dist.tp_size > 1 and self.dist.is_first_pp_rank:
-            if self.dist.tp_rank == 0:
-                # Preserve original `new_requests` on rank 0 since it may contain
-                # Python-only objects (e.g., custom logits processors) not serializable by pybind.
-                _ = self.dist.tp_broadcast(new_requests, root=0)
-            else:
-                new_requests = self.dist.tp_broadcast(new_requests, root=0)
+            new_requests = self.dist.tp_broadcast(new_requests, root=0)
 
         # tag = [0, num_micro_batches - 1] used for new_tokens send/recv
         tag = self.num_micro_batches
 
         # 1. send metadata: len(num_requests) and serialized buffer size
-        has_logit_processors = 0
         if self.dist.is_first_pp_rank and len(new_requests) > 0:
-            logit_processors_dict = {}
-            # If logits processors are present, they must be sent across ranks
-            # as pure Python objects, since C++ bindings can't pickle Python functions.
-            for idx, item in enumerate(new_requests):
-                if item is None:
-                    continue
-                _, req = item
-                lp = getattr(req, "py_logits_post_processors", None)
-                if lp is not None:
-                    has_logit_processors = 1
-                    logit_processors_dict[idx] = lp
-
-            payloads = new_requests if not has_logit_processors else (
-                new_requests, logit_processors_dict)
-            buf = np.array(bytearray(dill.dumps(payloads)))
+            buf = np.array(bytearray(dill.dumps(new_requests)))
             buf_size = len(buf)
         else:
             buf, buf_size = None, 0
-        metadata_arr = np.array(
-            [len(new_requests), buf_size, has_logit_processors])
+        metadata_arr = np.array([len(new_requests), buf_size])
 
         if not self.dist.is_first_pp_rank:
             self.dist.recv(metadata_arr, self.dist.prev_pp_rank, tag)
@@ -1219,19 +1198,7 @@ class PyExecutor:
                 self.dist.send(buf, self.dist.next_pp_rank, tag)
 
             if not self.dist.is_first_pp_rank:
-                buf_data = dill.loads(buf.tobytes())  # nosec B301
-                if metadata_arr[2] == 0:
-                    new_requests = buf_data
-                else:
-                    # has logits processors
-                    new_requests, logit_processors_dict = buf_data
-                    for idx, item in enumerate(new_requests):
-                        if item is None:
-                            continue
-                        _, req = item
-                        lp = logit_processors_dict.get(idx)
-                        if lp is not None:
-                            setattr(req, "py_logits_post_processors", lp)
+                new_requests = dill.loads(buf.tobytes())  # nosec B301
                 assert len(new_requests) == num_new_requests
 
         return new_requests
@@ -1253,12 +1220,26 @@ class PyExecutor:
                 self.request_queue, timeout,
                 total_max_num_active_requests - total_num_active_requests)
 
+        if self.dist.rank == 0:
+            py_request_objects = self._collect_py_objects_from_requests(
+                new_requests, "py_logits_post_processors")
+        else:
+            py_request_objects = None
+
         if self.dist.rank == 0 and not self.dist.has_pp:
             # Preserve original `new_requests` on rank 0 since it may contain
             # Python-only objects (e.g., custom logits processors) not serializable by pybind.
             _ = self._broadcast_new_requests(new_requests)
         else:
             new_requests = self._broadcast_new_requests(new_requests)
+
+        py_request_objects = self.dist.broadcast(py_request_objects, root=0)
+
+        if py_request_objects and (self.dist.tp_size > 1
+                                   or self.dist.has_pp) and self.dist.rank > 0:
+            attr_name, req_obj_dict = py_request_objects
+            self._attach_py_objects_to_requests(new_requests, attr_name,
+                                                req_obj_dict)
 
         if not self.enable_attention_dp:
             self._update_new_active_requests_queue_latency(new_requests)
@@ -1390,6 +1371,37 @@ class PyExecutor:
                 self.inflight_req_ids.erase(req.request_id)
                 self._terminate_request(req)
                 self.active_requests.remove(req)
+
+    def _collect_py_objects_from_requests(
+            self, requests, attribute_name: str) -> Optional[tuple[str, dict]]:
+        """WAR to gather dynamic Python-only attributes (e.g., custom logits processors)
+        that cannot be handled by pybind serialization during MP communication.
+
+        Returns:
+            A tuple of (attribute_name, {request_id: object}) or None.
+        """
+        req_id_to_obj = {}
+        for item in requests:
+            if item is None:
+                continue
+            req_id, req = item[:2]
+            obj = getattr(req, attribute_name, None)
+            if obj is not None:
+                req_id_to_obj[req_id] = obj
+        return None if not req_id_to_obj else (attribute_name, req_id_to_obj)
+
+    def _attach_py_objects_to_requests(self, requests, attribute_name: str,
+                                       py_request_objects: dict):
+        """Attaches Python-only objects (e.g., dynamic attributes not handled by pybind)
+        to each request.
+        """
+        for item in requests:
+            if item is None:
+                continue
+            req_id, req = item[:2]
+            py_obj = py_request_objects.get(req_id)
+            if py_obj is not None:
+                setattr(req, attribute_name, py_obj)
 
     def _partition_context(self, ctx_ids_list):
         ctx_ids = torch.tensor(ctx_ids_list).unsqueeze(0)
