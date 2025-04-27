@@ -289,6 +289,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
         ) else None
         from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
 
+        import torch
+        torch.cuda.Stream()
         self.mpi_futures = self.mpi_session.submit(
             worker_main,
             **worker_kwargs,
