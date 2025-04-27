@@ -43,6 +43,7 @@
 #include <cstdlib>
 #include <memory>
 #include <random>
+#include <tensorrt_llm/batch_manager/cacheTransBuffer.h>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
 #include <tensorrt_llm/executor/cache_transmission/cacheConcatenate.h>
 
@@ -381,15 +382,19 @@ protected:
 
     void setUpCacheTransceiver()
     {
+        int maxNumTokens = 1024;
+        mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
         if (isSender)
         {
-            mResponder = std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
-                mConnectionManager.get(), *mCacheState, mlocalRank, std::make_unique<CacheFormatter>(mManager.get())));
+            mResponder = std::make_unique<DataResponder>(
+                std::make_unique<DataSenderImpl>(mConnectionManager.get(), *mCacheState, mlocalRank,
+                    std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get())));
         }
         else
         {
-            mRequester = std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
-                mConnectionManager.get(), *mCacheState, mlocalRank, std::make_unique<CacheFormatter>(mManager.get())));
+            mRequester = std::make_unique<DataRequester>(
+                std::make_unique<DataReceiverImpl>(mConnectionManager.get(), *mCacheState, mlocalRank,
+                    std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get())));
         }
     }
 
@@ -443,6 +448,7 @@ protected:
     LlmRequest::RequestIdType mRequestId{0};
     SizeType32 mMaxNumSequences{};
     std::unique_ptr<KVCacheManager> mManager;
+    std::unique_ptr<CacheTransBufferManager> mCacheTransBufferManager;
     std::unique_ptr<DataResponder> mResponder;
     std::unique_ptr<DataRequester> mRequester;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;
@@ -679,6 +685,8 @@ protected:
         }
         else if (tensorrt_llm::common::getEnvUseMPIKvCache() || tensorrt_llm::common::getEnvUseUCXKvCache())
         {
+            int maxNumTokens = 1024;
+            mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
             bool isUcx = tensorrt_llm::common::getEnvUseUCXKvCache();
             TLLM_LOG_INFO("Enable %s KV cache transport.", isUcx ? "UCX" : "MPI");
 
@@ -707,8 +715,10 @@ protected:
 
             auto makeFormatter = [this]()
             {
-                return mIsMLA ? std::unique_ptr<IOFormatter>(std::make_unique<MLACacheFormatter>(mManager.get()))
-                              : std::unique_ptr<IOFormatter>(std::make_unique<CacheFormatter>(mManager.get()));
+                return mIsMLA ? std::unique_ptr<IOFormatter>(
+                           std::make_unique<MLACacheFormatter>(mManager.get(), mCacheTransBufferManager.get()))
+                              : std::unique_ptr<IOFormatter>(
+                                  std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get()));
             };
 
             if (mIsContext)
@@ -1042,6 +1052,7 @@ protected:
     bool mIsMLA{false};
     SizeType32 mMaxNumSequences{};
     std::unique_ptr<KVCacheManager> mManager;
+    std::unique_ptr<CacheTransBufferManager> mCacheTransBufferManager;
     std::unique_ptr<DataResponder> mResponder;
     std::unique_ptr<DataRequester> mRequester;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;
