@@ -128,9 +128,6 @@ public:
 
     std::optional<std::shared_ptr<KVCacheEventManager>> getKVCacheEventManager() const;
 
-    static auto constexpr kMpiTagOffset = 18;
-    static auto constexpr kMpiTagUpperBound = kMpiTagOffset + 4;
-
 private:
     using RtTensorPtr = runtime::ITensor::SharedPtr;
     using CudaStreamPtr = runtime::BufferManager::CudaStreamPtr;
@@ -230,9 +227,9 @@ private:
     void cleanupDynamicLogitsPostProcessors(RequestList const& finishedRequests);
 
     void orchSendReqThread();
-    void orchRecvThread(int32_t idTag, int32_t dataTag);
+    void orchRecvThread(mpi::MpiTag idTag, mpi::MpiTag dataTag);
     void leaderRecvReqThread();
-    void leaderSendThread(MpiMessageQueue& sendQueue, int32_t idTag, int32_t dataTag);
+    void leaderSendThread(MpiMessageQueue& sendQueue, mpi::MpiTag idTag, mpi::MpiTag dataTag);
 
     void addTerminatedReqId(std::vector<Response> const& responses, IdType const& reqId);
 
