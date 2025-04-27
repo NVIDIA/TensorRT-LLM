@@ -258,7 +258,7 @@ class RemoteTask(NamedTuple):
     kwargs: Dict[str, Any]
 
 
-class RemoteMpiCommSessionClient():
+class RemoteMpiCommSessionClient(MpiSession):
     '''
     RemoteMpiCommSessionClient is a variant of MpiCommSession that is used to connect to a remote MPI pool.
     '''
@@ -288,6 +288,9 @@ class RemoteMpiCommSessionClient():
     def submit_sync(self, task, *args, **kwargs):
         return self.submit(task, *args, **kwargs)
 
+    def abort(self):
+        self.shutdown()
+
     def shutdown(self, wait=True):
         if self._is_shutdown:
             return
@@ -303,6 +306,9 @@ class RemoteMpiCommSessionClient():
                 "red")
         finally:
             self._is_shutdown = True
+
+    def shutdown_abort(self, grace: float = 60, reason=None):
+        self.shutdown()
 
 
 class RemoteMpiCommSessionServer():
