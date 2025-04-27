@@ -1,5 +1,8 @@
 import os
 import subprocess  # nosec B404
+import sys
+from subprocess import PIPE, Popen
+from typing import Literal
 
 import pytest
 
@@ -51,7 +54,8 @@ def run_client(server_addr, values_to_process):
 
 
 @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5179666")
-def test_remote_mpi_session():
+@pytest.mark.parametrize("task_type", ["submit", "submit_sync"])
+def test_remote_mpi_session(task_type: Literal["submit", "submit_sync"]):
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""
     os.environ['TLLM_SPAWN_PROXY_PROCESS'] = "1"
     os.environ['TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR'] = "ipc://" + str(
@@ -59,13 +63,27 @@ def test_remote_mpi_session():
 
     command = [
         "mpirun", "--allow-run-as-root", "-np", "2", "trtllm-llmapi-launch",
-        "python3", "_run_mpi_comm_task.py"
+        "python3", "_run_mpi_comm_task.py", "--task_type", task_type
     ]
-    subprocess.run(command,
-                   check=True,
-                   stdout=subprocess.PIPE,
-                   stderr=subprocess.PIPE,
-                   env=os.environ)  # nosec B603
+    print(' '.join(command))
+    with Popen(command,
+               env=os.environ,
+               stdout=PIPE,
+               stderr=PIPE,
+               bufsize=1,
+               universal_newlines=True) as process:
+        # Process both stdout and stderr in real-time
+        for line in process.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+
+        for line in process.stderr:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+
+        return_code = process.wait()
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, command)
 
 
 def task1():
