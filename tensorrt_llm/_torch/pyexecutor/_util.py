@@ -251,8 +251,8 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     py_executor.resource_manager.resource_managers.get(
         "kv_cache_manager").shutdown()
 
+    py_executor.is_warmup = False
     if py_executor.dist.mapping.rank == 0:
-        py_executor.is_warmup = False
         py_executor.shutdown()
 
     return kv_cache_max_tokens
