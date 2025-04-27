@@ -16,6 +16,7 @@ set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 if(ENABLE_NIXL)
   set(NIXL_ROOT "/opt/nvidia/nvda_nixl")
   # Find NIXL
+  message(STATUS "batch_manager: Finding NIXL libraries in ${NIXL_ROOT}")
   find_package(NIXL REQUIRED)
 
   message(STATUS "Found NIXL libraries:")

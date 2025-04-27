@@ -15,6 +15,12 @@
 # the License.
 #
 
+# Check if NIXL is already found
+if(NIXL_FOUND)
+  # If NIXL is already found, exit the script early
+  return()
+endif()
+
 set(NIXL_ROOT "/opt/nvidia/nvda_nixl")
 
 # calculate TARGET_ARCH
@@ -23,6 +29,44 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
 else()
   message(FATAL_ERROR "Unsupported system with NIXL: ${CMAKE_SYSTEM_PROCESSOR}")
 endif()
+
+# NIXL not found, attempt to build and install
+message(STATUS "NIXL not found. Attempting to build and install NIXL.")
+
+# Define the build directory for NIXL
+set(NIXL_BUILD_DIR ${CMAKE_CURRENT_BINARY_DIR}/nixl_build)
+
+# Create the build directory
+file(MAKE_DIRECTORY ${NIXL_BUILD_DIR})
+message(STATUS "NIXL_BUILD_DIR: ${NIXL_BUILD_DIR}")
+
+# Check if the UCX path exists
+if(NOT EXISTS "${UCX_PATH}")
+  message(FATAL_ERROR "UCX path does not exist: ${UCX_PATH}")
+endif()
+message(STATUS "UCX path exists: ${UCX_PATH}")
+
+# Run the Meson setup and build commands
+message(STATUS "Current source dir: ${CMAKE_CURRENT_SOURCE_DIR}")
+execute_process(
+  COMMAND ${MESON_EXECUTABLE} setup ${NIXL_BUILD_DIR} -Ducx_path=${UCX_PATH}
+  WORKING_DIRECTORY ${NIXL_SOURCE_DIR}
+  RESULT_VARIABLE MESON_SETUP_RESULT
+  OUTPUT_VARIABLE MESON_SETUP_OUTPUT
+  ERROR_VARIABLE MESON_SETUP_ERROR
+  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_STRIP_TRAILING_WHITESPACE)
+message(STATUS "Meson setup output: ${MESON_SETUP_OUTPUT}")
+message(STATUS "Meson setup error: ${MESON_SETUP_ERROR}")
+if(NOT MESON_SETUP_RESULT EQUAL 0)
+  message(
+    FATAL_ERROR "Meson setup failed with error code ${MESON_SETUP_RESULT}")
+endif()
+
+# Build and install NIXL
+execute_process(COMMAND ${NINJA_EXECUTABLE} WORKING_DIRECTORY ${NIXL_BUILD_DIR})
+
+execute_process(COMMAND ${NINJA_EXECUTABLE} install
+                WORKING_DIRECTORY ${NIXL_BUILD_DIR})
 
 find_path(NIXL_INCLUDE_DIR nixl.h HINTS ${NIXL_ROOT}/include)
 
@@ -50,6 +94,20 @@ find_package_handle_standard_args(
     UCX_UTILS_LIBRARY
     GDS_BACKEND_LIBRARY)
 
+# Re-attempt to find NIXL after installation
+find_package_handle_standard_args(
+  NIXL
+  FOUND_VAR NIXL_FOUND
+  REQUIRED_VARS
+    NIXL_INCLUDE_DIR
+    NIXL_LIBRARY
+    NIXL_BUILD_LIBRARY
+    SERDES_LIBRARY
+    UCX_BACKEND_LIBRARY
+    UCX_UTILS_LIBRARY
+    GDS_BACKEND_LIBRARY)
+
+# Set up the NIXL target if found
 if(NIXL_FOUND)
   if(NOT TARGET NIXL::nixl)
     add_library(NIXL::nixl SHARED IMPORTED)
@@ -58,12 +116,5 @@ if(NIXL_FOUND)
                             IMPORTED_LOCATION "${NIXL_LIBRARY}")
   endif()
 else()
-  message(STATUS "NIXL_INCLUDE_DIR: ${NIXL_INCLUDE_DIR}")
-  message(STATUS "NIXL_LIBRARY: ${NIXL_LIBRARY}")
-  message(STATUS "NIXL_BUILD_LIBRARY: ${NIXL_BUILD_LIBRARY}")
-  message(STATUS "SERDES_LIBRARY: ${SERDES_LIBRARY}")
-  message(STATUS "UCX_BACKEND_LIBRARY: ${UCX_BACKEND_LIBRARY}")
-  message(STATUS "UCX_UTILS_LIBRARY: ${UCX_UTILS_LIBRARY}")
-  message(STATUS "GDS_BACKEND_LIBRARY: ${GDS_BACKEND_LIBRARY}")
-  message(FATAL_ERROR "NIXL not found. Please install NIXL or set NIXL_ROOT")
+  message(FATAL_ERROR "NIXL not found after installation attempt.")
 endif()

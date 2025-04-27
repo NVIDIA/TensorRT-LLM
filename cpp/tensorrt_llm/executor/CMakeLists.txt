@@ -16,6 +16,7 @@ set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 if(ENABLE_NIXL)
   set(NIXL_ROOT "/opt/nvidia/nvda_nixl")
   # Include the FindNIXL module
+  message(STATUS "executor: Finding NIXL libraries in ${NIXL_ROOT}")
   find_package(NIXL REQUIRED)
   # Check if all required packages were found
   if(NOT NIXL_FOUND)
