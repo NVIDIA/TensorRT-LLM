@@ -514,7 +514,11 @@ if(ENABLE_NIXL)
 
   execute_process(COMMAND ${NINJA_EXECUTABLE} install
                   WORKING_DIRECTORY ${NIXL_BUILD_DIR})
-
+  find_package(NIXL REQUIRED)
+  if(NOT NIXL_FOUND)
+    message(FATAL_ERROR "NIXL not found. Please install NIXL or set NIXL_ROOT")
+    set(ENABLE_NIXL 0)
+  endif()
 endif()
 
 add_subdirectory(tensorrt_llm)

@@ -22,24 +22,14 @@ set(API_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/cutlass_extensions/include
                     ${API_INCLUDE_DIR})
 # Add NIXL configuration
-set(NIXL_ROOT "/opt/nvidia/nvda_nixl")
-
-# Find NIXL
-find_path(NIXL_INCLUDE_DIR nixl.h HINTS ${NIXL_ROOT}/include
-                                        /opt/nvidia/nvda_nixl/include)
-
-find_library(
-  NIXL_LIBRARY
-  NAMES nixl
-  HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
-        /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
-
-if(NOT NIXL_INCLUDE_DIR OR NOT NIXL_LIBRARY)
+find_package(NIXL REQUIRED)
+if(NOT NIXL_FOUND)
   message(FATAL_ERROR "NIXL not found. Please install NIXL or set NIXL_ROOT")
 endif()
 
-message(STATUS "Found trt-llm, NIXL: ${NIXL_LIBRARY}")
-message(STATUS "NIXL include dir: ${NIXL_INCLUDE_DIR}")
+message(STATUS "Using NIXL include dir: ${NIXL_INCLUDE_DIR}")
+message(STATUS "Using NIXL lib: ${NIXL_LIBRARY}")
+include_directories(${NIXL_INCLUDE_DIR})
 
 if(ENABLE_MULTI_DEVICE)
   find_package(MPI REQUIRED)
@@ -298,8 +288,8 @@ if(NOT WIN32)
   set_target_properties(
     ${SHARED_TARGET}
     PROPERTIES LINK_FLAGS "-Wl,-rpath='$ORIGIN'"
-               BUILD_RPATH "/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu"
-               INSTALL_RPATH "/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu"
+               BUILD_RPATH "${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH}"
+               INSTALL_RPATH "${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH}"
                INSTALL_RPATH_USE_LINK_PATH TRUE)
 endif()
 
@@ -314,11 +304,3 @@ if(BUILD_PYBIND)
 endif()
 
 add_subdirectory(plugins)
-
-# Add include directories to the shared target
-target_include_directories(${SHARED_TARGET} PRIVATE ${NIXL_INCLUDE_DIR})
-
-# Make sure NIXL headers are available to dependent targets
-target_include_directories(
-  ${SHARED_TARGET} PUBLIC $<BUILD_INTERFACE:${NIXL_INCLUDE_DIR}>
-                          $<INSTALL_INTERFACE:include>)
