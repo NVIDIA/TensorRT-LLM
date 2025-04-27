@@ -347,7 +347,7 @@ class RemoteMpiCommSessionServer():
                 print_colored_debug(
                     f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received shutdown signal\n",
                     "green")
-                self.session.shutdown()
+                self.session.shutdown_abort()
                 break
             else:
                 print_colored_debug(
