@@ -1144,7 +1144,7 @@ class PyTorchModelEngine(ModelEngine):
 
         if not attn_metadata.is_cuda_graph or (
                 self.is_spec_decode
-                and self.spec_config.spec_dec_mode.has_variable_seq_len()):
+                and self.spec_config.spec_dec_mode.has_variable_seq_lens()):
             # Usually, we don't need to update seq_lens when using CUDA graphs.
             # This is because CUDA graphs are only used for pure decoding batches.
             # If we're doing spec decode, however, we can have variable seqlens (up

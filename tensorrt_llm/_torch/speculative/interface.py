@@ -38,7 +38,7 @@ class SpeculativeDecodingMode(IntEnum):
     def support_overlap_scheduler(self):
         return self.is_mtp()
 
-    def has_variable_seq_len(self):
+    def has_variable_seq_lens(self):
         return self.is_eagle3()
 
     def extend_ctx(self, attention_backend: AttentionBackend):
