@@ -122,6 +122,9 @@ class ModelConfig(Generic[TConfig]):
                             'group_size', None)
                         mixed_quant_configs[layer] = config
                 layer_quant_config = mixed_quant_configs
+            elif quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
+                if quant_config.group_size is None:
+                    quant_config.group_size = 128
 
             if kwargs.get(
                     'moe_backend'
