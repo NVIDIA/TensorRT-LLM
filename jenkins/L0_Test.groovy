@@ -966,6 +966,13 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
                 error("Error in post-debug session: ${e.message}")
             }
         }
+        // If the execution test list is null, remove the test result xml
+        sh """
+            ls -all ${stageName}/
+            if ! grep -q '<testcase' ${stageName}/results.xml; then
+                rm ${stageName}/results.xml
+            fi
+        """
         def llmPath = sh (script: "realpath .", returnStdout: true).trim()
         def llmSrc = "${llmPath}/${LLM_ROOT}${config}/TensorRT-LLM/src"
         // CPP tests will generate test result in ${llmSrc}/cpp/build_backup/, move these files to job result folder
@@ -975,7 +982,6 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
         sh "cd ${llmSrc}/cpp/build_backup/ && sed -i 's/\" classname=\"/\" classname=\"${stageName}./g' *.xml || true"
         sh "cd ${llmSrc}/cpp/build_backup/ && sed -i 's/testsuite name=\"[^\"]*\"/testsuite name=\"${stageName}\"/g' *.xml || true"
         // Sed for Pytest result
-        sh "ls ${stageName}/ -all"
         sh "cd ${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
         // Copy CPP test result
         sh "cp ${llmSrc}/cpp/build_backup/*.xml ${stageName} || true"
