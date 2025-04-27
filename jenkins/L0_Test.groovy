@@ -70,6 +70,8 @@ def BUILD_CONFIGS = [
   (LINUX_AARCH64_CONFIG) : [(TARNAME) : "TensorRT-LLM-GH200.tar.gz"],
 ]
 
+TESTER_CORES = "12"
+TESTER_MEMORY = "96Gi"
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
