@@ -200,7 +200,10 @@ void RuntimeBuffers::reshape(TllmRuntime const& runtime, ModelConfig const& mode
         shape.d[0] = numTokens;
         tensor->reshape(shape);
     }
-
+    // scores have shape (b * context_length, b * numEncoderTokens). Context length == 1 for generation requests
+    scores->reshape(ITensor::makeShape(
+        {numContextTokens + numGenRequests, getNumRequests() * encoderBuffers->encoderOutputLen}
+    ));
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -253,7 +256,7 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     logitsIdsHost = manager.emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kINT32);
 
     inputsIds = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
-
+    scores = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
     if (worldConfig.isPipelineParallel())
     {
         hiddenStates = manager.emptyTensor(MemoryType::kGPU, modelConfig.getDataType());
@@ -896,6 +899,79 @@ void RuntimeBuffers::prepareEagleBuffers(RequestVector const& contextRequests, R
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+std::vector<float> RuntimeBuffers::getScoresHost(runtime::TllmRuntime const& runtime) 
+{
+    auto const& manager = runtime.getBufferManager();
+    auto const& stream = runtime.getStream();
+    std::vector<float> scoresHost;
+    auto scoresShape = scores->getShape();
+    auto scoresSize = ITensor::volume(scoresShape);
+    if (scoresSize > 0) {
+        scoresHost.resize(scoresSize);
+        manager.copy(*scores, scoresHost.data());
+        stream.synchronize();  // Ensure copy completes
+    }
+    return scoresHost;
+}
+
+void RuntimeBuffers::setAttentionPriorIdx(
+    RequestVector const& contextRequests, RequestVector const& genRequests, TllmRuntime const& runtime)
+{
+    /**
+     * is called after inference is done. processes the "scores" buffer and sets up
+     * the index with most attention focus for each request.
+     * scores buffer has shape (b * context_length, b * numEncoderTokens),
+     * that means there is extra data to be ommitted
+     */
+    // compute total encoder output length among all requests
+    SizeType32 totalContextEncoderOutputLen = 0; 
+    for (auto const& llmReq : contextRequests) {
+        totalContextEncoderOutputLen += llmReq->getEncoderOutputLen();
+    }
+    SizeType32 totalEncoderOutputLen = totalContextEncoderOutputLen;
+    for (auto const& llmReq : genRequests) {
+        totalEncoderOutputLen += llmReq->getEncoderOutputLen();
+    }
+
+    SizeType32 offset = 0;
+    // we skip all context requests
+    for (auto const& llmReq : contextRequests) {
+        offset += llmReq->getContextCurrentPosition() * totalEncoderOutputLen;
+        // for context we just focusing at the beginning of the encoder sequence
+        llmReq->setAttentionPriorIdx(0);
+    }
+
+    std::vector<float> scoresHost = getScoresHost(runtime);
+
+    // for generation requests, there is no context,
+    // but we need to find correct section in (b * encoder_output_len)
+    for (SizeType32 i = 0; i < (SizeType32)genRequests.size(); ++i) {
+        // skip the context
+        offset += totalContextEncoderOutputLen;
+        for (SizeType32 j = 0; j < (SizeType32)genRequests.size(); ++j) {
+            auto const& llmReq = genRequests[j];
+            SizeType32 encoderOutputLen = llmReq->getEncoderOutputLen();
+            if (i == j) {
+                // find maximum score and it's index in current subsection of scores buffer
+                SizeType32 maxScoreIdx = 0;
+                SizeType32 maxScore = scoresHost[offset];
+                
+                // Find the index with maximum score in the current subsection
+                for (SizeType32 k = 1; k < encoderOutputLen; ++k) {
+                    if (scoresHost[offset + k] > maxScore) {
+                        maxScore = scoresHost[offset + k];
+                        maxScoreIdx = k;
+                    }
+                }
+                
+                // Set the attention prior index to the position with maximum score
+                llmReq->setAttentionPriorIdx(maxScoreIdx);
+            }
+            offset += encoderOutputLen;
+        }
+    }
+}
+
 std::tuple<SizeType32, RuntimeBuffers::TensorMap const&, RuntimeBuffers::TensorMap&> RuntimeBuffers::prepareStep(
     RequestVector const& contextRequests, RequestVector const& genRequests, SizeType32 maxBeamWidth,
     SizeType32 maxAttentionWindow, DecoderBuffers& decoderBuffers, kv_cache_manager::BaseKVCacheManager* kvCacheManager,
@@ -966,7 +1042,7 @@ void RuntimeBuffers::fillIOMaps(ModelConfig const& modelConfig, WorldConfig cons
     inputMap.insert_or_assign(kContextLengthsTensorName, contextLengthsDevice);
     inputMap.insert_or_assign(kHostContextLengthsTensorName, contextLengthsHost);
     inputMap.insert_or_assign(kSequenceLengthsTensorName, sequenceLengthsDevice);
-
+    outputMap.insert_or_assign(kScoresTensorName, scores);
     if (modelConfig.useCrossAttention())
     {
         encoderBuffers->insertInputTensors(inputMap);

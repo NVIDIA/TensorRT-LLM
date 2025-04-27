@@ -57,6 +57,7 @@ public:
 
     // encoder output
     TensorPtr encoderOutput; // [numEncoderTokens, hiddenSize]
+    SizeType32 encoderOutputLen{};
 
     // output buffer owned by llmRequest, such that it's per-request output buffer
     // encoderBuffers class can init and reshape each buffer, without maintaining a list/set of inflight buffers
@@ -82,7 +83,6 @@ public:
 private:
     SizeType32 numRequests{};
     SizeType32 encoderInputLen{};
-    SizeType32 encoderOutputLen{};
     SizeType32 maxInputLengthInBatch{}; // max input length in a batch
 
     // prefilled with deterministic values to avoid runtime creation

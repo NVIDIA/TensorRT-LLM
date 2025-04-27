@@ -71,7 +71,7 @@ public:
     static constexpr auto kPromptVocabSizeTensorName = "prompt_vocab_size";
     static constexpr auto kMRopeRotaryCosSinTensorName = "mrope_rotary_cos_sin";
     static constexpr auto kMRopePositionDeltasTensorName = "mrope_position_deltas";
-
+    static constexpr auto kScoresTensorName = "scores";
     using SizeType32 = runtime::SizeType32;
     using TensorPtr = runtime::ITensor::SharedPtr;
     using TensorMap = runtime::ITensor::TensorMap;
@@ -150,6 +150,8 @@ private:
 
     //! Prompt-Tuning
     std::unique_ptr<PromptTuningBuffers> promptTuningBuffers;
+    // Time index of input token with the highest attention score
+    TensorPtr scores;  // [b * context_length, b * numEncoderTokens]
 
     //! Mrope
     TensorPtr mropeRotaryCosSin;
@@ -283,6 +285,10 @@ public:
     void prepareEagleBuffers(RequestVector const& contextRequests, RequestVector const& genRequests,
         DecoderBuffers& decoderBuffers, runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig);
+
+    std::vector<float> getScoresHost(runtime::TllmRuntime const& runtime);
+    void setAttentionPriorIdx(RequestVector const& contextRequests, RequestVector const& genRequests,
+        runtime::TllmRuntime const& runtime);
 
 private:
     void create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,

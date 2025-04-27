@@ -474,6 +474,8 @@ void TransformerBuffers::copyCrossAttentionMasks(RequestVector const& contextReq
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const& manager = runtime.getBufferManager();
+    auto const& stream = runtime.getStream();
+
 
     // Reshape the tensor to make sure the dim1 matches maxEncoderInputLengthInBatch.
     auto crossAttentionMaskShape = crossAttentionMaskDevice->getShape();
@@ -494,10 +496,8 @@ void TransformerBuffers::copyCrossAttentionMasks(RequestVector const& contextReq
         }
     }
     // If not all requests have cross attention mask, let us create the default ones.
-    auto const& stream = runtime.getStream();
     if (!allContextCrossAttentionMaskProvided)
     {
-        TLLM_LOG_WARNING("Default padding attention mask will be used as not all requests have cross attention mask.");
         tk::AttentionMaskParams<bool> attentionMaskParams;
         memset((void*) &attentionMaskParams, 0, sizeof(attentionMaskParams));
         // Set parameters.
@@ -654,13 +654,42 @@ void TransformerBuffers::copyCrossAttentionMasks(RequestVector const& contextReq
             numCopiedTokens++;
             numTokens++;
         }
+        else if (llmReq->hasAttentionPriorIdx())
+        {
+            auto focusTimeIdx = llmReq->getAttentionPriorIdx();
+            // Create a mask where only the token at focusTimeIdx is attended to
+            // Use std::unique_ptr with bool[] instead of vector<bool> to avoid bit packing
+            auto customMask = std::make_unique<bool[]>(maxEncoderInputLengthInBatch);
+            // Initialize all elements to false
+            std::fill_n(customMask.get(), maxEncoderInputLengthInBatch, false);
+            
+            if (focusTimeIdx < maxEncoderInputLengthInBatch) {
+                // TODO: implement flooring, window, etc.
+                customMask[focusTimeIdx] = true;
+            } else {
+                TLLM_LOG_WARNING("Time index %d exceeds encoder length %d, no position will be attended to", 
+                                 focusTimeIdx, maxEncoderInputLengthInBatch);
+            }
+            
+            // Copy the custom mask to pinned memory
+            std::memcpy(pinnedMemPtr, customMask.get(), maxEncoderInputLengthInBatch);
+            pinnedMemPtr += maxEncoderInputLengthInBatch;
+            
+            // Set up copy offsets the same way as before
+            batchedCopySrcOffsets.begin()[numCopiedTokens] = static_cast<SizeType64>(pinnedMemPtr - primarySrcPtr);
+            batchedCopyDstOffsets.begin()[numCopiedTokens] = numTokens * static_cast<SizeType64>(maxEncoderInputLengthInBatch);
+            batchedCopySizes.begin()[numCopiedTokens] = maxEncoderInputLengthInBatch;
+            
+            numCopiedTokens++;
+            numTokens++;
+        }
         else
         {
             numTokens++;
-            TLLM_LOG_WARNING(
-                "CrossAttentionMask is not provided for the generation request. Full valid attentionMask will "
-                "be used "
-                "by default.");
+	    //TLLM_LOG_WARNING(
+            //    "CrossAttentionMask is not provided for the generation request. Full valid attentionMask will "
+            //    "be used "
+            //    "by default.");
         }
     }
     sync_check_cuda_error(stream.get());

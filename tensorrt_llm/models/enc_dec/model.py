@@ -25,7 +25,7 @@ from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      MLPType, PositionEmbeddingType, Tensor,
                                      assertion, cast, gather_last_token_logits,
                                      gelu, maximum, minimum, recv, send, shape,
-                                     transpose, unsqueeze)
+                                     matmul, stack, mean, transpose, unsqueeze)
 # yapf: disable
 from tensorrt_llm.layers import (MLP, Attention, AttentionMaskParams,
                                  AttentionMaskType, AttentionParams,
@@ -247,7 +247,6 @@ class EncoderLayer(Module):
             dtype=dtype,
             quant_mode=quant_mode,
         )
-
         self.mlp_layernorm = ln_type(normalized_shape=hidden_size,
                                      eps=layernorm_eps,
                                      dtype=dtype)
@@ -380,6 +379,25 @@ class DecoderLayer(Module):
         # e.g. BART post, T5 pre
         self.layernorm_position = layernorm_position
 
+        self.q_proj = ColumnLinear(
+            hidden_size,
+            hidden_size,
+            bias=False,
+            dtype=dtype,
+            tp_group=mapping.tp_group,
+            tp_size=mapping.tp_size,
+            gather_output=True,
+        )
+        self.k_proj = ColumnLinear(
+            hidden_size,
+            hidden_size,
+            bias=False,
+            dtype=dtype,
+            tp_group=mapping.tp_group,
+            tp_size=mapping.tp_size,
+            gather_output=True,
+        )
+
         # e.g. BART q_scaling = 1.f, T5 q_scaling = 1.f/sqrt(head_size)
         self.self_attention = Attention(
             local_layer_idx=local_layer_idx,
@@ -439,8 +457,8 @@ class DecoderLayer(Module):
             quant_mode=quant_mode)
 
         self.cross_attention_layernorm = ln_type(normalized_shape=hidden_size,
-                                                 eps=layernorm_eps,
-                                                 dtype=dtype)
+                                                eps=layernorm_eps,
+                                                dtype=dtype)
 
         # T5/BART MLP, Flan-T5 GatedMLP
         self.mlp_type = mlp_type
@@ -455,7 +473,6 @@ class DecoderLayer(Module):
             dtype=dtype,
             quant_mode=quant_mode,
         )
-
         self.mlp_layernorm = ln_type(normalized_shape=hidden_size,
                                      eps=layernorm_eps,
                                      dtype=dtype)
@@ -533,6 +550,10 @@ class DecoderLayer(Module):
         if self.layernorm_position == LayerNormPositionType.pre_layernorm:
             hidden_states = self.cross_attention_layernorm(hidden_states)
 
+        q = self.q_proj(hidden_states)   # b * context x hidden
+        k = self.k_proj(encoder_output)  # b * enc x hidden
+        scores = matmul(q, k, transb=True)  # b * context x b * enc
+
         attention_output = self.cross_attention(
             hidden_states=hidden_states,
             attention_mask=attention_mask_params.cross_attention_mask,
@@ -591,8 +612,8 @@ class DecoderLayer(Module):
                 hidden_states = minimum(64000.0, hidden_states)
 
         if use_cache:
-            return (hidden_states, presents_self, presents_cross)
-        return hidden_states
+            return (hidden_states, presents_self, presents_cross, scores)
+        return hidden_states, scores
 
 
 class EncoderModel(PretrainedModel):
@@ -1245,6 +1266,7 @@ class DecoderModel(PretrainedModel):
         if use_cache:
             presents = []
 
+        all_scores = []
         for i, (decoder_layer, past) in enumerate(
                 zip(self.transformer.layers, kv_cache_params.past_key_value)):
 
@@ -1289,12 +1311,19 @@ class DecoderModel(PretrainedModel):
                 language_adapter_routings=language_adapter_routings)
 
             if use_cache:
-                presents_self, presents_cross = hidden_states[1], hidden_states[
-                    2]
+                presents_self, presents_cross, scores = hidden_states[1], hidden_states[2], hidden_states[3]
                 presents.append((presents_self, presents_cross))
                 hidden_states = hidden_states[0]
+            else:
+                hidden_states, scores = hidden_states[0], hidden_states[1]
+            all_scores.append(scores)
             self.register_network_output(f'decoder_layer_{i}_output',
                                          hidden_states)
+        
+
+        scores_stacked = stack(all_scores, 0)  # [layers x b*context_length x b*numEncoderTokens]
+        mean_scores = cast(mean(scores_stacked, 0), "float32")  # [b*context length x b*numTokens]
+        mean_scores.mark_output("scores")
 
         if self.mapping.is_last_pp_rank():
             if self.has_model_final_layernorm:
@@ -1380,7 +1409,7 @@ class DecoderModel(PretrainedModel):
         max_output_len_range = [0, (max_output_len + 1) // 2, max_output_len]
 
         encoder_num_tokens_range = [
-            0,  # 0 for generation phase, >0 for context phase
+            1,  # 0 for generation phase, >0 for context phase
             (max_encoder_input_len * max_batch_size + 1) // 2,
             max_encoder_input_len * max_batch_size,
         ]
@@ -1394,7 +1423,7 @@ class DecoderModel(PretrainedModel):
         # No enable_two_optimization_profiles support yet
 
         encoder_input_len_range = [
-            0,  # 0 for generation phase, >0 for context phase
+            1,  # 0 for generation phase, >0 for context phase
             (max_encoder_input_len + 1) // 2,
             max_encoder_input_len
         ]

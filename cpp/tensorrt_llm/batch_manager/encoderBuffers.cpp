@@ -486,6 +486,7 @@ void EncoderBuffers::setBufferSizes(RequestVector const& contextRequests, Reques
 
     for (auto const& llmReq : genRequests)
     {
+        encoderOutputLen += llmReq->getEncoderOutputLen();
         auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
         numRequests += reqBeamWidth; // tile by beam width
         maxInputLengthInBatch = std::max(maxInputLengthInBatch, llmReq->getEncoderInputLen());
@@ -518,25 +519,14 @@ void EncoderBuffers::fill(
     {
         for (auto const& llmReq : requests)
         {
-            // 1. only ctx requests should gather the encoder output
-            // 2. only gen requests should tile encoder input lengths info by beam width
-            bool isCtx = llmReq->isContextInitState();
-            if (isCtx)
-            {
-                size = llmReq->getEncoderOutputLen();
-                auto const encoderOutputSlice = runtime::ITensor::slice(encoderOutput, offset, size);
-                manager.copy(*llmReq->getEncoderOutput(), *encoderOutputSlice);
-                offset += size;
+            // copy encoder output to encoder output buffer for both ctx and gen requests,
+            // disable freeing enc buffer in llm request for it
+            size = llmReq->getEncoderOutputLen();
+            auto const encoderOutputSlice = runtime::ITensor::slice(encoderOutput, offset, size);
+            manager.copy(*llmReq->getEncoderOutput(), *encoderOutputSlice);
+            offset += size;
 
-                inputLengthsAll.emplace_back(size);
-            }
-            else
-            {
-                auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
-                std::fill_n(std::back_inserter(inputLengthsAll), reqBeamWidth,
-                    llmReq->getEncoderOutputLen()); // although encoder output is not needed, gen phase still needs the
-                                                    // encoder length info for cross kv cache. Also tile by beam width
-            }
+            inputLengthsAll.emplace_back(size);
         }
     }
     manager.copy(inputLengthsAll.data(), *inputLengths);
