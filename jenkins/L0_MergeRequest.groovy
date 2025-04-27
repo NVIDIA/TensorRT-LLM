@@ -145,7 +145,7 @@ def echoNodeAndGpuInfo(pipeline, stageName)
 
 def setupPipelineEnvironment(pipeline, testFilter, globalVars)
 {
-    setupPipelineSpec = trtllm_utils.createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
+    setupPipelineSpec = trtllm_utils.createKubernetesPodConfig(image: LLM_DOCKER_IMAGE, type: "build")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
         sh "env | sort"
         updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
