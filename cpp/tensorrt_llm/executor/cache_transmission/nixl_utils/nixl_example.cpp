@@ -252,6 +252,7 @@ int main()
     // only initiator should call invalidate
     ret1 = A1.invalidateRemoteMD(agent2);
     assert(ret1 == NIXL_SUCCESS);
+    std::cout << "ret1: " << ret1 << " ret2: " << ret2 << " \n";
 
     free(addr1);
     free(addr2);

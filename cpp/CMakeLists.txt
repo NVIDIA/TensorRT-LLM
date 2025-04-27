@@ -466,7 +466,22 @@ if(ENABLE_NIXL)
     message(WARNING "Meson or Ninja not found, disabling NIXL build")
     set(ENABLE_NIXL 0)
   else()
-    message(STATUS "Meson and Ninja found, enabling NIXL build")
+    message(STATUS "Meson and Ninja found")
+  endif()
+  # Check if the architecture is aarch64 and disable NIXL if true
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+    message(STATUS "Architecture is aarch64, disabling NIXL")
+    set(ENABLE_NIXL 0)
+  endif()
+
+  # Allow the UCX path to be specified at build time
+  set(UCX_PATH
+      "/usr/local/ucx"
+      CACHE PATH "Path to the UCX installation")
+  # Check if the UCX path exists and disable NIXL if not
+  if(NOT EXISTS "${UCX_PATH}")
+    message(STATUS "UCX path does not exist, disabling NIXL")
+    set(ENABLE_NIXL 0)
   endif()
 endif()
 
@@ -480,10 +495,10 @@ if(ENABLE_NIXL)
   file(MAKE_DIRECTORY ${NIXL_BUILD_DIR})
   message(STATUS "NIXL_BUILD_DIR: ${NIXL_BUILD_DIR}")
   # Check if the UCX path exists
-  if(EXISTS "/usr/local/ucx")
-    message(STATUS "UCX path exists: /usr/local/ucx")
+  if(EXISTS "${UCX_PATH}")
+    message(STATUS "UCX path exists: ${UCX_PATH}")
   else()
-    message(FATAL_ERROR "UCX path does not exist: /usr/local/ucx")
+    message(FATAL_ERROR "UCX path does not exist: ${UCX_PATH}")
   endif()
 
   if(EXISTS "${NIXL_BUILD_DIR}")
@@ -495,8 +510,7 @@ if(ENABLE_NIXL)
   # Run the Meson setup and build commands
   message(STATUS "current source dir: ${CMAKE_CURRENT_SOURCE_DIR}")
   execute_process(
-    COMMAND ${MESON_EXECUTABLE} setup ${NIXL_BUILD_DIR}
-            -Ducx_path=/usr/local/ucx/
+    COMMAND ${MESON_EXECUTABLE} setup ${NIXL_BUILD_DIR} -Ducx_path=${UCX_PATH}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../3rdparty/nixl
     RESULT_VARIABLE MESON_SETUP_RESULT
     OUTPUT_VARIABLE MESON_SETUP_OUTPUT
@@ -514,11 +528,12 @@ if(ENABLE_NIXL)
 
   execute_process(COMMAND ${NINJA_EXECUTABLE} install
                   WORKING_DIRECTORY ${NIXL_BUILD_DIR})
+
   find_package(NIXL REQUIRED)
   if(NOT NIXL_FOUND)
     message(FATAL_ERROR "NIXL not found. Please install NIXL or set NIXL_ROOT")
-    set(ENABLE_NIXL 0)
   endif()
+
 endif()
 
 add_subdirectory(tensorrt_llm)

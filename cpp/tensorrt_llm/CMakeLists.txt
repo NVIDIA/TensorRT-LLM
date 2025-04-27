@@ -22,14 +22,16 @@ set(API_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/cutlass_extensions/include
                     ${API_INCLUDE_DIR})
 # Add NIXL configuration
-find_package(NIXL REQUIRED)
-if(NOT NIXL_FOUND)
-  message(FATAL_ERROR "NIXL not found. Please install NIXL or set NIXL_ROOT")
-endif()
+if(ENABLE_NIXL)
+  find_package(NIXL REQUIRED)
+  if(NOT NIXL_FOUND)
+    message(FATAL_ERROR "NIXL not found. Please install NIXL or set NIXL_ROOT")
+  endif()
 
-message(STATUS "Using NIXL include dir: ${NIXL_INCLUDE_DIR}")
-message(STATUS "Using NIXL lib: ${NIXL_LIBRARY}")
-include_directories(${NIXL_INCLUDE_DIR})
+  message(STATUS "Using NIXL include dir: ${NIXL_INCLUDE_DIR}")
+  message(STATUS "Using NIXL lib: ${NIXL_LIBRARY}")
+  include_directories(${NIXL_INCLUDE_DIR})
+endif()
 
 if(ENABLE_MULTI_DEVICE)
   find_package(MPI REQUIRED)

@@ -34,7 +34,6 @@ endif()
 # keep this list sorted alphabetically
 set(SRCS
     cache_transmission/mpi_utils/connection.cpp
-    cache_transmission/nixl_utils/nixl_example.cpp
     cache_transmission/cacheConcatenate.cu
     contextPhaseParams.cpp
     debugConfig.cpp
@@ -72,6 +71,10 @@ set(SRCS
     requestUtils.cpp
     contextPhaseParams.cpp
     disaggServerUtil.cpp)
+
+if(ENABLE_NIXL)
+  list(APPEND SRCS cache_transmission/nixl_utils/nixl_example.cpp)
+endif()
 
 if(NOT WIN32)
   # additional warnings
