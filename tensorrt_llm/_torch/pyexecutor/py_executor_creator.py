@@ -97,7 +97,6 @@ def create_py_executor(executor_config: ExecutorConfig,
             dist=dist,
             spec_config=draft_spec_config,
         )
-        draft_model_engine.is_draft_model = True
         draft_model_engine.kv_cache_manager_key = DRAFT_KV_CACHE_MANAGER_KEY
         draft_model_engine.load_weights_from_target_model(model_engine.model)
     else:
