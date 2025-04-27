@@ -531,6 +531,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("gpu_weights_percent", &tb::TrtGptModelOptionalParams::gpuWeightsPercent)
         .def_readwrite("max_beam_width", &tb::TrtGptModelOptionalParams::maxBeamWidth)
         .def_readwrite("scheduler_config", &tb::TrtGptModelOptionalParams::schedulerConfig)
+        .def_readwrite("cache_transceiver_config", &tb::TrtGptModelOptionalParams::cacheTransceiverConfig)
         .def(py::pickle(gptModelParamsGetState, gptModelParamsSetState));
 
     py::class_<tr::MemoryCounters>(m, "MemoryCounters")

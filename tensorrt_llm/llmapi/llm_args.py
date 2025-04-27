@@ -19,6 +19,8 @@ from ..auto_parallel import AutoParallelConfig, infer_cluster_config
 # yapf: disable
 from ..bindings.executor import BatchingType as _BatchingType
 from ..bindings.executor import \
+    CacheTransceiverConfig as _CacheTransceiverConfig
+from ..bindings.executor import \
     CapacitySchedulerPolicy as _CapacitySchedulerPolicy
 from ..bindings.executor import ContextChunkingPolicy as _ContextChunkingPolicy
 from ..bindings.executor import DecodingConfig, DecodingMode
@@ -640,6 +642,19 @@ class ExtendedRuntimePerfKnobConfig(BaseModel, PybindMirror):
         return res
 
 
+@PybindMirror.mirror_pybind_fields(_CacheTransceiverConfig)
+class CacheTransceiverConfig(BaseModel, PybindMirror):
+    """
+    Configuration for the cache transceiver.
+    """
+    max_num_tokens: Optional[int] = Field(
+        default=None,
+        description="The max number of tokens the transfer buffer can fit.")
+
+    def _to_pybind(self):
+        return _CacheTransceiverConfig(max_num_tokens=self.max_num_tokens)
+
+
 @dataclass
 class _ModelWrapper:
     model: Union[str, Path]
@@ -845,6 +860,9 @@ class LlmArgs(BaseModel):
 
     scheduler_config: Optional[SchedulerConfig] = Field(
         default=None, description="Scheduler config.")
+
+    cache_transceiver_config: Optional[CacheTransceiverConfig] = Field(
+        default=None, description="Cache transceiver config.")
 
     # Speculative decoding parameters
     speculative_config: Optional[Union[
@@ -1327,6 +1345,7 @@ def update_llm_args_with_extra_dict(
         "batching_type": BatchingType,
         "extended_runtime_perf_knob_config": ExtendedRuntimePerfKnobConfig,
         "pytorch_backend_config": PyTorchConfig,
+        "cache_transceiver_config": CacheTransceiverConfig,
     }
     for field, field_type in field_mapping.items():
         if field in llm_args_dict:

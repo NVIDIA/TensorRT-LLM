@@ -1380,6 +1380,21 @@ private:
     bool mReplicate;
 };
 
+class CacheTransceiverConfig
+{
+public:
+    explicit CacheTransceiverConfig(std::optional<size_t> maxNumTokens = std::nullopt);
+
+    [[nodiscard]] std::optional<size_t> getMaxNumTokens() const;
+    void setMaxNumTokens(size_t maxNumTokens);
+
+private:
+    /// @brief The maximum number of tokens that the CacheTransceiver's pre-allocated buffer can hold. If the number of
+    /// kvCache tokens to be transferred for a single request is greater than this value, the performance of the cache
+    /// transfer may be degraded.
+    std::optional<size_t> mMaxNumTokens;
+};
+
 /// @brief Configuration class for the model executor
 class ExecutorConfig
 {
@@ -1408,6 +1423,7 @@ public:
         std::optional<SpeculativeDecodingConfig> specDecConfig = std::nullopt,
         std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
+        std::optional<CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
         bool gatherGenerationLogits = false, bool useVariableBeamWidthSearch = false,
         bool promptTableOffloading = false);
 
@@ -1443,6 +1459,7 @@ public:
     [[nodiscard]] bool getGatherGenerationLogits() const;
     [[nodiscard]] bool getUseVariableBeamWidthSearch() const;
     [[nodiscard]] bool getPromptTableOffloading() const;
+    [[nodiscard]] std::optional<CacheTransceiverConfig> getCacheTransceiverConfig() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
@@ -1471,6 +1488,7 @@ public:
     void setGatherGenerationLogits(bool gatherGenerationLogits);
     void setUseVariableBeamWidthSearch(bool useVariableBeamWidthSearch);
     void setPromptTableOffloading(bool promptTableOffloading);
+    void setCacheTransceiverConfig(CacheTransceiverConfig const& cacheTransceiverConfig);
 
 private:
     friend class Serialization;
@@ -1545,6 +1563,9 @@ private:
 
     /// @brief The additional outputs to gather from the model.
     std::optional<std::vector<AdditionalModelOutput>> mAdditionalModelOutputs;
+
+    /// @brief The cache transceiver configuration
+    std::optional<CacheTransceiverConfig> mCacheTransceiverConfig;
 
     /// @brief Controls if generation logits should be gathered, so that returnGenerationLogits can be requested.
     bool mGatherGenerationLogits{false};

@@ -406,6 +406,23 @@ void initConfigBindings(pybind11::module_& m)
             "stop_token_ids", &tle::GuidedDecodingConfig::getStopTokenIds, &tle::GuidedDecodingConfig::setStopTokenIds)
         .def(py::pickle(guidedDecodingConfigGetstate, guidedDecodingConfigSetstate));
 
+    auto cacheTransceiverConfigGetstate
+        = [](tle::CacheTransceiverConfig const& self) { return py::make_tuple(self.getMaxNumTokens()); };
+    auto cacheTransceiverConfigSetstate = [](py::tuple const& state)
+    {
+        if (state.size() != 1)
+        {
+            throw std::runtime_error("Invalid CacheTransceiverConfig state!");
+        }
+        return tle::CacheTransceiverConfig(state[0].cast<std::optional<size_t>>());
+    };
+
+    py::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
+        .def(py::init<std::optional<size_t>>(), py::arg("max_num_tokens") = py::none())
+        .def_property("max_num_tokens", &tle::CacheTransceiverConfig::getMaxNumTokens,
+            &tle::CacheTransceiverConfig::setMaxNumTokens)
+        .def(py::pickle(cacheTransceiverConfigGetstate, cacheTransceiverConfigSetstate));
+
     auto executorConfigGetState = [](py::object const& self)
     {
         auto& c = self.cast<tle::ExecutorConfig&>();
@@ -417,8 +434,8 @@ void initConfigBindings(pybind11::module_& m)
             c.getUseGpuDirectStorage(), c.getGpuWeightsPercent(), c.getMaxQueueSize(),
             c.getExtendedRuntimePerfKnobConfig(), c.getDebugConfig(), c.getRecvPollPeriodMs(),
             c.getMaxSeqIdleMicroseconds(), c.getSpecDecConfig(), c.getGuidedDecodingConfig(),
-            c.getAdditionalModelOutputs(), c.getGatherGenerationLogits(), c.getUseVariableBeamWidthSearch(),
-            c.getPromptTableOffloading());
+            c.getAdditionalModelOutputs(), c.getCacheTransceiverConfig(), c.getGatherGenerationLogits(),
+            c.getUseVariableBeamWidthSearch(), c.getPromptTableOffloading());
         auto pickle_tuple = py::make_tuple(cpp_states, py::getattr(self, "__dict__"));
         return pickle_tuple;
     };
@@ -431,7 +448,7 @@ void initConfigBindings(pybind11::module_& m)
 
         // Restore C++ data
         auto cpp_states = state[0].cast<py::tuple>();
-        if (cpp_states.size() != 27)
+        if (cpp_states.size() != 28)
         {
             throw std::runtime_error("Invalid cpp_states!");
         }
@@ -461,9 +478,10 @@ void initConfigBindings(pybind11::module_& m)
             cpp_states[21].cast<std::optional<tle::SpeculativeDecodingConfig>>(), // SpecDecConfig
             cpp_states[22].cast<std::optional<tle::GuidedDecodingConfig>>(),      // GuidedDecodingConfig
             cpp_states[23].cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(), // AdditionalModelOutputs
-            cpp_states[24].cast<bool>(),                                                   // GatherGenerationLogits
-            cpp_states[25].cast<bool>(),                                                   // UseVariableBeamWidthSearch
-            cpp_states[26].cast<bool>()                                                    // PromptTableOffloading
+            cpp_states[24].cast<std::optional<tle::CacheTransceiverConfig>>(),             // CacheTransceiverConfig
+            cpp_states[25].cast<bool>(),                                                   // GatherGenerationLogits
+            cpp_states[26].cast<bool>(),                                                   // UseVariableBeamWidthSearch
+            cpp_states[27].cast<bool>()                                                    // PromptTableOffloading
         );
 
         auto py_state = state[1].cast<py::dict>();
@@ -497,6 +515,7 @@ void initConfigBindings(pybind11::module_& m)
                  std::optional<tle::SpeculativeDecodingConfig>,          // SpecDecConfig
                  std::optional<tle::GuidedDecodingConfig>,               // GuidedDecodingConfig
                  std::optional<std::vector<tle::AdditionalModelOutput>>, // AdditionalModelOutputs
+                 std::optional<tle::CacheTransceiverConfig>,             // CacheTransceiverConfig
                  bool,                                                   // GatherGenerationLogits
                  bool,                                                   // UseVariableBeamWidthSearch
                  bool                                                    // PromptTableOffloading
@@ -518,8 +537,9 @@ void initConfigBindings(pybind11::module_& m)
             py::arg("debug_config") = py::none(), py::arg("recv_poll_period_ms") = 0,
             py::arg("max_seq_idle_microseconds") = tle::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds,
             py::arg("spec_dec_config") = py::none(), py::arg("guided_decoding_config") = py::none(),
-            py::arg("additional_model_outputs") = py::none(), py::arg("gather_generation_logits") = false,
-            py::arg("use_variable_beam_width_search") = false, py::arg("mm_embedding_offloading") = false)
+            py::arg("additional_model_outputs") = py::none(), py::arg("cache_transceiver_config") = py::none(),
+            py::arg("gather_generation_logits") = false, py::arg("use_variable_beam_width_search") = false,
+            py::arg("mm_embedding_offloading") = false)
         .def_property("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
         .def_property("max_batch_size", &tle::ExecutorConfig::getMaxBatchSize, &tle::ExecutorConfig::setMaxBatchSize)
         .def_property("max_num_tokens", &tle::ExecutorConfig::getMaxNumTokens, &tle::ExecutorConfig::setMaxNumTokens)
@@ -561,6 +581,8 @@ void initConfigBindings(pybind11::module_& m)
             &tle::ExecutorConfig::setGuidedDecodingConfig)
         .def_property("additional_model_outputs", &tle::ExecutorConfig::getAdditionalModelOutputs,
             &tle::ExecutorConfig::setAdditionalModelOutputs)
+        .def_property("cache_transceiver_config", &tle::ExecutorConfig::getCacheTransceiverConfig,
+            &tle::ExecutorConfig::setCacheTransceiverConfig)
         .def_property("gather_generation_logits", &tle::ExecutorConfig::getGatherGenerationLogits,
             &tle::ExecutorConfig::setGatherGenerationLogits)
         .def_property("use_variable_beam_width_search", &tle::ExecutorConfig::getUseVariableBeamWidthSearch,

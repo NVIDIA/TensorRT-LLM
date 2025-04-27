@@ -227,6 +227,11 @@ public:
     static void serialize(DebugConfig const& debugConfig, std::ostream& os);
     static size_t serializedSize(DebugConfig const& debugConfig);
 
+    // CacheTransceiverConfig
+    static CacheTransceiverConfig deserializeCacheTransceiverConfig(std::istream& is);
+    static void serialize(CacheTransceiverConfig const& cacheTransceiverConfig, std::ostream& os);
+    static size_t serializedSize(CacheTransceiverConfig const& cacheTransceiverConfig);
+
     // ExecutorConfig
     static ExecutorConfig deserializeExecutorConfig(std::istream& is);
     static void serialize(ExecutorConfig const& executorConfig, std::ostream& os);

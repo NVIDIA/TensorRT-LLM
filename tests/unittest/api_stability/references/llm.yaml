@@ -43,6 +43,9 @@ methods:
       decoding_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.DecodingConfig]
         default: null
+      cache_transceiver_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig]
+        default: null
       # Misc
       backend:
         annotation: Optional[str]

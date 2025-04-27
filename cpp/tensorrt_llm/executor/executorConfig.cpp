@@ -32,7 +32,8 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig, std::optional<DebugConfig> debugConfig,
     SizeType32 recvPollPeriodMs, uint64_t maxSeqIdleMicroseconds,
     std::optional<SpeculativeDecodingConfig> specDecConfig, std::optional<GuidedDecodingConfig> guidedDecodingConfig,
-    std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs, bool gatherGenerationLogits,
+    std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs,
+    std::optional<CacheTransceiverConfig> cacheTransceiverConfig, bool gatherGenerationLogits,
     bool useVariableBeamWidthSearch, bool promptTableOffloading)
     : mMaxBeamWidth(maxBeamWidth)
     , mSchedulerConfig(std::move(schedulerConfig))
@@ -58,6 +59,7 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     , mSpeculativeDecodingConfig(specDecConfig)
     , mGuidedDecodingConfig(std::move(guidedDecodingConfig))
     , mAdditionalModelOutputs(std::move(additionalModelOutputs))
+    , mCacheTransceiverConfig(std::move(cacheTransceiverConfig))
     , mGatherGenerationLogits(gatherGenerationLogits)
     , mUseVariableBeamWidthSearch(useVariableBeamWidthSearch)
     , mPromptTableOffloading(promptTableOffloading)
@@ -196,6 +198,11 @@ std::optional<GuidedDecodingConfig> ExecutorConfig::getGuidedDecodingConfig() co
 std::optional<std::vector<AdditionalModelOutput>> ExecutorConfig::getAdditionalModelOutputs() const
 {
     return mAdditionalModelOutputs;
+}
+
+std::optional<CacheTransceiverConfig> ExecutorConfig::getCacheTransceiverConfig() const
+{
+    return mCacheTransceiverConfig;
 }
 
 bool ExecutorConfig::getGatherGenerationLogits() const
@@ -338,6 +345,11 @@ void ExecutorConfig::setGuidedDecodingConfig(GuidedDecodingConfig const& guidedD
 void ExecutorConfig::setAdditionalModelOutputs(std::vector<AdditionalModelOutput> const& additionalModelOutputs)
 {
     mAdditionalModelOutputs = additionalModelOutputs;
+}
+
+void ExecutorConfig::setCacheTransceiverConfig(CacheTransceiverConfig const& cacheTransceiverConfig)
+{
+    mCacheTransceiverConfig = cacheTransceiverConfig;
 }
 
 void ExecutorConfig::setGatherGenerationLogits(bool gatherGenerationLogits)

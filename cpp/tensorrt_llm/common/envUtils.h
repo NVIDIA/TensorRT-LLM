@@ -87,6 +87,8 @@ bool getEnvForceDeterministicAllReduce();
 // This only works when force deterministic is enabled.
 size_t getEnvAllReduceWorkspaceSize();
 
+size_t getEnvKVCacheRecvBufferCount();
+
 bool getEnvKVCacheTransferUseAsyncBuffer();
 
 size_t getEnvKVCacheSendMaxConcurrenceNum();
