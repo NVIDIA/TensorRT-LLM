@@ -26,8 +26,12 @@ class MTPConfig(SpecConfig):
     # The number of max batch size
     max_batch_size: int = 8
 
+    # Whether to use relaxed acceptance during thinking phase for reasoning model
     use_relaxed_acceptance_for_thinking: bool = False
+    # The top-N tokens are sampled from logits to obtain a candidate set.
     relaxed_topk: int = 1
+    # The threshold to further filter the candidate set.
+    # Filter out tokens with a large probability gap between the top-1 token's log probability.
     relaxed_delta: float = 0.
 
     # TODO: Hard code for DeepSeek R1
@@ -71,12 +75,13 @@ class MTPHiddenStatesManager(BaseResourceManager):
             device='cuda',
             dtype=torch.int,
         )
-        # The relaxed_delta for relaxed acceptance
-        self.mtp_relaxed_delta_pool = torch.zeros(
-            (self.max_num_requests),
-            dtype=torch.float,
-            device='cuda',
-        )
+        if self.use_relaxed_acceptance_for_thinking:
+            # The relaxed_delta for relaxed acceptance
+            self.mtp_relaxed_delta_pool = torch.zeros(
+                (self.max_num_requests),
+                dtype=torch.float,
+                device='cuda',
+            )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_batch = scheduled_batch.context_requests
@@ -165,7 +170,7 @@ class MTPSpecMetadata(SpecMetadata):
         else:
             self.num_tokens -= self.num_generations
 
-        if self.mtp_hidden_states_manager is not None:
+        if self.mtp_hidden_states_manager is not None:  # MTP vanilla or use relaxed acceptance
             mtp_slot_ids = []
             for rid in self.request_ids:
                 slot_id = self.mtp_hidden_states_manager.slot_manager.get_slot(

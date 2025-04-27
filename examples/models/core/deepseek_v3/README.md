@@ -90,6 +90,7 @@ python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MT
 `N` is the number of MTP modules. When `N` is equal to `0`, which means that MTP is not used (default). When `N` is greater than `0`, which means that `N` MTP modules are enabled. In the current implementation, the weight of each MTP module is shared.
 
 #### Relaxed acceptance
+**NOTE: This feature can only be used for DeepSeek R1.**
 When verifying and receiving draft tokens, there are two ways:
 - Strict acceptance: (default)
 
