@@ -48,10 +48,6 @@ namespace tensorrt_llm::executor
 class RequestWithIdAsyncSend;
 class CancelledRequestsAsyncSend;
 
-std::vector<RequestWithId> requestWithIdRecv(std::shared_ptr<tensorrt_llm::mpi::MpiComm> const& commSession, int peer);
-std::unordered_set<IdType> cancelledRequestsRecv(
-    std::shared_ptr<tensorrt_llm::mpi::MpiComm> const& commSession, int peer);
-
 class MpiMessageQueue
 {
 public:

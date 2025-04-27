@@ -17,13 +17,11 @@
 
 #include "tensorrt_llm/executor/executorImpl.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
-#include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/batch_manager/trtEncoderModel.h"
 #include "tensorrt_llm/batch_manager/trtGptModelFactory.h"
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaProfilerUtils.h"
-#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/common/timestampUtils.h"
@@ -49,14 +47,14 @@
 #include <optional>
 #include <utility>
 
+namespace tensorrt_llm::executor
+{
+
 namespace
 {
 
-using namespace tensorrt_llm::batch_manager;
-using namespace tensorrt_llm::runtime;
-namespace su = tensorrt_llm::executor::serialize_utils;
-
-void checkOptionalParams(TrtGptModelOptionalParams& optionalParams, ModelConfig const& modelConfig)
+void checkOptionalParams(
+    batch_manager::TrtGptModelOptionalParams& optionalParams, runtime::ModelConfig const& modelConfig)
 {
     // Disable chunked context when not supported
     if (optionalParams.enableChunkedContext)
@@ -71,10 +69,14 @@ void checkOptionalParams(TrtGptModelOptionalParams& optionalParams, ModelConfig 
         }
     }
 }
-} // namespace
 
-namespace tensorrt_llm::executor
+SizeType32 getNumChildRequests(Request const& request)
 {
+    auto samplingConfig = request.getSamplingConfig();
+    return samplingConfig.getBeamWidth() > 1 ? 0 : samplingConfig.getNumReturnSequences().value_or(1) - 1;
+}
+
+} // namespace
 
 /// @brief Version of TRT-LLM as defined in tensorrt_llm/version.py
 char const* version() noexcept
@@ -89,8 +91,8 @@ public:
         std::unordered_set<IdType> const& cancelledReqIds, int peer)
     {
         TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-        TLLM_LOG_DEBUG("start send cancelled requests to rank %d", peer);
         mNumReq = static_cast<int64_t>(cancelledReqIds.size());
+        TLLM_LOG_DEBUG("start send %ld cancelled requests to rank %d", mNumReq, peer);
         mRequest1 = commSession->sendAsync(&mNumReq, 1, mpi::MpiType::kINT64, peer, kMpiTagOffset);
         if (mNumReq > 0)
         {
@@ -119,6 +121,27 @@ public:
     CancelledRequestsAsyncSend(CancelledRequestsAsyncSend&&) = delete;
     CancelledRequestsAsyncSend& operator=(CancelledRequestsAsyncSend&&) = delete;
 
+    static std::unordered_set<IdType> cancelledRequestsRecv(
+        std::shared_ptr<tensorrt_llm::mpi::MpiComm> const& commSession, int peer)
+    {
+        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+        TLLM_LOG_DEBUG("start recv cancelled requests from rank %d", peer);
+        std::unordered_set<IdType> cancelledReqIds;
+        int64_t numReq{0};
+        commSession->recv(&numReq, 1, mpi::MpiType::kINT64, peer, CancelledRequestsAsyncSend::kMpiTagOffset);
+        TLLM_LOG_DEBUG("recv %ld cancelled requests", numReq);
+        if (numReq > 0)
+        {
+            std::vector<IdType> buffer(numReq);
+            commSession->recv(buffer.data(), buffer.size(), mpi::MpiType::kUINT64, peer,
+                CancelledRequestsAsyncSend::kMpiTagOffset + 1);
+            cancelledReqIds = std::unordered_set<IdType>(buffer.begin(), buffer.end());
+        }
+        TLLM_LOG_DEBUG("end recv cancelled requests from rank %d", peer);
+        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+        return cancelledReqIds;
+    }
+
     static auto constexpr kMpiTagOffset = 13;
     static auto constexpr kMpiTagUpperBound = kMpiTagOffset + 2;
     static_assert(kMpiTagOffset >= tensorrt_llm::batch_manager::DecoderSlotAsyncSend::kMpiTagUpperBound);
@@ -129,26 +152,6 @@ private:
     std::shared_ptr<tensorrt_llm::mpi::MpiRequest> mRequest1;
     std::shared_ptr<tensorrt_llm::mpi::MpiRequest> mRequest2;
 };
-
-std::unordered_set<IdType> cancelledRequestsRecv(
-    std::shared_ptr<tensorrt_llm::mpi::MpiComm> const& commSession, int peer)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    TLLM_LOG_DEBUG("start recv cancelled requests from rank %d", peer);
-    std::unordered_set<IdType> cancelledReqIds;
-    int64_t numReq{0};
-    commSession->recv(&numReq, 1, mpi::MpiType::kINT64, peer, CancelledRequestsAsyncSend::kMpiTagOffset);
-    if (numReq > 0)
-    {
-        std::vector<IdType> buffer(numReq);
-        commSession->recv(
-            buffer.data(), buffer.size(), mpi::MpiType::kUINT64, peer, CancelledRequestsAsyncSend::kMpiTagOffset + 1);
-        cancelledReqIds = std::unordered_set<IdType>(buffer.begin(), buffer.end());
-    }
-    TLLM_LOG_DEBUG("end recv cancelled requests from rank %d", peer);
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return cancelledReqIds;
-}
 
 class RequestWithIdAsyncSend
 {
@@ -193,6 +196,29 @@ public:
     RequestWithIdAsyncSend(RequestWithIdAsyncSend&&) = delete;
     RequestWithIdAsyncSend& operator=(RequestWithIdAsyncSend&&) = delete;
 
+    static std::vector<RequestWithId> requestWithIdRecv(
+        std::shared_ptr<tensorrt_llm::mpi::MpiComm> const& commSession, int peer)
+    {
+        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+        TLLM_LOG_DEBUG("start recv requests from rank %d", peer);
+        std::vector<RequestWithId> reqWithIds;
+        int64_t numReq{0};
+        commSession->recv(&numReq, 1, mpi::MpiType::kINT64, peer, RequestWithIdAsyncSend::kMpiTagOffset);
+        if (numReq > 0)
+        {
+            std::vector<char> buffer;
+            int64_t vecSize = 0;
+            commSession->recv(&vecSize, 1, mpi::MpiType::kINT64, peer, RequestWithIdAsyncSend::kMpiTagOffset + 1);
+            buffer.resize(vecSize);
+            commSession->recv(
+                buffer.data(), buffer.size(), mpi::MpiType::kCHAR, peer, RequestWithIdAsyncSend::kMpiTagOffset + 2);
+            reqWithIds = RequestWithId::deserializeReqWithIds(buffer);
+        }
+        TLLM_LOG_DEBUG("end recv requests from rank %d", peer);
+        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+        return reqWithIds;
+    }
+
     static auto constexpr kMpiTagOffset = 15;
     static auto constexpr kMpiTagUpperBound = kMpiTagOffset + 3;
     static_assert(kMpiTagOffset >= CancelledRequestsAsyncSend::kMpiTagUpperBound);
@@ -205,34 +231,6 @@ private:
     std::shared_ptr<tensorrt_llm::mpi::MpiRequest> mRequest2;
     std::shared_ptr<tensorrt_llm::mpi::MpiRequest> mRequest3;
 };
-
-std::vector<RequestWithId> requestWithIdRecv(std::shared_ptr<tensorrt_llm::mpi::MpiComm> const& commSession, int peer)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    TLLM_LOG_DEBUG("start recv requests from rank %d", peer);
-    std::vector<RequestWithId> reqWithIds;
-    int64_t numReq{0};
-    commSession->recv(&numReq, 1, mpi::MpiType::kINT64, peer, RequestWithIdAsyncSend::kMpiTagOffset);
-    if (numReq > 0)
-    {
-        std::vector<char> buffer;
-        int64_t vecSize = 0;
-        commSession->recv(&vecSize, 1, mpi::MpiType::kINT64, peer, RequestWithIdAsyncSend::kMpiTagOffset + 1);
-        buffer.resize(vecSize);
-        commSession->recv(
-            buffer.data(), buffer.size(), mpi::MpiType::kCHAR, peer, RequestWithIdAsyncSend::kMpiTagOffset + 2);
-        reqWithIds = RequestWithId::deserializeReqWithIds(buffer);
-    }
-    TLLM_LOG_DEBUG("end recv requests from rank %d", peer);
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return reqWithIds;
-}
-
-SizeType32 getNumChildRequests(Request const& request)
-{
-    auto samplingConfig = request.getSamplingConfig();
-    return samplingConfig.getBeamWidth() > 1 ? 0 : samplingConfig.getNumReturnSequences().value_or(1) - 1;
-}
 
 void Executor::Impl::loadModel(std::optional<std::filesystem::path> const& modelPathOpt,
     std::optional<BufferView> const& engineBufferOpt, runtime::GptJsonConfig const& jsonConfig,
@@ -495,7 +493,7 @@ std::shared_ptr<Model> Executor::Impl::createModel(runtime::RawEngine const& raw
 
     bool const isLeaderInOrchMode = (mCommMode == CommunicationMode::kORCHESTRATOR) && mIsLeader;
     auto optionalParams = batch_manager::TrtGptModelOptionalParams(executorConfig, isLeaderInOrchMode);
-    ::checkOptionalParams(optionalParams, modelConfig);
+    checkOptionalParams(optionalParams, modelConfig);
     return batch_manager::TrtGptModelFactory::create(rawEngine, modelConfig, worldConfig, gptModelType, optionalParams);
 }
 
@@ -631,6 +629,8 @@ void Executor::Impl::initializeOrchestrator(SizeType32 tp, SizeType32 pp, SizeTy
     std::filesystem::path const& modelPath)
 {
 #if ENABLE_MULTI_DEVICE
+    namespace su = tensorrt_llm::executor::serialize_utils;
+
     auto const& worldComm = tensorrt_llm::mpi::MpiComm::world();
     int32_t const worldSize = worldComm.getSize();
 
@@ -1391,7 +1391,7 @@ std::vector<RequestWithId> Executor::Impl::getNewReqWithIds(
             {
                 request3->wait();
             }
-            reqWithIds = requestWithIdRecv(mCommPipelineParallel, peer);
+            reqWithIds = RequestWithIdAsyncSend::requestWithIdRecv(mCommPipelineParallel, peer);
         }
         if (worldConfig.isTensorParallel() || worldConfig.isContextParallel())
         {
@@ -1418,7 +1418,7 @@ std::vector<RequestWithId> Executor::Impl::getNewReqWithIds(
         else
         {
             auto const peer = worldConfig.getPipelineParallelRank() - 1;
-            reqWithIds = requestWithIdRecv(mCommPipelineParallel, peer);
+            reqWithIds = RequestWithIdAsyncSend::requestWithIdRecv(mCommPipelineParallel, peer);
         }
     }
     if (!worldConfig.isLastPipelineParallelRank())
@@ -2054,8 +2054,8 @@ void Executor::Impl::terminateCancelledRequests(RequestList& activeRequests)
                 {
                     auto const peer = worldConfig.getPipelineParallelism() - 1;
                     bool shouldExit = false;
-                    mCommPipelineParallel->send(&shouldExit, 1, mpi::MpiType::kBOOL, peer, kMpiTagOffset + 3);
-                    auto pipelineCancelledReqIds = cancelledRequestsRecv(mCommPipelineParallel, peer);
+                    auto pipelineCancelledReqIds
+                        = CancelledRequestsAsyncSend::cancelledRequestsRecv(mCommPipelineParallel, peer);
                     mCancelledReqIds.insert(pipelineCancelledReqIds.begin(), pipelineCancelledReqIds.end());
                 }
 
@@ -2103,7 +2103,7 @@ void Executor::Impl::terminateCancelledRequests(RequestList& activeRequests)
                 else
                 {
                     auto const peer = worldConfig.getPipelineParallelRank() - 1;
-                    mCancelledReqIds = cancelledRequestsRecv(mCommPipelineParallel, peer);
+                    mCancelledReqIds = CancelledRequestsAsyncSend::cancelledRequestsRecv(mCommPipelineParallel, peer);
                 }
             }
             if (!worldConfig.isLastPipelineParallelRank())
