@@ -226,7 +226,16 @@ public:
     {
 #if ENABLE_MULTI_DEVICE
         // TODO: Don't ignore return status
-        MPI_Wait(&mRequest, MPI_STATUS_IGNORE);
+        TLLM_MPI_CHECK(MPI_Wait(&mRequest, MPI_STATUS_IGNORE));
+#else
+        TLLM_THROW("Multi device support is disabled.");
+#endif
+    }
+
+    void cancel()
+    {
+#if ENABLE_MULTI_DEVICE
+        TLLM_MPI_CHECK(MPI_Cancel(&mRequest));
 #else
         TLLM_THROW("Multi device support is disabled.");
 #endif
