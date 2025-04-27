@@ -177,7 +177,7 @@ def buildOrCache(pipeline, key, reuseArtifactPath, artifacts, image, k8s_cpu, ru
         return
     }
 
-    trtllm_utils.launchKubernetesPod(pipeline, trtllm_utils.createKubernetesPodConfig(image, "build", k8s_cpu), "trt-llm", {
+    trtllm_utils.launchKubernetesPod(pipeline, trtllm_utils.createKubernetesPodConfig(image: image, type: "build", arch: k8s_cpu), "trt-llm", {
         stage(key) {
             stage("[${key}] Run") {
                 echoNodeAndGpuInfo(pipeline, key)
@@ -531,7 +531,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         parallelJobs += [
         (key): {
             script {
-                trtllm_utils.launchKubernetesPod(pipeline, trtllm_utils.createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build", k8s_cpu), "trt-llm", {
+                trtllm_utils.launchKubernetesPod(pipeline, trtllm_utils.createKubernetesPodConfig(image: LLM_DOCKER_IMAGE, type: "build", arch: k8s_cpu), "trt-llm", {
                     stage(key) {
                         stage("[${key}] Run") {
                             echoNodeAndGpuInfo(pipeline, key)
@@ -558,7 +558,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
 
 pipeline {
     agent {
-        kubernetes trtllm_utils.createKubernetesPodConfig(AGENT_IMAGE, "package", "amd64")
+        kubernetes trtllm_utils.createKubernetesPodConfig(image: AGENT_IMAGE, type: "package", arch: "amd64")
     }
     options {
         // Check the valid options at: https://www.jenkins.io/doc/book/pipeline/syntax/
