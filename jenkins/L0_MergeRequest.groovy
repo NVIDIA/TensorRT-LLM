@@ -226,7 +226,7 @@ def launchReleaseCheck(pipeline)
 
     def image = "urm.nvidia.com/docker/golang:1.22"
     stageName = "Release Check"
-    trtllm_utils.launchKubernetesPod(pipeline, trtllm_utils.createKubernetesPodConfig(image, "build"), "trt-llm", {
+    trtllm_utils.launchKubernetesPod(pipeline, trtllm_utils.createKubernetesPodConfig(image: image, type: "build"), "trt-llm", {
         stage("[${stageName}] Run") {
             if (RELESE_CHECK_CHOICE == STAGE_CHOICE_SKIP) {
                 echo "Release Check job is skipped due to Jenkins configuration"
@@ -521,7 +521,7 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
 
 def collectTestResults(pipeline, testFilter)
 {
-    collectResultPodSpec = trtllm_utils.createKubernetesPodConfig("", "agent")
+    collectResultPodSpec = trtllm_utils.createKubernetesPodConfig(image: "", type: "agent")
     trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
         stage ("Collect test result") {
             sh "rm -rf **/*.xml *.tar.gz"
@@ -929,7 +929,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 
 pipeline {
     agent {
-        kubernetes trtllm_utils.createKubernetesPodConfig("", "agent")
+        kubernetes trtllm_utils.createKubernetesPodConfig(image: "", type: "agent")
     }
     options {
         // Check the valid options at: https://www.jenkins.io/doc/book/pipeline/syntax/

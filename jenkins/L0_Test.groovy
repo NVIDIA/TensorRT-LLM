@@ -384,7 +384,7 @@ def runLLMDocBuild(pipeline, config)
 def launchTestListCheck(pipeline)
 {
     stageName = "Test List Check"
-    trtllm_utils.launchKubernetesPod(pipeline, trtllm_utils.createKubernetesPodConfig(image=LLM_DOCKER_IMAGE, type="a10", gpuType=KubernetesManager.selectGPU("a10"), driverVersion=DEFAULT_DRIVER), "trt-llm", {
+    trtllm_utils.launchKubernetesPod(pipeline, trtllm_utils.createKubernetesPodConfig(image: LLM_DOCKER_IMAGE, type: "a10", gpuType: KubernetesManager.selectGPU("a10"), driverVersion: DEFAULT_DRIVER), "trt-llm", {
         try {
             echoNodeAndGpuInfo(pipeline, stageName)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
@@ -1194,7 +1194,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "DGX_H200-4_GPUs-TensorRT-[Post-Merge]-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
     ]
 
-    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [trtllm_utils.createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf"), KubernetesManager.selectGPU(values[0]), driverVersion=DEFAULT_DRIVER), {
+    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [trtllm_utils.createKubernetesPodConfig(image: LLM_DOCKER_IMAGE, type: values[0], gpuCount: values[4] ?: 1, perfMode: key.contains("Perf"), gpuType: KubernetesManager.selectGPU(values[0]), driverVersion: DEFAULT_DRIVER), {
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -1240,7 +1240,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     fullSet += SBSASlurmTestConfigs.keySet()
 
     if (env.targetArch == AARCH64_TRIPLE) {
-        parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [trtllm_utils.createKubernetesPodConfig(image=LLM_DOCKER_IMAGE, type=values[0], arch="arm64", gpuType=KubernetesManager.selectGPU(values[0]), driverVersion=DEFAULT_DRIVER), {
+        parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [trtllm_utils.createKubernetesPodConfig(image: LLM_DOCKER_IMAGE, type: values[0], arch: "arm64", gpuType: KubernetesManager.selectGPU(values[0]), driverVersion: DEFAULT_DRIVER), {
             runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3])
         }]]}
 
@@ -1258,7 +1258,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         parallelJobs += parallelSlurmJobs
     }
 
-    docBuildSpec = trtllm_utils.createKubernetesPodConfig(image=LLM_DOCKER_IMAGE, type="a10", gpuType=KubernetesManager.selectGPU("a10"), driverVersion=DEFAULT_DRIVER)
+    docBuildSpec = trtllm_utils.createKubernetesPodConfig(image: LLM_DOCKER_IMAGE, type: "a10", gpuType: KubernetesManager.selectGPU("a10"), driverVersion: DEFAULT_DRIVER)
     docBuildConfigs = [
         "A10-Build_Docs": [docBuildSpec, {
             sh "rm -rf **/*.xml *.tar.gz"
@@ -1351,14 +1351,14 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                 k8s_arch = "arm64"
             }
 
-            def buildSpec = trtllm_utils.createKubernetesPodConfig(values[0], "build", k8s_arch)
+            def buildSpec = trtllm_utils.createKubernetesPodConfig(image: values[0], type: "build", arch: k8s_arch)
             def buildRunner = runInKubernetes(pipeline, buildSpec, "trt-llm")
             def sanityRunner = null
 
             if (dockerNode) {
                 sanityRunner = runInDockerOnNode(values[0], dockerNode, dockerArgs)
             } else {
-                def sanitySpec = trtllm_utils.createKubernetesPodConfig(image=values[0], type=gpu_type, arch=k8s_arch, gpuType=KubernetesManager.selectGPU(gpu_type), driverVersion=DEFAULT_DRIVER)
+                def sanitySpec = trtllm_utils.createKubernetesPodConfig(image: values[0], type: gpu_type, arch: k8s_arch, gpuType: KubernetesManager.selectGPU(gpu_type), driverVersion: DEFAULT_DRIVER)
                 sanityRunner = runInKubernetes(pipeline, sanitySpec, "trt-llm")
             }
 
@@ -1397,7 +1397,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
             if (checkPipStage) {
                 stage("Run LLMAPI tests") {
-                    pipInstallSanitySpec = trtllm_utils.createKubernetesPodConfig(imaeg=values[5], type=gpu_type, arch=k8s_arch, gpuType=KubernetesManager.selectGPU(gpu_type), driverVersion=DEFAULT_DRIVER)
+                    pipInstallSanitySpec = trtllm_utils.createKubernetesPodConfig(imaeg: values[5], type: gpu_type, arch: k8s_arch, gpuType: KubernetesManager.selectGPU(gpu_type), driverVersion: DEFAULT_DRIVER)
                     trtllm_utils.launchKubernetesPod(pipeline, pipInstallSanitySpec, "trt-llm", {
                         echo "###### Prerequisites Start ######"
                         // Clean up the pip constraint file from the base NGC PyTorch image.
@@ -1595,7 +1595,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
 pipeline {
     agent {
-        kubernetes trtllm_utils.createKubernetesPodConfig("", "agent")
+        kubernetes trtllm_utils.createKubernetesPodConfig(image: "", type: "agent")
     }
     options {
         // Check the valid options at: https://www.jenkins.io/doc/book/pipeline/syntax/
