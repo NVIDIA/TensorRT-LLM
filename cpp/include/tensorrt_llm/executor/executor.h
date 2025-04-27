@@ -1389,6 +1389,9 @@ public:
     void setMaxNumTokens(size_t maxNumTokens);
 
 private:
+    /// @brief The maximum number of tokens that the CacheTransceiver's pre-allocated buffer can hold. If the number of
+    /// kvCache tokens to be transferred for a single request is greater than this value, the performance of the cache
+    /// transfer may be degraded.
     std::optional<size_t> mMaxNumTokens;
 };
 
