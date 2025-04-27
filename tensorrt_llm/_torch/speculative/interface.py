@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 import torch
 
 from ..._utils import get_sm_version
+from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
 from ..model_config import TConfig
 from ..pyexecutor.scheduler import ScheduledRequests
 
@@ -37,15 +38,16 @@ class SpeculativeDecodingMode(IntEnum):
     def support_overlap_scheduler(self):
         return self.is_mtp()
 
-    def extend_ctx(self):
+    def extend_ctx(self, attention_backend: AttentionBackend):
         """
         If true, treat generation requests with draft tokens as
         chunked context requests at the kernel level. Required for
         any spec dec mode that uses the SpecExecutor.
         """
 
-        # Fixme: only blackwell supports eagle3 generation-phase kernels.
-        return self.is_eagle3() and get_sm_version() != 100
+        # Fixme: only trtllm attention backend supports eagle3 generation-phase kernels on blackwell.
+        return self.is_eagle3() and not (isinstance(
+            attention_backend, TrtllmAttention) and get_sm_version() == 100)
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":
