@@ -2237,9 +2237,9 @@ void Executor::Impl::executionLoop()
         RequestList finishedRequests;
         if (!activeRequests.empty())
         {
-            forwardSync(activeRequests);
             finishTimedOutRequests(activeRequests);
             terminateCancelledRequests(activeRequests);
+            forwardSync(activeRequests);
             finishedRequests = populateNewResponses(activeRequests, inTransmissionRequests, newResponses);
             cleanupDynamicLogitsPostProcessors(finishedRequests);
             auto const iterCounter = mModel->getIterCounter();

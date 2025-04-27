@@ -726,7 +726,7 @@ void TrtGptModelInflightBatching::terminateRequest(LlmRequestPtr const& llmReq, 
 void TrtGptModelInflightBatching::terminateRequestSync(
     LlmRequestPtr const& llmRequest, executor::FinishReason finishReason)
 {
-    mReqIdsToTerminate[llmRequest->mRequestId] = finishReason;
+    mReqIdsToTerminate.try_emplace(llmRequest->mRequestId, finishReason);
 }
 
 TrtGptModelInflightBatching::IterationStatsIFB TrtGptModelInflightBatching::fillIterationStats(
@@ -830,11 +830,14 @@ void TrtGptModelInflightBatching::forwardSync()
             {
                 for (auto const& llmReq : requests)
                 {
-                    if (!llmReq->isGenerationToCompleteState() && mReqIdsToTerminate.count(llmReq->mRequestId) != 0U)
+                    if (mReqIdsToTerminate.count(llmReq->mRequestId) != 0U)
                     {
-                        terminateRequest(llmReq);
-                        llmReq->finishByReason(mReqIdsToTerminate[llmReq->mRequestId]);
-                        llmReq->clearGeneratedTokens();
+                        if (!llmReq->isGenerationToCompleteState())
+                        {
+                            terminateRequest(llmReq);
+                            llmReq->finishByReason(mReqIdsToTerminate[llmReq->mRequestId]);
+                            llmReq->clearGeneratedTokens();
+                        }
                         mReqIdsToTerminate.erase(llmReq->mRequestId);
                     }
                 }

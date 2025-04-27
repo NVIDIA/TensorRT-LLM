@@ -4123,25 +4123,19 @@ TEST_P(TimeoutTest, TimeoutStreamingTest)
     {
         GTEST_SKIP() << "Skipping MultiGpu tests";
     }
-    else
+    if (val != NULL && !isMultiGpu)
     {
-        if (val != NULL && !isMultiGpu)
-        {
-            GTEST_SKIP() << "Skipping SingleGpu tests";
-        }
-
-        if (!isMultiGpu && !useOrchestratorMode)
-        {
-            GTEST_SKIP() << "Leader mode on single GPU crashes";
-        }
-
+        GTEST_SKIP() << "Skipping SingleGpu tests";
+    }
+    if (val != NULL && isMultiGpu)
+    {
         // Check that it was launched with right number of MPI ranks
         if (!useOrchestratorMode && COMM_SESSION.getSize() != 4)
         {
             // No orchestrator, need worldSize to match TP*PP
             FAIL() << "Leader mode and world size is not equal to 4";
         }
-        else if (useOrchestratorMode && COMM_SESSION.getSize() != 1)
+        if (useOrchestratorMode && COMM_SESSION.getSize() != 1)
         {
             // No orchestrator, need worldSize to match TP*PP
             FAIL() << "Orchestrator mode and World size is not equal to 1";
@@ -4336,25 +4330,19 @@ TEST_P(TimeoutTest, TimeoutNonstreamingTest)
     {
         GTEST_SKIP() << "Skipping MultiGpu tests";
     }
-    else
+    if (val != NULL && !isMultiGpu)
     {
-        if (val != NULL && !isMultiGpu)
-        {
-            GTEST_SKIP() << "Skipping SingleGpu tests";
-        }
-
-        if (!isMultiGpu && !useOrchestratorMode)
-        {
-            GTEST_SKIP() << "Leader mode on single GPU crashes";
-        }
-
+        GTEST_SKIP() << "Skipping SingleGpu tests";
+    }
+    if (val != NULL && isMultiGpu)
+    {
         // Check that it was launched with right number of MPI ranks
         if (!useOrchestratorMode && COMM_SESSION.getSize() != 4)
         {
             // No orchestrator, need worldSize to match TP*PP
             FAIL() << "Leader mode and world size is not equal to 4";
         }
-        else if (useOrchestratorMode && COMM_SESSION.getSize() != 1)
+        if (useOrchestratorMode && COMM_SESSION.getSize() != 1)
         {
             // No orchestrator, need worldSize to match TP*PP
             FAIL() << "Orchestrator mode and World size is not equal to 1";
