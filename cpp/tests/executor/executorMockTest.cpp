@@ -51,6 +51,8 @@ public:
     MOCK_METHOD(void, forwardSync, (), ());
     MOCK_METHOD(void, forwardAsync, (RequestList const&), ());
     MOCK_METHOD(void, terminateRequest, (std::shared_ptr<tb::LlmRequest> const& llmRequest, bool pause), ());
+    MOCK_METHOD(
+        void, terminateRequestSync, (std::shared_ptr<tb::LlmRequest> const& llmRequest, FinishReason finishReason), ());
     MOCK_METHOD(SizeType32, getMaxNumSequences, (), (const));
     MOCK_METHOD(SizeType32, getMaxInputLen, (), (const));
     MOCK_METHOD(SizeType32, getHiddenSize, (), (const));
@@ -195,6 +197,7 @@ TEST_F(GptExecutorTest, MockedModelMaxQueueSize)
     auto model = std::make_shared<MockedModel>();
 
     EXPECT_CALL(*model, terminateRequest(_, _)).Times(0);
+    EXPECT_CALL(*model, terminateRequestSync(_, _)).Times(0);
     EXPECT_CALL(*model, getVocabSizePadded()).Times(0);
     EXPECT_CALL(*model, getLogitDataType()).Times(0);
 

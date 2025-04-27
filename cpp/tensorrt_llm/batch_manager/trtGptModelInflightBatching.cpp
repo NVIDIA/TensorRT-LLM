@@ -723,6 +723,12 @@ void TrtGptModelInflightBatching::terminateRequest(LlmRequestPtr const& llmReq, 
         *mSeqSlotManager, *llmReq, getMaxInputLen(), mKvCacheManager, mCrossKvCacheManager, mPeftCacheManager, pause);
 }
 
+void TrtGptModelInflightBatching::terminateRequestSync(
+    LlmRequestPtr const& llmRequest, executor::FinishReason finishReason)
+{
+    mReqIdsToTerminate[llmRequest->mRequestId] = finishReason;
+}
+
 TrtGptModelInflightBatching::IterationStatsIFB TrtGptModelInflightBatching::fillIterationStats(
     ScheduledRequests const& scheduledRequests, RequestVector const& requestsToPause)
 {
@@ -817,6 +823,23 @@ void TrtGptModelInflightBatching::forwardSync()
             mKvCacheManager, mCrossKvCacheManager, mPeftCacheManager);
         (*mPauseRequests)(currRequests.generationRequests, mInflightReqIds, mReqIdsToPause, true, *mSeqSlotManager,
             mKvCacheManager, mCrossKvCacheManager, mPeftCacheManager);
+
+        if (!mReqIdsToTerminate.empty())
+        {
+            for (auto const& requests : {currRequests.contextRequests, currRequests.generationRequests})
+            {
+                for (auto const& llmReq : requests)
+                {
+                    if (!llmReq->isGenerationToCompleteState() && mReqIdsToTerminate.count(llmReq->mRequestId) != 0U)
+                    {
+                        terminateRequest(llmReq);
+                        llmReq->finishByReason(mReqIdsToTerminate[llmReq->mRequestId]);
+                        llmReq->clearGeneratedTokens();
+                        mReqIdsToTerminate.erase(llmReq->mRequestId);
+                    }
+                }
+            }
+        }
 
         for (auto const& llmReq : currRequests.contextRequests)
         {

@@ -1716,9 +1716,7 @@ void Executor::Impl::finishTimedOutRequests(RequestList const& activeRequests)
                     auto& selCancelledReqIds = mUsePipelineParallel ? mPipelineCancelledReqIds : mCancelledReqIds;
                     selCancelledReqIds.insert(request->mRequestId);
                 }
-                request->finishByReason(FinishReason::kTIMED_OUT);
-                request->clearGeneratedTokens();
-                mModel->terminateRequest(request);
+                mModel->terminateRequestSync(request, FinishReason::kTIMED_OUT);
             }
         }
     }
@@ -2132,10 +2130,7 @@ void Executor::Impl::terminateCancelledRequests(RequestList& activeRequests)
             auto reqId = req->isChild() ? req->getParentRequestId() : req->mRequestId;
             if (mCancelledReqIds.find(reqId) != mCancelledReqIds.end())
             {
-                req->setState(batch_manager::LlmRequestState::kGENERATION_COMPLETE);
-                mModel->terminateRequest(req);
-                req->finishByReason(FinishReason::kCANCELLED);
-                req->clearGeneratedTokens();
+                mModel->terminateRequestSync(req, FinishReason::kCANCELLED);
                 // Parent and child requests share the same request id.
                 // Mark it terminated first and remove from the set later.
                 terminatedReqIds.insert(reqId);

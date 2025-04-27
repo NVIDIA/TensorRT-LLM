@@ -52,6 +52,9 @@ public:
     ~TrtEncoderModel() override;
 
     void terminateRequest(std::shared_ptr<LlmRequest> const& llmRequest, bool pause = false) override;
+    void terminateRequestSync(
+        std::shared_ptr<LlmRequest> const& llmRequest, executor::FinishReason finishReason) override;
+
     void forward(RequestVector& activeRequests);
 
     void forwardSync() override;
