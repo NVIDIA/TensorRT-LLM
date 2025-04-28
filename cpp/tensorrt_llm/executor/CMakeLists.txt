@@ -52,7 +52,8 @@ set(SRCS
     types.cpp
     requestUtils.cpp
     contextPhaseParams.cpp
-    disaggServerUtil.cpp)
+    disaggServerUtil.cpp
+    cacheTransceiverConfig.cpp)
 
 if(NOT WIN32)
   # additional warnings
