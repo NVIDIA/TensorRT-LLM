@@ -45,7 +45,7 @@ class Eagle3SpecMetadata(SpecMetadata):
 
     def __post_init__(self):
         if self.num_layers == 1:
-            self.layers_to_capture = (1, )
+            self.layers_to_capture = (0, )
         else:
             if self.num_layers <= 5:
                 raise ValueError("Not enough hidden layers for EAGLE")
@@ -66,21 +66,17 @@ class Eagle3SpecMetadata(SpecMetadata):
         if not self.is_cuda_graph:
             self.hidden_states = []
 
-    def maybe_capture_hidden_states(
-            self,
-            layer_id: int,
-            hidden_states: torch.Tensor,
-            residual: Optional[torch.Tensor] = None) -> None:
+    def maybe_capture_hidden_states(self, layer_id: int,
+                                    hidden_states: torch.Tensor,
+                                    residual: torch.Tensor) -> None:
         if not self.is_cuda_graph:
             if layer_id in self.layers_to_capture:
-                to_save = hidden_states + residual if residual is not None else hidden_states
-                self.hidden_states.append(to_save)
+                self.hidden_states.append(hidden_states + residual)
         else:
             assert len(self.hidden_states) == len(self.layers_to_capture)
             for i, captured_layer_id in enumerate(self.layers_to_capture):
                 if captured_layer_id == layer_id:
-                    to_save = hidden_states + residual if residual is not None else hidden_states
-                    self.hidden_states[i].copy_(to_save)
+                    self.hidden_states[i].copy_(hidden_states + residual)
                     break
 
     def get_hidden_states(
@@ -109,6 +105,8 @@ class Eagle3SpecMetadata(SpecMetadata):
         if len(self.hidden_states) == 1:
             return self.hidden_states[0][hidden_states_gather_ids]
         else:
+            # Note that we must call cat() here. We can't have this control
+            # flow inside the model - that would break CUDA graphs.
             return torch.cat(
                 [h[hidden_states_gather_ids] for h in self.hidden_states],
                 dim=-1)
