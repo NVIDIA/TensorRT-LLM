@@ -18,7 +18,7 @@ from .trt_test_alternative import print_info, print_warning
 
 # from misc.reorder_venv_tests import reorder_tests
 
-kVALID_TEST_LIST_MARKERS = ["XFAIL", "SKIP", "UNSTABLE"]
+kVALID_TEST_LIST_MARKERS = ["XFAIL", "SKIP", "UNSTABLE", "TIMEOUT"]
 record_invalid_tests = True
 
 kSTRIP_PARENS_PAT = re.compile(r'\((.*?)\)')
@@ -122,12 +122,21 @@ def parse_test_list_lines(test_list, lines, test_prefix):
         test_name = line
         marker = None
         reason = None
+        timeout = None
         for marker in kVALID_TEST_LIST_MARKERS:
             if f" {marker}" in line:
                 test_name, marker, reason_raw = line.partition(f" {marker}")
                 test_name = test_name.strip()
                 marker = marker.strip()
-                if len(reason_raw) > 0:
+                if marker == "TIMEOUT":
+                    # Extract timeout value from parentheses
+                    timeout = strip_parens(reason_raw.strip())
+                    if not timeout or not timeout.isdigit():
+                        raise ValueError(
+                            f'{test_list}:{lineno}: Invalid syntax for TIMEOUT value: "{reason_raw}". '
+                            "Expected a numeric value in parentheses.")
+                    timeout = int(timeout)
+                elif len(reason_raw) > 0:
                     reason = strip_parens(reason_raw.strip())
                     if not reason:
                         raise ValueError(
@@ -157,7 +166,10 @@ def parse_test_list_lines(test_list, lines, test_prefix):
     parsed_test_list = list(filter(lambda x: x[0] is not None,
                                    parsed_test_list))
     test_names = [x[0] for x in parsed_test_list]
-    test_name_to_marker_dict = {x[0]: (x[1], x[2]) for x in parsed_test_list}
+    test_name_to_marker_dict = {
+        x[0]: (x[1], x[2], x[3])
+        for x in parsed_test_list
+    }
 
     return (test_names, test_name_to_marker_dict)
 
@@ -633,11 +645,14 @@ def modify_by_test_list(test_list, items, config):
             item = found_items[name]
             selected.append(item)
             # Also update the item based on the marker specified in the file
-            marker, reason = full_test_name_to_marker_dict[name]
+            marker, reason, timeout = full_test_name_to_marker_dict[name]
             if marker:
-                mark_func = getattr(pytest.mark, marker.lower())
-                mark = mark_func(reason=reason)
-                item.add_marker(mark)
+                if marker == "TIMEOUT" and timeout:
+                    item.add_marker(pytest.mark.timeout(timeout))
+                else:
+                    mark_func = getattr(pytest.mark, marker.lower())
+                    mark = mark_func(reason=reason)
+                    item.add_marker(mark)
 
     if deselected:
         config.hook.pytest_deselected(items=deselected)
