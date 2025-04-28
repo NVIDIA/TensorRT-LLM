@@ -51,7 +51,6 @@ class Qwen3RMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         hidden_states = (self.weight * hidden_states).to(input_dtype)
-
         if residual is ...:
             return hidden_states
         else:
@@ -90,8 +89,14 @@ class Qwen3Attention(Attention):
             config=model_config,
         )
 
-        self.q_norm = Qwen3RMSNorm(hidden_size=self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen3RMSNorm(hidden_size=self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = RMSNorm(hidden_size=self.head_dim,
+                                   eps=1e-6,
+                                   dtype=config.torch_dtype,
+                                   has_weights=True)
+        self.k_norm = RMSNorm(hidden_size=self.head_dim,
+                                   eps=1e-6,
+                                   dtype=config.torch_dtype,
+                                   has_weights=True)
 
 
 class Qwen3DecoderLayer(DecoderLayer):
@@ -150,6 +155,7 @@ class Qwen3DecoderLayer(DecoderLayer):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+
         return hidden_states, residual
 
 
