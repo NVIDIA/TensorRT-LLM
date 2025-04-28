@@ -74,3 +74,8 @@ deepseek-ai/DeepSeek-R1:
   - quant_algo: NVFP4
     spec_dec_algo: MTP
     accuracy: 87.33
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 87.573
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 87.573
