@@ -1397,7 +1397,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
             if (checkPipStage) {
                 stage("Run LLMAPI tests") {
-                    pipInstallSanitySpec = trtllm_utils.createKubernetesPodConfig(imaeg: values[5], type: gpu_type, arch: k8s_arch, gpuType: KubernetesManager.selectGPU(gpu_type), driverVersion: DEFAULT_DRIVER)
+                    pipInstallSanitySpec = trtllm_utils.createKubernetesPodConfig(image: values[5], type: gpu_type, arch: k8s_arch, gpuType: KubernetesManager.selectGPU(gpu_type), driverVersion: DEFAULT_DRIVER)
                     trtllm_utils.launchKubernetesPod(pipeline, pipInstallSanitySpec, "trt-llm", {
                         echo "###### Prerequisites Start ######"
                         // Clean up the pip constraint file from the base NGC PyTorch image.
