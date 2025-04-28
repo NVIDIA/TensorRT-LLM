@@ -24,7 +24,7 @@ This document provides an overview of the internal hierarchy and event system fo
 - **Block ↔ Pool:** Each block is an index into a pool; the pool provides the actual storage, while the block is the metadata handle.
 
 ### **WindowBlockManager/BlockManager**
-- **WindowBlockManager:** Manages blocks and pools for a specific attention window size.
+- **WindowBlockManager:** Manages blocks and pools for a specific attention window size. Within a `WindowBlockManager`, there can be multiple pools - each corresponding a unique number of KV heads - i.e., to support VGQA.
 - **BlockManager:** Manages all `WindowBlockManager` instances, one per unique window size.
 
 **Hierarchy Summary:**
