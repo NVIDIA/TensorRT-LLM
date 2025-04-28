@@ -73,10 +73,6 @@ set(SRCS
     contextPhaseParams.cpp
     disaggServerUtil.cpp)
 
-if(ENABLE_NIXL)
-  list(APPEND SRCS cache_transmission/nixl_utils/nixl_example.cpp)
-endif()
-
 if(NOT WIN32)
   # additional warnings
   #
@@ -107,6 +103,14 @@ target_compile_definitions(${EXECUTOR_STATIC_TARGET}
 add_subdirectory(cache_transmission/ucx_utils)
 
 if(ENABLE_NIXL)
+
+  add_executable(nixl_example cache_transmission/nixl_utils/nixl_example.cpp)
+  target_include_directories(nixl_example PRIVATE ${NIXL_INCLUDE_DIR})
+  target_link_libraries(nixl_example PRIVATE ${EXECUTOR_STATIC_TARGET})
+  target_link_libraries(
+    nixl_example
+    PRIVATE ${NIXL_LIBRARY} ${NIXL_BUILD_LIBRARY} ${SERDES_LIBRARY}
+            ${UCX_BACKEND_LIBRARY} ${UCX_UTILS_LIBRARY} ${GDS_BACKEND_LIBRARY})
   # Add include directories
   target_include_directories(${EXECUTOR_STATIC_TARGET}
                              PRIVATE ${NIXL_INCLUDE_DIR})
