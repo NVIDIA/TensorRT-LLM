@@ -244,7 +244,7 @@ class FusedMoE(nn.Module):
         dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
-        aux_stream: torch.cuda.Stream = torch.cuda.Stream(),
+        aux_stream: torch.cuda.Stream = None,
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         apply_router_weight_on_input: bool = False,
@@ -259,7 +259,10 @@ class FusedMoE(nn.Module):
         self.intermediate_size = intermediate_size
         self.weight_loading_mode = weight_loading_mode
 
-        self.aux_stream = aux_stream
+        if aux_stream is None:
+            self.aux_stream = torch.cuda.Stream()
+        else:
+            self.aux_stream = aux_stream
         self.event_dict = {
             key: torch.cuda.Event()
             for key in [EventType.Main, EventType.MoeChunkingOverlap]
