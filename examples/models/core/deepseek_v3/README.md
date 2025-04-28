@@ -21,7 +21,8 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
   - [Quick Start](#quick-start)
     - [Run a single inference](#run-a-single-inference)
     - [Multi-Token Prediction (MTP)](#multi-token-prediction-mtp)
-    - [Run evaluation on GPQA dataset](#run-evaluation-on-gpqa-dataset)
+    - [Long context support](#long-context-support)
+  - [Evaluation](#evaluation)
   - [Serving](#serving)
   - [Advanced Usages](#advanced-usages)
     - [Multi-node](#multi-node)
@@ -87,6 +88,68 @@ python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MT
 ```
 
 `N` is the number of MTP modules. When `N` is equal to `0`, which means that MTP is not used (default). When `N` is greater than `0`, which means that `N` MTP modules are enabled. In the current implementation, the weight of each MTP module is shared.
+
+### Long context support
+DeepSeek-V3 model can support up to 128k context length. The following shows how to benchmark 64k and 128k input_seq_length using trtllm-bench on B200.
+To avoid OOM (out of memory) error, you need to adjust the values of "--max_batch_size", "--max_num_tokens" and "--kv_cache_free_gpu_mem_fraction".
+#### ISL-64k-OSL-1024
+```bash
+DS_R1_NVFP4_MODEL_PATH=/path/to/DeepSeek-R1
+python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
+        --stdout --tokenizer ${DS_R1_NVFP4_MODEL_PATH} \
+        token-norm-dist \
+        --input-mean 65536 --output-mean 1024 \
+        --input-stdev 0 --output-stdev 0 \
+        --num-requests 24 > /tmp/benchmarking_64k.txt
+
+cat <<EOF > /tmp/extra-llm-api-config.yml
+pytorch_backend_config:
+  enable_overlap_scheduler: true
+  use_cuda_graph: true
+  cuda_graph_padding_enabled: true
+  cuda_graph_batch_sizes: [1, 4, 8, 12]
+EOF
+
+trtllm-bench -m deepseek-ai/DeepSeek-R1 --model_path ${DS_R1_NVFP4_MODEL_PATH} throughput \
+        --tp 8 --ep 8 \
+        --warmup 0 \
+        --dataset /tmp/benchmarking_64k.txt \
+        --backend pytorch \
+        --max_batch_size 12 \
+        --max_num_tokens 65548 \
+        --kv_cache_free_gpu_mem_fraction 0.6 \
+        --extra_llm_api_options /tmp/extra-llm-api-config.yml
+```
+
+#### ISL-128k-OSL-1024
+```bash
+DS_R1_NVFP4_MODEL_PATH=/path/to/DeepSeek-R1
+python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
+        --stdout --tokenizer ${DS_R1_NVFP4_MODEL_PATH} \
+        token-norm-dist \
+        --input-mean 131072 --output-mean 1024 \
+        --input-stdev 0 --output-stdev 0 \
+        --num-requests 4 > /tmp/benchmarking_128k.txt
+
+cat <<EOF > /tmp/extra-llm-api-config.yml
+pytorch_backend_config:
+  enable_overlap_scheduler: true
+  use_cuda_graph: true
+  cuda_graph_padding_enabled: true
+  cuda_graph_batch_sizes: [1, 2]
+  moe_max_num_tokens: 16384
+EOF
+
+trtllm-bench -m deepseek-ai/DeepSeek-R1 --model_path ${DS_R1_NVFP4_MODEL_PATH} throughput \
+        --tp 8 --ep 8 \
+        --warmup 0 \
+        --dataset /tmp/benchmarking_128k.txt \
+        --backend pytorch \
+        --max_batch_size 2 \
+        --max_num_tokens 131074 \
+        --kv_cache_free_gpu_mem_fraction 0.3 \
+        --extra_llm_api_options /tmp/extra-llm-api-config.yml
+```
 
 ## Evaluation
 
