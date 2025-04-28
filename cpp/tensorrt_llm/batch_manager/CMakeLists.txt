@@ -16,19 +16,13 @@ set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 if(ENABLE_NIXL)
   set(NIXL_ROOT "/opt/nvidia/nvda_nixl")
   # Find NIXL
-  message(STATUS "batch_manager: Finding NIXL libraries in ${NIXL_ROOT}")
   find_package(NIXL REQUIRED)
 
-  message(STATUS "Found NIXL libraries:")
-  message(STATUS "  NIXL: ${NIXL_LIBRARY}")
-  message(STATUS "  NIXL Build: ${NIXL_BUILD_LIBRARY}")
-  message(STATUS "  SERDES: ${SERDES_LIBRARY}")
-  message(STATUS "  UCX Backend: ${UCX_BACKEND_LIBRARY}")
-  message(STATUS "  UCX Utils: ${UCX_UTILS_LIBRARY}")
-  message(STATUS "  GDS Backend: ${GDS_BACKEND_LIBRARY}")
-
   if(NOT NIXL_FOUND)
-    message(FATAL_ERROR "NIXL not found. Please install NIXL or set NIXL_ROOT")
+    message(
+      FATAL_ERROR
+        "NIXL not found. for building batch_manager. Please install NIXL or set NIXL_ROOT"
+    )
   endif()
 endif()
 

@@ -493,7 +493,10 @@ def launchTestListCheck(pipeline)
             sh "tar -zxf ${tarName}"
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def llmSrc = "${llmPath}/TensorRT-LLM/src"
-            sh "python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa"
+            sh """
+                export LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu:\${LD_LIBRARY_PATH:-} && \
+                python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa
+            """
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -858,6 +861,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def testCmdLine = [
             "LLM_ROOT=${llmSrc}",
             "LLM_MODELS_ROOT=${MODEL_CACHE_DIR}",
+            "LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu:\${LD_LIBRARY_PATH:-}",
             extraInternalEnv,
             "pytest",
             "-v",
@@ -928,6 +932,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     pipeline,
                     numRetries: 1,
                     script: """
+                        export LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu:\${LD_LIBRARY_PATH:-} && \
                         rm -rf ${stageName}/ && \
                         cd ${llmSrc}/tests/integration/defs && \
                         ${testCmdLine.join(" ")}
@@ -940,6 +945,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (perfMode) {
             stage("Check perf result") {
                 sh """
+                    export LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu:\${LD_LIBRARY_PATH:-} && \
                     python3 ${llmSrc}/tests/integration/defs/perf/sanity_perf_check.py \
                     ${stageName}/perf_script_test_results.csv \
                     ${llmSrc}/tests/integration/defs/perf/base_perf.csv

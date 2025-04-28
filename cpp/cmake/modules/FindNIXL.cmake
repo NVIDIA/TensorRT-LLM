@@ -81,6 +81,27 @@ find_library(UCX_UTILS_LIBRARY ucx_utils
 find_library(GDS_BACKEND_LIBRARY plugin_GDS
              HINTS ${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH}/plugins)
 
+# Modified to find the Python binding libraries with more flexibility
+find_file(
+  NIXL_BINDINGS_LIBRARY
+  NAMES _bindings.cpython-312-x86_64-linux-gnu.so
+        _bindings.cpython-3*-x86_64-linux-gnu.so
+  HINTS ${NIXL_ROOT}/lib/python3/dist-packages/nixl)
+
+find_file(
+  NIXL_UTILS_LIBRARY
+  NAMES _utils.cpython-312-x86_64-linux-gnu.so
+        _utils.cpython-3*-x86_64-linux-gnu.so
+  HINTS ${NIXL_ROOT}/lib/python3/dist-packages/nixl)
+
+message(STATUS "NIXL_LIBRARY: ${NIXL_LIBRARY}")
+message(STATUS "NIXL_BUILD_LIBRARY: ${NIXL_BUILD_LIBRARY}")
+message(STATUS "SERDES_LIBRARY: ${SERDES_LIBRARY}")
+message(STATUS "UCX_BACKEND_LIBRARY: ${UCX_BACKEND_LIBRARY}")
+message(STATUS "UCX_UTILS_LIBRARY: ${UCX_UTILS_LIBRARY}")
+message(STATUS "GDS_BACKEND_LIBRARY: ${GDS_BACKEND_LIBRARY}")
+message(STATUS "NIXL_BINDINGS_LIBRARY: ${NIXL_BINDINGS_LIBRARY}")
+message(STATUS "NIXL_UTILS_LIBRARY: ${NIXL_UTILS_LIBRARY}")
 include(FindPackageHandleStandardArgs)
 find_package_handle_standard_args(
   NIXL
@@ -92,7 +113,9 @@ find_package_handle_standard_args(
     SERDES_LIBRARY
     UCX_BACKEND_LIBRARY
     UCX_UTILS_LIBRARY
-    GDS_BACKEND_LIBRARY)
+    GDS_BACKEND_LIBRARY
+    NIXL_BINDINGS_LIBRARY
+    NIXL_UTILS_LIBRARY)
 
 # Re-attempt to find NIXL after installation
 find_package_handle_standard_args(
