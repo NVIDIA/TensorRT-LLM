@@ -620,8 +620,6 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         latent_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
-
         kv = self.kv_b_proj(compressed_kv)
         k_nope, v = kv.split(
             [
@@ -713,18 +711,6 @@ class MLA(nn.Module):
                 self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
             ])
             return fused_q
-
-        # def _concat_kv_cache():
-        #     latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
-        #     return latent_cache
-
-        # fused_q, latent_cache = maybe_execute_in_parallel(
-        #     _run_bmm,
-        #     _concat_kv_cache,
-        #     self.ln_events[0],
-        #     self.ln_events[1],
-        #     self.aux_stream,
-        # )
 
         fused_q = _run_bmm()
 
