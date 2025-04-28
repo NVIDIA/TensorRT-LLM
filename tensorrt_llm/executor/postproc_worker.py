@@ -77,6 +77,7 @@ class PostprocWorker:
         tokenizer_dir: str,
         record_creator: Callable[
             ["PostprocWorker.Input", TransformersTokenizer], Any],
+        additional_serializable_classes: Optional[Dict] = None,
     ):
         '''
         Args:
@@ -89,15 +90,19 @@ class PostprocWorker:
 
         self._records: Dict[int, GenerationResult] = {}
         self._record_creator = record_creator
-        self._pull_pipe = ZeroMqQueue(address=pull_pipe_addr,
-                                      is_async=True,
-                                      is_server=False,
-                                      name="postprocess_pull_pipe")
-        self._push_pipe = ZeroMqQueue(address=push_pipe_addr,
-                                      is_async=True,
-                                      is_server=False,
-                                      socket_type=zmq.PUSH,
-                                      name="postprocess_push_pipe")
+        self._pull_pipe = ZeroMqQueue(
+            address=pull_pipe_addr,
+            is_async=True,
+            is_server=False,
+            name="postprocess_pull_pipe",
+            additional_serializable_classes=additional_serializable_classes)
+        self._push_pipe = ZeroMqQueue(
+            address=push_pipe_addr,
+            is_async=True,
+            is_server=False,
+            socket_type=zmq.PUSH,
+            name="postprocess_push_pipe",
+            additional_serializable_classes=additional_serializable_classes)
         self._to_stop = asyncio.Event()
 
         self._q = deque()
@@ -211,11 +216,16 @@ class PostprocWorker:
 
 
 @print_traceback_on_error
-def postproc_worker_main(feedin_ipc_addr: tuple[str, Optional[bytes]],
-                         feedout_ipc_addr: tuple[str, Optional[bytes]],
-                         tokenizer_dir: str, record_creator: Callable):
-    worker = PostprocWorker(feedin_ipc_addr,
-                            feedout_ipc_addr,
-                            tokenizer_dir=tokenizer_dir,
-                            record_creator=record_creator)
+def postproc_worker_main(
+        feedin_ipc_addr: tuple[str, Optional[bytes]],
+        feedout_ipc_addr: tuple[str, Optional[bytes]],
+        tokenizer_dir: str,
+        record_creator: Callable,
+        additional_serializable_classes: Optional[Dict] = None):
+    worker = PostprocWorker(
+        feedin_ipc_addr,
+        feedout_ipc_addr,
+        tokenizer_dir=tokenizer_dir,
+        record_creator=record_creator,
+        additional_serializable_classes=additional_serializable_classes)
     worker.start()
