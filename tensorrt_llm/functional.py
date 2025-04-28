@@ -2539,7 +2539,7 @@ def masked_scatter(input: Tensor, mask: Tensor, source: Tensor) -> Tensor:
     '''
     Add the masked_scatter base on PyTorch definition.
 
-    See https://pytorch.org/docs/stable/generated/torch.Tensor.masked_scatter_.html#torch-tensor-masked-scatter for a
+    See https://pytorch.org/docs/stable/generated/torch.Tensor.masked_scatter.html#torch-tensor-masked-scatter for a
     description of that function.
 
     Parameters:
