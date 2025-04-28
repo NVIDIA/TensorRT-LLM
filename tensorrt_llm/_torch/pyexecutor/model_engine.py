@@ -415,10 +415,11 @@ class PyTorchModelEngine(ModelEngine):
                 token_num = max(
                     1,
                     min(
-                        available_tokens, kv_cache_manager.max_seq_len -
+                        available_tokens, self.max_seq_len -
                         kv_cache_manager.num_extra_kv_tokens - 1 -
                         max_num_draft_tokens),
                 )
+
                 # Add one dummy request with the maximum possible sequence length.
                 # The sequence length is limited by both the max_seq_len and the number of available blocks.
                 max_seq_len_request = kv_cache_manager.add_dummy_requests(
@@ -545,8 +546,8 @@ class PyTorchModelEngine(ModelEngine):
 
         if self.pytorch_backend_config.autotuner_enabled:
             with no_cuda_graph(), autotune():
-                num_tokens_per_request = min(self.max_num_tokens,
-                                             kv_cache_manager.max_seq_len - 1)
+                num_tokens_per_request = min(self.max_seq_len - 1,
+                                             self.max_num_tokens)
                 with release_batch(
                         get_torch_compile_warmup_request(
                             1, num_tokens_per_request)) as batch:

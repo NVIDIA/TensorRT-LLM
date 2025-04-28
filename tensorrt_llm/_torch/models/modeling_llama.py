@@ -459,6 +459,10 @@ class Llama4DecoderLayer(DecoderLayer):
             min_latency_mode=min_latency_mode,
         )
         if spec_metadata is not None:
+            # We save the hidden states in the spec metadata here. In _prepare_draft_tokens,
+            # PyExecutor will extract these from the model engine's spec metadata.
+            # They will be passed to the draft model engine on the first draft iteration.
+            # TODO: can we support multiple model outputs instead?
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
                                                       hidden_states, residual)
 
@@ -557,6 +561,10 @@ class LlamaDecoderLayer(DecoderLayer):
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states, **kwargs)
         if spec_metadata is not None:
+            # We save the hidden states in the spec metadata here. In _prepare_draft_tokens,
+            # PyExecutor will extract these from the model engine's spec metadata.
+            # They will be passed to the draft model engine on the first draft iteration.
+            # TODO: can we support multiple model outputs instead?
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
                                                       hidden_states, residual)
         return hidden_states, residual
@@ -634,6 +642,7 @@ class Eagle3LlamaDecoderLayer(DecoderLayer):
         embeds: torch.Tensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        spec_metadata: SpecMetadata,
     ) -> torch.Tensor:
         residual = hidden_states
 
@@ -651,6 +660,15 @@ class Eagle3LlamaDecoderLayer(DecoderLayer):
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+
+        assert isinstance(spec_metadata, Eagle3SpecMetadata)
+        # We save the hidden states in the spec metadata here. In _prepare_draft_tokens,
+        # PyExecutor will extract these from the draft model engine's spec metadata.
+        # They will be passed to the draft model engine on the next iteration.
+        # TODO: can we support multiple model outputs instead?
+        spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states,
+                                                  residual)
+
         return hidden_states, residual
 
 
@@ -1039,12 +1057,10 @@ class Eagle3LlamaDraftModel(DecoderModel):
         hidden_states, residual = self.midlayer(position_ids=position_ids,
                                                 embeds=inputs_embeds,
                                                 hidden_states=hidden_states,
-                                                attn_metadata=attn_metadata)
+                                                attn_metadata=attn_metadata,
+                                                spec_metadata=spec_metadata)
 
-        hidden_states, hidden_states_to_save = self.norm(
-            hidden_states, residual)
-        assert isinstance(spec_metadata, Eagle3SpecMetadata)
-        spec_metadata.maybe_capture_hidden_states(1, hidden_states_to_save)
+        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
