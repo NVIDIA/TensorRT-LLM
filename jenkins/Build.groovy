@@ -401,10 +401,10 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     if (env.alternativeTRT) {
         trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, "cp312")
     }
-
+    sh " export LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu:\${LD_LIBRARY_PATH:-}"
     sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]} --benchmarks --extra-make-targets modelSpec"
     if (is_linux_x86_64) {
-        sh "cd ${LLM_ROOT} && python3 scripts/build_cpp_examples.py"
+        sh "export LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu:\${LD_LIBRARY_PATH:-} && cd ${LLM_ROOT} && python3 scripts/build_cpp_examples.py"
     }
 
     // Step 3: packaging wheels into tarfile

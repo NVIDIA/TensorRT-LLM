@@ -909,6 +909,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             echo "Prepend ${containerPIP_LLM_LIB_PATH} into \${LD_LIBRARY_PATH}"
             containerLD_LIBRARY_PATH = "${containerPIP_LLM_LIB_PATH}:${containerLD_LIBRARY_PATH}"
         }
+        if (!containerLD_LIBRARY_PATH.contains("/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu:")) {
+            echo "Prepend /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu into \\${LD_LIBRARY_PATH}"
+            containerLD_LIBRARY_PATH = "/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu:${containerLD_LIBRARY_PATH}"
+        }
         containerLD_LIBRARY_PATH = containerLD_LIBRARY_PATH.replaceAll(':+$', '')
         withEnv(["LD_LIBRARY_PATH=${containerLD_LIBRARY_PATH}"]) {
             withCredentials([
