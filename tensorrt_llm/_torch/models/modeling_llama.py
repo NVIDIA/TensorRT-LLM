@@ -466,7 +466,7 @@ class Llama4DecoderLayer(DecoderLayer):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
                                                       hidden_states, residual)
 
-        if self.fusion_config.POST_MOE_FUSION or self.fusion_config.POST_MLP_FUSION:
+        if (self.fusion_config.POST_MOE_FUSION or self.fusion_config.POST_MLP_FUSION) and self.next_layer_layernorm is not None:
             if min_latency_mode:
                 shared_output = hidden_states[0]
                 hidden_states_activated_experts = hidden_states[1]
