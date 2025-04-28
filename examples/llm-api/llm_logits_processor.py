@@ -72,7 +72,8 @@ def main():
     # should be specified when initializing LLM.
     llm = LLM(
         model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        batched_logits_processor=MyBatchedLogitsProcessor(allowed_token_id=42))
+        batched_logits_processor=MyBatchedLogitsProcessor(allowed_token_id=42),
+        additional_serializable_classes={"__main__": ["MyLogitsProcessor"]})
 
     # Sample prompts
     prompts = [
