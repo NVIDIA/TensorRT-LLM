@@ -268,7 +268,8 @@ def disaggregated(config_file: Optional[str], server_start_timeout: int,
                                 req_timeout_secs=request_timeout,
                                 server_start_timeout_secs=server_start_timeout,
                                 ctx_router_config=disagg_cfg.ctx_router_config,
-                                gen_router_config=disagg_cfg.gen_router_config)
+                                gen_router_config=disagg_cfg.gen_router_config,
+                                condition=disagg_cfg.condition)
 
     asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
 
