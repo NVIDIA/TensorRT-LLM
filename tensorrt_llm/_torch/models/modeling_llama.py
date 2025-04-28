@@ -953,6 +953,7 @@ class Llama4ForConditionalGeneration(Llama4ForCausalLM):
         **kwargs,
     ) -> torch.Tensor:
         mm_embed = kwargs.get("multi_modal_data", [])
+        pipeline_interface = kwargs.get("pipeline_interface", None)
         input_ids, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
                                                      input_ids, mm_embed)
         logits = super().forward(attn_metadata,
@@ -960,7 +961,8 @@ class Llama4ForConditionalGeneration(Llama4ForCausalLM):
                                  position_ids,
                                  inputs_embeds,
                                  spec_metadata=spec_metadata,
-                                 return_context_logits=return_context_logits)
+                                 return_context_logits=return_context_logits,
+                                 pipeline_interface=pipeline_interface)
         return logits
 
 
