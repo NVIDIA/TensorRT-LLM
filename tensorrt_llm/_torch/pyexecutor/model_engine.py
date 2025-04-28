@@ -210,6 +210,18 @@ def initialize_dummy_weights(
         elif torch.is_floating_point(param):
             param.uniform_(low, high, generator=generator)
 
+    def _set_next_layer_layernorm(model):
+        if not hasattr(model, 'layers'):
+            return
+            
+        for idx, layer in enumerate(model.layers):
+            if idx == len(model.layers) - 1:
+                layer.next_layer_layernorm = model.norm
+            else:
+                layer.next_layer_layernorm = model.layers[idx + 1].input_layernorm
+
+    _set_next_layer_layernorm(model.model)
+
 
 KV_CACHE_MANAGER_KEY = 'kv_cache_manager'
 DRAFT_KV_CACHE_MANAGER_KEY = 'draft_kv_cache_manager'

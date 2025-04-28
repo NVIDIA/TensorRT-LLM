@@ -208,6 +208,7 @@ class Linear(nn.Module):
         self.use_llama4_fc_swiglu = use_llama4_fc_swiglu and self.in_features == 5120 and (
             self.out_features == 2048 or self.out_features == 4096)
 
+        self.combined_scale = torch.randn(1, dtype=torch.float32, device='cuda')
         if not skip_create_weights:
             self.create_weights()
 

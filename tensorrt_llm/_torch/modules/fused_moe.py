@@ -315,6 +315,14 @@ class FusedMoE(nn.Module):
         if not self.has_any_quant:
             return
         if self.has_fp8_qdq:
+            if self.fc31_dequant.device.type == 'meta':
+                self.fc31_dequant.data = self.fc31_dequant.to(torch.device('cuda')).data
+            if self.fc2_quant.device.type == 'meta':
+                self.fc2_quant.data = self.fc2_quant.to(torch.device('cuda')).data
+            if self.fc2_dequant.device.type == 'meta':
+                self.fc2_dequant.data = self.fc2_dequant.to(torch.device('cuda')).data
+            if self.fc31_input_dequant.device.type == 'meta':
+                self.fc31_input_dequant.data = self.fc31_input_dequant.to(torch.device('cuda')).data
             self.quant_scales = FusedMoEQuantScalesFP8(
                 fc1_dequant=self.fc31_dequant,
                 fc2_quant=self.fc2_quant,
