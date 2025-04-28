@@ -864,6 +864,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             "--apply-test-list-correction",
             "--splitting-algorithm least_duration",
             "--timeout=${pytestTestTimeout}",
+            "--timeout-method=thread",
             "--rootdir ${llmSrc}/tests/integration/defs",
             "--test-prefix=${stageName}",
             "--splits ${splits}",
