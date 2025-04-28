@@ -886,6 +886,7 @@ def rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout) {
             continue
         }
         sh "cat ${rerunTestList}"
+        xmlFile = "${WORKSPACE}/${stageName}/rerun_results_${times}.xml"
         testCmdLine = [
             "LLM_ROOT=${llmSrc}",
             "LLM_MODELS_ROOT=${MODEL_CACHE_DIR}",
@@ -898,7 +899,7 @@ def rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout) {
             "--test-list=${rerunTestList}",
             "--output-dir=${WORKSPACE}/${stageName}/",
             "--csv=${WORKSPACE}/${stageName}/rerun_report_${times}.csv",
-            "--junit-xml ${WORKSPACE}/${stageName}/rerun_results_${times}.xml",
+            "--junit-xml ${xmlFile}",
             "-o junit_logging=out-err",
             "--reruns ${times - 1}"
         ]
@@ -910,7 +911,11 @@ def rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout) {
         } catch(InterruptedException e) {
             throw e
         } catch (Exception e) {
-            echo "Rerun tests failed"
+            if (!fileExists(xmlFile)) {
+                echo "The tests crashed when rerun attempt."
+                throw e
+            }
+            echo "The tests still failed after rerun attempt."
             isRerunFailed = true
         }
     }
@@ -1192,7 +1197,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     } catch (Exception e) {
                         isRerunFailed = rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout)
                         if (isRerunFailed) {
-                            error "Rerun tests failed"
+                            echo "The tests still failed after rerun attempt."
+                            throw e
                         }
                     }
                 }
