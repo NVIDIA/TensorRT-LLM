@@ -45,7 +45,7 @@ def torch_moe(
         valid_mask, selected_experts, torch.full_like(selected_experts, num_experts)
     )
     # Create one-hot encoding with an extra class.
-    one_hot = torch.nn.functional.one_hot(selected_experts_fixed, num_classes=num_experts + 1)
+    one_hot = F.one_hot(selected_experts_fixed, num_classes=num_experts + 1)
     expert_mask = one_hot[..., :num_experts].permute(2, 1, 0)
 
     for expert_idx in range(num_experts):
