@@ -257,6 +257,9 @@ class Linear(nn.Module):
                 self.inv_input_scale = Parameter(torch.tensor(
                     1., dtype=torch.float32, device=device),
                                                  requires_grad=False)
+                self.combined_scale = Parameter(torch.tensor(
+                    1., dtype=torch.float32, device=device),
+                                                 requires_grad=False)
             elif qc.layer_quant_mode.has_fp8_block_scales():
                 self.has_fp8_block_scales = True
 
@@ -365,17 +368,34 @@ class Linear(nn.Module):
                         position_ids,
                     )
                 elif self.use_llama4_fc_swiglu and inv_input_scale is not None:
-                    output = torch.ops.trtllm.llama4_fc_swiglu_tiled_fp8(
-                        qinput,
-                        weight.t(),
-                        self.combined_scale,
-                        inv_input_scale,
-                    )
+                    if self.dtype == torch.float8_e4m3fn:
+                        print("use llama4_fc_swiglu_tiled_fp8 kernel")
+                        output = torch.ops.trtllm.llama4_fc_swiglu_tiled_fp8(
+                            qinput,
+                            weight.t(),
+                            self.combined_scale,
+                            inv_input_scale,
+                        )
+                    elif self.dtype == torch.bfloat16:
+                        print("use llama4_fc_swiglu_bf16 kernel")
+                        output = torch.ops.trtllm.llama4_fc_swiglu_bf16(
+                            qinput,
+                            weight.t(),
+                            self.combined_scale,
+                            inv_input_scale,
+                        )
+                    else:
+                        raise ValueError(f'unsupported dtype: {self.dtype} for llama4_fc_swiglu kernel')
+
                 elif self.use_trtllm_gen_fc_swiglu and qinput.shape[0] <= 4:
-                    assert self.trtllm_gen_global_scale is not None
+                    print("use trtllm-gen fc_swiglu kernel")
+                    # assert self.trtllm_gen_global_scale is not None
+                    if not hasattr(self, "trtllm_gen_global_scale"):
+                        print("create trtllm_gen_global_scale, identical with combined_scale")
+                        self.trtllm_gen_global_scale = self.combined_scale
                     output = torch.ops.trtllm.fp8_per_tensor_scaling_tllmg_gemm(
-                        qinput,
-                        weight,
+                        qinput.contiguous(),
+                        weight.contiguous(),
                         global_scale=self.trtllm_gen_global_scale,
                         global_scale_gate=self.combined_scale,
                         out_dtype=self.dtype,
@@ -503,7 +523,13 @@ class Linear(nn.Module):
             if self.gather_output:
                 output = allgather(output, self.mapping)
         else:
-            output = self.apply_linear(input, self.weight, self.bias)
+            if self.use_llama4_fc_swiglu and self.has_fp8_qdq and input.shape[0] <= 4 and inv_input_scale is not None:
+                output = self.apply_linear(input,
+                                           self.weight,
+                                           self.bias,
+                                           inv_input_scale=inv_input_scale)
+            else:
+                output = self.apply_linear(input, self.weight, self.bias)
 
         return output
 
