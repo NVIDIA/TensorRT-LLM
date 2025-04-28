@@ -95,7 +95,7 @@ static char const* _cudaGetErrorEnum(cudaError_t error)
     {
         size_t free, total;
         cudaMemGetInfo(&free, &total);
-        return fmtstr("%s, free memory %d, total memory %d.", cudaGetErrorString(error), free, total).c_str();
+        return fmtstr("%s, free memory %ld, total memory %ld.", cudaGetErrorString(error), free, total).c_str();
     }
     else
     {
