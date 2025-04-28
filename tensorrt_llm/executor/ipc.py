@@ -26,28 +26,6 @@ class ZeroMqQueue:
         zmq.PUSH: "PUSH",
     }
 
-    # Base serializable types and their handlers
-    BASE_SERIALIZABLE_TYPES = {
-        "builtins": ["Exception"],
-        "tensorrt_llm.executor.request":
-        ["CancellingRequest", "GenerationRequest"],
-        "tensorrt_llm.sampling_params": ["SamplingParams"],
-        "tensorrt_llm.executor.postproc_worker":
-        ["PostprocParams", "PostprocWorker.Input", "PostprocWorker.Output"],
-        "tensorrt_llm.serve.postprocess_handlers":
-        ["CompletionPostprocArgs", "completion_response_post_processor"],
-        "tensorrt_llm.bindings.executor": [
-            "Response", "Result", "FinishReason", "KvCacheRetentionConfig",
-            "KvCacheRetentionConfig.TokenRangeRetentionConfig"
-        ],
-        "tensorrt_llm.serve.openai_protocol":
-        ["CompletionResponse", "CompletionResponseChoice", "UsageInfo"],
-        "torch._utils": ["_rebuild_tensor_v2"],
-        "torch.storage": ["_load_from_bytes"],
-        "collections": ["OrderedDict"],
-        "datetime": ["timedelta"],
-    }
-
     def __init__(self,
                  address: Optional[tuple[str, Optional[bytes]]] = None,
                  *,
