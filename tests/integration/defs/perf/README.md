@@ -46,3 +46,13 @@ Running this print the diffs between both performance results. It presents only:
 3. Metrics missing in `target_perf_csv`.
 
 If any diffs were found it will also generate a patch file to change `base_perf_csv`  with the new metrics, it will be written to the same directory as <target_perf_csv_path> resides in.
+
+
+## Generating diff report
+To view the difference between 2 reports, it is possible to generate a pdf report containing Bar graphs comparing the base and target value per-metric. Each metric will contain 2 bars per-each configuration (1 for the base and 1 for the target).
+To generate this report
+```
+python tests/integration/defs/perf/create_perf_comparison_report.py --base_csv_path=<path_to_base_csv> --target_csv_path=<path_to_target_csv> --output_path=<output_path_for_report>
+```
+
+This will create a pdf file at <output_path_for_report>.
