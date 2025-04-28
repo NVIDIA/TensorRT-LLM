@@ -5,6 +5,7 @@ import time
 import weakref
 from typing import Dict, Optional, Union
 
+import torch
 import zmq
 import zmq.asyncio
 
@@ -288,7 +289,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
         tracer_init_kwargs = get_tracer().init_kwargs if enable_llm_tracer(
         ) else None
         from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
-
+        torch.cuda.Stream()
         self.mpi_futures = self.mpi_session.submit(
             worker_main,
             **worker_kwargs,

@@ -14,7 +14,7 @@ from tensorrt_llm.inputs.data import TextPrompt
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
 
 from .. import bindings as tllm
-from .._utils import global_mpi_rank, nvtx_range_debug
+from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..builder import EngineConfig
 from ..disaggregated_params import DisaggregatedParams
@@ -298,9 +298,6 @@ class LLM:
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
-        print_colored_debug(
-            f"rank {global_mpi_rank()} generate_async: {inputs}\n", "green")
-
         sampling_params = self._prepare_sampling_params(sampling_params)
 
         if sampling_params.n > self.args.build_config.max_batch_size:
@@ -644,8 +641,21 @@ class LLM:
         logger.info(f"Save model to {engine_dir}")
         if self._engine_dir is None:
             raise RuntimeError("The engine is not built yet.")
-        if self._engine_dir.absolute() != os.path.abspath(engine_dir):
+
+        if self._engine_dir.absolute() == os.path.abspath(engine_dir):
+            return
+
+        if not self.mpi_session or not self.mpi_session.is_comm_session():
             shutil.copytree(self._engine_dir, engine_dir, dirs_exist_ok=True)
+        else:
+            # NFS is fragile, so we copy files one by one
+            target_engine_dir = Path(engine_dir)
+            target_engine_dir.mkdir(parents=True, exist_ok=True)
+            # copy files one by one
+            for file in self._engine_dir.iterdir():
+                print_colored_debug(
+                    f"Copying {file} to {target_engine_dir / file.name}\n")
+                shutil.copy(file, target_engine_dir / file.name)
 
     def shutdown(self) -> None:
         if hasattr(self, "_executor") and self._executor is not None:
