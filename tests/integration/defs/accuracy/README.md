@@ -104,7 +104,7 @@ If all the evaluated accuracies are equal to or higher than the corresponding th
 
 ### Add New Test Cases with Existing Tasks
 
-We suggest supporting your model with LLM API, and then add tests to [test_llm_api.py](./test_llm_api.py) or [test_llm_api_pytorch.py](./test_llm_api_pytorch.py). Typically, a test class is responsible for a model (corresponding to a unique Hugging Face model ID); it contains several test methods for different features (e.g., quantizations, parallelisms). For example, in [test_llm_api_pytorch.py](./test_llm_api_pytorch.py) the model `meta-llama/Llama-3.1-8B-Instruct` has the test class defined as:
+We suggest supporting your model with LLM API, and then add tests to [test_llm_api.py](./test_llm_api.py) or [test_llm_api_pytorch.py](./test_llm_api_pytorch.py). Typically, a test class is responsible for a model (corresponding to a unique Hugging Face model ID); it contains several test methods for different features (e.g., quantizations, parallelisms). For example, in [test_llm_api_pytorch.py](./test_llm_api_pytorch.py) the model [`meta-llama/Llama-3.1-8B-Instruct`](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) has the test class defined as:
 
 ```python
 class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
