@@ -16,7 +16,7 @@ class PipelineInterface:
     - Slicing: pp[start:end]
 
     Note: When using this interface in pp, the packing/unpacking and send/recv
-    operations must be used symmetrically within stage and between succsive ranks.
+    operations must be used symmetrically within stage and between successive ranks.
     """
     _pp_comm = None
 

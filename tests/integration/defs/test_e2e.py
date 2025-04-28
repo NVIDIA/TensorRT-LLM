@@ -39,12 +39,12 @@ sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
 
 def test_gpt3_175b_1layers_build_only(llm_root, llm_venv, engine_dir):
     "Build GPT-3 175B: 96 layer w/ plugins"
-    example_root = os.path.join(llm_root, "examples", "gpt")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "gpt")
     engine_dir = os.path.join(engine_dir, "gpt-175-96layers-build-only")
 
     dtype = 'float16'
     convert_cmd = [
-        f"{example_root}/../generate_checkpoint_config.py",
+        f"{example_root}/../../../generate_checkpoint_config.py",
         f"--output_path={engine_dir}/ckpt_config.json",
         "--architecture=GPTForCausalLM", f"--dtype={dtype}",
         "--num_hidden_layers=1", "--num_attention_heads=96",
@@ -72,12 +72,12 @@ def test_gpt3_175b_1layers_build_only(llm_root, llm_venv, engine_dir):
                          ids=["use_cpp_session", "use_py_session"])
 def test_gpt_fp32(llm_root, llm_venv, additional_build_option, use_py_session,
                   engine_dir):
-    example_root = os.path.join(llm_root, "examples", "gpt")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "gpt")
     engine_dir = os.path.join(engine_dir, "gpt2")
 
     dtype = 'float32'
     convert_cmd = [
-        f"{example_root}/../generate_checkpoint_config.py",
+        f"{example_root}/../../../generate_checkpoint_config.py",
         f"--output_path={engine_dir}/ckpt_config.json",
         "--architecture=GPTForCausalLM", f"--dtype={dtype}",
         "--num_hidden_layers=2", "--num_attention_heads=16",
@@ -102,7 +102,7 @@ def test_gpt_fp32(llm_root, llm_venv, additional_build_option, use_py_session,
 
     print("Running inference...")
     run_cmd = [
-        f"{example_root}/../run.py", "--max_output_len=1",
+        f"{example_root}/../../../run.py", "--max_output_len=1",
         f"--engine_dir={engine_dir}"
     ]
     if use_py_session:
@@ -164,7 +164,7 @@ def test_llama_e2e(llama_example_root, llama_tokenizer_model_root, llm_venv,
 
     print("Run inference...")
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=1",
         f"--tokenizer_dir={llama_tokenizer_model_root}",
         "--log_level=verbose",
@@ -248,7 +248,7 @@ def test_mistral_e2e(llama_example_root, llama_tokenizer_model_root, llm_venv,
 
     print("Run inference...")
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=1",
         f"--tokenizer_dir={llama_tokenizer_model_root}",
         "--log_level=verbose",
@@ -1000,18 +1000,70 @@ def test_falcon_gqa_e2e(falcon_example_root, llm_venv, engine_dir, enable_fp8,
     venv_check_call(llm_venv, run_cmd)
 
 
+def test_mistral_large_hidden_vocab_size(llama_example_root, llm_venv,
+                                         llama_tokenizer_model_root,
+                                         engine_dir):
+    """RCCA https://nvbugs/4753548"""
+    config = {
+        "architecture": "LlamaForCausalLM",
+        "dtype": "float16",
+        "vocab_size": 131072,
+        "hidden_size": 16384,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 96,
+        "hidden_act": "silu",
+        "logits_dtype": "float32",
+        "norm_epsilon": 1e-06,
+        "position_embedding_type": "rope_gpt_neox",
+        "max_position_embeddings": 131072,
+        "num_key_value_heads": 8,
+        "intermediate_size": 36864,
+        "head_size": 128,
+    }
+
+    # Save the dummy-weight checkpoint config.json to engine_dir
+    if not os.path.exists(engine_dir):
+        os.makedirs(engine_dir)
+    ckpt_config_path = os.path.join(engine_dir, 'ckpt_config.json')
+    with open(ckpt_config_path, 'w') as f:
+        json.dump(config, f, indent=4)
+
+    build_cmd = [
+        "trtllm-build",
+        f"--model_config={ckpt_config_path}",
+        f"--output_dir={engine_dir}",
+        "--max_input_len=8096",
+        "--max_seq_len=52488",
+        "--max_num_tokens=52488",
+        "--gemm_plugin=float16",
+        "--gpt_attention_plugin=float16",
+        "--paged_kv_cache=enable",
+        "--remove_input_padding=enable",
+        "--max_batch_size=32",
+    ]
+    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+
+    print("Run inference...")
+    run_cmd = [
+        f"{llama_example_root}/../../../run.py",
+        "--max_output_len=20",
+        f"--engine_dir={engine_dir}",
+        f"--tokenizer_dir={llama_tokenizer_model_root}",
+    ]
+    venv_check_call(llm_venv, run_cmd)
+
+
 run_llm_path = os.path.join(os.path.dirname(__file__), "_run_llmapi_llm.py")
 
 
 @pytest.mark.parametrize("model_name,model_path", [
     ("llama", "llama-models/llama-7b-hf"),
-    ("gptj", "gpt-j-6b"),
-    ("falcon", "falcon-7b-instruct"),
     ("llama", "codellama/CodeLlama-7b-Instruct-hf"),
 ])
 def test_llmapi_load_engine_from_build_command(llm_root, llm_venv, engine_dir,
                                                model_name, model_path):
-    llama_example_root = os.path.join(llm_root, "examples", model_name)
+    llama_example_root = os.path.join(llm_root, "examples", "models", "core",
+                                      model_name)
     dtype = 'float16'
     cmodel_dir = os.path.join(engine_dir, f"{model_name}-engine")
 
@@ -1049,7 +1101,8 @@ def test_llmapi_load_engine_from_build_command(llm_root, llm_venv, engine_dir,
 ])
 def test_llmapi_load_engine_from_build_command_with_lora(
         llm_root, llm_venv, engine_dir, model_name, model_path):
-    llama_example_root = os.path.join(llm_root, "examples", model_name)
+    llama_example_root = os.path.join(llm_root, "examples", "models", "core",
+                                      model_name)
     dtype = 'bfloat16'
     cmodel_dir = os.path.join(engine_dir, f"{model_name}-engine")
 
@@ -1150,7 +1203,8 @@ def test_llmapi_build_command_parameters_align(llm_root, llm_venv, engine_dir,
 
 
 def test_llmapi_load_ckpt_from_convert_command(llm_root, llm_venv, engine_dir):
-    llama_example_root = os.path.join(llm_root, "examples", "llama")
+    llama_example_root = os.path.join(llm_root, "examples", "models", "core",
+                                      "llama")
     dtype = 'float16'
     cmodel_dir = os.path.join(engine_dir, "llama-7b-cmodel")
 
@@ -1224,6 +1278,19 @@ def test_trtllm_serve_example(llm_root, llm_venv):
          str(test_root / "_test_trtllm_serve_example.py")])
 
 
+def test_trtllm_serve_multimodal_example(llm_root, llm_venv):
+    example_root = Path(os.path.join(llm_root, "examples", "serve"))
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_trtllm_serve_multimodal_example.py")
+    ])
+
+
 def test_openai_misc_example(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_openai_misc.py")])
@@ -1245,6 +1312,19 @@ def test_openai_chat_example(llm_root, llm_venv):
     ])
 
     llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_openai_chat.py")])
+
+
+def test_openai_chat_multimodal_example(llm_root, llm_venv):
+    example_root = Path(os.path.join(llm_root, "examples", "apps"))
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_chat_multimodal.py")])
 
 
 @pytest.mark.skip_less_device(2)
@@ -1477,6 +1557,7 @@ def test_ptp_quickstart(llm_root, llm_venv):
 
 @pytest.mark.parametrize("model_name,model_path", [
     ("Llama3.1-8B-BF16", "llama-3.1-model/Meta-Llama-3.1-8B"),
+    ("Llama3.2-11B-BF16", "llama-3.2-models/Llama-3.2-11B-Vision"),
     ("Nemotron4_4B-BF16", "nemotron/Minitron-4B-Base"),
     pytest.param('Llama3.1-8B-NVFP4',
                  'nvfp4-quantized/Meta-Llama-3.1-8B',
@@ -1535,7 +1616,7 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
         f"{llm_models_root()}/{model_path}",
         "--eagle_model_dir",
         f"{llm_models_root()}/{eagle_model_path}",
-        "--kv_cache_enable_block_reuse",
+        "--disable_kv_cache_reuse",
     ])
 
 
@@ -1562,7 +1643,7 @@ def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
         "--kv_cache_fraction=0.95",
         "--max_batch_size=1",
         "--max_seq_len=3000",
-        "--kv_cache_enable_block_reuse",
+        "--disable_kv_cache_reuse",
     ])
 
 
@@ -1729,7 +1810,8 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
              ],
              [
                  "The image shows a multi-lane highway with traffic flowing in both directions. The road appears to be relatively clear, with a few vehicles visible on the road. There is a bus in the right lane, a police car in the middle lane, and a few other vehicles scattered across the lanes. The traffic seems to be",
-                 "The image shows a multi-lane highway with traffic flowing in both directions. The road appears to be relatively clear, with a few vehicles visible on the road. There is a bus on the right side of the road, and a police car is seen in the middle lane, possibly indicating a traffic check or an incident."
+                 "The image shows a multi-lane highway with traffic flowing in both directions. The road appears to be relatively clear, with a few vehicles visible on the road. There is a bus on the right side of the road, and a police car is seen in the middle lane, possibly indicating a traffic check or an incident.",
+                 "The image shows a multi-lane highway with traffic flowing in both directions. The road appears to be relatively clear, with a few vehicles visible on the road. There is a bus on the right side of the road, and a police car is seen in the middle lane. The traffic seems to be moving smoothly, with"
              ]],
             "video":
             [[
@@ -1855,7 +1937,8 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
     tllm_logits = []
     for output in outputs:
         prompt = output.prompt
-        tllm_logit = output.context_logits.cpu()
+        tllm_logit = output.context_logits.cpu(
+        )[:, 0]  # drop vocab_size dimension.
         print(f"Prompt: {prompt!r}, Context logits: {tllm_logit}")
         tllm_logits += [tllm_logit]
     # Stack the output
@@ -1910,8 +1993,8 @@ def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
     example_root = Path(os.path.join(llm_root, "examples", "scaffolding"))
     input_file = Path(os.path.join(example_root, "test.jsonl"))
     llm_venv.run_cmd([
-        str(example_root / "aime24_test.py"),
-        "--generation_dir",
+        str(example_root / "run_majority_vote_aime24.py"),
+        "--model_dir",
         f"{llm_models_root()}/{model_path}",
         f"--jsonl_file={input_file}",
         "--threshold=0.5",

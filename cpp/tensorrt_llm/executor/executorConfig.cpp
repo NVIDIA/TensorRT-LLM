@@ -32,8 +32,9 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig, std::optional<DebugConfig> debugConfig,
     SizeType32 recvPollPeriodMs, uint64_t maxSeqIdleMicroseconds,
     std::optional<SpeculativeDecodingConfig> specDecConfig, std::optional<GuidedDecodingConfig> guidedDecodingConfig,
-    std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs, bool gatherGenerationLogits,
-    bool useVariableBeamWidthSearch)
+    std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs,
+    std::optional<CacheTransceiverConfig> cacheTransceiverConfig, bool gatherGenerationLogits,
+    bool useVariableBeamWidthSearch, bool promptTableOffloading)
     : mMaxBeamWidth(maxBeamWidth)
     , mSchedulerConfig(std::move(schedulerConfig))
     , mKvCacheConfig(std::move(kvCacheConfig))
@@ -58,8 +59,10 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     , mSpeculativeDecodingConfig(specDecConfig)
     , mGuidedDecodingConfig(std::move(guidedDecodingConfig))
     , mAdditionalModelOutputs(std::move(additionalModelOutputs))
+    , mCacheTransceiverConfig(std::move(cacheTransceiverConfig))
     , mGatherGenerationLogits(gatherGenerationLogits)
     , mUseVariableBeamWidthSearch(useVariableBeamWidthSearch)
+    , mPromptTableOffloading(promptTableOffloading)
 {
     TLLM_CHECK(iterStatsMaxIterations >= 0);
     TLLM_CHECK(requestStatsMaxIterations >= 0);
@@ -197,6 +200,11 @@ std::optional<std::vector<AdditionalModelOutput>> ExecutorConfig::getAdditionalM
     return mAdditionalModelOutputs;
 }
 
+std::optional<CacheTransceiverConfig> ExecutorConfig::getCacheTransceiverConfig() const
+{
+    return mCacheTransceiverConfig;
+}
+
 bool ExecutorConfig::getGatherGenerationLogits() const
 {
     return mGatherGenerationLogits;
@@ -205,6 +213,11 @@ bool ExecutorConfig::getGatherGenerationLogits() const
 bool ExecutorConfig::getUseVariableBeamWidthSearch() const
 {
     return mUseVariableBeamWidthSearch;
+}
+
+bool ExecutorConfig::getPromptTableOffloading() const
+{
+    return mPromptTableOffloading;
 }
 
 void ExecutorConfig::setMaxBeamWidth(SizeType32 maxBeamWidth)
@@ -334,6 +347,11 @@ void ExecutorConfig::setAdditionalModelOutputs(std::vector<AdditionalModelOutput
     mAdditionalModelOutputs = additionalModelOutputs;
 }
 
+void ExecutorConfig::setCacheTransceiverConfig(CacheTransceiverConfig const& cacheTransceiverConfig)
+{
+    mCacheTransceiverConfig = cacheTransceiverConfig;
+}
+
 void ExecutorConfig::setGatherGenerationLogits(bool gatherGenerationLogits)
 {
     mGatherGenerationLogits = gatherGenerationLogits;
@@ -342,6 +360,11 @@ void ExecutorConfig::setGatherGenerationLogits(bool gatherGenerationLogits)
 void ExecutorConfig::setUseVariableBeamWidthSearch(bool useVariableBeamWidthSearch)
 {
     mUseVariableBeamWidthSearch = useVariableBeamWidthSearch;
+}
+
+void ExecutorConfig::setPromptTableOffloading(bool promptTableOffloading)
+{
+    mPromptTableOffloading = promptTableOffloading;
 }
 
 } // namespace tensorrt_llm::executor

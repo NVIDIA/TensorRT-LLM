@@ -1,7 +1,6 @@
 import asyncio
 import copy
 import json
-import logging
 import os
 import subprocess
 from typing import List, Optional, Tuple
@@ -11,7 +10,10 @@ import pytest
 import yaml
 from transformers import AutoTokenizer
 
-logging.basicConfig(level=logging.INFO)
+from tensorrt_llm import logger
+from tensorrt_llm.bindings.internal.batch_manager import (BlockKey,
+                                                          BlockKeyHasher)
+
 MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
 
@@ -46,7 +48,7 @@ def run_disaggregated_workers(
         str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
         config_file
     ]
-    logging.info(f"Running workers with command: {' '.join(workers_cmd)}")
+    logger.info(f"Running workers with command: {' '.join(workers_cmd)}")
     workers_proc = subprocess.Popen(workers_cmd,
                                     stdout=stdout,
                                     stderr=subprocess.STDOUT,
@@ -86,7 +88,7 @@ class BasicWorkerTester:
 
             response_dict = await response.json()
             if not response.ok:
-                logging.error(f"Received failed response {response_dict}")
+                logger.error(f"Received failed response {response_dict}")
                 response.raise_for_status()
             return response_dict
 
@@ -155,7 +157,7 @@ class BasicWorkerTester:
             iter = 0
             while not await are_servers_ready(session):
                 wait_time = 3
-                logging.info(
+                logger.info(
                     f"Context and generation servers are not ready. Waiting ({iter})..."
                 )
                 await asyncio.sleep(wait_time)
@@ -194,14 +196,14 @@ class ConditionalWorkerTester(BasicWorkerTester):
         for i in range(max_rounds):
             # conditional disaggregation by kv cache (estimated by prompt length)
             if prev_prompt_len > curr_prompt_len * threshold:
-                logging.info(f"Sending normal request at iter {i}")
+                logger.info(f"Sending normal request at iter {i}")
                 response = await self.send_request(session, self.gen_servers[0],
                                                    request)
             else:
-                logging.info(f"Sending disaggregated request at iter {i}")
+                logger.info(f"Sending disaggregated request at iter {i}")
                 response = await self.send_disagg_request(
                     session, self.ctx_servers[0], self.gen_servers[0], request)
-            logging.info(
+            logger.info(
                 f"Received response {i}: {repr(response['choices'][0]['text'])}"
             )
             prev_prompt_len = response["usage"]["prompt_tokens"]
@@ -237,23 +239,11 @@ class CacheBlockMeta:
         return self.__str__()
 
 
-# TODO: use pybind-ed BlockKeyHasher
 def block_key_hasher(token_ids: List[int],
                      parent_hash: Optional[int] = None) -> int:
-    mask32 = 0xffff_ffff
-    mask64 = 0xffff_ffff_ffff_ffff
-    seed = len(token_ids)
-    if parent_hash is not None:
-        seed ^= (parent_hash * 0xbf58476d1ce4e5b9) & mask64
-    for token_id in token_ids:
-        a = token_id & mask32
-        a = (((a >> 16) ^ a) * 0x45d9f3b) & mask32
-        a = (((a >> 16) ^ a) * 0x45d9f3b) & mask32
-        a = (a >> 16) ^ a
-        seed ^= (((a + 0x9e3779b9) & mask32) + ((seed << 6) & mask64) +
-                 (seed >> 2)) & mask64
-        # TODO: handle token_extra_id and lora_task_id
-    return seed & mask64
+    block_key = BlockKey(token_ids)
+    return BlockKeyHasher.hash(block_key,
+                               0 if parent_hash is None else parent_hash)
 
 
 class KvCacheBlockMap:
@@ -348,7 +338,7 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
                                                       self.ctx_servers[0],
                                                       self.gen_servers[0],
                                                       request)
-            logging.info(
+            logger.info(
                 f"Received response {i}: {repr(response['choices'][0]['text'])}"
             )
             prev_ctx_match_count = ctx_match_count

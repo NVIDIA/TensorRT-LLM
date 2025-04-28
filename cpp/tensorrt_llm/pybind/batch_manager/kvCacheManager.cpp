@@ -306,13 +306,26 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def_readwrite("max_input_len", &tbk::TempAttentionWindowInputs::maxInputLen)
         .def_readwrite("max_num_tokens", &tbk::TempAttentionWindowInputs::maxNumTokens);
 
+    py::class_<tbk::BlockKey>(m, "BlockKey")
+        .def(py::init<>())
+        .def(py::init<VecTokens const&, std::optional<tr::LoraTaskIdType>>(), py::arg("tokens"),
+            py::arg("lora_task_id") = std::nullopt)
+        .def(py::init<bool, std::optional<tr::LoraTaskIdType>, VecUniqueTokens const&>(), py::arg("uses_extra_ids"),
+            py::arg("lora_task_id"), py::arg("unique_tokens"))
+        .def_readonly("uses_extra_ids", &tbk::BlockKey::usesExtraIds)
+        .def_readonly("lora_task_id", &tbk::BlockKey::loraTaskId)
+        .def_readonly("unique_tokens", &tbk::BlockKey::uniqueTokens);
+
+    py::class_<tbk::BlockKeyHasher>(m, "BlockKeyHasher")
+        .def_static("hash", &tbk::BlockKeyHasher::hash, py::arg("block_key"), py::arg("parent_hash") = 0);
+
     py::class_<tbk::KVCacheEventManager, std::shared_ptr<tbk::KVCacheEventManager>>(m, "KVCacheEventManager")
         .def(py::init<size_t>(), py::arg("max_kv_event_entries"));
 
     py::classh<tbk::BaseKVCacheManager, PyKvCacheManager>(m, "BaseKVCacheManager")
         .def_static("calculate_max_num_blocks", &tbk::BaseKVCacheManager::calculateMaxNumBlocks, py::arg("config"),
             py::arg("dtype"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"),
-            py::arg("kvFactor"))
+            py::arg("kvFactor"), py::arg("extra_cost_memory") = 0)
         .def("allocate_pools", &BaseKVCacheManager::allocatePools)
         .def("release_pools", &BaseKVCacheManager::releasePools)
         .def("start_scheduling", &BaseKVCacheManager::startScheduling)

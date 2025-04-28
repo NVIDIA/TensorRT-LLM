@@ -79,14 +79,14 @@ TEST_F(SamplingUtilsKernelTest, CurandInitialize)
     for (size_t i = 0; i < batchSize; ++i)
     {
         EXPECT_TRUE(randValsSeed0HostPtr[i] != randValsSeed1HostPtr[i])
-            << tc::fmtstr("Fail at val[%d]=%d <> val[%d]=%d", i, randValsSeed0HostPtr[i], i, randValsSeed1HostPtr[i]);
+            << tc::fmtstr("Fail at val[%lu]=%d <> val[%lu]=%d", i, randValsSeed0HostPtr[i], i, randValsSeed1HostPtr[i]);
     }
 
     // The same seed produces the same random number.
     for (size_t i = 0; i < batchSize; ++i)
     {
         EXPECT_TRUE(randValsSeed0HostPtr[i] == randValsSeed0AltHostPtr[i]) << tc::fmtstr(
-            "Fail at val[%d]=%d <> val[%d]=%d", i, randValsSeed0HostPtr[i], i, randValsSeed0AltHostPtr[i]);
+            "Fail at val[%lu]=%d <> val[%lu]=%d", i, randValsSeed0HostPtr[i], i, randValsSeed0AltHostPtr[i]);
     }
 }
 
@@ -126,7 +126,7 @@ TEST_F(SamplingUtilsKernelTest, CurandBatchInitialize)
     auto const randValsHost = mBufferManager->copyFrom(*randValsDevice, MemoryType::kCPU);
     this->mStream->synchronize();
 
-    auto const randValsHostPtr = bufferCast<SizeType32>(*randValsHost);
+    auto* const randValsHostPtr = bufferCast<SizeType32>(*randValsHost);
 
     // The same seed produces the same random number.
     for (SizeType32 bi = 0; bi + periodSize - 1 < batchSize; bi += periodSize)
@@ -134,7 +134,7 @@ TEST_F(SamplingUtilsKernelTest, CurandBatchInitialize)
         for (size_t pi = 1; pi < periodSize; ++pi)
         {
             EXPECT_TRUE(randValsHostPtr[bi] == randValsHostPtr[bi + pi]) << tc::fmtstr(
-                "Fail at val[%d]=%d <> val[%d]=%d", bi, randValsHostPtr[bi], bi + pi, randValsHostPtr[bi + pi]);
+                "Fail at val[%d]=%d <> val[%lu]=%d", bi, randValsHostPtr[bi], bi + pi, randValsHostPtr[bi + pi]);
         }
     }
 
