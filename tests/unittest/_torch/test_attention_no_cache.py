@@ -182,6 +182,7 @@ scenarios = generate_attn_scenarios(num_q_heads_kv_heads, head_dim, num_layers,
 
 # skip for blackwell
 @skip_blackwell
+@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5247232")
 # Convert parameterized tests to pytest parametrize
 @pytest.mark.parametrize("accuracy", [(1e-2, 1e-3)],
                          ids=lambda x: f"atol={x[0]} rtol={x[1]}")
