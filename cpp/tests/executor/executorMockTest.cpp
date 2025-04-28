@@ -750,7 +750,12 @@ TEST_F(GptExecutorTest, MockedModelCancelRequest)
     constexpr bool streaming = true;
     auto model = std::make_shared<MockedModel>();
 
+    std::unordered_map<IdType, tensorrt_llm::executor::FinishReason> reqIdsToTerminate;
     // Two requests with one child request (3 in total) should be terminated
+    EXPECT_CALL(*model, terminateRequestSync(_, _))
+        .Times(3)
+        .WillRepeatedly(Invoke([&](LlmRequestPtr const& llmRequest, FinishReason finishReason)
+            { reqIdsToTerminate.try_emplace(llmRequest->mRequestId, finishReason); }));
     EXPECT_CALL(*model, terminateRequest(_, _)).Times(3);
     EXPECT_CALL(*model, getVocabSizePadded()).Times(0);
     EXPECT_CALL(*model, getLogitDataType()).Times(0);
@@ -792,6 +797,17 @@ TEST_F(GptExecutorTest, MockedModelCancelRequest)
                     else
                     {
                         callCountPerSeq[llmReq->mRequestId] = 1;
+                    }
+
+                    if (reqIdsToTerminate.count(llmReq->mRequestId) != 0U)
+                    {
+                        if (!llmReq->isGenerationToCompleteState())
+                        {
+                            model->terminateRequest(llmReq, false);
+                            llmReq->finishByReason(reqIdsToTerminate[llmReq->mRequestId]);
+                            llmReq->clearGeneratedTokens();
+                        }
+                        reqIdsToTerminate.erase(llmReq->mRequestId);
                     }
                 }
                 callCount++;
