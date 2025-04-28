@@ -137,7 +137,6 @@ def buildImage(target, action="build", torchInstallType="skip", args="", custom_
                   TORCH_INSTALL_TYPE=${torchInstallType} \
                   IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${tag} \
                   BUILD_WHEEL_OPTS='-j ${BUILD_JOBS}' ${args} \
-                  BUILD_TRITON=1 \
                   GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote
                   """
                 }
@@ -150,7 +149,6 @@ def buildImage(target, action="build", torchInstallType="skip", args="", custom_
                   TORCH_INSTALL_TYPE=${torchInstallType} \
                   IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${custom_tag} \
                   BUILD_WHEEL_OPTS='-j ${BUILD_JOBS}' ${args} \
-                  BUILD_TRITON=1 \
                   GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote
                   """
                }
