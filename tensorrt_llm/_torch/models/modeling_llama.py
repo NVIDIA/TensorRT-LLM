@@ -7,7 +7,6 @@ from transformers import Llama4Config, LlamaConfig
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, DeepseekAllReduce)
-
 from tensorrt_llm._torch.pipeline_interface import PipelineInterface
 from tensorrt_llm.functional import PositionEmbeddingType
 
@@ -24,7 +23,7 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
-from ..speculative import Eagle3SpecMetadata, SpecMetadata
+from ..speculative import SpecMetadata, get_spec_worker
 from ..utils import Fp4QuantizedTensor
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, MissingLayer,
@@ -336,9 +335,8 @@ class Llama4DecoderLayer(DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.PRE_MOE_FUSION
-                or self.fusion_config.PRE_MLP_FUSION
-                or self.mapping.tp_size == 1)),
+                self.fusion_config.PRE_MOE_FUSION or self.fusion_config.
+                PRE_MLP_FUSION or self.mapping.tp_size == 1)),
             **kwargs,
         )
 
@@ -417,7 +415,9 @@ class Llama4DecoderLayer(DecoderLayer):
                 self.next_layer_layernorm.variance_epsilon,
                 AllReduceFusionOp.MOE_ALLREDUCE_RESIDUAL_RMS_NORM,
             )
-        elif (self.fusion_config.POST_MOE_FUSION or self.fusion_config.POST_MLP_FUSION) and self.next_layer_layernorm is not None:
+        elif (self.fusion_config.POST_MOE_FUSION
+              or self.fusion_config.POST_MLP_FUSION
+              ) and self.next_layer_layernorm is not None:
             # fp8 POST_MOE_FUSION case might have illegal memory access issue. Disable it temporarily.
             if self.fusion_config.POST_MLP_FUSION and use_fp8_allreduce and self.next_attn is not None:
                 hidden_states, residual = self.post_quant_allreduce(
@@ -700,9 +700,16 @@ class LlamaModel(DecoderModel):
             config.vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
-            mapping=model_config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            gather_output=True,
+            parallel_config=None
+            if model_config.mapping.enable_attention_dp else ParallelConfig(
+                tensor_parallel_rank=model_config.mapping.tp_rank,
+                tensor_parallel_size=model_config.mapping.tp_size,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                pipeline_parallel_size=model_config.mapping.pp_size,
+                parallel_rank=model_config.mapping.rank,
+                gather_output=True,
+                gpus_per_node=model_config.mapping.gpus_per_node,
+            ),
         )
         self.layers = nn.ModuleList([
             LlamaDecoderLayer(
@@ -767,6 +774,91 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
+        self.draft_model = None
+        if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
+        ):
+            draft_config = ModelConfig.from_pretrained(
+                model_config.spec_config.draft_model_path,
+                trust_remote_code=True,
+                attn_backend=model_config.attn_backend,
+                moe_backend=model_config.moe_backend,
+                mapping=model_config.mapping)
+            draft_config.spec_config = model_config.spec_config
+            draft_config.max_num_tokens = model_config.max_num_tokens
+            draft_config.moe_max_num_tokens = model_config.moe_max_num_tokens
+            draft_config.quant_config.kv_cache_quant_algo = \
+                model_config.quant_config.kv_cache_quant_algo
+            self.draft_model = Eagle3LlamaForCausalLM(
+                draft_config, model_config.pretrained_config.num_hidden_layers)
+            self.spec_worker = get_spec_worker(model_config.spec_config)
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.LongTensor = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pipeline_interface: Optional[PipelineInterface] = None,
+        return_context_logits: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if self._supports_pp and self.pp_size > 1:
+            output = self.model(
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                pipeline_interface=pipeline_interface,
+                spec_metadata=spec_metadata,
+            )
+
+            # No need to compute logits for non-last PP ranks
+            if self.pp_rank < self.pp_size - 1:
+                return output
+            else:
+                hidden_states = output
+        else:
+            hidden_states = self.model(
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                spec_metadata=spec_metadata,
+            )
+
+        if self.draft_model is not None:
+            # get logits
+            logits = self.logits_processor.forward(
+                hidden_states[spec_metadata.gather_ids],
+                self.lm_head,
+                attn_metadata,
+                True,
+            )
+            # get accepetd tokens and next draft tokens
+            return self.spec_worker(input_ids=input_ids,
+                                    position_ids=position_ids,
+                                    hidden_states=hidden_states,
+                                    logits=logits,
+                                    attn_metadata=attn_metadata,
+                                    spec_metadata=spec_metadata,
+                                    draft_model=self.draft_model)
+        else:
+            logits = self.logits_processor.forward(
+                hidden_states,
+                self.lm_head,
+                attn_metadata,
+                return_context_logits,
+            )
+
+        return logits
+
+    def load_weights(self, weights: Dict):
+        super().load_weights(weights, skip_modules=["draft_model"])
+
+    def load_draft_weights(self, weights: Dict):
+        self.draft_model.load_weights(weights)
+        self.draft_model.load_weights_from_target_model(self)
 
 
 @register_auto_model("Llama4ForConditionalGeneration")
@@ -786,6 +878,84 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
+        self.draft_model = None
+        if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
+        ):
+            draft_config = ModelConfig.from_pretrained(
+                model_config.spec_config.draft_model_path,
+                trust_remote_code=True,
+                attn_backend=model_config.attn_backend,
+                moe_backend=model_config.moe_backend,
+                mapping=model_config.mapping)
+            draft_config.spec_config = model_config.spec_config
+            draft_config.max_num_tokens = model_config.max_num_tokens
+            draft_config.moe_max_num_tokens = model_config.moe_max_num_tokens
+            draft_config.quant_config.kv_cache_quant_algo = \
+                model_config.quant_config.kv_cache_quant_algo
+            self.draft_model = Eagle3LlamaForCausalLM(
+                draft_config, model_config.pretrained_config.num_hidden_layers)
+            self.spec_worker = get_spec_worker(model_config.spec_config)
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.LongTensor = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pipeline_interface: Optional[PipelineInterface] = None,
+        return_context_logits: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if self._supports_pp and self.pp_size > 1:
+            output = self.model(
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                pipeline_interface=pipeline_interface,
+                spec_metadata=spec_metadata,
+            )
+
+            # No need to compute logits for non-last PP ranks
+            if self.pp_rank < self.pp_size - 1:
+                return output
+            else:
+                hidden_states = output
+        else:
+            hidden_states = self.model(
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                spec_metadata=spec_metadata,
+            )
+
+        if self.draft_model is not None:
+            # get logits
+            logits = self.logits_processor.forward(
+                hidden_states[spec_metadata.gather_ids],
+                self.lm_head,
+                attn_metadata,
+                True,
+            )
+            # get accepetd tokens and next draft tokens
+            return self.spec_worker(input_ids=input_ids,
+                                    position_ids=position_ids,
+                                    hidden_states=hidden_states,
+                                    logits=logits,
+                                    attn_metadata=attn_metadata,
+                                    spec_metadata=spec_metadata,
+                                    draft_model=self.draft_model)
+        else:
+            logits = self.logits_processor.forward(
+                hidden_states,
+                self.lm_head,
+                attn_metadata,
+                return_context_logits,
+            )
+
+        return logits
 
     def infer_max_seq_len(self):
         # TODO: increase to support 10M context length. There are two blockers
@@ -805,7 +975,7 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
             else:
                 new_weights[key] = tensor
 
-        super().load_weights(new_weights)
+        super().load_weights(new_weights, skip_modules=["draft_model"])
 
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
@@ -815,6 +985,10 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
                 layer.next_attn = self.model.layers[idx + 1].self_attn
+
+    def load_draft_weights(self, weights: Dict):
+        self.draft_model.load_weights(weights)
+        self.draft_model.load_weights_from_target_model(self)
 
 
 @register_auto_model("MistralForCausalLM")
@@ -832,10 +1006,13 @@ class MistralForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
 
 class Eagle3LlamaDraftModel(DecoderModel):
 
-    def __init__(self, model_config: ModelConfig[LlamaConfig]) -> None:
+    def __init__(self,
+                 model_config: ModelConfig[LlamaConfig],
+                 start_layer_idx: int = 0) -> None:
         super().__init__(model_config)
 
         config = model_config.pretrained_config
+        self.spec_config = model_config.spec_config
         self.dtype = config.torch_dtype
         self.hidden_size = config.hidden_size
 
@@ -849,7 +1026,7 @@ class Eagle3LlamaDraftModel(DecoderModel):
                          bias=getattr(config, "bias", False),
                          dtype=config.torch_dtype)
 
-        self.midlayer = Eagle3LlamaDecoderLayer(model_config, 0)
+        self.midlayer = Eagle3LlamaDecoderLayer(model_config, start_layer_idx)
 
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
@@ -905,9 +1082,9 @@ class Eagle3LlamaDraftModel(DecoderModel):
 
         hidden_states, hidden_states_to_save = self.norm(
             hidden_states, residual)
-        assert isinstance(spec_metadata, Eagle3SpecMetadata)
-        spec_metadata.maybe_capture_hidden_states(1, hidden_states_to_save)
-        return hidden_states
+        if self.spec_config.spec_dec_mode.is_eagle3():
+            spec_metadata.maybe_capture_hidden_states(1, hidden_states_to_save)
+        return hidden_states, hidden_states_to_save
 
 
 @register_auto_model("EAGLE3LlamaForCausalLM")
@@ -917,9 +1094,10 @@ class Eagle3LlamaForCausalLM(DecoderModelForCausalLM[Eagle3LlamaDraftModel,
     def __init__(
         self,
         model_config: ModelConfig[LlamaConfig],
+        start_layer_idx: int = 0,
     ):
         super().__init__(
-            Eagle3LlamaDraftModel(model_config),
+            Eagle3LlamaDraftModel(model_config, start_layer_idx),
             config=model_config,
             hidden_size=model_config.pretrained_config.hidden_size,
             vocab_size=model_config.pretrained_config.draft_vocab_size)
@@ -935,7 +1113,7 @@ class Eagle3LlamaForCausalLM(DecoderModelForCausalLM[Eagle3LlamaDraftModel,
         hidden_states: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        output = self.model(
+        output, _ = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
             position_ids=position_ids,

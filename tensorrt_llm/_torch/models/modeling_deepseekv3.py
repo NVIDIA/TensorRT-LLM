@@ -56,7 +56,7 @@ from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
 from ..pipeline_interface import PipelineInterface
 from ..pyexecutor.cuda_graph_runner import is_graph_capturing
-from ..speculative import MTPEagleWorker, MTPSpecMetadata, MTPWorker
+from ..speculative import SpecMetadata, get_spec_worker
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
                      disable_fp4_allgather)
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
@@ -796,7 +796,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         lm_head: Linear,
         embed_tokens: nn.Embedding,
         attn_metadata: AttentionMetadata,
-        spec_metadata: MTPSpecMetadata,
+        spec_metadata: SpecMetadata,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
@@ -974,7 +974,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 mtp_layer = DeepseekV3MTP(model_config, self.num_hidden_layers,
                                           self.model.aux_stream_dict)
                 self.model.layers.append(mtp_layer)
-                self.mtp_worker = MTPEagleWorker(model_config.spec_config)
+                self.mtp_worker = get_spec_worker(model_config.spec_config)
             else:
                 # TODO: fix the accuracy issue and remove this assert.
                 assert False, "Cannot support num_nextn_predict_layers>1 in checkpoint now. Will fix it soon"
@@ -985,7 +985,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                     for layer_idx in range(model_nextn)
                 ])
                 self.model.layers.extend(mtp_layers)
-                self.mtp_worker = MTPWorker(model_config.spec_config)
+                self.mtp_worker = get_spec_worker(model_config.spec_config)
                 # modify the QuantConfig to support duplicated mtp layers
                 if model_config.quant_config.exclude_modules is not None:
                     extend_exclude_modules = []
@@ -1010,7 +1010,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         input_ids: torch.LongTensor = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        spec_metadata: Optional[MTPSpecMetadata] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         pipeline_interface: Optional[PipelineInterface] = None,
         return_context_logits: bool = False,
         **kwargs,
