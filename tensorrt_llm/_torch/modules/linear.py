@@ -159,6 +159,8 @@ class Linear(nn.Module):
         use_custom_cublas_mm: bool = False,
         use_llama4_qkv: bool = False,
         use_llama4_fc_swiglu: bool = False,
+        use_trtllm_gen_fc_swiglu: bool = False,
+        previous_gate_up_proj: nn.Module = None,
     ):
         from ..distributed import AllReduce
 
@@ -206,11 +208,23 @@ class Linear(nn.Module):
         # Llama4 FC13+SwiGLU kernel has hard requirement of hidden_size = 5120
         # and targets output_features = 2048 or 4096.
         self.use_llama4_fc_swiglu = use_llama4_fc_swiglu and self.in_features == 5120 and (
-            self.out_features == 2048 or self.out_features == 4096)
+            self.out_features == 2048 or self.out_features == 4096) and not use_trtllm_gen_fc_swiglu
+        self.use_trtllm_gen_fc_swiglu = use_trtllm_gen_fc_swiglu and self.in_features == 5120 and (
+            self.out_features == 2048 or self.out_features == 4096) and not use_llama4_fc_swiglu
 
         self.combined_scale = torch.randn(1, dtype=torch.float32, device='cuda')
         if not skip_create_weights:
             self.create_weights()
+
+        # Record the previous linear layer.
+        # We need this in llama4, where the previous layer, gate up projection,
+        # is custom kernel is outputing fp8 precision. In this case, we want to feed
+        # inv_input_scale from this current layer to our previous to offset the
+        # quantization. Due to current workflow problem, the weight initrialization
+        # happens during load_weights. From gate_up_proj perspective, it doesn't want
+        # combined_scale * down_proj.inv_input_scale to happen during runtime.
+        # Such initialization will be done in the current layer with this object linked.
+        self.previous_gate_up_proj = previous_gate_up_proj
 
     def create_weights(self):
         if self._weights_created:
@@ -356,6 +370,17 @@ class Linear(nn.Module):
                         weight.t(),
                         self.combined_scale,
                         inv_input_scale,
+                    )
+                elif self.use_trtllm_gen_fc_swiglu and qinput.shape[0] <= 4:
+                    assert self.trtllm_gen_global_scale is not None
+                    output = torch.ops.trtllm.fp8_per_tensor_scaling_tllmg_gemm(
+                        qinput,
+                        weight,
+                        global_scale=self.trtllm_gen_global_scale,
+                        global_scale_gate=self.combined_scale,
+                        out_dtype=self.dtype,
+                        low_latency_kernel=True, # Assume always low latency mode for now
+                        gated_silu=True,
                     )
                 else:
                     # This op does not support bias now.
@@ -514,6 +539,16 @@ class Linear(nn.Module):
                     copy(self.weight_scale, weight_scale[0])
                     self.inv_input_scale.data = 1.0 / self.input_scale
                     self.combined_scale = self.input_scale * self.weight_scale
+                    if self.previous_gate_up_proj is not None:
+                        print("[Gate down]")
+                        if hasattr(self.previous_gate_up_proj, "combined_scale"):
+                            print("Gate down weight load happened after gate up weight load")
+                            print("Created trtllm_gen_global_scale")
+                            self.previous_gate_up_proj.trtllm_gen_global_scale = self.previous_gate_up_proj.combined_scale * self.inv_input_scale
+                        else:
+                            print("Gate down weight load happened before gate up weight load")
+                        self.previous_gate_up_proj.next_gate_down_inv_input_scale = self.inv_input_scale
+
                 elif quant_mode.has_nvfp4():
                     input_scale, weight_scale, alpha = load_weight_scales_nvfp4(
                         weights,
@@ -625,7 +660,15 @@ class Linear(nn.Module):
                     copy(self.weight_scale, max(weight_scale))
                     gate_weight = gate_weight.to(self.dtype) * weight_scale[0]
                     up_weight = up_weight.to(self.dtype) * weight_scale[1]
-                    self.combined_scale = self.input_scale * self.weight_scale
+                    if hasattr(self, "next_gate_down_inv_input_scale"):
+                        print("[Gate up]")
+                        print("Gate up weight load happened after gate down weight load")
+                        print("Created trtllm_gen_global_scale")
+                        self.combined_scale = self.input_scale * self.weight_scale
+                        self.trtllm_gen_global_scale = self.combined_scale * self.next_gate_down_inv_input_scale
+                    else:
+                        self.combined_scale = self.input_scale * self.weight_scale
+
                 elif quant_mode.has_nvfp4():
                     input_scale, weight_scale, alpha = load_weight_scales_nvfp4(
                         weights,

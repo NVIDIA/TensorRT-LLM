@@ -77,9 +77,11 @@ class GatedMLP(nn.Module):
             quant_config=config.get_quant_config(),
             is_expert=is_expert,
             skip_create_weights=config.skip_create_weights,
-            # During llama4, we are using the custom kernel that performs FC+SwiGLU
-            # in one kernel.
-            use_llama4_fc_swiglu=is_llama4)
+            # # During llama4, we are using the custom kernel that performs FC+SwiGLU
+            # # in one kernel.
+            # use_llama4_fc_swiglu=is_llama4,
+            use_trtllm_gen_fc_swiglu=is_llama4,
+        )
 
         self.down_proj = Linear(
             self.intermediate_size,
@@ -91,6 +93,7 @@ class GatedMLP(nn.Module):
             quant_config=config.get_quant_config(),
             is_expert=is_expert,
             skip_create_weights=config.skip_create_weights,
+            previous_gate_up_proj=self.gate_up_proj,
         )
 
         # These two modules are mutually exclusive - either splitted_gate_up_lora or fused_gate_up_lora will be used,
@@ -115,14 +118,20 @@ class GatedMLP(nn.Module):
     ) -> torch.Tensor:
         if self.activation == F.silu:
             if self.is_llama4 and self.down_proj.has_fp8_qdq and x.shape[0] <= 4:
-                # In Llama4, we have added a custom kernel that performs both FC+SwiGLU in one
-                # kernel. This was toggled by use_llama4_fc_swiglu in the Linear layer.
-                # Currently, we are replacing a kernel that gives fp8 in and bf16 out with
-                # fp8 in and fp8 out. Since next gemm is also fp8, we will need to feed
-                # the next gemm layer's input_scale inverse to the current layer as output
-                # scaling factor.
-                h2 = self.gate_up_proj(
-                    x, inv_input_scale=self.down_proj.inv_input_scale)
+                if self.gate_up_proj.use_llama4_fc_swiglu:
+                    # In Llama4, we have added a custom kernel that performs both FC+SwiGLU in one
+                    # kernel. This was toggled by use_llama4_fc_swiglu in the Linear layer.
+                    # Currently, we are replacing a kernel that gives fp8 in and bf16 out with
+                    # fp8 in and fp8 out. Since next gemm is also fp8, we will need to feed
+                    # the next gemm layer's input_scale inverse to the current layer as output
+                    # scaling factor.
+                    print("Using Po-Han custom kernel")
+                    h2 = self.gate_up_proj(
+                        x, inv_input_scale=self.down_proj.inv_input_scale)
+                else:
+                    # Using trtllm-gen kernel for FC+SwiGLU
+                    print("Using trtllm-gen kernel")
+                    h2 = self.gate_up_proj(x)
             else:
                 h1 = self.gate_up_proj(x)
                 if lora_params is not None:
