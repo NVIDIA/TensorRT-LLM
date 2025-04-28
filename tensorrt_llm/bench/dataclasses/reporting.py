@@ -370,6 +370,13 @@ class ReportUtility:
                         for k, v in
                         self.statistics.ttft_percentiles.model_dump().items()
                     },
+                "gen_tps_percentiles":
+                self.statistics.generation_tp_percentiles.model_dump(
+                    exclude_none=True, by_alias=True, mode='json') | {
+                        k: self.convert_to_ms(v)
+                        for k, v in self.statistics.generation_tp_percentiles.
+                        model_dump().items()
+                    },
             }
 
         spec_decoding, decoding_mode = False, None
@@ -507,15 +514,21 @@ class ReportUtility:
                 f"[TTFT] {key.upper():<7}: {ttft[key]:.4f}" for key in
                 ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
 
+            gen_tps_stats = "\n".join(
+                f"[GTPS] {key.upper():<7}: {streaming['gen_tps_percentiles'][key]:.4f}"
+                for key in
+                ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
+
             perf_stats += (
-                f"Average time-to-first-token [TTFT] (ms):          {streaming['avg_ttft_ms']:.4f}\n"
-                f"Average time-per-output-token [TPOT] (ms):        {streaming['avg_tpot_ms']:.4f}\n"
-                f"Per User Output Speed (tps/user) [1/avg(TPOT)]:   {streaming['token_output_speed_tok_s']:.4f}\n"
-                f"Per User Generation Throughput (tps/user):        {streaming['token_genphase_tok_per_s']:.4f}\n"
+                f"Average time-to-first-token [TTFT] (ms):   {streaming['avg_ttft_ms']:.4f}\n"
+                f"Average time-per-output-token [TPOT] (ms): {streaming['avg_tpot_ms']:.4f}\n"
+                f"Per User Output Speed (tps/user):          {streaming['token_output_speed_tok_s']:.4f}\n"
                 "\n-- Per-Request Time-per-Output-Token [TPOT] Breakdown (ms)\n\n"
                 f"{tpot_stats}\n"
                 "\n-- Per-Request Time-to-First-Token [TTFT] Breakdown (ms) \n\n"
-                f"{ttft_stats}\n")
+                f"{ttft_stats}\n"
+                "\n-- Per-Request Generation Throughput Breakdown (tps/user)\n\n"
+                f"{gen_tps_stats}\n")
 
         perf_stats += (
             "\n-- Request Latency Breakdown (ms) -----------------------\n\n"
