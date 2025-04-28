@@ -344,11 +344,8 @@ class ReportUtility:
                 self.statistics.per_user_time_per_output_token_ns)
 
             stats_dict["streaming_metrics"] = {
-                # Token output speed (1 / time-per-output-token)
-                # NOTE: Excludes TTFT by nature of using TPOT.
+                # NOTE: Excludes TTFT by nature as this is a genphase calculation.
                 "token_output_speed_tok_s":
-                1000.0 / avg_tpot,
-                "token_genphase_tok_per_s":
                 self.per_user_generation_token_throughput_s,
                 # Average per request time-to-first-token (TTFT)
                 "avg_ttft_ms":
