@@ -2,10 +2,8 @@ import copy
 from enum import Enum
 from typing import List
 
-from stream_generation_task import StreamGenerationTask
-
-from tensorrt_llm.scaffolding.controller import Controller
-from tensorrt_llm.scaffolding.task import GenerationTask, Task
+from tensorrt_llm.scaffolding import Controller, GenerationTask, Task
+from tensorrt_llm.scaffolding.contrib import StreamGenerationTask
 
 
 class NativeStreamGenerationController(Controller):

@@ -1,7 +1,11 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
+ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
 ARG BASE_TAG=25.03-py3
+ARG TRITON_BASE_TAG=25.03-py3
 ARG DEVEL_IMAGE=devel
+
+FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
 
@@ -48,6 +52,15 @@ RUN bash ./install_tensorrt.sh \
     --NCCL_VER=${NCCL_VER} \
     --CUBLAS_VER=${CUBLAS_VER} && \
     rm install_tensorrt.sh
+
+ARG INSTALL_TRITON=0
+COPY --from=triton /opt/tritonserver/backends/python /opt/tritonserver/backends/python
+COPY --from=triton /opt/tritonserver/lib /opt/tritonserver/lib
+COPY --from=triton /opt/tritonserver/include /opt/tritonserver/include
+COPY --from=triton /opt/tritonserver/bin /opt/tritonserver/bin
+COPY --from=triton /opt/tritonserver/caches /opt/tritonserver/caches
+COPY docker/common/install_triton.sh install_triton.sh
+RUN bash ./install_triton.sh && rm install_triton.sh
 
 # Install latest Polygraphy
 COPY docker/common/install_polygraphy.sh install_polygraphy.sh
