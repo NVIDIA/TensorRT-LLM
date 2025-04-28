@@ -90,7 +90,17 @@ enum class OperationType
 /* **************************** debug tools ********************************* */
 static char const* _cudaGetErrorEnum(cudaError_t error)
 {
-    return cudaGetErrorString(error);
+
+    if (error == cudaErrorMemoryAllocation)
+    {
+        size_t free, total;
+        cudaMemGetInfo(&free, &total);
+        return fmtstr("%s, free memory %d, total memory %d.", cudaGetErrorString(error), free, total).c_str();
+    }
+    else
+    {
+        return cudaGetErrorString(error);
+    }
 }
 
 static char const* _cudaGetErrorEnum(cublasStatus_t error)
