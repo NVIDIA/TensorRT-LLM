@@ -489,3 +489,5 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4 SKIP (h
 unittest/_torch/multi_gpu_modeling/test_llama4.py::test_llama4[tp8-trtllm-scout] SKIP (https://nvbugs/5244009)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp2pp2-attn_backend=TRTLLM] SKIP (https://nvbugs/5241627)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp2pp2-attn_backend=FLASHINFER] SKIP (https://nvbugs/5241627)
+examples/test_gemma.py::test_llm_hf_gemma_quantization_1gpu[gemma-2-27b-it-fp8-bfloat16-8] SKIP (https://nvbugs/5234164)
+examples/test_llama.py::test_llm_llama_lookahead_single_gpu_summary[llama-3.1-8b] SKIP (https://nvbugs/5246733)

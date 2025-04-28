@@ -1113,7 +1113,7 @@ def test_llm_llama_v1_2gpu_summary(llama_example_root, llama_model_root,
 
     print("Run summarize...")
     summary_cmd = [
-        f"{llama_example_root}/../summarize.py", "--test_trt_llm",
+        f"{llama_example_root}/../../../summarize.py", "--test_trt_llm",
         "--check_accuracy", f"--hf_model_dir={llama_model_root}",
         f"--engine_dir={engine_dir}", f"--num_beams={num_beams}",
         f"--dataset_dir={llm_datasets_root}", f"--rouge_dir={llm_rouge_root}"
@@ -1210,7 +1210,7 @@ def test_llm_llama_v1_1gpu_paged_kv_cache(llama_example_root, llama_model_root,
 
     print("Run inference")
     summary_cmd = [
-        f"{llama_example_root}/../summarize.py", "--test_trt_llm",
+        f"{llama_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", f"{llama_model_root}", "--data_type", "fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}",
         f"--num_beams={num_beams}", f"--dataset_dir={llm_datasets_root}",
@@ -4207,7 +4207,7 @@ def test_llm_llama_v3_1_1node_multi_gpus(llama_example_root, llama_model_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     gen_cmd = [
-        f"{llama_example_root}/../infinitebench/construct_synthetic_dataset.py",
+        f"{llama_example_root}/../../../infinitebench/construct_synthetic_dataset.py",
         "--test_case=build_passkey",
         "--test_level=3",
     ]
