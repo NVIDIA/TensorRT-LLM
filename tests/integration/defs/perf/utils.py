@@ -409,6 +409,8 @@ class AbstractPerfScriptTestClass(abc.ABC):
         self._gpu_clock_lock = gpu_clock_lock
         tmpDir = temp_wd(self.get_working_dir())
 
+        is_prepare_dataset_cmd = self._config.runtime == 'bench' and cmd_idx == 0
+
         # Start the timer.
         self._start_timestamp = datetime.utcnow()
         try:
@@ -422,16 +424,17 @@ class AbstractPerfScriptTestClass(abc.ABC):
                                 buf), self._gpu_clock_lock, tmpDir:
                             output = commands.run_cmd(cmd_idx, venv)
                             # Print the output log to buf.
-                            print(collect_and_clean_myelin_time(output))
+                            if not is_prepare_dataset_cmd:
+                                print(collect_and_clean_myelin_time(output))
                     else:
                         with contextlib.redirect_stdout(buf), tmpDir:
                             output = commands.run_cmd(cmd_idx, venv)
                             # Print the output log to buf.
-                            print(collect_and_clean_myelin_time(output))
+                            if not is_prepare_dataset_cmd:
+                                print(collect_and_clean_myelin_time(output))
 
                     # Print the output log to stdout and cache it.
-                    # skip the output log for prepare dataset command
-                    if 'prepare_dataset' not in commands.get_cmd_str(cmd_idx):
+                    if not is_prepare_dataset_cmd:
                         print(buf.getvalue())
                     outputs[cmd_idx] = buf.getvalue()
             else:
@@ -464,7 +467,7 @@ class AbstractPerfScriptTestClass(abc.ABC):
         # Only save perf result if the result is valid.
         if self._result_state == "valid":
             # Parse the perf result from the test outputs.
-            if self._config.runtime == 'bench' and cmd_idx == 0:
+            if is_prepare_dataset_cmd:
                 print_info(
                     f"skip writing perf result when calling generating dataset in trtllm-bench"
                 )
