@@ -293,8 +293,8 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
                 block_hashes.append(
                     block_key_hasher(tokens[t:t_end],
                                      None if t == 0 else block_hashes[-1]))
-            ctx_match_count = await ctx_blocks.match_blocks([block_hashes])
-            gen_match_count = await gen_blocks.match_blocks([block_hashes])
+            ctx_match_count = await ctx_blocks.matched_tokens([block_hashes])
+            gen_match_count = await gen_blocks.matched_tokens([block_hashes])
             ctx_evicted = False
             gen_evicted = False
             for event in ctx_events:
