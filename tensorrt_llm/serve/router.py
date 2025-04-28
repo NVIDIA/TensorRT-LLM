@@ -96,13 +96,14 @@ class KvCacheAwareServerState(ServerState):
             events_raw = await response.json()
         return events_raw
 
-    async def match_blocks(self, block_hashes: list[list[int]]) -> int:
+    async def matched_tokens(self, block_hashes: list[list[int]]) -> int:
         match_count = 0
         async with self._lock:
             for hash_list in block_hashes:
                 for hash in hash_list:
+                    # TODO: 1) parent hash verification, 2) partial matching
                     if hash in self._kv_cache_block_table:
-                        match_count += 1
+                        match_count += self._tokens_per_block
                     else:
                         break
         return match_count
@@ -268,7 +269,9 @@ class KvCacheAwareRouter(Router):
                     block_key_hasher(token_list[t:t_end],
                                      None if t == 0 else hash_list[-1]))
             block_hashes.append(hash_list)
-        total_blocks = sum(len(hash_list) for hash_list in block_hashes)
+        padded_tokens = sum(
+            len(hash_list)
+            for hash_list in block_hashes) * self._tokens_per_block
         # select the server by (KV match - load)
         # TODO: more options
         workloads = [
@@ -280,20 +283,19 @@ class KvCacheAwareRouter(Router):
         for i in range(len(servers)):
             server = servers[i]
             # https://github.com/ai-dynamo/dynamo/blob/main/docs/kv_cache_routing.md#kv-cache-routing-and-load-balancing
-            match_count = await self._server_state[server].match_blocks(
-                block_hashes)
-            score = match_count / total_blocks - workloads[
+            matches.append(
+                await self._server_state[server].matched_tokens(block_hashes))
+            score = matches[-1] / padded_tokens - workloads[
                 i] / self._max_batch_size
             scores.append(score)
-            matches.append(match_count)
         server = servers[scores.index(max(scores))]
         await self._server_state[server].increment_load(request)
         async with self._lock:
             self._req_routing_table[id(request)] = server
         return server, {
-            "block_hashes": block_hashes,
-            "token_lists": token_lists,
-            "matches": matches,
+            "block_hashes": block_hashes,  # list[list[int]]
+            "token_lists": token_lists,  # list[list[int]]
+            "matches": matches,  # list[int]
         }
 
     async def finish_request(self,
