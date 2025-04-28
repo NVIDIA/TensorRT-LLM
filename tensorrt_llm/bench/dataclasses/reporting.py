@@ -527,7 +527,7 @@ class ReportUtility:
                 f"{tpot_stats}\n"
                 "\n-- Per-Request Time-to-First-Token [TTFT] Breakdown (ms) \n\n"
                 f"{ttft_stats}\n"
-                "\n-- Per-Request Generation Throughput Breakdown (tps/user)\n\n"
+                "\n-- Per-Request Generation Throughput [GTPS] Breakdown (tps/user)\n\n"
                 f"{gen_tps_stats}\n")
 
         perf_stats += (
