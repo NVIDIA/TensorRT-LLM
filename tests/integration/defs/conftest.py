@@ -709,8 +709,16 @@ def llm_venv(llm_root, custom_user_workspace):
         workspace_dir = "llm-test-workspace"
     workspace_dir = os.path.join(workspace_dir, subdir)
     from defs.local_venv import PythonVenvRunnerImpl
-    return PythonVenvRunnerImpl("", "", "python3",
+    venv = PythonVenvRunnerImpl("", "", "python3",
                                 os.path.join(os.getcwd(), workspace_dir))
+    yield venv
+    # Remove the workspace directory
+    if os.path.exists(workspace_dir):
+        print(f"Cleaning up workspace: {workspace_dir}")
+        try:
+            shutil.rmtree(workspace_dir)
+        except Exception as e:
+            print(f"Failed to clean up workspace: {e}")
 
 
 @pytest.fixture(scope="session")
