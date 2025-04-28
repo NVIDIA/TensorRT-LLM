@@ -14,6 +14,7 @@ class SpeculativeDecodingMode(IntEnum):
     MTP = auto()
     MTP_EAGLE = auto()
     EAGLE3 = auto()
+    EAGLE3_ONE_MODEL = auto()
     NONE = auto()
 
     def is_mtp(self):
@@ -25,17 +26,30 @@ class SpeculativeDecodingMode(IntEnum):
     def is_eagle3(self):
         return self == SpeculativeDecodingMode.EAGLE3
 
+    def is_eagle3_one_model(self):
+        return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
+
     def is_none(self):
         return self == SpeculativeDecodingMode.NONE
 
     def without_logits(self):
-        return self.is_mtp()
+        return self.is_mtp() or self.is_eagle3_one_model()
 
     def needs_kv_cache_rewind(self):
-        return self.is_mtp()
+        return self.is_mtp() or self.is_eagle3_one_model()
 
     def support_overlap_scheduler(self):
-        return self.is_mtp()
+        return self.is_mtp() or self.is_eagle3_one_model()
+
+    def has_draft_model(self):
+        return self.is_eagle3()
+
+    def need_load_draft_weights(self):
+        """
+        Whether the draft model and target model are in the same model engine,
+        and the draft model needs to load weights from the seperate checkpoint.
+        """
+        return self.is_eagle3_one_model()
 
     def extend_ctx(self):
         """
@@ -65,6 +79,8 @@ class SpecConfig:
     spec_dec_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
     # The max number of draft tokens
     max_draft_tokens: int = 1024
+    # The path to the draft model
+    draft_model_path: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.spec_dec_mode = SpeculativeDecodingMode.from_string(
@@ -122,7 +138,7 @@ class SpecMetadata:
     num_extra_kv_tokens: Optional[int] = 0  # Number of layers in target model
     num_layers: int = 0
 
-    def prepare():
+    def prepare(self):
         """
         Hook to be called before the forward step of the model.
         """

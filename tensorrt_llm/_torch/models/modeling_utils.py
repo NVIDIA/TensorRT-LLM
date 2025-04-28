@@ -475,7 +475,7 @@ class DecoderModelForCausalLM(nn.Module,
             return_context_logits,
         )
 
-    def load_weights(self, weights: Dict):
+    def load_weights(self, weights: Dict, skip_modules: List[str] = []):
         tp_size = self.model_config.mapping.tp_size
         head_dim = self.config.hidden_size // self.config.num_attention_heads
 
@@ -495,6 +495,10 @@ class DecoderModelForCausalLM(nn.Module,
         for name, module in tqdm(list(self.named_modules()),
                                  desc="Loading weights"):
             if len(module._parameters) > 0:
+                # skip load weights if module is in skip_modules
+                if any(skip_module in name for skip_module in skip_modules):
+                    continue
+
                 # skip load weights if tie word embeddings is enabled and layer is lm_head
                 if self.config.tie_word_embeddings and name.startswith(
                         "lm_head"):

@@ -303,6 +303,11 @@ class Linear(nn.Module):
                                                    dtype=torch.float32,
                                                    device=device),
                                        requires_grad=False)
+            elif qc.quant_algo is None:
+                self.weight = Parameter(torch.empty(weight_shape,
+                                                    dtype=self.dtype,
+                                                    device=device),
+                                        requires_grad=False)
             else:
                 # TODO(zhenhuanc): support other quant mode
                 raise ValueError(f'unsupported quant mode: {qc.quant_mode}')
@@ -321,12 +326,13 @@ class Linear(nn.Module):
             self.register_parameter("bias", None)
         self._weights_created = True
 
-    def apply_linear(self,
-                     input,
-                     weight,
-                     bias,
-                     inv_input_scale: Optional[torch.Tensor] = None,
-                     position_ids: Optional[torch.LongTensor] = None,
+    def apply_linear(
+        self,
+        input,
+        weight,
+        bias,
+        inv_input_scale: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         if self.has_any_quant:
             qc = self.quant_config
@@ -389,6 +395,15 @@ class Linear(nn.Module):
                                                      self.dtype)
                 if bias is not None:
                     output = output + bias
+            elif qc.quant_algo is None:
+                # TODO: remove custom cublas_mm when default heuristics is good enough
+                if self.use_custom_cublas_mm:
+                    output = torch.ops.trtllm.cublas_mm(input,
+                                                        self.weight.t(),
+                                                        bias,
+                                                        out_dtype=None)
+                else:
+                    output = F.linear(input, self.weight, bias)
             else:
                 # TODO(zhenhuanc): support other quant mode
                 raise ValueError(f'unsupported quant mode: {qc.quant_mode}')
