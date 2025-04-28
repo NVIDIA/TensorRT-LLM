@@ -557,10 +557,13 @@ public:
     void releaseLastBlock(GenerationRequest& sequence);
 
     //! \brief Cache block offsets for the sequence
-    void cacheBlockOffsets(GenerationRequest& sequence);
+    void cacheBlockOffsets(GenerationRequest& sequence) const;
+
+    //! \brief Detach block from the sequence
+    void detachBlock(GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength, bool const enableBlockReuse);
 
     //! \brief Cache new block offsets for the sequence
-    void cacheNewBlockOffsets(GenerationRequest& sequence);
+    void cacheNewBlockOffsets(GenerationRequest& sequence) const;
 
     //! \brief Update the sequence blocks when a new token is added or removed
     void updateSequenceBlocks(GenerationRequest& sequence, bool const addToken, SizeType32 const sinkBlockTokenLength,
@@ -880,7 +883,7 @@ public:
 
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
 
-    void cacheBlockOffsets(GenerationRequest& sequence, SizeType32 windowSize);
+    void cacheBlockOffsets(GenerationRequest& sequence, SizeType32 windowSize) const;
 
     void updateSequenceBlocks(GenerationRequest& sequence, bool const addToken, SizeType32 const sinkBlockTokenLength,
         bool const isCrossKv, bool const enableBlockReuse);

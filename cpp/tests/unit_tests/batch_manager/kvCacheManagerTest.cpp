@@ -113,6 +113,7 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
     auto constexpr maxNumSequences = 8;
     auto const stream = std::make_shared<tr::CudaStream>();
     auto constexpr onboardBlocks = true;
+    auto constexpr shareLastContextBlock = false;
 
     auto constexpr beamWidth = 8;
     auto constexpr numBlocksPerBeam = blocksInPrimaryPool / beamWidth;
@@ -131,7 +132,7 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
 
     auto constexpr requestId = 42;
     GenerationRequest seq0{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    blockManager.addSequence(seq0, numBlocksPerBeam, false, maxAttentionWindow);
+    blockManager.addSequence(seq0, numBlocksPerBeam, shareLastContextBlock, maxAttentionWindow);
     auto constexpr occupiedBlocks = (numBlocksPerBeam - 1) + beamWidth;
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - occupiedBlocks);
     auto const& ids = seq0.getCacheBlockIds(maxAttentionWindow);
@@ -160,15 +161,17 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
     // occupy 22/24 blocks
-    EXPECT_NO_THROW(blockManager.addSequence(seq0, numBlocksPerBeam, false, maxAttentionWindow));
+    EXPECT_NO_THROW(blockManager.addSequence(seq0, numBlocksPerBeam, shareLastContextBlock, maxAttentionWindow));
     GenerationRequest seq1{requestId + 1, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    EXPECT_NO_THROW(blockManager.addSequence(seq1, numBlocksPerBeam, false, maxAttentionWindow));
+    EXPECT_NO_THROW(blockManager.addSequence(seq1, numBlocksPerBeam, shareLastContextBlock, maxAttentionWindow));
     // same requestId not allowed
     GenerationRequest seq2{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    EXPECT_THROW(blockManager.addSequence(seq2, numBlocksPerBeam, false, maxAttentionWindow), std::runtime_error);
+    EXPECT_THROW(blockManager.addSequence(seq2, numBlocksPerBeam, shareLastContextBlock, maxAttentionWindow),
+        std::runtime_error);
     // no more blocks
     GenerationRequest seq3{requestId + 2, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    EXPECT_THROW(blockManager.addSequence(seq3, numBlocksPerBeam, false, maxAttentionWindow), std::runtime_error);
+    EXPECT_THROW(blockManager.addSequence(seq3, numBlocksPerBeam, shareLastContextBlock, maxAttentionWindow),
+        std::runtime_error);
 }
 
 template <typename T, nvinfer1::DataType type, int mask>

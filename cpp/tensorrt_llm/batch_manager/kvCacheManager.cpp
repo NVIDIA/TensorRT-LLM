@@ -1387,8 +1387,6 @@ void WindowBlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<
     TLLM_CHECK(node);
     auto& sequenceBlocks = node.mapped();
 
-    // TODO: refactor this method in two: store blocks for reuse and just 'release blocks'. Only the caller
-    // can know which blocks to store for reuse and which to just release.
     // When releasing the blocks for a sequence, we store those blocks for potential reuse only if:
     // - Block reuse is enabled.
     // - A request was provided to this function call to identify which tokens these blocks cover
@@ -1725,12 +1723,12 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
     return (numTotalBlocksPerBeam - numAllocBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
 }
 
-void BlockManager::cacheBlockOffsets(GenerationRequest& sequence, SizeType32 windowSize)
+void BlockManager::cacheBlockOffsets(GenerationRequest& sequence, SizeType32 windowSize) const
 {
     mWindowBlockManagers.at(windowSize).cacheBlockOffsets(sequence);
 }
 
-void WindowBlockManager::cacheBlockOffsets(GenerationRequest& sequence)
+void WindowBlockManager::cacheBlockOffsets(GenerationRequest& sequence) const
 {
     auto const& cacheBlocks = sequence.getCacheBlockIds(mWindowSize);
     auto& cacheBlocksTensor = sequence.getCacheBlockIndices(mWindowSize);
@@ -1750,7 +1748,56 @@ void WindowBlockManager::cacheBlockOffsets(GenerationRequest& sequence)
     }
 }
 
-void WindowBlockManager::cacheNewBlockOffsets(GenerationRequest& sequence)
+void WindowBlockManager::detachBlock(
+    GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength, bool const enableBlockReuse)
+{
+    // Get the block to detach from sequence
+    auto const requestId = sequence.getRequestId();
+    auto const beamWidth = sequence.getBeamWidth();
+    auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
+    SizeType32 outOfWindowBlockIdx = sinkBlockTokenLength / getTokensPerBlock();
+
+    auto const storeBlocksForReuse
+        = enableBlockReuse && beamWidth == 1 && !sequence.getContextRequiresSlidingWindowKvCache();
+
+    for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+    {
+        auto outOfWindowBlock = allocatedBlocks.at(outOfWindowBlockIdx * beamWidth + beamIdx);
+
+        // Decrease ref count
+        outOfWindowBlock->decRefCount();
+
+        // If block has no refs, evict / offload it based on block reuse
+        if (!outOfWindowBlock->hasRefs())
+        {
+            if (storeBlocksForReuse)
+            {
+                // If possible, offload the out-of-window block to secondary cache to save primary memory.
+                // Block can be released only after it is added to radix tree for reuse search, which is done
+                // after sequence is complete. Otherwise, we will create ophaned blocks and/or blocks that can't
+                // be freed since they are not leaf blocks.
+                if (getNumFreeBlocks(kSecondaryLevel) > 0)
+                {
+                    offloadBlock(outOfWindowBlock);
+                }
+            }
+            else
+            {
+                mEvictionPolicy->releaseBlock(outOfWindowBlock);
+                removeBlockFromHashMap(outOfWindowBlock);
+            }
+        }
+    }
+
+    // Disconnect first block from sequence
+    // Remove block from allocated blocks
+    allocatedBlocks.erase(allocatedBlocks.begin() + outOfWindowBlockIdx * beamWidth,
+        allocatedBlocks.begin() + (outOfWindowBlockIdx + 1) * beamWidth);
+    // Remove stored block ids in sequence
+    sequence.removeBlock(outOfWindowBlockIdx, mWindowSize);
+}
+
+void WindowBlockManager::cacheNewBlockOffsets(GenerationRequest& sequence) const
 {
     auto const& cacheBlocks = sequence.getCacheBlockIds(mWindowSize);
     auto& cacheBlocksTensor = sequence.getCacheBlockIndices(mWindowSize);
@@ -1797,50 +1844,7 @@ void WindowBlockManager::updateSequenceBlocks(GenerationRequest& sequence, bool 
 
         if (canDetachBlock)
         {
-            // Get the block to detach from sequence
-            auto const requestId = sequence.getRequestId();
-            auto const beamWidth = sequence.getBeamWidth();
-            auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
-            SizeType32 outOfWindowBlockIdx = sinkBlockTokenLength / getTokensPerBlock();
-
-            auto const storeBlocksForReuse
-                = enableBlockReuse && beamWidth == 1 && !sequence.getContextRequiresSlidingWindowKvCache();
-
-            for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
-            {
-                auto outOfWindowBlock = allocatedBlocks.at(outOfWindowBlockIdx * beamWidth + beamIdx);
-
-                // Decrease ref count
-                outOfWindowBlock->decRefCount();
-
-                // If block has no refs, evict / offload it based on block reuse
-                if (!outOfWindowBlock->hasRefs())
-                {
-                    if (storeBlocksForReuse)
-                    {
-                        // If possible, offload the out-of-window block to secondary cache to save primary memory.
-                        // Block can be released only after it is added to radix tree for reuse search, which is done
-                        // after sequence is complete. Otherwise, we will create ophaned blocks and/or blocks that can't
-                        // be freed since they are not leaf blocks.
-                        if (getNumFreeBlocks(kSecondaryLevel) > 0)
-                        {
-                            offloadBlock(outOfWindowBlock);
-                        }
-                    }
-                    else
-                    {
-                        mEvictionPolicy->releaseBlock(outOfWindowBlock);
-                        removeBlockFromHashMap(outOfWindowBlock);
-                    }
-                }
-            }
-
-            // Disconnect first block from sequence
-            // Remove block from allocated blocks
-            allocatedBlocks.erase(allocatedBlocks.begin() + outOfWindowBlockIdx * beamWidth,
-                allocatedBlocks.begin() + (outOfWindowBlockIdx + 1) * beamWidth);
-            // Remove stored block ids in sequence
-            sequence.removeBlock(outOfWindowBlockIdx, mWindowSize);
+            detachBlock(sequence, sinkBlockTokenLength, enableBlockReuse);
         }
 
         if (shouldAllocateBlock)
