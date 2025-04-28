@@ -90,11 +90,11 @@ python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MT
 `N` is the number of MTP modules. When `N` is equal to `0`, which means that MTP is not used (default). When `N` is greater than `0`, which means that `N` MTP modules are enabled. In the current implementation, the weight of each MTP module is shared.
 
 ### Long context support
-DeepSeek-V3 model can support up to 128k context length. The following shows how to benchmark 64k and 128k input_seq_length using trtllm-bench on B200. 
+DeepSeek-V3 model can support up to 128k context length. The following shows how to benchmark 64k and 128k input_seq_length using trtllm-bench on B200.
 To avoid OOM (out of memory) error, you need to adjust the values of "--max_batch_size", "--max_num_tokens" and "--kv_cache_free_gpu_mem_fraction".
 #### ISL-64k-OSL-1024
 ```bash
-DS_R1_NVFP4_MODEL_PATH=/path/to/DeepSeek-R1 
+DS_R1_NVFP4_MODEL_PATH=/path/to/DeepSeek-R1
 python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
         --stdout --tokenizer ${DS_R1_NVFP4_MODEL_PATH} \
         token-norm-dist \
@@ -118,12 +118,12 @@ trtllm-bench -m deepseek-ai/DeepSeek-R1 --model_path ${DS_R1_NVFP4_MODEL_PATH} t
         --max_batch_size 12 \
         --max_num_tokens 65548 \
         --kv_cache_free_gpu_mem_fraction 0.6 \
-        --extra_llm_api_options /tmp/extra-llm-api-config.yml 
+        --extra_llm_api_options /tmp/extra-llm-api-config.yml
 ```
 
 #### ISL-128k-OSL-1024
 ```bash
-DS_R1_NVFP4_MODEL_PATH=/path/to/DeepSeek-R1 
+DS_R1_NVFP4_MODEL_PATH=/path/to/DeepSeek-R1
 python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
         --stdout --tokenizer ${DS_R1_NVFP4_MODEL_PATH} \
         token-norm-dist \
@@ -148,7 +148,7 @@ trtllm-bench -m deepseek-ai/DeepSeek-R1 --model_path ${DS_R1_NVFP4_MODEL_PATH} t
         --max_batch_size 2 \
         --max_num_tokens 131074 \
         --kv_cache_free_gpu_mem_fraction 0.3 \
-        --extra_llm_api_options /tmp/extra-llm-api-config.yml 
+        --extra_llm_api_options /tmp/extra-llm-api-config.yml
 ```
 
 ## Evaluation
