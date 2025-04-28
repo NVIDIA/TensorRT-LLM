@@ -160,7 +160,7 @@ def parse_test_list_lines(test_list, lines, test_prefix):
         test_name = full_prefix + test_name
         test_name = parse_test_name(test_name)
 
-        return (test_name, marker, reason)
+        return (test_name, marker, reason, timeout)
 
     parsed_test_list = map(parse_test_line, enumerate(lines))
     parsed_test_list = list(filter(lambda x: x[0] is not None,
