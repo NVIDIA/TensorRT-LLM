@@ -49,6 +49,7 @@ add_library(
   fp4Op.cpp
   fp4Gemm.cpp
   fp4GemmTrtllmGen.cpp
+  fp8BatchedGemmTrtllmGen.cpp
   fp4Quantize.cpp
   fp4BatchedQuantize.cpp
   fp8BlockScalingGemm.cpp
@@ -58,7 +59,9 @@ add_library(
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
   moeOp.cpp
+  moeCommOp.cpp
   fp8BlockScaleMoe.cpp
+  fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
   ncclCommunicatorOp.cpp
   parallelDecodeKVCacheUpdateOp.cpp
@@ -69,7 +72,8 @@ add_library(
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
   weightOnlyQuantOp.cpp
-  mtpOp.cpp)
+  mtpOp.cpp
+  loraOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(th_common PRIVATE ${TORCH_LIBRARIES} th_utils
                                         ${Python3_LIBRARIES} ${SHARED_TARGET})

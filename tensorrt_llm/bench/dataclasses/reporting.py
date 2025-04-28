@@ -162,6 +162,7 @@ class ReportUtility:
             logger (Logger): A logger for logging.
             streaming (bool, optional): Streaming benchmark used. Defaults to False.
         """
+        self.raw_statistics = statistics
         self.statistics = statistics.generate_statistics_summary()
         self.dataset_metadata = dataset_metadata
         self.rt_cfg = rt_cfg
@@ -211,6 +212,13 @@ class ReportUtility:
         """Output throughput per user in tokens per second."""
         return self.convert_rate_to_s(
             self.statistics.output_throughput_tok_ns_per_user)
+
+    def get_output_tokens(self, tokenizer) -> Dict[int, List[str]]:
+        retval = {}
+        for req_id, request in self.raw_statistics.requests.items():
+            output_str = tokenizer.decode(request.tokens)
+            retval[req_id] = output_str
+        return dict(sorted(retval.items()))
 
     def get_statistics_dict(self) -> Dict[str, Any]:
         """Get statistics as a dictionary.
@@ -264,7 +272,9 @@ class ReportUtility:
                 "backend":
                 "Pytorch",
                 "dtype":
-                torch_dtype_to_str(model_config.pretrained_config.torch_dtype),
+                torch_dtype_to_str(
+                    model_config.pretrained_config.torch_dtype
+                    or model_config.pretrained_config.text_config.torch_dtype),
                 "kv_cache_dtype":
                 model_config.quant_config.kv_cache_quant_algo,
                 "quantization":

@@ -110,6 +110,7 @@ cat >./extra-llm-api-config.yml<<EOF
 pytorch_backend_config:
     enable_overlap_scheduler: true
     use_cuda_graph: true
+    moe_backend: TRTLLM
 speculative_config:
     decoding_type: MTP
     num_nextn_predict_layers: 3
@@ -125,7 +126,7 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
     --concurrency 1 \
     --max_batch_size 1 \
     --tp 8 \
-    --ep 4 \
+    --ep 2 \
     --extra_llm_api_options ./extra-llm-api-config.yml
 ```
 
@@ -147,12 +148,13 @@ The perf can be different when using different datasets and different machines.
 ===========================================================
 = PERFORMANCE OVERVIEW
 ===========================================================
-Request Throughput (req/sec):                     0.1244
-Total Output Throughput (tokens/sec):             254.5535
-Per User Output Throughput (tokens/sec/user):     254.7634
-Per GPU Output Throughput (tokens/sec/gpu):       31.8192
-Total Latency (ms):                               80368.1616
-Average request latency (ms):                     8036.7546
+Request Throughput (req/sec):                     0.1341
+Total Output Throughput (tokens/sec):             274.4168
+Per User Output Throughput (tokens/sec/user):     274.7188
+Per GPU Output Throughput (tokens/sec/gpu):       34.3021
+Total Token Throughput (tokens/sec):              414.0461
+Total Latency (ms):                               74561.7520
+Average request latency (ms):                     7456.1219
 ```
 
 ### B200 max-throughput

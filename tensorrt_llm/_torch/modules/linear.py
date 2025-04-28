@@ -108,6 +108,8 @@ def load_weight_scales_nvfp4(weights: List[Dict],
     weight_scale_2 = None
     weight_scale = []
 
+    device = torch.device("cuda")
+
     for w in weights:
         if "input_scale" in w:
             if input_scale is None:
@@ -116,8 +118,11 @@ def load_weight_scales_nvfp4(weights: List[Dict],
                 assert input_scale == w["input_scale"][
                     ...], "The input_scale should be same for all the weights"
         if "weight_scale" in w:
-            ws = load_weight_shard(w["weight_scale"], tp_size, tp_rank,
-                                   tp_mode).contiguous()
+            ws = load_weight_shard(w["weight_scale"],
+                                   tp_size,
+                                   tp_rank,
+                                   tp_mode,
+                                   device=device).contiguous()
             assert ws.dtype == torch.float8_e4m3fn  # TODO: or e8m0 for mxfp4 recipe?
             weight_scale.append(ws.view(fp4_utils.float4_sf_dtype))
         if "weight_scale_2" in w:
@@ -146,11 +151,11 @@ class Linear(nn.Module):
         dtype: torch.dtype = None,
         mapping: Optional[Mapping] = None,
         tensor_parallel_mode: Optional[TensorParallelMode] = None,
-        gather_output: bool = False,
+        gather_output: bool = False,  # COLUMN parallel only
         quant_config: Optional[QuantConfig] = None,
         weights_loading_config: Optional[WeightsLoadingConfig] = None,
-        is_expert: bool = False,
-        skip_create_weights: bool = False,
+        reduce_output: bool = True,  # ROW parallel only
+        skip_create_weights_in_init: bool = False,
         use_custom_cublas_mm: bool = False,
     ):
         from ..distributed import AllReduce
@@ -188,12 +193,12 @@ class Linear(nn.Module):
         self.in_features = local_in_features
         self.out_features = local_out_features
 
-        self.all_reduce = AllReduce(self.mapping) if not is_expert else None
+        self.all_reduce = AllReduce(self.mapping) if reduce_output else None
         self._weights_created = False
-        self.is_expert = is_expert
+        self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm
 
-        if not skip_create_weights:
+        if not skip_create_weights_in_init:
             self.create_weights()
 
     def create_weights(self):
@@ -204,7 +209,7 @@ class Linear(nn.Module):
         self.has_any_quant = False
         self.has_fp8_qdq = False
         self.has_fp8_block_scales = False
-        self.has_nv_fp4 = False
+        self.has_nvfp4 = False
         # only _create_weights, and load quantized weight directly.
         if self.quant_config and self.quant_config.layer_quant_mode.has_any_quant(
         ):
@@ -251,7 +256,7 @@ class Linear(nn.Module):
                                                  requires_grad=False)
 
             elif qc.layer_quant_mode.has_nvfp4():
-                self.has_nv_fp4 = True
+                self.has_nvfp4 = True
                 self.scaling_vector_size = 16
                 assert self.in_features % self.scaling_vector_size == 0, f"in_features {self.in_features} must be divisible by scaling_vector_size {self.scaling_vector_size}"
 
@@ -337,7 +342,7 @@ class Linear(nn.Module):
                     act_input_fp8, self.weight, act_input_sf, self.weight_scale)
                 if bias is not None:
                     output = output + bias
-            elif self.has_nv_fp4:
+            elif self.has_nvfp4:
                 if isinstance(input, Fp4QuantizedTensor):
                     act_fp4, act_sf = input.fp4_tensor, input.scaling_factor
                 else:
@@ -365,6 +370,23 @@ class Linear(nn.Module):
                 output = F.linear(input, self.weight, bias)
         return output
 
+    def _maybe_fuse_bias_into_allreduce(
+        self,
+        bias: Optional[torch.Tensor],
+        all_reduce_params: Optional[AllReduceParams] = None,
+    ) -> bool:
+        if self.tp_size > 1:
+            fuse_bias_into_all_reduce = (
+                bias is not None and all_reduce_params is not None
+                and (all_reduce_params.fusion_op
+                     == AllReduceFusionOp.RESIDUAL_RMS_NORM))
+            if fuse_bias_into_all_reduce:
+                all_reduce_params.bias = bias
+                return True
+        else:
+            assert all_reduce_params is None or all_reduce_params.enable_allreduce is False, "Cannot fuse norm/residual/bias ops into allreduce op since we do not call allreduce op when tp_size is 1."
+            return False
+
     def forward(
         self,
         input: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -375,17 +397,10 @@ class Linear(nn.Module):
 
         if self.tp_mode == TensorParallelMode.ROW:
             bias = None if (self.tp_rank > 0) else self.bias
-            if not self.is_expert:
-                if self.tp_size > 1:
-                    fuse_bias_into_all_reduce = (
-                        bias is not None and all_reduce_params is not None
-                        and (all_reduce_params.fusion_op
-                             == AllReduceFusionOp.RESIDUAL_RMS_NORM))
-                    if fuse_bias_into_all_reduce:
-                        all_reduce_params.bias = bias
-                        bias = None
-                else:
-                    assert all_reduce_params is None or all_reduce_params.enable_allreduce is False, "Cannot fuse norm/residual/bias ops into allreduce op since we do not call allreduce op when tp_size is 1."
+            if self.reduce_output:
+                fuse_bias = self._maybe_fuse_bias_into_allreduce(
+                    bias, all_reduce_params)
+                bias = None if fuse_bias else bias
                 output = self.apply_linear(input, self.weight, bias)
                 output = self.all_reduce(
                     output,
@@ -405,7 +420,7 @@ class Linear(nn.Module):
     def load_weights(self, weights: List[Dict]):
         assert self._weights_created
 
-        def copy(dst: Parameter, src: torch.Tensor):
+        def _copy(dst: Parameter, src: torch.Tensor):
             assert dst.dtype == src.dtype, f"Incompatible dtype. dst: {dst.dtype}, src: {src.dtype}"
             dst.data.copy_(src)
 
@@ -419,19 +434,19 @@ class Linear(nn.Module):
 
             weight = load_weight_shard(weights[0]['weight'], self.tp_size,
                                        self.tp_rank, self.tp_mode, device)
-            copy(self.weight, weight)
+            _copy(self.weight, weight)
 
             if self.bias is not None:
                 bias = load_weight_shard(weights[0]['bias'], self.tp_size,
                                          self.tp_rank, self.tp_mode, device)
-                copy(self.bias, bias)
+                _copy(self.bias, bias)
 
             if quant_mode:
                 if quant_mode.has_fp8_qdq():
                     input_scale, weight_scale = load_weight_scales_fp8_qdq(
                         weights)
-                    copy(self.input_scale, input_scale[0])
-                    copy(self.weight_scale, weight_scale[0])
+                    _copy(self.input_scale, input_scale[0])
+                    _copy(self.weight_scale, weight_scale[0])
                     self.inv_input_scale.data = 1.0 / self.input_scale
                 elif quant_mode.has_nvfp4():
                     input_scale, weight_scale, alpha = load_weight_scales_nvfp4(
@@ -444,10 +459,10 @@ class Linear(nn.Module):
                     # Swizzle weight scale
                     weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
                         weight_scale)
-                    copy(self.input_scale, input_scale)
-                    copy(self.weight_scale, weight_scale)
+                    _copy(self.input_scale, input_scale)
+                    _copy(self.weight_scale, weight_scale)
                     self.inv_input_scale.data = self.input_scale / E2M1_MAX
-                    copy(self.alpha, alpha)
+                    _copy(self.alpha, alpha)
 
                 elif quant_mode.has_fp8_block_scales():
                     # `weight_scale_inv` for DS recipe and  `weight_scale` for ModelOpt recipe.
@@ -458,9 +473,9 @@ class Linear(nn.Module):
                     weight_scale = load_weight_shard(weights[0][scale_name],
                                                      self.tp_size, self.tp_rank,
                                                      self.tp_mode, device)
-                    copy(self.weight_scale, weight_scale)
+                    _copy(self.weight_scale, weight_scale)
                     if "input_scale" in weights[0]:
-                        copy(self.input_scale, weights[0]["input_scale"])
+                        _copy(self.input_scale, weights[0]["input_scale"])
                         self.inv_input_scale.data = 1.0 / self.input_scale
 
         elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
@@ -477,8 +492,8 @@ class Linear(nn.Module):
                 if quant_mode.has_fp8_qdq():
                     input_scale, weight_scale = load_weight_scales_fp8_qdq(
                         weights)
-                    copy(self.input_scale, max(input_scale))
-                    copy(self.weight_scale, max(weight_scale))
+                    _copy(self.input_scale, max(input_scale))
+                    _copy(self.weight_scale, max(weight_scale))
                     q_weight = q_weight.to(self.dtype) * weight_scale[0]
                     k_weight = k_weight.to(self.dtype) * weight_scale[1]
                     v_weight = v_weight.to(self.dtype) * weight_scale[2]
@@ -492,9 +507,9 @@ class Linear(nn.Module):
                     weight_scale = torch.cat(weight_scale, 0)
                     weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
                         weight_scale)
-                    copy(self.input_scale, input_scale)
-                    copy(self.weight_scale, weight_scale)
-                    copy(self.alpha, alpha)
+                    _copy(self.input_scale, input_scale)
+                    _copy(self.weight_scale, weight_scale)
+                    _copy(self.alpha, alpha)
                 elif quant_mode.has_fp8_block_scales():
                     scale_name = "weight_scale_inv"
                     if scale_name not in weights[0]:
@@ -510,7 +525,7 @@ class Linear(nn.Module):
                                                 self.tp_mode).contiguous()
                     fused_fp8_block_scale = torch.cat(
                         (q_scale, k_scale, v_scale))
-                    copy(self.weight_scale, fused_fp8_block_scale)
+                    _copy(self.weight_scale, fused_fp8_block_scale)
 
             fused_weight = torch.cat((q_weight, k_weight, v_weight))
 
@@ -518,7 +533,7 @@ class Linear(nn.Module):
                 fused_weight = (fused_weight / self.weight_scale).to(
                     torch.float8_e4m3fn)
 
-            copy(self.weight, fused_weight)
+            _copy(self.weight, fused_weight)
 
             if self.bias is not None:
                 q_bias = load_weight_shard(weights[0]['bias'], self.tp_size,
@@ -527,7 +542,7 @@ class Linear(nn.Module):
                                            self.tp_rank, self.tp_mode, device)
                 v_bias = load_weight_shard(weights[2]['bias'], self.tp_size,
                                            self.tp_rank, self.tp_mode, device)
-                copy(self.bias, torch.cat((q_bias, k_bias, v_bias)))
+                _copy(self.bias, torch.cat((q_bias, k_bias, v_bias)))
         elif weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
             assert len(weights) == 2
 
@@ -539,8 +554,8 @@ class Linear(nn.Module):
                 if quant_mode.has_fp8_qdq():
                     input_scale, weight_scale = load_weight_scales_fp8_qdq(
                         weights)
-                    copy(self.input_scale, max(input_scale))
-                    copy(self.weight_scale, max(weight_scale))
+                    _copy(self.input_scale, max(input_scale))
+                    _copy(self.weight_scale, max(weight_scale))
                     gate_weight = gate_weight.to(self.dtype) * weight_scale[0]
                     up_weight = up_weight.to(self.dtype) * weight_scale[1]
                 elif quant_mode.has_nvfp4():
@@ -553,9 +568,9 @@ class Linear(nn.Module):
                     weight_scale = torch.cat(weight_scale, 0)
                     weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
                         weight_scale)
-                    copy(self.input_scale, input_scale)
-                    copy(self.weight_scale, weight_scale)
-                    copy(self.alpha, alpha)
+                    _copy(self.input_scale, input_scale)
+                    _copy(self.weight_scale, weight_scale)
+                    _copy(self.alpha, alpha)
                 elif quant_mode.has_fp8_block_scales():
                     scale_name = "weight_scale_inv"
                     if scale_name not in weights[0]:
@@ -567,7 +582,7 @@ class Linear(nn.Module):
                                                     self.tp_size, self.tp_rank,
                                                     self.tp_mode, device)
                     fused_scale = torch.cat([left_scale, right_scale], dim=0)
-                    copy(self.weight_scale, fused_scale)
+                    _copy(self.weight_scale, fused_scale)
 
             fused_weight = torch.cat((gate_weight, up_weight))
 
@@ -575,7 +590,7 @@ class Linear(nn.Module):
                 fused_weight = (fused_weight / self.weight_scale).to(
                     torch.float8_e4m3fn)
 
-            copy(self.weight, fused_weight)
+            _copy(self.weight, fused_weight)
 
             if self.bias is not None:
                 gate_bias = load_weight_shard(weights[0]['bias'], self.tp_size,
@@ -583,6 +598,6 @@ class Linear(nn.Module):
                                               device)
                 up_bias = load_weight_shard(weights[1]['bias'], self.tp_size,
                                             self.tp_rank, self.tp_mode, device)
-                copy(self.bias, torch.cat((up_bias, gate_bias)))
+                _copy(self.bias, torch.cat((up_bias, gate_bias)))
         else:
             raise ValueError(f'unsupported weight mode: {weight_mode}')

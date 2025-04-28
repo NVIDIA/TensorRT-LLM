@@ -312,7 +312,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         sampling_params: SamplingParams,
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data, mm_processor_kwargs = inputs.get("prompt"), \
-                        inputs.get("multi_modal_data"), inputs.get("mm_processor_kwargs", {})
+                        inputs.get("multi_modal_data", {}), inputs.get("mm_processor_kwargs", {})
 
         # NOTE: Since we are passed in Tensor images, we don't need to rescale them.
         mm_processor_kwargs['do_rescale'] = False
@@ -417,7 +417,8 @@ class Qwen2VLModelBase(PreTrainedModel):
         assert mm_embed == [] or len(
             mm_embed) == num_context_requests, error_msg
 
-        input_ids, input_embeds = fuse_input_embeds(self, input_ids, mm_embed)
+        input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
+                                                    input_ids, mm_embed)
 
         mrope_config = kwargs.get("mrope_config", {})
         if mrope_config:
@@ -437,10 +438,7 @@ class Qwen2VLModelBase(PreTrainedModel):
             inputs_embeds=input_embeds,
             return_context_logits=return_context_logits,
             mrope_config=mrope_config)
-        logger.debug(
-            f"output_ids: {(output_prob if output_prob.dim() == 2 else output_prob.unsqueeze(0)).argmax(dim=1).tolist()}"
-        )
-        logger.info(f'output shape: {output_prob.shape}')
+        logger.debug(f'output shape: {output_prob.shape}')
         return output_prob
 
 

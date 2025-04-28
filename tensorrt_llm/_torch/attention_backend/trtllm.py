@@ -11,7 +11,6 @@ from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
                         AttentionMetadata, KVCacheParams, MLAParams,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
                         RopeParams)
-from .vanilla import VanillaAttention
 
 
 @dataclass(kw_only=True, init=False)
@@ -69,7 +68,6 @@ class TrtllmAttentionWrapper:
         head_size: int,
         num_kv_heads: Optional[int] = None,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
-        quant_config: Optional[QuantConfig] = None,
         q_scaling: Optional[float] = None,
         mla_params: Optional[MLAParams] = None,
         **kwargs,
@@ -115,8 +113,6 @@ class TrtllmAttentionWrapper:
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads or num_heads
         self.head_size = head_size
-        quant_config = quant_config or QuantConfig()
-        self.quant_mode = int(quant_config.layer_quant_mode)
         self.position_embedding_type = int(
             pos_embd_params.type) if pos_embd_params is not None else 0
         self.rotary_embedding_dim = rope_params.dim
@@ -129,6 +125,10 @@ class TrtllmAttentionWrapper:
         self.rotary_embedding_original_max_positions = rope_params.original_max_positions
         self.kwargs = {}
         self.kwargs.update(kwargs)
+
+    def create_weights(self, quant_config: Optional[QuantConfig] = None):
+        quant_config = quant_config or QuantConfig()
+        self.quant_mode = int(quant_config.layer_quant_mode)
 
     def plan(
         self,
@@ -490,7 +490,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def prepare(self) -> None:
 
-        if not self.is_dummy_attention and self.kv_cache_manager is None:
+        if self.kv_cache_manager is None:
             # Convert the attention metadata to a TRT-LLM no cache attention metadata.
             assert self.kv_cache_manager is None, "no cache attention should not have KV cache manager"
             assert self._max_seq_len_storage is not None, "max_seq_len should be set for no cache attention"
@@ -570,6 +570,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         q_scaling: Optional[float] = None,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
         mla_params: Optional[MLAParams] = None,
+        skip_create_weights_in_init: bool = False,
         **kwargs,
     ):
         """
@@ -595,13 +596,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                          pos_embd_params=pos_embd_params,
                          mla_params=mla_params,
                          **kwargs)
+
         self.wrapper = TrtllmAttentionWrapper(
             layer_idx,
             num_heads,
             head_dim,
             num_kv_heads,
             pos_embd_params=pos_embd_params,
-            quant_config=quant_config,
             q_scaling=q_scaling,
             mla_params=mla_params,
         )
@@ -617,8 +618,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         self.kv_scale_quant_orig = self.kv_cache_scaling_factor
         self.kv_scale_orig_quant = 1.0 / self.kv_scale_quant_orig
+        if not skip_create_weights_in_init:
+            self.update_quant_config(self.quant_config)
+
+    def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
+        self.quant_config = new_quant_config
+        self.wrapper.create_weights(self.quant_config)
+
         self.has_fp8_qdq = self.has_fp8_kv_cache = self.has_nvfp4 = False
-        if self.quant_config:
+        if self.quant_config is not None:
             self.has_fp8_qdq = self.quant_config.layer_quant_mode.has_fp8_qdq()
             self.has_fp8_block_wise = self.quant_config.layer_quant_mode.has_fp8_block_scales(
             )
@@ -642,31 +650,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mrope_config: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # This is only for memory estimation for now.
-        # NOTE: this method is not accurate while it works for most scenario.
-        if metadata.is_dummy_attention:
-            q_size = self.num_heads * self.head_dim
-            k_size = self.num_kv_heads * self.head_dim
-            v_size = self.num_kv_heads * self.v_head_dim
-            q, k, v = q.split([q_size, k_size, v_size], dim=-1)
-            q = q.view(-1, self.num_heads, self.head_dim)
-            k = k.view(-1, self.num_kv_heads, self.head_dim)
-            v = v.view(-1, self.num_kv_heads, self.v_head_dim)
-            if self.head_dim != self.v_head_dim:
-                # the dummy forward doesn't support head_dim != v_head_dim case
-                # so we use a tensor with supported shape to replace the v
-                # the memory estimation is not accurate in this case
-                v = torch.randn(q.shape[0],
-                                self.num_kv_heads,
-                                self.head_dim,
-                                dtype=q.dtype,
-                                device=q.device)
-            output = VanillaAttention.dummy_forward(q, k, v)
-            if self.head_dim != self.v_head_dim:
-                output = output[..., :self.num_kv_heads *
-                                self.v_head_dim].contiguous()
-            return output
-
         assert isinstance(
             metadata,
             TrtllmAttentionMetadata,
@@ -736,3 +719,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                   or k is not None,
                                   attention_mask=attention_mask)
         return output
+
+    @classmethod
+    def support_fused_rope(cls) -> bool:
+        return True
+
+    @classmethod
+    def support_fused_qkv(cls) -> bool:
+        return True
+
+    @classmethod
+    def support_mla(cls) -> bool:
+        return True

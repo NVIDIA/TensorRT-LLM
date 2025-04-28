@@ -317,6 +317,7 @@ private:
     bool mIsSchedulerMaxUtilization;
     bool mIsSchedulerGuaranteedNoEvict;
     bool mIsChunkedContext;
+    bool mPromptTableOffloading;
 
     CommunicationMode mCommMode;
     bool mIsWorker = false;

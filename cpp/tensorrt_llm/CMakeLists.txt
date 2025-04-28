@@ -193,6 +193,7 @@ set(TRTLLM_LINK_LIBS
     ${CUDA_DRV_LIB}
     ${CUBLAS_LIB}
     ${CUBLASLT_LIB}
+    ${CURAND_LIB}
     ${CMAKE_DL_LIBS}
     ${TRT_LIB}
     common_src
@@ -204,12 +205,12 @@ set(TRTLLM_LINK_LIBS
     trtllm_gen_blockscale_gemm
     trtllm_gen_fp8_block_scale_moe
     trtllm_gen_gemm
+    trtllm_gen_fp8_batched_gemm
     selective_scan_src
     ws_layernorm_src
     fpA_intB_gemm_src
     # moe_gemm_src
     fb_gemm_src
-    fp8_blockscale_gemm_src
     ar_gemm_src
     gemm_swiglu_sm90_src
     cutlass_src

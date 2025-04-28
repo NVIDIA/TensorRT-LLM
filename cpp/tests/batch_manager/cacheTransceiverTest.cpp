@@ -43,6 +43,7 @@
 #include <cstdlib>
 #include <memory>
 #include <random>
+#include <tensorrt_llm/batch_manager/cacheTransBuffer.h>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
 #include <tensorrt_llm/executor/cache_transmission/cacheConcatenate.h>
 
@@ -295,7 +296,6 @@ protected:
 
         auto constexpr maxNumTokens = tokensPerBlock * maxBlocksPerSeq;
         auto constexpr maxAttentionWindow = maxNumTokens;
-        auto constexpr temporaryAttentionWindow = 0;
         auto constexpr inputLength = maxNumTokens - tokensPerBlock - 1;
         auto constexpr numSharedBlocks = inputLength / tokensPerBlock;
         auto constexpr numBlocksPerSeq = numSharedBlocks + (maxBlocksPerSeq - numSharedBlocks) * maxBeamWidth;
@@ -308,9 +308,9 @@ protected:
         auto constexpr dataType = nvinfer1::DataType::kFLOAT;
 
         mManager = std::make_unique<KVCacheManager>(numLayers, numHeads, sizePerHead, tokensPerBlock, totalNumBlocks,
-            blocksInSecondaryPool, mMaxNumSequences, maxBeamWidth, std::vector<SizeType32>{maxAttentionWindow},
-            temporaryAttentionWindow, sinkTokenLength, stream, std::nullopt, enableBlockReuse, onboardBlocks,
-            CacheType::kSELF, std::nullopt, nullptr, true);
+            blocksInSecondaryPool, mMaxNumSequences, maxBeamWidth,
+            std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, dataType, sinkTokenLength, stream,
+            std::nullopt, enableBlockReuse, onboardBlocks, CacheType::kSELF, std::nullopt, nullptr, true);
         mCacheState = std::make_unique<texec::kv_cache::CacheState>(
             numLayers, numHeads, sizePerHead, tokensPerBlock, 1, 1, dataType);
 
@@ -377,20 +377,24 @@ protected:
         }
         // UVM seems to be incompatible with MPI, and it is continuing to investigate.
         bool constexpr useUvm = false;
-        mManager->allocatePools(dataType, useUvm);
+        mManager->allocatePools(useUvm);
     }
 
     void setUpCacheTransceiver()
     {
+        int maxNumTokens = 1024;
+        mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
         if (isSender)
         {
-            mResponder = std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
-                mConnectionManager.get(), *mCacheState, mlocalRank, std::make_unique<CacheFormatter>(mManager.get())));
+            mResponder = std::make_unique<DataResponder>(
+                std::make_unique<DataSenderImpl>(mConnectionManager.get(), *mCacheState, mlocalRank,
+                    std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get())));
         }
         else
         {
-            mRequester = std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
-                mConnectionManager.get(), *mCacheState, mlocalRank, std::make_unique<CacheFormatter>(mManager.get())));
+            mRequester = std::make_unique<DataRequester>(
+                std::make_unique<DataReceiverImpl>(mConnectionManager.get(), *mCacheState, mlocalRank,
+                    std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get())));
         }
     }
 
@@ -414,7 +418,7 @@ protected:
         mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
         if (isSender)
         {
-            auto blockRange = BlockRange(*mManager, llmRequest->mRequestId, beamIdx, 0);
+            auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mManager, llmRequest->mRequestId);
             for (auto& block : blockRange)
             {
                 // fill cache with tokens (= request length), for reuse test
@@ -427,7 +431,7 @@ protected:
             auto future = mRequester->requestAndReceiveAsync(*llmRequest);
             future.get();
             TLLM_CUDA_CHECK(cudaDeviceSynchronize());
-            auto blockRange = BlockRange(*mManager, llmRequest->mRequestId, beamIdx, 0);
+            auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mManager, llmRequest->mRequestId);
             for (auto& block : blockRange)
             {
                 std::vector<uint8_t> bytes(block.getSizeInBytes());
@@ -444,6 +448,7 @@ protected:
     LlmRequest::RequestIdType mRequestId{0};
     SizeType32 mMaxNumSequences{};
     std::unique_ptr<KVCacheManager> mManager;
+    std::unique_ptr<CacheTransBufferManager> mCacheTransBufferManager;
     std::unique_ptr<DataResponder> mResponder;
     std::unique_ptr<DataRequester> mRequester;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;
@@ -619,7 +624,6 @@ protected:
 
         auto maxNumTokens = tokensPerBlock * maxBlocksPerSeq;
         auto maxAttentionWindow = maxNumTokens;
-        auto constexpr temporaryAttentionWindow = 0;
         auto inputLength = maxNumTokens - tokensPerBlock - 1;
         auto numSharedBlocks = inputLength / tokensPerBlock;
         auto numBlocksPerSeq = numSharedBlocks + (maxBlocksPerSeq - numSharedBlocks) * maxBeamWidth;
@@ -657,7 +661,7 @@ protected:
         }
         mManager = std::make_unique<KVCacheManager>(numLayers / mPpSize, numHeadsPerRank, sizePerHead, tokensPerBlock,
             totalNumBlocks, blocksInSecondaryPool, mMaxNumSequences, maxBeamWidth,
-            std::vector<SizeType32>{maxAttentionWindow}, temporaryAttentionWindow, sinkTokenLength, stream,
+            std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, dataType, sinkTokenLength, stream,
             std::nullopt, enableBlockReuse, onboardBlocks, cacheType, std::nullopt, nullptr, true);
         texec::kv_cache::CacheState::AttentionType attentionType = isMLA
             ? texec::kv_cache::CacheState::AttentionType::kMLA
@@ -670,7 +674,7 @@ protected:
 
         // UVM seems to be incompatible with MPI, and it is continuing to investigate.
         bool constexpr useUvm = false;
-        mManager->allocatePools(dataType, useUvm);
+        mManager->allocatePools(useUvm);
     }
 
     void setUpCacheTransceiver()
@@ -681,6 +685,8 @@ protected:
         }
         else if (tensorrt_llm::common::getEnvUseMPIKvCache() || tensorrt_llm::common::getEnvUseUCXKvCache())
         {
+            int maxNumTokens = 1024;
+            mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
             bool isUcx = tensorrt_llm::common::getEnvUseUCXKvCache();
             TLLM_LOG_INFO("Enable %s KV cache transport.", isUcx ? "UCX" : "MPI");
 
@@ -709,8 +715,10 @@ protected:
 
             auto makeFormatter = [this]()
             {
-                return mIsMLA ? std::unique_ptr<IOFormatter>(std::make_unique<MLACacheFormatter>(mManager.get()))
-                              : std::unique_ptr<IOFormatter>(std::make_unique<CacheFormatter>(mManager.get()));
+                return mIsMLA ? std::unique_ptr<IOFormatter>(
+                           std::make_unique<MLACacheFormatter>(mManager.get(), mCacheTransBufferManager.get()))
+                              : std::unique_ptr<IOFormatter>(
+                                  std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get()));
             };
 
             if (mIsContext)
@@ -817,7 +825,7 @@ protected:
             mContextCacheState->getParallelConfig().mTensorParallelism,
             mContextCacheState->getParallelConfig().mPipelineParallelism, mContextCacheState->getDataType(),
             mContextCacheState->getAttentionConfig().mAttentionType, mContextCacheState->getAttentionConfig().mKvFactor,
-            mContextCacheState->getParallelConfig().mEnableAttenionDP, contextDpRank,
+            mContextCacheState->getParallelConfig().mEnableAttentionDP, contextDpRank,
             mContextCacheState->getParallelConfig().mTensorParallelism};
         state->setCacheState(cacheState);
         auto stats = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt);
@@ -830,14 +838,21 @@ protected:
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
         mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
-        auto blockRange = BlockRange(*mManager, llmRequest->mRequestId, beamIdx, 0);
+        auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mManager, llmRequest->mRequestId);
         int blockIdx = 0;
         for (auto& block : blockRange)
         {
             fillBlockData(block, blockIdx, llmRequest->getPromptLen());
             blockIdx++;
         }
-        mManager->getBlockManager().getBufferManager().getStream().synchronize();
+        auto const& blockManager = mManager->getBlockManager();
+        if (blockManager.getNumPools() != 1)
+        {
+            throw std::runtime_error("Test assumes that just a single pool (single window size) is used");
+        }
+        auto const onlyWindowSize = blockManager.getPoolWindowSize(0);
+
+        blockManager.getBufferManager(onlyWindowSize).getStream().synchronize();
         auto future = mResponder->respondAndSendAsync(*llmRequest);
         return future;
     }
@@ -859,7 +874,7 @@ protected:
 
         TLLM_CUDA_CHECK(cudaDeviceSynchronize());
 
-        auto blockRange = BlockRange(*mManager, llmRequest->mRequestId, beamIdx, 0);
+        auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mManager, llmRequest->mRequestId);
         for (auto& block : blockRange)
         {
             verifyBlockData(block, blockIdx, llmRequest->getPromptLen());
@@ -869,13 +884,17 @@ protected:
 
     void fillBlockData(tensorrt_llm::runtime::ITensor& blockData, int blockId, size_t initial)
     {
-        auto hostTensor
-            = mManager->getBlockManager().getBufferManager().cpu(blockData.getShape(), blockData.getDataType());
+        auto const& blockManager = mManager->getBlockManager();
+        ASSERT_EQ(blockManager.getNumPools(), 1);
+        auto const onlyWindowSize = blockManager.getPoolWindowSize(0);
+        auto const& bufferManager = blockManager.getBufferManager(onlyWindowSize);
+
+        auto hostTensor = tensorrt_llm::runtime::BufferManager::cpu(blockData.getShape(), blockData.getDataType());
         int layerSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.size() / mPpSize;
         int startLayerId = layerSizePerRank * mPpRank;
         int headSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.at(0);
         int startHeadId = headSizePerRank * mTpRank;
-        bool enableDP = mCacheState->getParallelConfig().mEnableAttenionDP;
+        bool enableDP = mCacheState->getParallelConfig().mEnableAttentionDP;
         if (mIsMLA || enableDP)
         {
             startHeadId = 0;
@@ -924,18 +943,22 @@ protected:
                 }
             }
         }
-        mManager->getBlockManager().getBufferManager().copy(*hostTensor, blockData);
+        bufferManager.copy(*hostTensor, blockData);
     }
 
     void verifyBlockData(tensorrt_llm::runtime::ITensor& blockData, int blockId, size_t initial)
     {
-        auto hostTensor
-            = mManager->getBlockManager().getBufferManager().cpu(blockData.getShape(), blockData.getDataType());
+        auto const& blockManager = mManager->getBlockManager();
+        ASSERT_EQ(blockManager.getNumPools(), 1);
+        auto const onlyWindowSize = blockManager.getPoolWindowSize(0);
+        auto const& bufferManager = blockManager.getBufferManager(onlyWindowSize);
+
+        auto hostTensor = tensorrt_llm::runtime::BufferManager::cpu(blockData.getShape(), blockData.getDataType());
         int layerSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.size() / mPpSize;
         int startLayerId = layerSizePerRank * mPpRank;
         int headSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.at(0);
         int startHeadId = headSizePerRank * mTpRank;
-        bool enableDP = mCacheState->getParallelConfig().mEnableAttenionDP;
+        bool enableDP = mCacheState->getParallelConfig().mEnableAttentionDP;
         if (mIsMLA || enableDP)
         {
             startHeadId = 0;
@@ -945,8 +968,8 @@ protected:
         int startTokenId = blockId * tokensPerBlock;
         int sizePerHead = mCacheState->getModelConfig().mSizePerHead;
 
-        mManager->getBlockManager().getBufferManager().copy(blockData, *hostTensor);
-        mManager->getBlockManager().getBufferManager().getStream().synchronize();
+        bufferManager.copy(blockData, *hostTensor);
+        bufferManager.getStream().synchronize();
 
         for (int layerId = 0; layerId < layerSizePerRank; layerId++)
         {
@@ -1029,6 +1052,7 @@ protected:
     bool mIsMLA{false};
     SizeType32 mMaxNumSequences{};
     std::unique_ptr<KVCacheManager> mManager;
+    std::unique_ptr<CacheTransBufferManager> mCacheTransBufferManager;
     std::unique_ptr<DataResponder> mResponder;
     std::unique_ptr<DataRequester> mRequester;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;

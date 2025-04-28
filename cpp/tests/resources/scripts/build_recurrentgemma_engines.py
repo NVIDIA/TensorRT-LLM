@@ -32,7 +32,8 @@ import tensorrt_llm.bindings as _tb
 def build_engine(weight_dir: _pl.Path, ckpt_dir: _pl.Path, engine_dir: _pl.Path,
                  *args):
     convert_args = [
-        _sys.executable, "examples/recurrentgemma/convert_checkpoint.py"
+        _sys.executable,
+        "examples/models/core/recurrentgemma/convert_checkpoint.py"
     ] + (['--model_dir', str(weight_dir)] if weight_dir else []) + [
         '--output_dir',
         str(ckpt_dir),

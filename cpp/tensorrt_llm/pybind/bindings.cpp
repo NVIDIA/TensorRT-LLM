@@ -527,9 +527,11 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("enable_chunked_context", &tb::TrtGptModelOptionalParams::enableChunkedContext)
         .def_readwrite("normalize_log_probs", &tb::TrtGptModelOptionalParams::normalizeLogProbs)
         .def_readwrite("decoding_config", &tb::TrtGptModelOptionalParams::decodingConfig)
+        .def_readwrite("use_gpu_direct_storage", &tb::TrtGptModelOptionalParams::useGpuDirectStorage)
         .def_readwrite("gpu_weights_percent", &tb::TrtGptModelOptionalParams::gpuWeightsPercent)
         .def_readwrite("max_beam_width", &tb::TrtGptModelOptionalParams::maxBeamWidth)
         .def_readwrite("scheduler_config", &tb::TrtGptModelOptionalParams::schedulerConfig)
+        .def_readwrite("cache_transceiver_config", &tb::TrtGptModelOptionalParams::cacheTransceiverConfig)
         .def(py::pickle(gptModelParamsGetState, gptModelParamsSetState));
 
     py::class_<tr::MemoryCounters>(m, "MemoryCounters")

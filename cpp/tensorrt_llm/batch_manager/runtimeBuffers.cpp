@@ -51,9 +51,12 @@ RuntimeBuffers::RuntimeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     std::vector<SizeType32> const& maxAttentionWindowVec, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLen,
     TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
     executor::DecodingConfig const& decodingConfig, bool gatherGenerationLogits, std::optional<SizeType32> maxNumTokens,
-    std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs)
+    std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs,
+    bool promptTableOffloadingParam)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    promptTableOffloading = promptTableOffloadingParam;
 
     create(maxBatchSize, maxBeamWidth, maxAttentionWindowVec, maxAttentionWindow, sinkTokenLen, runtime, modelConfig,
         worldConfig, decodingConfig, gatherGenerationLogits, additionalModelOutputs);
@@ -303,7 +306,8 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
 
     if (modelConfig.usePromptTuning())
     {
-        promptTuningBuffers = std::make_unique<PromptTuningBuffers>(maxBatchSize, manager, modelConfig, worldConfig);
+        promptTuningBuffers = std::make_unique<PromptTuningBuffers>(
+            maxBatchSize, manager, modelConfig, worldConfig, promptTableOffloading);
     }
 
     if (modelConfig.useLoraPlugin())

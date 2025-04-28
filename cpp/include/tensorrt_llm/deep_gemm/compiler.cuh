@@ -307,6 +307,15 @@ public:
         uint32_t const block_k, uint32_t const num_groups, uint32_t const num_stages, uint32_t const num_tma_multicast,
         deep_gemm::GemmType const gemm_type)
     {
+        int sm_version = tensorrt_llm::common::getSMVersion();
+        if (sm_version != 90)
+        {
+            TLLM_THROW(
+                "DeepGEMM only supports Hopper (SM90) architectures, but current device compute "
+                "capability is %d.",
+                sm_version);
+        }
+
         // Build signature - simplified, no MD5 calculation
         std::string name = "gemm_" + std::to_string(shape_n) + "_" + std::to_string(shape_k) + "_"
             + std::to_string(block_m) + "_" + std::to_string(block_n) + "_" + std::to_string(block_k) + "_"

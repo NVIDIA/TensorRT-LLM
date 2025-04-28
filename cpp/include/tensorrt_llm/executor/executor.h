@@ -1380,6 +1380,21 @@ private:
     bool mReplicate;
 };
 
+class CacheTransceiverConfig
+{
+public:
+    explicit CacheTransceiverConfig(std::optional<size_t> maxNumTokens = std::nullopt);
+
+    [[nodiscard]] std::optional<size_t> getMaxNumTokens() const;
+    void setMaxNumTokens(size_t maxNumTokens);
+
+private:
+    /// @brief The maximum number of tokens that the CacheTransceiver's pre-allocated buffer can hold. If the number of
+    /// kvCache tokens to be transferred for a single request is greater than this value, the performance of the cache
+    /// transfer may be degraded.
+    std::optional<size_t> mMaxNumTokens;
+};
+
 /// @brief Configuration class for the model executor
 class ExecutorConfig
 {
@@ -1400,15 +1415,17 @@ public:
         std::optional<ParallelConfig> parallelConfig = std::nullopt,
         std::optional<PeftCacheConfig> const& peftCacheConfig = std::nullopt,
         std::optional<LogitsPostProcessorConfig> logitsPostProcessorConfig = std::nullopt,
-        std::optional<DecodingConfig> decodingConfig = std::nullopt, float gpuWeightsPercent = 1,
-        std::optional<SizeType32> maxQueueSize = std::nullopt,
+        std::optional<DecodingConfig> decodingConfig = std::nullopt, bool useGpuDirectStorage = false,
+        float gpuWeightsPercent = 1, std::optional<SizeType32> maxQueueSize = std::nullopt,
         ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig = ExtendedRuntimePerfKnobConfig(),
         std::optional<DebugConfig> debugConfig = std::nullopt, SizeType32 recvPollPeriodMs = 0,
         uint64_t maxSeqIdleMicroseconds = kDefaultMaxSeqIdleMicroseconds,
         std::optional<SpeculativeDecodingConfig> specDecConfig = std::nullopt,
         std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
-        bool gatherGenerationLogits = false, bool useVariableBeamWidthSearch = false);
+        std::optional<CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
+        bool gatherGenerationLogits = false, bool useVariableBeamWidthSearch = false,
+        bool promptTableOffloading = false);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -1429,6 +1446,7 @@ public:
     [[nodiscard]] std::optional<PeftCacheConfig> getPeftCacheConfig() const;
     [[nodiscard]] std::optional<LogitsPostProcessorConfig> getLogitsPostProcessorConfig() const;
     [[nodiscard]] std::optional<DecodingConfig> getDecodingConfig() const;
+    [[nodiscard]] bool getUseGpuDirectStorage() const;
     [[nodiscard]] float getGpuWeightsPercent() const;
     [[nodiscard]] std::optional<SizeType32> getMaxQueueSize() const;
     [[nodiscard]] ExtendedRuntimePerfKnobConfig getExtendedRuntimePerfKnobConfig() const;
@@ -1440,6 +1458,8 @@ public:
     [[nodiscard]] std::optional<std::vector<AdditionalModelOutput>> getAdditionalModelOutputs() const;
     [[nodiscard]] bool getGatherGenerationLogits() const;
     [[nodiscard]] bool getUseVariableBeamWidthSearch() const;
+    [[nodiscard]] bool getPromptTableOffloading() const;
+    [[nodiscard]] std::optional<CacheTransceiverConfig> getCacheTransceiverConfig() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
@@ -1455,6 +1475,7 @@ public:
     void setPeftCacheConfig(PeftCacheConfig const& peftCacheConfig);
     void setLogitsPostProcessorConfig(LogitsPostProcessorConfig const& logitsPostProcessorConfig);
     void setDecodingConfig(DecodingConfig const& decodingConfig);
+    void setUseGpuDirectStorage(bool const& useGpuDirectStorage);
     void setGpuWeightsPercent(float const& gpuWeightsPercent);
     void setMaxQueueSize(std::optional<SizeType32> const& maxQueueSize);
     void setExtendedRuntimePerfKnobConfig(ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig);
@@ -1466,6 +1487,8 @@ public:
     void setAdditionalModelOutputs(std::vector<AdditionalModelOutput> const& additionalModelOutputs);
     void setGatherGenerationLogits(bool gatherGenerationLogits);
     void setUseVariableBeamWidthSearch(bool useVariableBeamWidthSearch);
+    void setPromptTableOffloading(bool promptTableOffloading);
+    void setCacheTransceiverConfig(CacheTransceiverConfig const& cacheTransceiverConfig);
 
 private:
     friend class Serialization;
@@ -1510,6 +1533,9 @@ private:
     /// @brief Decoding configuration.
     std::optional<DecodingConfig> mDecodingConfig;
 
+    /// @brief Enable/disable use of GPU Direct Storage (GDS) to load engines.
+    bool mUseGpuDirectStorage;
+
     /// @brief GPU weights percent for weight streaming.
     float mGpuWeightsPercent;
 
@@ -1538,11 +1564,17 @@ private:
     /// @brief The additional outputs to gather from the model.
     std::optional<std::vector<AdditionalModelOutput>> mAdditionalModelOutputs;
 
+    /// @brief The cache transceiver configuration
+    std::optional<CacheTransceiverConfig> mCacheTransceiverConfig;
+
     /// @brief Controls if generation logits should be gathered, so that returnGenerationLogits can be requested.
     bool mGatherGenerationLogits{false};
 
     /// @brief Controls if Variable-Beam-Width-Search is enabled.
     bool mUseVariableBeamWidthSearch{false};
+
+    /// @brief Controls if prompt table offloading is enabled.
+    bool mPromptTableOffloading{false};
 };
 
 struct KVCacheCreatedData

@@ -50,6 +50,7 @@ namespace tensorrt_llm::batch_manager
 namespace kv_cache_manager
 {
 class KVCacheManager;
+struct OffsetTableDimensions;
 } // namespace kv_cache_manager
 
 namespace rnn_state_manager
@@ -60,6 +61,7 @@ class SequenceSlotManager;
 class DecoderStepAsyncSend;
 class DecoderSlotAsyncSend;
 class DecoderInputBuffers;
+class DecoderOutputBuffers;
 class DecoderBuffers;
 class SlotDecoderBuffers;
 class LlmRequest;
@@ -80,15 +82,24 @@ class GenerateRequestOptions;
 class LogitsPostProcessor;
 class MakeDecodingBatchInputOutput;
 class CreateNewDecoderRequests;
+class UpdateDecoderBuffers;
 
 namespace utils
 {
 class CudaGraphExecutorCache;
 } // namespace utils
 
+struct RewindInputs
+{
+    SizeType32 maxBlocksPerSeq;
+    bool isUseOneMoreBlock;
+    SizeType32 numKvHeads;
+};
+
 class TrtGptModelInflightBatching : public TrtGptModel
 {
     using BaseKVCacheManager = kv_cache_manager::BaseKVCacheManager;
+    using OffsetTableDimensions = kv_cache_manager::OffsetTableDimensions;
     using KVCacheManager = kv_cache_manager::KVCacheManager;
     using KvCacheType = kv_cache_manager::CacheType;
     using KvCacheConfig = kv_cache_manager::KvCacheConfig;
@@ -285,7 +296,6 @@ private:
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> decoderSync(
         ScheduledRequests const& scheduledRequests, std::optional<runtime::CudaEvent> const& decoderFinishEvent);
 
-    runtime::CudaEvent updateDecoderBuffers(bool returnLogProbs, runtime::CudaEvent decoderFinishEvent);
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> communicateDecoderBuffers(bool returnLogProbs);
     void updateRequests(ScheduledRequests const& scheduledRequests);
 
@@ -330,7 +340,7 @@ private:
 
     [[nodiscard]] nvinfer1::Dims getTensorShape(std::string const& name) const override;
 
-    void reshapeKvTensors(SizeType32 maxBlocksPerSeq, kv_cache_manager::CacheType kvCacheType, SizeType32 numPools);
+    void reshapeKvTensors(OffsetTableDimensions const& dims);
 
     [[nodiscard]] bool hasSpeculativeDecodingFastLogits() const noexcept override
     {
@@ -351,6 +361,14 @@ private:
 
     /// @brief Change the speculative decoding mode.
     void changeSpecDecMode(ScheduledRequests const& scheduledRequests);
+
+    void prefetchNextPromptTableChunk(RequestVector const& contextRequests, bool isFirstChunk, SizeType32 bufferId);
+
+    void remapInputTokensForPromptTable(
+        std::shared_ptr<LlmRequest> const& llmReq, bool isCurrentChunk, SizeType32 bufferId, SizeType32 contextId);
+
+    void copyPromptTableToGpuInChunk(std::shared_ptr<LlmRequest> const& llmReq,
+        std::vector<int32_t> const& outOfVocabTokens, bool useCurrentBuffer, SizeType32 bufferId, SizeType32 contextId);
 
 protected:
     std::shared_ptr<BaseKVCacheManager> getKVCacheManager() override
@@ -439,6 +457,8 @@ private:
     std::shared_ptr<BasePeftCacheManager> mPeftCacheManager;
     // BufferManager using a separate stream for async copy operations.
     runtime::BufferManager mCopyBufferManager;
+    // Event for async data transfers
+    runtime::CudaEvent mPtableCopyDoneEvent;
 
     /******************** Logits Post-Processor ********************/
     std::optional<LogitsPostProcessorBatched> mLogitsPostProcessorBatched;
@@ -454,14 +474,14 @@ private:
     std::unique_ptr<tensorrt_llm::batch_manager::GuidedDecoder> mGuidedDecoder;
 
     /******************** Pipeline parallelism ********************/
-    std::shared_ptr<tensorrt_llm::mpi::MpiComm> mMpiCommPipelinePara;
+    std::unique_ptr<tensorrt_llm::mpi::MpiComm> mMpiCommPipelinePara;
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> mDecStepAsyncSndHdls;
     std::vector<std::unique_ptr<DecoderSlotAsyncSend>> mDecSlotAsyncSndHdls;
     std::unique_ptr<tensorrt_llm::mpi::MpiWaitThread> mAsyncSendWaitThread;
 
     /******************** Tensor parallelism ********************/
-    std::shared_ptr<tensorrt_llm::mpi::MpiComm> mMpiCommTensorPara;
-    std::shared_ptr<runtime::AllReduceBuffers> mAllReduceBuffers;
+    std::unique_ptr<tensorrt_llm::mpi::MpiComm> mMpiCommTensorPara;
+    std::unique_ptr<runtime::AllReduceBuffers> mAllReduceBuffers;
 
     /******************** Runtime parameters ********************/
     // Flag to select fused or unfused context+generation execution
@@ -489,16 +509,20 @@ private:
     std::optional<SizeType32> mMaxNumTokensRuntime;
     // Controls if generation logits should be gathered, so that returnGenerationLogits can be requested.
     bool mGatherGenerationLogits{false};
+    // offloading and prefetching the prompt tuning table (only effective in chunked prefill mode)
+    bool mPromptTableOffloading;
 
     /******************** Buffers ********************/
     // Buffers for each micro batch. Unfused path (mCtxGenFusion==false) uses two times the buffers.
-    std::vector<std::shared_ptr<RuntimeBuffers>> mBuffers;
-    // Decoder buffers for each micro batch.
+    std::vector<std::unique_ptr<RuntimeBuffers>> mBuffers;
+    // Decoder input buffers for each micro batch.
     std::vector<DecoderInputBuffers> mDecoderInputBuffers;
+    // Decoder output buffers for each micro batch.
+    std::vector<DecoderOutputBuffers> mDecoderOutputBuffers;
     // Global buffer to interface with decoder. Slots in this buffer are selected by mSeqSlotManager.
-    std::shared_ptr<DecoderBuffers> mDecoderBuffers;
+    std::unique_ptr<DecoderBuffers> mDecoderBuffers;
     // Buffers for each slot in the decoder
-    std::vector<std::shared_ptr<SlotDecoderBuffers>> mSlotDecoderBuffers;
+    std::vector<std::unique_ptr<SlotDecoderBuffers>> mSlotDecoderBuffers;
     // PEFT table for each micro batch
     std::vector<PeftTable> mPeftTables;
     // Decoder input for each micro batch.
@@ -533,6 +557,7 @@ private:
     RequestVector mDraftRequestsWaitingToSendLogits;
     SizeType32 mSeamlessLADMaxDraftLen{0};
     bool mUseSeamlessLookahead{false};
+    RewindInputs mRewindInputs;
 
     /******************** Algorithms ********************/
     // Algorithms are reentrant, they are assigned a state at
@@ -549,6 +574,7 @@ private:
     std::unique_ptr<tensorrt_llm::batch_manager::LogitsPostProcessor const> mLogitsPostProcessor;
     std::unique_ptr<tensorrt_llm::batch_manager::MakeDecodingBatchInputOutput const> mMakeDecodingBatchInputOutput;
     std::unique_ptr<tensorrt_llm::batch_manager::CreateNewDecoderRequests const> mCreateNewDecoderRequests;
+    std::unique_ptr<tensorrt_llm::batch_manager::UpdateDecoderBuffers const> mUpdateDecoderBuffers;
 };
 
 } // namespace tensorrt_llm::batch_manager

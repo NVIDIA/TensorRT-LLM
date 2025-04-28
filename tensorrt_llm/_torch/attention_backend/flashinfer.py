@@ -13,7 +13,6 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ..utils import get_global_attrs, get_model_extra_attrs
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
                         PredefinedAttentionMask)
-from .vanilla import VanillaAttention
 
 try:
     check_cuda_arch()
@@ -123,7 +122,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         super().__post_init__()
 
         if self.workspace_buffer is None:
-            self.workspace_buffer = torch.empty(256 * 1024 * 1024,
+            # Note: even though flashinfer only recommends 128 MB, we have to push it
+            # a bit higher to cover all possible CUDA graph cases. If it's too small,
+            # warmup will crash.
+            self.workspace_buffer = torch.empty(320 * 1024 * 1024,
                                                 dtype=torch.uint8,
                                                 device="cuda")
 
@@ -247,12 +249,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                                                paged_kv_indptr_decode
                                                                .size(0)]
         elif self.num_generations == 0:
-            assert not self.is_cuda_graph
             self.paged_kv_indptr = self.paged_kv_indptr_prefill[:
                                                                 paged_kv_indptr_prefill
                                                                 .size(0)]
         else:
-            assert not self.is_cuda_graph
+            assert not self.is_cuda_graph, "Cannot mix decode/prefill with CUDA graphs"
             self.paged_kv_indptr = torch.cumsum(
                 torch.tensor([0] + self.num_blocks, dtype=torch.int32),
                 dtype=torch.int32,
@@ -314,21 +315,24 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 "Make sure you run a few warmup runs before capturing the graph!"
             )
 
-        if not self.is_cuda_graph:
-            if plan_params in self._plan_params_to_wrappers:
-                prefill_wrapper = self._plan_params_to_wrappers[
-                    plan_params].prefill_wrapper
-            else:
-                # flashinfer fa3 backend has accuracy issue in H100 PCIe
-                prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                    self.workspace_buffer, self.kv_layout, backend='fa2')
+        if plan_params in self._plan_params_to_wrappers:
+            prefill_wrapper = self._plan_params_to_wrappers[
+                plan_params].prefill_wrapper
         else:
-            prefill_wrapper = None
+            # flashinfer fa3 backend has accuracy issue in H100 PCIe
+            prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                self.kv_layout,
+                backend='fa2',
+                qo_indptr_buf=self.qo_indptr,
+                paged_kv_indptr_buf=self.paged_kv_indptr_prefill,
+                paged_kv_indices_buf=self._paged_kv_indices,
+                paged_kv_last_page_len_buf=self._paged_kv_last_page_len,
+                use_cuda_graph=self.is_cuda_graph)
 
         is_causal = plan_params.attention_mask_type == AttentionMaskType.causal
 
         def prefill_plan():
-            assert prefill_wrapper is not None, "Prefill not supported w/ CUDA graphs"
             prefill_wrapper.plan(
                 self.qo_indptr[:self.num_contexts + 1],
                 self.paged_kv_indptr_prefill[:self.num_contexts + 1],
@@ -407,134 +411,22 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        skip_create_weights_in_init: bool = False,
         **kwargs,
     ):
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
+        if not skip_create_weights_in_init:
+            self.update_quant_config(self.quant_config)
 
+    def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
+        self.quant_config = new_quant_config
         self.has_fp8_kv_cache = False
-        if quant_config and quant_config.layer_quant_mode.has_any_quant():
-            quant_mode = quant_config.layer_quant_mode
+        if self.quant_config and self.quant_config.layer_quant_mode.has_any_quant(
+        ):
+            quant_mode = self.quant_config.layer_quant_mode
             if quant_mode.has_fp8_kv_cache():
                 self.has_fp8_kv_cache = True
-
-    @torch.library.custom_op("trtllm::flashinfer_forward", mutates_args=())
-    @staticmethod
-    def forward_pattern(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        num_heads: int,
-        head_dim: int,
-        num_kv_heads: int,
-        layer_idx: int,
-        has_fp8_kv_cache: bool,
-        attention_mask_type: int,
-        attention_mask_data: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        '''
-        Wrapping the flashinfer forward as a custom op is required to fix `torch.compile` graph breaks,
-        otherwise it will graph break when calling `metadata.num_contexts` since it convert tensor's sum directly to int.
-        '''
-        # torch.compile does not support custom object as arguments, so we have to use global function to get the metadata.
-        extra_attrs = get_model_extra_attrs()
-        if extra_attrs is not None:
-            metadata_ref = extra_attrs.get("attention_metadata", None)
-            metadata = metadata_ref() if metadata_ref is not None else None
-        else:
-            metadata = get_global_attrs().attention_metadata()
-
-        q = q.view(-1, num_heads, head_dim)
-        if k is not None:
-            k = k.view(-1, num_kv_heads, head_dim)
-        if v is not None:
-            v = v.view(-1, num_kv_heads, head_dim)
-
-        # This is only for memory estimation for now.
-        # NOTE: this method is not accurate while it works for most scenario.
-        if metadata is None or metadata.kv_cache_manager is None:
-            return VanillaAttention.dummy_forward(q, k, v)
-
-        assert isinstance(
-            metadata,
-            FlashInferAttentionMetadata,
-        )
-
-        kv_cache = metadata.kv_cache_manager.get_buffers(layer_idx)
-
-        if k is not None and v is not None:
-            if has_fp8_kv_cache:
-                assert kv_cache.dtype == torch.float8_e4m3fn, f"KV cache should have fp8 dtype, but get {kv_cache.dtype}"
-                k = k.to(torch.float8_e4m3fn)
-                v = v.to(torch.float8_e4m3fn)
-            assert k.dtype == v.dtype == kv_cache.dtype, f"KV cache dtype {kv_cache.dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
-
-            flashinfer.page.append_paged_kv_cache(
-                append_key=k,
-                append_value=v,
-                batch_indices=metadata.batch_indices,
-                positions=metadata.positions,
-                paged_kv_cache=kv_cache,
-                kv_indices=metadata.paged_kv_indices,
-                kv_indptr=metadata.paged_kv_indptr,
-                kv_last_page_len=metadata.paged_kv_last_page_len,
-                kv_layout=metadata.kv_layout)
-
-        num_contexts = metadata.num_contexts
-        num_generations = metadata.num_generations
-        num_ctx_tokens = metadata.num_ctx_tokens
-
-        def prefill_forward(plan_params: PlanParams):
-            wrapper = metadata.get_prefill_wrapper(plan_params)
-            output = wrapper.run(q[:num_ctx_tokens], kv_cache)
-            output = output.view(num_ctx_tokens, -1)
-            return output
-
-        def decode_forward(plan_params: PlanParams):
-            wrapper = metadata.get_decode_wrapper(plan_params)
-            output = wrapper.run(q[num_ctx_tokens:], kv_cache)
-            output = output.view(num_generations, -1)
-            return output
-
-        # this will do nothing if the last forward pass had the same parameters
-        plan_params = metadata.plan(num_heads,
-                                    num_kv_heads,
-                                    head_dim,
-                                    q_dtype=q.dtype,
-                                    kv_dtype=kv_cache.dtype,
-                                    attention_mask_type=attention_mask_type,
-                                    attention_mask_data=attention_mask_data)
-
-        if num_contexts > 0:
-            ctx_output = prefill_forward(plan_params)
-
-        if num_generations > 0:
-            gen_output = decode_forward(plan_params)
-
-        if num_contexts > 0 and num_generations > 0:
-            output = torch.cat([ctx_output, gen_output], dim=0)
-        elif num_contexts > 0:
-            output = ctx_output
-        elif num_generations > 0:
-            output = gen_output
-
-        return output
-
-    @forward_pattern.register_fake
-    @staticmethod
-    def _(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        num_heads: int,
-        head_dim: int,
-        num_kv_heads: int,
-        layer_idx: int,
-        has_fp8_kv_cache: bool,
-        attention_mask_type: int,
-        attention_mask_data: Optional[torch.Tensor],
-    ):
-        return torch.empty_like(q)
 
     def forward(self,
                 q: torch.Tensor,
@@ -553,7 +445,121 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         else:
             raise ValueError("Unexpected attention mask type")
 
-        return FlashInferAttention.forward_pattern(
-            q, k, v, self.num_heads, self.head_dim, self.num_kv_heads,
-            self.layer_idx, self.has_fp8_kv_cache, attention_mask_type,
-            attention_mask_data)
+        return forward_pattern(q, k, v, self.num_heads, self.head_dim,
+                               self.num_kv_heads, self.layer_idx,
+                               self.has_fp8_kv_cache, attention_mask_type,
+                               attention_mask_data)
+
+
+@torch.library.custom_op("trtllm::flashinfer_forward", mutates_args=())
+def forward_pattern(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    num_kv_heads: int,
+    layer_idx: int,
+    has_fp8_kv_cache: bool,
+    attention_mask_type: int,
+    attention_mask_data: Optional[torch.Tensor],
+) -> torch.Tensor:
+    '''
+    Wrapping the flashinfer forward as a custom op is required to fix `torch.compile` graph breaks,
+    otherwise it will graph break when calling `metadata.num_contexts` since it convert tensor's sum directly to int.
+    '''
+    # torch.compile does not support custom object as arguments, so we have to use global function to get the metadata.
+    extra_attrs = get_model_extra_attrs()
+    if extra_attrs is not None:
+        metadata_ref = extra_attrs.get("attention_metadata", None)
+        metadata = metadata_ref() if metadata_ref is not None else None
+    else:
+        metadata = get_global_attrs().attention_metadata()
+
+    assert isinstance(
+        metadata,
+        FlashInferAttentionMetadata,
+    )
+
+    # Query
+    q = q.view(-1, num_heads, head_dim)
+
+    # Key and Value
+    kv_cache = metadata.kv_cache_manager.get_buffers(layer_idx)
+
+    if k is not None and v is not None:
+        k = k.view(-1, num_kv_heads, head_dim)
+        v = v.view(-1, num_kv_heads, head_dim)
+
+        if has_fp8_kv_cache:
+            assert kv_cache.dtype == torch.float8_e4m3fn, f"KV cache should have fp8 dtype, but get {kv_cache.dtype}"
+            k = k.to(torch.float8_e4m3fn)
+            v = v.to(torch.float8_e4m3fn)
+        assert k.dtype == v.dtype == kv_cache.dtype, f"KV cache dtype {kv_cache.dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
+
+        flashinfer.page.append_paged_kv_cache(
+            append_key=k,
+            append_value=v,
+            batch_indices=metadata.batch_indices,
+            positions=metadata.positions,
+            paged_kv_cache=kv_cache,
+            kv_indices=metadata.paged_kv_indices,
+            kv_indptr=metadata.paged_kv_indptr,
+            kv_last_page_len=metadata.paged_kv_last_page_len,
+            kv_layout=metadata.kv_layout)
+
+    num_contexts = metadata.num_contexts
+    num_generations = metadata.num_generations
+    num_ctx_tokens = metadata.num_ctx_tokens
+
+    def prefill_forward(plan_params: PlanParams):
+        wrapper = metadata.get_prefill_wrapper(plan_params)
+        output = wrapper.run(q[:num_ctx_tokens], kv_cache)
+        output = output.view(num_ctx_tokens, -1)
+        return output
+
+    def decode_forward(plan_params: PlanParams):
+        wrapper = metadata.get_decode_wrapper(plan_params)
+        output = wrapper.run(q[num_ctx_tokens:], kv_cache)
+        output = output.view(num_generations, -1)
+        return output
+
+    # this will do nothing if the last forward pass had the same parameters
+    plan_params = metadata.plan(num_heads,
+                                num_kv_heads,
+                                head_dim,
+                                q_dtype=q.dtype,
+                                kv_dtype=kv_cache.dtype,
+                                attention_mask_type=attention_mask_type,
+                                attention_mask_data=attention_mask_data)
+
+    if num_contexts > 0:
+        ctx_output = prefill_forward(plan_params)
+
+    if num_generations > 0:
+        gen_output = decode_forward(plan_params)
+
+    if num_contexts > 0 and num_generations > 0:
+        output = torch.cat([ctx_output, gen_output], dim=0)
+    elif num_contexts > 0:
+        output = ctx_output
+    elif num_generations > 0:
+        output = gen_output
+
+    return output
+
+
+@forward_pattern.register_fake
+def _(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    num_kv_heads: int,
+    layer_idx: int,
+    has_fp8_kv_cache: bool,
+    attention_mask_type: int,
+    attention_mask_data: Optional[torch.Tensor],
+):
+    return torch.empty_like(q)
