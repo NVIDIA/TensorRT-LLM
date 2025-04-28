@@ -8,6 +8,7 @@ from transformers import AutoTokenizer
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.executor import GenerationExecutor
 from tensorrt_llm.llmapi.llm import LLM
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 from .task import GenerationTask, Task, TaskStatus
@@ -139,7 +140,7 @@ class TRTLLMWorker(Worker):
         self,
         llm: LLM,
         tokenizer: AutoTokenizer,
-        max_num_tokens: int = 2048,
+        max_tokens: int = 2048,
         temperature: float = 0.9,
         top_p: Optional[float] = None,
         topk: Optional[float] = None,
@@ -147,7 +148,7 @@ class TRTLLMWorker(Worker):
     ):
         self.llm = llm
         self.tokenizer = tokenizer
-        self.default_sampling_params = SamplingParams(max_tokens=max_num_tokens,
+        self.default_sampling_params = SamplingParams(max_tokens=max_tokens,
                                                       temperature=temperature,
                                                       top_p=top_p,
                                                       top_k=topk,
@@ -161,11 +162,16 @@ class TRTLLMWorker(Worker):
                           model_dir: str,
                           backend: str = None,
                           max_batch_size: int = 32,
+                          max_num_tokens: int = 4096,
+                          kv_cache_free_gpu_memory_fraction: float = 0.9,
+                          enable_overlap_scheduler: bool = True,
                           **kwargs):
         pytorch_backend_config = PyTorchConfig(
             mixed_decoder=True,
-            enable_overlap_scheduler=True,
+            enable_overlap_scheduler=enable_overlap_scheduler,
         )
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction, )
 
         tokenizer = AutoTokenizer.from_pretrained(
             model_dir,
@@ -180,8 +186,9 @@ class TRTLLMWorker(Worker):
                   backend=backend,
                   tokenizer=tokenizer,
                   pytorch_backend_config=pytorch_backend_config,
+                  kv_cache_config=kv_cache_config,
                   max_batch_size=max_batch_size,
-                  max_num_tokens=kwargs.get("max_num_tokens", 2048))
+                  max_num_tokens=max_num_tokens)
 
         worker = cls(llm, tokenizer, **kwargs)
         worker.own_llm = True
@@ -195,6 +202,8 @@ class TRTLLMWorker(Worker):
         add_attr_if_not_none(sampling_params, "temperature", [task.temperature])
         add_attr_if_not_none(sampling_params, "top_p", [task.top_p])
         add_attr_if_not_none(sampling_params, "top_k", [task.top_k])
+        add_attr_if_not_none(sampling_params, "return_context_logits",
+                             [task.return_context_logits])
 
         return sampling_params
 
@@ -209,6 +218,7 @@ class TRTLLMWorker(Worker):
         task.cumulative_logprob = result.outputs[0].cumulative_logprob
         task.logprobs = result.outputs[0].logprobs
         task.output_str = result.outputs[0].text
+        task.context_logits = result.context_logits
 
         # TODO: error handle
         return TaskStatus.SUCCESS
