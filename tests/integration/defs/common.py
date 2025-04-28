@@ -532,7 +532,7 @@ def similar(a, b, threshold=0.8):
 
 def generate_summary_cmd(example_root, *args, **kwargs):
     "generate summary command"
-    summarize_script = f"{example_root}/../../../summarize.py" if "core" in example_root else f"{example_root}/../summarize.py"
+    summarize_script = f"{example_root}/../../../summarize.py"
     summary_cmd = [summarize_script, "--test_trt_llm", "--check_accuracy"]
 
     for key, value in kwargs.items():
