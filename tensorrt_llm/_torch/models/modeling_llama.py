@@ -310,21 +310,11 @@ class Llama4MoE(nn.Module):
     ) -> torch.Tensor:
         # Only enable multi-stream for cuda graph since switch stream has extra host overhead
         # This design is mainly for low latency use case. Need to improve for max throughput use case.
-        do_multi_stream = torch.cuda.is_current_stream_capturing()
-        if do_multi_stream:
-            self.moe_event[0].record()
-        shared_output = self.shared_expert(hidden_states)
-        if do_multi_stream:
-            with torch.cuda.stream(self.aux_stream):
-                self.moe_event[0].wait()
-                routed_output = self.compute_routed_output(
-                    hidden_states, all_rank_num_tokens, min_latency_mode)
-                self.moe_event[1].record()
-            self.moe_event[1].wait()
-        else:
-            routed_output = self.compute_routed_output(hidden_states,
-                                                       all_rank_num_tokens,
-                                                       min_latency_mode)
+        fn0 = lambda: self.shared_expert(hidden_states)
+        fn1 = lambda: self.compute_routed_output(
+            hidden_states, all_rank_num_tokens, min_latency_mode)
+        shared_output, routed_output = maybe_execute_in_parallel(
+            fn0, fn1, self.moe_event[0], self.moe_event[1], self.aux_stream)
         if min_latency_mode:
             return [shared_output, *routed_output]
 
