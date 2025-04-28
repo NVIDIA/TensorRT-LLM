@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheConcatenate.h"
@@ -101,6 +102,7 @@ private:
     std::unique_ptr<IOFormatter> mFormatter;
     std::unordered_map<std::string, std::unique_ptr<ReceiveCacheResource>> mProcessToResources;
     std::mutex mProcessIoResouceMutex;
+    batch_manager::kv_cache_manager::CacheTransBufferManager* mCacheTransBufferManager;
 };
 
 } // namespace tensorrt_llm::batch_manager
