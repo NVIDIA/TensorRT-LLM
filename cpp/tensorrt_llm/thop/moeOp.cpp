@@ -606,7 +606,7 @@ torch::Tensor fused_moe_llama4_tp8ep1_min_latency(torch::Tensor const& input, to
     CHECK_INPUT(fc2_dequant, c10::ScalarType::Float);
     TORCH_CHECK(fc1_dequant.dim() == 1, "fc1 dequant must be 1D");
     TORCH_CHECK(fc2_quant.dim() == 0, "fc2 quant must be a scalar tensor");
-    TORCH_CHECK(fc2_dequant.dim() == 1, "fc2 quant must be 1D");
+    TORCH_CHECK(fc2_dequant.dim() == 1, "fc2 dequant must be 1D");
     TORCH_CHECK(fc1_dequant.sizes()[0] == num_experts, "fc1 dequant size must be (num_experts,)");
     TORCH_CHECK(fc2_dequant.sizes()[0] == num_experts, "fc2 dequant size must be (num_experts,)");
 
