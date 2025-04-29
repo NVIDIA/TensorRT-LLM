@@ -233,8 +233,6 @@ class PyExecutor:
         self.micro_batches: List[BatchStatePP
                                  | None] = [None] * self.num_micro_batches
         self.send_handles = [None] * self.num_micro_batches
-        # one handle each for metadata and serialized new_reqs buffer
-        self.send_new_reqs_handle = [None] * 2
 
         self.inflight_req_ids = ReqIdsSet()
         self.canceled_req_ids = ReqIdsSet()
@@ -606,7 +604,7 @@ class PyExecutor:
                 scheduled_batch, _, _ = self._schedule()
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
-                logger.info(
+                logger.debug(
                     f'has {len(self.active_requests)} active_request, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
                     f'{len(scheduled_batch.generation_requests)} generation requests'
@@ -708,7 +706,7 @@ class PyExecutor:
                 scheduled_batch, _, _ = self._schedule()
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
-                logger.info(
+                logger.debug(
                     f'has {len(self.active_requests)} active_request, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
                     f'{len(scheduled_batch.generation_requests)} generation requests'
@@ -866,7 +864,7 @@ class PyExecutor:
                         "probably run out of resource.")
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
-                logger.info(
+                logger.debug(
                     f'has {len(self.active_requests)} active_request, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
                     f'{len(scheduled_batch.generation_requests)} generation requests'
@@ -1006,7 +1004,7 @@ class PyExecutor:
                         "probably run out of resource.")
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
-                logger.info(
+                logger.debug(
                     f'has {len(self.active_requests)} active_request, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
                     f'{len(scheduled_batch.generation_requests)} generation requests'
@@ -1192,10 +1190,7 @@ class PyExecutor:
             self.dist.recv(metadata_arr, self.dist.prev_pp_rank, tag)
 
         if not self.dist.is_last_pp_rank:
-            if self.send_new_reqs_handle[0] is not None:
-                self.send_new_reqs_handle[0].Wait()
-            self.send_new_reqs_handle[0] = self.dist.isend(
-                metadata_arr, self.dist.next_pp_rank, tag)
+            self.dist.send(metadata_arr, self.dist.next_pp_rank, tag)
 
         # 2. send serialized buffer when new requests is not empty
         num_new_requests = metadata_arr[0]
@@ -1206,10 +1201,7 @@ class PyExecutor:
                 self.dist.recv(buf, self.dist.prev_pp_rank, tag)
 
             if not self.dist.is_last_pp_rank:
-                if self.send_new_reqs_handle[1] is not None:
-                    self.send_new_reqs_handle[1].Wait()
-                self.send_new_reqs_handle[1] = self.dist.isend(
-                    buf, self.dist.next_pp_rank, tag)
+                self.dist.send(buf, self.dist.next_pp_rank, tag)
 
             if not self.dist.is_first_pp_rank:
                 new_requests = dill.loads(buf.tobytes())  # nosec B301

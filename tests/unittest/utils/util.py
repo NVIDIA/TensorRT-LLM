@@ -78,6 +78,8 @@ skip_pre_blackwell = pytest.mark.skipif(
 skip_blackwell = pytest.mark.skipif(
     getSMVersion() == 100,
     reason="This test is not supported in Blackwell architecture")
+skip_blackwell_geforce = pytest.mark.skipif(
+    getSMVersion() == 120, reason="This test is not supported on SM 120")
 
 # If used together with @parameterized, we have to use unittest.skipIf instead of pytest.mark.skipif
 skip_pre_ada_unittest = unittest.skipIf(
@@ -126,7 +128,7 @@ def skip_blackwell_for_fmha_tests(context_fmha_type, head_size):
 
 
 def skip_fp4_pre_blackwell(use_fp4):
-    if use_fp4 and (getSMVersion() < 100 or getSMVersion() >= 120):
+    if use_fp4 and getSMVersion() < 100:
         pytest.skip("FP4 is not supported on pre-Blackwell architectures")
 
 

@@ -4656,6 +4656,7 @@ def test_llm_llama_lookahead_xqa_fp8_1gpu(llama_example_root, llama_model_root,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_pre_ada
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("code_llama_model_root", ['CodeLlama-7b-Instruct'],
                          indirect=True)
