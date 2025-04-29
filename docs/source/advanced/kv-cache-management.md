@@ -24,6 +24,21 @@ This document provides an overview of the internal hierarchy and event system fo
 - **Block ↔ Pool:** Each block is an index into a pool; the pool provides the actual storage, while the block is the metadata handle.
 
 ### **WindowBlockManager/BlockManager**
+
+TRT-LLM supports 2 complex features related to KV cache management:
+1. **Variable GQA** - i.e. a different `num_kv_heads` value for different layers.
+2. **Variable SWA** - i.e. a different `attention_window_size` value for different layers.
+
+In order to support both of these features, the pool management works as described below.
+
+But in the simple, *most common case*, for most models, where
+1. MHA/MQA/Non-variable GQA, i.e., same `num_kv_heads` value for all layers,
+2. Global attention/SWA, i.e., same `attention_window_size` value for all layers,
+
+only a *single* pool will be created within the structure described below.
+
+#### KV Cache Pool Management
+
 - **WindowBlockManager:** Manages blocks and pools for a specific attention window size. Within a `WindowBlockManager`, there can be multiple pools - each corresponding a unique number of KV heads - i.e., to support VGQA.
 - **BlockManager:** Manages all `WindowBlockManager` instances, one per unique window size.
 
