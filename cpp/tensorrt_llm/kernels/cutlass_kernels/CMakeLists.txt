@@ -174,7 +174,7 @@ if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
   add_library(
     ar_gemm_src STATIC
     ${ARGEMM_SRC_CU}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/ipcNvlsMemory.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/ipcNvlsMemory.cu)
   target_include_directories(
     ar_gemm_src
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../internal_cutlass_kernels/include)
@@ -217,6 +217,11 @@ function(process_target target_name enable_hopper enable_blackwell)
   if(ENABLE_MULTI_DEVICE)
     target_compile_options(${target_name} PRIVATE "-DENABLE_MULTI_DEVICE=1")
     target_link_libraries(${target_name} PRIVATE ${MPI_C_LIBRARIES})
+  endif()
+
+  if(ENABLE_NVSHMEM)
+    target_link_libraries(${target_name} PRIVATE nvshmem::nvshmem_host
+                                                 nvshmem::nvshmem_device)
   endif()
 
 endfunction()

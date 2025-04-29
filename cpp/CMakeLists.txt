@@ -43,6 +43,7 @@ option(ENABLE_MULTI_DEVICE
        "Enable building with multi device support (requires NCCL, MPI,...)" ON)
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
+option(ENABLE_NVSHMEM "Enable building with NVSHMEM support" OFF)
 option(USING_OSS_CUTLASS_LOW_LATENCY_GEMM
        "Using open sourced Cutlass low latency gemm kernel" ON)
 option(USING_OSS_CUTLASS_FP4_GEMM "Using open sourced Cutlass fp4 gemm kernel"
@@ -51,6 +52,8 @@ option(USING_OSS_CUTLASS_MOE_GEMM "Using open sourced Cutlass moe gemm kernel"
        ON)
 option(USING_OSS_CUTLASS_ALLREDUCE_GEMM
        "Using open sourced Cutlass AR gemm kernel" ON)
+
+message(STATUS "ENABLE_NVSHMEM is ${ENABLE_NVSHMEM}")
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
@@ -157,6 +160,7 @@ message(STATUS "CUDA library status:")
 message(STATUS "    version: ${CUDAToolkit_VERSION}")
 message(STATUS "    libraries: ${CUDAToolkit_LIBRARY_DIR}")
 message(STATUS "    include path: ${CUDAToolkit_INCLUDE_DIRS}")
+message(STATUS "CUDA_NVML_LIB: ${CUDA_NVML_LIB}")
 
 # Prevent CMake from creating a response file for CUDA compiler, so clangd can
 # pick up on the includes
@@ -248,9 +252,21 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss ")
 # note: cmake expr generation $<BOOL:${ENABLE_MULTI_DEVICE}> is a build time
 # evaluation so hard to debug at cmake time
 if(ENABLE_MULTI_DEVICE)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_MULTI_DEVICE=1")
+  # Add target definitions for both C++ and CUDA
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_MULTI_DEVICE=1>
+                          $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_MULTI_DEVICE=1>)
 else()
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_MULTI_DEVICE=0")
+  # Add target definitions for both C++ and CUDA
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_MULTI_DEVICE=0>
+                          $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_MULTI_DEVICE=0>)
+endif()
+
+if(ENABLE_NVSHMEM)
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_NVSHMEM=1>
+                          $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_NVSHMEM=1>)
+else()
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_NVSHMEM=0>
+                          $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_NVSHMEM=0>)
 endif()
 
 # Fix linking issue with TRT 10, the detailed description about `--mcmodel` can

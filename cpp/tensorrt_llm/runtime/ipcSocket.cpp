@@ -72,6 +72,7 @@ struct NcclIpcSocket
     int fd;
     char socketName[NCCL_IPC_SOCKNAME_LEN];
     uint32_t volatile* abortFlag;
+    uint64_t hash;
 };
 
 /*
@@ -89,6 +90,7 @@ std::shared_ptr<NcclIpcSocket> ncclIpcSocketInit(int rank, uint64_t hash, uint32
         TLLM_NCCL_CHECK(ncclInternalError); // throws
     }
 
+    handle->hash = hash;
     handle->fd = -1;
     handle->socketName[0] = '\0';
     if ((fd = socket(AF_UNIX, SOCK_DGRAM, 0)) < 0)
@@ -310,9 +312,9 @@ void ncclIpcSocketSendMsg(
     }
 }
 
-void ncclIpcSocketSendFd(std::shared_ptr<NcclIpcSocket> handle, int sendFd, int rank, uint64_t hash)
+void ncclIpcSocketSendFd(std::shared_ptr<NcclIpcSocket> handle, int sendFd, int rank)
 {
-    ncclIpcSocketSendMsg(handle, NULL, 0, sendFd, rank, hash);
+    ncclIpcSocketSendMsg(handle, NULL, 0, sendFd, rank, handle->hash);
 }
 
 } // namespace tensorrt_llm::runtime
