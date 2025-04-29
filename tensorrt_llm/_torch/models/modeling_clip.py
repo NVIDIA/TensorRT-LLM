@@ -6,28 +6,23 @@ from tqdm import tqdm
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (BaseModelOutput,
                                            BaseModelOutputWithPooling)
+from transformers.modeling_utils import (get_parameter_device,
+                                         get_parameter_dtype)
 from transformers.models.clip.configuration_clip import CLIPVisionConfig
 from transformers.models.clip.modeling_clip import CLIPVisionEmbeddings
 
 from ..attention_backend.interface import (AttentionMetadata,
                                            PredefinedAttentionMask)
+from ..attention_backend.utils import get_attention_backend
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.mlp import MLP
-from .modeling_utils import register_auto_model
-"""
-NOTE:
-Configuration Class from HF to TRT-LLM ModelConfig naming convention:
-In this file, all `config`s or `self.config`s are HF Configs
-all `model_config`s or `self.model_config`s are TRT-LLM ModelConfig
-At the same time, the `model_config.pretrained_config` is also HF Config as this is defined by the ModelConfig class
-"""
+from .modeling_utils import (duplicate_kv_weight, missing_layer_parameter,
+                             register_auto_model, rename_weights_with_regex)
 
 
-# --- Attention Implementation ---
 class CLIPAttention(Attention):
 
-    # Updated to only take CLIPVisionConfig
     def __init__(self, model_config: ModelConfig[CLIPVisionConfig],
                  layer_idx: int):
         config = model_config.pretrained_config
@@ -133,16 +128,10 @@ class CLIPEncoder(nn.Module):
         for encoder_layer in self.layers:
             if output_hidden_states:
                 # hidden_states is (batch_size * seq_len, embed_dim) because TRT-LLM Attention is applied to flattened tokens
-                seq_len = (
-                    self.config.image_size // self.config.patch_size
-                )**2 + 1  # the "seq_len" is fixed, it is the number of patches +1 (cls token).
-                batch_size = hidden_states.shape[0] // seq_len
                 # we want the output shape align with HF output shape (batch_size, seq_len, embed_dim)
                 encoder_states = encoder_states + (hidden_states.view(
-                    batch_size, seq_len, -1), )
-                # print(
-                #     f"hidden_states is added with shape: {hidden_states.view(batch_size, seq_len, -1).shape}, batch_size: {batch_size}, seq_len: {seq_len}"
-                # )
+                    attn_metadata.seq_lens.shape[0], attn_metadata.seq_lens[0],
+                    -1), )
 
             layer_outputs = encoder_layer(
                 hidden_states,
@@ -152,25 +141,15 @@ class CLIPEncoder(nn.Module):
 
         if output_hidden_states:
             # hidden_states is (batch_size * seq_len, embed_dim) because TRT-LLM Attention is applied to flattened tokens
-            seq_len = (
-                self.config.image_size // self.config.patch_size
-            )**2 + 1  # the "seq_len" is fixed, it is the number of patches. Note that we have a cls token for clip, so we need to add 1
-            batch_size = hidden_states.shape[0] // seq_len
             # we want the output shape align with HF output shape (batch_size, seq_len, embed_dim)
             encoder_states = encoder_states + (hidden_states.view(
-                batch_size, seq_len, -1), )
-            # print(
-            #     f"hidden_states is added with shape: {hidden_states.view(batch_size, seq_len, -1).shape}, batch_size: {batch_size}, seq_len: {seq_len}"
-            # )
+                attn_metadata.seq_lens.shape[0], attn_metadata.seq_lens[0],
+                -1), )
 
         return BaseModelOutput(
             last_hidden_state=
             hidden_states,  # Keep it flattened for subsequent layers/pooling
             hidden_states=encoder_states)
-
-
-# --- Vision Transformer ---
-# Uses HF CLIPVisionEmbeddings
 
 
 class CLIPVisionTransformer(nn.Module):
@@ -222,9 +201,8 @@ class CLIPVisionTransformer(nn.Module):
 
         # Pooling: Use the CLS token (first token) output
         pooled_output = last_hidden_state[:, 0, :]
-        pooled_output = self.post_layernorm(pooled_output)  # Apply final LN
+        pooled_output = self.post_layernorm(pooled_output)
 
-        # Pass the reshaped hidden_states if requested
         returned_hidden_states = encoder_outputs.hidden_states
 
         return BaseModelOutputWithPooling(
@@ -232,35 +210,49 @@ class CLIPVisionTransformer(nn.Module):
             last_hidden_state=last_hidden_state,
             pooler_output=pooled_output,
             hidden_states=returned_hidden_states,
-            # Attentions are not returned by TRT-LLM Attention module by default
             attentions=None,
         )
 
 
-# --- Vision Model ---
 @register_auto_model("CLIPVisionModel")
 class CLIPVisionModel(nn.Module):
 
     def __init__(self, model_config: ModelConfig[CLIPVisionConfig]):
         super().__init__()
-        # No need to check for CLIPConfig anymore
-        if not isinstance(model_config.pretrained_config, CLIPVisionConfig):
-            raise ValueError(
-                "Invalid config type for CLIPVisionModel, expected CLIPVisionConfig"
-            )
-
         self.model_config = model_config
         self.config = self.model_config.pretrained_config  # HF Vision Config
         self.vision_model = CLIPVisionTransformer(self.model_config)
+        self.metadata_cls = get_attention_backend(
+            model_config.attn_backend).Metadata
+
+    def prepare_attn_metadata(self, batch_size):
+        """
+        To simplify the usage of the model, this function aims to fill the metadata for Attention
+        Call this function before forward pass
+        """
+        seq_len = (self.config.image_size // self.config.patch_size)**2 + 1
+        request_ids = list(range(1, batch_size + 1))
+        prompt_lens = [seq_len] * batch_size
+        attn_metadata = self.metadata_cls(
+            seq_lens=torch.tensor([seq_len] * batch_size, dtype=torch.int),
+            num_contexts=batch_size,
+            max_num_requests=batch_size,
+            max_num_tokens=seq_len * batch_size,
+            kv_cache_manager=None,
+            request_ids=request_ids,
+            prompt_lens=prompt_lens,
+        )
+        attn_metadata.max_seq_len = seq_len * batch_size
+        attn_metadata.prepare()
+        return attn_metadata
 
     @property
     def dtype(self):
-        # Infer dtype from a parameter
-        return next(self.parameters()).dtype
+        return get_parameter_dtype(self)
 
     @property
     def device(self):
-        return next(self.parameters()).device
+        return get_parameter_device(self)
 
     @torch.inference_mode()
     def forward(self,
@@ -276,12 +268,7 @@ class CLIPVisionModel(nn.Module):
             interpolate_pos_encoding=interpolate_pos_encoding)
 
     def load_weights(self, weights: Dict):
-        # FIXME: Temporary import
-        from .modeling_utils import (duplicate_kv_weight,
-                                     missing_layer_parameter,
-                                     rename_weights_with_regex)
 
-        # FIXME: Temporary import
         # Pattern mapping for CLIP based on Siglip's example and CLIP HF names
         pattern_mapping = {
             r'(.*?)self_attn\.out_proj(.*)': r'\1self_attn.o_proj\2',
@@ -316,7 +303,6 @@ class CLIPVisionModel(nn.Module):
                 # Skip if parameter belongs to a missing layer
                 if missing_layer_parameter(name, self):
                     continue
-                # print(f"loading {name}")
 
                 names = name.split('.')
                 if names[-1] in params_map:
@@ -336,16 +322,11 @@ class CLIPVisionModel(nn.Module):
                             }
                         module_weights.append(fw)
                     module.load_weights(weights=module_weights)
-                    # print(
-                    #     f"loaded {name}: {[w_dic.keys() for w_dic in module_weights]}"
-                    # )
                 else:
                     module_weights = filter_weights(name, weights)
-                    # print(f"module_weights: {module_weights.keys()}")
                     if hasattr(module, 'load_weights'):
                         module.load_weights(weights=[module_weights])
                     else:
                         for n, p in module._parameters.items():
                             if p is not None:
                                 p.data.copy_(module_weights[n][:])
-                    # print(f"loaded {name}: {module_weights.keys()}")
