@@ -75,7 +75,7 @@ class KvCacheAwareServerState(ServerState):
 
     def remove_blocks(self, block_hashes: Iterable[int]):
         for hash in block_hashes:
-            self._kv_cache_block_table.remove(hash)
+            self._kv_cache_block_table.discard(hash)
 
     def update_with_events(self, events: Iterable[dict]):
         # event_raw: {"id": <id>, "data": <event body>}
@@ -276,14 +276,16 @@ class KvCacheAwareRouter(Router):
             for state in self._server_state.values()
         ]
         scores = []
+        matches = []
         for i in range(len(servers)):
             server = servers[i]
             # https://github.com/ai-dynamo/dynamo/blob/main/docs/kv_cache_routing.md#kv-cache-routing-and-load-balancing
-            score = await self._server_state[server].match_blocks(
-                block_hashes
-            ) / total_blocks - workloads[i] / self._max_batch_size
+            match_count = await self._server_state[server].match_blocks(
+                block_hashes)
+            score = match_count / total_blocks - workloads[
+                i] / self._max_batch_size
             scores.append(score)
-
+            matches.append(match_count)
         server = servers[scores.index(max(scores))]
         await self._server_state[server].increment_load(request)
         async with self._lock:
@@ -291,6 +293,7 @@ class KvCacheAwareRouter(Router):
         return server, {
             "block_hashes": block_hashes,
             "token_lists": token_lists,
+            "matches": matches,
         }
 
     async def finish_request(self,
