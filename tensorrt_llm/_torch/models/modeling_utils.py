@@ -510,73 +510,7 @@ class DecoderModelForCausalLM(nn.Module,
         )
 
     def load_weights(self, weights: Dict):
-        tp_size = self.model_config.mapping.tp_size
-        head_dim = getattr(
-            self.config, "head_dim",
-            self.config.hidden_size // self.config.num_attention_heads)
-
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v
-            return result
-
-        params_map = {
-            'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
-            'gate_up_proj': ['gate_proj', 'up_proj']
-        }
-
-        for name, module in tqdm(list(self.named_modules()),
-                                 desc="Loading weights"):
-            if len(module._parameters) > 0:
-                # skip load weights if tie word embeddings is enabled and layer is lm_head
-                if self.config.tie_word_embeddings and name.startswith(
-                        "lm_head"):
-                    continue
-
-                # Skip loading weights for embedding and lm_head if LoRA is enabled
-                if hasattr(self.model_config, 'lora_config'
-                           ) and self.model_config.lora_config is not None and (
-                               name == "model.embed_tokens"
-                               or name == "lm_head"):
-                    continue
-
-                # Skip if parameter belongs to a missing layer
-                if missing_layer_parameter(name, self):
-                    continue
-
-                names = name.split('.')
-                # WAR: better solution is that llama has its own load_weights function.
-                if names[-1] == 'next_layer_layernorm':
-                    continue
-                if names[-1] in params_map:
-                    module_weights = []
-                    for new_name in params_map[names[-1]]:
-                        fw = filter_weights('.'.join(names[:-1] + [new_name]),
-                                            weights)
-                        if new_name in ['k_proj', 'v_proj']:
-                            fw = {
-                                k:
-                                duplicate_kv_weight(
-                                    weight=v[:],
-                                    head_dim=head_dim,
-                                    tensor_parallel_size=tp_size)
-                                if k in ["weight", "bias"] else v
-                                for k, v in fw.items()
-                            }
-
-                        module_weights.append(fw)
-                    module.load_weights(weights=module_weights)
-                else:
-                    module_weights = filter_weights(name, weights)
-                    if hasattr(module, 'load_weights'):
-                        module.load_weights(weights=[module_weights])
-                    else:
-                        for n, p in module._parameters.items():
-                            if p is not None:
-                                p.data.copy_(module_weights[n][:])
+        _load_weights_impl(self, weights)
 
     def infer_max_seq_len(self) -> int:
         # Modified from tensorrt_llm/builder.py _init_max_seq_len
@@ -681,3 +615,82 @@ def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
             renamed_weights[key] = weights[key]
 
     return renamed_weights
+
+
+def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
+                       weights: Dict,
+                       params_map: Optional[Dict[str, str]] = None):
+    if not hasattr(model, 'model_config') or not isinstance(
+            model.model_config, ModelConfig):
+        raise ValueError("model must have a model_config attribute")
+    if not hasattr(model, 'config'):
+        raise ValueError("model must have a config attribute")
+
+    if params_map is not None:
+        weights = rename_weights_with_regex(params_map, weights)
+        logger.info(f"Renamed weights with params_map: {params_map}")
+
+    tp_size = model.model_config.mapping.tp_size
+    head_dim = getattr(
+        model.config, "head_dim",
+        model.config.hidden_size // model.config.num_attention_heads)
+
+    def filter_weights(prefix, weights: Dict):
+        result = {}
+        for k, v in weights.items():
+            if k.startswith(prefix):
+                new_k = k[len(prefix) + 1:]
+                result[new_k] = v
+        return result
+
+    params_map = {
+        'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
+        'gate_up_proj': ['gate_proj', 'up_proj']
+    }
+
+    for name, module in tqdm(list(model.named_modules()),
+                             desc="Loading weights"):
+        if len(module._parameters) > 0:
+            # skip load weights if tie word embeddings is enabled and layer is lm_head
+            if model.config.tie_word_embeddings and name.startswith("lm_head"):
+                continue
+
+            # Skip loading weights for embedding and lm_head if LoRA is enabled
+            if hasattr(model.model_config, 'lora_config'
+                       ) and model.model_config.lora_config is not None and (
+                           name == "model.embed_tokens" or name == "lm_head"):
+                continue
+
+            # Skip if parameter belongs to a missing layer
+            if missing_layer_parameter(name, model):
+                continue
+
+            names = name.split('.')
+            # WAR: better solution is that llama has its own load_weights function.
+            if names[-1] == 'next_layer_layernorm':
+                continue
+            if names[-1] in params_map:
+                module_weights = []
+                for new_name in params_map[names[-1]]:
+                    fw = filter_weights('.'.join(names[:-1] + [new_name]),
+                                        weights)
+                    if new_name in ['k_proj', 'v_proj']:
+                        fw = {
+                            k:
+                            duplicate_kv_weight(weight=v[:],
+                                                head_dim=head_dim,
+                                                tensor_parallel_size=tp_size)
+                            if k in ["weight", "bias"] else v
+                            for k, v in fw.items()
+                        }
+
+                    module_weights.append(fw)
+                module.load_weights(weights=module_weights)
+            else:
+                module_weights = filter_weights(name, weights)
+                if hasattr(module, 'load_weights'):
+                    module.load_weights(weights=[module_weights])
+                else:
+                    for n, p in module._parameters.items():
+                        if p is not None:
+                            p.data.copy_(module_weights[n][:])
