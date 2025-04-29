@@ -226,6 +226,7 @@ class PyExecutor:
         self.has_context_request = False
         self.ctx_in_transmission_requests = []
         self.previous_batch: Optional[BatchState] = None
+        self.num_scheduled_requests: int = 0
 
         # list of requests in each PP micro batch
         self.num_micro_batches = self.dist.pp_size + enable_overlap_scheduler
@@ -467,6 +468,7 @@ class PyExecutor:
                     f"currank_total_requests = {self.num_fetch_requests_cur_rank}/{self.num_fetch_requests}, "
                     f"elapsed_time = {end_time - start_time}s, "
                     f"timestamp = {formatted_timestamp}, "
+                    f"num_scheduled_requests: {self.num_scheduled_requests}, "
                     f"states = {self.model_engine.iter_states}")
 
             it += 1
@@ -603,6 +605,13 @@ class PyExecutor:
                     self._merge_dummy_request(num_dummy_request)
                 scheduled_batch, _, _ = self._schedule()
 
+                self.num_scheduled_requests = scheduled_batch.batch_size
+                logger.info(
+                    f'has {len(self.active_requests)} active_request, '
+                    f'scheduled {len(scheduled_batch.context_requests)} context requests and '
+                    f'{len(scheduled_batch.generation_requests)} generation requests'
+                )
+
                 if self.enable_attention_dp:
                     tp_batch_sizes = self.dist.tp_allgather(
                         scheduled_batch.batch_size)
@@ -697,6 +706,13 @@ class PyExecutor:
                 if num_dummy_request > 0:
                     self._merge_dummy_request(num_dummy_request)
                 scheduled_batch, _, _ = self._schedule()
+
+                self.num_scheduled_requests = scheduled_batch.batch_size
+                logger.info(
+                    f'has {len(self.active_requests)} active_request, '
+                    f'scheduled {len(scheduled_batch.context_requests)} context requests and '
+                    f'{len(scheduled_batch.generation_requests)} generation requests'
+                )
 
                 if self.enable_attention_dp:
                     tp_batch_sizes = self.dist.tp_allgather(
@@ -849,7 +865,8 @@ class PyExecutor:
                         "fail to schedule any pending request, "
                         "probably run out of resource.")
 
-                logger.debug(
+                self.num_scheduled_requests = scheduled_batch.batch_size
+                logger.info(
                     f'has {len(self.active_requests)} active_request, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
                     f'{len(scheduled_batch.generation_requests)} generation requests'
@@ -988,7 +1005,8 @@ class PyExecutor:
                         "fail to schedule any pending request, "
                         "probably run out of resource.")
 
-                logger.debug(
+                self.num_scheduled_requests = scheduled_batch.batch_size
+                logger.info(
                     f'has {len(self.active_requests)} active_request, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
                     f'{len(scheduled_batch.generation_requests)} generation requests'
