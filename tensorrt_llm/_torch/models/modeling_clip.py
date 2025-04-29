@@ -27,7 +27,6 @@ class CLIPAttention(Attention):
                  layer_idx: int):
         config = model_config.pretrained_config
         pos_embd_params = None
-        rotary_emb = None
 
         # Vision model has class token
         num_patches = (config.image_size // config.patch_size)**2
@@ -41,7 +40,6 @@ class CLIPAttention(Attention):
             num_key_value_heads=config.num_attention_heads,  # CLIP uses MHA
             max_position_embeddings=max_position_embeddings,
             bias=bias,
-            rotary_emb=rotary_emb,
             pos_embd_params=pos_embd_params,
             layer_idx=layer_idx,
             dtype=config.torch_dtype

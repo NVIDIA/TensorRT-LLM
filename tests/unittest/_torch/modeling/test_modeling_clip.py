@@ -12,7 +12,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 # Import TRT-LLM CLIP model
 from tensorrt_llm._torch.models.modeling_clip import CLIPVisionModel
 
-# Default CLIP config from HF
+# Default CLIP config from HF (https://github.com/huggingface/transformers/blob/v4.51.3/src/transformers/models/clip/configuration_clip.py#L144-L172)
 CLIP_CONFIG = {
     "hidden_size": 768,
     "intermediate_size": 3072,

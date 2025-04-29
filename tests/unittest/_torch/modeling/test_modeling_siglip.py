@@ -10,6 +10,7 @@ from transformers import SiglipVisionModel as HFSiglipVisionModel
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_siglip import SiglipVisionModel
 
+# use the default config from HF (https://github.com/huggingface/transformers/blob/main/src/transformers/models/siglip/configuration_siglip.py#L126-L147)
 SIGLIP_CONFIG = {
     "hidden_size": 768,
     "intermediate_size": 3072,
@@ -17,12 +18,16 @@ SIGLIP_CONFIG = {
     "num_attention_heads": 12,
     "image_size": 224,
     "patch_size": 16,
-    "hidden_act": "gelu",
+    "hidden_act": "gelu_pytorch_tanh",
     "layer_norm_eps": 1e-6,
     "hidden_dropout_prob": 0.0,
     "attention_probs_dropout_prob": 0.0,
     "num_channels": 3,
     "vision_use_head": False,
+}
+
+ACCURACY_CONFIG = {
+    torch.float16: (2e-2, 2e-2),
 }
 
 
@@ -105,8 +110,8 @@ class TestSiglipVisionModel(unittest.TestCase):
             torch.testing.assert_close(
                 hf_ref.float(),
                 tllm_res.float(),
-                rtol=2e-2,
-                atol=2e-2,
+                rtol=ACCURACY_CONFIG[dtype][0],
+                atol=ACCURACY_CONFIG[dtype][1],
                 msg=
                 f"FAILED: TRT-LLM and HF hidden_states mismatch for {dtype} with {num_images} images at layer {select_layer}"
             )
