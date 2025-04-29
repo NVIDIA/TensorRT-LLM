@@ -13,20 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from collections import defaultdict
 from pathlib import Path
-from typing import Union, Iterable, Tuple, TextIO, List, Dict
+from typing import Dict, Iterable, List, TextIO, Tuple, Union
 
+import click
+import kaldialign
+import numpy
 import numpy as np
 import torch
-import numpy
-import click
-import kaldialign, logging
 import torch.nn.functional as F
-import logging
-import os
-
-from torch.xpu import device
 
 Pathlike = Union[str, Path]
 
@@ -188,7 +185,6 @@ def write_error_stats(
     return float(tot_err_rate)
 
 
-
 def store_transcripts(filename: Pathlike, texts: Iterable[Tuple[str, str,
                                                                 str]]) -> None:
     """Save predicted results and reference transcripts to a file.
@@ -234,6 +230,7 @@ def pad_or_trim(array, length: int = N_SAMPLES, *, axis: int = -1):
 
     return array
 
+
 def trim(array, length: int = N_SAMPLES, *, axis: int = -1):
     """
     Pad or trim the audio array to N_SAMPLES, as expected by the encoder.
@@ -251,20 +248,28 @@ def trim(array, length: int = N_SAMPLES, *, axis: int = -1):
 
 
 class MelFilterBankFeats:
-    def __init__(self, mel_basis, nfft=None,
-                 window_size=0.025, window_stride=0.010, window_type='hann',
-                 preemp=0.97,  fs = 16000, mag_power=2.0,
-                 log=True, log_zero_guard_type="add", log_zero_guard_value=2 ** -24,
-                 normalize='per_feature', device='cuda'
 
-                 ):
+    def __init__(self,
+                 mel_basis,
+                 nfft=None,
+                 window_size=0.025,
+                 window_stride=0.010,
+                 window_type='hann',
+                 preemp=0.97,
+                 fs=16000,
+                 mag_power=2.0,
+                 log=True,
+                 log_zero_guard_type="add",
+                 log_zero_guard_value=2**-24,
+                 normalize='per_feature',
+                 device='cuda'):
 
         self.device = device
         self.mel_basis = mel_basis
         self.nfilt = self.mel_basis.shape[1]
         self.normalize = normalize
-        if preemp==0.0:
-            preemp=None
+        if preemp == 0.0:
+            preemp = None
         self.preemp = preemp
 
         if nfft is None:
@@ -276,36 +281,46 @@ class MelFilterBankFeats:
         self.log_zero_guard_type = log_zero_guard_type
         self.log = log
 
-        assert self.nfft/2+1==self.mel_basis.shape[2]
+        assert self.nfft / 2 + 1 == self.mel_basis.shape[2]
 
-        self.window_size = int(fs*window_size)
-        self.window_stride = int(fs*window_stride)
+        self.window_size = int(fs * window_size)
+        self.window_stride = int(fs * window_stride)
         self.mag_power = mag_power
         if window_type == 'hann':
-            self.window= torch.hann_window(self.window_size, dtype=torch.float, device=self.device)
+            self.window = torch.hann_window(self.window_size,
+                                            dtype=torch.float,
+                                            device=self.device)
         elif window_type == 'hamming':
-            self.window= torch.hamming_window(self.window_size, dtype=torch.float, device=self.device)
+            self.window = torch.hamming_window(self.window_size,
+                                               dtype=torch.float,
+                                               device=self.device)
         elif window_type == 'bartlett':
-            self.window= torch.bartlett_window(self.window_size, dtype=torch.float, device=self.device)
+            self.window = torch.bartlett_window(self.window_size,
+                                                dtype=torch.float,
+                                                device=self.device)
         elif window_type == 'blackman':
-            self.window = torch.blackman_window(self.window_size, dtype=torch.float, device=self.device)
+            self.window = torch.blackman_window(self.window_size,
+                                                dtype=torch.float,
+                                                device=self.device)
 
         else:
-            self.window= torch.ones(self.window_size, dtype=torch.float, device=self.device)
-
-
+            self.window = torch.ones(self.window_size,
+                                     dtype=torch.float,
+                                     device=self.device)
 
     def stft(self, audio):
 
-        return torch.stft(audio, n_fft=self.nfft,
-                          hop_length=self.window_stride,
-                          win_length=self.window_size,
-                          window=self.window,
-                          center=True,
-                          pad_mode='reflect',
-                          return_complex=True,
-                          onesided=True,
-                          )
+        return torch.stft(
+            audio,
+            n_fft=self.nfft,
+            hop_length=self.window_stride,
+            win_length=self.window_size,
+            window=self.window,
+            center=True,
+            pad_mode='reflect',
+            return_complex=True,
+            onesided=True,
+        )
 
     @staticmethod
     def normalize_batch(x, seq_len, normalize_type):
@@ -318,27 +333,27 @@ class MelFilterBankFeats:
             # When doing stream capture to a graph, item() is not allowed
             # because it calls cudaStreamSynchronize(). Therefore, we are
             # sacrificing some error checking when running with cuda graphs.
-            if (
-                    torch.cuda.is_available()
+            if (torch.cuda.is_available()
                     and not torch.cuda.is_current_stream_capturing()
-                    and torch.any(seq_len == 1).item()
-            ):
+                    and torch.any(seq_len == 1).item()):
                 raise ValueError(
                     "normalize_batch with `per_feature` normalize_type received a tensor of length 1. This will result "
                     "in torch.std() returning nan. Make sure your audio length has enough samples for a single "
-                    "feature (ex. at least `hop_length` for Mel Spectrograms)."
-                )
-            time_steps = torch.arange(max_time, device=x.device).unsqueeze(0).expand(batch_size, max_time)
+                    "feature (ex. at least `hop_length` for Mel Spectrograms).")
+            time_steps = torch.arange(max_time,
+                                      device=x.device).unsqueeze(0).expand(
+                                          batch_size, max_time)
             valid_mask = time_steps < seq_len.unsqueeze(1)
-            x_mean_numerator = torch.where(valid_mask.unsqueeze(1), x, 0.0).sum(axis=2)
+            x_mean_numerator = torch.where(valid_mask.unsqueeze(1), x,
+                                           0.0).sum(axis=2)
             x_mean_denominator = valid_mask.sum(axis=1)
             x_mean = x_mean_numerator / x_mean_denominator.unsqueeze(1)
 
             # Subtract 1 in the denominator to correct for the bias.
             x_std = torch.sqrt(
-                torch.sum(torch.where(valid_mask.unsqueeze(1), x - x_mean.unsqueeze(2), 0.0) ** 2, axis=2)
-                / (x_mean_denominator.unsqueeze(1) - 1.0)
-            )
+                torch.sum(torch.where(valid_mask.unsqueeze(1),
+                                      x - x_mean.unsqueeze(2), 0.0)**2,
+                          axis=2) / (x_mean_denominator.unsqueeze(1) - 1.0))
             # make sure x_std is not zero
             x_std += CONSTANT
             return (x - x_mean.unsqueeze(2)) / x_std.unsqueeze(2)
@@ -346,40 +361,41 @@ class MelFilterBankFeats:
             x_mean = torch.zeros(seq_len.shape, dtype=x.dtype, device=x.device)
             x_std = torch.zeros(seq_len.shape, dtype=x.dtype, device=x.device)
             for i in range(x.shape[0]):
-                x_mean[i] = x[i, :, : seq_len[i].item()].mean()
-                x_std[i] = x[i, :, : seq_len[i].item()].std()
+                x_mean[i] = x[i, :, :seq_len[i].item()].mean()
+                x_std[i] = x[i, :, :seq_len[i].item()].std()
             # make sure x_std is not zero
             x_std += CONSTANT
             return (x - x_mean.view(-1, 1, 1)) / x_std.view(-1, 1, 1)
         elif "fixed_mean" in normalize_type and "fixed_std" in normalize_type:
             x_mean = torch.tensor(normalize_type["fixed_mean"], device=x.device)
             x_std = torch.tensor(normalize_type["fixed_std"], device=x.device)
-            return (
-                (x - x_mean.view(x.shape[0], x.shape[1]).unsqueeze(2)) / x_std.view(x.shape[0], x.shape[1]).unsqueeze(
-                    2)
-            )
+            return ((x - x_mean.view(x.shape[0], x.shape[1]).unsqueeze(2)) /
+                    x_std.view(x.shape[0], x.shape[1]).unsqueeze(2))
         else:
             return x
 
     def get_feat_seq_len(self, seq_len):
         # Assuming that center is True is stft_pad_amount = 0
-        pad_amount =  self.nfft // 2 * 2
-        seq_len = torch.floor_divide((seq_len + pad_amount - self.nfft), self.window_stride) + 1
+        pad_amount = self.nfft // 2 * 2
+        seq_len = torch.floor_divide(
+            (seq_len + pad_amount - self.nfft), self.window_stride) + 1
         return seq_len.to(dtype=torch.int64)
 
     def get_feats(self, audio, seq_len=None):
         if seq_len is None:
-            seq_len=[len(a) for a in audio]
+            seq_len = [len(a) for a in audio]
 
-        seq_len=torch.Tensor(seq_len).to(dtype=torch.int32, device=self.device)
-        if type(audio)==list:
-            audio=torch.nn.utils.rnn.pad_sequence(audio, batch_first=True, padding_value=0.0).to(device=self.device)
-
-
+        seq_len = torch.Tensor(seq_len).to(dtype=torch.int32,
+                                           device=self.device)
+        if type(audio) == list:
+            audio = torch.nn.utils.rnn.pad_sequence(
+                audio, batch_first=True,
+                padding_value=0.0).to(device=self.device)
 
         if self.preemp is not None:
-            audio = torch.cat((audio[:, 0].unsqueeze(1), audio[:, 1:] - self.preemp * audio[:, :-1]), dim=1)
-
+            audio = torch.cat((audio[:, 0].unsqueeze(1),
+                               audio[:, 1:] - self.preemp * audio[:, :-1]),
+                              dim=1)
 
         spec = torch.view_as_real(self.stft(audio))
 
@@ -393,26 +409,36 @@ class MelFilterBankFeats:
 
         spec = torch.log(spec + self.log_zero_guard_value)
         seq_len = self.get_feat_seq_len(seq_len)
-        spec = self.normalize_batch(spec, seq_len, normalize_type=self.normalize)
+        spec = self.normalize_batch(spec,
+                                    seq_len,
+                                    normalize_type=self.normalize)
 
-        return spec,seq_len
+        return spec, seq_len
 
 
 def audio2feat(mel_basis, preemp, audio):
-    mel_feats=MelFilterBankFeats(mel_basis, preemp=preemp)
+    mel_feats = MelFilterBankFeats(mel_basis, preemp=preemp)
     feats = mel_feats.get_feats(audio)
     return feats
 
 
-
 @click.command()
-@click.option('-m', '--mel_basis', required=True, type=click.Path(exists=True), help='Path to mel_basis.')
-@click.option('-p', '--preemp', default=0.97, type=float, required=True, help='Preemphasis coefficient.')
+@click.option('-m',
+              '--mel_basis',
+              required=True,
+              type=click.Path(exists=True),
+              help='Path to mel_basis.')
+@click.option('-p',
+              '--preemp',
+              default=0.97,
+              type=float,
+              required=True,
+              help='Preemphasis coefficient.')
 @click.argument('audio_path', type=click.Path(exists=True))
 @click.argument('feats_path', type=click.Path())
-def main(mel_basis, preemp, audio_path, feats_path ):
+def main(mel_basis, preemp, audio_path, feats_path):
     mel_basis = numpy.load(mel_basis)
-    audio,fs = sf.read(audio_path)
+    audio, fs = sf.read(audio_path)
     print(audio.size)
     audio = numpy.reshape(audio, (1, audio.shape[0]))
     feats = audio2feat(mel_basis, preemp, audio)
@@ -422,9 +448,3 @@ def main(mel_basis, preemp, audio_path, feats_path ):
 
 if __name__ == '__main__':
     main()
-
-
-
-
-
-

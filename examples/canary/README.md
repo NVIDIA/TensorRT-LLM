@@ -8,7 +8,7 @@ This document shows how to build and run a NeMO [canary model](https://huggingfa
     - [Build TensorRT engine(s)](#build-tensorrt-engines)
     - [Run](#run)
     - [Acknowledgment](#acknowledgment)
-  
+
 ## Overview
 
 The TensorRT-LLM Canary example code is located in [`examples/canary`](./).
@@ -17,7 +17,7 @@ The TensorRT-LLM Canary example code is located in [`examples/canary`](./).
    * Export the Fastconformer encoder model to onnx
    * Export the feat basis functions and features (preprocessor) configuration
    * Saves the weights of the Transformer decoder (and softmax) to TRT-LLM format
- * [`conformer_onnx_trt.py`](./conformer_onnx_trt.py) builds the Fast conformer encoder [TensorRT](https://developer.nvidia.com/tensorrt) engine from onnx 
+ * [`conformer_onnx_trt.py`](./conformer_onnx_trt.py) builds the Fast conformer encoder [TensorRT](https://developer.nvidia.com/tensorrt) engine from onnx
  * `trtllm-build` to build the [TensorRT](https://developer.nvidia.com/tensorrt) Transformer decoder engine needed to run the Canary model.
  * [`run.py`](./run.py) to run the inference on a single wav file, or [a HuggingFace dataset](https://huggingface.co/datasets/librispeech_asr) [\(Librispeech test clean\)](https://www.openslr.org/12).
 
@@ -32,7 +32,7 @@ INFERENCE_PRECISION=bfloat16 # precision float16 or bfloat16
 MAX_BEAM_WIDTH=4 # max beam width of decoder
 MAX_BATCH_SIZE=8 # max batch size
 MAX_FEAT_LEN=3001 #Max audio duration(ms)/10ms (window shift). Assuming 30s audio
-MAX_ENCODER_OUTPUT_LEN=376 #MAX_ENCODER_OUTPUT_LEN = 1 + (MAX_FEAT_LEN / 8), 8 is subsampling factor for canary conformer 
+MAX_ENCODER_OUTPUT_LEN=376 #MAX_ENCODER_OUTPUT_LEN = 1 + (MAX_FEAT_LEN / 8), 8 is subsampling factor for canary conformer
 MAX_TOKENS=196 # Max number of tokens to generate
 MAX_PROMPT_TOKENS=10 # Max number of tokens to be passed
 
@@ -83,7 +83,7 @@ python3 run.py --engine_dir ${engine_dir} --name single_wav_test --batch_size=1 
 # decode a whole dataset
 python3 run.py --engine_dir ${engine_dir} --dataset hf-internal-testing/librispeech_asr_dummy --enable_warmup  --batch_size=<batch_size> --num_beam=<beam_len>  --name librispeech_dummy_large_v3
 
-# decode with a manifest file and save to manifest. 
+# decode with a manifest file and save to manifest.
 python3 run.py --engine_dir ${engine_dir} --enable_warmup --batch_size=<batch_size> --num_beam=<beam_len> --name <test_name> --manifest_file <path_to_manifest_file>
 
 ```

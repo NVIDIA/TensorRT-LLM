@@ -13,26 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import json
+import logging
+import os
 import time
 
-import tensorrt_llm
-import torch
 import nemo.collections.asr.models as nemo_asr
-import logging
+import torch
 from omegaconf import OmegaConf
-
-from tensorrt_llm.functional import LayerNormType, LayerNormPositionType
-from tensorrt_llm.models.convert_utils import weight_only_quantize_dict
-from tensorrt_llm.quantization import QuantAlgo
 from safetensors.torch import save_file
 
-import onnx
-import onnx_graphsurgeon as gs
-
-import yaml
-import json
-
-import os
+import tensorrt_llm
+from tensorrt_llm.functional import LayerNormPositionType, LayerNormType
+from tensorrt_llm.quantization import QuantAlgo
 
 TORCH_DTYPES = {
     'float32': torch.float32,
@@ -53,10 +46,11 @@ def parse_arguments():
                             "nvidia/canary-1b-flash",
                             "nvidia/canary-180m-flash",
                         ])
-    parser.add_argument('--model_path',
-                        type=str,
-                        default=None,
-                        )
+    parser.add_argument(
+        '--model_path',
+        type=str,
+        default=None,
+    )
     parser.add_argument('--dtype',
                         type=str,
                         default='float16',
@@ -90,21 +84,25 @@ def parse_arguments():
     args = parser.parse_args()
     return args
 
+
 class UnsupportedModel(Exception):
+
     def __init__(self, *args, model_name):
         super().__init__(*args)
         self.model_name = model_name
 
 
 class CudaOOMInExportOfASRWithMaxDim(Exception):
+
     def __init__(self, *args, max_dim=None):
         super().__init__(*args)
         self.max_dim = max_dim
 
 
 class CanaryModel:
+
     def __init__(self, args):
-        self.args=args
+        self.args = args
         quant_algo = None
         self.plugin_weight_only_quant_type = None
         if args.use_weight_only and args.weight_only_precision == 'int8':
@@ -130,16 +128,20 @@ class CanaryModel:
                 try:
                     with torch.inference_mode():
                         # Restore instance from .nemo file using generic model restore_from
-                        self.model = nemo_asr.EncDecMultiTaskModel.restore_from(args.model_path).to('cpu')
+                        self.model = nemo_asr.EncDecMultiTaskModel.restore_from(
+                            args.model_path).to('cpu')
 
                 except Exception as e:
-                    logging.error(f"Failed to restore model from NeMo file : {args.model_path}. ")
+                    logging.error(
+                        f"Failed to restore model from NeMo file : {args.model_path}. "
+                    )
                     raise e
             else:
                 raise UnsupportedModel(model_name=args.model_name)
         else:
             if args.model_name == 'nvidia/canary-1b' or args.model_name == 'nvidia/canary-1b-flash' or args.model_name == 'nvidia/canary-180m-flash':
-                self.model = nemo_asr.EncDecMultiTaskModel.from_pretrained(args.model_name).to(device='cpu')
+                self.model = nemo_asr.EncDecMultiTaskModel.from_pretrained(
+                    args.model_name).to(device='cpu')
             else:
                 raise UnsupportedModel(model_name=args.model_name)
         self.model.freeze()
@@ -152,7 +154,10 @@ class CanaryModel:
 
     @staticmethod
     def is_supported(model_type: str):
-        supported_models = ['nvidia/canary-1b', 'nvidia/canary-1b-flash', 'nemo.canary', 'nemo/canary', 'canary']
+        supported_models = [
+            'nvidia/canary-1b', 'nvidia/canary-1b-flash', 'nemo.canary',
+            'nemo/canary', 'canary'
+        ]
 
         if model_type in supported_models:
             return True
@@ -162,43 +167,47 @@ class CanaryModel:
     def export_encoder(self):
         encoder_path = f"{self.args.output_dir}/encoder"
         preprocessor_path = f"{self.args.engine_dir}/preprocessor"
-        encoder_config=self.model_config['encoder']
-        encoder_config['dtype']=self.dtype
+        encoder_config = self.model_config['encoder']
+        encoder_config['dtype'] = self.dtype
 
         try:
-            autocast = torch.cuda.amp.autocast(enabled=True, cache_enabled=False, dtype=torch.float32)
+            autocast = torch.cuda.amp.autocast(enabled=True,
+                                               cache_enabled=False,
+                                               dtype=torch.float32)
             with autocast, torch.no_grad(), torch.inference_mode():
                 logging.info(f"Exporting model {self.model.__class__.__name__}")
                 os.makedirs(encoder_path, exist_ok=True)
 
                 encoder_filename = 'encoder.onnx'
                 export_file = os.path.join(encoder_path, "encoder.onnx")
-                enc_dec_proj_file = os.path.join(encoder_path, "enc_dec_proj.pt")
+                enc_dec_proj_file = os.path.join(encoder_path,
+                                                 "enc_dec_proj.pt")
                 #encoder=self.model.encoder
                 #encoder.to(dtype=TORCH[self.dtype])
                 #encoder.export(export_file, onnx_opset_version=17)
 
                 self.model.encoder.export(export_file, onnx_opset_version=17)
 
-                with open(os.path.join(encoder_path, "config.json"), 'w') as encoder_config_file:
+                with open(os.path.join(encoder_path, "config.json"),
+                          'w') as encoder_config_file:
                     json.dump(encoder_config, encoder_config_file)
 
                 mel_basis_file = os.path.join(preprocessor_path, "mel_basis.pt")
                 os.makedirs(preprocessor_path, exist_ok=True)
 
-                torch.save(self.model.preprocessor.featurizer.filter_banks, mel_basis_file)
+                torch.save(self.model.preprocessor.featurizer.filter_banks,
+                           mel_basis_file)
 
                 torch.save(self.model.encoder_decoder_proj, enc_dec_proj_file)
 
-                with open(os.path.join(preprocessor_path, "config.json"),'w') as feat_config:
+                with open(os.path.join(preprocessor_path, "config.json"),
+                          'w') as feat_config:
                     json.dump(self.model_config['preprocessor'], feat_config)
 
         except Exception as e:
             raise e
 
         return export_file, encoder_filename
-
-
 
     def make_config(self):
         keys_required = [
@@ -213,36 +222,54 @@ class CanaryModel:
         ]
 
         if 'beam_search' not in self.model_config and 'decoding' in self.model_config:
-            self.model_config['beam_search'] = self.model_config['decoding'].get('beam', {'beam_size': 1, 'len_pen': 0.0,
-                                                                                'max_generation_delta': 50}
-                                                                       )
+            self.model_config['beam_search'] = self.model_config[
+                'decoding'].get('beam', {
+                    'beam_size': 1,
+                    'len_pen': 0.0,
+                    'max_generation_delta': 50
+                })
 
-        enc_dec_hidden_size=self.model_config['model_defaults']['asr_enc_hidden']
-        if type(self.model.encoder_decoder_proj) == torch.nn.modules.linear.Linear:
+        enc_dec_hidden_size = self.model_config['model_defaults'][
+            'asr_enc_hidden']
+        if type(self.model.encoder_decoder_proj
+                ) == torch.nn.modules.linear.Linear:
             if self.model.encoder_decoder_proj.out_features != self.model.encoder_decoder_proj.in_features:
-                enc_dec_hidden_size=self.model.encoder_decoder_proj.out_features
-            
+                enc_dec_hidden_size = self.model.encoder_decoder_proj.out_features
 
-        
         model_metadata = {
-            "decoder_layers": self.model_config['transf_decoder']['config_dict']['num_layers'],  # 24,
-            "num_attention_heads": self.model_config['transf_decoder']['config_dict']['num_attention_heads'],  # 8,
-            "hidden_size": self.model_config['transf_decoder']['config_dict']['hidden_size'],  # 1024,
-            "vocab_size": self.model_config['head']['num_classes'],
-            "max_sequence_length": self.model_config['transf_decoder']['config_dict']['max_sequence_length'],  # 512,
-            'hidden_act': self.model_config['transf_decoder']['config_dict']['hidden_act'],
-            'max_position_embeddings': self.model_config['encoder']['pos_emb_max_len'],
-            'ff_expansion_factor': self.model_config['encoder']['ff_expansion_factor'],
-            'd_model': self.model_config['encoder']['d_model'],
-            'enc_hidden_size': enc_dec_hidden_size,
-            'enc_heads': self.model_config['encoder']['n_heads'],
-            'vocab': self.export_vocab(),
-            'prompt_format': self.model_config['prompt_format'],
+            "decoder_layers":
+            self.model_config['transf_decoder']['config_dict']
+            ['num_layers'],  # 24,
+            "num_attention_heads":
+            self.model_config['transf_decoder']['config_dict']
+            ['num_attention_heads'],  # 8,
+            "hidden_size":
+            self.model_config['transf_decoder']['config_dict']
+            ['hidden_size'],  # 1024,
+            "vocab_size":
+            self.model_config['head']['num_classes'],
+            "max_sequence_length":
+            self.model_config['transf_decoder']['config_dict']
+            ['max_sequence_length'],  # 512,
+            'hidden_act':
+            self.model_config['transf_decoder']['config_dict']['hidden_act'],
+            'max_position_embeddings':
+            self.model_config['encoder']['pos_emb_max_len'],
+            'ff_expansion_factor':
+            self.model_config['encoder']['ff_expansion_factor'],
+            'd_model':
+            self.model_config['encoder']['d_model'],
+            'enc_hidden_size':
+            enc_dec_hidden_size,
+            'enc_heads':
+            self.model_config['encoder']['n_heads'],
+            'vocab':
+            self.export_vocab(),
+            'prompt_format':
+            self.model_config['prompt_format'],
         }
 
         return model_metadata
-
-
 
     def convert_decoder(self):
         self.model.transf_decoder.freeze()
@@ -251,17 +278,24 @@ class CanaryModel:
             weights = {}
             self.model.transf_decoder.to(dtype=TORCH_DTYPES[self.dtype])
             model_params = self.model.transf_decoder.state_dict()
-            lm_head=self.model.log_softmax.state_dict()
+            lm_head = self.model.log_softmax.state_dict()
             #model_params.update(self.model.log_softmax.state_dict())
 
-            assert torch.equal(lm_head['mlp.layer0.weight'],model_params['_embedding.token_embedding.weight'])
+            assert torch.equal(
+                lm_head['mlp.layer0.weight'],
+                model_params['_embedding.token_embedding.weight'])
 
-            weights['embedding.vocab_embedding.weight'] = model_params['_embedding.token_embedding.weight'].contiguous().clone()
-            weights['lm_head.weight'] = lm_head['mlp.layer0.weight'].contiguous()
+            weights['embedding.vocab_embedding.weight'] = model_params[
+                '_embedding.token_embedding.weight'].contiguous().clone()
+            weights['lm_head.weight'] = lm_head['mlp.layer0.weight'].contiguous(
+            )
             weights['lm_head.bias'] = lm_head['mlp.layer0.bias'].contiguous()
-            weights['embedding.position_embedding.weight'] = model_params['_embedding.position_embedding.pos_enc'].contiguous()
-            weights['embedding.embedding_layernorm.weight'] = model_params['_embedding.layer_norm.weight'].contiguous()
-            weights['embedding.embedding_layernorm.bias'] = model_params['_embedding.layer_norm.bias'].contiguous()
+            weights['embedding.position_embedding.weight'] = model_params[
+                '_embedding.position_embedding.pos_enc'].contiguous()
+            weights['embedding.embedding_layernorm.weight'] = model_params[
+                '_embedding.layer_norm.weight'].contiguous()
+            weights['embedding.embedding_layernorm.bias'] = model_params[
+                '_embedding.layer_norm.bias'].contiguous()
 
             for i in range(self.config['decoder_layers']):
 
@@ -275,21 +309,31 @@ class CanaryModel:
                 #first_sub_layer
                 t = torch.cat(
                     [
-                        model_params[f'_decoder.layers.{i}.first_sub_layer.query_net.weight'],
-                        model_params[f'_decoder.layers.{i}.first_sub_layer.key_net.weight'],
-                        model_params[f'_decoder.layers.{i}.first_sub_layer.value_net.weight'],
+                        model_params[
+                            f'_decoder.layers.{i}.first_sub_layer.query_net.weight'],
+                        model_params[
+                            f'_decoder.layers.{i}.first_sub_layer.key_net.weight'],
+                        model_params[
+                            f'_decoder.layers.{i}.first_sub_layer.value_net.weight'],
                     ],
                     dim=0,
                 ).contiguous()
-                dst = weights[f'decoder_layers.{i}.self_attention.qkv.weight'] = t
-                t=model_params[f'_decoder.layers.{i}.first_sub_layer.out_projection.weight'].contiguous()
-                dst = weights[f'decoder_layers.{i}.self_attention.dense.weight'] = t
+                dst = weights[
+                    f'decoder_layers.{i}.self_attention.qkv.weight'] = t
+                t = model_params[
+                    f'_decoder.layers.{i}.first_sub_layer.out_projection.weight'].contiguous(
+                    )
+                dst = weights[
+                    f'decoder_layers.{i}.self_attention.dense.weight'] = t
 
                 weights[f'decoder_layers.{i}.self_attention.qkv.bias'] = torch.cat(
                     [
-                        model_params[f'_decoder.layers.{i}.first_sub_layer.query_net.bias'],
-                        model_params[f'_decoder.layers.{i}.first_sub_layer.key_net.bias'],
-                        model_params[f'_decoder.layers.{i}.first_sub_layer.value_net.bias'],
+                        model_params[
+                            f'_decoder.layers.{i}.first_sub_layer.query_net.bias'],
+                        model_params[
+                            f'_decoder.layers.{i}.first_sub_layer.key_net.bias'],
+                        model_params[
+                            f'_decoder.layers.{i}.first_sub_layer.value_net.bias'],
                     ],
                     dim=0).contiguous()
 
@@ -306,30 +350,39 @@ class CanaryModel:
                 #second_sub_layer
                 t = torch.cat(
                     [
-                        model_params[f'_decoder.layers.{i}.second_sub_layer.query_net.weight'],
-                        model_params[f'_decoder.layers.{i}.second_sub_layer.key_net.weight'],
-                        model_params[f'_decoder.layers.{i}.second_sub_layer.value_net.weight'],
+                        model_params[
+                            f'_decoder.layers.{i}.second_sub_layer.query_net.weight'],
+                        model_params[
+                            f'_decoder.layers.{i}.second_sub_layer.key_net.weight'],
+                        model_params[
+                            f'_decoder.layers.{i}.second_sub_layer.value_net.weight'],
                     ],
                     dim=0,
                 ).contiguous()
 
-                dst = weights[f'decoder_layers.{i}.cross_attention.qkv.weight'] = t
+                dst = weights[
+                    f'decoder_layers.{i}.cross_attention.qkv.weight'] = t
 
-                t = model_params[f'_decoder.layers.{i}.second_sub_layer.out_projection.weight'].contiguous()
+                t = model_params[
+                    f'_decoder.layers.{i}.second_sub_layer.out_projection.weight'].contiguous(
+                    )
 
-                dst = weights[f'decoder_layers.{i}.cross_attention.dense.weight'] = t
+                dst = weights[
+                    f'decoder_layers.{i}.cross_attention.dense.weight'] = t
 
-                cross_attn_qkv_bias = torch.cat(
-                    [
-                        model_params[f'_decoder.layers.{i}.second_sub_layer.query_net.bias'],
-                        model_params[f'_decoder.layers.{i}.second_sub_layer.key_net.bias'],
-                        model_params[f'_decoder.layers.{i}.second_sub_layer.value_net.bias'],
-                    ],
-                    dim=0).contiguous()
-                weights[f'decoder_layers.{i}.cross_attention.qkv.bias'] = cross_attn_qkv_bias
+                cross_attn_qkv_bias = torch.cat([
+                    model_params[
+                        f'_decoder.layers.{i}.second_sub_layer.query_net.bias'],
+                    model_params[
+                        f'_decoder.layers.{i}.second_sub_layer.key_net.bias'],
+                    model_params[
+                        f'_decoder.layers.{i}.second_sub_layer.value_net.bias'],
+                ],
+                                                dim=0).contiguous()
+                weights[
+                    f'decoder_layers.{i}.cross_attention.qkv.bias'] = cross_attn_qkv_bias
                 weights[f'decoder_layers.{i}.cross_attention.dense.bias'] = \
                     model_params[f'_decoder.layers.{i}.second_sub_layer.out_projection.bias'].contiguous()
-
 
                 #layer_norm_3
                 weights[f'decoder_layers.{i}.mlp_layernorm.weight'] = \
@@ -338,9 +391,13 @@ class CanaryModel:
                     model_params[f'_decoder.layers.{i}.layer_norm_3.bias'].contiguous()
 
                 #third_sub_layer
-                t = model_params[f'_decoder.layers.{i}.third_sub_layer.dense_in.weight'].contiguous()
+                t = model_params[
+                    f'_decoder.layers.{i}.third_sub_layer.dense_in.weight'].contiguous(
+                    )
                 weights[f'decoder_layers.{i}.mlp.fc.weight'] = t
-                t = model_params[f'_decoder.layers.{i}.third_sub_layer.dense_out.weight'].contiguous()
+                t = model_params[
+                    f'_decoder.layers.{i}.third_sub_layer.dense_out.weight'].contiguous(
+                    )
                 weights[f'decoder_layers.{i}.mlp.proj.weight'] = t
 
                 weights[f'decoder_layers.{i}.mlp.fc.bias'] = \
@@ -348,20 +405,20 @@ class CanaryModel:
                 weights[f'decoder_layers.{i}.mlp.proj.bias'] = \
                     model_params[f'_decoder.layers.{i}.third_sub_layer.dense_out.bias'].contiguous()
 
-            weights['final_layernorm.weight'] = model_params['_decoder.final_layer_norm.weight'].contiguous()
-            weights['final_layernorm.bias'] = model_params['_decoder.final_layer_norm.bias'].contiguous()
+            weights['final_layernorm.weight'] = model_params[
+                '_decoder.final_layer_norm.weight'].contiguous()
+            weights['final_layernorm.bias'] = model_params[
+                '_decoder.final_layer_norm.bias'].contiguous()
 
         except Exception as e:
             raise e
 
         component_save_dir = os.path.join(args.output_dir, "decoder")
-        vocab_dir = os.path.join(args.engine_dir,'decoder')
+        vocab_dir = os.path.join(args.engine_dir, 'decoder')
         os.makedirs(component_save_dir, exist_ok=True)
         os.makedirs(vocab_dir, exist_ok=True)
 
-
         # weights = weight_only_quantize_dict(weights,quant_algo=self.quant_algo, plugin=True)
-
 
         save_file(weights, os.path.join(component_save_dir,
                                         f'rank0.safetensors'))
@@ -371,84 +428,121 @@ class CanaryModel:
         with open(os.path.join(vocab_dir, 'vocab.json'), 'w') as f:
             json.dump(self.config['vocab'], f, indent=4)
 
-
-
     def export_vocab(self):
 
-        tokenizer_vocab = {'tokens': {},
-                           'offsets': self.model.tokenizer.token_id_offset
-                           }
+        tokenizer_vocab = {
+            'tokens': {},
+            'offsets': self.model.tokenizer.token_id_offset
+        }
         for lang in self.model.tokenizer.langs:
             tokenizer_vocab['tokens'][lang] = {}
         tokenizer_vocab['size'] = self.model.tokenizer.vocab_size
 
         try:
             tokenizer_vocab['bos_id'] = self.model.tokenizer.bos_id
-        except Exception as e:
-            logging.warning(f"Tokenizer is missing bos_id. Could affect accuracy")
+        except Exception:
+            logging.warning(
+                f"Tokenizer is missing bos_id. Could affect accuracy")
 
         try:
             tokenizer_vocab['eos_id'] = self.model.tokenizer.eos_id
-        except Exception as e:
-            logging.warning(f"Tokenizer is missing eos_id. Could affect accuracy")
+        except Exception:
+            logging.warning(
+                f"Tokenizer is missing eos_id. Could affect accuracy")
         try:
             tokenizer_vocab['nospeech_id'] = self.model.tokenizer.nospeech_id
-        except Exception as e:
-            logging.warning(f"Tokenizer is missing nospeech_id. Could affect accuracy")
+        except Exception:
+            logging.warning(
+                f"Tokenizer is missing nospeech_id. Could affect accuracy")
         try:
             tokenizer_vocab['pad_id'] = self.model.tokenizer.pad_id
-        except Exception as e:
-            logging.warning(f"Tokenizer is missing pad_id. Could affect accuracy")
+        except Exception:
+            logging.warning(
+                f"Tokenizer is missing pad_id. Could affect accuracy")
 
         for t_id in range(0, self.model.tokenizer.vocab_size):
             lang = self.model.tokenizer.ids_to_lang([t_id])
-            tokenizer_vocab['tokens'][lang][t_id] = self.model.tokenizer.ids_to_tokens([t_id])[0]
-
+            tokenizer_vocab['tokens'][lang][
+                t_id] = self.model.tokenizer.ids_to_tokens([t_id])[0]
 
         return tokenizer_vocab
 
     def get_decoder_config(self):
         return {
-            'architecture': "DecoderModel",
-            'dtype': self.dtype,
-            'logits_dtype': self.logits_dtype,
-            'num_hidden_layers': self.config['decoder_layers'],
-            'num_attention_heads': self.config['num_attention_heads'],
-            'hidden_size': self.config['hidden_size'],
-            'norm_epsilon': 1e-5,
-            'vocab_size': self.config['vocab_size'],
-            'hidden_act': self.config['hidden_act'],
-            'use_parallel_embedding': False,
-            'embedding_sharding_dim': 0,
-            'max_position_embeddings': self.config['max_sequence_length'],
-            'use_prompt_tuning': False,
-            'prompt_format': self.config['prompt_format'],
-            'head_size': self.config['hidden_size'] // self.config['num_attention_heads'],
-            'has_position_embedding': True,
-            'layernorm_type': LayerNormType.LayerNorm,
-            'layernorm_position': LayerNormPositionType.pre_layernorm,
-            'has_attention_qkvo_bias': True,
-            'has_mlp_bias': True,
-            'has_lm_head_bias': True,
-            'has_model_final_layernorm': True,
-            'has_embedding_layernorm': True,
-            'has_embedding_scale': False,
-            'ffn_hidden_size': self.config['ff_expansion_factor'] * self.config['d_model'],
-            'q_scaling': 1.0,
-            'relative_attention': False,
-            'max_distance': 0,
-            'num_buckets': 0, #1 in riva implementation
-            'model_type': 'canary',
-            'rescale_before_lm_head': False,
-            'encoder_hidden_size': self.config['enc_hidden_size'],
-            'encoder_num_heads': self.config['enc_heads'],
-            'encoder_head_size': None,
-            'skip_cross_qkv': False,
+            'architecture':
+            "DecoderModel",
+            'dtype':
+            self.dtype,
+            'logits_dtype':
+            self.logits_dtype,
+            'num_hidden_layers':
+            self.config['decoder_layers'],
+            'num_attention_heads':
+            self.config['num_attention_heads'],
+            'hidden_size':
+            self.config['hidden_size'],
+            'norm_epsilon':
+            1e-5,
+            'vocab_size':
+            self.config['vocab_size'],
+            'hidden_act':
+            self.config['hidden_act'],
+            'use_parallel_embedding':
+            False,
+            'embedding_sharding_dim':
+            0,
+            'max_position_embeddings':
+            self.config['max_sequence_length'],
+            'use_prompt_tuning':
+            False,
+            'prompt_format':
+            self.config['prompt_format'],
+            'head_size':
+            self.config['hidden_size'] // self.config['num_attention_heads'],
+            'has_position_embedding':
+            True,
+            'layernorm_type':
+            LayerNormType.LayerNorm,
+            'layernorm_position':
+            LayerNormPositionType.pre_layernorm,
+            'has_attention_qkvo_bias':
+            True,
+            'has_mlp_bias':
+            True,
+            'has_lm_head_bias':
+            True,
+            'has_model_final_layernorm':
+            True,
+            'has_embedding_layernorm':
+            True,
+            'has_embedding_scale':
+            False,
+            'ffn_hidden_size':
+            self.config['ff_expansion_factor'] * self.config['d_model'],
+            'q_scaling':
+            1.0,
+            'relative_attention':
+            False,
+            'max_distance':
+            0,
+            'num_buckets':
+            0,  #1 in riva implementation
+            'model_type':
+            'canary',
+            'rescale_before_lm_head':
+            False,
+            'encoder_hidden_size':
+            self.config['enc_hidden_size'],
+            'encoder_num_heads':
+            self.config['enc_heads'],
+            'encoder_head_size':
+            None,
+            'skip_cross_qkv':
+            False,
             'quantization': {
                 'quant_algo': self.quant_algo
             },
         }
-
 
 
 if __name__ == '__main__':
@@ -464,22 +558,15 @@ if __name__ == '__main__':
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
-
-
     #model_path = os.path.join(args.model_dir, args.model_name + '.pt')
     #assert os.path.exists(model_path), f"Model {model_path} does not exist."
 
     #model = torch.load(model_path, map_location='cpu')
     #print(f"Loaded model from {model_path}")
     #model_metadata = model['dims']
-   # model_state_dict = model['model_state_dict']
+# model_state_dict = model['model_state_dict']
 
-
-    canary_model=CanaryModel(args)
-
-
-
-
+    canary_model = CanaryModel(args)
 
     print("Converting encoder checkpoints...")
     canary_model.export_encoder()

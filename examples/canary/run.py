@@ -20,30 +20,27 @@ import re
 import time
 from collections import OrderedDict
 from pathlib import Path
+from string import punctuation
 
+import librosa
 import numpy
 import numpy as np
 import tensorrt as trt
-
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
-
+from utils import (N_SAMPLES, MelFilterBankFeats, pad_or_trim, store_transcripts,
+                   write_error_stats)
 
 import tensorrt_llm
 import tensorrt_llm.logger as logger
-from tensorrt_llm._utils import (str_dtype_to_torch, str_dtype_to_trt,
-                                 trt_dtype_to_torch)
-from tensorrt_llm.bindings import GptJsonConfig, KVCacheType
+from tensorrt_llm._utils import (str_dtype_to_torch, trt_dtype_to_torch)
+from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.session import Session, TensorInfo
-from string import punctuation
-import librosa
-
-from utils import MelFilterBankFeats, pad_or_trim, trim, store_transcripts, Pathlike, N_SAMPLES, write_error_stats
 
 if PYTHON_BINDINGS:
-    from tensorrt_llm.runtime import ModelRunnerCpp
+    pass
 
 
 def parse_arguments():
@@ -54,8 +51,7 @@ def parse_arguments():
     parser.add_argument('--assets_dir', type=str, default='./assets')
     parser.add_argument('--input_file', type=str, default=None)
     parser.add_argument('--max_new_tokens', type=int, default=None)
-    parser.add_argument('--prompt_text', type=str,
-                        default=None)
+    parser.add_argument('--prompt_text', type=str, default=None)
     parser.add_argument('--manifest_file', type=str, default=None)
     parser.add_argument('--results_manifest', type=str, default=None)
 
@@ -124,13 +120,13 @@ def read_config(component, engine_dir):
 
 
 class CanaryTokenizer:
+
     def __init__(self, engine_dir, prompt_format='canary1'):
         vocab_file = os.path.join(engine_dir, 'decoder/vocab.json')
         decoder_config = read_config('decoder', engine_dir)
         self.prompt_format = decoder_config.get('prompt_format', prompt_format)
         self.blank = '▁'
         self.has_country_code = False
-  
 
         with open(vocab_file, 'r') as jfp:
             vocab = json.load(jfp)
@@ -139,67 +135,74 @@ class CanaryTokenizer:
         self.__id_to_token__ = {l: {} for l in vocab['tokens']}
 
         self.spl_tokens = self.__id_to_token__['spl_tokens']
- 
-            
 
         for lang in vocab['tokens']:
-            self.__id_to_token__[lang] = {int(k): v for k, v in vocab['tokens'][lang].items()}
+            self.__id_to_token__[lang] = {
+                int(k): v
+                for k, v in vocab['tokens'][lang].items()
+            }
         self.__token_to_id__ = {}
         for lang in self.__id_to_token__:
-            self.__token_to_id__[lang] = {v: k for k, v in self.__id_to_token__[lang].items()}
-        
+            self.__token_to_id__[lang] = {
+                v: k
+                for k, v in self.__id_to_token__[lang].items()
+            }
+
         for lang in self.langs:
             if lang == 'spl_tokens':
                 continue
-            lang_token=f"<|{lang.split('-')[0]}|>"
+            lang_token = f"<|{lang.split('-')[0]}|>"
             if "-" in lang:
-                lang_country_token=f"<|{lang}|>"
+                lang_country_token = f"<|{lang}|>"
                 self.has_country_code = True
             else:
-                lang_country_token=lang_token
-            if lang_country_token  in self.__token_to_id__['spl_tokens']:
+                lang_country_token = lang_token
+            if lang_country_token in self.__token_to_id__['spl_tokens']:
                 continue
 
-            if lang_country_token not in self.__token_to_id__['spl_tokens'] and lang_token in self.__token_to_id__['spl_tokens']:
-                self.__token_to_id__['spl_tokens'][lang_country_token]=self.__token_to_id__['spl_tokens'][lang_token]
+            if lang_country_token not in self.__token_to_id__[
+                    'spl_tokens'] and lang_token in self.__token_to_id__[
+                        'spl_tokens']:
+                self.__token_to_id__['spl_tokens'][
+                    lang_country_token] = self.__token_to_id__['spl_tokens'][
+                        lang_token]
                 if lang_country_token != lang_token:
                     self.langs.append(lang.split('-')[0])
-        
+
         if self.has_country_code:
-            dpl='en-US'
+            dpl = 'en-US'
         else:
-            dpl='en'
+            dpl = 'en'
         if self.prompt_format == 'canary2':
-            self.default_prompt = f"<|startofcontext|> <|startoftranscript|> <|emo:undefined|> <|{dpl}|> <|{dpl}|> <|nopnc|> <|noitn|> <|notimestamp|> <|nodiarize|>" 
+            self.default_prompt = f"<|startofcontext|> <|startoftranscript|> <|emo:undefined|> <|{dpl}|> <|{dpl}|> <|nopnc|> <|noitn|> <|notimestamp|> <|nodiarize|>"
         else:
             self.default_prompt = f"<|startoftranscript|> <|{dpl}|> <|transcribe|> <|{dpl}|> <|pnc|>"
-
-                
 
         self.id_to_token = {}
         for lang in self.__id_to_token__:
             self.id_to_token.update(self.__id_to_token__[lang])
-        self.task = {'transcribe': '<|transcribe|>',
-                     'translate': '<|translate|>',
-                     'asr': '<|transcribe|>',
-                     'ast': '<|translate|>'}
+        self.task = {
+            'transcribe': '<|transcribe|>',
+            'translate': '<|translate|>',
+            'asr': '<|transcribe|>',
+            'ast': '<|translate|>'
+        }
 
         try:
             self.bos_id = vocab['bos_id']
-        except Exception as exp:
+        except Exception:
             self.bos_id = self.spl_tokens['<|startoftranscript|>']
-            pass
         try:
             self.eos_id = vocab['eos_id']
-        except Exception as exp:
+        except Exception:
             self.eos_id = self.spl_tokens['<|endoftext|>']
         try:
             self.nospeech_id = vocab['nospeech_id']
-        except Exception as exp:
+        except Exception:
             pass
         try:
             self.pad_id = vocab['pad_id']
-        except Exception as exp:
+        except Exception:
             self.pad_id = vocab['pad_id']
 
         self.blank_id = self.__token_to_id__['spl_tokens'][self.blank]
@@ -209,7 +212,9 @@ class CanaryTokenizer:
 
     @staticmethod
     def word_separator(lang):
-        if lang in ['ja-JP', 'ko-KR', 'zh-CN', 'th-TH', 'km-KH', 'my-MM', 'lo-LA']:
+        if lang in [
+                'ja-JP', 'ko-KR', 'zh-CN', 'th-TH', 'km-KH', 'my-MM', 'lo-LA'
+        ]:
             return ''
         else:
             return " "
@@ -259,25 +264,38 @@ class CanaryTokenizer:
                 clean_ids.append(i)
 
         if lang is None:
-            return ''.join(self.ids_to_tokens(clean_ids)).replace('▁', ' ').strip()
+            return ''.join(self.ids_to_tokens(clean_ids)).replace('▁',
+                                                                  ' ').strip()
         else:
             ws = self.word_separator(lang)
-            tokens = [self.__id_to_token__[lang].get(k, f" <unk> ").replace('▁', ws) for k in clean_ids]
+            tokens = [
+                self.__id_to_token__[lang].get(k, f" <unk> ").replace('▁', ws)
+                for k in clean_ids
+            ]
 
             if ws == "":
-                return re.sub(r'(?<=[.,;:])(?=[^\s])', r' ', ''.join(tokens).strip())
+                return re.sub(r'(?<=[.,;:])(?=[^\s])', r' ',
+                              ''.join(tokens).strip())
             return ''.join(tokens).strip()
 
-    def get_prompt_v2(self, pnc=True, src_lang='en', tgt_lang=None, itn=False, timestamp=False, diarize=False,):
-        # prompt_format: 
+    def get_prompt_v2(
+        self,
+        pnc=True,
+        src_lang='en',
+        tgt_lang=None,
+        itn=False,
+        timestamp=False,
+        diarize=False,
+    ):
+        # prompt_format:
         # <|startofcontext|><|startoftranscript|><|emo:undefined|><|{src_lang}|><|{tgt_lang}|><|[no]pnc|><|[no]itn|><|[no]timestamp><|[no]diarize|>
         prompt = "<|startofcontext|> <|startoftranscript|> <|emo:undefined|>"
 
-        if not self.has_country_code and '-'  in src_lang: 
+        if not self.has_country_code and '-' in src_lang:
             src_lang = src_lang.split('-')[0]
 
         if src_lang not in self.langs:
-            
+
             raise ValueError(f"Invalid language {src_lang=} specified")
 
         prompt += f" <|{src_lang}|>"
@@ -300,7 +318,7 @@ class CanaryTokenizer:
 
         if tgt_lang is None:
             tgt_lang = src_lang
-        if not self.has_country_code and '-'  in tgt_lang: 
+        if not self.has_country_code and '-' in tgt_lang:
             tgt_lang = tgt_lang.split('-')[0]
         if tgt_lang not in self.langs:
             raise ValueError(f"Invalid language {tgt_lang=} specified")
@@ -308,11 +326,16 @@ class CanaryTokenizer:
         prompt += f" <|{src_lang}|> <|{tgt_lang}|> {pnc} {itn} {timestamp} {diarize}"
 
         return prompt
-    
-    def get_prompt_legacy(self, task_type='transcribe', pnc=True, src_lang='en', tgt_lang=None):
+
+    def get_prompt_legacy(self,
+                          task_type='transcribe',
+                          pnc=True,
+                          src_lang='en',
+                          tgt_lang=None):
         prompt = "<|startoftranscript|>"
 
-        if src_lang not in self.langs and "-" in src_lang and src_lang.split('-')[0] in self.langs:
+        if src_lang not in self.langs and "-" in src_lang and src_lang.split(
+                '-')[0] in self.langs:
             src_lang = src_lang.split('-')[0]
 
         if src_lang not in self.langs:
@@ -324,11 +347,11 @@ class CanaryTokenizer:
         else:
             pnc = "<|nopnc|>"
 
-
         if task_type == 'translate' or task_type == 'ast':
             if tgt_lang is None:
                 tgt_lang = src_lang
-            if tgt_lang not in self.langs and "-" in tgt_lang and tgt_lang.split('-')[0] in self.langs:
+            if tgt_lang not in self.langs and "-" in tgt_lang and tgt_lang.split(
+                    '-')[0] in self.langs:
                 tgt_lang = tgt_lang.split('-')[0]
 
             if tgt_lang not in self.langs:
@@ -342,23 +365,31 @@ class CanaryTokenizer:
             raise ValueError(f"Invalid task {task_type=} specified")
         return prompt
 
-    def get_prompt_ids(self, task='transcribe', pnc=False, src_lang='en', tgt_lang=None):
-        return self.tokens_to_ids(self.get_prompt_legacy(task, pnc=pnc, src_lang=src_lang, tgt_lang=tgt_lang))
+    def get_prompt_ids(self,
+                       task='transcribe',
+                       pnc=False,
+                       src_lang='en',
+                       tgt_lang=None):
+        return self.tokens_to_ids(
+            self.get_prompt_legacy(task,
+                                   pnc=pnc,
+                                   src_lang=src_lang,
+                                   tgt_lang=tgt_lang))
 
     def get_prompt_ids_from_cfg(self, cfg):
 
         if self.prompt_format == 'canary2':
             return self.tokens_to_ids(
-                self.get_prompt_v2(cfg['pnc'], cfg['source_language'], cfg['target_language'], cfg['itn'], cfg['timestamp'], cfg['diarize'])
-            )
+                self.get_prompt_v2(cfg['pnc'], cfg['source_language'],
+                                   cfg['target_language'], cfg['itn'],
+                                   cfg['timestamp'], cfg['diarize']))
 
         else:
             return self.tokens_to_ids(
-                self.get_prompt_legacy(cfg['task'], cfg['pnc'], cfg['source_language'], cfg['target_language'])
-            )
+                self.get_prompt_legacy(cfg['task'], cfg['pnc'],
+                                       cfg['source_language'],
+                                       cfg['target_language']))
 
-
-    
     def encode(self, prompt):
         return self.tokens_to_ids(prompt.split())
 
@@ -368,24 +399,25 @@ class CanaryTokenizer:
 
 
 class CanaryEncoder:
-    def __init__(self,engine_dir):
-        engine_path=os.path.join(engine_dir, 'encoder/encoder.plan' )
-        self.encoder_config=json.load(open(os.path.join(engine_dir, 'encoder/config.json'),'r'))
+
+    def __init__(self, engine_dir):
+        engine_path = os.path.join(engine_dir, 'encoder/encoder.plan')
+        self.encoder_config = json.load(
+            open(os.path.join(engine_dir, 'encoder/config.json'), 'r'))
         logger.info(f"Loading engine from {engine_path}")
         with open(engine_path, "rb") as f:
             engine_buffer = f.read()
         logger.info(f"Creating session from engine {engine_path}")
         self.session_conformer = Session.from_serialized_engine(engine_buffer)
-        self.device = torch.device("cuda:0") if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(
+            "cuda:0") if torch.cuda.is_available() else "cpu"
         if self.encoder_config.get('projection', False):
-            self.enc_dec_proj = torch.load(os.path.join(engine_dir, 'encoder/enc_dec_proj.pt')).to(self.device)
+            self.enc_dec_proj = torch.load(
+                os.path.join(engine_dir,
+                             'encoder/enc_dec_proj.pt')).to(self.device)
         else:
             self.enc_dec_proj = None
-        
 
-
-
-  
     @staticmethod
     def get_masked_emb(enc_outputs):
         enc_emb = enc_outputs['outputs']
@@ -393,31 +425,34 @@ class CanaryEncoder:
         batch_size = enc_len.shape[0]
         max_length = enc_emb.shape[2]
 
-        mask = torch.arange(max_length, device='cuda').unsqueeze(0).expand(batch_size, max_length) < enc_len.unsqueeze(
-            1
-        )
+        mask = torch.arange(max_length, device='cuda').unsqueeze(0).expand(
+            batch_size, max_length) < enc_len.unsqueeze(1)
         enc_mask = torch.where(mask.unsqueeze(1), enc_emb, 0.0).permute(0, 2, 1)
 
-        return enc_mask,enc_len
+        return enc_mask, enc_len
 
-    def infer(self,audio_signal, lengths, stream, audio_file=""):
+    def infer(self, audio_signal, lengths, stream, audio_file=""):
 
-        audio_inputs={'audio_signal': audio_signal, 'length': lengths}
+        audio_inputs = {'audio_signal': audio_signal, 'length': lengths}
 
-        outputs_info= self.session_conformer.infer_shapes([TensorInfo("audio_signal", trt.DataType.FLOAT, audio_signal.shape),
-                                                           TensorInfo("length", trt.DataType.INT64, lengths.shape)])
+        outputs_info = self.session_conformer.infer_shapes([
+            TensorInfo("audio_signal", trt.DataType.FLOAT, audio_signal.shape),
+            TensorInfo("length", trt.DataType.INT64, lengths.shape)
+        ])
         enc_outputs = {
-            t.name: torch.empty(tuple(t.shape),
-                                dtype=trt_dtype_to_torch(t.dtype),
-                                device="cuda:0")
+            t.name:
+            torch.empty(tuple(t.shape),
+                        dtype=trt_dtype_to_torch(t.dtype),
+                        device="cuda:0")
             for t in outputs_info
         }
 
-        is_ok = self.session_conformer.run(audio_inputs, enc_outputs, stream.cuda_stream)
+        is_ok = self.session_conformer.run(audio_inputs, enc_outputs,
+                                           stream.cuda_stream)
 
         assert is_ok, "Runtime execution failed for Conformer Encoder session"
         stream.synchronize()
-        enc_mask, emb_len=self.get_masked_emb(enc_outputs)
+        enc_mask, emb_len = self.get_masked_emb(enc_outputs)
         if self.enc_dec_proj is not None:
             enc_mask = self.enc_dec_proj(enc_mask.to(dtype=torch.float32))
         return enc_mask, emb_len
@@ -425,28 +460,30 @@ class CanaryEncoder:
 
 class CanaryDecoding:
 
-    def __init__(self, engine_dir, runtime_mapping, tokenizer, debug_mode=False, device="cuda:0"):
+    def __init__(self,
+                 engine_dir,
+                 runtime_mapping,
+                 tokenizer,
+                 debug_mode=False,
+                 device="cuda:0"):
         self.tokenizer = tokenizer
         self.decoder_config = read_config('decoder', engine_dir)
         self.prompt_format = self.decoder_config['prompt_format']
         self.tokenizer.set_prompt_format(self.prompt_format)
         self.decoder_generation_session = self.get_session(
             engine_dir, runtime_mapping, debug_mode)
-        self.dtype=str_dtype_to_torch(self.decoder_config['dtype'])
+        self.dtype = str_dtype_to_torch(self.decoder_config['dtype'])
         self.max_seq_len = self.decoder_config['max_seq_len']
         self.max_input_len = self.decoder_config['max_input_len']
         self.device = device
 
-
-        
-
-
     @staticmethod
     def get_x_attention_mask(lens, max_length):
         batch_size = lens.shape[0]
-        mask = torch.arange(max_length).repeat(batch_size, 1).to(lens.device) < lens[:, None]
+        mask = torch.arange(max_length).repeat(batch_size,
+                                               1).to(lens.device) < lens[:,
+                                                                         None]
         return mask
-
 
     def get_session(self, engine_dir, runtime_mapping, debug_mode=False):
         serialize_path = engine_dir / 'decoder' / 'rank0.engine'
@@ -488,21 +525,26 @@ class CanaryDecoding:
                  encoder_input_lengths,
                  max_new_tokens,
                  num_beams=1):
-        
+
         encoder_outputs = encoder_outputs.to(dtype=self.dtype)
         batch_size = decoder_input_ids.shape[0]
-        
+
         encoder_max_input_length = encoder_outputs.shape[1]
 
-        decoder_input_lengths = torch.tensor(
-            [decoder_input_ids.shape[-1] for _ in range(decoder_input_ids.shape[0])], dtype=torch.int32, device='cuda'
-        )
+        decoder_input_lengths = torch.tensor([
+            decoder_input_ids.shape[-1]
+            for _ in range(decoder_input_ids.shape[0])
+        ],
+                                             dtype=torch.int32,
+                                             device='cuda')
         decoder_max_input_length = torch.max(decoder_input_lengths).item()
 
         assert decoder_max_input_length <= self.max_input_len, f"Decoder input length {decoder_max_input_length} exceeds max input length {self.max_input_len}"
 
-        if max_new_tokens  > self.max_seq_len:
-            print(f"max_new_tokens {max_new_tokens} is greater than max_seq_len {self.max_seq_len}, setting max_new_tokens to max_seq_len")
+        if max_new_tokens > self.max_seq_len:
+            print(
+                f"max_new_tokens {max_new_tokens} is greater than max_seq_len {self.max_seq_len}, setting max_new_tokens to max_seq_len"
+            )
             max_new_tokens = self.max_seq_len
 
         cross_attention_mask = torch.ones([
@@ -511,9 +553,9 @@ class CanaryDecoding:
         ]).int().cuda()
 
         # generation config
-        sampling_config = SamplingConfig(
-            end_id=self.tokenizer.eos_id, pad_id=self.tokenizer.pad_id, num_beams=num_beams
-        )
+        sampling_config = SamplingConfig(end_id=self.tokenizer.eos_id,
+                                         pad_id=self.tokenizer.pad_id,
+                                         num_beams=num_beams)
         self.decoder_generation_session.setup(
             decoder_input_lengths.size(0),
             decoder_max_input_length,
@@ -530,9 +572,9 @@ class CanaryDecoding:
                 decoder_input_ids, pad_value=self.tokenizer.pad_id)
             if encoder_outputs.dim() == 3:
                 encoder_input_lengths = torch.full((encoder_outputs.shape[0], ),
-                                                 encoder_max_input_length,
-                                                 dtype=torch.int32,
-                                                 device='cuda')
+                                                   encoder_max_input_length,
+                                                   dtype=torch.int32,
+                                                   device='cuda')
 
                 encoder_outputs = remove_tensor_padding(encoder_outputs,
                                                         encoder_input_lengths)
@@ -562,121 +604,124 @@ class CanaryTRTLLM(object):
                  num_beams=1,
                  use_py_session=False):
 
-        self.device=device
+        self.device = device
         world_size = 1
         runtime_rank = tensorrt_llm.mpi_rank()
         runtime_mapping = tensorrt_llm.Mapping(world_size, runtime_rank)
         torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
         engine_dir = Path(engine_dir)
-        decoder_config = read_config('decoder', engine_dir)
+        read_config('decoder', engine_dir)
         with open(os.path.join(engine_dir, 'preprocessor/config.json')) as f:
             preprocessor_config = json.load(f)
-
 
         self.decoder_config = read_config('decoder', engine_dir)
         self.max_seq_len = self.decoder_config['max_seq_len']
         self.max_input_len = self.decoder_config['max_input_len']
         self.max_batch_size = self.decoder_config['max_batch_size']
 
-
         self.num_feats = preprocessor_config['features']
         self.n_fft = preprocessor_config['n_fft']
         mel_basis_file = engine_dir / "preprocessor/mel_basis.pt"
-        self.mel_basis = torch.load(mel_basis_file, weights_only=True,map_location=torch.device(self.device))
+        self.mel_basis = torch.load(mel_basis_file,
+                                    weights_only=True,
+                                    map_location=torch.device(self.device))
 
-        window_size=preprocessor_config.get('window_size',0.025)
-        window_stride = preprocessor_config.get('window_stride',0.010)
-        window_type = preprocessor_config.get('window','hann')
-        preemp = preprocessor_config.get('preemp',False)
-        sample_rate = preprocessor_config.get('sample_rate',16000)
+        window_size = preprocessor_config.get('window_size', 0.025)
+        window_stride = preprocessor_config.get('window_stride', 0.010)
+        window_type = preprocessor_config.get('window', 'hann')
+        preemp = preprocessor_config.get('preemp', False)
+        sample_rate = preprocessor_config.get('sample_rate', 16000)
 
-
-
-
-        self.preprocessor = MelFilterBankFeats(self.mel_basis,window_size=window_size,window_stride=window_stride,
-                                               window_type=window_type,fs=sample_rate, preemp=preemp)
+        self.preprocessor = MelFilterBankFeats(self.mel_basis,
+                                               window_size=window_size,
+                                               window_stride=window_stride,
+                                               window_type=window_type,
+                                               fs=sample_rate,
+                                               preemp=preemp)
         self.tokenizer = CanaryTokenizer(engine_dir)
 
         if not use_py_session:
-            print("Only Python session is supported for now. Setting use_py_session to True")
+            print(
+                "Only Python session is supported for now. Setting use_py_session to True"
+            )
             use_py_session = True
         if use_py_session:
             self.encoder = CanaryEncoder(engine_dir)
             self.decoder = CanaryDecoding(engine_dir,
-                                      runtime_mapping, tokenizer=self.tokenizer,
-                                      debug_mode=debug_mode, device=self.device)
+                                          runtime_mapping,
+                                          tokenizer=self.tokenizer,
+                                          debug_mode=debug_mode,
+                                          device=self.device)
 
-    
         self.use_py_session = use_py_session
 
-
     def process_batch(
-            self,
-            audio,
-            audio_input_lengths,
-            text_prefix=None,
-            num_beams=1,
-            max_new_tokens=None,
-            prompts_cfg=None,):
+        self,
+        audio,
+        audio_input_lengths,
+        text_prefix=None,
+        num_beams=1,
+        max_new_tokens=None,
+        prompts_cfg=None,
+    ):
         batch_size = len(audio_input_lengths)
         if prompts_cfg is None:
             if text_prefix is None:
                 text_prefix = self.tokenizer.default_prompt
-                
+
             prompt_id = self.tokenizer.encode(text_prefix)
             prompt_id = torch.tensor(prompt_id)
             decoder_input_ids = prompt_id.repeat(batch_size, 1)
         else:
-            prompt_ids=[]
+            prompt_ids = []
             for cfg in prompts_cfg:
                 prompt_id = self.tokenizer.get_prompt_ids_from_cfg(cfg)
                 prompt_ids.append(torch.tensor(prompt_id))
-            decoder_input_ids =  torch.nn.utils.rnn.pad_sequence(
-                prompt_ids, batch_first=True, padding_value=self.tokenizer.pad_id
-            ).to(self.device)
+            decoder_input_ids = torch.nn.utils.rnn.pad_sequence(
+                prompt_ids,
+                batch_first=True,
+                padding_value=self.tokenizer.pad_id).to(self.device)
 
-        stream=torch.cuda.current_stream('cuda')
+        stream = torch.cuda.current_stream('cuda')
 
         if max_new_tokens is None:
             max_new_tokens = self.max_seq_len
-        
-  
 
-        mel,mel_input_lengths = self.preprocessor.get_feats(audio, audio_input_lengths)
+        mel, mel_input_lengths = self.preprocessor.get_feats(
+            audio, audio_input_lengths)
 
         if self.use_py_session:
             encoder_output, encoder_output_lengths = self.encoder.infer(
                 mel, mel_input_lengths, stream)
             output_ids = self.decoder.generate(decoder_input_ids,
-                                           encoder_output,
-                                           encoder_output_lengths,
-                                           max_new_tokens=max_new_tokens,
-                                           num_beams=num_beams)
+                                               encoder_output,
+                                               encoder_output_lengths,
+                                               max_new_tokens=max_new_tokens,
+                                               num_beams=num_beams)
 
         texts = []
         for i in range(len(output_ids)):
             text = self.tokenizer.decode(output_ids[i][0]).strip()
-            text=text.lstrip(punctuation)
+            text = text.lstrip(punctuation)
             texts.append(text)
         return texts
 
 
-def decode_wav_file(
-        input_file_path,
-        model,
-        max_new_tokens=None,
-        batch_size=1,
-        text_prefix=None,
-        num_beams=1):
-    
-    waveform, sample_rate = librosa.load(input_file_path,sr=16000)
+def decode_wav_file(input_file_path,
+                    model,
+                    max_new_tokens=None,
+                    batch_size=1,
+                    text_prefix=None,
+                    num_beams=1):
 
-        
-    total_duration=waveform.shape[0]/sample_rate
-    waveform=torch.from_numpy(waveform).to(dtype=torch.float32,  device="cuda:0")
+    waveform, sample_rate = librosa.load(input_file_path, sr=16000)
 
+    total_duration = waveform.shape[0] / sample_rate
+    waveform = torch.from_numpy(waveform).to(dtype=torch.float32,
+                                             device="cuda:0")
 
-    predictions = model.process_batch([waveform]*batch_size,[len(waveform)]*batch_size, text_prefix,
+    predictions = model.process_batch([waveform] * batch_size,
+                                      [len(waveform)] * batch_size, text_prefix,
                                       num_beams, max_new_tokens)
 
     prediction = predictions[0]
@@ -686,53 +731,50 @@ def decode_wav_file(
 
     print(f"prediction: {prediction}")
     results = [(0, [""], prediction.split())]
-    return results, total_duration*batch_size
-
+    return results, total_duration * batch_size
 
 
 def batch_manifest(manifest_file, batch_size):
     waveforms, durations, labels, ids, prompts_cfg = [], [], [], [], []
-    count=0
-    max_batch_len=0
-    total_count=0
-    total_batches=0
-    last_batch_size=0
-    with open(manifest_file,'r') as manifest:
+    count = 0
+    max_batch_len = 0
+    with open(manifest_file, 'r') as manifest:
         for line in manifest:
-                data = json.loads(line)
-                waveform, sample_rate = librosa.load(data['audio_filepath'], sr=16000)
+            data = json.loads(line)
+            waveform, sample_rate = librosa.load(data['audio_filepath'],
+                                                 sr=16000)
 
-                duration = len(waveform)
-                if max_batch_len < duration:
-                    max_batch_len = duration
-            
+            duration = len(waveform)
+            if max_batch_len < duration:
+                max_batch_len = duration
 
-                prompt={'task':data.get('taskname','transcribe'),
-                        'pnc': data.get('pnc','no')=='yes',
-                        'source_language': data.get('source_language','en-US'),
-                        'target_language': data.get('source_language','en-US'),
-                        'itn': data.get('itn', "no")=='yes',
-                        'timestamp': data.get('timestamp', "no")=='yes',
-                        'diarize': data.get('diarize', "no")=='yes',
-                        }
-                if 'text' in data:
-                    prompt['text'] = data['text']
-                else:
-                    data['text'] = "na"
-                if 'answer' in data:
-                    prompt['answer'] = data['answer']
-                prompts_cfg.append(prompt)
-                labels.append(data['text'])
-                ids.append(data['audio_filepath'])
-                durations.append(duration)
-                waveforms.append(waveform)
-                count += 1
+            prompt = {
+                'task': data.get('taskname', 'transcribe'),
+                'pnc': data.get('pnc', 'no') == 'yes',
+                'source_language': data.get('source_language', 'en-US'),
+                'target_language': data.get('source_language', 'en-US'),
+                'itn': data.get('itn', "no") == 'yes',
+                'timestamp': data.get('timestamp', "no") == 'yes',
+                'diarize': data.get('diarize', "no") == 'yes',
+            }
+            if 'text' in data:
+                prompt['text'] = data['text']
+            else:
+                data['text'] = "na"
+            if 'answer' in data:
+                prompt['answer'] = data['answer']
+            prompts_cfg.append(prompt)
+            labels.append(data['text'])
+            ids.append(data['audio_filepath'])
+            durations.append(duration)
+            waveforms.append(waveform)
+            count += 1
 
-                if count == batch_size:
-                    yield waveforms, durations, labels, ids, prompts_cfg, max_batch_len
-                    waveforms, durations, labels, ids, prompts_cfg = [], [], [], [], []
-                    count=0
-                    max_batch_len=0
+            if count == batch_size:
+                yield waveforms, durations, labels, ids, prompts_cfg, max_batch_len
+                waveforms, durations, labels, ids, prompts_cfg = [], [], [], [], []
+                count = 0
+                max_batch_len = 0
 
         if count > 0:
             yield waveforms, durations, labels, ids, prompts_cfg, max_batch_len
@@ -740,60 +782,61 @@ def batch_manifest(manifest_file, batch_size):
             return
 
 
-def decode_manifest(
-        manifest_file,
-        model,
-        max_new_tokens=None,
-        batch_size=1,
-        num_beams=1,
-        sample_rate=16000,
-        output_manifest=None,
-        warmstart_batches=None):
+def decode_manifest(manifest_file,
+                    model,
+                    max_new_tokens=None,
+                    batch_size=1,
+                    num_beams=1,
+                    sample_rate=16000,
+                    output_manifest=None,
+                    warmstart_batches=None):
 
     results = []
     total_duration = 0
-    total_batches=0
+    total_batches = 0
 
-    for waveforms, durations, texts, ids, prompt_cfg, max_batch_len in batch_manifest(manifest_file, batch_size):
+    for waveforms, durations, texts, ids, prompt_cfg, max_batch_len in batch_manifest(
+            manifest_file, batch_size):
         for idx in range(len(waveforms)):
-            max_batch_len = max(max_batch_len, sample_rate*3)
+            max_batch_len = max(max_batch_len, sample_rate * 3)
             waveform = pad_or_trim(waveforms[idx], max_batch_len)
 
             waveform = waveform.astype(np.float32)
             waveform = torch.from_numpy(waveform)
-            waveforms[idx]=waveform
+            waveforms[idx] = waveform
 
         total_duration += sum(durations) / sample_rate
-        predictions = model.process_batch(waveforms, durations,
-                                          num_beams=num_beams, max_new_tokens=max_new_tokens, prompts_cfg=prompt_cfg)
-        for wav_id, label, prediction, cfg in zip(ids, texts, predictions, prompt_cfg):
+        predictions = model.process_batch(waveforms,
+                                          durations,
+                                          num_beams=num_beams,
+                                          max_new_tokens=max_new_tokens,
+                                          prompts_cfg=prompt_cfg)
+        for wav_id, label, prediction, cfg in zip(ids, texts, predictions,
+                                                  prompt_cfg):
             # remove all special tokens in the prediction
             prediction = re.sub(r'<\|.*?\|>', '', prediction)
 
-
-            data={'audio_filepath': wav_id,
-                  'source_lang': cfg['source_language'],
-                  'target_lang': cfg['target_language'],
-                  'pnc': 'no' if cfg['pnc']=='yes' else 'yes',
-                  'task': cfg['task'],
-                  'prediction': prediction,
-                  'answer':cfg.get('answer','na'),
-                  'text':cfg.get('text','na')
-
+            data = {
+                'audio_filepath': wav_id,
+                'source_lang': cfg['source_language'],
+                'target_lang': cfg['target_language'],
+                'pnc': 'no' if cfg['pnc'] == 'yes' else 'yes',
+                'task': cfg['task'],
+                'prediction': prediction,
+                'answer': cfg.get('answer', 'na'),
+                'text': cfg.get('text', 'na')
             }
 
-            results.append((ids,texts,prompt_cfg))
+            results.append((ids, texts, prompt_cfg))
             if output_manifest is not None:
                 output_manifest.append(data)
-            
-            total_batches+=1
+
+            total_batches += 1
 
             if warmstart_batches is not None and total_batches >= warmstart_batches:
                 return results, total_duration
-            
+
     return results, total_duration
-
-
 
 
 def collate_wrapper(batch):
@@ -810,14 +853,14 @@ def collate_wrapper(batch):
         ids.append(item["id"])
     return speeches, durations, labels, ids
 
-def decode_dataset(
-        model,
-        dataset,
-        max_new_tokens=None,
-        text_prefix=None,
-        batch_size=1,
-        num_beams=1,
-        sample_rate=16000):
+
+def decode_dataset(model,
+                   dataset,
+                   max_new_tokens=None,
+                   text_prefix=None,
+                   batch_size=1,
+                   num_beams=1,
+                   sample_rate=16000):
     librispeech_dummy = load_dataset(dataset, "clean", split="validation")
 
     data_loader = DataLoader(librispeech_dummy,
@@ -831,66 +874,72 @@ def decode_dataset(
     for batch in data_loader:
         waveforms, durations, texts, ids = batch
         total_duration += sum(durations) / sample_rate
-        max_durations=max(durations)
-        max_batch_len = max(max_durations, sample_rate*3)
-        waveforms_list=[]
+        max_durations = max(durations)
+        max_batch_len = max(max_durations, sample_rate * 3)
+        waveforms_list = []
 
         for idx in range(len(waveforms)):
             waveform = pad_or_trim(waveforms[idx], max_batch_len)
             waveforms_list.append(waveform)
 
-
-
         predictions = model.process_batch(waveforms_list, durations,
-                                          text_prefix, num_beams, max_new_tokens)
+                                          text_prefix, num_beams,
+                                          max_new_tokens)
         for wav_id, label, prediction in zip(ids, texts, predictions):
             # remove all special tokens in the prediction
             prediction = re.sub(r'<\|.*?\|>', '', prediction)
 
-            results.append((wav_id, label.lower().split(), prediction.lower().split()))
+            results.append(
+                (wav_id, label.lower().split(), prediction.lower().split()))
     return results, total_duration, start_time
 
 
 if __name__ == '__main__':
     args = parse_arguments()
 
-    args.use_py_session=True
+    args.use_py_session = True
 
     tensorrt_llm.logger.set_level(args.log_level)
-    model = CanaryTRTLLM(args.engine_dir, debug_mode=args.debug, device="cuda:0",
-                          use_py_session=args.use_py_session, batch_size=args.batch_size, num_beams=args.num_beams)
+    model = CanaryTRTLLM(args.engine_dir,
+                         debug_mode=args.debug,
+                         device="cuda:0",
+                         use_py_session=args.use_py_session,
+                         batch_size=args.batch_size,
+                         num_beams=args.num_beams)
 
     if args.batch_size is None:
         if args.input_file:
-            args.batch_size=1
+            args.batch_size = 1
         else:
-            args.batch_size=model.max_batch_size
+            args.batch_size = model.max_batch_size
     else:
         if args.batch_size > model.max_batch_size:
-            print(f"batch_size {args.batch_size} is greater than max_batch_size {model.max_batch_size}, setting batch_size to max_batch_size")
-            args.batch_size=model.max_batch_size
-        
-    log_file=None
+            print(
+                f"batch_size {args.batch_size} is greater than max_batch_size {model.max_batch_size}, setting batch_size to max_batch_size"
+            )
+            args.batch_size = model.max_batch_size
+
+    log_file = None
     if args.manifest_file is not None:
-        args.results_dir=Path(args.manifest_file).parent.absolute()
-        mf_name=Path(args.manifest_file).stem
-        args.results_manifest=os.path.join(args.results_dir, f"{args.name}_manifest_{mf_name}.json")
-        log_file=os.path.join(args.results_dir, f"{args.name}_log_{mf_name}.log")
+        args.results_dir = Path(args.manifest_file).parent.absolute()
+        mf_name = Path(args.manifest_file).stem
+        args.results_manifest = os.path.join(
+            args.results_dir, f"{args.name}_manifest_{mf_name}.json")
+        log_file = os.path.join(args.results_dir,
+                                f"{args.name}_log_{mf_name}.log")
     if args.results_manifest is not None:
         output_manifest = []
     else:
         output_manifest = None
     if args.enable_warmup:
         if args.manifest_file:
-            decode_manifest(
-                args.manifest_file,
-                model,
-                batch_size=args.batch_size,
-                num_beams=args.num_beams,
-                max_new_tokens=args.max_new_tokens,
-                output_manifest=None,
-                warmstart_batches=10
-            )
+            decode_manifest(args.manifest_file,
+                            model,
+                            batch_size=args.batch_size,
+                            num_beams=args.num_beams,
+                            max_new_tokens=args.max_new_tokens,
+                            output_manifest=None,
+                            warmstart_batches=10)
         elif args.input_file:
             decode_wav_file(
                 args.input_file,
@@ -906,12 +955,10 @@ if __name__ == '__main__':
                 "hf-internal-testing/librispeech_asr_dummy",
                 batch_size=args.batch_size,
                 num_beams=args.num_beams,
-                max_new_tokens=args.max_new_tokens,     
+                max_new_tokens=args.max_new_tokens,
             )
     if args.input_file:
         start_time = time.time()
-
- 
 
         results, total_duration = decode_wav_file(
             args.input_file,
@@ -919,8 +966,9 @@ if __name__ == '__main__':
             text_prefix=args.prompt_text,
             batch_size=args.batch_size,
             num_beams=args.num_beams,
-            max_new_tokens=args.max_new_tokens,)
-            
+            max_new_tokens=args.max_new_tokens,
+        )
+
     elif args.manifest_file:
 
         start_time = time.time()
@@ -934,7 +982,6 @@ if __name__ == '__main__':
             max_new_tokens=args.max_new_tokens,
         )
 
-
     else:
 
         results, total_duration, start_time = decode_dataset(
@@ -943,7 +990,8 @@ if __name__ == '__main__':
             batch_size=args.batch_size,
             text_prefix=args.prompt_text,
             num_beams=args.num_beams,
-            max_new_tokens=args.max_new_tokens,)
+            max_new_tokens=args.max_new_tokens,
+        )
 
     elapsed = time.time() - start_time
     results = sorted(results)
@@ -952,12 +1000,9 @@ if __name__ == '__main__':
     store_transcripts(filename=f"{args.results_dir}/recogs-{args.name}.txt",
                       texts=results)
 
+    s = ""
 
-
-
-    s=""
-
-    if output_manifest is  None and args.input_file is None:
+    if output_manifest is None and args.input_file is None:
         with open(f"{args.results_dir}/errs-{args.name}.txt", "w") as f:
             total_error_rate = write_error_stats(f,
                                                  "test-set",
@@ -967,7 +1012,7 @@ if __name__ == '__main__':
                 assert total_error_rate <= 2.0, f"Word Error rate using canary model should be 1.22%, but got {total_error_rate}"
             s = f"total error rate: {total_error_rate:.2f}%\n"
 
-    rtf = total_duration/elapsed
+    rtf = total_duration / elapsed
     s += f"RTFx: {rtf:.4f}\n"
     s += f"total_duration: {total_duration:.3f} seconds\n"
     s += f"({total_duration/3600:.2f} hours)\n"
