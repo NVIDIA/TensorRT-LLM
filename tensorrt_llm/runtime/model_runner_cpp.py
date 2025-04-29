@@ -935,11 +935,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
         responses = []
         while len(responses) < len(request_ids) * num_sequences:
-            multi_responses = self.executor.await_responses(request_ids)
-            responses.extend([
-                response for responses in multi_responses
-                for response in responses
-            ])
+            responses.extend(self.executor.await_responses())
 
         return self._fill_output(
             responses=responses,
