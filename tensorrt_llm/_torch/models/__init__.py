@@ -16,6 +16,7 @@ from .modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
 from .modeling_qwen3 import Qwen3ForCausalLM
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .modeling_qwen_moe import Qwen2MoeForCausalLM
+from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import get_model_architecture
 from .modeling_vila import VilaModel
 
@@ -41,6 +42,7 @@ __all__ = [
     "Qwen2_5_VLModel",
     "Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM",
+    "SiglipVisionModel",
 ]
 
 if transformers.__version__ >= "4.45.1":
