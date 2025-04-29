@@ -2,7 +2,7 @@
 
 ## Background
 "Sanity perf check" is a mechanism to detect performance regressions in the L0 pipeline.
-The tests defined in `l0_perf.yaml` are the ones that are required to pass for every PR before merge.
+The tests defined in `l0_perf.yml` are the ones that are required to pass for every PR before merge.
 
 ### `base_perf.csv`
 The baseline for performance benchmarking is defined at `base_perf.csv` - this file contains the metrics that we verify regression on between CI runs.
@@ -17,13 +17,13 @@ To allow for some machine dependent variance in performance benchmarking we also
 `threshold` is relative.
 
 ## CI
-As part of our CI, the `test_perf.py` collects performance metrics for configurations defined in `l0_perf.yaml`. This step outputs a `perf_script_test_results.csv` containing the metrics collected for all configurations.
+As part of our CI, the `test_perf.py` collects performance metrics for configurations defined in `l0_perf.yml`. This step outputs a `perf_script_test_results.csv` containing the metrics collected for all configurations.
 
 After this step completes, the CI will run `sanity_perf_check.py`. This script will make sure that all differences in metrics from the run on this branch is within a designated threshold of the baseline (`base_perf.csv`).
 
 There're 4 possible results for this:
 1. The current HEAD impact on the performance for our setups is within accepted threshold - the perf check will **pass** w/o exception.
-2. The current HEAD introduces a new setup/metric in `l0_perf.yaml` or removes some of them. This will result in new metrics collected by `test_perf.py` which will **fail** `sanity_perf_check.py`. This requires an update for `base_perf.csv`.
+2. The current HEAD introduces a new setup/metric in `l0_perf.yml` or removes some of them. This will result in new metrics collected by `test_perf.py` which will **fail** `sanity_perf_check.py`. This requires an update for `base_perf.csv`.
 3. The current HEAD improves performance for at least one metric by more than the accepted threshold, which will **fail** `sanity_perf_check.py`. This requires an update for `base_perf.csv`
 4. The current HEAD introduces a regression to one of the metrics that is over the accepted threshold, which will **fail** `sanity_perf_check.py`. This will require to fix the current branch and rerun the pipeline.
 
