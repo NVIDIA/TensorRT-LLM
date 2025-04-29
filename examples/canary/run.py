@@ -686,6 +686,9 @@ def batch_manifest(manifest_file, batch_size):
     waveforms, durations, labels, ids, prompts_cfg = [], [], [], [], []
     count=0
     max_batch_len=0
+    total_count=0
+    total_batches=0
+    last_batch_size=0
     with open(manifest_file,'r') as manifest:
         for line in manifest:
                 data = json.loads(line)
@@ -716,13 +719,17 @@ def batch_manifest(manifest_file, batch_size):
                 durations.append(duration)
                 waveforms.append(waveform)
                 count += 1
+
                 if count == batch_size:
                     yield waveforms, durations, labels, ids, prompts_cfg, max_batch_len
                     waveforms, durations, labels, ids, prompts_cfg = [], [], [], [], []
                     count=0
                     max_batch_len=0
 
-        return waveforms, durations, labels, ids, prompts_cfg
+        if count > 0:
+            yield waveforms, durations, labels, ids, prompts_cfg, max_batch_len
+        else:
+            return
 
 
 def decode_manifest(
