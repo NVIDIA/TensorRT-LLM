@@ -358,7 +358,6 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             )
             self.max_draft_len = spec_config.max_draft_tokens
-            print("self.without_logits=",self.without_logits," self.max_draft_len=",self.max_draft_len)
         else:
             self.without_logits = False
             self.max_draft_len = 0
@@ -962,7 +961,6 @@ class PyTorchModelEngine(ModelEngine):
                                                        non_blocking=True))
 
         is_spec_decode = len(extend_requests) > 0
-        print("is_spec_decode=",is_spec_decode)
         if self._enable_overlap_scheduler and is_spec_decode:
             spec_dec_mode = self.spec_config.spec_dec_mode
             assert spec_dec_mode.support_overlap_scheduler(
@@ -1051,7 +1049,6 @@ class PyTorchModelEngine(ModelEngine):
         num_tokens = len(input_ids)
         previous_batchs = len(previous_batch_indices)
         if num_tokens > 0:
-            print("num_tokens=",num_tokens," input_ids=",input_ids)
             input_ids = torch.tensor(input_ids,
                                      dtype=torch.int,
                                      pin_memory=True)
@@ -1132,7 +1129,6 @@ class PyTorchModelEngine(ModelEngine):
                 dtype=torch.int,
                 pin_memory=True,
             )
-            print("sequence_lengths=",sequence_lengths)
 
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
