@@ -184,7 +184,7 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
     PerfMetricType.INFERENCE_TIME:
     re.compile(r"Total Latency \(ms\):\s+([\d\.]+)"),
     PerfMetricType.TOKEN_THROUGHPUT:
-    re.compile(r"GPU Output Throughput \(tokens\/sec\/gpu\):\s+([\d\.]+)"),
+    re.compile(r"GPU Output Throughput \(tps\/gpu\):\s+([\d\.]+)"),
     PerfMetricType.SEQ_THROUGHPUT:
     re.compile(r"Request Throughput \(req\/sec\):\s+([\d\.]+)"),
     PerfMetricType.FIRST_TOKEN_TIME:
