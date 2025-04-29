@@ -1,4 +1,5 @@
 import math
+import os
 import random
 from collections.abc import Iterable
 
@@ -17,7 +18,8 @@ from ..speculative import (get_num_spec_layers, get_spec_decoder,
                            get_spec_resource_manager)
 from .decoder import (EarlyStopDecoder, TorchDecoder, TorchStarAttentionDecoder,
                       TRTLLMDecoder)
-from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
+from .kv_cache_transceiver import (AttentionTypeCpp, CacheTransBufferManager,
+                                   create_kv_cache_transceiver)
 from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
                            PyTorchModelEngine)
 from .py_executor import PyExecutor
@@ -147,6 +149,29 @@ def get_token_num_for_estimation(executor_config, model_config):
         return None
 
 
+def get_cache_transceiver_prealloc_size(executor_config: ExecutorConfig,
+                                        model_config: PyTorchModelEngine,
+                                        mapping: Mapping):
+    if (os.getenv("TRTLLM_USE_MPI_KVCACHE")
+            or os.getenv("TRTLLM_USE_UCX_KVCACHE")):
+        kv_size_per_token = int(get_cache_size_per_token(model_config, mapping))
+        logger.info(
+            f"get_cache_transceiver_prealloc_size kv_size_per_token: {kv_size_per_token} , executor_config.cache_transceiver_config: {executor_config.cache_transceiver_config}"
+        )
+        if executor_config.cache_transceiver_config is not None:
+            logger.info(
+                f"get_cache_transceiver_prealloc_size executor_config.cache_transceiver_config.max_num_tokens: {executor_config.cache_transceiver_config.max_num_tokens}"
+            )
+            return CacheTransBufferManager.pre_alloc_buffer_size(
+                executor_config.cache_transceiver_config.max_num_tokens,
+                kv_size_per_token)
+        else:
+            return CacheTransBufferManager.pre_alloc_buffer_size(
+                None, kv_size_per_token)
+    else:
+        return 0
+
+
 def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
                                  model_engine: PyTorchModelEngine,
                                  executor_config: ExecutorConfig,
@@ -181,6 +206,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
         req = create_dummy_context_requests(max_num_tokens, seq_len, vocab_size)
         req_ids = py_executor.enqueue_requests(req)
     req_ids = mpi_broadcast(req_ids, root=0)
+    py_executor.is_warmup = True
     py_executor.start_worker()
     py_executor.await_responses(req_ids)
     # TODO check why call mpi_barrier() here will hang-on, but call mpi_allgather(0) is fine.
@@ -194,7 +220,12 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     total_used_bytes = total_gpu_memory - end
     activation_bytes = torch_peak_memory - model_bytes
     extra_cost = max(total_used_bytes - torch_used_bytes, 0)
-    peak_memory = torch_peak_memory + extra_cost
+    kv_cache_transceiver_prealloc_size = get_cache_transceiver_prealloc_size(
+        executor_config, model_engine.model.model_config, mapping)
+    logger.info(
+        f"kv_cache_transceiver_prealloc_size: {kv_cache_transceiver_prealloc_size}"
+    )
+    peak_memory = torch_peak_memory + extra_cost + kv_cache_transceiver_prealloc_size
     logger.info(
         f"Memory dynamically allocated during inference (inside torch) in memory usage profiling: {activation_bytes / (GB):.2f} GiB"
     )
@@ -220,6 +251,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     py_executor.resource_manager.resource_managers.get(
         "kv_cache_manager").shutdown()
 
+    py_executor.is_warmup = False
     if py_executor.dist.mapping.rank == 0:
         py_executor.shutdown()
 
@@ -425,9 +457,9 @@ def create_py_executor_instance(dist,
     config = model_engine.model.model_config.pretrained_config
     attention_type = AttentionTypeCpp.MLA if is_mla(
         config) else AttentionTypeCpp.DEFAULT
-    kv_cache_transceiver = create_kv_cache_transceiver(mapping,
-                                                       kv_cache_manager,
-                                                       attention_type)
+    cache_transceiver_config = executor_config.cache_transceiver_config
+    kv_cache_transceiver = create_kv_cache_transceiver(
+        mapping, kv_cache_manager, attention_type, cache_transceiver_config)
 
     decoder = instantiate_decoder(model_engine, executor_config, spec_decoder,
                                   pytorch_backend_config, mapping)

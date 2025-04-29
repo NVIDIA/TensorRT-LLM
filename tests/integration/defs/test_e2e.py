@@ -1993,8 +1993,8 @@ def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
     example_root = Path(os.path.join(llm_root, "examples", "scaffolding"))
     input_file = Path(os.path.join(example_root, "test.jsonl"))
     llm_venv.run_cmd([
-        str(example_root / "aime24_test.py"),
-        "--generation_dir",
+        str(example_root / "run_majority_vote_aime24.py"),
+        "--model_dir",
         f"{llm_models_root()}/{model_path}",
         f"--jsonl_file={input_file}",
         "--threshold=0.5",
