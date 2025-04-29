@@ -235,7 +235,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
         num_attention_heads = config.num_attention_heads
         num_key_value_heads = getattr(config, 'num_key_value_heads',
                                       num_attention_heads)
-        head_dim = hidden_size // num_attention_heads
+        head_dim = config.head_dim if hasattr(config, 'head_dim') else hidden_size // num_attention_heads
 
         if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
         ):
