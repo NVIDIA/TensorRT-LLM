@@ -606,7 +606,7 @@ class PyExecutor:
                 scheduled_batch, _, _ = self._schedule()
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
-                logger.info(
+                logger.debug(
                     f'has {len(self.active_requests)} active_request, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
                     f'{len(scheduled_batch.generation_requests)} generation requests'
@@ -708,7 +708,7 @@ class PyExecutor:
                 scheduled_batch, _, _ = self._schedule()
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
-                logger.info(
+                logger.debug(
                     f'has {len(self.active_requests)} active_request, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
                     f'{len(scheduled_batch.generation_requests)} generation requests'
@@ -866,7 +866,7 @@ class PyExecutor:
                         "probably run out of resource.")
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
-                logger.info(
+                logger.debug(
                     f'has {len(self.active_requests)} active_request, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
                     f'{len(scheduled_batch.generation_requests)} generation requests'
@@ -1006,7 +1006,7 @@ class PyExecutor:
                         "probably run out of resource.")
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
-                logger.info(
+                logger.debug(
                     f'has {len(self.active_requests)} active_request, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
                     f'{len(scheduled_batch.generation_requests)} generation requests'
