@@ -553,6 +553,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/unittest/llmapi/test_llm_pytorch.py",
         "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
         "jenkins/L0_Test.groovy",
+        "tensorrt_llm/_torch/pyexecutor/_util.py",
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)

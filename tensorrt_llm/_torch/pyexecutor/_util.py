@@ -210,6 +210,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     py_executor.start_worker()
     py_executor.await_responses(req_ids)
     # TODO check why call mpi_barrier() here will hang-on, but call mpi_allgather(0) is fine.
+    mpi_allgather(0)
 
     torch_peak_memory = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
 
@@ -254,6 +255,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     py_executor.is_warmup = False
     if py_executor.dist.mapping.rank == 0:
         py_executor.shutdown()
+    mpi_allgather(0)
 
     return kv_cache_max_tokens
 
