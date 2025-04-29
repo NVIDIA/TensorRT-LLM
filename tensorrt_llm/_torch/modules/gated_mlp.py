@@ -77,8 +77,8 @@ class GatedMLP(nn.Module):
             quant_config=config.get_quant_config(),
             is_expert=is_expert,
             skip_create_weights=config.skip_create_weights,
-            # # During llama4, we are using the custom kernel that performs FC+SwiGLU
-            # # in one kernel.
+            # During llama4, we are using the custom kernel that performs FC+SwiGLU
+            # in one kernel.
             # use_llama4_fc_swiglu=is_llama4,
             use_trtllm_gen_fc_swiglu=is_llama4,
         )
