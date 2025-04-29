@@ -1188,8 +1188,6 @@ def test_build_time_benchmark_sanity(llm_root, llm_venv):
     ])
 
 
-# End of HLAPI examples
-
 
 ### Pivot-To-Python examples
 def test_ptp_quickstart(llm_root, llm_venv):
