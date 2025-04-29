@@ -38,17 +38,3 @@ class NGramConfig(SpecConfig):
 
     def update_from_model_config(self, model_config):
         pass
-
-
-@dataclass
-class NGramSpecMetadata(SpecMetadata):
-    """
-    Metadata for NGram.
-    """
-    def __post_init__(self) -> None:
-        pass
-
-    def prepare(self):
-        pass
-
-
