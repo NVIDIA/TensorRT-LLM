@@ -46,7 +46,7 @@ class SpeculativeDecodingMode(IntEnum):
         chunked context requests at the kernel level. Required for
         any spec dec mode that uses the SpecExecutor.
         """
-        return self.is_eagle3()
+        return self.is_eagle3() or self.is_ngram()
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":
