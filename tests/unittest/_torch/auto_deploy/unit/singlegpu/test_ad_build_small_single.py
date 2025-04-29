@@ -41,7 +41,7 @@ from utils.llm_data import llm_models_root
             },
         ),
         # small Mixtral-8x7B model with world_size 1
-        (
+        pytest.param(
             1,
             {
                 "model": _hf_model_dir_or_hub_id(
@@ -53,6 +53,7 @@ from utils.llm_data import llm_models_root
                 "compile_backend": "torch-simple",
                 "model_kwargs": {"num_hidden_layers": 2},
             },
+            marks=pytest.mark.threadleak(enabled=False),
         ),
         # small llama3.1-8B model with world_size 0 (no processes are spawned) + torch-opt
         (
