@@ -120,6 +120,7 @@ static_assert(hasSerializedSize<GuidedDecodingConfig>(size_t()));
 static_assert(hasSerializedSize<GuidedDecodingParams>(size_t()));
 static_assert(!hasSerializedSize<std::string>(size_t()));
 static_assert(!hasSerializedSize<std::optional<float>>(size_t()));
+static_assert(hasSerializedSize<CacheTransceiverConfig>(size_t()));
 
 template <typename T>
 size_t serializedSize(T const& data)
@@ -215,6 +216,7 @@ static_assert(hasSerialize<DataTransceiverState>(nullptr));
 static_assert(hasSerialize<ContextPhaseParams>(nullptr));
 static_assert(!hasSerialize<std::string>(nullptr));
 static_assert(!hasSerialize<std::optional<float>>(nullptr));
+static_assert(hasSerialize<CacheTransceiverConfig>(nullptr));
 
 template <typename T>
 void serialize(T const& data, std::ostream& os)
@@ -490,6 +492,10 @@ T deserialize(std::istream& is)
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::AdditionalOutput>)
     {
         return Serialization::deserializeAdditionalOutput(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::CacheTransceiverConfig>)
+    {
+        return Serialization::deserializeCacheTransceiverConfig(is);
     }
     // Optional
     else if constexpr (std::is_same_v<T, std::optional<typename ValueType<T>::type>>)

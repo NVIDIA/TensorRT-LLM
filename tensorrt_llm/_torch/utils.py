@@ -96,6 +96,10 @@ class Fp4QuantizedTensor:
     fp4_tensor: torch.Tensor
     scaling_factor: torch.Tensor
 
+    @property
+    def shape(self):
+        return self.fp4_tensor.shape
+
 
 _disable_fp4_allgather = os.getenv("TLLM_DISABLE_FP4_ALLGATHER", "0") == "1"
 
@@ -197,7 +201,7 @@ def get_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
         num_token_buckets.append(m)
         m //= 2
 
-    return num_token_buckets
+    return tuple(num_token_buckets)
 
 
 def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:

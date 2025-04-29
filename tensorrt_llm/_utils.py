@@ -531,6 +531,14 @@ def mpi_isend(buf, dest, tag=0):
     return None
 
 
+def mpi_send(buf, dest, tag=0):
+    # send in buf-like objects (e.g. numpy array)
+    # return request handle if ENABLE_MULTI_DEVICE
+    if ENABLE_MULTI_DEVICE:
+        mpi_comm().Send(buf, dest, tag=tag)
+    return None
+
+
 def mpi_recv(buf, source, tag):
     # recv in buf-like object (e.g. numpy array)
     if ENABLE_MULTI_DEVICE:

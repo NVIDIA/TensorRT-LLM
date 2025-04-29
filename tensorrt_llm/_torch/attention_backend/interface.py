@@ -167,7 +167,7 @@ class AttentionMetadata:
                 # This copy is safe because the batch size is guaranteed to not
                 # change in the CUDA graph case. The seqlens can change if we
                 # are doing spec decode.
-                self._seq_lens_cuda.copy_(self._seq_lens)
+                self._seq_lens_cuda.copy_(self._seq_lens, non_blocking=True)
             else:
                 self._seq_lens_cuda = self._seq_lens.cuda(non_blocking=True)
 
@@ -495,6 +495,7 @@ class AttentionBackend(Generic[TMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        skip_create_weights_in_init: bool = False,
         **kwargs,
     ):
         """
@@ -511,6 +512,14 @@ class AttentionBackend(Generic[TMetadata]):
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads or self.num_heads
         self.quant_config = quant_config
+
+    def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
+        """
+        To support mixed quantization mode, self.quant_config can be modified after __init__ is called.
+        Any states or set up related to self.quant_config must be moved to this function, which is called
+        after self.quant_config is reset.
+        """
+        self.quant_config = new_quant_config
 
     def forward(self,
                 q: torch.Tensor,

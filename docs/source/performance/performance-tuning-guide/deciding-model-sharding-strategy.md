@@ -42,7 +42,7 @@ The `LLM` class takes `tensor_parallel_size` and `pipeline_parallel_size` as par
 If you are using the [CLI flow for building engines](./benchmarking-default-performance.md#building-and-saving-engines-via-cli) you can specify tensor parallelism and pipeline parallelism by providing the `--tp_size` and `--tp_size` arguments to `convert_checkpoint.py`
 
 ```
-python examples/llama/convert_checkpoint.py --model_dir ./tmp/llama/405B/ \
+python examples/models/core/llama/convert_checkpoint.py --model_dir ./tmp/llama/405B/ \
                             --output_dir ./tllm_checkpoint_16gpu_tp8_pp2 \
                             --dtype float16 \
                             --tp_size 8

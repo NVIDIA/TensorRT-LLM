@@ -1000,6 +1000,59 @@ def test_falcon_gqa_e2e(falcon_example_root, llm_venv, engine_dir, enable_fp8,
     venv_check_call(llm_venv, run_cmd)
 
 
+def test_mistral_large_hidden_vocab_size(llama_example_root, llm_venv,
+                                         llama_tokenizer_model_root,
+                                         engine_dir):
+    """RCCA https://nvbugs/4753548"""
+    config = {
+        "architecture": "LlamaForCausalLM",
+        "dtype": "float16",
+        "vocab_size": 131072,
+        "hidden_size": 16384,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 96,
+        "hidden_act": "silu",
+        "logits_dtype": "float32",
+        "norm_epsilon": 1e-06,
+        "position_embedding_type": "rope_gpt_neox",
+        "max_position_embeddings": 131072,
+        "num_key_value_heads": 8,
+        "intermediate_size": 36864,
+        "head_size": 128,
+    }
+
+    # Save the dummy-weight checkpoint config.json to engine_dir
+    if not os.path.exists(engine_dir):
+        os.makedirs(engine_dir)
+    ckpt_config_path = os.path.join(engine_dir, 'ckpt_config.json')
+    with open(ckpt_config_path, 'w') as f:
+        json.dump(config, f, indent=4)
+
+    build_cmd = [
+        "trtllm-build",
+        f"--model_config={ckpt_config_path}",
+        f"--output_dir={engine_dir}",
+        "--max_input_len=8096",
+        "--max_seq_len=52488",
+        "--max_num_tokens=52488",
+        "--gemm_plugin=float16",
+        "--gpt_attention_plugin=float16",
+        "--paged_kv_cache=enable",
+        "--remove_input_padding=enable",
+        "--max_batch_size=32",
+    ]
+    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+
+    print("Run inference...")
+    run_cmd = [
+        f"{llama_example_root}/../../../run.py",
+        "--max_output_len=20",
+        f"--engine_dir={engine_dir}",
+        f"--tokenizer_dir={llama_tokenizer_model_root}",
+    ]
+    venv_check_call(llm_venv, run_cmd)
+
+
 run_llm_path = os.path.join(os.path.dirname(__file__), "_run_llmapi_llm.py")
 
 
@@ -1545,6 +1598,31 @@ def test_ptq_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
     ])
 
 
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("model_name,model_path", [
+    pytest.param('DeepSeek-V3', 'DeepSeek-V3', marks=skip_pre_hopper),
+])
+def test_ptp_quickstart_advanced_deepseek_v3_2nodes_8gpus(
+        llm_root, llm_venv, model_name, model_path):
+    # "RCCA https://nvbugs/5163844"
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--enable_overlap_scheduler",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--moe_ep_size=8",
+        "--tp_size=16",
+        "--use_cuda_graph",
+        "--kv_cache_fraction=0.5",
+        "--max_batch_size=32",
+        "--max_num_tokens=2048",
+        "--kv_cache_enable_block_reuse",
+    ])
+
+
 @pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
     ("Llama-3.1-8b-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct",
      "EAGLE3-LLaMA3.1-Instruct-8B"),
@@ -1563,7 +1641,7 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
         f"{llm_models_root()}/{model_path}",
         "--eagle_model_dir",
         f"{llm_models_root()}/{eagle_model_path}",
-        "--kv_cache_enable_block_reuse",
+        "--disable_kv_cache_reuse",
     ])
 
 
@@ -1590,7 +1668,7 @@ def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
         "--kv_cache_fraction=0.95",
         "--max_batch_size=1",
         "--max_seq_len=3000",
-        "--kv_cache_enable_block_reuse",
+        "--disable_kv_cache_reuse",
     ])
 
 
@@ -1608,9 +1686,11 @@ def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
     pytest.param('Mixtral-8x7B-NVFP4',
                  'nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1',
                  marks=skip_pre_blackwell),
-    pytest.param('Nemotron-Ultra-253B',
-                 'nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
-                 marks=skip_pre_hopper),
+    pytest.param(
+        'Nemotron-Ultra-253B',
+        'nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
+        marks=[skip_pre_hopper,
+               pytest.mark.skip_less_device_memory(140000)]),
 ])
 def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
                                        model_path):
@@ -1757,7 +1837,8 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
              ],
              [
                  "The image shows a multi-lane highway with traffic flowing in both directions. The road appears to be relatively clear, with a few vehicles visible on the road. There is a bus in the right lane, a police car in the middle lane, and a few other vehicles scattered across the lanes. The traffic seems to be",
-                 "The image shows a multi-lane highway with traffic flowing in both directions. The road appears to be relatively clear, with a few vehicles visible on the road. There is a bus on the right side of the road, and a police car is seen in the middle lane, possibly indicating a traffic check or an incident."
+                 "The image shows a multi-lane highway with traffic flowing in both directions. The road appears to be relatively clear, with a few vehicles visible on the road. There is a bus on the right side of the road, and a police car is seen in the middle lane, possibly indicating a traffic check or an incident.",
+                 "The image shows a multi-lane highway with traffic flowing in both directions. The road appears to be relatively clear, with a few vehicles visible on the road. There is a bus on the right side of the road, and a police car is seen in the middle lane. The traffic seems to be moving smoothly, with"
              ]],
             "video":
             [[
@@ -1883,7 +1964,8 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
     tllm_logits = []
     for output in outputs:
         prompt = output.prompt
-        tllm_logit = output.context_logits.cpu()
+        tllm_logit = output.context_logits.cpu(
+        )[:, 0]  # drop vocab_size dimension.
         print(f"Prompt: {prompt!r}, Context logits: {tllm_logit}")
         tllm_logits += [tllm_logit]
     # Stack the output
@@ -1938,8 +2020,8 @@ def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
     example_root = Path(os.path.join(llm_root, "examples", "scaffolding"))
     input_file = Path(os.path.join(example_root, "test.jsonl"))
     llm_venv.run_cmd([
-        str(example_root / "aime24_test.py"),
-        "--generation_dir",
+        str(example_root / "run_majority_vote_aime24.py"),
+        "--model_dir",
         f"{llm_models_root()}/{model_path}",
         f"--jsonl_file={input_file}",
         "--threshold=0.5",

@@ -26,7 +26,8 @@ from defs.trt_test_alternative import check_call
 @pytest.fixture(scope="module")
 def qwenvl_example_root(llm_root, llm_venv):
     "Get qwenvl example root"
-    example_root = os.path.join(llm_root, "examples", "qwenvl")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "qwenvl")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")

@@ -2286,6 +2286,12 @@ def test_guided_decoding_config_pickle():
     assert config_copy.stop_token_ids == config.stop_token_ids
 
 
+def test_cache_transceiver_config_pickle():
+    config = trtllm.CacheTransceiverConfig(max_num_tokens=1024)
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config_copy.max_num_tokens == config.max_num_tokens
+
+
 def test_executor_config_pickle():
     beam_width = 2
     config = trtllm.ExecutorConfig(beam_width)

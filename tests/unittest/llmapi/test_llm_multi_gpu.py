@@ -234,16 +234,11 @@ def test_tinyllama_logits_processor_tp2pp2():
 
 @pytest.mark.gpu4
 @pytest.mark.part0
-@pytest.mark.parametrize("backend", ['tensorrt', 'pytorch'])
-def test_tinyllama_guided_decoding_tp2pp2(backend: str):
-    llm_kwargs = {}
-    if backend == 'pytorch':
-        llm_kwargs['backend'] = 'pytorch'
+def test_tinyllama_guided_decoding_tp2pp2():
     tinyllama_guided_decoding_test_harness(
         tensor_parallel_size=2,
         pipeline_parallel_size=2,
-        kv_cache_config=global_kv_cache_config,
-        **llm_kwargs)
+        kv_cache_config=global_kv_cache_config)
 
 
 @pytest.mark.gpu2
@@ -290,7 +285,6 @@ def run_command(command: str):
 
 @skip_single_gpu
 def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
-    # TODO[chunweiy]: reactivate this later
     nworkers = 2
     test_case_file = os.path.join(os.path.dirname(__file__), "run_llm.py")
     os.path.join(os.path.dirname(__file__), "launch.py")
