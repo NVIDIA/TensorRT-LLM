@@ -252,6 +252,8 @@ def prepare_model(
     def _prepare(model_name: str, run_fp8=False):
         install_additional_requirements(model_name)
 
+        start_time = time.time()
+
         _cpp.prepare_model_tests(
             model_name=model_name,
             python_exe=python_exe,
@@ -259,6 +261,10 @@ def prepare_model(
             resources_dir=cpp_resources_dir,
             model_cache_arg=model_cache_arg,
         )
+
+        duration = time.time() - start_time
+        print(f"Built model: {model_name}")
+        print(f"Duration: {duration} seconds")
 
     return _prepare
 
