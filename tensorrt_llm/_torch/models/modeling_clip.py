@@ -29,8 +29,10 @@ class CLIPAttention(Attention):
         pos_embd_params = None
 
         # Vision model has class token
-        num_patches = (config.image_size // config.patch_size)**2
-        max_position_embeddings = num_patches + 1
+        #num_patches = (config.image_size // config.patch_size)**2
+
+        #FIXME: max_position_embeddings seems to be unused
+        max_position_embeddings = None
 
         # CLIP uses bias in attention QKV projections
         bias = True
