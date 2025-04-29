@@ -34,7 +34,7 @@ class NGramConfig(SpecConfig):
     def __post_init__(self) -> None:
         self.spec_dec_mode = SpeculativeDecodingMode.from_string(
             self.spec_dec_name)
-        self.max_draft_tokens = self.max_matching_ngram_size
+        self.max_draft_tokens = self.prompt_lookup_num_tokens
 
     def update_from_model_config(self, model_config):
         pass
