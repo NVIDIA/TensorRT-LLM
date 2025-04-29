@@ -168,16 +168,16 @@ As a result, even if TensorRT has a powerful pattern-matching algorithm and
 supports a lot of possible fusions, there is always the risk that it cannot
 identify uncommon and/or very advanced patterns. To overcome that inevitable
 limitation, TensorRT offers a powerful mechanism known as
-[plugins](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Plugin/pyPlugin.html).
+[plugins](https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Plugin/pyPlugin.html).
 
 The plugins are nodes inserted in the network graph definition that map to user-defined
 GPU kernels. TensorRT-LLM uses a number of such plugins. They can be found in
 the [`cpp/tensorrt_llm/plugins`](source:/cpp/tensorrt_llm/plugins) directory.
 
 Plugins are written in C++ and follow a well-defined interface described in the
-[Extending TensorRT with Custom Layers](https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#extending)
+[Extending TensorRT with Custom Layers](https://docs.nvidia.com/deeplearning/tensorrt/latest/inference-library/extending-custom-layers.html)
 section of the TensorRT
-[Developer Guide](https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html).
+[Developer Guide](https://docs.nvidia.com/deeplearning/tensorrt/latest/index.html).
 When executed within a TensorRT engine, plugins trigger the execution of
 their encapsulated GPU kernels. A fairly simple example of plugins is the
 [`QuantizeTensorPlugin`](source:/cpp/tensorrt_llm/plugins/quantizeTensorPlugin) that
