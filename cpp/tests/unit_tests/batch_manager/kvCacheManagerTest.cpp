@@ -113,7 +113,6 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
     auto constexpr maxNumSequences = 8;
     auto const stream = std::make_shared<tr::CudaStream>();
     auto constexpr onboardBlocks = true;
-    auto constexpr shareLastContextBlock = false;
 
     auto constexpr beamWidth = 8;
     auto constexpr numBlocksPerBeam = blocksInPrimaryPool / beamWidth;
@@ -132,6 +131,7 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
 
     auto constexpr requestId = 42;
     GenerationRequest seq0{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
+    bool shareLastContextBlock = false;
     blockManager.addSequence(seq0, numBlocksPerBeam, shareLastContextBlock, maxAttentionWindow);
     auto constexpr occupiedBlocks = (numBlocksPerBeam - 1) + beamWidth;
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - occupiedBlocks);
@@ -147,7 +147,8 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
     blockManager.releaseBlocks(seq0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
-    blockManager.addSequence(seq0, numBlocksPerBeam, true, maxAttentionWindow);
+    shareLastContextBlock = true;
+    blockManager.addSequence(seq0, numBlocksPerBeam, shareLastContextBlock, maxAttentionWindow);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocksPerBeam);
     EXPECT_EQ(ids.size(), beamWidth);
     for (std::size_t i = 0u; i < ids.front().size(); ++i)
@@ -161,6 +162,7 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
     // occupy 22/24 blocks
+    shareLastContextBlock = false;
     EXPECT_NO_THROW(blockManager.addSequence(seq0, numBlocksPerBeam, shareLastContextBlock, maxAttentionWindow));
     GenerationRequest seq1{requestId + 1, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
     EXPECT_NO_THROW(blockManager.addSequence(seq1, numBlocksPerBeam, shareLastContextBlock, maxAttentionWindow));
