@@ -242,17 +242,30 @@ async def test_kv_cache_aware_router(servers):
     # block-wise (32/block) hit rate: 96/512, 32/512, 0/512
     another_request = CompletionRequest(model="TinyLlama",
                                         prompt=[[1000] * 500])
-    results = [
-        await router.get_next_server(copy.copy(another_request))
-        for _ in range(20)
+    dup_requests = [copy.copy(another_request) for _ in range(20)]
+    another_results = [
+        await router.get_next_server(req) for req in dup_requests
     ]
-    servers, infos = zip(*results)
+    servers, infos = zip(*another_results)
     # due to workload balancing, not all requests are sent to the same server
     # distribution is related to the hit rate
     counts = {server: 0 for server in servers}
     for server in servers:
         counts[server] += 1
     assert counts["server1"] > counts["server2"] > counts["server3"] > 0
+    for req in dup_requests:
+        await router.finish_request(req)
+
+    # test router after block eviction on server 1&2
+    # results: server3(request2), server2(request1), server1(request0)
+    for server, infos in results[1:]:
+        assert server in ["server1", "server2"]
+        events = [{"type": "removed", "block_hashes": infos["block_hashes"][0]}]
+        router._server_state[server].update_with_events(events)
+
+    results = [await router.get_next_server(req) for req in reversed(requests)]
+    servers, infos = zip(*results)
+    assert servers == ("server3", "server1", "server2")
 
 
 def test_create_router(servers):

@@ -388,6 +388,65 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             ]
             await asyncio.gather(*chat_threads)
 
+    async def test_eviction(self):
+        async with await self.new_session() as session:
+            # send a dummy request for initialization
+            dummy_request = {
+                "model": MODEL_NAME,
+                "prompt": [3] * 100,
+                "max_tokens": 1,
+                "temperature": 0.0,
+            }
+            assert len(self.gen_servers) == 1
+            server = self.gen_servers[0]  # only test on this server
+            server_state = self.gen_router._server_state[server]
+            await self.send_request(session, server, dummy_request)
+            # get block pool size from created event
+            events = await self.query_kv_cache_events(session, server)
+            server_state.update_with_events(events)
+            block_pool_size = None
+            for event in events:
+                if event["type"] == "created":
+                    block_pool_size = event["num_blocks_per_cache_level"][0]
+                    break
+            assert block_pool_size is not None
+            logger.info(f"Block pool size: {block_pool_size}")
+
+            # the dummy request can be reused
+            openai_request = CompletionRequest(model=MODEL_NAME,
+                                               prompt=dummy_request["prompt"])
+            server, info = await self.gen_router.get_next_server(openai_request)
+            first_match = info["matches"][0]
+            assert first_match > 0
+            await self.gen_router.finish_request(openai_request)
+
+            # flood requests until eviction
+            batch_size = 8
+            blocks_per_request = 32
+            requests = [copy.copy(dummy_request) for _ in range(batch_size)]
+            has_evicted = False
+            for i in range(0, block_pool_size // blocks_per_request + 10,
+                           batch_size):
+                logger.info(f"Flooding request {i} ~ {i + batch_size - 1}")
+                prompt_len = self.gen_router._tokens_per_block * blocks_per_request - 10
+                for j in range(batch_size):
+                    prompt = [10 + i + j] * prompt_len
+                    requests[j]["prompt"] = prompt
+                await asyncio.gather(*[
+                    self.send_request(session, server, request)
+                    for request in requests
+                ])
+                events = await self.query_kv_cache_events(session, server)
+                server_state.update_with_events(events)
+                for event in events:
+                    if event["type"] == "removed":
+                        has_evicted = True
+            assert has_evicted
+
+            # the dummy request's reusable length decreases after eviction
+            server, info = await self.gen_router.get_next_server(openai_request)
+            assert info["matches"][0] < first_match
+
 
 def prepare_llama_model(llama_model_root: str, llm_venv):
     src_dst_dict = {
@@ -472,3 +531,18 @@ def test_workers_kv_cache_aware_router(disaggregated_test_root,
         tester = KvCacheAwareRouterTester(ctx_servers, gen_servers)
         prompts = load_default_prompts(disaggregated_example_root)
         asyncio.run(tester.test_multi_round_request(prompts, 6, 4))
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_workers_kv_cache_aware_router_eviction(disaggregated_test_root,
+                                                disaggregated_example_root,
+                                                llm_venv, llama_model_root):
+    config_file = os.path.join(disaggregated_test_root,
+                               'test_configs/disagg_config_cache_reuse.yaml')
+    prepare_llama_model(llama_model_root, llm_venv)
+
+    with background_workers(llm_venv, config_file,
+                            2) as (ctx_servers, gen_servers):
+        tester = KvCacheAwareRouterTester(ctx_servers, gen_servers)
+        asyncio.run(tester.test_eviction())
