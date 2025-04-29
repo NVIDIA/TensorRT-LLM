@@ -859,9 +859,6 @@ class PyExecutor:
                             scheduled_batch)
 
                     batch_outputs = self._forward_step(scheduled_batch)
-                    if not isinstance(batch_outputs, dict):
-                        batch_outputs = {'logits': batch_outputs}
-                        print("batch_outputs=",batch_outputs)
 
                     ctx_transmission_reqs = self._send_disagg_ctx_cache(
                         scheduled_batch.context_requests
