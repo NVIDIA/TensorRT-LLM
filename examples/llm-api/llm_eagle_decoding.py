@@ -1,11 +1,12 @@
 ### Generate Text Using Eagle Decoding
+import argparse
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (LLM, BuildConfig, EagleDecodingConfig,
                                  KvCacheConfig, SamplingParams)
 
 
-def main():
+def main(eagle_mode):
     # Sample prompts.
     prompts = [
         "Hello, my name is",
@@ -31,18 +32,27 @@ def main():
     # greedy_sampling,posterior_threshold, use_dynamic_tree and dynamic_tree_max_topK
     # with the EagleDecodingConfig class
 
-    speculative_config = EagleDecodingConfig(
-        speculative_model="yuhuili/EAGLE-Vicuna-7B-v1.3",
-        max_draft_len=63,
-        num_eagle_layers=4,
-        max_non_leaves_per_layer=10,
-                            eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
+    if eagle_mode == 'eagle-1':
+        eagle_args = {
+            'eagle_choices': [[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
                                             [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
                                             [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
                                             [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], \
                                             [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], \
                                             [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]
-    )
+
+        }
+    elif eagle_mode == 'eagle-2':
+        eagle_args = {'use_dynamic_tree': True, 'dynamic_tree_max_topK': 10}
+    else:
+        raise ValueError(f"Invalid eagle mode: {eagle_mode}")
+
+    speculative_config = EagleDecodingConfig(
+        speculative_model="yuhuili/EAGLE-Vicuna-7B-v1.3",
+        max_draft_len=63,
+        num_eagle_layers=4,
+        max_non_leaves_per_layer=10,
+        **eagle_args)
 
     llm = LLM(model=model,
               build_config=build_config,
@@ -60,4 +70,12 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(
+        description="Generate text using Eagle decoding.")
+    parser.add_argument('-eagle_mode',
+                        type=str,
+                        default='eagle-1',
+                        choices=['eagle-1', 'eagle-2'],
+                        help='Eagle decoding mode')
+    args = parser.parse_args()
+    main(args.eagle_mode)
