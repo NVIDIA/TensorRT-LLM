@@ -7,8 +7,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._utils import (mpi_broadcast, str_dtype_to_binding,
-                                 torch_dtype_to_str)
+from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, load_torch_hf_lora
@@ -205,11 +204,13 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
             py_executor.decoder) == TRTLLMDecoder else origin_seq_len
         req = create_dummy_context_requests(max_num_tokens, seq_len, vocab_size)
         req_ids = py_executor.enqueue_requests(req)
-    req_ids = mpi_broadcast(req_ids, root=0)
+    req_ids = py_executor.dist.broadcast(req_ids, root=0)
     py_executor.is_warmup = True
     py_executor.start_worker()
     py_executor.await_responses(req_ids)
     # TODO check why call mpi_barrier() here will hang-on, but call mpi_allgather(0) is fine.
+    # sync all ranks after processing dummy requests. mpi barrier causes hang, so allgather is used.
+    py_executor.dist.allgather(0)
 
     torch_peak_memory = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
 
@@ -254,6 +255,8 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     py_executor.is_warmup = False
     if py_executor.dist.mapping.rank == 0:
         py_executor.shutdown()
+
+    py_executor.dist.allgather(0)
 
     return kv_cache_max_tokens
 
