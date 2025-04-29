@@ -21,7 +21,7 @@ namespace tensorrt_llm::mpi
 
 enum class MpiTag : int
 {
-    kDefault = -1,
+    kDefault = 0,
 
     // DecoderStepAsyncSend
     kDecoderStepNewOutputTokensHost = 0,
