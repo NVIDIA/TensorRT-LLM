@@ -233,20 +233,20 @@ class FusedMoE(nn.Module):
         model_config (ModelConfig): Configuration object for the model.
         enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
 
-    MoE Op:
+    MoE torch custom op:
         cutlass Backend
             In min-latency mode:
             Quant:
                 fp8 block scales (SM90 Hopper only):
                     FusedMoE Op: dynamic quant + gemm1 + swiglu + gemm2 (return tensor list).
-                fp8 qdq, nvfp4
+                fp8 qdq, nvfp4:
                     FusedMoE Op: gemm1 + swiglu + gemm2 (return tensor list).
 
             In max-throughput mode:
             Quant:
                 fp8 block scales (SM90 Hopper only):
                     FusedMoE Op: dynamic quant + scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute (return one tensor)
-                p8 qdq, nvfp4
+                p8 qdq, nvfp4:
                     FusedMoE Op: scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute (return one tensor)
 
         trtllm_gen backend:
@@ -255,22 +255,22 @@ class FusedMoE(nn.Module):
                 FusedMoE Op: routing(topK, etc.) + scatter + gemm1 + swiglu + gemm2 + finalize MoeRoute
 
     FusedMoE module:
-        cutlass Backend  (moe_backend="CUTLASS"):
+        cutlass Backend (moe_backend="CUTLASS"):
             min-latency mode:
                 routing(topK, etc.) + FusedMoE Op
                 equals to: routing(topK, etc.) [+ dynamic quant fp8 qdq | optional dynamic quant nvfp4] + gemm1 + swiglu + gemm2
 
             max-throughput mode:
-                routing(topK, etc.) [+ dynamic quant for fp8 qdq and nvfp4 ] [+ allgather when dp enabled and nvfp4 allgather enabled]  + FusedMoe Op [+ allReduce is self.reduce_results] + reducescatter
-                equals to: dynamic quant + routing(topK, etc.) [+ allgather when dp enabled and nvfp4 allgather disabled] + scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute [+ allReduce is self.reduce_results] + reducescatter
+                routing(topK, etc.) [+ dynamic quant for fp8 qdq and nvfp4 ] [+ fp4_allgather] + FusedMoe Op[no allreduce] + reducescatter, with AttentionDP on
+                equals to: dynamic quant + routing(topK, etc.) [+ fp4_allgather] + scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute [no allreduce] + reducescatter
 
         trtllm_gen backend (moe_backend="TRTLLM"):
             min-latency mode (min_latency_mode flag of forward has no effect when trtllm_gen is used):
-                dynamic quant +  FusedMoe Op
+                dynamic quant + FusedMoe Op
                 equals to: dynamic quant + routing(topK, etc.) + scatter + gemm1 + swiglu + gemm2 + finalize MoeRoute
 
-    In min-latency mode, there is no AllReduce in FusedMoE module by setting `reduce_results=False`, they shall be added in model definition.
-    AttentionDP is turned off for min-latency mode.
+    In min-latency mode, setting `reduce_results=False` disables the AllReduce in the FusedMoE module, so any necessary AllReduce operations must be added explicitly in the model definition.
+    AttentionDP should be turned off for min-latency mode.
     """
 
     def __init__(
@@ -709,7 +709,6 @@ class FusedMoE(nn.Module):
         assert token_selected_experts.dtype == torch.int32
 
         if self.apply_router_weight_on_input:
-            assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
             x = x * token_final_scales.to(x.dtype)
             # TODO: remove this once we have correct fusedmoe kernel ready
             token_final_scales = None
