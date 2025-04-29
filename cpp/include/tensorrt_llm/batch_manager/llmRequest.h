@@ -1035,21 +1035,12 @@ public:
             prepopulatedPromptLen, getPromptLen());
 
         auto const promptLen = getPromptLen();
-        // Add debug log if prepopulatedPromptLen >= promptLen
-        // Prepopulated tokens represent tokens that are already cached in the KV cache
-        // The prompt length represents the total number of tokens that need processing
-        // If prepopulatedPromptLen >= promptLen:
-        // means the KV cache is already populated with more tokens than the total prompt length
-        // This is an invalid state and should be caught
-
-        if (prepopulatedPromptLen >= promptLen)
-        {
-            TLLM_LOG_ERROR("Invalid state: prepopulatedPromptLen (%d) >= promptLen (%d) for request %lu",
-                prepopulatedPromptLen, promptLen, mRequestId);
-        }
 
         // This check is make sure prepopulated prompt length (tokens already cached in KV cache) is less than prompt
         // length (total tokens in the prompt)
+        TLLM_CHECK_WITH_INFO(prepopulatedPromptLen < promptLen,
+            "Invalid state: prepopulatedPromptLen (%d) >= promptLen (%d) for request %lu", prepopulatedPromptLen,
+            promptLen, mRequestId);
         TLLM_CHECK(prepopulatedPromptLen < promptLen);
         mPrepopulatedPromptLen = prepopulatedPromptLen;
 
