@@ -936,6 +936,7 @@ int AttentionOp::mlaGeneration(
 
     if (mUseTllmGen)
     {
+        TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
         TllmGenFmhaRunnerParams tllmRunnerParams;
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
 
@@ -991,10 +992,9 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mScaleQ = mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim))
             / sqrtf((float) (mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim));
 
-        auto const [freeMemory, totalMemory] = tensorrt_llm::common::getDeviceMemoryInfo(false);
         // The kv cache should be based on the maximum headDim of K and V due to paddings.
         int maxHeadDimKv = std::max(tllmRunnerParams.mHeadDimQk, tllmRunnerParams.mHeadDimV);
-        tllmRunnerParams.mNumPagesInMemPool = totalMemory
+        tllmRunnerParams.mNumPagesInMemPool = mTllmGenFMHARunner->getTotalDeviceMemory()
             / (tllmRunnerParams.mNumHeadsKv * tllmRunnerParams.mNumTokensPerPage * maxHeadDimKv * elemSize);
 
         tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
@@ -1010,7 +1010,6 @@ int AttentionOp::mlaGeneration(
                 = reinterpret_cast<float const*>(params.bmm1_scale) + bmm1_scale_offset;
         }
 
-        TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
         mTllmGenFMHARunner->run(tllmRunnerParams);
         sync_check_cuda_error(stream);
     }
