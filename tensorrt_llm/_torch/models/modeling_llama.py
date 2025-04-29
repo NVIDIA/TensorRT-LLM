@@ -140,6 +140,16 @@ class Llama4MoE(nn.Module):
         super().__init__()
         config = model_config.pretrained_config
         self.top_k = top_k
+
+        self.shared_expert = GatedMLP(
+            hidden_size=hidden_size,
+            intermediate_size=shared_expert_intermediate_size,
+            bias=False,
+            dtype=dtype,
+            config=model_config,
+            is_expert=True,
+            is_llama4=True)
+
         self.experts = FusedMoE(
             routing_method=Llama4RenormalizeMoeRoutingMethod(top_k),
             num_experts=num_experts,
@@ -150,16 +160,12 @@ class Llama4MoE(nn.Module):
             False,  # In both low latency and max-throughput scenarios, FusedMoE needs not to do allreduce inside op.
             weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             model_config=model_config,
-            apply_router_weight_on_input=True)
-
-        self.shared_expert = GatedMLP(
-            hidden_size=hidden_size,
-            intermediate_size=shared_expert_intermediate_size,
-            bias=False,
-            dtype=dtype,
-            config=model_config,
-            is_expert=True,
-            is_llama4=True)
+            apply_router_weight_on_input=True,
+            # In Llama4 TP8 EP1 min-latency mode, we fuse the sigmoid score scaling into the FC31 kernel, so
+            # we must use the input scale before the score scaling as the input scale for the MoE layer.
+            # Therefore, pass a reference to the shared expert to the MoE layer so that it can access the input scale
+            # before the score scaling.
+            shared_expert=self.shared_expert)
 
         self.router = Linear(hidden_size,
                              num_experts,
@@ -173,8 +179,11 @@ class Llama4MoE(nn.Module):
         self.aux_stream = aux_stream
 
     def compute_routed_output(self, hidden_states, all_rank_num_tokens,
-                              min_latency_mode, llama4_tp8ep1_min_latency_mode):
-        router_logits = self.router.llama4_router_forward(hidden_states)
+                              min_latency_mode, llama4_tp8ep1_min_latency_mode,
+                              hidden_states_high: Optional[torch.Tensor] = None):
+        # Use high precision hidden states for routing gemm if it is provided.
+        hidden_states_routing = hidden_states_high if hidden_states_high is not None else hidden_states
+        router_logits = self.router.llama4_router_forward(hidden_states_routing)
         routed_output = self.experts(hidden_states, router_logits,
                                      min_latency_mode,
                                      llama4_tp8ep1_min_latency_mode)
@@ -187,7 +196,17 @@ class Llama4MoE(nn.Module):
         final_all_reduce_params: Optional[AllReduceParams] = None,
         min_latency_mode: Optional[bool] = False,
         llama4_tp8ep1_min_latency_mode: Optional[bool] = False,
+        # Optional input for routing gemm if experts and routing gemm require
+        # different precisions for input hidden states.
+        hidden_states_high: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # If we do not use llama4_tp8ep1_min_latency_mode, pass the high-precision hidden states into shared/routed
+        # experts when the hidden_states are in fp8 because the default path does not work with fp8 input.
+        if not llama4_tp8ep1_min_latency_mode and hidden_states.dtype == torch.float8_e4m3fn and hidden_states_high is not None:
+            hidden_states_experts = hidden_states_high
+        else:
+            hidden_states_experts = hidden_states
+
         # Only enable multi-stream for cuda graph since switch stream has extra host overhead
         # This design is mainly for low latency use case. Need to improve for max throughput use case.
         do_multi_stream = torch.cuda.is_current_stream_capturing()
@@ -198,14 +217,14 @@ class Llama4MoE(nn.Module):
             with torch.cuda.stream(self.aux_stream):
                 self.moe_event[0].wait()
                 routed_output = self.compute_routed_output(
-                    hidden_states, all_rank_num_tokens, min_latency_mode,
-                    llama4_tp8ep1_min_latency_mode)
+                    hidden_states_experts, all_rank_num_tokens, min_latency_mode,
+                    llama4_tp8ep1_min_latency_mode, hidden_states_high)
                 self.moe_event[1].record()
             self.moe_event[1].wait()
         else:
             routed_output = self.compute_routed_output(
-                hidden_states, all_rank_num_tokens, min_latency_mode,
-                llama4_tp8ep1_min_latency_mode)
+                hidden_states_experts, all_rank_num_tokens, min_latency_mode,
+                llama4_tp8ep1_min_latency_mode, hidden_states_high)
         if min_latency_mode:
             return [shared_output, *routed_output]
 
@@ -253,9 +272,9 @@ class Llama4DecoderLayer(DecoderLayer):
                                              config, "use_qk_norm", False),
                                          aux_stream=aux_stream)
 
-        is_mlp_layer = (layer_idx + 1) % config.interleave_moe_layer_step != 0
+        self.is_mlp_layer = (layer_idx + 1) % config.interleave_moe_layer_step != 0
 
-        if is_mlp_layer:
+        if self.is_mlp_layer:
             self.feed_forward = GatedMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size_mlp,
@@ -340,6 +359,8 @@ class Llama4DecoderLayer(DecoderLayer):
             **kwargs,
         )
 
+        # Reserved if we need both high-precision and low-precision hidden states.
+        hidden_states_high = None
         if self.fusion_config.PRE_MLP_FUSION and use_fp8_allreduce:
             hidden_states, residual = self.pre_mlp_quant_allreduce(
                 hidden_states,
@@ -362,6 +383,21 @@ class Llama4DecoderLayer(DecoderLayer):
                 AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
             )
             hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
+        elif self.fusion_config.PRE_MOE_FUSION and use_fp8_allreduce:
+            # For pre-MoE all reduce in FP8 mode, we must output two variants of
+            # the tensor: one in high-precision (BF16) and one in FP8.
+            # This is because routing gemm requires BF16 input while shared
+            # expert and routed expert require FP8 input.
+            hidden_states_high, hidden_states, residual = self.pre_mlp_quant_allreduce(
+                hidden_states,
+                [
+                    residual,
+                    self.post_attention_layernorm.weight,
+                    self.feed_forward.shared_expert.gate_up_proj.input_scale,
+                ],
+                self.post_attention_layernorm.variance_epsilon,
+                AllReduceFusionOp.RESIDUAL_RMS_NORM_AND_QUANT_FP8,
+            )
         elif self.fusion_config.PRE_MOE_FUSION or self.fusion_config.PRE_MLP_FUSION:
             hidden_states, residual = self.all_reduce(
                 hidden_states,
@@ -385,15 +421,28 @@ class Llama4DecoderLayer(DecoderLayer):
                 self.fusion_config.POST_MLP_FUSION = False
                 min_latency_mode = False
 
-        hidden_states = self.feed_forward(
-            hidden_states,
-            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-            final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.POST_MOE_FUSION or self.fusion_config.
-                POST_MLP_FUSION or self.mapping.tp_size == 1)),
-            min_latency_mode=min_latency_mode,
-            llama4_tp8ep1_min_latency_mode=llama4_tp8ep1_min_latency_mode,
-        )
+        if self.is_mlp_layer:
+            hidden_states = self.feed_forward(
+                hidden_states,
+                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                final_all_reduce_params=AllReduceParams(enable_allreduce=not (
+                    self.fusion_config.POST_MOE_FUSION or self.fusion_config.
+                    POST_MLP_FUSION or self.mapping.tp_size == 1)),
+                min_latency_mode=min_latency_mode,
+                llama4_tp8ep1_min_latency_mode=llama4_tp8ep1_min_latency_mode,
+            )
+        else:
+            hidden_states = self.feed_forward(
+                hidden_states,
+                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                final_all_reduce_params=AllReduceParams(enable_allreduce=not (
+                    self.fusion_config.POST_MOE_FUSION or self.fusion_config.
+                    POST_MLP_FUSION or self.mapping.tp_size == 1)),
+                min_latency_mode=min_latency_mode,
+                llama4_tp8ep1_min_latency_mode=llama4_tp8ep1_min_latency_mode,
+                hidden_states_high=hidden_states_high,
+            )
+
         if spec_metadata is not None:
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
                                                       hidden_states, residual)
@@ -418,8 +467,8 @@ class Llama4DecoderLayer(DecoderLayer):
         elif (self.fusion_config.POST_MOE_FUSION
               or self.fusion_config.POST_MLP_FUSION
               ) and self.next_layer_layernorm is not None:
-            # fp8 POST_MOE_FUSION case might have illegal memory access issue. Disable it temporarily.
-            if self.fusion_config.POST_MLP_FUSION and use_fp8_allreduce and self.next_attn is not None:
+            if (self.fusion_config.POST_MLP_FUSION or self.fusion_config.POST_MOE_FUSION) \
+                and use_fp8_allreduce and self.next_attn is not None:
                 hidden_states, residual = self.post_quant_allreduce(
                     hidden_states,
                     [

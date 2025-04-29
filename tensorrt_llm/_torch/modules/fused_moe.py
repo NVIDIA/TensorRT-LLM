@@ -15,6 +15,7 @@ from ..model_config import ModelConfig
 from ..utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
                      reswizzle_sf)
 from .linear import TensorParallelMode, load_weight_shard
+from .gated_mlp import GatedMLP
 
 # The declarations aligns with moe_kernels.h
 # pack inputs into int64, e.g. 4 x bf16 input values
@@ -245,6 +246,12 @@ class FusedMoE(nn.Module):
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         apply_router_weight_on_input: bool = False,
+        # The min-latency fused MoE FC13 kernel applies the sigmoid score
+        # scaling to the input, so we must use the input scale before the score
+        # scaling as the input scale for the MoE layer.
+        # Therefore, pass a reference to the shared expert to the MoE layer so that it can access the input scale
+        # before the score scaling.
+        shared_expert: Optional[GatedMLP] = None,
     ):
         from ..distributed import AllReduce
 
@@ -309,6 +316,9 @@ class FusedMoE(nn.Module):
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
+
+        self.shared_expert = shared_expert
+        self.min_latency_quant_scales = None
 
     def setup_quant_scales(self):
         self.quant_scales = None
@@ -586,11 +596,18 @@ class FusedMoE(nn.Module):
     ) -> torch.Tensor:
         # When running tp8ep1 on fp8 128 experts llama4, we use min latency gemv kernels to run moe.
         if llama4_tp8ep1_min_latency_mode:
-            x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                x, self.fc31_input_dequant)
+            # Quantize input if it is not already in fp8.
+            if x.dtype != torch.float8_e4m3fn:
+                x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                    x, self.fc31_input_dequant)
+
+            # If min_latency_input_scale is provided and the input tensor is already in fp8
+            # we should use rescaled quant scales.
+            quant_scales = self.min_latency_quant_scales if self.min_latency_quant_scales is not None and x.dtype == torch.float8_e4m3fn else self.quant_scales
+
             outputs = torch.ops.trtllm.fused_moe_llama4_tp8ep1_min_latency(
                 x, router_logits, self.w3_w1_weight, self.w2_weight,
-                self.quant_scales)
+                quant_scales)
             return outputs
 
         if isinstance(x, Fp4QuantizedTensor):
@@ -612,7 +629,8 @@ class FusedMoE(nn.Module):
         assert token_selected_experts.dtype == torch.int32
 
         if self.apply_router_weight_on_input:
-            assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
+            assert self.routing_method.top_k == 1, "Current workaround only supports top-1 routing"
+            assert x.dtype != torch.float8_e4m3fn, "Current workaround for apply_router_weight_on_input does not support fp8 input"
             x = x * token_final_scales.to(x.dtype)
             # TODO: remove this once we have correct fusedmoe kernel ready
             token_final_scales = None
@@ -952,6 +970,17 @@ class FusedMoE(nn.Module):
                 )
             # Re-setup quant scales after loading weights as the tensors may have been modified.
             self.setup_quant_scales()
+
+        # If the reference to the shared expert is provided, read the pre-score scaling input scale from the shared
+        # expert. This assumes that shared expert is loaded before the MoE layer.
+        if self.shared_expert is not None:
+            pre_score_scaling_input_scale = self.shared_expert.gate_up_proj.input_scale
+            self.min_latency_quant_scales = FusedMoEQuantScalesFP8(
+                fc1_dequant=self.fc31_dequant.data / self.fc31_input_dequant.data * pre_score_scaling_input_scale,
+                fc2_quant=self.fc2_quant,
+                fc2_dequant=self.fc2_dequant,
+                fc1_input_dequant=pre_score_scaling_input_scale,
+            )
 
     def _load_fp8_block_scales_scales(self, weights: Dict):
         all_w2_scales = [
