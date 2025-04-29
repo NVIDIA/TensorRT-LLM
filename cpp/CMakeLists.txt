@@ -373,6 +373,8 @@ print(os.path.dirname(torch.__file__),end='');"
     message(FATAL_ERROR "Torch config Error.")
   endif()
   list(APPEND CMAKE_PREFIX_PATH ${TORCH_DIR})
+  set(USE_SYSTEM_NVTX ON)
+  set(nvtx3_dir ${3RDPARTY_DIR}/NVTX/include)
   find_package(Torch REQUIRED)
 
   message(STATUS "TORCH_CXX_FLAGS: ${TORCH_CXX_FLAGS}")
