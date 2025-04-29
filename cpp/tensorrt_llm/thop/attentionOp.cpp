@@ -293,7 +293,7 @@ public:
             // Current mlaGeneration will using fmha to do attention, so we don't go into enqueueGeneration
             if (op.isMLAEnabled())
             {
-                if (op.mUseFlashMLA == true)
+                if (op.mUseGenFlashMLA == true)
                 {
                     TORCH_CHECK(block_ids_per_seq.has_value());
                     int const* block_ids_per_seq_ptr = static_cast<int*>(block_ids_per_seq->data_ptr());
@@ -454,8 +454,8 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
         int32_t const layer_num = host_kv_cache_pool_mapping.value().size(0);
         op->mIsMLAEnabled = true;
         op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache();
-        // only enable flash mla on sm90 and head_size == 576 and tokens_per_block == 64
-        op->mUseFlashMLA = tensorrt_llm::common::getSMVersion() == 90 && head_size == 576 && tokens_per_block == 64;
+        // only enable flash mla in the generation phase on sm90 and tokens_per_block == 64
+        op->mUseGenFlashMLA = tensorrt_llm::common::getSMVersion() == 90 && tokens_per_block == 64;
         op->mMLAParams = {static_cast<int>(q_lora_rank.value()), static_cast<int>(kv_lora_rank.value()),
             static_cast<int>(qk_nope_head_dim.value()), static_cast<int>(qk_rope_head_dim.value()),
             static_cast<int>(v_head_dim.value()), static_cast<int>(predicted_tokens_per_seq),
