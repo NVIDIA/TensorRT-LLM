@@ -17,7 +17,7 @@ import os
 
 import pytest
 from defs.common import convert_weights, venv_check_call, venv_mpi_check_call
-from defs.conftest import get_device_memory, skip_pre_ada
+from defs.conftest import get_device_memory, skip_post_blackwell, skip_pre_ada
 from defs.trt_test_alternative import check_call
 
 
@@ -617,7 +617,7 @@ def _test_llm_multimodal_general(llm_venv,
     'neva-22b',
     'kosmos-2',
     'video-neva',
-    'Phi-3-vision-128k-instruct',
+    pytest.param('Phi-3-vision-128k-instruct', marks=skip_post_blackwell),
     'Phi-3.5-vision-instruct',
     'Phi-4-multimodal-instruct',
     'Llama-3.2-11B-Vision',

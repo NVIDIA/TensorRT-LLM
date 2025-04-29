@@ -193,7 +193,7 @@ struct BuildDecoderInfoParams
         {
             return true;
         }
-        if (maxQSeqLength > 1)
+        if (maxQSeqLength > 1 && batchSize > 1)
         {
             return true;
         }

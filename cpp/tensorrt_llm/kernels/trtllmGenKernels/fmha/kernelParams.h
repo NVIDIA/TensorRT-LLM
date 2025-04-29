@@ -120,6 +120,10 @@ struct KernelParams
     int32_t mLogNumEltsPerSageAttnBlkV;
     // The sequence lengths for Q and K/V.
     int32_t mMaxSeqLenQ, mMaxSeqLenKv;
+    // The maximum number of CTAs for Q.
+    int32_t mMaxNumCtasQ;
+    // The maximum number of CTAs for K/V.
+    int32_t mMaxNumCtasKv;
     // The maximum number of pages per sequence for paged-kv buffer.
     int32_t mMaxNumPagesPerSeqKv;
     // The number of heads for K/V.
@@ -599,7 +603,8 @@ struct KernelParams
 
     // Setup the kernel parameters.
     template <class FmhaOptions_, class KernelMeta>
-    static KernelParams setKernelParams(FmhaOptions_ const& options, KernelMeta const& kernelMeta)
+    static KernelParams setKernelParams(
+        FmhaOptions_ const& options, KernelMeta const& kernelMeta, int32_t maxNumCtasQ, int32_t maxNumCtasKv)
     {
 
         // Create the return struct.
@@ -737,6 +742,8 @@ struct KernelParams
         params.mAttentionWindowSize = options.mAttentionWindowSize;
         params.mMaxSeqLenQ = options.mMaxSeqLenQ;
         params.mMaxSeqLenKv = options.mMaxSeqLenKv;
+        params.mMaxNumCtasQ = maxNumCtasQ;
+        params.mMaxNumCtasKv = maxNumCtasKv;
         params.mMaxNumPagesPerSeqKv = options.mMaxNumPagesPerSeqKv;
         // TODO: just use mMaxSeqLenQ for number of MTP tokens.
         params.mNumMtpTokens = options.mMaxSeqLenQ;

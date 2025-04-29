@@ -15,7 +15,6 @@
  */
 
 #pragma once
-
 #include <cassert>
 #include <iostream>
 #include <sstream>
@@ -138,6 +137,22 @@ enum class CutlassTileConfigSM100
     CtaShape256x64x128B,
     CtaShape256x128x128B,
     CtaShape256x256x128B,
+};
+
+enum class CutlassTileConfigSM120
+{
+    // Signals that we should run heuristics do choose a config
+    Undefined,
+
+    // Signals that we should run heuristics do choose a config
+    ChooseWithHeuristic,
+
+    CtaShape128x128x128B,
+    CtaShape128x128x64B,
+    CtaShape256x128x64B,
+    CtaShape128x256x64B,
+    CtaShape128x128x256B,
+    CtaShape256x128x128B,
 };
 
 enum class MainloopScheduleType
@@ -387,6 +402,7 @@ struct CutlassGemmConfig
     // config options for sm90
     CutlassTileConfigSM90 tile_config_sm90 = CutlassTileConfigSM90::ChooseWithHeuristic;
     CutlassTileConfigSM100 tile_config_sm100 = CutlassTileConfigSM100::ChooseWithHeuristic;
+    CutlassTileConfigSM120 tile_config_sm120 = CutlassTileConfigSM120::ChooseWithHeuristic;
     MainloopScheduleType mainloop_schedule = MainloopScheduleType::AUTO;
     EpilogueScheduleType epilogue_schedule = EpilogueScheduleType::AUTO;
     ClusterShape cluster_shape = ClusterShape::ClusterShape_1x1x1;
@@ -427,10 +443,21 @@ struct CutlassGemmConfig
     {
     }
 
+    CutlassGemmConfig(CutlassTileConfigSM120 tile_config_sm120, MainloopScheduleType mainloop_schedule,
+        EpilogueScheduleType epilogue_schedule, ClusterShape cluster_shape)
+        : tile_config_sm120(tile_config_sm120)
+        , mainloop_schedule(mainloop_schedule)
+        , epilogue_schedule(epilogue_schedule)
+        , cluster_shape(cluster_shape)
+        , sm_version(120)
+        , is_tma_warp_specialized(true)
+    {
+    }
+
     int getTileConfigAsInt() const
     {
         if (sm_version == 120)
-            return (int) tile_config_sm80;
+            return (int) tile_config_sm120;
         if (sm_version >= 100)
             return (int) tile_config_sm100;
         if (sm_version == 90)
@@ -445,7 +472,7 @@ struct CutlassGemmConfig
     {
         std::stringstream tactic;
         tactic << "Cutlass GEMM Tactic";
-        if (is_tma_warp_specialized && getTileConfigAsInt() != (int) CutlassTileConfigSM90::ChooseWithHeuristic)
+        if (is_tma_warp_specialized)
         {
             assert(sm_version >= 90 && "Invalid cutlass GEMM config");
             tactic << "\n\tstyle=TMA Warp Specialized"
