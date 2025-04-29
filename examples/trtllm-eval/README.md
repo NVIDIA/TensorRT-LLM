@@ -1,8 +1,8 @@
 # Accuracy Evaluation Tool `trtllm-eval`
 
-We provide a CLI tool `trtllm-eval` for accuracy evaluation, which shares the core evaluation logics with the [accuracy test suite](../../tests/integration/defs/accuracy) of TensorRT-LLM.
+We provide a CLI tool `trtllm-eval` for evaluating model accuracy. It shares the core evaluation logics with the [accuracy test suite](../../tests/integration/defs/accuracy) of TensorRT-LLM.
 
-`trtllm-eval` is built on the offline API -- [LLM API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html). It provides developers a unified entrypoint for accuracy evaluation. Compared with the online API [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html), offline API provides clearer error messages and eases the debugging workflow.
+`trtllm-eval` is built on the offline API -- [LLM API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html). It provides developers a unified entrypoint for accuracy evaluation. Compared with the online API [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html), offline API provides clearer error messages and simplifies the debugging workflow.
 
 `trtllm-eval` follows the CLI interface of [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html).
 

@@ -1,12 +1,10 @@
 # Accuracy Test Suite
 
-This folder maintains an accuracy test suite of TensorRT-LLM. Our CI/CD workflow and QA cycles run these tests to protect the model implementations from accuracy regressions.
+This folder contains an accuracy test suite for TensorRT-LLM. Our CI/CD workflow and QA cycles run these tests to protect the model implementations from accuracy regressions.
 
-This test suite employs a *hypothesis testing* methodology, which decides the evaluation sample volume and accuracy thresholds based on objective statistics. This prevents the thresholds from being neither
-* too close to the reference (so the tests *intermittently fail* for reasonable accuracy variance) nor
-* too far away from the reference (so the tests *always pass* even accuracy regresses).
+This test suite employs a *hypothesis testing* methodology that determines the evaluation sample volume and accuracy thresholds based on objective statistics. This approach prevents the thresholds from being either too close to the reference (which could lead to intermittent failures due to normal accuracy fluctuations) or too far from the reference (which could result in tests always passing even if an accuracy regression occurs).
 
-In addition, most tests are based on the offline API -- [LLM API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html). Hence, the tests can easily leverage inflight fused batching and other performance optimizations, and thus run efficiently. Compared with the online API [trtllm-serve](https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html), offline API provides clearer error messages and eases the debugging workflow.
+In addition, most tests are based on the offline API -- [LLM API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html). This allows the tests to leverage in-flight fused batching and other performance optimizations efficiently. Compared to the online API [trtllm-serve](https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html), the offline API provides clearer error messages and simplifies the debugging workflow.
 
 This test suite is organized as following:
 * [accuracy_core.py](./accuracy_core.py) provides the test harness, including hypothesis testing logics, evaluation task configurations, and common utilities.
@@ -16,7 +14,7 @@ This test suite is organized as following:
 * [references](./references) registers the reference accuracies for each task, each model and each specification (e.g., data type, quantization).
 * [scripts](./scripts) provides some utility scripts that may help setup accuracy tests.
 
-Currently, the below tasks are supported.
+The following tasks are currently supported:
 
 | Dataset           | Task                | Metric     | LLM API | CLI flow |
 |:-----------------:|:-------------------:|:----------:|:-------:|:--------:|
@@ -38,11 +36,11 @@ New accuracy tests are strongly recommended to be added to this test suite, in p
 
 ## Background: Why This Test Suite?
 
-It probably seems simple to setup an accuracy test:
+It probably seems simple to set up an accuracy test:
 * Decide the dataset and task; if the dataset is large, optionally decide the sample volume of a subset.
 * Evaluate the model on the subset and obtain a reference accuracy.
-* Setup a threshold slightly lower than the reference accuracy.
-* Implement the testing code that automatically runs the same evaluation and compares the resulted accuracy to the threshold.
+* Set up a threshold slightly lower than the reference accuracy.
+* Implement the testing code that automatically runs the evaluation and compares the resulting accuracy to the threshold.
     * If the evaluated accuracy is higher than the threshold, the test passes.
     * If the evaluated accuracy is lower than the threshold, the test fails.
 
@@ -50,29 +48,29 @@ Once implemented, the test can be run in the CI/CD workflow or QA cycles, to pro
 
 The above steps are quite intuitive except for a seemingly trivial question: How to decide the sample volume and threshold?
 
-According to our engineering experience, a model's accuracy can slightly vary because it *reasonably* executes on different kernels (e.g., different batch sizes, fusion patterns, kernel implementations, hardwares). That means, a model's accuracy can slightly drop but it doesn't mean accuracy regression. Another engineering insight is that increasing the sample volume can reduce the evaluated accuracy variance. This is also intuitive because the evaluated accuracy is typically averaged over sample scores, and sampled average score’s variance is inversely proportional to the sample volume ([central limit theorem](https://en.wikipedia.org/wiki/Central_limit_theorem)).
+According to our engineering experience, a model's accuracy can slightly vary because it *reasonably* executes on different kernels (e.g., different batch sizes, fusion patterns, kernel implementations, hardware). That means, a model's accuracy can slightly drop but it doesn't mean accuracy regression. Another engineering insight is that increasing the sample volume can reduce the evaluated accuracy variance. This is also intuitive because the evaluated accuracy is typically averaged over sample scores, and sampled average score's variance is inversely proportional to the sample volume ([central limit theorem](https://en.wikipedia.org/wiki/Central_limit_theorem)).
 
 Thus, it becomes tricky when deciding the sample volume and threshold:
 * Higher sample volume reduces the evaluated accuracy variance.
 * Lower sample volume reduces the test cost.
-* Higher threshold makes the test more stict, so that accuracy regression can be easily detected.
+* Higher threshold makes the test more strict, so that accuracy regression can be easily detected.
 * Lower threshold makes the test more robust, so that reasonable accuracy variance can be ignored.
 
-From the statistics view, we are balancing several conflicting objectives:
+From a statistical perspective, we aim to balance several conflicting objectives:
 * Minimize sample volume $n$.
 * Minimize minimum detectable effect $\theta$ (the minimum accuracy difference regarded as a regression).
 * Minimize false positive rate $\alpha$ (the probability that the test fails but accuracy does not regress).
 * Minimize false negative rate $\beta$ (the probability that the test passes but accuracy regresses).
 
-Increasing $n$ allows lower $\theta$, $\alpha$ and $\beta$. Given $n$ and $\theta$, threshold setting is trading off $\alpha$ and $\beta$. Hypothesis testing provides a rigorous solution to the balance.
+Increasing $n$ allows for lower values of $\theta$, $\alpha$, and $\beta$. Given $n$ and $\theta$, the threshold setting involves a trade-off between $\alpha$ and $\beta$. Hypothesis testing provides a rigorous framework for this balance.
 
-Within this solution, we first decide $\theta$, $\alpha$ and $\beta$, and then compute the least required sample volume and threshold. To clarify, the three parameters $\theta$, $\alpha$ and $\beta$ don't increase the complexity to add a new test. Existing evaluation tasks have provide these parameters, and new tasks can use default values: $\theta = 2$ (scoring from 0 to 100), $\alpha = 0.05$ and $\beta = 0.2$.
+Within this framework, we first determine $\theta$, $\alpha$, and $\beta$, and then compute the minimum required sample volume along with the corresponding threshold. Note that incorporating these three parameters does not increase the complexity of adding a new test. Existing evaluation tasks provide these parameters, and new tasks can adopt the default values: $\theta = 3$ (scoring from 0 to 100), $\alpha = 0.05$, and $\beta = 0.2$.
 
 In addition to the hypothesis testing framework, this accuracy test suite provides:
 * Test harness, which encapsulates common test logics.
-    * The new test functions are simplified in relative to the legacy style.
+    * The new test functions are simplified compared to the legacy style.
 * Centralized accuracy reference registration.
-    * The accuracy references are registered in YAML files in [references](./references), in stead of being hard-coded in testing code.
+    * The accuracy references are registered in YAML files in [references](./references), instead of being hard-coded in the testing code.
     * The accuracy references are categorized by tasks, models and accuracy specifications, which allows fine-grained management.
 * Performant evaluation.
     * The test harness leverages our own inference optimizations, which accelerates the accuracy evaluation.
@@ -88,7 +86,7 @@ Each test case aims to evaluate the accuracy of a model with some accuracy speci
 
 #### Evaluation Tasks
 
-Given an existing task, $\theta$, $\alpha$, $\beta$ and $n$ are all configured. For example, in [accuracy_core.py](./accuracy_core.py) the MMLU task is defined as following:
+Given an existing task, $\theta$, $\alpha$, $\beta$ and $n$ are all configured. For example, in [accuracy_core.py](./accuracy_core.py) the MMLU task is defined as follows:
 
 ```python
 class MMLU(AccuracyTask):
@@ -125,15 +123,15 @@ meta-llama/Llama-3.1-8B-Instruct:
 
 The first item is the default accuracy specification (i.e., using original Hugging Face model data type and no quantization), and the reference accuracy is 68.17. The second item is an accuracy specification with FP8 GEMM quantization, with a slightly lower reference accuracy 67.93. The third item is a specification with FP8 GEMM and KV cache quantization, with a further slightly lower reference accuracy 67.87.
 
-Model data type and quantization decide the precision in model computation, so accuracy differences can be *justified* if different data types or quantizations are used. Hence, they are the most typical components in accuracy specifications. Please see other categories of accuracy specifications documented in `AccuracyTask.get_num_samples_and_threshold` in [accuracy_core.py](./accuracy_core.py). Note that we exclude most inference features even like parallelsm, because theoretically they should not affect model accuracies. Think from the opposite perspective, if enabling tensor parallelsm results in statistically significant accuracy loss, we might need to check whether some accuracy bugs exist.
+Model data type and quantization decide the precision in model computation, so accuracy differences can be *justified* if different data types or quantizations are used. Hence, they are the most typical components in accuracy specifications. Please see other categories of accuracy specifications documented in `AccuracyTask.get_num_samples_and_threshold` in [accuracy_core.py](./accuracy_core.py). Note that we exclude most inference features such as parallelism, because theoretically they should not affect model accuracy. Think from the opposite perspective, if enabling tensor parallelism results in statistically significant accuracy loss, we might need to check whether some accuracy bugs exist.
 
-A direct implication is that multiple test cases with different features may share a same accuracy reference. This is by design. For example, we should expect a test case with tensor parallelim has very close accuracies to its single-gpu counterpart.
+A direct implication is that multiple test cases with different features may share the same accuracy reference. This is by design. For example, we should expect a test case with tensor parallelism to have very similar accuracy to its single-GPU counterpart.
 
 #### Testing Logic
 
 As aforementioned, each test case evaluates the accuracy of a model with some specifications by running one or multiple tasks.
 
-For each task, it obtains the parameters $\theta$, $\alpha$, $\beta$, $\sigma$ and $n$ from the task configuration, and looks for the reference accuracy from the YAML files via task, model and accuracy specifications. Thus, the threshold can be computed (See formulas in [Hypothesis Testing Methodology](#hypothesis-testing-methodology) or function `compute_threshold` in [accuracy_core.py](./accuracy_core.py)). The test case runs the model on the task (a subset of volume $n$) and get the evaluated accuracy.
+For each task, it obtains the parameters $\theta$, $\alpha$, $\beta$, $\sigma$ and $n$ from the task configuration, and looks for the reference accuracy from the YAML files via task, model and accuracy specifications. Thus, the threshold can be computed (See formulas in [Hypothesis Testing Methodology](#hypothesis-testing-methodology) or function `compute_threshold` in [accuracy_core.py](./accuracy_core.py)). The test case runs the model on the task (a subset of volume $n$) and obtains the evaluated accuracy.
 
 If all the evaluated accuracies are equal to or higher than the corresponding thresholds, the test passes.
 
@@ -163,7 +161,7 @@ Please inherit `LlmapiAccuracyTestHarness` when defining a new test class. At th
 
 At the test method level, the test code should enable the tested features when creating the LLM instance, and then create and run task instances one by one. Existing tasks can be imported from [accuracy_core.py](./accuracy_core.py).
 
-The last step is registering the accuracy reference. If the new test case shares the task, model and accuracy specifications with existing cases, then the accuracy reference has been already registered, and this step can be skipped.
+The last step is registering the accuracy reference. If the new test case shares the task, model, and accuracy specifications with existing cases, then the accuracy reference has already been registered, and this step can be skipped.
 
 Otherwise, run the new test case without reference by `TRTLLM_ACCURACY_NO_REFERENCE=1`. For example,
 
@@ -277,14 +275,14 @@ The new task class is all set. Use it in [test_llm_api.py](./test_llm_api.py) or
 
 For a given dataset and model, the evaluated scores can be viewed as a population with mean $\mu$ and variance $\sigma$. Note that the distribution is not necessarily to be a normal distribution.
 
-When we finish implementing a model, we need to setup an accuracy *reference*. By evaluating the model on a subset of $n$ samples, we practically draw $n$ scores $`x_1, x_2, \dots, x_n`$ from the population, and thus we can compute and record the sample average $`\bar{x} = \frac{1}{n} \sum_{i} x_i`$.
+When we finish implementing a model, we need to set up an accuracy *reference*. By evaluating the model on a subset of $n$ samples, we practically draw $n$ scores $`x_1, x_2, \dots, x_n`$ from the population, and thus we can compute and record the sample average $`\bar{x} = \frac{1}{n} \sum_{i} x_i`$.
 
-When testing if there is an accuracy *regression*, we once again evaluate the model on $n$ samples, resulting in $`x'_1, x'_2, \dots, x'_n`$, and also sample average $`\bar{x'} = \frac{1}{n} \sum_{i} x'_i`$. The question is that, are these $n$ samples drawn from the same distribution to the referenced one? This can be formulated as a hypothesis testing problem:
+When testing if there is an accuracy *regression*, we once again evaluate the model on $n$ samples, resulting in $`x'_1, x'_2, \dots, x'_n`$, and also sample average $`\bar{x'} = \frac{1}{n} \sum_{i} x'_i`$. The question is, are these $n$ samples drawn from the same distribution as the reference? This can be formulated as a hypothesis testing problem:
 
-* Null Hypothesis ($H_0$): $`x'_1, x'_2, \dots, x'_n`$ are drawn from the same distribution to the reference.
-* Alternative Hypothesis ($H_1$): $`x'_1, x'_2, \dots, x'_n`$ are from a different distribution from the reference.
+* Null Hypothesis ($H_0$): $`x'_1, x'_2, \dots, x'_n`$ are drawn from the same distribution as the reference.
+* Alternative Hypothesis ($H_1$): $`x'_1, x'_2, \dots, x'_n`$ are drawn from a different distribution than the reference.
 
-Since we care about accuracy regression only, so it should be a one-tailed hypothesis testing problem:
+Since we are only concerned with detecting accuracy regression, this is formulated as a one-tailed hypothesis testing problem:
 
 * Null Hypothesis ($H_0$): $`x'_1, x'_2, \dots, x'_n`$ are drawn from a distribution with a mean equal to or higher than the reference.
 * Alternative Hypothesis ($H_1$): $`x'_1, x'_2, \dots, x'_n`$ are drawn from a distribution with a mean lower than the reference.
@@ -306,7 +304,7 @@ $$
 \end{equation*}
 $$
 
-In practive, we setup a $\alpha$ (e.g., 0.05) and then compute the threshold $\gamma$:
+In practice, we set up an $\alpha$ (e.g., 0.05) and then compute the threshold $\gamma$:
 
 $$
 \begin{equation*}
@@ -329,7 +327,7 @@ $$
 \end{equation*}
 $$
 
-In practice, we setup a $\beta$ (e.g., 0.2) and then compute $\theta$:
+In practice, we set up a $\beta$ (e.g., 0.2) and then compute $\theta$:
 
 $$
 \begin{equation*}
