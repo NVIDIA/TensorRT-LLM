@@ -6,6 +6,8 @@ from tqdm import tqdm
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (BaseModelOutput,
                                            BaseModelOutputWithPooling)
+from transformers.modeling_utils import (get_parameter_device,
+                                         get_parameter_dtype)
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 from transformers.models.siglip.modeling_siglip import (
     SiglipMultiheadAttentionPoolingHead, SiglipVisionConfig,
@@ -13,17 +15,12 @@ from transformers.models.siglip.modeling_siglip import (
 
 from ..attention_backend.interface import (AttentionMetadata,
                                            PredefinedAttentionMask)
+from ..attention_backend.utils import get_attention_backend
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.mlp import MLP
-from .modeling_utils import register_auto_model
-"""
-NOTE:
-Configuration Class from HF to TRT-LLM ModelConfig naming convention:
-In this file, all `config`s or `self.config`s are HF Configs
-all `model_config`s or `self.model_config`s are TRT-LLM ModelConfig
-At the same time, the `model_config.pretrained_config` is also HF Config as this is defined by the ModelConfig class
-"""
+from .modeling_utils import (duplicate_kv_weight, missing_layer_parameter,
+                             register_auto_model, rename_weights_with_regex)
 
 
 class SiglipAttention(Attention):
@@ -71,22 +68,15 @@ class SiglipEncoderLayer(nn.Module):
         self.layer_norm2 = nn.LayerNorm(self.embed_dim,
                                         eps=config.layer_norm_eps)
 
-    # Ignore copy
     def forward(
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> Tuple[torch.FloatTensor]:
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`):
-                Input to the layer of shape `(batch, seq_len, embed_dim)`.
-        """
         residual = hidden_states
 
         hidden_states = self.layer_norm1(hidden_states)
 
-        # FIXME: temporary config for AttentionMetadata and Mask
         attention_mask = PredefinedAttentionMask.FULL
         hidden_states = self.self_attn(position_ids=None,
                                        hidden_states=hidden_states,
@@ -106,13 +96,6 @@ class SiglipEncoderLayer(nn.Module):
 
 
 class SiglipEncoder(nn.Module):
-    """
-    Transformer encoder consisting of `config.num_hidden_layers` self attention layers. Each layer is a
-    [`SiglipEncoderLayer`].
-
-    Args:
-        config: SiglipConfig
-    """
 
     def __init__(self, model_config: ModelConfig[SiglipVisionConfig]):
         super().__init__()
@@ -123,33 +106,12 @@ class SiglipEncoder(nn.Module):
             for layer_idx in range(config.num_hidden_layers)
         ])
 
-    # Ignore copy
     def forward(
         self,
         inputs_embeds,
         attn_metadata: AttentionMetadata,
         output_hidden_states: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutput]:
-        r"""
-        Args:
-            inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
-                Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation.
-                This is useful if you want more control over how to convert `input_ids` indices into associated vectors
-                than the model's internal embedding lookup matrix.
-            attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
-
-                - 1 for tokens that are **not masked**,
-                - 0 for tokens that are **masked**.
-
-                [What are attention masks?](../glossary#attention-mask)
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-            output_hidden_states (`bool`, *optional*):
-                Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors
-                for more detail.
-        """
         output_hidden_states = (output_hidden_states
                                 if output_hidden_states is not None else
                                 self.config.output_hidden_states)
@@ -160,16 +122,10 @@ class SiglipEncoder(nn.Module):
         for encoder_layer in self.layers:
             if output_hidden_states:
                 # hidden_states is (batch_size * seq_len, embed_dim) because TRT-LLM Attention is applied to flattened tokens
-                seq_len = (
-                    self.config.image_size // self.config.patch_size
-                )**2  # the "seq_len" is fixed, it is the number of patches
-                batch_size = hidden_states.shape[0] // seq_len
                 # we want the output shape align with HF output shape (batch_size, seq_len, embed_dim)
                 encoder_states = encoder_states + (hidden_states.view(
-                    batch_size, seq_len, -1), )
-                print(
-                    f"hidden_states is added with shape: {hidden_states.view(batch_size, seq_len, -1).shape}, batch_size: {batch_size}, seq_len: {seq_len}"
-                )
+                    attn_metadata.seq_lens.shape[0], attn_metadata.seq_lens[0],
+                    -1), )
             layer_outputs = encoder_layer(
                 hidden_states,
                 attn_metadata=attn_metadata,
@@ -179,10 +135,9 @@ class SiglipEncoder(nn.Module):
 
         if output_hidden_states:
             # same as above
-            seq_len = (self.config.image_size // self.config.patch_size)**2
-            batch_size = hidden_states.shape[0] // seq_len
             encoder_states = encoder_states + (hidden_states.view(
-                batch_size, seq_len, -1), )
+                attn_metadata.seq_lens.shape[0], attn_metadata.seq_lens[0],
+                -1), )
 
         return BaseModelOutput(last_hidden_state=hidden_states,
                                hidden_states=encoder_states)
@@ -211,34 +166,22 @@ class SiglipVisionTransformer(nn.Module):
         output_hidden_states: Optional[bool] = None,
         interpolate_pos_encoding: Optional[bool] = False,
     ) -> BaseModelOutputWithPooling:
-        r"""
-        Args:
-            pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`):
-                Pixel values.
-            attn_metadata (`AttentionMetadata`):
-                Attention metadata.
-        """
         output_hidden_states = (output_hidden_states
                                 if output_hidden_states is not None else
                                 self.config.output_hidden_states)
 
         hidden_states = self.embeddings(
             pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
-        print(f"hidden_states: {hidden_states.shape}")
         # reshape hidden_states to (batch_size * seq_len, embed_dim)
-        # TODO: check the overhead here because of the reshape
         hidden_states = hidden_states.reshape(
             hidden_states.shape[0] * hidden_states.shape[1],
             hidden_states.shape[2])
-        print(f"after reshape hidden_states: {hidden_states.shape}")
-        print(f"attn_metadata: {attn_metadata}")
 
         encoder_outputs: BaseModelOutput = self.encoder(
             inputs_embeds=hidden_states,
             attn_metadata=attn_metadata,
             output_hidden_states=output_hidden_states,
         )
-        print(f"encoder_outputs: {encoder_outputs}")
         last_hidden_state = encoder_outputs.last_hidden_state
         last_hidden_state = self.post_layernorm(last_hidden_state)
 
@@ -259,11 +202,39 @@ class SiglipVisionModel(nn.Module):
         self.config = model_config.pretrained_config
         self.vision_model = SiglipVisionTransformer(model_config)
         self.model_config = model_config
+        self.metadata_cls = get_attention_backend(
+            model_config.attn_backend).Metadata
+
+    def prepare_attn_metadata(self, batch_size):
+        """
+        To simplify the usage of the model, this function aims to fill the metadata for Attention
+        Call this function before forward pass
+        """
+        seq_len = (self.config.image_size // self.config.patch_size)**2
+        request_ids = list(range(1, batch_size + 1))
+        prompt_lens = [seq_len] * batch_size
+        attn_metadata = self.metadata_cls(
+            seq_lens=torch.tensor([seq_len] * batch_size, dtype=torch.int),
+            num_contexts=batch_size,
+            max_num_requests=batch_size,
+            max_num_tokens=seq_len * batch_size,
+            kv_cache_manager=None,
+            request_ids=request_ids,
+            prompt_lens=prompt_lens,
+        )
+        attn_metadata.max_seq_len = seq_len * batch_size
+        attn_metadata.prepare()
+        return attn_metadata
 
     @property
     def dtype(self):
-        return self.config.torch_dtype
+        return get_parameter_dtype(self)
 
+    @property
+    def device(self):
+        return get_parameter_device(self)
+
+    @torch.inference_mode()
     def forward(self,
                 pixel_values,
                 attn_metadata: AttentionMetadata,
@@ -272,13 +243,6 @@ class SiglipVisionModel(nn.Module):
                                  output_hidden_states)
 
     def load_weights(self, weights: Dict):
-        # FIXME: Temporary import
-        from .modeling_utils import (duplicate_kv_weight,
-                                     missing_layer_parameter,
-                                     rename_weights_with_regex)
-
-        # FIXME: Temporary import
-
         pattern_mapping = {
             r'(.*?)out_proj(.*)': r'\1o_proj\2',
             r'(.*?)fc1(.*)': r'\1up_proj\2',
@@ -312,7 +276,6 @@ class SiglipVisionModel(nn.Module):
                 # Skip if parameter belongs to a missing layer
                 if missing_layer_parameter(name, self):
                     continue
-                print(f"loading {name}")
 
                 names = name.split('.')
                 if names[-1] in params_map:
@@ -332,16 +295,11 @@ class SiglipVisionModel(nn.Module):
                             }
                         module_weights.append(fw)
                     module.load_weights(weights=module_weights)
-                    print(
-                        f"loaded {name}: {[w_dic.keys() for w_dic in module_weights]}"
-                    )
                 else:
                     module_weights = filter_weights(name, weights)
-                    print(f"module_weights: {module_weights.keys()}")
                     if hasattr(module, 'load_weights'):
                         module.load_weights(weights=[module_weights])
                     else:
                         for n, p in module._parameters.items():
                             if p is not None:
                                 p.data.copy_(module_weights[n][:])
-                    print(f"loaded {name}: {module_weights.keys()}")
