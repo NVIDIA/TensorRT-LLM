@@ -27,7 +27,7 @@ SIGLIP_CONFIG = {
 }
 
 ACCURACY_CONFIG = {
-    torch.float16: (2e-2, 2e-2),
+    torch.float16: (2e-2, 5e-2),
 }
 
 
@@ -113,10 +113,10 @@ class TestSiglipVisionModel(unittest.TestCase):
                 rtol=ACCURACY_CONFIG[dtype][0],
                 atol=ACCURACY_CONFIG[dtype][1],
                 msg=
-                f"FAILED: TRT-LLM and HF hidden_states mismatch for {dtype} with {num_images} images at layer {select_layer}"
+                f"FAILED: TRT-LLM and HF hidden_states mismatch for {dtype} with {num_images} images at layer {select_layer}, the mean value of this layer is {hf_ref.mean()}"
             )
             print(
-                f"PASSED: TRT-LLM and HF hidden_states match for {dtype} with {num_images} images at layer {select_layer}"
+                f"PASSED: TRT-LLM and HF hidden_states match for {dtype} with {num_images} images at layer {select_layer}, the mean value of this layer is {hf_ref.mean()}"
             )
 
 

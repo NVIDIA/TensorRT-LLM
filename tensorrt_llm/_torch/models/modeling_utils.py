@@ -669,9 +669,6 @@ def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
         # Check each pattern for a match
         for pattern, replacement in pattern_mapping.items():
             if re.match(pattern, key):
-                print(
-                    f"matched {key} with {pattern}, replacing with {replacement}"
-                )
                 # Create the new key by applying the regex replacement
                 new_key = re.sub(pattern, replacement, key)
                 # Store the weight with the new key

@@ -12,7 +12,9 @@ from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
+from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_clip import CLIPVisionModel
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import ModelConfig, register_auto_model
 
@@ -25,10 +27,16 @@ class LlavaNextInputProcessor(InputProcessor):
                                                        use_fast=True)
         self.model_config = model_config
 
-        model = LlavaNextForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=model_config.text_config.torch_dtype)
         self.device = 'cuda'
-        self.vision_tower = model.vision_tower.vision_model.to(self.device)
+        model = LlavaNextForConditionalGeneration.from_pretrained(
+            model_path,
+            torch_dtype=model_config.text_config.torch_dtype).to(self.device)
+        vision_model_config = ModelConfig(
+            pretrained_config=model_config.vision_config, attn_backend="TRTLLM")
+        self.vision_tower = CLIPVisionModel(vision_model_config).to(
+            self.device).to(model.dtype)
+        self.vision_tower.load_weights(model.vision_tower.state_dict())
+
         self.mm_projector = model.multi_modal_projector.to(self.device)
 
     @nvtx_range("[Vision] preprocess")
@@ -44,7 +52,10 @@ class LlavaNextInputProcessor(InputProcessor):
 
     @nvtx_range("[Vision] process")
     def _process(self, pixel_values):
+        attn_metadata = self.vision_tower.prepare_attn_metadata(
+            pixel_values.shape[0])
         image_features = self.vision_tower(pixel_values,
+                                           attn_metadata=attn_metadata,
                                            output_hidden_states=True)
         selected_image_feature = image_features.hidden_states[-2][:, 1:]
         image_features = self.mm_projector(selected_image_feature)
