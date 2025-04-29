@@ -627,7 +627,6 @@ class PyTorchModelEngine(ModelEngine):
                 spec_resource_manager=spec_resource_manager)
 
         if self.spec_metadata is not None:
-            self.spec_metadata.mtp_hidden_states_manager = spec_resource_manager
             return self.spec_metadata
         self.spec_metadata = get_spec_metadata(
             self.spec_config,
