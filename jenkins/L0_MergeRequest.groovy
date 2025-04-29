@@ -450,6 +450,12 @@ def getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl) {
 }
 
 def getMergeRequestChangedFileList(pipeline, globalVars) {
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("Force set changed file list to empty list.")
+        return []
+    }
+
     def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
 
     if (globalVars[CACHED_CHANGED_FILE_LIST] != null) {
@@ -473,6 +479,11 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
 
 def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
     def autoTriggerTagList = []
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("Force set auto trigger tags to empty list.")
+        return autoTriggerTagList
+    }
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
     if (!changedFileList || changedFileList.isEmpty()) {
         return autoTriggerTagList
