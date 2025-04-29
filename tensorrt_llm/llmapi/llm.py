@@ -320,7 +320,6 @@ class LLM:
                 mm_processor_kwargs=inputs.get("mm_processor_kwargs"))
 
         query_token_ids = None
-        prompt_tuning_config = None
         multimodal_embedding = None
         mrope_config = None
         if "prompt_token_ids" in inputs:
@@ -335,10 +334,6 @@ class LLM:
             if queries is not None:
                 query_token_ids, _ = self.input_processor(
                     queries, sampling_params)
-            if (extra_processed_inputs is not None
-                    and 'prompt_tuning_config' in extra_processed_inputs):
-                prompt_tuning_config = extra_processed_inputs.get(
-                    'prompt_tuning_config')
             if (extra_processed_inputs is not None
                     and 'mm_embedding' in extra_processed_inputs):
                 multimodal_embedding = extra_processed_inputs.get(
@@ -365,7 +360,6 @@ class LLM:
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
             streaming=streaming,
-            prompt_tuning_config=prompt_tuning_config,
             multimodal_embedding=multimodal_embedding,
             mrope_config=mrope_config,
             kv_cache_retention_config=kv_cache_retention_config,

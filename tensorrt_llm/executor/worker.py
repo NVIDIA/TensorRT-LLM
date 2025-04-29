@@ -345,9 +345,6 @@ class ExecutorBindingsWorker(GenerationExecutor):
             pa_length = prompt_tuning_config.embedding_table.size(0)
             prompt_token_ids = list(range(
                 vocab_size, vocab_size + pa_length)) + prompt_token_ids
-        elif request.prompt_tuning_config is not None:
-            prompt_tuning_config = tllm.PromptTuningConfig(
-                request.prompt_tuning_config[0])
 
         if request.mrope_config is not None:
             mrope_config = tllm.MropeConfig(**request.mrope_config)
