@@ -370,12 +370,17 @@ class CanaryTokenizer:
 class CanaryEncoder:
     def __init__(self,engine_dir):
         engine_path=os.path.join(engine_dir, 'encoder/encoder.plan' )
+        self.encoder_config=json.load(open(os.path.join(engine_dir, 'encoder/config.json'),'r'))
         logger.info(f"Loading engine from {engine_path}")
         with open(engine_path, "rb") as f:
             engine_buffer = f.read()
         logger.info(f"Creating session from engine {engine_path}")
         self.session_conformer = Session.from_serialized_engine(engine_buffer)
         self.device = torch.device("cuda:0") if torch.cuda.is_available() else "cpu"
+        if self.encoder_config.get('projection', False):
+            self.enc_dec_proj = torch.load(os.path.join(engine_dir, 'encoder/enc_dec_proj.pt')).to(self.device)
+        else:
+            self.enc_dec_proj = None
         
 
 
@@ -412,15 +417,15 @@ class CanaryEncoder:
 
         assert is_ok, "Runtime execution failed for Conformer Encoder session"
         stream.synchronize()
-
         enc_mask, emb_len=self.get_masked_emb(enc_outputs)
-
+        if self.enc_dec_proj is not None:
+            enc_mask = self.enc_dec_proj(enc_mask.to(dtype=torch.float32))
         return enc_mask, emb_len
 
 
 class CanaryDecoding:
 
-    def __init__(self, engine_dir, runtime_mapping, tokenizer, debug_mode=False):
+    def __init__(self, engine_dir, runtime_mapping, tokenizer, debug_mode=False, device="cuda:0"):
         self.tokenizer = tokenizer
         self.decoder_config = read_config('decoder', engine_dir)
         self.prompt_format = self.decoder_config['prompt_format']
@@ -430,6 +435,10 @@ class CanaryDecoding:
         self.dtype=str_dtype_to_torch(self.decoder_config['dtype'])
         self.max_seq_len = self.decoder_config['max_seq_len']
         self.max_input_len = self.decoder_config['max_input_len']
+        self.device = device
+
+
+        
 
 
     @staticmethod
@@ -480,9 +489,7 @@ class CanaryDecoding:
                  max_new_tokens,
                  num_beams=1):
         
-        
-        encoder_outputs=encoder_outputs.to(dtype=self.dtype)
-
+        encoder_outputs = encoder_outputs.to(dtype=self.dtype)
         batch_size = decoder_input_ids.shape[0]
         
         encoder_max_input_length = encoder_outputs.shape[1]
@@ -597,7 +604,7 @@ class CanaryTRTLLM(object):
             self.encoder = CanaryEncoder(engine_dir)
             self.decoder = CanaryDecoding(engine_dir,
                                       runtime_mapping, tokenizer=self.tokenizer,
-                                      debug_mode=debug_mode)
+                                      debug_mode=debug_mode, device=self.device)
 
     
         self.use_py_session = use_py_session
@@ -632,6 +639,7 @@ class CanaryTRTLLM(object):
 
         if max_new_tokens is None:
             max_new_tokens = self.max_seq_len
+        
   
 
         mel,mel_input_lengths = self.preprocessor.get_feats(audio, audio_input_lengths)

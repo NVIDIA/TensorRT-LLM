@@ -51,6 +51,7 @@ def parse_arguments():
                         choices=[
                             "nvidia/canary-1b",
                             "nvidia/canary-1b-flash",
+                            "nvidia/canary-180m-flash",
                         ])
     parser.add_argument('--model_path',
                         type=str,
@@ -137,7 +138,7 @@ class CanaryModel:
             else:
                 raise UnsupportedModel(model_name=args.model_name)
         else:
-            if args.model_name == 'nvidia/canary-1b' or args.model_name == 'nvidia/canary-1b-flash':
+            if args.model_name == 'nvidia/canary-1b' or args.model_name == 'nvidia/canary-1b-flash' or args.model_name == 'nvidia/canary-180m-flash':
                 self.model = nemo_asr.EncDecMultiTaskModel.from_pretrained(args.model_name).to(device='cpu')
             else:
                 raise UnsupportedModel(model_name=args.model_name)
@@ -172,7 +173,7 @@ class CanaryModel:
 
                 encoder_filename = 'encoder.onnx'
                 export_file = os.path.join(encoder_path, "encoder.onnx")
-
+                enc_dec_proj_file = os.path.join(encoder_path, "enc_dec_proj.pt")
                 #encoder=self.model.encoder
                 #encoder.to(dtype=TORCH[self.dtype])
                 #encoder.export(export_file, onnx_opset_version=17)
@@ -186,6 +187,8 @@ class CanaryModel:
                 os.makedirs(preprocessor_path, exist_ok=True)
 
                 torch.save(self.model.preprocessor.featurizer.filter_banks, mel_basis_file)
+
+                torch.save(self.model.encoder_decoder_proj, enc_dec_proj_file)
 
                 with open(os.path.join(preprocessor_path, "config.json"),'w') as feat_config:
                     json.dump(self.model_config['preprocessor'], feat_config)
@@ -214,9 +217,13 @@ class CanaryModel:
                                                                                 'max_generation_delta': 50}
                                                                        )
 
+        enc_dec_hidden_size=self.model_config['model_defaults']['asr_enc_hidden']
+        if type(self.model.encoder_decoder_proj) == torch.nn.modules.linear.Linear:
+            if self.model.encoder_decoder_proj.out_features != self.model.encoder_decoder_proj.in_features:
+                enc_dec_hidden_size=self.model.encoder_decoder_proj.out_features
+            
 
-
-
+        
         model_metadata = {
             "decoder_layers": self.model_config['transf_decoder']['config_dict']['num_layers'],  # 24,
             "num_attention_heads": self.model_config['transf_decoder']['config_dict']['num_attention_heads'],  # 8,
@@ -227,7 +234,7 @@ class CanaryModel:
             'max_position_embeddings': self.model_config['encoder']['pos_emb_max_len'],
             'ff_expansion_factor': self.model_config['encoder']['ff_expansion_factor'],
             'd_model': self.model_config['encoder']['d_model'],
-            'enc_hidden_size': self.model_config['model_defaults']['asr_enc_hidden'],
+            'enc_hidden_size': enc_dec_hidden_size,
             'enc_heads': self.model_config['encoder']['n_heads'],
             'vocab': self.export_vocab(),
             'prompt_format': self.model_config['prompt_format'],

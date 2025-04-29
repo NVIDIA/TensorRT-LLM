@@ -18,7 +18,7 @@ import os
 import time
 
 import tensorrt as trt
-
+import torch
 import click
 
 
@@ -82,12 +82,15 @@ class ConformerTRT:
         #config.flags = config.flags
         parser = trt.OnnxParser(network, logger)
         onnx_file=os.path.join(self.checkpoint_dir, 'encoder/encoder.onnx')
+        enc_dec_proj_file=os.path.join(self.checkpoint_dir, 'encoder/enc_dec_proj.pt')
         with open(onnx_file, "rb") as model:
             if not parser.parse(model.read(), "/".join(onnx_file.split("/"))):
                 print("Failed parsing %s" % onnx_file)
                 for error in range(parser.num_errors):
                     print(parser.get_error(error))
             print("Succeeded parsing %s" % onnx_file)
+        
+
 
         nBS = -1
         nFeats = -1
@@ -123,6 +126,13 @@ class ConformerTRT:
 
         plan_file=os.path.join(plan_path,'encoder.plan')
         config_file=os.path.join(plan_path,'config.json')
+        proj_file=os.path.join(plan_path,'enc_dec_proj.pt')
+        enc_dec_proj = torch.load(enc_dec_proj_file)
+        if type(enc_dec_proj) == torch.nn.modules.linear.Identity:
+            self.encoder_config['projection'] = False
+        else:
+            self.encoder_config['projection'] = True
+        
         if engineString == None:
             print("Failed building %s" % plan_file)
         else:
@@ -131,6 +141,9 @@ class ConformerTRT:
                 f.write(engineString)
             with open(config_file, 'w') as jf:
                 json.dump(self.encoder_config,jf)
+            if self.encoder_config['projection']:
+                torch.save(enc_dec_proj, proj_file)
+            
 
 
 
