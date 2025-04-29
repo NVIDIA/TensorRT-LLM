@@ -90,7 +90,7 @@ class AccuracyTask:
 
     def __init__(self, model_name: str):
         with open(f"{self.REFERENCE_DIR}/{self.DATASET}.yaml") as f:
-            self.reference = yaml.safe_load(f)[model_name]
+            self.reference: List[dict] = yaml.safe_load(f).get(model_name, [])
 
     def get_num_samples_and_threshold(self, **acc_specs):
         """Get num_samples and threshold via accuracy specifications.
@@ -264,7 +264,7 @@ class MMLU(AccuracyTask):
     DATASET = "mmlu"
     DATASET_DIR = f"{llm_models_root()}/datasets/mmlu"
 
-    ALPHA = 0.01
+    ALPHA = 0.05
     BETA = 0.2
     SIGMA = 50
     NUM_SAMPLES = 4096
@@ -281,7 +281,7 @@ class GSM8K(AccuracyTask):
     DATASET = "gsm8k"
     DATASET_DIR = f"{llm_models_root()}/datasets/openai/gsm8k"
 
-    ALPHA = 0.02
+    ALPHA = 0.05
     BETA = 0.2
     SIGMA = 50
     NUM_SAMPLES = 1319  # Full sample

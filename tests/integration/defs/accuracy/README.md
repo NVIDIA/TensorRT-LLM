@@ -6,7 +6,7 @@ This test suite employs a *hypothesis testing* methodology, which decides the ev
 * too close to the reference (so the tests *intermittently fail* for reasonable accuracy variance) nor
 * too far away from the reference (so the tests *always pass* even accuracy regresses).
 
-In addition, most tests are based on the official offline API -- [LLM API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html). Hence, the tests can easily leverage inflight fused batching and other performance optimizations, and thus run efficiently. Compared with the online API [trtllm-serve](https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html), offline API provides clearer error messages and easier for debugging.
+In addition, most tests are based on the offline API -- [LLM API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html). Hence, the tests can easily leverage inflight fused batching and other performance optimizations, and thus run efficiently. Compared with the online API [trtllm-serve](https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html), offline API provides clearer error messages and eases the debugging workflow.
 
 This test suite is organized as following:
 * [accuracy_core.py](./accuracy_core.py) provides the test harness, including hypothesis testing logics, evaluation task configurations, and common utilities.
@@ -18,8 +18,8 @@ This test suite is organized as following:
 
 Currently, the below tasks are supported.
 
-| Dataset | Task | Metric | LLM API | CLI flow |
-|:-------:|:----:|:------:|:-------:|:--------:|
+| Dataset           | Task                | Metric     | LLM API | CLI flow |
+|:-----------------:|:-------------------:|:----------:|:-------:|:--------:|
 | CNN Dailymail     | summarization       | rouge      | Y | Y |
 | MMLU              | QA; multiple choice | accuracy   | Y | Y |
 | GSM8K             | QA; regex matching  | accuracy   | Y | N |
@@ -30,6 +30,8 @@ Currently, the below tasks are supported.
 | SlimPajama-6B     | perplexity          | perplexity | N | Y |
 
 \* Rouge is an informal evaluation metric for code completion.
+
+For LLM API supported tasks, the core evaluation logics (i.e., evaluators) are implemented in the [`tensorrt_llm.evaluate`](../../../../tensorrt_llm/evaluate) module. They are also shared with the CLI tool [`trtllm-eval`](../../../../examples/trtllm-eval). CLI flow tasks typically require calling a standalone script like [`summarize.py`](../../../../examples/summarize.py).
 
 New accuracy tests are strongly recommended to be added to this test suite, in particular, in the LLM API style (i.e., [test_llm_api.py](./test_llm_api.py) and [test_llm_api_pytorch.py](./test_llm_api_pytorch.py)). There are some legacy accuracy tests outside this test suite (e.g., the tests in [examples](../examples) folder), but they are not recommended anymore.
 
@@ -44,7 +46,7 @@ It probably seems simple to setup an accuracy test:
     * If the evaluated accuracy is higher than the threshold, the test passes.
     * If the evaluated accuracy is lower than the threshold, the test fails.
 
-Once implemented, the test will be run in the CI/CD workflow or QA cycles, to protect the model from accuracy regression due to future code changes.
+Once implemented, the test can be run in the CI/CD workflow or QA cycles, to protect the model from accuracy regression due to future code changes.
 
 The above steps are quite intuitive except for a seemingly trivial question: How to decide the sample volume and threshold?
 
@@ -73,38 +75,71 @@ In addition to the hypothesis testing framework, this accuracy test suite provid
     * The accuracy references are registered in YAML files in [references](./references), in stead of being hard-coded in testing code.
     * The accuracy references are categorized by tasks, models and accuracy specifications, which allows fine-grained management.
 * Performant evaluation.
-    * The test harness utilizes our own inference optimizations, which accelerates accuracy evaluation.
+    * The test harness leverages our own inference optimizations, which accelerates the accuracy evaluation.
 
 
 ## How to Add Accuracy Tests
 
+Before proceeding with the detailed steps, please take a look at [tests/README.md](../../../README.md) for a general guidance on how to run or add new tests. This accuracy test suite belongs to integration tests.
 
+### Understanding Existing Tests
 
-### Understanding Existing Tasks and Test Cases
+Each test case aims to evaluate the accuracy of a model with some accuracy specifications (e.g., data type, quantization). To achieve this, it runs one or more evaluation tasks.
+
+#### Evaluation Tasks
 
 Given an existing task, $\theta$, $\alpha$, $\beta$ and $n$ are all configured. For example, in [accuracy_core.py](./accuracy_core.py) the MMLU task is defined as following:
 
 ```python
 class MMLU(AccuracyTask):
     ...
-    ALPHA = 0.01
+    ALPHA = 0.05
     BETA = 0.2
     SIGMA = 50
     NUM_SAMPLES = 4096
     ...
 ```
 
-The parameters $\alpha$, $\beta$ and $n$ are clearly present. With an additional score variance $\sigma$, the parameter $\theta$ can be computed (See formulas in [Hypothesis Testing Methodology](#hypothesis-testing-methodology) or function `compute_theta` in [accuracy_core.py](./accuracy_core.py)).
+The parameters $\alpha$, $\beta$ and $n$ are clearly present. With an additional statistic score variance $\sigma$, the parameter $\theta$ can be computed (See formulas in [Hypothesis Testing Methodology](#hypothesis-testing-methodology) or function `compute_theta` in [accuracy_core.py](./accuracy_core.py)).
 
-Each test case aims to evaluate the accuracy of a model with some accuracy specifications (e.g., data type, quantization). To achieve this, it runs one or more evaluation tasks.
+For any test case that runs this task, it additionally requires a reference accuracy for threshold computation.
 
-For each task, the test case looks for the reference accuracy from the YAML files in [references](./references). Together with other parameters, the threshold can be computed (See formulas in [Hypothesis Testing Methodology](#hypothesis-testing-methodology) or function `compute_threshold` in [accuracy_core.py](./accuracy_core.py)). Then, the test case runs the model on the task (a subset of volume $n$) and get the evaluated accuracy.
+#### Accuracy References
+
+The accuracy references are registered in the YAML files in [references](./references). The references are organized by three levels:
+* Task level: Each task has a dedicated YAML file; for example, MMLU's references are in [references/mmlu.yaml](./references/mmlu.yaml).
+* Model level: Each model is indexed by its unique Hugging Face model ID in each YAML file.
+* Accuracy specification level: Each accuracy specification is some feature combination that has justifiable accuracy difference from the default accuracy.
+
+For example, in [references/mmlu.yaml](./references/mmlu.yaml) the model [`meta-llama/Llama-3.1-8B-Instruct`](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) has accuracy references as following:
+
+```yaml
+meta-llama/Llama-3.1-8B-Instruct:
+  - accuracy: 68.17
+  - quant_algo: FP8
+    accuracy: 67.93
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 67.87
+```
+
+The first item is the default accuracy specification (i.e., using original Hugging Face model data type and no quantization), and the reference accuracy is 68.17. The second item is an accuracy specification with FP8 GEMM quantization, with a slightly lower reference accuracy 67.93. The third item is a specification with FP8 GEMM and KV cache quantization, with a further slightly lower reference accuracy 67.87.
+
+Model data type and quantization decide the precision in model computation, so accuracy differences can be *justified* if different data types or quantizations are used. Hence, they are the most typical components in accuracy specifications. Please see other categories of accuracy specifications documented in `AccuracyTask.get_num_samples_and_threshold` in [accuracy_core.py](./accuracy_core.py). Note that we exclude most inference features even like parallelsm, because theoretically they should not affect model accuracies. Think from the opposite perspective, if enabling tensor parallelsm results in statistically significant accuracy loss, we might need to check whether some accuracy bugs exist.
+
+A direct implication is that multiple test cases with different features may share a same accuracy reference. This is by design. For example, we should expect a test case with tensor parallelim has very close accuracies to its single-gpu counterpart.
+
+#### Testing Logic
+
+As aforementioned, each test case evaluates the accuracy of a model with some specifications by running one or multiple tasks.
+
+For each task, it obtains the parameters $\theta$, $\alpha$, $\beta$, $\sigma$ and $n$ from the task configuration, and looks for the reference accuracy from the YAML files via task, model and accuracy specifications. Thus, the threshold can be computed (See formulas in [Hypothesis Testing Methodology](#hypothesis-testing-methodology) or function `compute_threshold` in [accuracy_core.py](./accuracy_core.py)). The test case runs the model on the task (a subset of volume $n$) and get the evaluated accuracy.
 
 If all the evaluated accuracies are equal to or higher than the corresponding thresholds, the test passes.
 
 ### Add New Test Cases with Existing Tasks
 
-We suggest supporting your model with LLM API, and then add tests to [test_llm_api.py](./test_llm_api.py) or [test_llm_api_pytorch.py](./test_llm_api_pytorch.py). Typically, a test class is responsible for a model (corresponding to a unique Hugging Face model ID); it contains several test methods for different features (e.g., quantizations, parallelisms). For example, in [test_llm_api_pytorch.py](./test_llm_api_pytorch.py) the model [`meta-llama/Llama-3.1-8B-Instruct`](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) has the test class defined as:
+We suggest supporting the model with LLM API, and then add tests to [test_llm_api.py](./test_llm_api.py) or [test_llm_api_pytorch.py](./test_llm_api_pytorch.py). Typically, a test class is responsible for a model (corresponding to a unique Hugging Face model ID); it contains several test methods for different features (e.g., quantizations, parallelisms). For example, in [test_llm_api_pytorch.py](./test_llm_api_pytorch.py) the model [`meta-llama/Llama-3.1-8B-Instruct`](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) has the test class defined as:
 
 ```python
 class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
@@ -124,23 +159,116 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 ```
 
-Please inherit `LlmapiAccuracyTestHarness` when defining a new test class. At the class level, `MODEL_NAME` is the unique Hugging Face model ID; it is also the key to find the accuracy references in the registration files. `MODEL_PATH` is the Hugging Face model checkpoint path accessible by the test machine. Normally, `MODEL_NAME` and `MODEL_PATH` should be the non-quantized version.
+Please inherit `LlmapiAccuracyTestHarness` when defining a new test class. At the class level, `MODEL_NAME` is the unique Hugging Face model ID. `MODEL_PATH` is the Hugging Face model checkpoint path accessible by the test machine. Normally, `MODEL_NAME` and `MODEL_PATH` should be the non-quantized version.
 
-At the method level, the test code should create an LLM instance with the tested features enabled, and then create and run task instances one by one. Existing tasks are imported from [accuracy_core.py](./accuracy_core.py).
+At the test method level, the test code should enable the tested features when creating the LLM instance, and then create and run task instances one by one. Existing tasks can be imported from [accuracy_core.py](./accuracy_core.py).
 
-TODO: accuracy specs and yaml files
+The last step is registering the accuracy reference. If the new test case shares the task, model and accuracy specifications with existing cases, then the accuracy reference has been already registered, and this step can be skipped.
 
-NOT support LLM Api?
+Otherwise, run the new test case without reference by `TRTLLM_ACCURACY_NO_REFERENCE=1`. For example,
+
+```bash
+TRTLLM_ACCURACY_NO_REFERENCE=1 pytest -vs "test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM-torch_compile]"
+```
+
+The results would look like:
+
+```txt
+......
+[04/29/2025-07:01:55] [TRT-LLM] [I] MMLU weighted average accuracy: 68.20 (4104)
+......
+[04/29/2025-07:03:00] [TRT-LLM] [I] lm-eval gsm8k average accuracy: 73.88
+```
+
+We can clearly see the evaluated accuracies from the test logs. If the accuracies look good, register them to [references](./references).
+
+The new test case is all set. See [tests/README.md](../../../README.md) for how to register the new case to the CI or QA list.
+
+If the model supports CLI flow only, please follow other cases in [test_cli_flow.py](./test_cli_flow.py).
 
 ### Add New Tasks
 
-* Estimate $\sigma$ from the full dataset.
-* Decide a target minimum detectable effect $\theta$ based on the nature of dataset and corresponding accuracy metric.
-* Decide $\alpha$ and $\beta$ based on the importance of model.
-* Iterate sample volume $n$ from small to large, and compute $\theta$ until it satisfies (is equal to or lower than) the target $\theta$.
-* Evaluate the model on the subset of sample volume $n$, resulting in the reference accuracy.
-* The threshold $\gamma$ is automatically setup based on $\alpha$, $\sigma$, $n$ and the reference accuracy.
+We recommend reading [Hypothesis Testing Methodology](#hypothesis-testing-methodology) before introducing a new evaluation task.
 
+#### New Evaluator in `tensorrt_llm.evaluate`
+
+For LLM API style tests, a new accuracy evaluator class should be implemented in the [tensorrt_llm.evaluate](../../../../tensorrt_llm/evaluate) module. In general, the evaluator class should inherit the `Evaluator` interface and implement the abstract methods. Please see [MMLU](../../../../tensorrt_llm/evaluate/mmlu.py) or [CNN Dailymail](../../../../tensorrt_llm/evaluate/cnn_dailymail.py) as examples.
+
+If the task is supported by [lm-eval](https://github.com/EleutherAI/lm-evaluation-harness), the new evaluator class should inherit the `LmEvalEvaluator` and specify the lm-eval task name in the class constructor. Please see [GSM8K](../../../../tensorrt_llm/evaluate/lm_eval.py) or [GPQADiamond](../../../../tensorrt_llm/evaluate/lm_eval.py) as examples.
+
+There is a bonus one step away! If we implement the the new evaluator's static method `command` and register it in [tensorrt_llm/commands/eval.py](../../../../tensorrt_llm/commands/eval.py), the new evaluator is automatically supported in `trtllm-eval`.
+
+#### New Task
+
+Let's revisit the MMLU task in [accuracy_core.py](./accuracy_core.py) as a reference for new task definition.
+
+```python
+class MMLU(AccuracyTask):
+    DATASET = "mmlu"
+    DATASET_DIR = f"{llm_models_root()}/datasets/mmlu"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50
+    NUM_SAMPLES = 4096
+
+    MAX_BATCH_SIZE = 128
+    MAX_INPUT_LEN = 4094
+    MAX_OUTPUT_LEN = 2
+
+    EVALUATOR_CLS = tensorrt_llm.evaluate.MMLU
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
+```
+
+Please inherit `AccuracyTask` when defining a new task class.
+
+The concepts of `ALPHA`, `BETA`, `SIGMA` and `NUM_SAMPLES` have been introduced above. [Hypothesis Testing Methodology](#hypothesis-testing-methodology) provides more concrete statistical analysis. Here we describe how to setup the values in practice.
+
+First, estimate the score variance $\sigma$ of the samples in the dataset. In theory, the variance should be estimated for each combination of task/dataset, model and accuracy specification. Specifically, we evaluate the model on the dataset, get the scores for all samples, and estimate the variance. While in practice, the variance is not necessary to be so accurate; it is sufficient to use a per-task variance estimated using a single model. It becomes even more simplified if the per-sample score is from a Bernoulli distribution (i.e., those from yes-no question datasets like MMLU and GSM8K). Given the correction possibility $p$, the variance should be $\sigma = p (1-p)$. Again, it is not necessary to be accurate, so we can use $p = 0.5$ and thus $\sigma = 0.5$. Remember to scale $\sigma$ to the scoring range. For the conventional range 0 to 100, $\sigma = 0.5$ should be scaled to $\sigma = 50$.
+
+Second, choose values for $\alpha$ and $\beta$. Without special reasons, we can use the default values 0.05 and 0.2 for $\alpha$ and $\beta$, respectively.
+
+Third, decide the minimum detectable effect $\theta$ and compute the least required sample volume $n$. $\theta$ is the minimum accuracy loss that should be regarded as a regression, so it depends on the task's characteristics (e.g., metric, importance). For example, MMLU has a scoring range from 0 to 100, and thus we can choose $\theta$ to be a value between 1 and 5 points. Then, run `scripts/compute_theta_and_thresholds.py` to show the $\theta$ values over a list of samples volumes:
+
+```bash
+# MMLU has total number of samples 14042
+python scripts/compute_theta_and_thresholds.py --num_samples_total 14042 \
+    --sigma 50 \
+    --alpha 0.05 \
+    --beta 0.2
+```
+
+The results are:
+
+```txt
+                 theta  threshold-reference
+num_samples
+32           31.080936           -20.560670
+64           21.977540           -14.538589
+128          15.540468           -10.280335
+256          10.988770            -7.269295
+512           7.770234            -5.140168
+1024          5.494385            -3.634647
+2048          3.885117            -2.570084
+4096          2.747193            -1.817324
+8192          1.942558            -1.285042
+14042         1.483729            -0.981517
+```
+
+If we require $\theta$ to be lower than 3 points, then the sample volume $n$ could be 4096. Accordingly, the tests will use a threshold lower than reference accuracy by 1.82 points.
+
+The remaining fields of the task class should be straightforward:
+* `DATASET`: The dataset name, which is used as the file name in [references](./references).
+* `DATASET_DIR`: The dataset path accessible by the test machine.
+* `MAX_BATCH_SIZE`: The maximum batch size to run the task; it is used by CLI flow only.
+* `MAX_INPUT_LEN`: The maximum input length of the dataset.
+* `MAX_OUTPUT_LEN`: The maximum output length required by the task.
+* `EVALUATOR_CLS`: The evaluator class.
+* `EVALUATOR_KWARGS`: The arguments used to create the evaluator instance.
+
+Please see `AccuracyTask.evaluate` in [accuracy_core.py](./accuracy_core.py) for how `EVALUATOR_CLS` and `EVALUATOR_KWARGS` are used.
+
+The new task class is all set. Use it in [test_llm_api.py](./test_llm_api.py) or [test_llm_api_pytorch.py](./test_llm_api_pytorch.py).
 
 
 ## Hypothesis Testing Methodology
