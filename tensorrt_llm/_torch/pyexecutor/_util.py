@@ -70,8 +70,11 @@ def get_cache_size_per_token(model_config, mapping):
         head_dim = config.kv_lora_rank + config.qk_rope_head_dim
         kv_factor = 1
     else:
-        head_dim = (config.hidden_size * num_key_value_heads /
-                    config.num_attention_heads / tp_size)
+        head_dim = getattr(
+            config,
+            "head_dim",
+            config.hidden_size // config.num_attention_heads,
+        ) * num_key_value_heads // tp_size
 
     num_hidden_layers = len(mapping.pp_layers(config.num_hidden_layers))
     mem_per_token *= num_hidden_layers * head_dim
@@ -272,7 +275,8 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
         num_attention_heads = config.num_attention_heads
         num_key_value_heads = getattr(config, 'num_key_value_heads',
                                       num_attention_heads)
-        head_dim = hidden_size // num_attention_heads
+        head_dim = getattr(config, "head_dim",
+                           hidden_size // num_attention_heads)
 
         if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
         ):

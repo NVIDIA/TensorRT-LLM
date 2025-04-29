@@ -38,9 +38,11 @@ class Attention(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
 
+        config = config or ModelConfig()
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
+        self.head_dim = getattr(config.pretrained_config, "head_dim",
+                                self.hidden_size // self.num_heads)
         self.num_key_value_heads = num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = max_position_embeddings
@@ -50,13 +52,7 @@ class Attention(nn.Module):
         if dense_bias is None:
             self.dense_bias = bias
 
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads}).")
-
         # tensor parallel
-        config = config or ModelConfig()
         tp_size = config.mapping.tp_size
         pp_size = config.mapping.pp_size
         if config.mapping.enable_attention_dp:
@@ -90,7 +86,7 @@ class Attention(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
         )
         self.o_proj = Linear(
-            self.hidden_size,
+            tp_size * self.q_size,
             self.hidden_size,
             bias=self.dense_bias,
             dtype=dtype,
@@ -241,7 +237,6 @@ class MLA(nn.Module):
 
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_heads = num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.qk_nope_head_dim = qk_nope_head_dim
@@ -263,10 +258,6 @@ class MLA(nn.Module):
         else:
             self.is_lite = False
 
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads}).")
         assert pos_embd_params is not None, "pos_embd_params must be provided in MLA"
 
         # tensor parallel
