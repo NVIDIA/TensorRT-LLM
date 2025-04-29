@@ -155,7 +155,7 @@ class Linear(nn.Module):
         quant_config: Optional[QuantConfig] = None,
         weights_loading_config: Optional[WeightsLoadingConfig] = None,
         reduce_output: bool = True,  # ROW parallel only
-        skip_create_weights: bool = False,
+        skip_create_weights_in_init: bool = False,
         use_custom_cublas_mm: bool = False,
     ):
         from ..distributed import AllReduce
@@ -198,7 +198,7 @@ class Linear(nn.Module):
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm
 
-        if not skip_create_weights:
+        if not skip_create_weights_in_init:
             self.create_weights()
 
     def create_weights(self):
@@ -210,9 +210,9 @@ class Linear(nn.Module):
         self.has_fp8_qdq = False
         self.has_fp8_block_scales = False
         self.has_nvfp4 = False
-        # only _create_weights, and load quantized weight directly.
+
         if self.quant_config and self.quant_config.layer_quant_mode.has_any_quant(
-        ):
+                exclude_kv_cache=True):
             self.has_any_quant = True
             qc = self.quant_config
             if qc.layer_quant_mode.has_fp8_qdq():

@@ -87,6 +87,11 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
+    # set prompts and media to example prompts and images if they are not provided
+    if args.prompt is None:
+        args.prompt = example_image_prompts if args.modality == "image" else example_video_prompts
+    if args.media is None:
+        args.media = example_images if args.modality == "image" else example_videos
 
     llm, sampling_params = setup_llm(args)
 

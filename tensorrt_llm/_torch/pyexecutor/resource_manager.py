@@ -59,30 +59,6 @@ class BaseResourceManager(ABC):
         pass
 
 
-class DummyKvCacheManager(BaseResourceManager):
-
-    def __init__(self,
-                 block_count: int,
-                 max_num_tokens: int,
-                 block_size: int = 64):
-        super(BaseResourceManager, self).__init__()
-        self.block_count = block_count
-        self.max_num_tokens = max_num_tokens
-        self.block_size = block_size
-
-    def get_max_resource_count(self) -> int:
-        return self.block_count
-
-    def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
-        max_new_tokens = request.max_new_tokens if request.max_new_tokens is not None else self.max_num_tokens - request.orig_prompt_len
-        context_token_count = request.orig_prompt_len
-        num_context_blocks = context_token_count // self.block_size
-        remaining_tokens = context_token_count + max_new_tokens - num_context_blocks * self.block_size
-        need_blocks = num_context_blocks + math.ceil(
-            remaining_tokens / self.block_size)
-        return need_blocks
-
-
 class KVCacheManager(BaseResourceManager):
 
     def __init__(
@@ -694,9 +670,9 @@ class SlotManager:
         return slot
 
     def remove_slot(self, request_id: int):
-        assert request_id in self.slot_mapping
-        slot = self.slot_mapping.pop(request_id)
-        self.free_slots.add(slot)
+        if request_id in self.slot_mapping:
+            slot = self.slot_mapping.pop(request_id)
+            self.free_slots.add(slot)
 
 
 class ResourceManager:
@@ -773,8 +749,6 @@ class PeftCacheManager(BaseResourceManager):
                                         buffer_manager=buffer_manager)
 
     def add_request_peft(self, request: LlmRequest):
-        # TODO smor- a helper function to add a request to the peft cache manager.
-        # Cosnider replacing in favor of prepare_resources
         self.impl.add_request_peft(request, True)
 
     def ensure_batch(self,
@@ -801,12 +775,8 @@ class PeftCacheManager(BaseResourceManager):
                     [1] + list(req.lora_config.shape))
             self.impl.add_request_peft(req, True)
 
-        from tensorrt_llm.bindings.internal.batch_manager import RequestVector
-        context_requests_vector = RequestVector(context_batch)
-        generation_requests_vector = RequestVector(generation_batch)
-
         py_lora_task_layer_module_configs = self.impl.ensure_batch(
-            context_requests_vector, generation_requests_vector, False)
+            context_batch, generation_batch, False)
 
         for req in context_batch:
             req.py_lora_task_layer_module_configs = py_lora_task_layer_module_configs[

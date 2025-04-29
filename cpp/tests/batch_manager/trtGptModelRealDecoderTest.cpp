@@ -1066,7 +1066,7 @@ INSTANTIATE_TEST_SUITE_P(GptV1Tests, ParamTest,
             BeamConfig{1, {1}}, BeamConfig{2, {2}} // , BeamConfig{2, {1, 2}}
             ),
         testing::Values(std::nullopt),             // maxTokensInPagedKvCache
-        testing::Values(std::nullopt, 0.8),        // freeGpuMemoryFraction
+        testing::Values(0.4),                      // freeGpuMemoryFraction
         testing::Values(false),                    // enableTrtOverlap
         testing::Values(false),                    // enableChunkedContext
         testing::Values(false),                    // enableStreamingMode
@@ -1092,7 +1092,7 @@ INSTANTIATE_TEST_SUITE_P(GptV1RandomEndIdTests, ParamTest,
             BeamConfig{1, {1}}, BeamConfig{2, {2}} // , BeamConfig{2, {1, 2}}
             ),
         testing::Values(std::nullopt),             // maxTokensInPagedKvCache
-        testing::Values(std::nullopt, 0.8),        // freeGpuMemoryFraction
+        testing::Values(std::nullopt, 0.4),        // freeGpuMemoryFraction
         testing::Values(false),                    // enableTrtOverlap
         testing::Values(false),                    // enableChunkedContext
         testing::Values(false),                    // enableStreamingMode
@@ -1128,7 +1128,7 @@ INSTANTIATE_TEST_SUITE_P(GptTests, ParamTest,
             BeamConfig{1, {1}}, BeamConfig{2, {2}} // , BeamConfig{2, {1, 2}}
             ),
         testing::Values(std::nullopt, 1280),       // maxTokensInPagedKvCache
-        testing::Values(std::nullopt, 0.8),        // freeGpuMemoryFraction
+        testing::Values(std::nullopt, 0.4),        // freeGpuMemoryFraction
         testing::Values(false, true),              // enableTrtOverlap
         testing::Values(false),                    // enableChunkedContext
         testing::Values(false),                    // enableStreamingMode
@@ -1154,7 +1154,7 @@ INSTANTIATE_TEST_SUITE_P(GptRandomEndIdTests, ParamTest,
             BeamConfig{1, {1}}, BeamConfig{2, {2}} // , BeamConfig{2, {1, 2}}
             ),
         testing::Values(std::nullopt, 1280),       // maxTokensInPagedKvCache
-        testing::Values(std::nullopt, 0.8),        // freeGpuMemoryFraction
+        testing::Values(std::nullopt, 0.4),        // freeGpuMemoryFraction
         testing::Values(false, true),              // enableTrtOverlap
         testing::Values(false),                    // enableChunkedContext
         testing::Values(false),                    // enableStreamingMode
@@ -1178,7 +1178,7 @@ INSTANTIATE_TEST_SUITE_P(GptKVOffloadingTest, ParamTest,
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}),
         testing::Values(256),               // maxTokensInPagedKvCache
-        testing::Values(std::nullopt, 0.8), // freeGpuMemoryFraction
+        testing::Values(std::nullopt, 0.4), // freeGpuMemoryFraction
         testing::Values(false, true),       // enableTrtOverlap
         testing::Values(false),             // enableChunkedContext
         testing::Values(false),             // enableStreamingMode
@@ -1210,7 +1210,7 @@ INSTANTIATE_TEST_SUITE_P(GptCudaGraphTests, ParamTest,
             BeamConfig{1, {1}}, BeamConfig{2, {2}} // , BeamConfig{2, {1, 2}}
             ),
         testing::Values(std::nullopt),             // maxTokensInPagedKvCache
-        testing::Values(std::nullopt),             // freeGpuMemoryFraction
+        testing::Values(0.4),                      // freeGpuMemoryFraction
         testing::Values(false),                    // enableTrtOverlap
         testing::Values(false, true),              // enableChunkedContext
         testing::Values(false),                    // enableStreamingMode
@@ -1237,7 +1237,7 @@ INSTANTIATE_TEST_SUITE_P(GptSwitchBwTests, ParamTest,
             BeamConfig{2, {1}}         // , BeamConfig{2, {1, 2}}
             ),
         testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(std::nullopt), // freeGpuMemoryFraction
+        testing::Values(0.4),          // freeGpuMemoryFraction
         testing::Values(false),        // enableTrtOverlap
         testing::Values(true),         // enableChunkedContext
         testing::Values(false),        // enableStreamingMode
@@ -1261,7 +1261,7 @@ INSTANTIATE_TEST_SUITE_P(GptNProfilesTests, ParamTest,
             BeamConfig{1, {1}}, BeamConfig{2, {2}} // , BeamConfig{2, {1, 2}}
             ),
         testing::Values(std::nullopt, 1280),       // maxTokensInPagedKvCache
-        testing::Values(std::nullopt, 0.8),        // freeGpuMemoryFraction
+        testing::Values(std::nullopt, 0.4),        // freeGpuMemoryFraction
         testing::Values(false, true),              // enableTrtOverlap
         testing::Values(false, true),              // enableChunkedContext
         testing::Values(false),                    // enableStreamingMode
@@ -1301,7 +1301,7 @@ INSTANTIATE_TEST_SUITE_P(GptSqTests, ParamTest,
             BeamConfig{1, {1}}         //, BeamConfig{2, {2}}
             ),
         testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(std::nullopt), // freeGpuMemoryFraction
+        testing::Values(0.4),          // freeGpuMemoryFraction
         testing::Values(false),        // enableTrtOverlap
         testing::Values(false),        // enableChunkedContext
         testing::Values(false),        // enableStreamingMode
@@ -1325,7 +1325,7 @@ INSTANTIATE_TEST_SUITE_P(DISABLED_GptChunkedContextTests, ParamTest,
         testing::Values(TrtGptModelIfbTestType::BULK), // TrtGptModelIfbTestType
         testing::Values(BeamConfig{1, {1}}),           // beam config
         testing::Values(257),                          // maxTokensInPagedKvCache
-        testing::Values(std::nullopt),                 // freeGpuMemoryFraction
+        testing::Values(0.4),                          // freeGpuMemoryFraction
         testing::Values(false),                        // enableTrtOverlap
         testing::Values(true),                         // enableChunkedContext
         testing::Values(false),                        // enableStreamingMode
@@ -1355,7 +1355,7 @@ INSTANTIATE_TEST_SUITE_P(GptChunkedLongContextTests, ParamTest,
             TrtGptModelIfbTestType::RANDOM), // TrtGptModelIfbTestType
         testing::Values(BeamConfig{1, {1}}), // beam config
         testing::Values(std::nullopt, 1024), // maxTokensInPagedKvCache
-        testing::Values(std::nullopt),       // freeGpuMemoryFraction
+        testing::Values(0.4),                // freeGpuMemoryFraction
         testing::Values(false),              // enableTrtOverlap
         testing::Values(true),               // enableChunkedContext
         testing::Values(false),              // enableStreamingMode
@@ -1393,7 +1393,7 @@ INSTANTIATE_TEST_SUITE_P(GptDraftTests, ParamTest,
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}), // beamConfig
         testing::Values(std::nullopt),       // maxTokensInPagedKvCache
-        testing::Values(std::nullopt),       // freeGpuMemoryFraction
+        testing::Values(0.4),                // freeGpuMemoryFraction
         testing::Values(false),              // enableTrtOverlap
         testing::Values(true),               // enableChunkedContext
         testing::Values(false),              // enableStreamingMode
@@ -1419,7 +1419,7 @@ INSTANTIATE_TEST_SUITE_P(GptLogitsTests, ParamTest,
             TrtGptModelIfbTestType::RANDOM),                                                        // testType
         testing::Values(BeamConfig{1, {1}}),                                                        // beamConfig
         testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(std::nullopt), // freeGpuMemoryFraction
+        testing::Values(0.4),          // freeGpuMemoryFraction
         testing::Values(false),        // enableTrtOverlap
         testing::Values(true),         // enableChunkedContext
         testing::Values(false, true),  // enableStreamingMode
@@ -1445,7 +1445,7 @@ INSTANTIATE_TEST_SUITE_P(GptLogProbsTests, ParamTest,
             TrtGptModelIfbTestType::RANDOM),                     // testType
         testing::Values(BeamConfig{1, {1}}),                     // beamConfig
         testing::Values(std::nullopt),                           // maxTokensInPagedKvCache
-        testing::Values(std::nullopt),                           // freeGpuMemoryFraction
+        testing::Values(0.4),                                    // freeGpuMemoryFraction
         testing::Values(false),                                  // enableTrtOverlap
         testing::Values(true),                                   // enableChunkedContext
         testing::Values(false),                                  // enableStreamingMode
@@ -1478,7 +1478,7 @@ INSTANTIATE_TEST_SUITE_P(GptjTests, ParamTest,
             BeamConfig{1, {1}}, BeamConfig{2, {2}} // , BeamConfig{2, {1, 2}}
             ),
         testing::Values(std::nullopt),             // maxTokensInPagedKvCache
-        testing::Values(std::nullopt),             // freeGpuMemoryFraction
+        testing::Values(0.4),                      // freeGpuMemoryFraction
         testing::Values(false),                    // enableTrtOverlap
         testing::Values(false),                    // enableChunkedContext
         testing::Values(false),                    // enableStreamingMode
@@ -1507,7 +1507,7 @@ INSTANTIATE_TEST_SUITE_P(MambaTests, ParamTest,
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}),
         testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(std::nullopt), // freeGpuMemoryFraction
+        testing::Values(0.4),          // freeGpuMemoryFraction
         testing::Values(false),        // enableTrtOverlap
         testing::Values(false),        // enableChunkedContext
         testing::Values(false),        // enableStreamingMode
@@ -1530,7 +1530,7 @@ INSTANTIATE_TEST_SUITE_P(RecurrentGemmaTests, ParamTest,
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}),
         testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(std::nullopt), // freeGpuMemoryFraction
+        testing::Values(0.4),          // freeGpuMemoryFraction
         testing::Values(false),        // enableTrtOverlap
         testing::Values(false),        // enableChunkedContext
         testing::Values(false),        // enableStreamingMode
@@ -1574,7 +1574,7 @@ INSTANTIATE_TEST_SUITE_P(LlamaTests, ParamTest,
             BeamConfig{1, {1}}, BeamConfig{2, {2}} // , BeamConfig{2, {1, 2}}
             ),
         testing::Values(std::nullopt),             // maxTokensInPagedKvCache
-        testing::Values(std::nullopt),             // freeGpuMemoryFraction
+        testing::Values(0.4),                      // freeGpuMemoryFraction
         testing::Values(false),                    // enableTrtOverlap
         testing::Values(false),                    // enableChunkedContext
         testing::Values(false),                    // enableStreamingMode
@@ -1597,7 +1597,7 @@ INSTANTIATE_TEST_SUITE_P(ChatGlmTests, ParamTest,
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}),
         testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(std::nullopt), // freeGpuMemoryFraction
+        testing::Values(0.4),          // freeGpuMemoryFraction
         testing::Values(false),        // enableTrtOverlap
         testing::Values(false, true),  // enableChunkedContext
         testing::Values(false),        // enableStreamingMode
@@ -1621,7 +1621,7 @@ INSTANTIATE_TEST_SUITE_P(ChatGlm0Tests, ParamTest,
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}),
         testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(std::nullopt), // freeGpuMemoryFraction
+        testing::Values(0.4),          // freeGpuMemoryFraction
         testing::Values(false),        // enableTrtOverlap
         testing::Values(false),        // enableChunkedContext
         testing::Values(false),        // enableStreamingMode
@@ -1646,7 +1646,7 @@ INSTANTIATE_TEST_SUITE_P(MedusaTests, ParamTest,
         testing::Values(TrtGptModelType::InflightFusedBatching), testing::Values(TrtGptModelIfbTestType::BULK),
         testing::Values(BeamConfig{1, {1}}),
         testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(std::nullopt), // freeGpuMemoryFraction
+        testing::Values(0.4),          // freeGpuMemoryFraction
         testing::Values(false),        // enableTrtOverlap
         testing::Values(false, true),  // enableChunkedContext
         testing::Values(false),        // enableStreamingMode
@@ -1670,7 +1670,7 @@ INSTANTIATE_TEST_SUITE_P(EagleTests, ParamTest,
         testing::Values(TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT),
         testing::Values(BeamConfig{1, {1}}),
         testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(std::nullopt), // freeGpuMemoryFraction
+        testing::Values(0.4),          // freeGpuMemoryFraction
         testing::Values(false),        // enableTrtOverlap
         testing::Values(false, true),  // enableChunkedContext
         testing::Values(false),        // enableStreamingMode
@@ -1695,7 +1695,7 @@ INSTANTIATE_TEST_SUITE_P(LlamaLookaheadDecodingTests, ParamTest,
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}), // beamConfig
         testing::Values(std::nullopt),       // maxTokensInPagedKvCache
-        testing::Values(std::nullopt),       // freeGpuMemoryFraction
+        testing::Values(0.4),                // freeGpuMemoryFraction
         testing::Values(false),              // enableTrtOverlap
         testing::Values(false),              // enableChunkedContext
         testing::Values(false),              // enableStreamingMode
@@ -1720,7 +1720,7 @@ INSTANTIATE_TEST_SUITE_P(ExplicitDraftTokensDecodingTests, ParamTest,
         testing::Values(TrtGptModelType::InflightFusedBatching), testing::Values(TrtGptModelIfbTestType::BULK),
         testing::Values(BeamConfig{1, {1}}), // beamConfig
         testing::Values(std::nullopt),       // maxTokensInPagedKvCache
-        testing::Values(std::nullopt),       // freeGpuMemoryFraction
+        testing::Values(0.4),                // freeGpuMemoryFraction
         testing::Values(false),              // enableTrtOverlap
         testing::Values(false, true),        // enableChunkedContext
         testing::Values(false),              // enableStreamingMode
@@ -1751,7 +1751,7 @@ INSTANTIATE_TEST_SUITE_P(GptjFP8Tests, ParamTest,
             BeamConfig{1, {1}}         // , BeamConfig{2, {2}}, BeamConfig{2, {1, 2}}
             ),
         testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(std::nullopt), // freeGpuMemoryFraction
+        testing::Values(0.4),          // freeGpuMemoryFraction
         testing::Values(false),        // enableTrtOverlap
         testing::Values(true),         // enableChunkedContext
         testing::Values(false),        // enableStreamingMode

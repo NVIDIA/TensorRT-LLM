@@ -10,4 +10,4 @@ examples/**/*.bin
 examples/**/*.engine
 examples/**/*.onnx
 examples/**/c-model
-examples/gpt/gpt*
+examples/models/core/gpt/gpt*

@@ -172,9 +172,9 @@ class AccuracyTask:
                                        **evaluator_kwargs)
         accuracy = evaluator.evaluate(llm, sampling_params)
         if self.HIGHER_IS_BETTER:
-            assert accuracy >= threshold, f"Expected accuracy >= {threshold}, but got {accuracy}"
+            assert accuracy >= threshold, f"Expected accuracy >= {threshold}, but got {accuracy}."
         else:
-            assert accuracy <= threshold, f"Expected accuracy <= {threshold}, but got {accuracy}"
+            assert accuracy <= threshold, f"Expected accuracy <= {threshold}, but got {accuracy}."
 
 
 class CnnDailymail(AccuracyTask):
@@ -345,12 +345,8 @@ class CliFlowAccuracyTestHarness:
             self.engine_dir = f"{workspace}/engines"
             yield
 
-    @property
-    def example_dir(self):
-        return f"{self.llm_root}/examples/models/core/{self.EXAMPLE_FOLDER}"
-
     def install_requirements(self):
-        requirements = f"{self.example_dir}/requirements.txt"
+        requirements = f"{self.llm_root}/examples/{self.EXAMPLE_FOLDER}/requirements.txt"
         if exists(requirements):
             self.llm_venv.run_cmd(["-m", "pip", "install", "-r", requirements])
 
@@ -405,15 +401,12 @@ class CliFlowAccuracyTestHarness:
 
         quant_config = QuantConfig(self.quant_algo, self.kv_cache_quant_algo)
         if not is_prequantized and quant_config._requires_modelopt_quantization:
-            if "core" in self.example_dir:
-                script = "../../../quantization/quantize.py"
-            else:
-                script = "../quantization/quantize.py"
+            script = f"{self.llm_root}/examples/quantization/quantize.py"
         else:
-            script = "convert_checkpoint.py"
+            script = f"{self.llm_root}/examples/{self.EXAMPLE_FOLDER}/convert_checkpoint.py"
 
         convert_cmd = [
-            f"{self.example_dir}/{script}",
+            script,
             f"--output_dir={self.ckpt_dir}",
             f"--dtype={self.dtype}",
         ]
@@ -446,7 +439,7 @@ class CliFlowAccuracyTestHarness:
             if self.quant_algo == QuantAlgo.NVFP4:
                 convert_cmd.append("--use_nvfp4")
             elif self.quant_algo == QuantAlgo.FP8:
-                if self.EXAMPLE_FOLDER != "gpt":  # --use_fp8 flag is not needed for gpt.
+                if self.EXAMPLE_FOLDER != "models/core/gpt":  # --use_fp8 flag is not needed for gpt.
                     convert_cmd.append("--use_fp8")
             elif self.quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
                 convert_cmd.append("--use_fp8_rowwise")
@@ -476,7 +469,7 @@ class CliFlowAccuracyTestHarness:
             if self.kv_cache_quant_algo == QuantAlgo.INT8:
                 convert_cmd.append("--int8_kv_cache")
             elif self.kv_cache_quant_algo == QuantAlgo.FP8:
-                if self.EXAMPLE_FOLDER != "gpt":  # --fp8_kv_cache flag is not needed for gpt.
+                if self.EXAMPLE_FOLDER != "models/core/gpt":  # --fp8_kv_cache flag is not needed for gpt.
                     convert_cmd.append("--fp8_kv_cache")
 
         if quant_config._requires_calibration:
@@ -573,31 +566,30 @@ class CliFlowAccuracyTestHarness:
 
     def mmlu(self, task: AccuracyTask):
         print("Running mmlu...")
-        mmlu_cmd = [
-            f"{self.llm_root}/examples/mmlu_llmapi.py",
-            f"--engine_dir={self.engine_dir}",
-            f"--hf_model_dir={self.MODEL_PATH}",
-            f"--data_dir={task.DATASET_DIR}", "--backend=tensorrt",
-            "--random_seed=0", "--check_accuracy"
-        ]
-
         num_samples, threshold = task.get_num_samples_and_threshold(
             dtype=self.dtype,
             quant_algo=self.quant_algo,
             kv_cache_quant_algo=self.kv_cache_quant_algo,
             spec_dec_algo=self.spec_dec_algo,
             extra_acc_spec=self.extra_acc_spec)
-        mmlu_cmd.extend([
-            f"--num_samples={num_samples}", f"--accuracy_threshold={threshold}"
-        ])
 
-        if task.MAX_INPUT_LEN + task.MAX_OUTPUT_LEN > BuildConfig.max_num_tokens:
-            mmlu_cmd.append("--enable_chunked_prefill")
+        mmlu_cmd = [
+            "trtllm-eval",
+            f"--model={self.engine_dir}",
+            f"--tokenizer={self.MODEL_PATH}",
+            "--backend=tensorrt",
+        ]
 
         if self.extra_mmlu_args:
             mmlu_cmd.extend(self.extra_mmlu_args)
 
-        venv_check_call(self.llm_venv, mmlu_cmd, env=self.env)
+        mmlu_cmd.extend([
+            "mmlu", f"--dataset_path={task.DATASET_DIR}",
+            f"--num_samples={num_samples}", "--random_seed=0",
+            "--check_accuracy", f"--accuracy_threshold={threshold}"
+        ])
+
+        check_call(" ".join(mmlu_cmd), shell=True, env=self.llm_venv._new_env)
 
     def eval_long_context(self, task: AccuracyTask):
         print("Running construct_synthetic_dataset...")

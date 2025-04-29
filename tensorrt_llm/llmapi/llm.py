@@ -10,8 +10,11 @@ from typing import Any, List, Literal, Optional, Sequence, Union
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
+from tensorrt_llm.inputs.data import TextPrompt
+from tensorrt_llm.inputs.registry import DefaultInputProcessor
+
 from .. import bindings as tllm
-from .._utils import global_mpi_rank, nvtx_range_debug
+from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..builder import EngineConfig
 from ..disaggregated_params import DisaggregatedParams
@@ -295,9 +298,6 @@ class LLM:
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
-        print_colored_debug(
-            f"rank {global_mpi_rank()} generate_async: {inputs}\n", "green")
-
         sampling_params = self._prepare_sampling_params(sampling_params)
 
         if sampling_params.n > self.args.build_config.max_batch_size:
@@ -308,6 +308,16 @@ class LLM:
         inputs = prompt_inputs(inputs)
         if queries is not None:
             queries = prompt_inputs(queries)
+
+        if not inputs.get("prompt") and inputs.get(
+                "prompt_token_ids") and not isinstance(self.input_processor,
+                                                       DefaultInputProcessor):
+            # VLMs need to process/tokenize the prompt in their own way
+            prompt = self.tokenizer.decode(inputs['prompt_token_ids'])
+            inputs = TextPrompt(
+                prompt=prompt,
+                multi_modal_data=inputs.get("multi_modal_data"),
+                mm_processor_kwargs=inputs.get("mm_processor_kwargs"))
 
         query_token_ids = None
         prompt_tuning_config = None
@@ -551,7 +561,9 @@ class LLM:
         if self.args.extended_runtime_perf_knob_config is not None:
             executor_config.extended_runtime_perf_knob_config = PybindMirror.maybe_to_pybind(
                 self.args.extended_runtime_perf_knob_config)
-
+        if self.args.cache_transceiver_config is not None:
+            executor_config.cache_transceiver_config = PybindMirror.maybe_to_pybind(
+                self.args.cache_transceiver_config)
         from tensorrt_llm._torch.pyexecutor.config import update_executor_config
         update_executor_config(
             executor_config,
@@ -595,8 +607,17 @@ class LLM:
         if self.runtime_context is not None:
             return self.runtime_context.tokenizer
 
+        # TODO smor- need to look more on this
+        # what should be chose as the tokenizer? the adapter or the base model?
+        # what happens if we have multiple adapters?
+        if hasattr(
+                self.args, "backend"
+        ) and self.args.backend == "pytorch" and self.args.lora_config is not None:
+            tokenizer_path = self.args.lora_config.lora_dir[0]
+        else:
+            tokenizer_path = self.args.model
         return ModelLoader.load_hf_tokenizer(
-            self.args.model,
+            tokenizer_path,
             trust_remote_code=self.args.trust_remote_code,
             use_fast=self.args.tokenizer_mode != 'slow')
 
@@ -620,8 +641,21 @@ class LLM:
         logger.info(f"Save model to {engine_dir}")
         if self._engine_dir is None:
             raise RuntimeError("The engine is not built yet.")
-        if self._engine_dir.absolute() != os.path.abspath(engine_dir):
+
+        if self._engine_dir.absolute() == os.path.abspath(engine_dir):
+            return
+
+        if not self.mpi_session or not self.mpi_session.is_comm_session():
             shutil.copytree(self._engine_dir, engine_dir, dirs_exist_ok=True)
+        else:
+            # NFS is fragile, so we copy files one by one
+            target_engine_dir = Path(engine_dir)
+            target_engine_dir.mkdir(parents=True, exist_ok=True)
+            # copy files one by one
+            for file in self._engine_dir.iterdir():
+                print_colored_debug(
+                    f"Copying {file} to {target_engine_dir / file.name}\n")
+                shutil.copy(file, target_engine_dir / file.name)
 
     def shutdown(self) -> None:
         if hasattr(self, "_executor") and self._executor is not None:

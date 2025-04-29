@@ -1616,7 +1616,7 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
         f"{llm_models_root()}/{model_path}",
         "--eagle_model_dir",
         f"{llm_models_root()}/{eagle_model_path}",
-        "--kv_cache_enable_block_reuse",
+        "--disable_kv_cache_reuse",
     ])
 
 
@@ -1643,7 +1643,7 @@ def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
         "--kv_cache_fraction=0.95",
         "--max_batch_size=1",
         "--max_seq_len=3000",
-        "--kv_cache_enable_block_reuse",
+        "--disable_kv_cache_reuse",
     ])
 
 
@@ -1937,7 +1937,8 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
     tllm_logits = []
     for output in outputs:
         prompt = output.prompt
-        tllm_logit = output.context_logits.cpu()
+        tllm_logit = output.context_logits.cpu(
+        )[:, 0]  # drop vocab_size dimension.
         print(f"Prompt: {prompt!r}, Context logits: {tllm_logit}")
         tllm_logits += [tllm_logit]
     # Stack the output
@@ -1992,8 +1993,8 @@ def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
     example_root = Path(os.path.join(llm_root, "examples", "scaffolding"))
     input_file = Path(os.path.join(example_root, "test.jsonl"))
     llm_venv.run_cmd([
-        str(example_root / "aime24_test.py"),
-        "--generation_dir",
+        str(example_root / "run_majority_vote_aime24.py"),
+        "--model_dir",
         f"{llm_models_root()}/{model_path}",
         f"--jsonl_file={input_file}",
         "--threshold=0.5",

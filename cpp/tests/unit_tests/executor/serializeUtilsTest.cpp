@@ -838,3 +838,10 @@ TEST(SerializeUtilsTest, MethodReturnType)
     static_assert(std::is_same_v<int, su::method_return_type_t<decltype(&S::bar)>>);
     static_assert(std::is_same_v<float const&, su::method_return_type_t<decltype(&S::baz)>>);
 }
+
+TEST(SerializeUtilsTest, CacheTransceiverConfig)
+{
+    texec::CacheTransceiverConfig cacheTransceiverConfig(1024);
+    auto cacheTransceiverConfig2 = serializeDeserialize(cacheTransceiverConfig);
+    EXPECT_EQ(cacheTransceiverConfig.getMaxNumTokens(), cacheTransceiverConfig2.getMaxNumTokens());
+}
