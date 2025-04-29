@@ -634,3 +634,53 @@ def get_model_architecture(
 def support_pp(cls: Type) -> Type:
     cls._supports_pp = True
     return cls
+
+
+def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
+    """
+    Rename weight keys according to regex pattern matching.
+
+    Args:
+        pattern_mapping: A dictionary mapping regex patterns to replacement strings. The key is HF name pattern, and the value is corresponding TRT-LLM name pattern.
+            The patterns will be used to match keys in the weights dict and replace
+            them according to the replacement string, which can use regex backreferences.
+            Example:
+            HF name: vision_model.encoder.layers.1.self_attn.out_proj.{weight,bias}
+            TRT-LLM name: vision_model.encoder.layers.1.self_attn.o_proj.{weight,bias}
+            Then the pattern_mapping could be:
+            pattern_mapping = {
+                r'(.*?)out_proj(.*)': r'\1o_proj\2'
+            }
+        weights: A dictionary of weights
+
+    Returns:
+        A dictionary of weights with renamed keys
+    """
+    import re
+
+    # Create a new dictionary to store the renamed weights
+    renamed_weights = {}
+
+    # Keep track of keys that have been matched by a pattern
+    matched_keys = set()
+
+    # Process each key in the weights dictionary
+    for key in list(weights.keys()):
+        # Check each pattern for a match
+        for pattern, replacement in pattern_mapping.items():
+            if re.match(pattern, key):
+                print(
+                    f"matched {key} with {pattern}, replacing with {replacement}"
+                )
+                # Create the new key by applying the regex replacement
+                new_key = re.sub(pattern, replacement, key)
+                # Store the weight with the new key
+                renamed_weights[new_key] = weights[key]
+                matched_keys.add(key)
+                break
+
+        # If the key wasn't matched by any pattern, keep it as is
+        if key not in matched_keys:
+            renamed_weights[key] = weights[key]
+
+    return renamed_weights
