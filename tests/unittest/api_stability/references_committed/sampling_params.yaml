@@ -123,9 +123,12 @@ methods:
         annotation: bool
         default: true
       # Returning controls
-      return_log_probs:
-        annotation: bool
-        default: false
+      logprobs:
+        annotation: Optional[int]
+        default: None
+      prompt_logprobs:
+        annotation: Optional[int]
+        default: None
       return_context_logits:
         annotation: bool
         default: false
