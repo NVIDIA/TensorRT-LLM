@@ -226,14 +226,13 @@ class PyExecutor:
         self.has_context_request = False
         self.ctx_in_transmission_requests = []
         self.previous_batch: Optional[BatchState] = None
+        self.num_scheduled_requests: int = 0
 
         # list of requests in each PP micro batch
         self.num_micro_batches = self.dist.pp_size + enable_overlap_scheduler
         self.micro_batches: List[BatchStatePP
                                  | None] = [None] * self.num_micro_batches
         self.send_handles = [None] * self.num_micro_batches
-        # one handle each for metadata and serialized new_reqs buffer
-        self.send_new_reqs_handle = [None] * 2
 
         self.inflight_req_ids = ReqIdsSet()
         self.canceled_req_ids = ReqIdsSet()
@@ -467,6 +466,7 @@ class PyExecutor:
                     f"currank_total_requests = {self.num_fetch_requests_cur_rank}/{self.num_fetch_requests}, "
                     f"elapsed_time = {end_time - start_time}s, "
                     f"timestamp = {formatted_timestamp}, "
+                    f"num_scheduled_requests: {self.num_scheduled_requests}, "
                     f"states = {self.model_engine.iter_states}")
 
             it += 1
@@ -603,6 +603,13 @@ class PyExecutor:
                     self._merge_dummy_request(num_dummy_request)
                 scheduled_batch, _, _ = self._schedule()
 
+                self.num_scheduled_requests = scheduled_batch.batch_size
+                logger.debug(
+                    f'has {len(self.active_requests)} active_request, '
+                    f'scheduled {len(scheduled_batch.context_requests)} context requests and '
+                    f'{len(scheduled_batch.generation_requests)} generation requests'
+                )
+
                 if self.enable_attention_dp:
                     tp_batch_sizes = self.dist.tp_allgather(
                         scheduled_batch.batch_size)
@@ -697,6 +704,13 @@ class PyExecutor:
                 if num_dummy_request > 0:
                     self._merge_dummy_request(num_dummy_request)
                 scheduled_batch, _, _ = self._schedule()
+
+                self.num_scheduled_requests = scheduled_batch.batch_size
+                logger.debug(
+                    f'has {len(self.active_requests)} active_request, '
+                    f'scheduled {len(scheduled_batch.context_requests)} context requests and '
+                    f'{len(scheduled_batch.generation_requests)} generation requests'
+                )
 
                 if self.enable_attention_dp:
                     tp_batch_sizes = self.dist.tp_allgather(
@@ -849,6 +863,7 @@ class PyExecutor:
                         "fail to schedule any pending request, "
                         "probably run out of resource.")
 
+                self.num_scheduled_requests = scheduled_batch.batch_size
                 logger.debug(
                     f'has {len(self.active_requests)} active_request, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
@@ -988,6 +1003,7 @@ class PyExecutor:
                         "fail to schedule any pending request, "
                         "probably run out of resource.")
 
+                self.num_scheduled_requests = scheduled_batch.batch_size
                 logger.debug(
                     f'has {len(self.active_requests)} active_request, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
@@ -1174,10 +1190,7 @@ class PyExecutor:
             self.dist.recv(metadata_arr, self.dist.prev_pp_rank, tag)
 
         if not self.dist.is_last_pp_rank:
-            if self.send_new_reqs_handle[0] is not None:
-                self.send_new_reqs_handle[0].Wait()
-            self.send_new_reqs_handle[0] = self.dist.isend(
-                metadata_arr, self.dist.next_pp_rank, tag)
+            self.dist.send(metadata_arr, self.dist.next_pp_rank, tag)
 
         # 2. send serialized buffer when new requests is not empty
         num_new_requests = metadata_arr[0]
@@ -1188,10 +1201,7 @@ class PyExecutor:
                 self.dist.recv(buf, self.dist.prev_pp_rank, tag)
 
             if not self.dist.is_last_pp_rank:
-                if self.send_new_reqs_handle[1] is not None:
-                    self.send_new_reqs_handle[1].Wait()
-                self.send_new_reqs_handle[1] = self.dist.isend(
-                    buf, self.dist.next_pp_rank, tag)
+                self.dist.send(buf, self.dist.next_pp_rank, tag)
 
             if not self.dist.is_first_pp_rank:
                 new_requests = dill.loads(buf.tobytes())  # nosec B301

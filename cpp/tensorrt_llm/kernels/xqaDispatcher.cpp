@@ -225,6 +225,7 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
     if (mUseTllmGen)
     {
         TLLM_LOG_DEBUG("Running TRTLLM-GEN generation kernel.");
+        TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
 
         int num_q_heads = params.num_q_heads;
         int num_kv_heads = params.num_kv_heads;
@@ -407,10 +408,9 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         tllmRunnerParams.mScaleQ = params.q_scaling;
         if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
         {
-            auto const [freeMemory, totalMemory] = tensorrt_llm::common::getDeviceMemoryInfo(false);
             // The kv cache should be based on the maximum headDim of K and V due to paddings.
             int maxHeadDimKv = std::max(tllmRunnerParams.mHeadDimQk, tllmRunnerParams.mHeadDimV);
-            tllmRunnerParams.mNumPagesInMemPool = totalMemory
+            tllmRunnerParams.mNumPagesInMemPool = mTllmGenFMHARunner->getTotalDeviceMemory()
                 / (tllmRunnerParams.mNumHeadsKv * tllmRunnerParams.mNumTokensPerPage * maxHeadDimKv
                     * get_size_in_bytes(mFixedParams.kvDataType));
         }
@@ -418,7 +418,6 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         tllmRunnerParams.stream = params.stream;
         tllmRunnerParams.mSfStartTokenIdx = params.start_token_idx_sf;
 
-        TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }
     else

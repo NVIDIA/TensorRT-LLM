@@ -1921,6 +1921,9 @@ skip_post_blackwell = pytest.mark.skipif(
 
 skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
                                   reason="NVLS is not supported")
+skip_no_hopper = pytest.mark.skipif(
+    get_sm_version() != 90,
+    reason="This test is only  supported in Hopper architecture")
 
 
 def skip_fp8_pre_ada(use_fp8):

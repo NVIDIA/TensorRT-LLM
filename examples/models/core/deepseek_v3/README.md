@@ -543,3 +543,7 @@ pytorch_backend_config:
 - **GPU Memory:** Adjust `--max_batch_size` and `--max_num_tokens` if you encounter out-of-memory errors.
 - **Logs:** Check `/workspace/trt_bench.log` for detailed performance information and troubleshooting messages.
 - **Configuration Files:** Verify that the configuration files are correctly formatted to avoid runtime issues.
+
+## Known Issues
+
+- MTP + attention DP + CUDA graph + overlap scheduler might have accuracy issues. We'll fix it later.
