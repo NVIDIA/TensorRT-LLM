@@ -162,18 +162,13 @@ public:
         int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank, bool min_latency_mode,
         torch::optional<c10::ArrayRef<int64_t>> profile_ids)
     {
-        // Free the profile workspace to save memory
-        if (mProfileWorkspace != nullptr)
-        {
-            auto const cu_free_status = cudaFree(mProfileWorkspace);
-            TORCH_CHECK(
-                cu_free_status == cudaSuccess, "Can't free profile workspace for MoE GEMM profile before runMoe.");
-            mProfileWorkspace = nullptr;
-        }
-
         std::lock_guard<std::mutex> lock(mMutex);
 
+        // Free the profile workspace to save memory
+        freeProfileWorkspace();
+
         TORCH_CHECK(cluster_size == 1 && cluster_rank == 0, "smart_router is supported in min_latency mode");
+
         CHECK_INPUT(input, mActivationDtype)
         CHECK_INPUT(token_selected_experts, at::ScalarType::Int)
         if (token_final_scales)
@@ -250,6 +245,9 @@ public:
         torch::optional<c10::ArrayRef<int64_t>> profile_ids)
     {
         std::lock_guard<std::mutex> lock(mMutex);
+
+        // Free the profile workspace to save memory
+        freeProfileWorkspace();
 
         CHECK_INPUT(input, mActivationDtype)
         CHECK_INPUT(token_selected_experts, at::ScalarType::Int)
@@ -381,13 +379,7 @@ public:
                 hidden_size, inter_size, GROUP_SIZE, tensorrt_llm::ActivationType::Swiglu, USE_BIAS, USE_LORA,
                 min_latency_mode, parallelism_config);
 
-            if (mProfileWorkspace != nullptr)
-            {
-                auto const cu_free_status = cudaFree(mProfileWorkspace);
-                TORCH_CHECK(cu_free_status == cudaSuccess,
-                    "Can't free profile workspace for MoE GEMM profile during memory reallocation.");
-                mProfileWorkspace = nullptr;
-            }
+            freeProfileWorkspace();
             size_t profile_workspace_size = mProfiler->getWorkspaceSize(num_rows);
             auto const cu_malloc_status = cudaMalloc(&mProfileWorkspace, profile_workspace_size);
             TORCH_CHECK(cu_malloc_status == cudaSuccess, "Can't allocate profile workspace for MoE GEMM profile.");
@@ -421,6 +413,17 @@ private:
 
     using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
     std::vector<Profile> mAllProfiles;
+
+    void freeProfileWorkspace()
+    {
+        if (mProfileWorkspace != nullptr)
+        {
+            auto const cu_free_status = cudaFree(mProfileWorkspace);
+            TORCH_CHECK(cu_free_status == cudaSuccess,
+                "Can't free profile workspace for MoE GEMM profile during memory reallocation.");
+            mProfileWorkspace = nullptr;
+        }
+    }
 
     void setRunnerProfiles(torch::optional<c10::ArrayRef<int64_t>> profile_ids)
     {

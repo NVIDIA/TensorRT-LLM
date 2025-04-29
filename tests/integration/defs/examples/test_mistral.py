@@ -355,6 +355,7 @@ def test_llm_mistral_v1_smooth_quant_4gpus(llama_example_root,
                         summary_cmd)
 
 
+@skip_pre_ada
 @pytest.mark.parametrize("run_type", ['inference', 'summarization'])
 @pytest.mark.parametrize("mistral_nemo_model_root", ['Mistral-Nemo-12b-Base'],
                          indirect=True)

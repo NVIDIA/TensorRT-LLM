@@ -128,8 +128,8 @@ def fused_moe(
     # TODO: only profile for min_latency_mode = False due to the error in the moe_kernels
     tuning_config = TuningConfig(dynamic_tensors=(
         # input, dim 0, all valid buckets, map a seq_len to power of 2 bucket index
-        (0, 0, ((16384, 8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4,
-                 2, 1), next_positive_power_of_2)),
+        (0, 0, ((8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1),
+                next_positive_power_of_2)),
         # min_latency_tensor, dim 0, (0 for False, 1 for True), map to it self
         (2, 0, ((0, ), lambda x: x)),
     ))

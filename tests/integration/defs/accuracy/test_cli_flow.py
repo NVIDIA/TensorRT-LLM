@@ -19,7 +19,8 @@ from tensorrt_llm.llmapi import (EagleDecodingConfig, LookaheadDecodingConfig,
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (llm_models_root, parametrize_with_ids, skip_no_nvls,
-                        skip_pre_ada, skip_pre_blackwell, skip_pre_hopper)
+                        skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
+                        skip_pre_hopper)
 from .accuracy_core import (MMLU, CliFlowAccuracyTestHarness, CnnDailymail,
                             Humaneval, PassKeyRetrieval64k,
                             PassKeyRetrieval128k, SlimPajama6B, ZeroScrolls)
@@ -57,6 +58,7 @@ class TestGpt2(CliFlowAccuracyTestHarness):
     def test_int8_kv_cache(self):
         self.run(kv_cache_quant_algo=QuantAlgo.INT8)
 
+    @skip_post_blackwell
     @parametrize_with_ids("per_token,per_channel", [(False, False),
                                                     (True, True)])
     def test_smooth_quant(self, per_token: bool, per_channel: bool):
@@ -142,6 +144,7 @@ class TestStarcoder2_15B(CliFlowAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/starcoder2-model"
     EXAMPLE_FOLDER = "models/core/gpt"
 
+    @skip_post_blackwell
     def test_smooth_quant_ootb(self):
         self.run(tasks=[Humaneval(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL)
@@ -194,9 +197,11 @@ class TestPhi2(CliFlowAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/phi-2"
     EXAMPLE_FOLDER = "models/core/phi"
 
+    @skip_post_blackwell
     def test_auto_dtype(self):
         self.run(dtype='auto')
 
+    @skip_post_blackwell
     @pytest.mark.skip_less_device(2)
     def test_tp2(self):
         self.run(tp_size=2)
@@ -316,6 +321,7 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
                  extra_build_args=["--speculative_decoding_mode=medusa"],
                  extra_summarize_args=extra_summarize_args)
 
+    @skip_post_blackwell
     @parametrize_with_ids("cuda_graph,chunked_context,typical_acceptance",
                           [(False, False, False), (True, False, False),
                            (True, True, False), (True, False, True)])
@@ -360,6 +366,7 @@ class TestLlama7B(CliFlowAccuracyTestHarness):
                  extra_build_args=["--max_beam_width=5"],
                  extra_summarize_args=["--num_beams=5"])
 
+    @skip_post_blackwell
     def test_int4_gptq(self):
         self.run(
             quant_algo=QuantAlgo.W4A16_GPTQ,
@@ -386,6 +393,7 @@ class TestLlama2_7B(CliFlowAccuracyTestHarness):
     def test_auto_dtype(self):
         self.run(dtype='auto')
 
+    @skip_post_blackwell
     def test_smooth_quant(self):
         self.run(quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN)
 
@@ -433,14 +441,17 @@ class TestLlama2_7B(CliFlowAccuracyTestHarness):
                  extra_build_args=["--low_latency_gemm_plugin=fp8"])
 
     @pytest.mark.skip_less_device(2)
+    @skip_post_blackwell
     def test_smooth_quant_ootb_tp2(self):
         self.run(quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL, tp_size=2)
 
     @pytest.mark.skip_less_device(2)
+    @skip_post_blackwell
     def test_int4_awq_tp2(self):
         self.run(quant_algo=QuantAlgo.W4A16_AWQ, tp_size=2)
 
     @pytest.mark.skip_less_device(2)
+    @skip_post_blackwell
     def test_int4_awq_prequantized_tp2(self, mocker):
         mocker.patch.object(
             self.__class__, "MODEL_PATH",
@@ -448,6 +459,7 @@ class TestLlama2_7B(CliFlowAccuracyTestHarness):
         self.run(quant_algo=QuantAlgo.W4A16_AWQ, tp_size=2)
 
     @pytest.mark.skip_less_device(2)
+    @skip_post_blackwell
     def test_int4_gptq_prequantized_tp2(self, mocker):
         mocker.patch.object(
             self.__class__, "MODEL_PATH",
@@ -469,16 +481,19 @@ class TestTinyLlama1_1BChat(CliFlowAccuracyTestHarness):
     def test_float32(self):
         self.run(dtype='float32')
 
+    @skip_post_blackwell
     @pytest.mark.parametrize("precision", ["int8", "int4"])
     def test_weight_only(self, precision: str):
         quant_algo = QuantAlgo.W8A16 if precision == "int8" else QuantAlgo.W4A16
         self.run(quant_algo=quant_algo)
 
+    @skip_post_blackwell
     @pytest.mark.parametrize("precision", ["int8", "int4"])
     def test_weight_only_int8_kv_cache(self, precision: str):
         quant_algo = QuantAlgo.W8A16 if precision == "int8" else QuantAlgo.W4A16
         self.run(quant_algo=quant_algo, kv_cache_quant_algo=QuantAlgo.INT8)
 
+    @skip_post_blackwell
     @pytest.mark.parametrize("precision", ["int8", "int4"])
     def test_weight_only_manage_weights(self, precision: str):
         quant_algo = QuantAlgo.W8A16 if precision == "int8" else QuantAlgo.W4A16
@@ -567,6 +582,7 @@ class TestLlama3_1_8B(CliFlowAccuracyTestHarness):
     def test_auto_dtype(self):
         self.run(dtype='auto')
 
+    @skip_post_blackwell
     def test_smooth_quant(self):
         self.run(quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN)
 
@@ -575,12 +591,14 @@ class TestLlama3_1_8B(CliFlowAccuracyTestHarness):
         self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
 
     @skip_pre_ada
+    @skip_post_blackwell
     def test_fp8_rowwise(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
                         MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
 
     @skip_pre_ada
+    @skip_post_blackwell
     def test_fp8_rowwise_meta_recipe(self):
         self.run(quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
                  extra_acc_spec="meta_recipe",
@@ -601,6 +619,7 @@ class TestLlama3_1_8B(CliFlowAccuracyTestHarness):
             extra_build_args=extra_build_args)
 
     @skip_pre_ada
+    @skip_post_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
         "gemm_allreduce", [False, pytest.param(True, marks=skip_no_nvls)],
@@ -646,6 +665,7 @@ class TestLlama3_1_8BInstruct(CliFlowAccuracyTestHarness):
         self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
 
     @skip_pre_ada
+    @skip_post_blackwell
     def test_medusa_fp8_prequantized(self, mocker):
         # nvidia/Llama-3.1-8B-Medusa-FP8
         mocker.patch.object(self.__class__, "MODEL_PATH",
@@ -670,23 +690,29 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
     def test_auto_dtype(self):
         self.run(dtype='auto')
 
+    @skip_post_blackwell
     def test_smooth_quant(self):
         self.run(quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN)
 
+    @skip_post_blackwell
     def test_smooth_quant_ootb(self):
         self.run(quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL)
 
+    @skip_post_blackwell
     def test_smooth_quant_ootb_manage_weights(self):
         self.run(quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL,
                  extra_build_args=["--fast_build"])
 
+    @skip_post_blackwell
     def test_int4_awq(self):
         self.run(quant_algo=QuantAlgo.W4A16_AWQ)
 
+    @skip_post_blackwell
     def test_int4_awq_int8_kv_cache(self):
         self.run(quant_algo=QuantAlgo.W4A16_AWQ,
                  kv_cache_quant_algo=QuantAlgo.INT8)
 
+    @skip_post_blackwell
     def test_int4_awq_manage_weights(self):
         self.run(quant_algo=QuantAlgo.W4A16_AWQ,
                  extra_build_args=["--fast_build"])
@@ -733,10 +759,12 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
                  pp_size=2)
 
     @skip_pre_ada
+    @skip_post_blackwell
     def test_fp8_rowwise(self):
         self.run(quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
 
     @skip_pre_ada
+    @skip_post_blackwell
     def test_fp8_rowwise_meta_recipe(self):
         self.run(quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
                  extra_acc_spec="meta_recipe",
@@ -830,6 +858,7 @@ class TestGemma2B(CliFlowAccuracyTestHarness):
         quant_algo = QuantAlgo.W8A16 if precision == "int8" else QuantAlgo.W4A16
         self.run(quant_algo=quant_algo, extra_convert_args=["--ckpt-type=hf"])
 
+    @skip_post_blackwell
     def test_smooth_quant(self):
         self.run(quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN,
                  extra_convert_args=[
@@ -841,6 +870,7 @@ class TestGemma2B(CliFlowAccuracyTestHarness):
     def test_fp8(self):
         self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
 
+    @skip_post_blackwell
     def test_int4_awq(self):
         self.run(quant_algo=QuantAlgo.W4A16_AWQ)
 
@@ -859,6 +889,7 @@ class TestGemma7B(CliFlowAccuracyTestHarness):
         quant_algo = QuantAlgo.W8A16 if precision == "int8" else QuantAlgo.W4A16
         self.run(quant_algo=quant_algo, extra_convert_args=["--ckpt-type=hf"])
 
+    @skip_post_blackwell
     @pytest.mark.skip_less_device_memory(50000)
     def test_smooth_quant(self):
         self.run(quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN,
@@ -871,6 +902,7 @@ class TestGemma7B(CliFlowAccuracyTestHarness):
     def test_fp8(self):
         self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
 
+    @skip_post_blackwell
     def test_int4_awq(self):
         self.run(quant_algo=QuantAlgo.W4A16_AWQ)
 
@@ -887,6 +919,7 @@ class TestGemma2_9BIt(CliFlowAccuracyTestHarness):
                  dtype='auto',
                  extra_convert_args=["--ckpt-type=hf"])
 
+    @skip_post_blackwell
     @pytest.mark.parametrize("precision", ["int8", "int4"])
     def test_weight_only(self, precision: str):
         quant_algo = QuantAlgo.W8A16 if precision == "int8" else QuantAlgo.W4A16
@@ -910,6 +943,7 @@ class TestQwen7BChat(CliFlowAccuracyTestHarness):
     def test_weight_only(self):
         self.run(quant_algo=QuantAlgo.W8A16)
 
+    @skip_post_blackwell
     def test_int4_gptq_prequantized(self, mocker):
         mocker.patch.object(self.__class__, "MODEL_PATH",
                             f"{llm_models_root()}/Qwen-7B-Chat-Int4")
@@ -938,6 +972,7 @@ class TestQwen2_0_5BInstruct(CliFlowAccuracyTestHarness):
     def test_auto_dtype(self):
         self.run(dtype='auto')
 
+    @skip_post_blackwell
     def test_weight_only(self):
         self.run(quant_algo=QuantAlgo.W8A16)
 
@@ -956,9 +991,11 @@ class TestQwen2_7BInstruct(CliFlowAccuracyTestHarness):
     def test_auto_dtype(self):
         self.run(dtype='auto')
 
+    @skip_post_blackwell
     def test_weight_only(self):
         self.run(quant_algo=QuantAlgo.W8A16)
 
+    @skip_post_blackwell
     def test_int4_awq_prequantized(self, mocker):
         mocker.patch.object(self.__class__, "MODEL_PATH",
                             f"{llm_models_root()}/Qwen2-7B-Instruct-AWQ")
@@ -990,6 +1027,7 @@ class TestQwen2_5_1_5BInstruct(CliFlowAccuracyTestHarness):
     def test_auto_dtype(self):
         self.run(dtype='auto')
 
+    @skip_post_blackwell
     def test_weight_only(self):
         self.run(quant_algo=QuantAlgo.W8A16)
 

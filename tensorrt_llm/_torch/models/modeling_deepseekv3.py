@@ -679,8 +679,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         using_prev_fusion = self.deepseek_allreduce_disabled or hidden_states.size(
             0) > 128
 
-        min_latency_mode = self._enable_latency_mode(hidden_states.size(0))
+        min_latency_mode = self._enable_latency_mode(
+            hidden_states.size(0)) and not using_prev_fusion
 
+        hidden_states_fp4 = None
         if self.fusion_config.PRE_MOE_FUSION:
             # Custom AR Fusion for DeepseekV3
             if using_prev_fusion:

@@ -24,7 +24,8 @@ from defs.conftest import (LLM_GATE_WAY_CLIENT_ID, LLM_GATE_WAY_TOKEN,
                            evaltool_mmlu_post_process,
                            evaltool_mtbench_post_process,
                            evaltool_wikilingua_post_process, get_device_memory,
-                           skip_fp8_pre_ada, skip_pre_ada)
+                           get_sm_version, skip_fp8_pre_ada,
+                           skip_post_blackwell, skip_pre_ada)
 from defs.trt_test_alternative import check_call
 from evaltool.constants import (EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT,
                                 EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT,
@@ -421,6 +422,8 @@ def test_llm_phi_lora_1gpu(data_type, lora_data_type, phi_example_root,
     model_name = 'phi-3-lora'
     if data_type == 'fp8':
         skip_fp8_pre_ada(use_fp8=True)
+        if get_sm_version() >= 100:
+            pytest.skip("FP8 is not supported on post-Blackwell architectures")
         model_dir = quantize_data(
             llm_venv,
             phi_example_root,
@@ -570,6 +573,7 @@ def test_llm_phi_quantization_1gpu(data_type, llm_phi_model_root, llm_venv,
 
 
 @skip_pre_ada
+@skip_post_blackwell
 @pytest.mark.parametrize("llm_phi_model_root", [
     "phi-2", "Phi-3-mini-128k-instruct", "Phi-3-small-128k-instruct",
     "Phi-3.5-mini-instruct", "Phi-3.5-MoE-instruct", "Phi-4-mini-instruct"

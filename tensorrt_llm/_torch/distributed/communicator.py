@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 
 from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_broadcast,
-                                 mpi_comm, mpi_isend, mpi_recv,
+                                 mpi_comm, mpi_isend, mpi_recv, mpi_send,
                                  torch_dtype_to_np)
 from tensorrt_llm.mapping import Mapping
 
@@ -113,6 +113,10 @@ class MPIDist(Distributed):
     def isend(self, buf: np.ndarray, dest, tag=0):
         # non-blocking send numpy buffer
         return mpi_isend(buf, dest, tag)
+
+    def send(self, buf: np.ndarray, dest, tag=0):
+        # blocking send numpy buffer
+        mpi_send(buf, dest, tag)
 
     def recv(self, buf: np.ndarray, src, tag=0):
         # in-place recv numpy buffer
@@ -238,6 +242,7 @@ class PPComm:
     # PP communication using torch.distributed with nccl backend
     def __init__(self, global_mapping: Mapping):
         self.mapping = global_mapping
+        self.send_event = torch.cuda.Event()
         if not dist.is_initialized():
             master_ip = os.getenv("MASTER_ADDR", "localhost")
             master_port = os.getenv("MASTER_PORT", "6000")
