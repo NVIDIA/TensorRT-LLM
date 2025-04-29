@@ -976,11 +976,11 @@ Navigate to the folder `TensorRT-LLM/examples/models/core/multimodal`
 
     ```bash
     export MODEL_NAME="Phi-4-multimodal-instruct" 
-    git clone https://huggingface.co/microsoft/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
-
     export HF_DIR="tmp/hf_models/${MODEL_NAME}"
     export CKPT_DIR="tmp/trt_models/${MODEL_NAME}/fp16/1-gpu"
     export ENGINE_DIR="tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu"
+    git clone https://huggingface.co/microsoft/${MODEL_NAME} ${HF_DIR} 
+
     ```
 
 2. Convert Huggingface weights into TRT-LLM checkpoints and build TRT engines using scripts in `examples/models/core/phi`.
