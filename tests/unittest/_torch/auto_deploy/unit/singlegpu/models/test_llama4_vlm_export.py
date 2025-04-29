@@ -173,11 +173,14 @@ def test_build_run_llama4_vlm():
 
     config = AutoConfig.from_pretrained(model_id)
     config.text_config.num_hidden_layers = 2
+    config.text_config.intermediate_size = 64
+    config.text_config.intermediate_size_mlp = 128
     config.vision_config.num_hidden_layers = 2
+
     # The returned cache <class 'transformers.cache_utils.HybridChunkedCache'> breaks torch.export
     config.text_config.use_cache = False
 
-    model = Llama4ForConditionalGeneration(config).to("cuda").bfloat16()
+    model = Llama4ForConditionalGeneration(config).eval().to("cuda").bfloat16()
 
     img1 = Image.new("RGB", (16, 16), color=(128, 128, 128))
     img2 = Image.new("RGB", (16, 16), color=(64, 64, 64))
@@ -204,25 +207,25 @@ def test_build_run_llama4_vlm():
         .to(torch.bfloat16)
     )
 
+    with torch.inference_mode():
+        out_real = model(inputs["input_ids"], inputs["pixel_values"], inputs["attention_mask"])
+        out_dummy = model(
+            inputs["input_ids"], torch.zeros_like(inputs["pixel_values"]), inputs["attention_mask"]
+        )
+
     gm = torch_export_to_gm(
         model,
         (inputs["input_ids"], inputs["pixel_values"], inputs["attention_mask"]),
         kwargs={},
     )
-
     move_to_device(gm, model.device)
 
     with torch.inference_mode():
         atol = 1e-3
         rtol = 1e-3
 
-        out_real = model(inputs["input_ids"], inputs["pixel_values"], inputs["attention_mask"])
         out_real_gm = gm(inputs["input_ids"], inputs["pixel_values"], inputs["attention_mask"])
         torch.testing.assert_close(out_real.logits, out_real_gm.logits, rtol=rtol, atol=atol)
-
-        out_dummy = model(
-            inputs["input_ids"], torch.zeros_like(inputs["pixel_values"]), inputs["attention_mask"]
-        )
         out_dummy_gm = gm(
             inputs["input_ids"], torch.zeros_like(inputs["pixel_values"]), inputs["attention_mask"]
         )
