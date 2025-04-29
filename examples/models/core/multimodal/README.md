@@ -1005,7 +1005,7 @@ Navigate to the folder `TensorRT-LLM/examples/models/core/multimodal`
 *Note: the encoders are not the TRT engines but are pure Pytorch ones*
 
     ```bash
-    python build_multimodal_engine.py --model_type phi-4-multimodal --model_path ${HF_DIR} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/
+    python build_multimodal_engine.py --model_type phi-4-multimodal --model_path ${HF_DIR} --output_dir ${ENGINE_DIR} 
 
     python run.py \
         --hf_model_dir ${HF_DIR} \
