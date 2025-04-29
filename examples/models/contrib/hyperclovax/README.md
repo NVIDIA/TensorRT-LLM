@@ -9,7 +9,8 @@ See the LLaMA example [`examples/models/core/llama`](../../core/llama) for detai
   - [Support Matrix](#support-matrix)
   - [Supported Models](#supported-models)
     - [HyperClovaX-SEED](#hyperclovax-seed)
-  - [Usage](#usage)
+  - [PyTorch flow](#quick-start-with-pytorch-flow)
+  - [TRT flow](#trt-flow)
     - [Convert checkpoint and build TensorRT engine(s)](#convert-checkpoint-and-build-tensorrt-engines)
     - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
     - [SmoothQuant](#smoothquant)
@@ -36,7 +37,23 @@ export MODEL_NAME=HyperCLOVAX-SEED-Text-Instruct-0.5B
 git clone https://huggingface.co/naver-hyperclovax/HyperCLOVAX-SEED-Text-Instruct-0.5B hf_models/$MODEL_NAME
 ```
 
-## Usage
+## Quick Start with PyTorch flow
+
+To quickly run HyperCLOVAX-SEED, you can use [examples/pytorch/quickstart_advanced.py](../../../pytorch/quickstart_advanced.py):
+
+```bash
+python ../../../pytorch/quickstart_advanced.py --model_dir hf_models/$MODEL_NAME
+```
+
+The output will be like:
+```bash
+[0] Prompt: 'Hello, my name is', Generated text: ' [name] and I am a [position] at [company name]. I am interested in learning more about the [industry] and would like to discuss this further with you. I would appreciate it if you could provide me with a list of questions to ask you. Here are some questions that I would like to ask'
+[1] Prompt: 'The president of the United States is', Generated text: ' the head of the executive branch, which is responsible for the day-to-day administration of the country. The president is the head of the executive branch, which is responsible for the day-to-day administration of the country. The president is the head of the executive branch, which is responsible for the day-to-day administration of the'
+[2] Prompt: 'The capital of France is', Generated text: ' Paris, which is the largest city in the country. It is home to the Eiffel Tower, the Louvre Museum, and Notre-Dame Cathedral. Paris is also known for its rich history, cultural heritage, and culinary delights. The city is a hub for art, fashion, and entertainment, and is home'
+[3] Prompt: 'The future of AI is', Generated text: " not just about technology, but about how we use it to improve our lives. It's about creating a world where technology and humanity work together to solve complex problems, make decisions, and enhance our quality of life. As we continue to develop and integrate AI into our daily lives, it's essential to consider the ethical implications"
+```
+
+## TRT flow
 The next section describe how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format. We will use llama's [convert_checkpoint.py](../../core/llama/convert_checkpoint.py) for HyperClovaX model and then we build the model with `trtllm-build`.
 
 ### Convert checkpoint and build TensorRT engine(s)

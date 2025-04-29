@@ -425,31 +425,6 @@ def llm_exaone_model_root(request) -> str:
 
 
 @pytest.fixture(scope="module")
-def hyperclovax_example_root(llm_root, llm_venv):
-    "Get HyperCLOVAX example root"
-    example_root = os.path.join(llm_root, "examples", "models", "contrib",
-                                "hyperclovax")
-
-    return example_root
-
-
-@pytest.fixture(scope="function")
-def llm_hyperclovax_model_root(request) -> str:
-    "Get HyperCLOVAX model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    if hasattr(request, "param"):
-        if request.param == "hyperclovax_seed_text_instruct_0.5b":
-            hyperclovax_model_root = os.path.join(
-                models_root, "HyperCLOVAX-SEED-Text-Instruct-0.5B")
-
-    assert exists(
-        hyperclovax_model_root), f"{hyperclovax_model_root} does not exist!"
-    return hyperclovax_model_root
-
-
-@pytest.fixture(scope="module")
 def falcon_example_root(llm_root, llm_venv):
     "Get falcon example root"
     example_root = os.path.join(llm_root, "examples", "models", "contrib",
