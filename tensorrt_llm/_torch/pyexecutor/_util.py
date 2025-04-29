@@ -316,6 +316,7 @@ def create_py_executor_instance(dist,
                                 ctx_chunk_config,
                                 model_engine,
                                 draft_model_engine,
+                                pld_pool,
                                 start_worker,
                                 lora_config: LoraConfig = None):
     spec_config = model_engine.spec_config
@@ -448,4 +449,5 @@ def create_py_executor_instance(dist,
                       if spec_config is not None else 0,
                       kv_cache_transceiver=kv_cache_transceiver,
                       draft_model_engine=draft_model_engine,
+                      pld_pool=pld_pool,
                       start_worker=start_worker)

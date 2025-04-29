@@ -13,6 +13,7 @@ class SpeculativeDecodingMode(IntEnum):
     MTP = auto()
     MTP_EAGLE = auto()
     EAGLE3 = auto()
+    NGRAM = auto()
     NONE = auto()
 
     def is_mtp(self):
@@ -23,6 +24,9 @@ class SpeculativeDecodingMode(IntEnum):
 
     def is_eagle3(self):
         return self == SpeculativeDecodingMode.EAGLE3
+
+    def is_ngram(self):
+        return self == SpeculativeDecodingMode.NGRAM
 
     def is_none(self):
         return self == SpeculativeDecodingMode.NONE

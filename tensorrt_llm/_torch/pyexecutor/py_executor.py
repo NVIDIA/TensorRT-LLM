@@ -33,6 +33,8 @@ from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
 from .model_engine import ModelEngine
 from .scheduler import ScheduledRequests
 
+from ..speculative import PLDPool
+
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
 PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
@@ -164,6 +166,7 @@ class PyExecutor:
                  max_draft_tokens: int = 0,
                  kv_cache_transceiver: KvCacheTransceiver = None,
                  draft_model_engine: Optional[ModelEngine] = None,
+                 pld_pool: Optional[PLDPool] = None,
                  start_worker: bool = True):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
@@ -186,6 +189,8 @@ class PyExecutor:
 
         # Draft model for certain spec decode algorithms, e.g. EAGLE3
         self.draft_model_engine = draft_model_engine
+        # PLDPool for ngram spec decode algorithm
+        self.pld_pool = pld_pool
 
         # enqueue and _fetch_new_requests used data
         self.enqueue_lock = threading.Lock()
@@ -817,7 +822,7 @@ class PyExecutor:
                 if num_dummy_request > 0:
                     self._merge_dummy_request(num_dummy_request)
 
-                if self.draft_model_engine is not None:
+                if self.draft_model_engine is not None or self.pld_pool is not None:
                     self._prepare_draft_requests()
 
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
@@ -845,6 +850,8 @@ class PyExecutor:
                     self.resource_manager.prepare_resources(scheduled_batch)
                     if self.draft_model_engine is not None:
                         self._prepare_draft_tokens(scheduled_batch)
+                    if self.pld_pool is not None:
+                        self._generate_ngram_draft_tokens(scheduled_batch)
 
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -852,6 +859,9 @@ class PyExecutor:
                             scheduled_batch)
 
                     batch_outputs = self._forward_step(scheduled_batch)
+                    if not isinstance(batch_outputs, dict):
+                        batch_outputs = {'logits': batch_outputs}
+                        print("batch_outputs=",batch_outputs)
 
                     ctx_transmission_reqs = self._send_disagg_ctx_cache(
                         scheduled_batch.context_requests
@@ -1644,6 +1654,60 @@ class PyExecutor:
     def _update_requests(self, decoder_state: DecoderState):
         try:
             self.decoder.update_requests(decoder_state)
+        except Exception as e:
+            traceback.print_exc()
+            error_msg = str(e)
+            logger.error(f"Encountered an error in decode: {error_msg}")
+            self._handle_errors(error_msg)
+
+    @nvtx_range("_generate_ngram_draft_tokens")
+    def _generate_ngram_draft_tokens(
+        self, scheduled_requests: ScheduledRequests
+    ) -> Tuple[ScheduledRequests, Dict[int, LlmRequest]]:
+        """
+        Prepares a batch for the draft model engine. Draft tokens are only produced
+        for generation requests.
+
+        The requests are prepared as follows:
+        1. The first time the draft engine sees a request, it's a context request.
+        2. Otherwise, if draft tokens were accepted on the last target model decoding
+        step, it's a chunked context request (we process all the accepted tokens together).
+        3. Otherwise, it's a generation request.
+        """
+        try:
+            req_id_to_num_rejected_tokens = {}
+
+            for request in scheduled_requests.generation_requests:
+                if request.py_draft_pages_allocated == 0:
+                    # No space for draft tokens.
+                    continue
+
+                num_draft_tokens = len(
+                    request.py_last_draft_tokens
+                ) if request.py_last_draft_tokens is not None else 0
+                request.py_draft_tokens = []
+
+                num_accepted_tokens = getattr(request,
+                                              "py_num_accepted_draft_tokens", 0)
+                num_rejected_tokens = num_draft_tokens - num_accepted_tokens
+                print("num_accepted_tokens=",num_accepted_tokens," num_rejected_tokens=",num_rejected_tokens)
+                assert num_rejected_tokens >= 0
+                req_id_to_num_rejected_tokens[
+                    request.py_request_id] = num_rejected_tokens
+
+                spec_config = self.model_engine.spec_config
+                beam_idx = 0
+                input_tokens = spec_config.get_draft_model_prompt(
+                    request.get_tokens()[beam_idx])
+
+                # TODO: Generate draft tokens. Add to request
+                draft_tokens, _ = self.pld_pool.get_draft_tokens([input_tokens], [0], [request.py_end_id])
+                draft_tokens = draft_tokens[0]
+                print("input_tokens=",input_tokens[-10:]," draft_tokens=",draft_tokens)
+                request.py_draft_tokens = draft_tokens
+
+            return req_id_to_num_rejected_tokens
+
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
