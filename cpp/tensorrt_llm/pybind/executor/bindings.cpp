@@ -29,8 +29,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "tensorCaster.h"
-
 #include <optional>
 
 namespace py = pybind11;
@@ -51,6 +49,8 @@ void instantiateEventDiff(pybind11::module& m, std::string const& name)
 void initBindings(pybind11::module_& m)
 {
     m.attr("__version__") = tle::version();
+    py::class_<tle::Tensor>(m, "Tensor");
+
     py::enum_<tle::ModelType>(m, "ModelType")
         .value("DECODER_ONLY", tle::ModelType::kDECODER_ONLY)
         .value("ENCODER_ONLY", tle::ModelType::kENCODER_ONLY)
