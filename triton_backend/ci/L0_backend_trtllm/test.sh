@@ -126,7 +126,7 @@ function wait_for_server_terminated {
         done
         if [ "$WAIT_RET" != "0" ]; then
             # Cleanup
-            kill -9 $SERVER_PID > /dev/null 2>&1 || true
+            kill $SERVER_PID > /dev/null 2>&1 || true
             # Fix graceful shutdown issue
             # echo -e "\n***\n*** Failed to wait for server to terminated $SERVER\n***"
             # cat $SERVER_LOG
