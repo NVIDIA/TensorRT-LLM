@@ -18,7 +18,6 @@ from ..modules.fused_moe import DefaultMoeRoutingMethod, FusedMoE
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, duplicate_kv_weight, register_auto_model
-from .modeling_qwen3 import Qwen3RMSNorm
 
 
 class Qwen3MoE(nn.Module):
@@ -104,8 +103,14 @@ class Qwen3MoEAttention(Attention):
             config=model_config,
         )
 
-        self.q_norm = Qwen3RMSNorm(hidden_size=self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen3RMSNorm(hidden_size=self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = RMSNorm(hidden_size=self.head_dim,
+                                   eps=1e-6,
+                                   dtype=config.torch_dtype,
+                                   has_weights=True)
+        self.k_norm = RMSNorm(hidden_size=self.head_dim,
+                                   eps=1e-6,
+                                   dtype=config.torch_dtype,
+                                   has_weights=True)
 
 
 class Qwen3MoEDecoderLayer(DecoderLayer):
