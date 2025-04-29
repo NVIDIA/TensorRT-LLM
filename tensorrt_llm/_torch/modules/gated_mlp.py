@@ -80,6 +80,7 @@ class GatedMLP(nn.Module):
             # During llama4, we are using the custom kernel that performs FC+SwiGLU
             # in one kernel.
             # use_llama4_fc_swiglu=is_llama4,
+            # We are replacing the llama4_fc_swiglu with trtllm-gen kernel
             use_trtllm_gen_fc_swiglu=is_llama4,
         )
 
@@ -125,12 +126,10 @@ class GatedMLP(nn.Module):
                     # fp8 in and fp8 out. Since next gemm is also fp8, we will need to feed
                     # the next gemm layer's input_scale inverse to the current layer as output
                     # scaling factor.
-                    print("Using Po-Han custom kernel")
                     h2 = self.gate_up_proj(
                         x, inv_input_scale=self.down_proj.inv_input_scale)
                 else:
                     # Using trtllm-gen kernel for FC+SwiGLU
-                    print("Using trtllm-gen kernel")
                     h2 = self.gate_up_proj(x)
             else:
                 h1 = self.gate_up_proj(x)
