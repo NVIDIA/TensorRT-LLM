@@ -1699,9 +1699,15 @@ class PyExecutor:
 
                 # TODO: Generate draft tokens. Add to request
                 draft_tokens, _ = self.pld_pool.get_draft_tokens([input_tokens], [0], [request.py_end_id])
-                draft_tokens = draft_tokens[0]
-                print("input_tokens=",input_tokens[-10:]," draft_tokens=",draft_tokens)
-                request.py_draft_tokens = draft_tokens
+                draft_tokens = list(draft_tokens[0])
+                max_draft_tokens = self.pld_pool.plnt
+                num_draft_tokens = len(draft_tokens)
+                if num_draft_tokens > 1 or draft_tokens[0] != request.py_end_id:
+                    if num_draft_tokens < max_draft_tokens:
+                        # pad to max_draft_tokens
+                        draft_tokens.extend(0 for _ in range(max_draft_tokens - num_draft_tokens))
+                    print("input_tokens=",input_tokens[-10:]," draft_tokens=",draft_tokens)
+                    request.py_draft_tokens = draft_tokens
 
             return req_id_to_num_rejected_tokens
 
