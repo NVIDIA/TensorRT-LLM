@@ -334,29 +334,51 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (False, True, False), (False, False, True),
                            (True, True, True)])
     @parametrize_with_ids("mtp_nextn", [None, 2])
-    def test_fp8_block_scales(self, mtp_nextn, attention_dp, cuda_graph,
+    @parametrize_with_ids(
+        "fp8kv", [False, pytest.param(True, marks=skip_pre_hopper)])
+    def test_fp8_block_scales(self, fp8kv, mtp_nextn, attention_dp, cuda_graph,
                               overlap_scheduler):
+        # Reduce the test cases for fp8kv=True
+        if fp8kv and not (cuda_graph and overlap_scheduler):
+            pytest.skip(
+                "FP8 KV cache tests only run with cuda_graph=True and overlap_scheduler=True"
+            )
+
         # OOM on H100 with default free_gpu_memory_fraction=0.9
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)
+
+        quant_config = QuantConfig()
+        quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+        if fp8kv:
+            quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            pytorch_config.kv_cache_dtype = "fp8"
+
         if mtp_nextn is not None and mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
         else:
             mtp_config = None
+
         llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
                   kv_cache_config=kv_cache_config,
                   pytorch_backend_config=pytorch_config,
+                  quant_config=quant_config,
                   enable_attention_dp=attention_dp,
                   speculative_config=mtp_config)
+
         assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+        if fp8kv:
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
         with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            if attention_dp and cuda_graph and overlap_scheduler:
+            if not fp8kv:  # No need to run these tests for fp8kv=True
+                task = CnnDailymail(self.MODEL_NAME)
+                task.evaluate(llm)
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm)
+            if (attention_dp and cuda_graph and overlap_scheduler) or fp8kv:
                 task = GSM8K(self.MODEL_NAME)
                 task.evaluate(llm)
 
@@ -367,36 +389,58 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (False, True, False), (False, False, True),
                            (True, True, True)])
     @parametrize_with_ids("mtp_nextn", [None, 2])
+    @parametrize_with_ids(
+        "fp8kv", [False, pytest.param(True, marks=skip_pre_hopper)])
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
                                                          (2, 2, 1), (1, 4, 1)],
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
-    def test_fp8_block_scales_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
-                                    attention_dp, cuda_graph,
+    def test_fp8_block_scales_4gpus(self, tp_size, pp_size, ep_size, fp8kv,
+                                    mtp_nextn, attention_dp, cuda_graph,
                                     overlap_scheduler):
+        # Reduce the test cases for fp8kv=True
+        if fp8kv and not (cuda_graph and overlap_scheduler):
+            pytest.skip(
+                "FP8 KV cache tests only run with cuda_graph=True and overlap_scheduler=True"
+            )
+
         # OOM on H100 with default free_gpu_memory_fraction=0.9
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)
+
+        quant_config = QuantConfig()
+        quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+        if fp8kv:
+            quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            pytorch_config.kv_cache_dtype = "fp8"
+
         if mtp_nextn is not None and mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
         else:
             mtp_config = None
+
         llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
                   tensor_parallel_size=tp_size,
                   pipeline_parallel_size=pp_size,
                   moe_expert_parallel_size=ep_size,
                   kv_cache_config=kv_cache_config,
                   pytorch_backend_config=pytorch_config,
+                  quant_config=quant_config,
                   enable_attention_dp=attention_dp,
                   speculative_config=mtp_config)
+
         assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+        if fp8kv:
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
         with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            if attention_dp and cuda_graph and overlap_scheduler:
+            if not fp8kv:  # No need to run these tests for fp8kv=True
+                task = CnnDailymail(self.MODEL_NAME)
+                task.evaluate(llm)
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm)
+            if (attention_dp and cuda_graph and overlap_scheduler) or fp8kv:
                 task = GSM8K(self.MODEL_NAME)
                 task.evaluate(llm)
 
@@ -405,20 +449,41 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                           [(False, False, False), (True, False, False),
                            (False, True, False), (False, False, True),
                            (True, True, True)])
-    def test_nvfp4(self, attention_dp, cuda_graph, overlap_scheduler):
+    @parametrize_with_ids(
+        "fp8kv", [False, pytest.param(True, marks=skip_pre_hopper)])
+    def test_nvfp4(self, fp8kv, attention_dp, cuda_graph, overlap_scheduler):
+        # Reduce the test cases for fp8kv=True
+        if fp8kv and not (cuda_graph and overlap_scheduler):
+            pytest.skip(
+                "FP8 KV cache tests only run with cuda_graph=True and overlap_scheduler=True"
+            )
+
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)
+
+        quant_config = QuantConfig()
+        quant_config.quant_algo = QuantAlgo.NVFP4
+        if fp8kv:
+            quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            pytorch_config.kv_cache_dtype = "fp8"
+
         llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only",
                   pytorch_backend_config=pytorch_config,
+                  quant_config=quant_config,
                   enable_attention_dp=attention_dp)
+
         assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+        if fp8kv:
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
         with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            if attention_dp and cuda_graph and overlap_scheduler:
+            if not fp8kv:  # No need to run these tests for fp8kv=True
+                task = CnnDailymail(self.MODEL_NAME)
+                task.evaluate(llm)
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm)
+            if (attention_dp and cuda_graph and overlap_scheduler) or fp8kv:
                 task = GSM8K(self.MODEL_NAME)
                 task.evaluate(llm)
 
@@ -428,27 +493,48 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                           [(False, False, False), (True, False, False),
                            (False, True, False), (False, False, True),
                            (True, True, True)])
+    @parametrize_with_ids(
+        "fp8kv", [False, pytest.param(True, marks=skip_pre_hopper)])
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
                                                          (2, 2, 1), (1, 4, 1)],
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
-    def test_nvfp4_4gpus(self, tp_size, pp_size, ep_size, attention_dp,
+    def test_nvfp4_4gpus(self, tp_size, pp_size, ep_size, fp8kv, attention_dp,
                          cuda_graph, overlap_scheduler):
+        # Reduce the test cases for fp8kv=True
+        if fp8kv and not (cuda_graph and overlap_scheduler):
+            pytest.skip(
+                "FP8 KV cache tests only run with cuda_graph=True and overlap_scheduler=True"
+            )
+
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)
+
+        quant_config = QuantConfig()
+        quant_config.quant_algo = QuantAlgo.NVFP4
+        if fp8kv:
+            quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            pytorch_config.kv_cache_dtype = "fp8"
+
         llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only",
                   tensor_parallel_size=tp_size,
                   pipeline_parallel_size=pp_size,
                   moe_expert_parallel_size=ep_size,
                   pytorch_backend_config=pytorch_config,
+                  quant_config=quant_config,
                   enable_attention_dp=attention_dp)
+
         assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+        if fp8kv:
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
         with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            if attention_dp and cuda_graph and overlap_scheduler:
+            if not fp8kv:  # No need to run these tests for fp8kv=True
+                task = CnnDailymail(self.MODEL_NAME)
+                task.evaluate(llm)
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm)
+            if (attention_dp and cuda_graph and overlap_scheduler) or fp8kv:
                 task = GSM8K(self.MODEL_NAME)
                 task.evaluate(llm)
 
