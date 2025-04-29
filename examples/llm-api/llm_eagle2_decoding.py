@@ -36,8 +36,8 @@ def main():
         max_draft_len=63,
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
-        use_dynamic_tree=True, # Eagle-2 arg
-        dynamic_tree_max_topK=10 # Eagle-2 arg
+        use_dynamic_tree=True,  # Eagle-2 arg
+        dynamic_tree_max_topK=10  # Eagle-2 arg
     )
 
     llm = LLM(model=model,
