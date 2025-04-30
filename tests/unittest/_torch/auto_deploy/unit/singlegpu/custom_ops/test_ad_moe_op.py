@@ -4,14 +4,16 @@ import sys
 import pytest
 import torch
 import torch.nn.functional as F
-from _torch_test_utils import fp8_compatible, fp4_compatible, trtllm_ops_available
+from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_available
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.modules.fused_moe import MoE  # noqa: F401
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 from helpers import reference_moe_torch
+
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale
+
 
 def setup_moe_test(dtype, num_experts):
     SEQ_LEN = 8
@@ -269,9 +271,7 @@ def test_fp4_moe_op_run(dtype):
             w2_alpha,
             w3_alpha,
         )
-        ref_output = reference_moe_torch(
-            x, selected_experts, final_scales, num_experts, weights
-        )
+        ref_output = reference_moe_torch(x, selected_experts, final_scales, num_experts, weights)
 
     torch.cuda.synchronize()
     rtol, atol = 1.5, 1.0
