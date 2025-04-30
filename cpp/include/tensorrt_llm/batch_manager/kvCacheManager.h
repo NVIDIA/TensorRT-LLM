@@ -567,7 +567,7 @@ public:
 
     //! \brief Update the sequence blocks when a new token is added or removed
     void updateSequenceBlocks(GenerationRequest& sequence, bool const addToken, SizeType32 const sinkBlockTokenLength,
-        bool const isCrossKv, bool const enableBlockReuse, WindowSizeMetadata const& metadata);
+        bool const enableBlockReuse, WindowSizeMetadata const& metadata);
 
     [[nodiscard]] SizeType32 getWindowSize() const noexcept
     {
@@ -886,7 +886,7 @@ public:
     void cacheBlockOffsets(GenerationRequest& sequence, SizeType32 windowSize) const;
 
     void updateSequenceBlocks(GenerationRequest& sequence, bool const addToken, SizeType32 const sinkBlockTokenLength,
-        bool const isCrossKv, bool const enableBlockReuse);
+        bool const enableBlockReuse);
 
     // WILL NOT WORK FOR VARIABLE WINDOW ATTENTION
     [[nodiscard]] std::optional<BlockKey> findNewContextBlock(

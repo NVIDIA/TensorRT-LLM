@@ -1816,18 +1816,17 @@ void WindowBlockManager::cacheNewBlockOffsets(GenerationRequest& sequence) const
 }
 
 void BlockManager::updateSequenceBlocks(GenerationRequest& sequence, bool const addToken,
-    SizeType32 const sinkBlockTokenLength, bool const isCrossKv, bool const enableBlockReuse)
+    SizeType32 const sinkBlockTokenLength, bool const enableBlockReuse)
 {
     for (auto const& [windowSize, metadata] : mWindowSizeToMetadata)
     {
         auto& manager = mWindowBlockManagers.at(windowSize);
-        manager.updateSequenceBlocks(sequence, addToken, sinkBlockTokenLength, isCrossKv, enableBlockReuse, metadata);
+        manager.updateSequenceBlocks(sequence, addToken, sinkBlockTokenLength, enableBlockReuse, metadata);
     }
 }
 
 void WindowBlockManager::updateSequenceBlocks(GenerationRequest& sequence, bool const addToken,
-    SizeType32 const sinkBlockTokenLength, bool const isCrossKv, bool const enableBlockReuse,
-    WindowSizeMetadata const& metadata)
+    SizeType32 const sinkBlockTokenLength, bool const enableBlockReuse, WindowSizeMetadata const& metadata)
 {
     auto const newNumTokens = sequence.getNumTokens();
     auto const prevNumTokens = newNumTokens + (addToken ? (-1) : 1);
@@ -1835,7 +1834,7 @@ void WindowBlockManager::updateSequenceBlocks(GenerationRequest& sequence, bool 
     if (addToken)
     {
         auto const isBlockBoundary = (prevNumTokens % getTokensPerBlock() == 0);
-        auto const shouldAllocateBlock = isBlockBoundary && (!isCrossKv || newNumTokens <= metadata.maxTokenNum);
+        auto const shouldAllocateBlock = isBlockBoundary;
 
         auto const numTokensWithoutSink = newNumTokens - sinkBlockTokenLength;
         auto const minTokensForBlockDetach = metadata.numNonSinkTokensInWindow + getTokensPerBlock();
@@ -1871,6 +1870,7 @@ void WindowBlockManager::updateSequenceBlocks(GenerationRequest& sequence, bool 
 
 void KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
 {
+    TLLM_CHECK_WITH_INFO(!isCrossKv(), "Update token is not supported with cross kv cache");
     if (addToken)
     {
         sequence.addNewTokens(1);
@@ -1880,7 +1880,7 @@ void KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
         sequence.removeTokens(1);
     }
 
-    mBlockManager.updateSequenceBlocks(sequence, addToken, mSinkBlockTokenLength, isCrossKv(), mEnableBlockReuse);
+    mBlockManager.updateSequenceBlocks(sequence, addToken, mSinkBlockTokenLength, mEnableBlockReuse);
 }
 
 void KVCacheManager::addToken(RequestIdType requestId)
