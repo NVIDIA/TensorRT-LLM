@@ -16,6 +16,7 @@ build
 tmp/
 venv/
 .venv/
+.venv-*/
 .python-version
 .local/
 .hypothesis/
@@ -32,6 +33,7 @@ config.json
 /*.svg
 cpp/cmake-build-*
 cpp/.ccache
+cpp/.conan
 tensorrt_llm/bin
 tensorrt_llm/include
 tensorrt_llm/libs
