@@ -16,6 +16,7 @@ from utils.util import force_ampere
 
 @force_ampere
 def test_tinyllama_guided_decoding():
+    pytest.skip(reason="https://nvbugs/5240350")
     tinyllama_guided_decoding_test_harness(backend="pytorch")
 
 
