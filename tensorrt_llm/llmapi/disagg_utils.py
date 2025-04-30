@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, List, Literal, Optional, Tuple
 
 import yaml
@@ -14,7 +15,10 @@ __all__ = [
     'split_world_comm',
 ]
 
-
+class ServerRole(Enum):
+    CONTEXT = 0
+    GENERATION = 1
+    
 @dataclass
 class CtxGenServerConfig():
     type: Literal['ctx', 'gen']
@@ -28,6 +32,7 @@ class CtxGenServerConfig():
 class RouterConfig():
     type: str = "round_robin"
     args: dict = field(default_factory=dict)
+    server_role: ServerRole = None
 
 
 @dataclass
@@ -50,6 +55,7 @@ class MetadataServerConfig():
     server_type: Literal['etcd']
     hostname: str = "localhost"
     port: int = 2379
+
 
 
 def parse_disagg_config_file(yaml_config_file: str):
@@ -92,6 +98,9 @@ def extract_disagg_cfg(hostname: str = 'localhost',
 
     ctx_router_config = extract_router_config(context_servers)
     gen_router_config = extract_router_config(generation_servers)
+    ctx_router_config.server_role = ServerRole.CONTEXT
+    gen_router_config.server_role = ServerRole.GENERATION
+    
     conditional_disagg_config = ConditionalDisaggConfig(
         **conditional_disagg_config) if conditional_disagg_config else None
 

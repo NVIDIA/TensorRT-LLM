@@ -19,7 +19,7 @@ from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.llmapi import LLM
-from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig
+from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig, ServerRole
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.chat_utils import (ConversationMessage,
@@ -51,6 +51,7 @@ class OpenAIServer:
     def __init__(self,
                  llm: LLM,
                  model: str,
+                 server_role: Optional[ServerRole],
                  metadata_server_cfg: MetadataServerConfig):
         self.llm = llm
         self.tokenizer = llm.tokenizer
@@ -76,17 +77,18 @@ class OpenAIServer:
                 metadata = {
                     "model": self.model,
                     "version": VERSION,
-                    "timestamp": datetime.now().isoformat()
+                    "timestamp": datetime.now().isoformat(),
+                    "server_role": server_role.name
                 }
                 # TODO: add more metadata
-                self.metadata_server.put(f"trtllm/{self.llm.llm_id}/metadata", metadata)
+                self.metadata_server.put(f"trtllm/{self.llm.llm_id}", metadata)
                 logger.info(f"trtllm/{self.llm.llm_id} is registered")
 
             # terminate rank0 worker
             yield
 
             if self.metadata_server is not None:
-                self.metadata_server.remove(f"trtllm/{self.llm.llm_id}/metadata")
+                self.metadata_server.remove(f"trtllm/{self.llm.llm_id}")
                 logger.info(f"trtllm/{self.llm.llm_id} is unregistered")
             self.llm.shutdown()
 
