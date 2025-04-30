@@ -48,7 +48,8 @@ class Attention(nn.Module):
             self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_heads = num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = max_position_embeddings
+        # self.max_position_embeddings = max_position_embeddings
+        self.max_position_embeddings = None
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
 
