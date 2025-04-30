@@ -550,7 +550,11 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)
+
+        quant_config = QuantConfig()
+        quant_config.quant_algo = QuantAlgo.NVFP4
         if fp8kv:
+            quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             pytorch_config.kv_cache_dtype = "fp8"
 
         if mtp_nextn is not None and mtp_nextn > 0:
@@ -563,6 +567,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                   moe_expert_parallel_size=ep_size,
                   kv_cache_config=kv_cache_config,
                   pytorch_backend_config=pytorch_config,
+                  quant_config=quant_config,
                   enable_attention_dp=attention_dp,
                   speculative_config=mtp_config)
         assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
@@ -592,7 +597,11 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)
+
+        quant_config = QuantConfig()
+        quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
         if fp8kv:
+            quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             pytorch_config.kv_cache_dtype = "fp8"
 
         if mtp_nextn is not None and mtp_nextn > 0:
@@ -606,6 +615,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                   moe_expert_parallel_size=ep_size,
                   kv_cache_config=kv_cache_config,
                   pytorch_backend_config=pytorch_config,
+                  quant_config=quant_config,
                   enable_attention_dp=attention_dp,
                   speculative_config=mtp_config)
         assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
