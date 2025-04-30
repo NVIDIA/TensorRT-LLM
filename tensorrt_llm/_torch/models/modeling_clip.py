@@ -24,11 +24,6 @@ class CLIPAttention(Attention):
                  layer_idx: int):
         config = model_config.pretrained_config
         pos_embd_params = None
-
-        # Vision model has class token
-        #num_patches = (config.image_size // config.patch_size)**2
-
-        #FIXME: max_position_embeddings seems to be unused
         max_position_embeddings = None
 
         # CLIP uses bias in attention QKV projections
@@ -37,7 +32,8 @@ class CLIPAttention(Attention):
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_attention_heads,  # CLIP uses MHA
-            max_position_embeddings=max_position_embeddings,
+            max_position_embeddings=
+            max_position_embeddings,  # does not matter for CLIP
             bias=bias,
             pos_embd_params=pos_embd_params,
             layer_idx=layer_idx,

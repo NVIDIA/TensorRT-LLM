@@ -1,14 +1,19 @@
 import copy
+import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
-from transformers import (AutoModel, AutoProcessor, LlavaNextConfig,
-                          LlavaNextForConditionalGeneration, PretrainedConfig,
-                          PreTrainedModel)
+import torch.nn as nn
+from transformers import (AutoConfig, AutoModel, AutoProcessor, LlavaNextConfig,
+                          PretrainedConfig, PreTrainedModel)
+from transformers.modeling_utils import load_sharded_checkpoint
+from transformers.models.llava_next.modeling_llava_next import \
+    LlavaNextMultiModalProjector
 
 from ..._utils import nvtx_range
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
                        register_input_processor)
+from ...llmapi.utils import download_hf_model
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
@@ -28,16 +33,39 @@ class LlavaNextInputProcessor(InputProcessor):
         self.model_config = model_config
 
         self.device = 'cuda'
-        model = LlavaNextForConditionalGeneration.from_pretrained(
-            model_path,
-            torch_dtype=model_config.text_config.torch_dtype).to(self.device)
+
+        # Determine the actual local path for model files
+        if os.path.isdir(model_path):
+            local_model_path = model_path
+        else:
+            local_model_path = download_hf_model(model_path)
+
+        # Partially load the model to reduce memory usage(Vision tower and multi-modal projector)
+        hf_model_config = AutoConfig.from_pretrained(local_model_path)
+        self.dtype = hf_model_config.text_config.torch_dtype
+        module_dict = nn.ModuleDict({
+            "vision_tower":
+            AutoModel.from_config(hf_model_config.vision_config),
+            "multi_modal_projector":
+            LlavaNextMultiModalProjector(hf_model_config)
+        })
+        missing_keys, _ = load_sharded_checkpoint(module_dict,
+                                                  local_model_path,
+                                                  strict=False)
+        assert len(missing_keys) == 0, f"Missing keys: {missing_keys}"
+        hf_vision_tower = module_dict["vision_tower"].to(self.dtype)
+        hf_mm_projector = module_dict["multi_modal_projector"].to(
+            self.dtype).to(self.device)
+
+        # Use TRTLLM vision tower(CLIPVisionModel)
         vision_model_config = ModelConfig(
             pretrained_config=model_config.vision_config, attn_backend="TRTLLM")
         self.vision_tower = CLIPVisionModel(vision_model_config).to(
-            self.device).to(model.dtype)
-        self.vision_tower.load_weights(model.vision_tower.state_dict())
+            self.device).to(self.dtype)
+        self.vision_tower.load_weights(hf_vision_tower.state_dict())
 
-        self.mm_projector = model.multi_modal_projector.to(self.device)
+        # Use HF multi-modal projector
+        self.mm_projector = hf_mm_projector
 
     @nvtx_range("[Vision] preprocess")
     def _preprocess(self, images):
