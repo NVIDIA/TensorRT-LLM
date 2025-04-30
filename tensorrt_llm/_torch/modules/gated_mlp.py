@@ -77,11 +77,8 @@ class GatedMLP(nn.Module):
             quant_config=config.get_quant_config(),
             is_expert=is_expert,
             skip_create_weights=config.skip_create_weights,
-            # During llama4, we are using the custom kernel that performs FC+SwiGLU
-            # in one kernel.
-            # use_llama4_fc_swiglu=is_llama4,
-            # We are replacing the llama4_fc_swiglu with trtllm-gen kernel
-            use_trtllm_gen_fc_swiglu=is_llama4,
+            # In Llama4, we are using the custom kernel that performs FC+SwiGLU
+            use_llama4_custom_fc_swiglu_kernel=is_llama4,
         )
 
         self.down_proj = Linear(
@@ -94,6 +91,10 @@ class GatedMLP(nn.Module):
             quant_config=config.get_quant_config(),
             is_expert=is_expert,
             skip_create_weights=config.skip_create_weights,
+            # In llama4, the custom kernel (triggered by use_llama4_custom_fc_swiglu_kernel)
+            # is outputing fp8. The current setting is assuming bf16 out, so we need
+            # to provide the inv_input_scale of this layer to it to offset the un-needed
+            # quantization.
             previous_gate_up_proj=self.gate_up_proj,
         )
 
@@ -118,19 +119,11 @@ class GatedMLP(nn.Module):
         lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         if self.activation == F.silu:
-            if self.is_llama4 and self.down_proj.has_fp8_qdq and x.shape[0] <= 4:
-                if self.gate_up_proj.use_llama4_fc_swiglu:
-                    # In Llama4, we have added a custom kernel that performs both FC+SwiGLU in one
-                    # kernel. This was toggled by use_llama4_fc_swiglu in the Linear layer.
-                    # Currently, we are replacing a kernel that gives fp8 in and bf16 out with
-                    # fp8 in and fp8 out. Since next gemm is also fp8, we will need to feed
-                    # the next gemm layer's input_scale inverse to the current layer as output
-                    # scaling factor.
-                    h2 = self.gate_up_proj(
-                        x, inv_input_scale=self.down_proj.inv_input_scale)
-                else:
-                    # Using trtllm-gen kernel for FC+SwiGLU
-                    h2 = self.gate_up_proj(x)
+            if self.is_llama4 and self.down_proj.has_fp8_qdq and x.shape[0] <= 16:
+                # In Llama4, we have two custom kernels for FC+SwiGLU. The first one is a
+                # gemv kernel that is efficient for small input sizes (token_length <= 4).
+                # The second one is the trtllm-gen kernel that is efficient for (4 < token_length <= 16).
+                h2 = self.gate_up_proj(x)
             else:
                 h1 = self.gate_up_proj(x)
                 if lora_params is not None:
