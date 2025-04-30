@@ -565,9 +565,13 @@ public:
     //! \brief Cache new block offsets for the sequence
     void cacheNewBlockOffsets(GenerationRequest& sequence) const;
 
-    //! \brief Update the sequence blocks when a new token is added or removed
-    void updateSequenceBlocks(GenerationRequest& sequence, bool const addToken, SizeType32 const sinkBlockTokenLength,
-        bool const enableBlockReuse, WindowSizeMetadata const& metadata);
+    //! \brief Add a new block to the sequence if needed
+    void addSequenceBlockIfNeeded(GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength,
+        bool const enableBlockReuse, SizeType32 const numNonSinkTokensInWindow);
+
+    //! \brief Remove a block from the sequence if needed
+    void removeSequenceBlockIfNeeded(GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength,
+        bool const enableBlockReuse, SizeType32 const maxTokenNum);
 
     [[nodiscard]] SizeType32 getWindowSize() const noexcept
     {
@@ -885,8 +889,11 @@ public:
 
     void cacheBlockOffsets(GenerationRequest& sequence, SizeType32 windowSize) const;
 
-    void updateSequenceBlocks(GenerationRequest& sequence, bool const addToken, SizeType32 const sinkBlockTokenLength,
-        bool const enableBlockReuse);
+    void addSequenceBlockIfNeeded(
+        GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength, bool const enableBlockReuse);
+
+    void removeSequenceBlockIfNeeded(
+        GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength, bool const enableBlockReuse);
 
     // WILL NOT WORK FOR VARIABLE WINDOW ATTENTION
     [[nodiscard]] std::optional<BlockKey> findNewContextBlock(
@@ -1601,9 +1608,6 @@ public:
     /// @return SizeType32 A maximum attention window in number of tokens.
     [[nodiscard]] static SizeType32 calculateMaxAttentionWindow(SizeType32 inputLength, SizeType32 outputLength,
         SizeType32 sinkTokenLength, SizeType32 blockCapacity, SizeType32 beamWidth, SizeType32 tokensPerBlock);
-
-private:
-    void updateToken(GenerationRequest& sequence, bool addToken);
 
 private:
     // Maximum number of sequences

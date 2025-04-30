@@ -1815,78 +1815,54 @@ void WindowBlockManager::cacheNewBlockOffsets(GenerationRequest& sequence) const
     }
 }
 
-void BlockManager::updateSequenceBlocks(GenerationRequest& sequence, bool const addToken,
-    SizeType32 const sinkBlockTokenLength, bool const enableBlockReuse)
+void BlockManager::addSequenceBlockIfNeeded(
+    GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength, bool const enableBlockReuse)
 {
     for (auto const& [windowSize, metadata] : mWindowSizeToMetadata)
     {
         auto& manager = mWindowBlockManagers.at(windowSize);
-        manager.updateSequenceBlocks(sequence, addToken, sinkBlockTokenLength, enableBlockReuse, metadata);
+        manager.addSequenceBlockIfNeeded(
+            sequence, sinkBlockTokenLength, enableBlockReuse, metadata.numNonSinkTokensInWindow);
     }
 }
 
-void WindowBlockManager::updateSequenceBlocks(GenerationRequest& sequence, bool const addToken,
-    SizeType32 const sinkBlockTokenLength, bool const enableBlockReuse, WindowSizeMetadata const& metadata)
+void WindowBlockManager::addSequenceBlockIfNeeded(GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength,
+    bool const enableBlockReuse, SizeType32 const numNonSinkTokensInWindow)
 {
     auto const newNumTokens = sequence.getNumTokens();
-    auto const prevNumTokens = newNumTokens + (addToken ? (-1) : 1);
+    auto const prevNumTokens = newNumTokens - 1;
 
-    if (addToken)
+    auto const isBlockBoundary = (prevNumTokens % getTokensPerBlock() == 0);
+    auto const shouldAllocateBlock = isBlockBoundary;
+
+    auto const numTokensWithoutSink = newNumTokens - sinkBlockTokenLength;
+    auto const minTokensForBlockDetach = numNonSinkTokensInWindow + getTokensPerBlock();
+    auto const canDetachBlock = (numTokensWithoutSink >= minTokensForBlockDetach)
+        && ((numTokensWithoutSink - minTokensForBlockDetach) % getTokensPerBlock() == 0);
+
+    if (canDetachBlock)
     {
-        auto const isBlockBoundary = (prevNumTokens % getTokensPerBlock() == 0);
-        auto const shouldAllocateBlock = isBlockBoundary;
-
-        auto const numTokensWithoutSink = newNumTokens - sinkBlockTokenLength;
-        auto const minTokensForBlockDetach = metadata.numNonSinkTokensInWindow + getTokensPerBlock();
-        auto const canDetachBlock = (numTokensWithoutSink >= minTokensForBlockDetach)
-            && ((numTokensWithoutSink - minTokensForBlockDetach) % getTokensPerBlock() == 0);
-
-        if (canDetachBlock)
-        {
-            detachBlock(sequence, sinkBlockTokenLength, enableBlockReuse);
-        }
-
-        if (shouldAllocateBlock)
-        {
-            allocateBlock(sequence, false);
-        }
-
-        if (shouldAllocateBlock || canDetachBlock)
-        {
-            cacheNewBlockOffsets(sequence);
-        }
-    }
-    else
-    {
-        auto const isBlockBoundary = (newNumTokens % getTokensPerBlock() == 0);
-        auto const shouldReleaseBlock = isBlockBoundary && (prevNumTokens <= metadata.maxTokenNum);
-        if (shouldReleaseBlock)
-        {
-            TLLM_CHECK_WITH_INFO(sequence.getBeamWidth() <= 1, "Remove token is not supported with beam search");
-            releaseLastBlock(sequence);
-        }
-    }
-}
-
-void KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
-{
-    TLLM_CHECK_WITH_INFO(!isCrossKv(), "Update token is not supported with cross kv cache");
-    if (addToken)
-    {
-        sequence.addNewTokens(1);
-    }
-    else
-    {
-        sequence.removeTokens(1);
+        detachBlock(sequence, sinkBlockTokenLength, enableBlockReuse);
     }
 
-    mBlockManager.updateSequenceBlocks(sequence, addToken, mSinkBlockTokenLength, mEnableBlockReuse);
+    if (shouldAllocateBlock)
+    {
+        allocateBlock(sequence, false);
+    }
+
+    if (shouldAllocateBlock || canDetachBlock)
+    {
+        cacheNewBlockOffsets(sequence);
+    }
 }
 
 void KVCacheManager::addToken(RequestIdType requestId)
 {
+    TLLM_CHECK_WITH_INFO(!isCrossKv(), "addToken is not supported with cross kv cache");
+
     auto& sequence = getSequence(requestId);
-    updateToken(sequence, true);
+    sequence.addNewTokens(1);
+    mBlockManager.addSequenceBlockIfNeeded(sequence, mSinkBlockTokenLength, mEnableBlockReuse);
 }
 
 std::optional<BlockKey> KVCacheManager::findNewContextBlock(
@@ -2134,8 +2110,35 @@ std::tuple<SizeType32, SizeType32> BaseKVCacheManager::calculateMaxNumBlocks(KvC
     return std::make_tuple(blocksInPrimaryPool, blocksInSecondaryPool);
 }
 
+void BlockManager::removeSequenceBlockIfNeeded(
+    GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength, bool const enableBlockReuse)
+{
+    for (auto const& [windowSize, metadata] : mWindowSizeToMetadata)
+    {
+        auto& manager = mWindowBlockManagers.at(windowSize);
+        manager.removeSequenceBlockIfNeeded(sequence, sinkBlockTokenLength, enableBlockReuse, metadata.maxTokenNum);
+    }
+}
+
+void WindowBlockManager::removeSequenceBlockIfNeeded(GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength,
+    bool const enableBlockReuse, SizeType32 const maxTokenNum)
+{
+    auto const newNumTokens = sequence.getNumTokens();
+    auto const prevNumTokens = newNumTokens + 1;
+
+    auto const isBlockBoundary = (newNumTokens % getTokensPerBlock() == 0);
+    auto const shouldReleaseBlock = isBlockBoundary && (prevNumTokens <= maxTokenNum);
+    if (shouldReleaseBlock)
+    {
+        TLLM_CHECK_WITH_INFO(sequence.getBeamWidth() <= 1, "Remove token is not supported with beam search");
+        releaseLastBlock(sequence);
+    }
+}
+
 void KVCacheManager::removeToken(RequestIdType requestId)
 {
+    TLLM_CHECK_WITH_INFO(!isCrossKv(), "removeToken is not supported with cross kv cache");
+
     auto& sequence = getSequence(requestId);
     auto const beamWidth = sequence.getBeamWidth();
 
@@ -2144,7 +2147,8 @@ void KVCacheManager::removeToken(RequestIdType requestId)
     {
         return;
     }
-    updateToken(sequence, false);
+    sequence.removeTokens(1);
+    mBlockManager.removeSequenceBlockIfNeeded(sequence, mSinkBlockTokenLength, mEnableBlockReuse);
 }
 
 void KVCacheManager::rewindKVCache(RequestIdType requestId, SizeType32 rewindLengths)
