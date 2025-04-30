@@ -113,6 +113,9 @@ All published functionality in the Release Notes has been fully tested and verif
   - Fixed incorrect batch slot usage in `addCumLogProbs` kernel. Thanks to the contribution from @aotman in #2787.
   - Fixed incorrect output for Llama-3.2-11B-Vision-Instruct. (#2796)
 
+### Infrastructure Changes
+  - The dependent NVIDIA ModelOpt version is updated to 0.27.
+
 
 ## TensorRT-LLM Release 0.18.2
 
