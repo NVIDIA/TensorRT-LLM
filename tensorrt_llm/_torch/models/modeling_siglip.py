@@ -1,15 +1,12 @@
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers.modeling_outputs import (BaseModelOutput,
-                                           BaseModelOutputWithPooling)
 from transformers.modeling_utils import (get_parameter_device,
                                          get_parameter_dtype)
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
-from transformers.models.siglip.modeling_siglip import (
-    SiglipMultiheadAttentionPoolingHead, SiglipVisionConfig,
-    SiglipVisionEmbeddings)
+from transformers.models.siglip.modeling_siglip import (SiglipVisionConfig,
+                                                        SiglipVisionEmbeddings)
 
 from ..attention_backend.interface import AttentionMetadata
 from ..attention_backend.utils import get_attention_backend
@@ -21,31 +18,27 @@ SiglipEncoder = CLIPEncoder
 
 
 class SiglipVisionTransformer(nn.Module):
+    """
+    This SiglipVisionTransformer is tailored for multimodal models that use Siglip as the vision encoder.
+    For example, it is different from the regular SiglipVisionTransformer in the sense that it does not return a pooled output.
+    """
 
     def __init__(self, model_config: ModelConfig[SiglipVisionConfig]):
         super().__init__()
         config = model_config.pretrained_config
         self.config = config
-        embed_dim = config.hidden_size
 
         self.embeddings = SiglipVisionEmbeddings(config)
         self.encoder = SiglipEncoder(model_config)
-        self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
-        self.use_head = True if not hasattr(
-            config, "vision_use_head") else config.vision_use_head
-        if self.use_head:
-            self.head = SiglipMultiheadAttentionPoolingHead(config)
+        if hasattr(config, "vision_use_head"):
+            assert not config.vision_use_head, "Currently, we only support vision_use_head = False"
 
     def forward(
         self,
         pixel_values,
         attn_metadata: AttentionMetadata,
-        output_hidden_states: Optional[bool] = None,
         interpolate_pos_encoding: Optional[bool] = False,
-    ) -> BaseModelOutputWithPooling:
-        output_hidden_states = (output_hidden_states
-                                if output_hidden_states is not None else
-                                self.config.output_hidden_states)
+    ) -> Tuple[torch.Tensor]:
 
         hidden_states = self.embeddings(
             pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
@@ -54,21 +47,12 @@ class SiglipVisionTransformer(nn.Module):
             hidden_states.shape[0] * hidden_states.shape[1],
             hidden_states.shape[2])
 
-        encoder_outputs: BaseModelOutput = self.encoder(
+        encoder_outputs: Tuple[torch.Tensor] = self.encoder(
             inputs_embeds=hidden_states,
             attn_metadata=attn_metadata,
-            output_hidden_states=output_hidden_states,
         )
-        last_hidden_state = encoder_outputs.last_hidden_state
-        last_hidden_state = self.post_layernorm(last_hidden_state)
 
-        pooler_output = self.head(last_hidden_state) if self.use_head else None
-
-        return BaseModelOutputWithPooling(
-            last_hidden_state=last_hidden_state,
-            pooler_output=pooler_output,
-            hidden_states=encoder_outputs.hidden_states,
-        )
+        return encoder_outputs
 
 
 @register_auto_model("SiglipVisionModel")
@@ -112,12 +96,11 @@ class SiglipVisionModel(nn.Module):
         return get_parameter_device(self)
 
     @torch.inference_mode()
-    def forward(self,
-                pixel_values,
-                attn_metadata: AttentionMetadata,
-                output_hidden_states: Optional[bool] = None):
-        return self.vision_model(pixel_values, attn_metadata,
-                                 output_hidden_states)
+    def forward(self, pixel_values, attn_metadata: AttentionMetadata):
+        return self.vision_model(
+            pixel_values=pixel_values,
+            attn_metadata=attn_metadata,
+        )
 
     def load_weights(self, weights: Dict):
         pattern_mapping = {

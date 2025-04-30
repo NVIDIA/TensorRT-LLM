@@ -29,7 +29,7 @@ CLIP_CONFIG = {
 }
 
 ACCURACY_CONFIG = {
-    torch.float16: (1e-2, 1e-3),
+    torch.float16: (1e-2, 1e-2),
 }
 
 
@@ -100,61 +100,29 @@ class TestCLIPVisionModel(unittest.TestCase):
         tllm_outputs = tllm_model(
             pixel_values=pixel_values,
             attn_metadata=attn_metadata,
-            output_hidden_states=True,
         )
 
         # Compare outputs
-        # 1. Pooled Output (CLS token output after post_layernorm)
-        hf_pooled = hf_outputs.pooler_output
-        tllm_pooled = tllm_outputs.pooler_output
-        rtol, atol = (1e-2, 1e-2) if dtype == torch.float16 else (1e-4, 1e-4)
-        torch.testing.assert_close(
-            hf_pooled.float(),
-            tllm_pooled.float(),
-            rtol=rtol,
-            atol=atol,
-            msg=
-            f"FAILED: TRT-LLM and HF pooled_output mismatch for {dtype} with {num_images} images"
-        )
-        print(
-            f"PASSED: TRT-LLM and HF pooled_output match for {dtype} with {num_images} images"
-        )
+        rtol, atol = ACCURACY_CONFIG[dtype]
 
-        # 2. Last Hidden State (Before pooling/final LN in HF, shaped (batch, seq, hidden))
-        hf_last_hidden = hf_outputs.last_hidden_state
-        tllm_last_hidden = tllm_outputs.last_hidden_state
-        torch.testing.assert_close(
-            hf_last_hidden.float(),
-            tllm_last_hidden.float(),
-            rtol=rtol,
-            atol=atol,
-            msg=
-            f"FAILED: TRT-LLM and HF last_hidden_state mismatch for {dtype} with {num_images} images"
-        )
-        print(
-            f"PASSED: TRT-LLM and HF last_hidden_state match for {dtype} with {num_images} images"
-        )
+        # Compare all hidden states
 
-        # 3. Compare all hidden states if available
-        if tllm_outputs.hidden_states is not None and hf_outputs.hidden_states is not None:
-            self.assertEqual(len(hf_outputs.hidden_states),
-                             len(tllm_outputs.hidden_states),
-                             "Number of hidden states mismatch")
-            for i, (hf_hs, tllm_hs) in enumerate(
-                    zip(hf_outputs.hidden_states, tllm_outputs.hidden_states)):
-                self.assertEqual(hf_hs.shape, tllm_hs.shape,
-                                 f"Shape mismatch for hidden state {i}")
-                torch.testing.assert_close(
-                    hf_hs.float(),
-                    tllm_hs.float(),
-                    rtol=rtol,
-                    atol=atol,
-                    msg=
-                    f"FAILED: TRT-LLM and HF hidden_states mismatch for {dtype} with {num_images} images at layer {i}"
-                )
-                print(
-                    f"PASSED: TRT-LLM and HF hidden_states match for {dtype} with {num_images} images at layer {i}"
-                )
+        for i, (hf_hs, tllm_hs) in enumerate(
+                zip(hf_outputs.hidden_states,
+                    tllm_outputs)):  # Iterate through tllm_outputs directly
+            self.assertEqual(hf_hs.shape, tllm_hs.shape,
+                             f"Shape mismatch for hidden state {i}")
+            torch.testing.assert_close(
+                hf_hs.float(),
+                tllm_hs.float(),
+                rtol=rtol,
+                atol=atol,
+                msg=
+                f"FAILED: TRT-LLM and HF hidden_states mismatch for {dtype} with {num_images} images at layer {i}"
+            )
+            print(
+                f"PASSED: TRT-LLM and HF hidden_states match for {dtype} with {num_images} images at layer {i}"
+            )
 
 
 if __name__ == "__main__":

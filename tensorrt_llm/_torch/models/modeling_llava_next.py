@@ -54,10 +54,11 @@ class LlavaNextInputProcessor(InputProcessor):
     def _process(self, pixel_values):
         attn_metadata = self.vision_tower.prepare_attn_metadata(
             pixel_values.shape[0])
-        image_features = self.vision_tower(pixel_values,
-                                           attn_metadata=attn_metadata,
-                                           output_hidden_states=True)
-        selected_image_feature = image_features.hidden_states[-2][:, 1:]
+        image_features: Tuple[torch.Tensor] = self.vision_tower(
+            pixel_values,
+            attn_metadata=attn_metadata,
+        )
+        selected_image_feature = image_features[-2][:, 1:]
         image_features = self.mm_projector(selected_image_feature)
         return image_features.reshape(-1, image_features.shape[-1])
 

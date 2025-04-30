@@ -99,24 +99,25 @@ class TestSiglipVisionModel(unittest.TestCase):
         tllm_outputs = tllm_model(
             pixel_values=pixel_values,
             attn_metadata=attn_metadata,
-            output_hidden_states=True,
         )
 
-        # compare all hidden states
-        for select_layer in range(len(hf_outputs.hidden_states)):
-            hf_ref = hf_outputs.hidden_states[select_layer]
-            tllm_res = tllm_outputs.hidden_states[select_layer]
+        # Compare all hidden states
+
+        for i, (hf_hs, tllm_hs) in enumerate(
+                zip(hf_outputs.hidden_states, tllm_outputs)):
+            self.assertEqual(hf_hs.shape, tllm_hs.shape,
+                             f"Shape mismatch for hidden state {i}")
 
             torch.testing.assert_close(
-                hf_ref.float(),
-                tllm_res.float(),
+                hf_hs.float(),
+                tllm_hs.float(),
                 rtol=ACCURACY_CONFIG[dtype][0],
                 atol=ACCURACY_CONFIG[dtype][1],
                 msg=
-                f"FAILED: TRT-LLM and HF hidden_states mismatch for {dtype} with {num_images} images at layer {select_layer}, the mean value of this layer is {hf_ref.mean()}"
+                f"FAILED: TRT-LLM and HF hidden_states mismatch for {dtype} with {num_images} images at layer {i}, the mean value of this layer is {hf_hs.mean()}"
             )
             print(
-                f"PASSED: TRT-LLM and HF hidden_states match for {dtype} with {num_images} images at layer {select_layer}, the mean value of this layer is {hf_ref.mean()}"
+                f"PASSED: TRT-LLM and HF hidden_states match for {dtype} with {num_images} images at layer {i}, the mean value of this layer is {hf_hs.mean()}"
             )
 
 
