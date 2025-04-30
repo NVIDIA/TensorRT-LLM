@@ -59,6 +59,7 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
         tokenizer_kwargs=config.tokenizer_kwargs,
         skip_loading_weights=config.skip_loading_weights,
     )
+    ad_logger.info(f"Prefetched model : {factory.model}")
 
     # construct llm high-level interface object
     llm_lookup = {
@@ -103,19 +104,24 @@ def main(config: Optional[SimpleConfig] = None):
     print_outputs(outs)
 
     # run a benchmark for the model with batch_size == config.benchmark_bs
-    if config.benchmark and config.runtime != "demollm":
-        ad_logger.warning(
-            f"Benchmarking with {config.runtime=} not supported. Please use `demollm` instead for "
-            "quick benchmarking and `trtllm-bench` for full benchmarking."
-        )
-    elif config.benchmark:
-        token_ids = torch.randint(0, 100, (config.benchmark_bs, config.benchmark_isl)).tolist()
-        sampling_params = SamplingParams(max_tokens=config.benchmark_osl, top_k=None)
-        keys = ["compile_backend", "attn_backend", "mla_backend"]
+    if config.benchmark:
+        keys = [
+            "compile_backend",
+            "attn_backend",
+            "mla_backend",
+            "benchmark_bs",
+            "benchmark_isl",
+            "benchmark_osl",
+            "benchmark_num",
+        ]
         benchmark(
-            lambda: llm.generate(token_ids, sampling_params=sampling_params, use_tqdm=False),
-            config.benchmark_num,
-            "Benchmark with " + ", ".join(f"{k}={getattr(config, k)}" for k in keys),
+            func=lambda: llm.generate(
+                torch.randint(0, 100, (config.benchmark_bs, config.benchmark_isl)).tolist(),
+                sampling_params=SamplingParams(max_tokens=config.benchmark_osl, top_k=None),
+                use_tqdm=False,
+            ),
+            num_runs=config.benchmark_num,
+            log_prefix="Benchmark with " + ", ".join(f"{k}={getattr(config, k)}" for k in keys),
             results_path=config.benchmark_results_path,
         )
     llm.shutdown()
