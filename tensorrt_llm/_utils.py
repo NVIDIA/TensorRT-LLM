@@ -646,7 +646,7 @@ def trace_func(func):
 
     @wraps(func)
     def wrapper(*args, **kwargs):
-        import dill
+        import dill  # nosec B403
 
         def globaltrace(frame, why, arg):
             if why == "call":
