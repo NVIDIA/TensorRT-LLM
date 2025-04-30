@@ -141,3 +141,198 @@ def torch_fused_moe(
     w2_stacked_weight: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty_like(x)
+
+
+@torch.library.custom_op("moe::torch_fp8_moe", mutates_args=())
+def torch_fp8_moe(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    w1_weight: List[torch.Tensor],
+    w2_weight: List[torch.Tensor],
+    w3_weight: List[torch.Tensor],
+    w1_input_scale: List[torch.Tensor],
+    w2_input_scale: List[torch.Tensor],
+    w3_input_scale: List[torch.Tensor],
+    w1_weight_scale: List[torch.Tensor],
+    w2_weight_scale: List[torch.Tensor],
+    w3_weight_scale: List[torch.Tensor],
+) -> torch.Tensor:
+    """
+    FP8 MoE op using quantized linear operations.
+
+    Computes a Mixture-of-Experts layer similar to the reference moe::torch_moe op, but uses the
+    quantized FP8 linear op for expert computations.
+
+    Args:
+        x: Input tensor of shape (B, H) or (B, S, H).
+        selected_experts: Tensor (B, TOP_K) or (B*S, TOP_K) containing expert indices.
+        routing_weights: Tensor of normalized routing weights.
+        w1_weight, w2_weight, w3_weight: Lists of pre-quantized weight tensors for the three linear ops.
+        w1_input_scale, w2_input_scale, w3_input_scale: Lists of input scale tensors for the corresponding ops.
+        w1_weight_scale, w2_weight_scale, w3_weight_scale: Lists of weight scale tensors for the corresponding ops.
+
+    """
+    hidden_dim = x.shape[-1]
+    num_experts = len(w1_weight)
+
+    final_hidden_states = torch.zeros_like(x)
+    valid_mask = (selected_experts >= 0) & (selected_experts < num_experts)
+    selected_experts_fixed = torch.where(
+        valid_mask, selected_experts, torch.full_like(selected_experts, num_experts)
+    )
+    one_hot = F.one_hot(selected_experts_fixed, num_classes=num_experts + 1)
+    expert_mask = one_hot[..., :num_experts].permute(2, 1, 0)
+
+    for expert_idx in range(num_experts):
+        idx, top_x = torch.where(expert_mask[expert_idx])
+        tokens_for_expert = x[None, top_x].reshape(-1, hidden_dim)
+
+        gate_out = torch.ops.quant.fp8_linear(
+            tokens_for_expert,
+            w1_weight[expert_idx],
+            bias=None,
+            input_scale=w1_input_scale[expert_idx],
+            weight_scale=w1_weight_scale[expert_idx],
+        )
+        up_out = torch.ops.quant.fp8_linear(
+            tokens_for_expert,
+            w3_weight[expert_idx],
+            bias=None,
+            input_scale=w3_input_scale[expert_idx],
+            weight_scale=w3_weight_scale[expert_idx],
+        )
+        activated = F.silu(gate_out)
+        prod = activated * up_out
+        expert_out = torch.ops.quant.fp8_linear(
+            prod,
+            w2_weight[expert_idx],
+            bias=None,
+            input_scale=w2_input_scale[expert_idx],
+            weight_scale=w2_weight_scale[expert_idx],
+        )
+
+        current_hidden_states = expert_out * routing_weights[top_x, idx, None]
+        final_hidden_states.index_add_(0, top_x, current_hidden_states)
+
+    return final_hidden_states.view_as(x)
+
+
+@torch_fp8_moe.register_fake
+def torch_fp8_moe(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    w1_weight: List[torch.Tensor],
+    w2_weight: List[torch.Tensor],
+    w3_weight: List[torch.Tensor],
+    w1_input_scale: List[torch.Tensor],
+    w2_input_scale: List[torch.Tensor],
+    w3_input_scale: List[torch.Tensor],
+    w1_weight_scale: List[torch.Tensor],
+    w2_weight_scale: List[torch.Tensor],
+    w3_weight_scale: List[torch.Tensor],
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@torch.library.custom_op("moe::torch_fp4_moe", mutates_args=())
+def torch_fp4_moe(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    w1_weight: List[torch.Tensor],
+    w2_weight: List[torch.Tensor],
+    w3_weight: List[torch.Tensor],
+    w1_input_scale: List[torch.Tensor],
+    w2_input_scale: List[torch.Tensor],
+    w3_input_scale: List[torch.Tensor],
+    w1_weight_scale: List[torch.Tensor],
+    w2_weight_scale: List[torch.Tensor],
+    w3_weight_scale: List[torch.Tensor],
+    w1_alpha: List[torch.Tensor],
+    w2_alpha: List[torch.Tensor],
+    w3_alpha: List[torch.Tensor],
+) -> torch.Tensor:
+    """
+    FP4 MoE op using quantized linear operations.
+
+    Computes a Mixture-of-Experts layer similar to the reference moe::torch_moe op,
+    but uses the NVFP4 quantized linear op for expert computations.
+
+    Args:
+        x: Input tensor of shape (B, H) or (B, S, H).
+        selected_experts: Tensor (B, TOP_K) or (B*S, TOP_K) containing expert indices.
+        routing_weights: Tensor of normalized routing weights.
+        w1_weight, w2_weight, w3_weight: Lists of pre-quantized weight tensors for the three linear ops.
+        w1_input_scale, w2_input_scale, w3_input_scale: Lists of input scale tensors.
+        w1_weight_scale, w2_weight_scale, w3_weight_scale: Lists of weight scale tensors.
+        w1_alpha, w2_alpha, w3_alpha: Lists of alpha scale tensors for FP4 quantization.
+    """
+    hidden_dim = x.shape[-1]
+    num_experts = len(w1_weight)
+
+    final_hidden_states = torch.zeros_like(x)
+    valid_mask = (selected_experts >= 0) & (selected_experts < num_experts)
+    selected_experts_fixed = torch.where(
+        valid_mask, selected_experts, torch.full_like(selected_experts, num_experts)
+    )
+    one_hot = F.one_hot(selected_experts_fixed, num_classes=num_experts + 1)
+    expert_mask = one_hot[..., :num_experts].permute(2, 1, 0)
+
+    for expert_idx in range(num_experts):
+        idx, top_x = torch.where(expert_mask[expert_idx])
+        tokens_for_expert = x[None, top_x].reshape(-1, hidden_dim)
+        gate_out = torch.ops.quant.fp4_linear(
+            tokens_for_expert,
+            w1_weight[expert_idx],
+            bias=None,
+            input_scale=w1_input_scale[expert_idx],
+            weight_scale=w1_weight_scale[expert_idx],
+            alpha=w1_alpha[expert_idx],
+        )
+        up_out = torch.ops.quant.fp4_linear(
+            tokens_for_expert,
+            w3_weight[expert_idx],
+            bias=None,
+            input_scale=w3_input_scale[expert_idx],
+            weight_scale=w3_weight_scale[expert_idx],
+            alpha=w3_alpha[expert_idx],
+        )
+        activated = F.silu(gate_out)
+        prod = activated * up_out
+        expert_out = torch.ops.quant.fp4_linear(
+            prod,
+            w2_weight[expert_idx],
+            bias=None,
+            input_scale=w2_input_scale[expert_idx],
+            weight_scale=w2_weight_scale[expert_idx],
+            alpha=w2_alpha[expert_idx],
+        )
+
+        current_hidden_states = expert_out * routing_weights[top_x, idx, None]
+        final_hidden_states.index_add_(0, top_x, current_hidden_states)
+
+    return final_hidden_states.view_as(x)
+
+
+@torch_fp4_moe.register_fake
+def torch_fp4_moe(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    w1_weight: List[torch.Tensor],
+    w2_weight: List[torch.Tensor],
+    w3_weight: List[torch.Tensor],
+    w1_input_scale: List[torch.Tensor],
+    w2_input_scale: List[torch.Tensor],
+    w3_input_scale: List[torch.Tensor],
+    w1_weight_scale: List[torch.Tensor],
+    w2_weight_scale: List[torch.Tensor],
+    w3_weight_scale: List[torch.Tensor],
+    w1_alpha: List[torch.Tensor],
+    w2_alpha: List[torch.Tensor],
+    w3_alpha: List[torch.Tensor],
+) -> torch.Tensor:
+    # Fake implementation for tracing/testing
+    return torch.empty_like(x)

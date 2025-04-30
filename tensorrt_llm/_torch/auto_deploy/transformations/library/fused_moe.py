@@ -87,6 +87,17 @@ def match_moe_pattern(gm: GraphModule) -> GraphModule:
                         expert_scales["w3_weight_scale"],
                     ),
                 )
+            elif weight_type == "fp4":
+                fused_moe_node = graph.call_function(
+                    torch.ops.moe.torch_fp4_moe,
+                    args = (
+                        hidden_states, selected_experts, normalized_routing_weights,
+                        w1_list, w2_list, w3_list,
+                        expert_scales["w1_input_scale"], expert_scales["w2_input_scale"], expert_scales["w3_input_scale"],
+                        expert_scales["w1_weight_scale"], expert_scales["w2_weight_scale"], expert_scales["w3_weight_scale"],
+                        expert_scales["w1_alpha"],       expert_scales["w2_alpha"],       expert_scales["w3_alpha"],
+                    ),
+                )
             else:
                 fused_moe_node = graph.call_function(
                     torch.ops.auto_deploy.torch_moe,
@@ -272,6 +283,21 @@ def _extract_linear_parameters(linear_node: Node) -> tuple[Node, torch.Tensor, O
         if weight_scale is None and len(linear_node.args) >= 5:
             weight_scale = linear_node.args[4]
         return input_node, weight, {"input_scale": input_scale, "weight_scale": weight_scale}, "fp8"
+    elif is_op(linear_node, torch.ops.quant.fp4_linear):
+        weight = linear_node.args[1]
+        input_scale  = linear_node.kwargs.get("input_scale", None)
+        weight_scale = linear_node.kwargs.get("weight_scale", None)
+        alpha        = linear_node.kwargs.get("alpha", None)
+        # fallback to positional args if absent
+        args = linear_node.args
+        if input_scale  is None and len(args) >= 4: input_scale  = args[3]
+        if weight_scale is None and len(args) >= 5: weight_scale = args[4]
+        if alpha        is None and len(args) >= 6: alpha        = args[5]
+        return input_node, weight, {
+            "input_scale":  input_scale,
+            "weight_scale": weight_scale,
+            "alpha":        alpha
+        }, "fp4"
     elif is_op(linear_node, torch.ops.linear.simple):
         weight = linear_node.args[1]
         return input_node, weight, None, "simple"
@@ -384,6 +410,16 @@ def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
             expert_scales["w3_weight_scale"].append(quant_params_w3["weight_scale"])
             expert_scales["w2_input_scale"].append(quant_params_w2["input_scale"])
             expert_scales["w2_weight_scale"].append(quant_params_w2["weight_scale"])
+        elif weight_type == "fp4":
+            expert_scales["w1_input_scale"].append(quant_params_w1["input_scale"])
+            expert_scales["w1_weight_scale"].append(quant_params_w1["weight_scale"])
+            expert_scales["w1_alpha"].append(quant_params_w1["alpha"])
+            expert_scales["w3_input_scale"].append(quant_params_w3["input_scale"])
+            expert_scales["w3_weight_scale"].append(quant_params_w3["weight_scale"])
+            expert_scales["w3_alpha"].append(quant_params_w3["alpha"])
+            expert_scales["w2_input_scale"].append(quant_params_w2["input_scale"])
+            expert_scales["w2_weight_scale"].append(quant_params_w2["weight_scale"])
+            expert_scales["w2_alpha"].append(quant_params_w2["alpha"])
 
     return pattern_input_nodes, pattern_output_nodes, expert_weights, expert_scales, weight_type
 

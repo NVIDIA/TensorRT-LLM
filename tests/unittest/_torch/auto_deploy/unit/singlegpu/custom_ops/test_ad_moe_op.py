@@ -4,14 +4,14 @@ import sys
 import pytest
 import torch
 import torch.nn.functional as F
-from _torch_test_utils import fp8_compatible
+from _torch_test_utils import fp8_compatible, fp4_compatible, trtllm_ops_available
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.modules.fused_moe import MoE  # noqa: F401
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 from helpers import reference_moe_torch
-
+from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale
 
 def setup_moe_test(dtype, num_experts):
     SEQ_LEN = 8
@@ -182,3 +182,98 @@ def test_fp8_moe_op_run(dtype):
     atol = 0.8 if dtype == torch.bfloat16 else 1
     torch.testing.assert_close(output_torch_fp8_moe, output_torch_moe, rtol=rtol, atol=atol)
     torch.testing.assert_close(output_torch_fp8_moe, ref_output, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.skipif(
+    not fp4_compatible() or not trtllm_ops_available(),
+    reason="Requires fp4 and trtllm support",
+)
+def test_fp4_moe_op_run(dtype):
+    num_experts = 3
+    (
+        x,
+        selected_experts,
+        final_scales,
+        w1_weight,
+        w2_weight,
+        w3_weight,
+        weights,
+        _,
+        _,
+    ) = setup_moe_test(dtype, num_experts)
+
+    with torch.inference_mode():
+        output_torch_moe = torch.ops.moe.torch_moe(
+            x,
+            selected_experts,
+            final_scales,
+            w1_weight,
+            w2_weight,
+            w3_weight,
+        )
+
+    # prepare FP4 scales and quantized weights
+    w1_input_scale, w2_input_scale, w3_input_scale = [], [], []
+    w1_weight_scale, w2_weight_scale, w3_weight_scale = [], [], []
+    w1_alpha, w2_alpha, w3_alpha = [], [], []
+    scaling_vector_size = 16
+
+    for i in range(num_experts):
+        inp_scale = fp4_global_scale(x)
+        wt_scale_2_w1 = fp4_global_scale(w1_weight[i])
+        wt_scale_2_w2 = fp4_global_scale(w2_weight[i])
+        wt_scale_2_w3 = fp4_global_scale(w3_weight[i])
+
+        # quantize weights
+        w1_fp4, w1_scale = torch.ops.trtllm.fp4_quantize(
+            w1_weight[i], wt_scale_2_w1, scaling_vector_size, False
+        )
+        w2_fp4, w2_scale = torch.ops.trtllm.fp4_quantize(
+            w2_weight[i], wt_scale_2_w2, scaling_vector_size, False
+        )
+        w3_fp4, w3_scale = torch.ops.trtllm.fp4_quantize(
+            w3_weight[i], wt_scale_2_w3, scaling_vector_size, False
+        )
+        w1_weight[i] = w1_fp4
+        w2_weight[i] = w2_fp4
+        w3_weight[i] = w3_fp4
+
+        # record scales and alpha
+        w1_input_scale.append(inp_scale)
+        w2_input_scale.append(inp_scale)
+        w3_input_scale.append(inp_scale)
+        w1_weight_scale.append(w1_scale)
+        w2_weight_scale.append(w2_scale)
+        w3_weight_scale.append(w3_scale)
+        w1_alpha.append(1 / (inp_scale * wt_scale_2_w1))
+        w2_alpha.append(1 / (inp_scale * wt_scale_2_w2))
+        w3_alpha.append(1 / (inp_scale * wt_scale_2_w3))
+
+    # run FP4 MoE op
+    with torch.inference_mode():
+        output_torch_fp4_moe = torch.ops.moe.torch_fp4_moe(
+            x,
+            selected_experts,
+            final_scales,
+            w1_weight,
+            w2_weight,
+            w3_weight,
+            w1_input_scale,
+            w2_input_scale,
+            w3_input_scale,
+            w1_weight_scale,
+            w2_weight_scale,
+            w3_weight_scale,
+            w1_alpha,
+            w2_alpha,
+            w3_alpha,
+        )
+        ref_output = reference_moe_torch(
+            x, selected_experts, final_scales, num_experts, weights
+        )
+
+    torch.cuda.synchronize()
+    rtol, atol = 1.5, 1.0
+    torch.testing.assert_close(output_torch_fp4_moe, output_torch_moe, rtol=rtol, atol=atol)
+    torch.testing.assert_close(output_torch_fp4_moe, ref_output, rtol=rtol, atol=atol)
