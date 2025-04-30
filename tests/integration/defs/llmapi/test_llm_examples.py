@@ -142,7 +142,8 @@ def test_llmapi_example_eagle_decoding(llm_root, engine_dir, llm_venv):
 
 
 def test_llmapi_example_eagle_2_decoding(llm_root, engine_dir, llm_venv):
-    _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_eagle_2_decoding.py")
+    _run_llmapi_example(llm_root, engine_dir, llm_venv,
+                        "llm_eagle_2_decoding.py")
 
 
 @pytest.mark.skip_less_device(2)
