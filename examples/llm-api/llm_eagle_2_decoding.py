@@ -1,4 +1,4 @@
-### Generate Text Using Eagle Decoding
+### Generate Text Using Eagle-2 Decoding
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (LLM, BuildConfig, EagleDecodingConfig,
