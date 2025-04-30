@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
-from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig
+from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig, ServerRole
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
@@ -49,8 +49,8 @@ class OpenAIDisaggServer:
         self.ctx_server_idx = 0
         self.gen_server_idx = 0
         self.metadata_server = create_metadata_server(metadata_server_cfg)
-        self.ctx_router = create_router(ctx_router_type, ctx_servers, self.metadata_server)
-        self.gen_router = create_router(gen_router_type, gen_servers, self.metadata_server)
+        self.ctx_router = create_router(ServerRole.CONTEXT, ctx_router_type, ctx_servers, self.metadata_server)
+        self.gen_router = create_router(ServerRole.GENERATION, gen_router_type, gen_servers, self.metadata_server)
 
 
         if (len(self.gen_servers) == 0):

@@ -3,6 +3,7 @@ import heapq
 from abc import ABC, abstractmethod
 from typing import List, Union
 
+from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest)
@@ -69,10 +70,12 @@ class ServerState:
 class Router(ABC):
 
     def __init__(self,
+                 server_role: ServerRole,
                  servers: List[str] = None,
                  metadata_server: JsonDictionary = None):
         self._servers = servers
         self._metadata_server = metadata_server
+        self._server_role = server_role
 
     @abstractmethod
     async def get_next_server(
@@ -119,9 +122,10 @@ class Router(ABC):
 class RoundRobinRouter(Router):
 
     def __init__(self,
+                 server_role: ServerRole,
                  servers: List[str] = None,
                  metadata_server: JsonDictionary = None):
-        super().__init__(servers, metadata_server)
+        super().__init__(server_role, servers, metadata_server)
         self._server_idx = 0
 
     async def get_next_server(
@@ -139,10 +143,11 @@ class RoundRobinRouter(Router):
 class LoadBalancingRouter(Router):
 
     def __init__(self,
+                 server_role: ServerRole,
                  servers: List[str] = None,
                  metadata_server: JsonDictionary = None,
                  use_tokens: bool = False):
-        super().__init__(servers, metadata_server)
+        super().__init__(server_role, servers, metadata_server)
         self._lock = asyncio.Lock()
         # Load map between servers and their number of tokens processed
         self._server_state = {}
@@ -188,6 +193,7 @@ class LoadBalancingRouter(Router):
 
 
 def create_router(router_type: str,
+                  server_role: ServerRole,
                   servers: List[str],
                   metadata_server: JsonDictionary = None) -> Router:
     """
@@ -220,6 +226,9 @@ def create_router(router_type: str,
 
     if router_type.endswith("load_balancing"):
         use_tokens = True if router_type.startswith("tokens") else False
-        return router_class(servers, metadata_server, use_tokens=use_tokens)
+        return router_class(server_role,
+                            servers,
+                            metadata_server,
+                            use_tokens=use_tokens)
     else:
-        return router_class(servers, metadata_server)
+        return router_class(server_role, servers, metadata_server)

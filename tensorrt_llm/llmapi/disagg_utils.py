@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, List, Literal, Optional, Tuple
 
 import yaml
@@ -38,6 +39,11 @@ class MetadataServerConfig():
     server_type: Literal['etcd']
     hostname: str = "localhost"
     port: int = 2379
+
+
+class ServerRole(Enum):
+    CONTEXT = 0
+    GENERATION = 1
 
 
 def parse_disagg_config_file(yaml_config_file: str):
