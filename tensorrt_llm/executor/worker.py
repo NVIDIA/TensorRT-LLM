@@ -335,8 +335,6 @@ class ExecutorBindingsWorker(GenerationExecutor):
         if request.multimodal_embedding is not None:
             multimodal_embedding = request.multimodal_embedding
         if request.prompt_adapter_request is not None:
-            assert request.prompt_tuning_config is None, \
-                "cannot accept both prompt_adapter_request and prompt_tuning_config in one request"
             self._load_prompt_adapter(request.prompt_adapter_request)
             uid = str(request.prompt_adapter_request.adapter_id)
             prompt_tuning_config = tllm.PromptTuningConfig(
