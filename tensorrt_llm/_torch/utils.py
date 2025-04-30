@@ -96,6 +96,10 @@ class Fp4QuantizedTensor:
     fp4_tensor: torch.Tensor
     scaling_factor: torch.Tensor
 
+    @property
+    def shape(self):
+        return self.fp4_tensor.shape
+
 
 _disable_fp4_allgather = os.getenv("TLLM_DISABLE_FP4_ALLGATHER", "0") == "1"
 
