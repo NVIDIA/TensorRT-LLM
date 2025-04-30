@@ -439,7 +439,7 @@ def create_py_executor_instance(dist,
 
     resources["seq_slot_manager"] = SeqSlotManager(
         executor_config.max_batch_size * num_micro_batches)
-        
+
     capacity_scheduler = BindCapacityScheduler(
         executor_config.max_batch_size,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
