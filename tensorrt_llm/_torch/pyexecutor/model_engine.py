@@ -1142,14 +1142,9 @@ class PyTorchModelEngine(ModelEngine):
                 gather_ids, dtype=torch.int, pin_memory=True),
                                                          non_blocking=True)
 
-        if not attn_metadata.is_cuda_graph or (
-                self.is_spec_decode
-                and self.spec_config.spec_dec_mode.has_variable_seq_lens()):
-            # Usually, we don't need to update seq_lens when using CUDA graphs.
-            # This is because CUDA graphs are only used for pure decoding batches.
-            # If we're doing spec decode, however, we can have variable seqlens (up
-            # to max_num_draft_tokens per request). The buffers inside the CUDA graph
-            # runner are padded to handle this. See [CUDA graph spec decode padding].
+        if not attn_metadata.is_cuda_graph:
+            # Assumes seq lens do not change between CUDA graph invocations. This applies
+            # to draft sequences too. This means that all draft sequences must be padded.
             attn_metadata.seq_lens = torch.tensor(
                 sequence_lengths,
                 dtype=torch.int,
