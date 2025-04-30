@@ -20,6 +20,7 @@ set(SRCS
     utils/sessionUtils.cpp
     utils/debugUtils.cu
     utils/speculativeChoicesUtils.cpp
+    utils/modelSpec.cpp
     bufferManager.cpp
     cudaMemPool.cpp
     decodingLayerWorkspace.cpp

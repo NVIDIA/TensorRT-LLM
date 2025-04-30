@@ -10,7 +10,6 @@
  * its affiliates is strictly prohibited.
  */
 
-#include "modelSpec.h"
 #include "tensorrt_llm/batch_manager/trtGptModel.h"
 #include "tensorrt_llm/batch_manager/trtGptModelFactory.h"
 #include "tensorrt_llm/common/assert.h"
@@ -18,6 +17,7 @@
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
+#include "tensorrt_llm/runtime/utils/modelSpec.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
 #include "tests/utils/common.h"

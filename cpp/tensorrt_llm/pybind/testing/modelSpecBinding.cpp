@@ -10,7 +10,8 @@
  * its affiliates is strictly prohibited.
  */
 
-#include "modelSpec.h"
+#include "modelSpecBinding.h"
+#include "tensorrt_llm/runtime/utils/modelSpec.h"
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -21,7 +22,10 @@ using tensorrt_llm::testing::KVCacheType;
 using tensorrt_llm::testing::QuantMethod;
 using tensorrt_llm::testing::OutputContentType;
 
-PYBIND11_MODULE(model_spec, m)
+namespace tensorrt_llm::pybind::testing
+{
+
+void initBindings(py::module_& m)
 {
     py::enum_<QuantMethod>(m, "QuantMethod", py::arithmetic(), "Quantization Method")
         .value("NONE", QuantMethod::kNONE, "No Quantization")
@@ -72,4 +76,6 @@ PYBIND11_MODULE(model_spec, m)
         .def("enable_context_fmha_fp32_acc", &ModelSpec::enableContextFMHAFp32Acc)
         .def("get_enable_context_fmha_fp32_acc", &ModelSpec::getEnableContextFMHAFp32Acc)
         .def("__copy__", [](ModelSpec const& self) { return ModelSpec(self); });
-};
+}
+
+} // namespace tensorrt_llm::pybind::testing
