@@ -726,6 +726,8 @@ void TrtGptModelInflightBatching::terminateRequest(LlmRequestPtr const& llmReq, 
 void TrtGptModelInflightBatching::terminateRequestSync(
     LlmRequestPtr const& llmRequest, executor::FinishReason finishReason)
 {
+    TLLM_LOG_DEBUG("Registering termination for request %lu with finish reason %d", llmRequest->mRequestId,
+        static_cast<int>(finishReason));
     mReqIdsToTerminate.try_emplace(llmRequest->mRequestId, finishReason);
 }
 
@@ -834,6 +836,8 @@ void TrtGptModelInflightBatching::forwardSync()
                     {
                         if (!llmReq->isGenerationToCompleteState())
                         {
+                            TLLM_LOG_DEBUG("Terminating request %lu with finish reason %d", llmReq->mRequestId,
+                                static_cast<int>(mReqIdsToTerminate[llmReq->mRequestId]));
                             terminateRequest(llmReq);
                             llmReq->finishByReason(mReqIdsToTerminate[llmReq->mRequestId]);
                             llmReq->clearGeneratedTokens();
