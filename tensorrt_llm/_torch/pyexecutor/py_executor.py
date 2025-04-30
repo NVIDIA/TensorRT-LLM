@@ -18,7 +18,8 @@ import dill  # nosec B403
 import numpy as np
 import torch
 
-from tensorrt_llm._utils import global_mpi_rank, nvtx_range
+from tensorrt_llm._utils import (global_mpi_rank, is_trace_enabled, nvtx_range,
+                                 trace_func)
 from tensorrt_llm.bindings.executor import (FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
                                             RequestType, StaticBatchingStats)
@@ -254,6 +255,9 @@ class PyExecutor:
             self.event_loop = self._executor_loop_pp_overlap if enable_overlap_scheduler else self._executor_loop_pp
         else:
             self.event_loop = self._executor_loop_overlap if enable_overlap_scheduler else self._executor_loop
+
+        if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
+            self.event_loop = trace_func(self.event_loop)
 
         if self.draft_model_engine is not None and self.event_loop.__name__ != self._executor_loop.__name__:
             raise NotImplementedError(
