@@ -243,9 +243,12 @@ class Eagle3OneModelWorker(nn.Module):
 
         # Prepare inputs for the 1st draft model forward
         position_ids = position_ids.squeeze(0)
+        last_tokens_idx = torch.cumsum(
+            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         inputs = self.prepare_1st_drafter_inputs(
             input_ids=input_ids,
             position_ids=position_ids,
+            last_tokens_idx=last_tokens_idx,
             hidden_states=hidden_states,
             accepted_tokens=accepted_tokens,
             attn_metadata=attn_metadata,
@@ -257,18 +260,14 @@ class Eagle3OneModelWorker(nn.Module):
         for i in range(self.max_draft_tokens):
             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
             if i == 0:
-                gather_ids_ctx = torch.cumsum(
-                    attn_metadata.seq_lens_cuda[:num_contexts],
-                    dim=0,
-                    dtype=torch.long) - 1
                 gather_ids_gen = torch.cumsum(
                     num_accepted_tokens[num_contexts:], dim=0,
                     dtype=torch.long) - 1 + attn_metadata.num_ctx_tokens
-                gather_ids = torch.concat([gather_ids_ctx, gather_ids_gen],
-                                          dim=0)
+                gather_ids = torch.concat(
+                    [last_tokens_idx[:num_contexts], gather_ids_gen], dim=0)
             else:
-                gather_ids = torch.cumsum(
-                    attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+                # All of the seq_len are 1, use batch_indices_cuda as gather_ids
+                gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
             logits = draft_model.logits_processor(hidden_states[gather_ids],
                                                   draft_model.lm_head,
                                                   attn_metadata, True)
@@ -282,19 +281,19 @@ class Eagle3OneModelWorker(nn.Module):
                 attn_metadata._seq_lens[:batch_size].fill_(1)
                 attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
                 attn_metadata.on_update()
-            # cannot run generation if their is no kv cache
-            if inputs["attn_metadata"].kv_cache_manager is not None:
-                attn_metadata.host_request_types[:attn_metadata.
-                                                 num_contexts].fill_(1)
-                attn_metadata.num_contexts = 0
-            if hasattr(attn_metadata, 'kv_lens_cuda'):
-                if i == 0:
+                # cannot run generation if their is no kv cache
+                if inputs["attn_metadata"].kv_cache_manager is not None:
+                    attn_metadata.host_request_types[:attn_metadata.
+                                                     num_contexts].fill_(1)
+                    attn_metadata.num_contexts = 0
+                # update kv_lens_cuda
+                if hasattr(attn_metadata, 'kv_lens_cuda'):
                     attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
                         self.max_draft_tokens -
                         num_accepted_tokens[num_contexts:])
                     attn_metadata.kv_lens_cuda[:num_contexts] += 1
-                else:
-                    attn_metadata.kv_lens_cuda[:batch_size] += 1
+            elif hasattr(attn_metadata, 'kv_lens_cuda'):
+                attn_metadata.kv_lens_cuda[:batch_size] += 1
             # support attention dp
             if spec_metadata.all_rank_num_tokens is not None:
                 spec_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
@@ -391,6 +390,7 @@ class Eagle3OneModelWorker(nn.Module):
         self,
         input_ids: torch.LongTensor,
         position_ids: torch.LongTensor,
+        last_tokens_idx: torch.LongTensor,
         hidden_states: torch.Tensor,
         accepted_tokens: torch.Tensor,
         attn_metadata: AttentionMetadata,
@@ -399,8 +399,6 @@ class Eagle3OneModelWorker(nn.Module):
     ):
         num_contexts = attn_metadata.num_contexts
         num_tokens = input_ids.shape[0]
-        last_tokens_idx = torch.cumsum(
-            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
 
         # prepare hidden states
         hidden_size_up = spec_metadata.hidden_size * len(
