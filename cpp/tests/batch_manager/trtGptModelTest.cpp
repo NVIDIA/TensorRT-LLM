@@ -22,7 +22,7 @@
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
-#include "tensorrt_llm/runtime/utils/modelSpec.h"
+#include "tensorrt_llm/testing/modelSpec.h"
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
