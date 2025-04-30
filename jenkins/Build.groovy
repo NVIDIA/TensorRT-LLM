@@ -417,7 +417,6 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     sh "cp ${LLM_ROOT}/cpp/build/benchmarks/gptManagerBenchmark TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/libtensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
-    sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.so TensorRT-LLM/benchmarks/cpp"
 
     // Copy model_spec.so (pybinding for ModelSpec) since various tests will need it.
     sh "mkdir -p TensorRT-LLM/src/cpp/tests/batch_manager"
@@ -482,7 +481,6 @@ def prepareBuildLib(pipeline, triple, pre_cxx11abi)
     if ((triple == X86_64_TRIPLE && pre_cxx11abi) || (triple == AARCH64_TRIPLE && !pre_cxx11abi)) {
         libraries += [
             "ucx_wrapper",
-            "nvrtc_wrapper",
         ]
     }
 
@@ -496,8 +494,6 @@ def prepareBuildLib(pipeline, triple, pre_cxx11abi)
         } else if (library_name == "executor") {
             libdir = "tensorrt_llm/executor"
             is_static = true
-        } else if (library_name == "nvrtc_wrapper") {
-            libdir = "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper"
         } else if (library_name == "internal_cutlass_kernels"){
             libdir = "tensorrt_llm/kernels/internal_cutlass_kernels"
             is_static = true
