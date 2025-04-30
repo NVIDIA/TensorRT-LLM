@@ -68,7 +68,7 @@ class EarlyStopDecoder(Decoder):
         scheduled_requests = decoder_state.scheduled_requests
         assert (not scheduled_requests.generation_requests)
         for idx, request in enumerate(scheduled_requests.context_requests):
-            request.state = LlmRequestState.GENERATION_COMPLETE
+            request.set_state(LlmRequestState.GENERATION_COMPLETE)
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
             logits = decoder_state.logits[idx]
@@ -203,17 +203,17 @@ class TorchDecoder(Decoder):
         """Handle stop criteria and set appropriate finish reasons and state.
         Returns True if generation should stop."""
         if new_token == request.py_end_id:
-            request.state = LlmRequestState.GENERATION_COMPLETE
+            request.set_state(LlmRequestState.GENERATION_COMPLETE)
             request.set_finished_reason(FinishReason.END_ID, beam_idx)
             return True
 
         if self._meet_max_token_stop_criteria(request, num_tokens):
-            request.state = LlmRequestState.GENERATION_COMPLETE
+            request.set_state(LlmRequestState.GENERATION_COMPLETE)
             request.set_finished_reason(FinishReason.LENGTH, beam_idx)
             return True
 
         if self._meet_stop_token_criteria(request):
-            request.state = LlmRequestState.GENERATION_COMPLETE
+            request.set_state(LlmRequestState.GENERATION_COMPLETE)
             request.set_finished_reason(FinishReason.STOP_WORDS, beam_idx)
             return True
 
@@ -260,7 +260,8 @@ class TorchDecoder(Decoder):
                 advance_idx()
                 continue
 
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
+            if request.get_state() != LlmRequestState.GENERATION_COMPLETE:
+
                 new_token = new_tokens_list[token_idx]
                 num_tokens = request.add_new_token(new_token, beam_idx)
                 self._handle_stop_criteria(request, new_token, num_tokens,
@@ -281,7 +282,7 @@ class TorchDecoder(Decoder):
                 generation_requests.append(request)
 
         for request in extend_requests:
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
+            if request.get_state() != LlmRequestState.GENERATION_COMPLETE:
                 new_token = new_tokens_list[token_idx]
                 num_tokens = request.add_new_token(new_token, beam_idx)
                 self._handle_stop_criteria(request, new_token, num_tokens,
@@ -308,7 +309,7 @@ class TorchDecoder(Decoder):
             advance_idx(len(request.py_draft_tokens) + 1)
 
         for request in generation_requests:
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
+            if request.get_state() != LlmRequestState.GENERATION_COMPLETE:
                 new_token = new_tokens_list[token_idx]
                 num_tokens = request.add_new_token(new_token, beam_idx)
                 self._handle_stop_criteria(request, new_token, num_tokens,
@@ -342,7 +343,7 @@ class TorchDecoder(Decoder):
             idx += 1
 
         for request in scheduled_requests.generation_requests:
-            if request.state == LlmRequestState.GENERATION_COMPLETE:
+            if request.get_state() == LlmRequestState.GENERATION_COMPLETE:
                 continue
             assert request.py_draft_tokens is None, "Speculative decoding not supported in SeparateDecoder."
             token_logits = logits[idx:idx + 1, :]
@@ -401,7 +402,7 @@ class TorchStarAttentionDecoder(TorchDecoder):
             request.py_result.append_log_probs([log_probs.tolist()])
 
         self._handle_stop_criteria(request, new_token, num_tokens, beam_idx)
-        if request.state != LlmRequestState.GENERATION_COMPLETE:
+        if request.get_state() != LlmRequestState.GENERATION_COMPLETE:
             request.py_decoding_iter += 1
 
     def update_requests(self, decoder_state: DecoderState):
@@ -412,7 +413,7 @@ class TorchStarAttentionDecoder(TorchDecoder):
         logits = decoder_state.logits
 
         for request in decoder_state.scheduled_requests.context_requests:
-            if request.state == LlmRequestState.GENERATION_IN_PROGRESS:
+            if request.get_state() == LlmRequestState.GENERATION_IN_PROGRESS:
                 self.update_one_request(request, new_tokens_list, logits)
 
         for request in decoder_state.scheduled_requests.generation_requests:
@@ -683,8 +684,8 @@ class TRTLLMDecoder(Decoder):
                 self.model_config)
 
             # Increment the decoding iteration counter
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
+            if request.get_state() != LlmRequestState.GENERATION_COMPLETE:
                 request.py_decoding_iter += 1
 
             if finished_sum_host[seq_slot] == self.beam_width:
-                request.state = LlmRequestState.GENERATION_COMPLETE
+                request.set_state(LlmRequestState.GENERATION_COMPLETE)

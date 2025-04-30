@@ -180,6 +180,7 @@ class PyExecutor:
         self.resource_manager = resource_manager
         self.scheduler = scheduler
         self.model_engine = model_engine
+        self.enable_pure_python_scheduler = model_engine.pytorch_backend_config.enable_pure_python_scheduler
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.decoder = decoder
         self.dist = dist
@@ -900,7 +901,8 @@ class PyExecutor:
                     if self.kv_cache_transceiver:
                         # For context only req in transmission, we reset the state since decoder might have changed it
                         for req in ctx_transmission_reqs:
-                            req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+                            req.set_state(LlmRequestState.
+                                          DISAGG_CONTEXT_TRANS_IN_PROGRESS)
 
                     self._handle_cancelled_requests()
                     finished_requests = self._handle_responses()
@@ -930,7 +932,7 @@ class PyExecutor:
             # Set draft tokens here to make the KV cache manager
             # and scheduler aware of them.
             for req in self.active_requests:
-                if req.state != LlmRequestState.GENERATION_IN_PROGRESS:
+                if req.get_state() != LlmRequestState.GENERATION_IN_PROGRESS:
                     continue
                 req.py_last_draft_tokens = req.py_draft_tokens
                 max_draft_len = self.model_engine.spec_config.max_draft_tokens
@@ -1091,7 +1093,7 @@ class PyExecutor:
 
         if self.kv_cache_transceiver and self.previous_batch.ctx_transmission_reqs:
             for req in self.previous_batch.ctx_transmission_reqs:
-                req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+                req.set_state(LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS)
 
         self._handle_cancelled_requests()
         finished_requests = self._handle_responses()
@@ -1226,6 +1228,10 @@ class PyExecutor:
                 self.request_queue, timeout,
                 total_max_num_active_requests - total_num_active_requests)
 
+            if self.enable_pure_python_scheduler:
+                for req in new_requests:
+                    req.py_path = True
+
         new_requests = self._broadcast_new_requests(new_requests)
 
         if not self.enable_attention_dp:
@@ -1349,10 +1355,10 @@ class PyExecutor:
     def _finish_dummy_request(self, scheduled_requests: ScheduledRequests):
         for req in scheduled_requests.context_requests:
             if req.is_dummy:
-                req.state = LlmRequestState.GENERATION_COMPLETE
+                req.set_state(LlmRequestState.GENERATION_COMPLETE)
         for req in scheduled_requests.generation_requests:
             if req.is_dummy:
-                req.state = LlmRequestState.GENERATION_COMPLETE
+                req.set_state(LlmRequestState.GENERATION_COMPLETE)
         for req in self.active_requests[:]:
             if req.is_dummy:
                 self.inflight_req_ids.erase(req.request_id)
@@ -1547,7 +1553,7 @@ class PyExecutor:
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
-                req.state = LlmRequestState.GENERATION_IN_PROGRESS
+                req.set_state(LlmRequestState.GENERATION_IN_PROGRESS)
                 req.context_current_position = req.prompt_len
                 req.decoding_iter = 1
                 req.py_decoding_iter = 1
@@ -1563,7 +1569,7 @@ class PyExecutor:
         # For gen-only benchmarking, mark new gen request as transmission complete right away
         if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
             for req in new_gen_reqs:
-                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+                req.set_state(LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE)
             return
 
         if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
@@ -1596,8 +1602,8 @@ class PyExecutor:
 
         # Keep track of ctx requests that are in transmission
         ctx_transmission_reqs = [
-            req for req in scheduled_ctx_requests
-            if req.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+            req for req in scheduled_ctx_requests if req.get_state() ==
+            LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
         ]
 
         return ctx_transmission_reqs
@@ -1631,15 +1637,15 @@ class PyExecutor:
         for request in scheduled_requests.context_requests:
             request.move_to_next_context_chunk()
             if request.get_context_remaining_length() == 0:
-                request.state = LlmRequestState.GENERATION_IN_PROGRESS
+                request.set_state(LlmRequestState.GENERATION_IN_PROGRESS)
             if request.is_dummy:
-                request.state = LlmRequestState.GENERATION_COMPLETE
+                request.set_state(LlmRequestState.GENERATION_COMPLETE)
 
     def _update_request_states_star_attention(
             self, scheduled_requests: ScheduledRequests):
         for request in scheduled_requests.context_requests:
             if request.ctx_iters >= len(request.ctx_blocks) - 2:
-                request.state = LlmRequestState.GENERATION_IN_PROGRESS
+                request.set_state(LlmRequestState.GENERATION_IN_PROGRESS)
             request.ctx_iters += 1
 
         for request in scheduled_requests.generation_requests:
@@ -1751,7 +1757,8 @@ class PyExecutor:
                     # Explicitly add the last token so get_last_tokens() returns
                     # the right value
                     new_request.add_new_token(input_tokens[-1], beam_idx)
-                    new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
+                    new_request.set_state(
+                        LlmRequestState.GENERATION_IN_PROGRESS)
                     draft_batch.generation_requests.append(new_request)
                 else:
                     new_request = LlmRequest(
@@ -1828,7 +1835,8 @@ class PyExecutor:
                     target_model_req = req_id_to_old_request[req.py_request_id]
                     target_model_req.py_draft_tokens.append(
                         req.get_last_tokens(0))
-                    if req.state != LlmRequestState.GENERATION_COMPLETE and len(
+                    if req.get_state(
+                    ) != LlmRequestState.GENERATION_COMPLETE and len(
                             target_model_req.py_draft_tokens
                     ) < target_model_req.py_draft_pages_allocated:
                         new_requests.append(req)
@@ -1876,7 +1884,7 @@ class PyExecutor:
         error_msg = error_msg or "error"
         for request in self.active_requests:
             req_id = request.py_request_id
-            request.state = LlmRequestState.GENERATION_COMPLETE
+            request.set_state(LlmRequestState.GENERATION_COMPLETE)
             self._terminate_request(request)
             error_responses[req_id] = ExecutorResponse(
                 req_id, error_msg, client_id=request.py_client_id)

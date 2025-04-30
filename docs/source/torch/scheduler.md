@@ -53,7 +53,7 @@ class GuaranteedNoEvictScheduler(CapacityScheduler):
         reserved_blocks = 0
         max_blocks = self.kv_cache_manager.get_max_resource_count()
         for request in active_requests:
-            req_state = request.state
+            req_state = request.get_state()
             # if request cannot be scheduled yet or request should no longer be scheduled, skip
             if req_state.value < self.no_schedule_until_state.value or req_state.value >= self.no_schedule_after_state.value:
                 continue
@@ -70,7 +70,7 @@ class GuaranteedNoEvictScheduler(CapacityScheduler):
 
         avaiable_blocks = max_blocks - reserved_blocks
         for request in pending_requests:
-            req_state = request.state
+            req_state = request.get_state()
             if len(scheduled_requests) >= self.max_num_requests:
                 break
             elif req_state == LlmRequestState.CONTEXT_INIT:
