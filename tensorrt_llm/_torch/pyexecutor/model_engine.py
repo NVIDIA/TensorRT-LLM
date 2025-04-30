@@ -651,6 +651,8 @@ class PyTorchModelEngine(ModelEngine):
             [max_req_id + i + 1 for i in range(padding_size)],
             is_gen=True,
             max_num_draft_tokens=max_num_draft_tokens)
+        for req in generation_requests:
+            req.is_cuda_graph_padding = True
         scheduled_requests.generation_requests.extend(generation_requests)
         return generation_requests
 
@@ -1022,9 +1024,9 @@ class PyTorchModelEngine(ModelEngine):
                 # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
                 # (2) request.py_batch_idx is None, which means the request has no previous batch.
                 # the second condition includes dummy generation requests created for CUDA graph padding.
-                # the dummy generation requests should be at the end of generation_requests.
+                # these dummy generation requests should be at the end of generation_requests.
                 # skip adding their input_ids so that new_tokens_device can be aligned to the correct positions.
-                if not request.is_dummy:
+                if not request.is_cuda_graph_padding:
                     input_ids.append(request.get_last_tokens(0))
                 past_seen_token_num = request.max_beam_num_tokens - 1
             else:

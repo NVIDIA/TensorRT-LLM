@@ -51,6 +51,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_last_draft_tokens = None
         self.py_decoding_iter = 0
         self.is_dummy = False
+        self.is_cuda_graph_padding = False
 
 
 def convert_wordlist(word_list) -> List[List[int]]:

@@ -1289,8 +1289,6 @@ class PyExecutor:
             max_num_draft_tokens=0
             if self.has_context_request else self.max_draft_tokens,
         )
-        for llm_request in llm_request_list:
-            llm_request.is_dummy = True
         self.active_requests += llm_request_list
 
     def _finish_dummy_request(self, scheduled_requests: ScheduledRequests):
