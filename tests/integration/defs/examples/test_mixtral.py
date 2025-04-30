@@ -22,7 +22,8 @@ from defs.common import (convert_weights, generate_summary_cmd, quantize_data,
                          venv_check_call, venv_mpi_check_call)
 from defs.conftest import (evaltool_mmlu_post_process,
                            evaltool_wikilingua_post_process, llm_models_root,
-                           skip_pre_ada, skip_pre_blackwell)
+                           skip_post_blackwell, skip_pre_ada,
+                           skip_pre_blackwell)
 from defs.trt_test_alternative import check_call
 from evaltool.constants import (EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT,
                                 EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT,
@@ -876,6 +877,7 @@ def test_llm_mixtral_1gpu_fp4_llmapi(
     check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
+@skip_post_blackwell
 @pytest.mark.parametrize("model_name", ['mixtral-8x7b-v0.1-AWQ'])
 def test_llm_mixtral_int4_awq_1gpu_summary(llama_example_root,
                                            llm_datasets_root, model_name,
@@ -916,6 +918,7 @@ def test_llm_mixtral_int4_awq_1gpu_summary(llama_example_root,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize(

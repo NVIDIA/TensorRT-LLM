@@ -295,7 +295,6 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
             layer for layer in self.layers[:config.num_hidden_layers]
             if not layer.is_missing()
         ]
-        print(f"{self._local_layers=}, {self.pp_layer_list=}")
 
         # add create_pipeline_interface method
         pp_interface_keys = ["hidden_states", "residual"]
