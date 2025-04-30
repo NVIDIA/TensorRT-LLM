@@ -111,6 +111,7 @@ GPU_OPTS          ?= --gpus=all
 SOURCE_DIR        ?= $(shell readlink -f ..)
 CODE_DIR          ?= /code/tensorrt_llm
 CCACHE_DIR        ?= ${CODE_DIR}/cpp/.ccache
+CONAN_DIR         ?= ${CODE_DIR}/cpp/.conan
 RUN_CMD           ?=
 CONTAINER_NAME    ?= tensorrt_llm
 WORK_DIR          ?= $(CODE_DIR)
@@ -128,6 +129,7 @@ endif
     		--volume $(SOURCE_DIR):$(CODE_DIR) \
     		--env "CCACHE_DIR=${CCACHE_DIR}" \
     		--env "CCACHE_BASEDIR=${CODE_DIR}" \
+    	    --env "CONAN_HOME=${CONAN_DIR}" \
     		--workdir $(WORK_DIR) \
     		--hostname $(shell hostname)-$* \
     		--name $(CONTAINER_NAME)-$*-$(USER_NAME) \
