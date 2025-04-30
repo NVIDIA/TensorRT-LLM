@@ -49,10 +49,14 @@ If any diffs were found it will also generate a patch file to change `base_perf_
 
 
 ## Generating diff report
-To view the difference between 2 reports, it is possible to generate a pdf report containing Bar graphs comparing the base and target value per-metric. Each metric will contain 2 bars per-each configuration (1 for the base and 1 for the target).
-To generate this report
+To view the difference between performance reports, it is possible to generate a pdf report containing Bar graphs comparing the perf metric value per-metric.
+Each metric will contain comparison bars per configuration.
+
+For example: If we run the script with 3 files and test 2 configurations per metric, we will have 2 groups of 3 bars - A group per-configuration, each group containing the 3 performance metrics reported in the 3 files.
+
+To generate this report:
 ```
-python tests/integration/defs/perf/create_perf_comparison_report.py --base_csv_path=<path_to_base_csv> --target_csv_path=<path_to_target_csv> --output_path=<output_path_for_report>
+python tests/integration/defs/perf/create_perf_comparison_report.py --output_path=<output_path_for_report> --files <csv file paths separated by spaces>
 ```
 
 This will create a pdf file at <output_path_for_report>.
