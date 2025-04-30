@@ -78,7 +78,7 @@ class GatedMLP(nn.Module):
             is_expert=is_expert,
             skip_create_weights=config.skip_create_weights,
             # In Llama4, we are using the custom kernel that performs FC+SwiGLU
-            use_llama4_custom_fc_swiglu_kernel=is_llama4,
+            use_llama4_fc_swiglu_kernel=is_llama4,
         )
 
         self.down_proj = Linear(
@@ -91,10 +91,10 @@ class GatedMLP(nn.Module):
             quant_config=config.get_quant_config(),
             is_expert=is_expert,
             skip_create_weights=config.skip_create_weights,
-            # In llama4, the custom kernel (triggered by use_llama4_custom_fc_swiglu_kernel)
+            # In llama4, the custom kernel (triggered by use_llama4_fc_swiglu_kernel)
             # is outputing fp8. The current setting is assuming bf16 out, so we need
             # to provide the inv_input_scale of this layer to it to offset the un-needed
-            # quantization.
+                # quantization.
             previous_gate_up_proj=self.gate_up_proj,
         )
 
