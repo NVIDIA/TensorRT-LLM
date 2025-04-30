@@ -1551,7 +1551,6 @@ def test_executor_config():
     assert config.guided_decoding_config is None
     assert config.additional_model_outputs is None
     assert config.gather_generation_logits is False
-    assert config.use_variable_beam_width_search is False
     assert config.use_gpu_direct_storage is False
     assert config.mm_embedding_offloading is False
     assert config.enable_trt_overlap is False
@@ -1603,8 +1602,6 @@ def test_executor_config():
         [trtllm.AdditionalModelOutput("topKLogits")],
         "gather_generation_logits":
         True,
-        "use_variable_beam_width_search":
-        True,
         "use_gpu_direct_storage":
         True,
         "mm_embedding_offloading":
@@ -1633,7 +1630,6 @@ def test_executor_config():
     assert config.additional_model_outputs[0].name == "topKLogits"
     assert config.additional_model_outputs[0].gather_context is False
     assert config.gather_generation_logits is True
-    assert config.use_variable_beam_width_search is True
     assert config.use_gpu_direct_storage is True
     assert config.mm_embedding_offloading is True
     assert config.enable_trt_overlap is True
@@ -2378,8 +2374,6 @@ def test_executor_config_pickle():
         [trtllm.AdditionalModelOutput("topKLogits")],
         "gather_generation_logits":
         True,
-        "use_variable_beam_width_search":
-        False,
         "mm_embedding_offloading":
         True,
         "enable_trt_overlap":
@@ -2425,7 +2419,6 @@ def test_executor_config_pickle():
         0].gather_context == config_copy.additional_model_outputs[
             0].gather_context
     assert config.gather_generation_logits == config_copy.gather_generation_logits
-    assert config.use_variable_beam_width_search == config_copy.use_variable_beam_width_search
     assert config.mm_embedding_offloading == config_copy.mm_embedding_offloading
     assert config.enable_trt_overlap == config_copy.enable_trt_overlap
 

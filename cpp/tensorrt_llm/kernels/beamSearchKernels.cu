@@ -263,11 +263,8 @@ void printBH(BeamHypotheses const& bh)
     PH2(bh.lengthPenalties, nbs);
     PH2(bh.earlyStoppings, nbs);
     PH3(bh.beamWidthArraysHost, nbs * kMaxBeamWidthArrayLength, kMaxBeamWidthArrayLength);
-    PH3(bh.beamWidthArraysDevice, nbs * kMaxBeamWidthArrayLength, kMaxBeamWidthArrayLength);
     PH2(bh.nBeamWidthInHost, nbs);
     PH2(bh.nBeamWidthOutHost, nbs);
-    PH2(bh.nBeamWidthInDevice, nbs);
-    PH2(bh.nBeamWidthOutDevice, nbs);
 
     PH2(bh.inputLengths, nbs * nbm);
     PH2(bh.endIds, nbs);

@@ -94,23 +94,33 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDe
 namespace
 {
 
-std::vector<SizeType32> getActiveSlots(RequestVector const& contextRequests, RequestVector const& generationRequests)
+std::pair<std::vector<SizeType32>, std::vector<SizeType32>> getActiveSlots(
+    RequestVector const& contextRequests, RequestVector const& generationRequests)
 {
-    std::vector<SizeType32> activeSlots;
+    std::vector<std::pair<SizeType32, SizeType32>> slots;
     for (auto const& requests : {contextRequests, generationRequests})
     {
         for (auto const& llmReq : requests)
         {
             if (llmReq->isGenerationInProgressState() || llmReq->isLastContextChunk())
             {
-                activeSlots.push_back(llmReq->mSeqSlot.value());
+                slots.push_back({llmReq->mSeqSlot.value(), llmReq->getDecodingIter()});
             }
         }
     }
 
-    std::sort(activeSlots.begin(), activeSlots.end());
+    std::sort(slots.begin(), slots.end(),
+        [](std::pair<SizeType32, SizeType32> const& a, std::pair<SizeType32, SizeType32> const& b)
+        { return a.first < b.first; });
 
-    return activeSlots;
+    std::vector<SizeType32> activeSlots, generationSteps;
+    for (auto const& slot : slots)
+    {
+        activeSlots.push_back(slot.first);
+        generationSteps.push_back(slot.second);
+    }
+
+    return {activeSlots, generationSteps};
 }
 
 void copySequenceLengths(RequestVector const& contextRequests, RequestVector const& generationRequests,
@@ -167,10 +177,11 @@ MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests, R
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto activeSlots = getActiveSlots(contextRequests, generationRequests);
+    auto [activeSlots, generationSteps] = getActiveSlots(contextRequests, generationRequests);
 
     auto decodingInput = createDecoderBatchInputs(activeSlots, decoderState, decoderBuffers.logits, maxNumSequences,
         inputBuffers.forwardBatchSlots, decoderBuffers.cacheIndirectionInput);
+    decodingInput->generationSteps = generationSteps;
 
     if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
     {

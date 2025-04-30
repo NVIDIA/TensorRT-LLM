@@ -52,11 +52,13 @@ public:
         TLLM_CHECK_WITH_INFO(static_cast<bool>(this->logits), "Invalid logits tensor");
     }
 
-    // mandatory parameters
-    TensorPtr logits; // [batchSize, maxBeamWidth, vocabSizePadded], on gpu
+    //! Mandatory parameters
+    //! [batchSize, maxBeamWidth, vocabSizePadded], on gpu
+    TensorPtr logits;
 
-    // parameters for beam search
-    TensorPtr cacheIndirection; // [batchSize, maxBeamWidth, maxSeqLen] - the k/v cache index for beam search, on gpu
+    //! Parameters for Beam Search
+    //! K/V cache index for beam search, [batchSize, maxBeamWidth, maxSeqLen], on gpu
+    TensorPtr cacheIndirection;
 };
 
 class Output
@@ -66,9 +68,11 @@ public:
 
     Output() = default;
 
-    // parameters for beam search
-    TensorPtr cacheIndirection; // [batchSize, maxBeamWidth, maxSeqLen], mandatory in beam search, on gpu
-    TensorPtr sequenceLengths;  // [batchSize, maxBeamWidth], mandatory, on gpu
+    //! Mandatory for beam search
+    //! [batchSize, maxBeamWidth, maxSeqLen], on gpu
+    TensorPtr cacheIndirection;
+    //! [batchSize, maxBeamWidth], on gpu
+    TensorPtr sequenceLengths;
 };
 } // namespace decoder
 

@@ -60,14 +60,12 @@ class DecoderDomain
 public:
     DecoderDomain(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 vocabSize,
         std::optional<runtime::SizeType32> vocabSizePadded = std::nullopt,
-        std::shared_ptr<runtime::SpeculativeDecodingModule const> speculativeDecodingModule = nullptr,
-        bool const useVariableBeamWidthSearch = false)
+        std::shared_ptr<runtime::SpeculativeDecodingModule const> speculativeDecodingModule = nullptr)
         : mBatchSize(batchSize)
         , mBeamWidth(beamWidth)
         , mVocabSize(vocabSize)
         , mVocabSizePadded(vocabSizePadded.value_or(vocabSize))
         , mSpeculativeDecodingModule(std::move(speculativeDecodingModule))
-        , mUseVariableBeamWidthSearch(useVariableBeamWidthSearch)
     {
     }
 
@@ -107,18 +105,12 @@ public:
         return mSpeculativeDecodingModule;
     }
 
-    [[nodiscard]] bool getUseVariableBeamWidthSearch() const
-    {
-        return mUseVariableBeamWidthSearch;
-    }
-
 private:
     runtime::SizeType32 mBatchSize;
     runtime::SizeType32 mBeamWidth;
     runtime::SizeType32 mVocabSize;
     runtime::SizeType32 mVocabSizePadded;
     std::shared_ptr<runtime::SpeculativeDecodingModule const> mSpeculativeDecodingModule;
-    bool mUseVariableBeamWidthSearch;
 };
 
 class BaseSetupParams

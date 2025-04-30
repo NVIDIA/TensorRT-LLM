@@ -26,8 +26,8 @@ from .._utils import mpi_broadcast
 from ..bindings import (DataType, GptJsonConfig, KVCacheType, ModelConfig,
                         WorldConfig)
 from ..bindings import executor as trtllm
-from ..bindings.executor import (ExternalDraftTokensConfig, OrchestratorConfig,
-                                 ParallelConfig)
+from ..bindings.executor import (DecodingMode, ExternalDraftTokensConfig,
+                                 OrchestratorConfig, ParallelConfig)
 from ..builder import EngineConfig
 from ..layers import MropeParams
 from ..logger import logger
@@ -348,6 +348,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
             decoding_config.lookahead_decoding_config = trtllm.LookaheadDecodingConfig(
                 w, n, g)
 
+        if use_variable_beam_width_search:
+            decoding_config.decoding_mode = DecodingMode.BeamSearch(
+            ).useVariableBeamWidthSearch(True)
+
         if max_batch_size is None:
             max_batch_size = model_config.max_batch_size
         else:
@@ -390,7 +394,6 @@ class ModelRunnerCpp(ModelRunnerMixin):
             use_gpu_direct_storage=use_gpu_direct_storage,
             gpu_weights_percent=gpu_weights_percent,
             gather_generation_logits=gather_generation_logits,
-            use_variable_beam_width_search=use_variable_beam_width_search,
         )
         trtllm_config.enable_chunked_context = enable_chunked_context
         trtllm_config.extended_runtime_perf_knob_config = extended_runtime_perf_knob_config
