@@ -430,8 +430,11 @@ class DecoderModelForCausalLM(nn.Module,
                             break
                 # TODO: support MLA
 
-        # 2. skip quant for modules in QuantConfig.exclude_modules
-        # kv_cache_quant_algo takes precedence over exclude_modules
+        # 2. skip quant for modules in QuantConfig.exclude_modules.
+        # kv_cache_quant_algo takes precedence over exclude_modules.
+        # kv_cache_quant_algo, if not None, is set for non-Attention
+        # modules too, which is the same practice as when there's no
+        # exclude_modules.
         quant_config = self.model_config.quant_config
         kv_cache_quant_algo = None
         if quant_config:
