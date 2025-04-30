@@ -1,5 +1,4 @@
 import base64
-import os
 import tempfile
 from io import BytesIO
 from pathlib import Path
@@ -16,16 +15,67 @@ from torchvision.transforms import ToTensor
 from transformers import AutoProcessor
 
 
+def _load_and_convert_image(image):
+    image = Image.open(image)
+    image.load()
+    return image.convert("RGB")
+
+
 def load_image(image: str,
                format: str = "pt",
                device: str = "cuda") -> Union[Image.Image, torch.Tensor]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
-    if image.startswith("http://") or image.startswith("https://"):
-        image = Image.open(requests.get(image, stream=True, timeout=10).raw)
+    parsed_url = urlparse(image)
+
+    if parsed_url.scheme in ["http", "https"]:
+        image = requests.get(image, stream=True, timeout=10).raw
+        image = _load_and_convert_image(image)
+    elif parsed_url.scheme == "data":
+        data_spec, data = parsed_url.path.split(",", 1)
+        media_type, data_type = data_spec.split(";", 1)
+
+        if data_type != "base64":
+            msg = "Only base64 data URLs are supported for now."
+            raise NotImplementedError(msg)
+
+        content = base64.b64decode(data)
+        image = _load_and_convert_image(BytesIO(content))
     else:
-        image = Image.open(image)
-    image = image.convert("RGB")
+        image = _load_and_convert_image(image)
+
+    if format == "pt":
+        return ToTensor()(image).to(device=device)
+    else:
+        return image
+
+
+async def async_load_image(
+        image: str,
+        format: str = "pt",
+        device: str = "cuda") -> Union[Image.Image, torch.Tensor]:
+    assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
+
+    parsed_url = urlparse(image)
+
+    if parsed_url.scheme in ["http", "https"]:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image) as response:
+                content = await response.read()
+                image = _load_and_convert_image(BytesIO(content))
+    elif parsed_url.scheme == "data":
+        data_spec, data = parsed_url.path.split(",", 1)
+        media_type, data_type = data_spec.split(";", 1)
+
+        if data_type != "base64":
+            msg = "Only base64 data URLs are supported for now."
+            raise NotImplementedError(msg)
+
+        content = base64.b64decode(data)
+        image = _load_and_convert_image(BytesIO(content))
+    else:
+        image = _load_and_convert_image(Path(parsed_url.path))
+
     if format == "pt":
         return ToTensor()(image).to(device=device)
     else:
@@ -76,6 +126,40 @@ def load_video(
             device=device) if format == "pt" else frames[index]
         for index in indices if index in frames
     ]
+
+
+async def async_load_video(
+        video: str,
+        num_frames: int = 10,
+        format: str = "pt",
+        device: str = "cuda") -> Union[List[Image.Image], List[torch.Tensor]]:
+    assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
+
+    parsed_url = urlparse(video)
+
+    if parsed_url.scheme in ["http", "https"]:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(video) as response:
+                with tempfile.NamedTemporaryFile(delete=False,
+                                                 suffix='.mp4') as tmp:
+                    tmp.write(await response.content.read())
+                    video_path = tmp.name
+    # TODO: add case for video encoded in base64
+    else:
+        video_path = video
+
+    return load_video(video_path, num_frames, format, device)
+
+
+# Copied from https://github.com/vllm-project/vllm/blob/main/examples/online_serving/openai_chat_completion_client_for_multimodal.py#L38
+def encode_base64_content_from_url(content_url: str) -> str:
+    """Encode a content retrieved from a remote url to base64 format."""
+
+    with requests.get(content_url, timeout=10) as response:
+        response.raise_for_status()
+        result = base64.b64encode(response.content).decode('utf-8')
+
+    return result
 
 
 """
@@ -176,7 +260,6 @@ def format_qwen2_vl_input(model_dir, inputs):
                    }]
 
         conversation = [{"role": "user", "content": content}]
-        # print(conversation)
         return processor.apply_chat_template(
             conversation,
             tokenize=False,
@@ -233,112 +316,3 @@ INPUT_FORMATTER_MAP = {
     "qwen2_5_vl": format_qwen2_vl_input,
     "llama4": format_generic_input,
 }
-
-
-async def async_load_image(
-        image: str,
-        format: str = "pt",
-        device: str = "cuda") -> Union[Image.Image, torch.Tensor]:
-    # print('[INFO] async_load_image is called')
-    assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
-
-    parsed_url = urlparse(image)
-
-    def load_and_conver_image(image):
-        image = Image.open(image)
-        image.load()
-        return image.convert("RGB")
-
-    if parsed_url.scheme in ["http", "https"]:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(image) as response:
-                content = await response.read()
-                image = load_and_conver_image(BytesIO(content))
-    elif parsed_url.scheme == "data":
-        data_spec, data = parsed_url.path.split(",", 1)
-        media_type, data_type = data_spec.split(";", 1)
-
-        if data_type != "base64":
-            msg = "Only base64 data URLs are supported for now."
-            raise NotImplementedError(msg)
-
-        content = base64.b64decode(data)
-        image = load_and_conver_image(BytesIO(content))
-    else:
-        filepath = Path(parsed_url.path)
-        image = load_and_conver_image(filepath)
-
-    # print('[INFO] async_load_image is finished')
-    if format == "pt":
-        return ToTensor()(image).to(device=device)
-    else:
-        return image
-
-
-async def async_load_video(
-        video: str,
-        num_frames: int = 10,
-        format: str = "pt",
-        device: str = "cuda") -> Union[List[Image.Image], List[torch.Tensor]]:
-    assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
-
-    # Load video frames from a video file
-    if video.startswith("http://") or video.startswith("https://"):
-        async with aiohttp.ClientSession() as session:
-            async with session.get(video) as response:
-                with tempfile.NamedTemporaryFile(delete=False,
-                                                 suffix='.mp4') as tmp:
-                    tmp.write(await response.content.read())
-                    video_path = tmp.name
-    else:
-        video_path = video
-
-    vidcap = cv2.VideoCapture(video_path)
-
-    if not vidcap.isOpened():
-        raise ValueError(
-            f"Video '{video}' could not be opened. Make sure opencv is installed with video support."
-        )
-
-    # Find the last frame as frame count might not be accurate
-    frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
-    while frame_count > 0:
-        vidcap.set(cv2.CAP_PROP_POS_FRAMES, frame_count - 1)
-        if vidcap.grab():
-            break
-        frame_count -= 1
-    else:
-        raise ValueError(f"Video '{video}' has no frames.")
-
-    # Extract frames uniformly
-    indices = np.round(np.linspace(0, frame_count - 1, num_frames)).astype(int)
-    frames = {}
-    for index in indices:
-        if index in frames:
-            continue
-        vidcap.set(cv2.CAP_PROP_POS_FRAMES, index)
-        success, frame = vidcap.read()
-        if not success:
-            continue
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frames[index] = Image.fromarray(frame)
-
-    if video.startswith("http://") or video.startswith("https://"):
-        os.unlink(video_path)
-
-    return [
-        ToTensor()(frames[index]).to(
-            device=device) if format == "pt" else frames[index]
-        for index in indices if index in frames
-    ]
-
-
-# Copied from https://github.com/vllm-project/vllm/blob/main/examples/online_serving/openai_chat_completion_client_for_multimodal.py#L38
-def encode_base64_content_from_url(content_url: str) -> str:
-    """Encode a content retrieved from a remote url to base64 format."""
-
-    with requests.get(content_url, timeout=10) as response:
-        response.raise_for_status()
-        result = base64.b64encode(response.content).decode('utf-8')
-
-    return result
