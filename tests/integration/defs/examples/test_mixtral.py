@@ -881,7 +881,6 @@ def test_llm_mixtral_1gpu_fp4_llmapi(
         f"{llmapi_example_root}/../mmlu_llmapi.py",
         f"--data_dir={mmlu_dataset_root}",
         f"--hf_model_dir={model_dir}",
-        "--backend=tensorrt",
         "--check_accuracy",
         f"--accuracy_threshold=68.0",
     ]
