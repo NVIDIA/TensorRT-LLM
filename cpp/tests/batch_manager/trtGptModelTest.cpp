@@ -44,7 +44,7 @@ namespace
 auto const TEST_RESOURCE_PATH = fs::path{TOP_LEVEL_DIR} / "cpp/tests/resources";
 auto const ENGINE_PATH = TEST_RESOURCE_PATH / "models/rt_engine";
 auto const GPT_MODEL_PATH = ENGINE_PATH / "gpt2";
-auto const LLAMA_MODEL_PATH = ENGINE_PATH / "llama-7b-hf";
+auto const LLAMA_MODEL_PATH = ENGINE_PATH / "Llama-3.2-1B";
 } // namespace
 
 namespace tensorrt_llm::batch_manager
