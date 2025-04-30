@@ -131,7 +131,7 @@ class Attention(nn.Module):
         self.rotary_emb = None
         self.apply_rotary_emb = (not self.enable_rope_fusion
                                  and pos_embd_params is not None)
-        if config.pretrained_config and config.pretrained_config.model_type == 'qwen3':
+        if config.pretrained_config and config.pretrained_config.model_type == 'qwen3' or config.pretrained_config and config.pretrained_config.model_type == 'qwen3_moe':
             self.apply_rotary_emb = True
         if self.apply_rotary_emb:
             self.rotary_emb = RotaryEmbedding(

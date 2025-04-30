@@ -32,7 +32,7 @@ class Qwen3MoE(nn.Module):
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size
         self.moe_intermediate_size = config.moe_intermediate_size
-        self.shared_expert_intermediate_size = config.shared_expert_intermediate_size
+        # self.shared_expert_intermediate_size = config.shared_expert_intermediate_size # not used in qwen3
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
