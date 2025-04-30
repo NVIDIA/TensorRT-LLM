@@ -13,7 +13,7 @@ from tensorrt_llm.llmapi import (LLM, BuildConfig, CapacitySchedulerPolicy,
                                  DynamicBatchConfig, KvCacheConfig,
                                  SchedulerConfig)
 from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
-                                              MetadataServerConfig,
+                                              MetadataServerConfig, ServerRole,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
@@ -85,7 +85,8 @@ def get_llm_args(model: str,
 
 
 def launch_server(host: str, port: int, llm_args: dict,
-                  metadata_server_cfg: MetadataServerConfig):
+                  metadata_server_cfg: MetadataServerConfig,
+                  server_role: Optional[ServerRole]):
 
     backend = llm_args["backend"]
     model = llm_args["model"]
@@ -97,6 +98,7 @@ def launch_server(host: str, port: int, llm_args: dict,
 
     server = OpenAIServer(llm=llm,
                           model=model,
+                          server_role=server_role,
                           metadata_server_cfg=metadata_server_cfg)
 
     asyncio.run(server(host, port))
@@ -193,16 +195,20 @@ def launch_server(host: str, port: int, llm_args: dict,
               type=str,
               default=None,
               help="Path to metadata server config file")
-def serve(model: str, tokenizer: Optional[str], host: str, port: int,
-          log_level: str, backend: str, max_beam_width: int,
-          max_batch_size: int, max_num_tokens: int, max_seq_len: int,
-          tp_size: int, pp_size: int, ep_size: Optional[int],
-          cluster_size: Optional[int], gpus_per_node: Optional[int],
-          kv_cache_free_gpu_memory_fraction: float,
-          num_postprocess_workers: int, trust_remote_code: bool,
-          extra_llm_api_options: Optional[str],
-          reasoning_parser: Optional[str]):
-          metadata_server_config_file: Optional[str]):
+@click.option(
+    "--server_role",
+    type=str,
+    default=None,
+    help="Server role. Specify this value only if running in disaggregated mode."
+)
+def serve(
+        model: str, tokenizer: Optional[str], host: str, port: int,
+        log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
+        max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
+        ep_size: Optional[int], gpus_per_node: Optional[int],
+        kv_cache_free_gpu_memory_fraction: float, num_postprocess_workers: int,
+        trust_remote_code: bool, extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
+        metadata_server_config_file: Optional[str], server_role: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -236,7 +242,14 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
 
-    launch_server(host, port, llm_args, metadata_server_cfg)
+    if metadata_server_cfg is not None:
+        try:
+            server_role = ServerRole(server_role)
+        except ValueError:
+            raise ValueError(f"Invalid server role: {server_role}. " \
+                             f"Must be one of: {', '.join([role.name for role in ServerRole])}")
+
+    launch_server(host, port, llm_args, metadata_server_cfg, server_role)
 
 
 def get_ctx_gen_server_urls(
