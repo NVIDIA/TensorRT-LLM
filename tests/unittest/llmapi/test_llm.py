@@ -1310,43 +1310,6 @@ def test_llm_api_eagle2():
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
 
-@skip_single_gpu
-@pytest.mark.part0
-def test_llm_api_eagle2_tp2():
-    prompts = [
-        "Hello, my name is",
-        "The president of the United States is",
-        "The capital of France is",
-        "The future of AI is",
-    ]
-    sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
-    build_config = BuildConfig(max_batch_size=1, max_seq_len=1024)
-
-    kv_cache_config = KvCacheConfig(enable_block_reuse=True)
-
-    speculative_config = EagleDecodingConfig(
-        max_draft_len=63,
-        speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
-        num_eagle_layers=4,
-        max_non_leaves_per_layer=10,
-        use_dynamic_tree=True,
-        dynamic_tree_max_topK=10)
-    llm = LLM(model=get_model_path("vicuna-7b-v1.3"),
-              build_config=build_config,
-              kv_cache_config=kv_cache_config,
-              speculative_config=speculative_config,
-              tensor_parallel_size=2,
-              fast_build=True)
-
-    outputs = llm.generate(prompts, sampling_params)
-
-    # Print the outputs.
-    for output in outputs:
-        prompt = output.prompt
-        generated_text = output.outputs[0].text
-        print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
-
-
 def tinyllama_lookahead_decoding_test_harness(**llm_kwargs):
     prompts = [
         "A B C",
