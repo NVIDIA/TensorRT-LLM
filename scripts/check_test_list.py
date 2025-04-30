@@ -30,11 +30,16 @@ def verify_l0_test_lists(llm_src):
         shell=True,
         check=True)
 
+    subprocess.run("echo $LD_LIBRARY_PATH", shell=True, check=True)
+    env = os.environ.copy()
+    env["LD_LIBRARY_PATH"] = "/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu:/opt/nvidia/nvda_nixl/lib/python3/dist-packages/nixl:" + env.get(
+        "LD_LIBRARY_PATH", "")
     subprocess.run(
         f"cd {llm_src}/tests/integration/defs && "
         f"pytest --apply-test-list-correction --test-list={test_list} --co -q",
         shell=True,
-        check=True)
+        check=True,
+        env=env)
 
 
 def verify_qa_test_lists(llm_src):
@@ -43,12 +48,16 @@ def verify_qa_test_lists(llm_src):
     subprocess.run(f"rm -f {test_qa_path}/*perf*", shell=True, check=True)
     test_def_files = subprocess.check_output(
         f"ls -d {test_qa_path}/*.txt", shell=True).decode().strip().split('\n')
+    env = os.environ.copy()
+    env["LD_LIBRARY_PATH"] = "/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu:/opt/nvidia/nvda_nixl/lib/python3/dist-packages/nixl:" + env.get(
+        "LD_LIBRARY_PATH", "")
     for test_def_file in test_def_files:
         subprocess.run(
             f"cd {llm_src}/tests/integration/defs && "
             f"pytest --apply-test-list-correction --test-list={test_def_file} --co -q",
             shell=True,
-            check=True)
+            check=True,
+            env=env)
 
 
 def main():

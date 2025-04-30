@@ -436,6 +436,51 @@ list(APPEND COMMON_HEADER_DIRS)
 include_directories(${COMMON_HEADER_DIRS})
 include_directories(SYSTEM ${TORCH_INCLUDE_DIRS})
 
+# Define the ENABLE_NIXL flag with a default value
+if(NOT DEFINED ENABLE_NIXL)
+  set(ENABLE_NIXL 1)
+endif()
+message(STATUS "ENABLE_NIXL is set to ${ENABLE_NIXL}")
+
+if(ENABLE_NIXL)
+  # Check for necessary dependencies for NIXL
+  find_program(MESON_EXECUTABLE meson)
+  find_program(NINJA_EXECUTABLE ninja)
+
+  if(NOT MESON_EXECUTABLE OR NOT NINJA_EXECUTABLE)
+    message(WARNING "Meson or Ninja not found, disabling NIXL build")
+    set(ENABLE_NIXL 0)
+  else()
+    message(STATUS "Meson and Ninja found")
+  endif()
+  # Check if the architecture is aarch64 and disable NIXL if true
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+    message(STATUS "Architecture is aarch64, disabling NIXL")
+    set(ENABLE_NIXL 0)
+  endif()
+
+  # Allow the UCX path to be specified at build time
+  set(UCX_PATH
+      "/usr/local/ucx"
+      CACHE PATH "Path to the UCX installation")
+  # Check if the UCX path exists and disable NIXL if not
+  if(NOT EXISTS "${UCX_PATH}")
+    message(STATUS "UCX path does not exist, disabling NIXL")
+    set(ENABLE_NIXL 0)
+  endif()
+endif()
+
+if(ENABLE_NIXL)
+  message(STATUS "Building and installing NIXL library")
+  set(NIXL_FOUND 0)
+  set(NIXL_SOURCE_DIR ${3RDPARTY_DIR}/nixl)
+  find_package(NIXL REQUIRED)
+  if(NOT NIXL_FOUND)
+    message(FATAL_ERROR "NIXL not found. Please install NIXL or set NIXL_ROOT")
+  endif()
+
+endif()
+
 add_subdirectory(tensorrt_llm)
 
 if(BUILD_TESTS)

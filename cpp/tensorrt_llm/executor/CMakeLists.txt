@@ -13,6 +13,19 @@ set(EXECUTOR_STATIC_TARGET ${EXECUTOR_TARGET_NAME}_static)
 
 set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
+if(ENABLE_NIXL)
+  set(NIXL_ROOT "/opt/nvidia/nvda_nixl")
+  # Include the FindNIXL module
+  find_package(NIXL REQUIRED)
+  # Check if all required packages were found
+  if(NOT NIXL_FOUND)
+    message(
+      FATAL_ERROR
+        "NIXL not found. for building executor. Please install NIXL or set NIXL_ROOT"
+    )
+  endif()
+endif()
+
 # keep this list sorted alphabetically
 set(SRCS
     cache_transmission/mpi_utils/connection.cpp
@@ -83,3 +96,32 @@ target_compile_definitions(${EXECUTOR_STATIC_TARGET}
                            PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
 
 add_subdirectory(cache_transmission/ucx_utils)
+
+if(ENABLE_NIXL)
+
+  add_executable(nixl_example cache_transmission/nixl_utils/nixl_example.cpp)
+  target_include_directories(nixl_example PRIVATE ${NIXL_INCLUDE_DIR})
+  target_link_libraries(nixl_example PRIVATE ${EXECUTOR_STATIC_TARGET})
+  target_link_libraries(
+    nixl_example
+    PRIVATE ${NIXL_LIBRARY} ${NIXL_BUILD_LIBRARY} ${SERDES_LIBRARY}
+            ${UCX_BACKEND_LIBRARY} ${UCX_UTILS_LIBRARY} ${GDS_BACKEND_LIBRARY})
+  # Add include directories
+  target_include_directories(${EXECUTOR_STATIC_TARGET}
+                             PRIVATE ${NIXL_INCLUDE_DIR})
+
+  # Link against all NIXL libraries
+  target_link_libraries(
+    ${EXECUTOR_STATIC_TARGET}
+    PRIVATE ${NIXL_LIBRARY} ${NIXL_BUILD_LIBRARY} ${SERDES_LIBRARY}
+            ${UCX_BACKEND_LIBRARY} ${UCX_UTILS_LIBRARY} ${GDS_BACKEND_LIBRARY})
+
+  # Add rpath for runtime library loading
+  if(NOT WIN32)
+    set_target_properties(
+      ${EXECUTOR_STATIC_TARGET}
+      PROPERTIES BUILD_RPATH "${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH}"
+                 INSTALL_RPATH "${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH}"
+                 INSTALL_RPATH_USE_LINK_PATH TRUE)
+  endif()
+endif()

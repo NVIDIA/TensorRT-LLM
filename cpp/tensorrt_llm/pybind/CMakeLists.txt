@@ -41,6 +41,6 @@ if(NOT WIN32)
     ${TRTLLM_PYBIND_MODULE}
     PROPERTIES
       LINK_FLAGS
-      "-Wl,-rpath,'$ORIGIN/libs' -Wl,-rpath,'$ORIGIN/../nvidia/nccl/lib' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}"
+      "-Wl,-rpath,'$ORIGIN/libs' -Wl,-rpath,'$ORIGIN/../nvidia/nccl/lib' -Wl,-rpath,'/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu' -Wl,-rpath,'/opt/nvidia/nvda_nixl/lib/python3/dist-packages/nixl' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}"
   )
 endif()

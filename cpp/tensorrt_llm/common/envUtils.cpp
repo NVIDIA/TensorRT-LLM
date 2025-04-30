@@ -264,6 +264,12 @@ bool getEnvUseMPIKvCache()
     return useMPIKVCache;
 }
 
+bool getEnvUseNIXLKvCache()
+{
+    static bool const useNIXLKVCache = getBoolEnv("TRTLLM_USE_NIXL_KVCACHE");
+    return useNIXLKVCache;
+}
+
 std::string getEnvUCXInterface()
 {
     static std::once_flag flag;

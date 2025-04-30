@@ -13,6 +13,19 @@ set(BATCH_MANAGER_STATIC_TARGET ${BATCH_MANAGER_TARGET_NAME}_static)
 
 set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
+if(ENABLE_NIXL)
+  set(NIXL_ROOT "/opt/nvidia/nvda_nixl")
+  # Find NIXL
+  find_package(NIXL REQUIRED)
+
+  if(NOT NIXL_FOUND)
+    message(
+      FATAL_ERROR
+        "NIXL not found. for building batch_manager. Please install NIXL or set NIXL_ROOT"
+    )
+  endif()
+endif()
+
 # keep this list sorted alphabetically
 set(SRCS
     allocateKvCache.cpp
@@ -96,6 +109,27 @@ set_property(TARGET ${BATCH_MANAGER_STATIC_TARGET}
 set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
 target_compile_definitions(${BATCH_MANAGER_STATIC_TARGET}
                            PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
+
+if(ENABLE_NIXL)
+  # Add include directories
+  target_include_directories(${BATCH_MANAGER_STATIC_TARGET}
+                             PRIVATE ${NIXL_INCLUDE_DIR})
+
+  # Link against all NIXL libraries
+  target_link_libraries(
+    ${BATCH_MANAGER_STATIC_TARGET}
+    PRIVATE ${NIXL_LIBRARY} ${NIXL_BUILD_LIBRARY} ${SERDES_LIBRARY}
+            ${UCX_BACKEND_LIBRARY} ${UCX_UTILS_LIBRARY} ${GDS_BACKEND_LIBRARY})
+
+  # Add rpath for runtime library loading
+  if(NOT WIN32)
+    set_target_properties(
+      ${BATCH_MANAGER_STATIC_TARGET}
+      PROPERTIES BUILD_RPATH "${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH}"
+                 INSTALL_RPATH "${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH}"
+                 INSTALL_RPATH_USE_LINK_PATH TRUE)
+  endif()
+endif()
 
 if(ENABLE_UCX)
   find_package(ucx REQUIRED)
