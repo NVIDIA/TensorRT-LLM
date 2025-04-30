@@ -121,6 +121,12 @@ All published functionality in the Release Notes has been fully tested and verif
 ### Infrastructure Changes
 
 
+## TensorRT-LLM Release 0.18.2
+
+### Key Features and Enhancements
+  - This update addresses known security issues. For the latest NVIDIA Vulnerability Disclosure Information visit https://www.nvidia.com/en-us/security/.
+
+
 ## TensorRT-LLM Release 0.18.1
 
 ### Key Features and Enhancements
