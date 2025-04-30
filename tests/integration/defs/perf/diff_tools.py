@@ -17,7 +17,7 @@ def load_file(csv_file: str) -> pd.DataFrame:
     return pd.read_csv(csv_file)
 
 
-def clean_missing(
+def get_intersecting_metrics(
     base: pd.DataFrame, target: pd.DataFrame
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
     missing_from_target = base.index.difference(target.index)
@@ -34,8 +34,8 @@ def get_diff_exceeding_threshold(
         target: pd.DataFrame) -> tuple[np.array, pd.DataFrame]:
     diff_exceeding_threshold = ~np.isclose(base[PERF_METRIC],
                                            target[PERF_METRIC],
-                                           rtol=base[THRESHOLD],
-                                           atol=base[ABSOLUTE_THRESHOLD])
+                                           rtol=abs(base[THRESHOLD]),
+                                           atol=abs(base[ABSOLUTE_THRESHOLD]))
     diff_exceeding_threshold = np.array([
         diff and base[METRIC_TYPE][i] not in IGNORED_METRICS
         for i, diff in enumerate(diff_exceeding_threshold)
@@ -69,7 +69,7 @@ def get_diff(base: pd.DataFrame,
     relevant_columns = base.columns
     base = base.set_index(PERF_CASE_NAME)
     target = target.set_index(PERF_CASE_NAME)
-    cleaned_base, cleaned_target, missing_from_target, missing_from_base = clean_missing(
+    cleaned_base, cleaned_target, missing_from_target, missing_from_base = get_intersecting_metrics(
         base, target)
     diff_over_threshold, new_df = get_diff_exceeding_threshold(
         cleaned_base, cleaned_target)
@@ -81,7 +81,6 @@ def get_diff(base: pd.DataFrame,
 
 def get_csv_lines(df: pd.DataFrame) -> list[str]:
     string_buffer = StringIO()
-    df.to_csv(string_buffer, index=False, lineterminator='\r\n'
-              )  # We want to be compatible with csv module default settings
+    df.to_csv(string_buffer, index=False)
     string_buffer.seek(0)
     return string_buffer.readlines()
