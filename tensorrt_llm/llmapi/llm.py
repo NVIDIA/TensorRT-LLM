@@ -192,9 +192,10 @@ class LLM:
                                      Sequence[LoRARequest]]] = None,
         prompt_adapter_request: Optional[Union[
             PromptAdapterRequest, Sequence[PromptAdapterRequest]]] = None,
-        queries: Optional[Union[PromptInputs, Sequence[PromptInputs]]] = None,
-        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
-        disaggregated_params: Optional[DisaggregatedParams] = None,
+        kv_cache_retention_config: Optional[Union[
+            KvCacheRetentionConfig, Sequence[KvCacheRetentionConfig]]] = None,
+        disaggregated_params: Optional[Union[
+            DisaggregatedParams, Sequence[DisaggregatedParams]]] = None,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -209,10 +210,10 @@ class LLM:
                 LoRA request to use for generation, if any. Defaults to None.
             prompt_adapter_request (tensorrt_llm.executor.request.PromptAdapterRequest, Sequence[tensorrt_llm.executor.request.PromptAdapterRequest], optional):
                 Prompt Adapter request to use for generation, if any. Defaults to None.
-            queries (tensorrt_llm.inputs.data.PromptInputs, Sequence[tensorrt_llm.inputs.data.PromptInputs], optional): The query text or token ids. Defaults to None.
-                it can be single prompt or batched prompts. it is used for star attention to run long context tasks.
-            kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, optional): Configuration for the request's retention in the KV Cache. Defaults to None.
-            disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
+            kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, Sequence[tensorrt_llm.bindings.executor.KvCacheRetentionConfig], optional):
+                Configuration for the request's retention in the KV Cache. Defaults to None.
+            disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, Sequence[tensorrt_llm.disaggregated_params.DisaggregatedParams], optional):
+                Disaggregated parameters. Defaults to None.
         Returns:
             Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
         """
@@ -223,37 +224,29 @@ class LLM:
 
         if unbatched:
             inputs = [inputs]
-            if queries:
-                queries = [queries]
 
         inputs = [prompt_inputs(i) for i in inputs]
-        if queries:
-            queries = [prompt_inputs(i) for i in queries]
+
+        def _get_from_possible_batch(
+                i: int, possible_batch: Union[Any, Sequence[Any]]) -> Any:
+            if isinstance(possible_batch, list):
+                return possible_batch[i]
+            else:
+                return possible_batch
 
         futures = []
         for i, request_inputs in enumerate(inputs):
-            if isinstance(sampling_params, list):
-                sp = sampling_params[i]
-            else:
-                sp = sampling_params
-            if isinstance(lora_request, list):
-                lora_req = lora_request[i]
-            else:
-                lora_req = lora_request
-            if isinstance(prompt_adapter_request, list):
-                pa_req = prompt_adapter_request[i]
-            else:
-                pa_req = prompt_adapter_request
-            request_queries = None if queries is None else queries[i]
             future = self.generate_async(
                 request_inputs,
-                queries=request_queries,
-                sampling_params=sp,
-                lora_request=lora_req,
-                prompt_adapter_request=pa_req,
-                kv_cache_retention_config=kv_cache_retention_config,
-                streaming=False,
-                disaggregated_params=disaggregated_params)
+                sampling_params=_get_from_possible_batch(i, sampling_params),
+                lora_request=_get_from_possible_batch(i, lora_request),
+                prompt_adapter_request=_get_from_possible_batch(
+                    i, prompt_adapter_request),
+                kv_cache_retention_config=_get_from_possible_batch(
+                    i, kv_cache_retention_config),
+                disaggregated_params=_get_from_possible_batch(
+                    i, disaggregated_params),
+                streaming=False)
             futures.append(future)
 
         for future in tqdm(futures,
@@ -275,7 +268,6 @@ class LLM:
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
-        queries: Optional[PromptInputs] = None,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
         _postproc_params: Optional[PostprocParams] = None,
@@ -290,8 +282,6 @@ class LLM:
             lora_request (tensorrt_llm.executor.request.LoRARequest, optional): LoRA request to use for generation, if any. Defaults to None.
             prompt_adapter_request (tensorrt_llm.executor.request.PromptAdapterRequest, optional): Prompt Adapter request to use for generation, if any. Defaults to None.
             streaming (bool): Whether to use the streaming mode for the generation. Defaults to False.
-            queries (tensorrt_llm.inputs.data.PromptInputs, optional): The query text or token ids. Defaults to None.
-                It can be single prompt or batched prompts. it is used for star attention to run long context tasks.
             kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, optional): Configuration for the request's retention in the KV Cache. Defaults to None.
             disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
 
@@ -306,8 +296,6 @@ class LLM:
             )
 
         inputs = prompt_inputs(inputs)
-        if queries is not None:
-            queries = prompt_inputs(queries)
 
         if not inputs.get("prompt") and inputs.get(
                 "prompt_token_ids") and not isinstance(self.input_processor,
@@ -330,15 +318,14 @@ class LLM:
         if "prompt_token_ids" in inputs:
             prompt_token_ids = inputs['prompt_token_ids']
             prompt = None
-            if queries is not None:
-                query_token_ids = queries['prompt_token_ids']
+            query_token_ids = inputs.get("query_token_ids", None)
         elif "prompt" in inputs:
             prompt_token_ids, extra_processed_inputs = self.input_processor(
                 inputs, sampling_params)
             prompt = inputs['prompt']
-            if queries is not None:
-                query_token_ids, _ = self.input_processor(
-                    queries, sampling_params)
+            if (extra_processed_inputs is not None
+                    and 'query_token_ids' in extra_processed_inputs):
+                query_token_ids = extra_processed_inputs.get('query_token_ids')
             if (extra_processed_inputs is not None
                     and 'mm_embedding' in extra_processed_inputs):
                 multimodal_embedding = extra_processed_inputs.get(
