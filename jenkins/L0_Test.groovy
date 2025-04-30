@@ -1025,6 +1025,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             "--output-dir=${WORKSPACE}/${stageName}/",
             "--csv=${WORKSPACE}/${stageName}/report.csv",
             "--junit-xml ${WORKSPACE}/${stageName}/results.xml",
+            "--capture=no",
             "-o junit_logging=out-err"
         ]
         if (perfMode) {
