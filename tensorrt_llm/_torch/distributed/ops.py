@@ -132,6 +132,10 @@ class AllReduce(nn.Module):
                     - RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
 
                 - AUTO: AUTO chooses between NCCL and MIN_LATENCY mode based on a heuristic policy.
+
+        Note:
+            For the reference implementation for each pattern, please refer to the following unit test:
+            https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/unittest/_torch/multi_gpu/test_allreduce.py
         """
 
         self.mapping = mapping
@@ -194,6 +198,67 @@ class AllReduce(nn.Module):
         )
 
         return output if len(output) > 1 else output[0]
+
+
+class MoEAllReduce(nn.Module):
+
+    def __init__(self, mapping: Mapping):
+        """
+        MoEAllReduce is a module that performs a specific fused MoE reduction
+        followed by a regular AR + RMS norm.
+
+        Args:
+            mapping (Mapping):  The parallel mapping config.
+
+        Notes:
+            Support pattern: MoE Reduction + Add + AR + ADD_RMS, see this torch reference implementation:
+            expert_reduction = torch.sum(active_experts_token_input *
+                                        scale.unsqueeze(-1),
+                                        dim=0)
+            output_add = expert_reduction + shared_expert_output
+            output_residual = output_add + residual
+            output_hidden_states = rms_norm(output_residual, norm_weight, eps)
+        """
+        super().__init__()
+        self.mapping = mapping
+        self.workspace = get_allreduce_workspace(self.mapping)
+
+    def forward(
+        self,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        device_num_experts: torch.Tensor,
+        scale_input: torch.Tensor,
+        active_experts_token_input: torch.Tensor,
+        token_input: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        """
+        Args:
+            residual: residual tensor
+            norm_weight: RMS norm weight
+            device_num_experts: number of experts per device
+            scale_input: experts to token score
+            active_experts_token_input: per token per expert input
+            token_input: per token input, shared expert output
+            eps: epsilon for RMSNorm
+
+        Output:
+            hidden_states: hidden_states of the model
+            residual: residual tensor
+        """
+        return torch.ops.trtllm.moe_allreduce(
+            residual=residual,
+            norm_weight=norm_weight,
+            device_num_experts=device_num_experts,
+            scale_input=scale_input,
+            active_experts_token_input=active_experts_token_input,
+            token_input=token_input,
+            workspace=self.workspace,
+            rank=self.mapping.tp_rank,
+            nranks=self.mapping.tp_size,
+            eps=eps,
+        )
 
 
 class DeepseekAllReduce(nn.Module):
