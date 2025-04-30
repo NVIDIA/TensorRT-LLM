@@ -1989,6 +1989,10 @@ void residualRmsNorm(
 void lamportInitialize(void* buffer, size_t size, nvinfer1::DataType dataType, cudaStream_t stream)
 {
     sync_check_cuda_error(stream);
+    if (size == 0)
+    {
+        return;
+    }
     switch (dataType)
     {
     case nvinfer1::DataType::kFLOAT:
