@@ -62,6 +62,11 @@ auto const LORA_DATA_PATH = DATA_PATH / "lora-test-weights-gpt2-tp1";
 auto const LORA_WEIGHTS_FILE = LORA_DATA_PATH / "source.npy";
 auto const LORA_CONFIG_FILE = LORA_DATA_PATH / "config.npy";
 
+auto constexpr LLAMA_INPUT_FILE = "input_tokens_llama.npy";
+auto constexpr LLAMA_VOCAB_SIZE_PADDED = 128256;
+auto constexpr LLAMA_PAD_ID = 128001;
+auto constexpr LLAMA_END_ID = 128001;
+
 } // namespace
 
 void testInvalidCtor(std::filesystem::path const& enginePath, ModelType modelType, ExecutorConfig executorConfig,
@@ -2148,6 +2153,8 @@ TEST_P(AllParamsTest, TokenComparison)
     ModelIds modelIds{50256, 50256};
     bool isSpeculativeDecoding{false};
 
+    SizeType32 vocabSizePadded = 50257;
+
     // NOTE: This can be used to disable checks for certain prompt batch entries
     FlakyTestInfo flakyTestInfo;
 
@@ -2182,6 +2189,12 @@ TEST_P(AllParamsTest, TokenComparison)
     else if (modelName == "llama_tp4_pp1_cp1" || modelName == "llama_tp1_pp4_cp1" || modelName == "llama_tp2_pp2_cp1"
         || modelName == "llama_tp1_pp2_cp1")
     {
+        inputPath = DATA_PATH / LLAMA_INPUT_FILE;
+        modelIds.padId = LLAMA_PAD_ID;
+        modelIds.endId = LLAMA_END_ID;
+
+        vocabSizePadded = LLAMA_VOCAB_SIZE_PADDED;
+
         auto const resultsPath
             = LLAMA_DATA_PATH / ((beamWidth == 1) ? "sampling" : "beam_search_" + std::to_string(beamWidth));
         if (modelName == "llama_tp4_pp1_cp1")
@@ -2364,8 +2377,6 @@ TEST_P(AllParamsTest, TokenComparison)
             }
         }
     }
-
-    SizeType32 constexpr vocabSizePadded{50257}; // gpt vocabSizePadded
 
     // Returning logits will bring higher latency
     if (streaming && (outConfig.returnContextLogits || outConfig.returnGenerationLogits))
@@ -3475,7 +3486,7 @@ TEST_P(GuidedDecodingParamsTest, All)
     else // llama
     {
         inputTokens = {
-            1, 1724, 338, 29871, 29896, 29974, 29896, 29973, 673, 20917, 297, 263, 9657, 297, 4390, 3402, 29901, 29871};
+            128000, 62, 3923, 7037, 62, 16, 10, 16, 30, 62, 16533, 87710, 1265, 4404, 5356, 1265, 9643, 9132, 25, 62};
     }
     SizeType32 maxNewTokens = 10;
     SamplingConfig samplingConfig{};
@@ -3513,11 +3524,11 @@ TEST_P(GuidedDecodingParamsTest, All)
     }
     else // llama
     {
-        expectedOutputTokens.push_back({29896, 29974, 29896, 29922, 29906, 13, 5618, 338, 29871, 29896});
-        expectedOutputTokens.push_back({6377, 29896, 1115, 376, 29896, 613, 376, 29896, 29974, 29896});
-        expectedOutputTokens.push_back({6377, 29874, 1983, 29893, 29872, 29878, 1115, 29871, 29896, 29913});
-        expectedOutputTokens.push_back({29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896});
-        expectedOutputTokens.push_back({29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896});
+        expectedOutputTokens.push_back({16, 10, 16, 28, 17, 198, 62, 3923, 7037, 62});
+        expectedOutputTokens.push_back({5018, 16, 794, 330, 16, 498, 330, 17, 794, 330});
+        expectedOutputTokens.push_back({5018, 9399, 794, 16, 92});
+        expectedOutputTokens.push_back({16});
+        expectedOutputTokens.push_back({16});
     }
 
     if (executor.canEnqueueRequests())
@@ -3548,10 +3559,7 @@ TEST_P(GuidedDecodingParamsTest, All)
                     auto& newTokens = result.outputTokenIds.at(0);
 
                     int reqIdx = std::find(reqIds.begin(), reqIds.end(), reqId) - reqIds.begin();
-                    for (int i = 0; i < maxNewTokens; i++)
-                    {
-                        EXPECT_EQ(newTokens[i], expectedOutputTokens[reqIdx][i]);
-                    }
+                    EXPECT_THAT(newTokens, ::testing::ElementsAreArray(expectedOutputTokens[reqIdx]));
                 }
                 numFinished++;
             }
@@ -4399,7 +4407,7 @@ TEST_P(TimeoutTest, TimeoutNonstreamingTest)
         = Request(finishedTokens, maxNewTokens, false, tensorrt_llm::executor::SamplingConfig(beamWidth));
     finishedRequest.setAllottedTimeMs(std::chrono::milliseconds(5000));
     std::vector<std::vector<int>> finishedReponse
-        = {{101, 102, 103, 104, 29889, 13, 13, 20001, 29901}, {101, 102, 103, 104, 29889, 13, 13, 2277, 29937}};
+        = {{101, 102, 103, 104, 49849, 225, 49849, 232, 55742}, {101, 102, 103, 104, 49849, 225, 49849, 232, 29082}};
 
     // assume responses will come in FIFO order
     std::vector<BeamTokens> refResponses = {immediateCancelResponse, oneForwardResponse, finishedReponse};

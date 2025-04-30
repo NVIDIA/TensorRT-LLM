@@ -37,7 +37,7 @@ def generate_output(engine: str,
                     cp_size: int = 1,
                     max_output_len: int = 8):
 
-    model = 'llama-7b-hf'
+    model = 'Llama-3.2-1B'
     resources_dir = Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
     hf_dir = models_dir / model
@@ -46,7 +46,7 @@ def generate_output(engine: str,
     engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_cp_dir
 
     data_dir = resources_dir / 'data'
-    input_file = data_dir / 'input_tokens.npy'
+    input_file = data_dir / 'input_tokens_llama.npy'
     model_data_dir = data_dir / model
     if num_beams <= 1:
         output_dir = model_data_dir / 'sampling'
@@ -79,7 +79,8 @@ def generate_outputs(num_beams, only_multi_gpu=False):
         raise RuntimeError(
             f"The world size of MPI {COMM_WORLD.size} is not equal to 1, 2, or 4."
         )
-    model_spec_obj = model_spec.ModelSpec('input_tokens.npy', _tb.DataType.HALF)
+    model_spec_obj = model_spec.ModelSpec('input_tokens_llama.npy',
+                                          _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.use_packed_input()
