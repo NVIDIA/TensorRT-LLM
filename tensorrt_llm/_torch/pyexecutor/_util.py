@@ -379,9 +379,6 @@ def create_py_executor_instance(dist,
             raise ValueError(
                 "Guided decoding is not supported with speculative decoding.")
 
-    resources["seq_slot_manager"] = SeqSlotManager(
-        executor_config.max_batch_size)
-
     logger.info(
         f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}"
     )
@@ -440,6 +437,9 @@ def create_py_executor_instance(dist,
     if mapping.has_pp:
         num_micro_batches = mapping.pp_size + pytorch_backend_config.enable_overlap_scheduler
 
+    resources["seq_slot_manager"] = SeqSlotManager(
+        executor_config.max_batch_size * num_micro_batches)
+        
     capacity_scheduler = BindCapacityScheduler(
         executor_config.max_batch_size,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
