@@ -71,7 +71,19 @@ class OpenAIDisaggServer:
 
             logging.info("Waiting for context and generation servers to be ready")
             await self.wait_for_servers_ready(server_start_timeout_secs)
+
+            if self.metadata_server:
+                logging.info("Starting server monitoring via metadata service")
+                await self.ctx_router.start_server_monitoring()
+                await self.gen_router.start_server_monitoring()
+
             yield
+
+            if self.metadata_server:
+                logging.info("Stopping server monitoring via metadata service")
+                await self.ctx_router.stop_server_monitoring()
+                await self.gen_router.stop_server_monitoring()
+
             await self.session.close()  # Ensure session cleanup
 
         self.app = FastAPI(lifespan=lifespan)
