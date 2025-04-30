@@ -112,10 +112,13 @@ All published functionality in the Release Notes has been fully tested and verif
   - Fixed a bug when loading an engine using LoRA through the LLM API. (#2782)
   - Fixed incorrect batch slot usage in `addCumLogProbs` kernel. Thanks to the contribution from @aotman in #2787.
   - Fixed incorrect output for Llama-3.2-11B-Vision-Instruct. (#2796)
+  - Removed the necessary of `--extra-index-url https://pypi.nvidia.com` when running `pip install tensorrt-llm`.
 
 ### Infrastructure Changes
   - The dependent NVIDIA ModelOpt version is updated to 0.27.
 
+### Known Issues
+  - The PyTorch workflow on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) for optimal support on SBSA platforms.
 
 ## TensorRT-LLM Release 0.18.2
 
