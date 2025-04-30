@@ -652,7 +652,7 @@ class PyTorchModelEngine(ModelEngine):
             is_gen=True,
             max_num_draft_tokens=max_num_draft_tokens)
         for req in generation_requests:
-            req.is_cuda_graph_padding = True
+            req.is_cuda_graph_dummy = True
         scheduled_requests.generation_requests.extend(generation_requests)
         return generation_requests
 
@@ -1026,7 +1026,7 @@ class PyTorchModelEngine(ModelEngine):
                 # the second condition includes dummy generation requests created for CUDA graph padding.
                 # these dummy generation requests should be at the end of generation_requests.
                 # skip adding their input_ids so that new_tokens_device can be aligned to the correct positions.
-                if not request.is_cuda_graph_padding:
+                if not request.is_cuda_graph_dummy:
                     input_ids.append(request.get_last_tokens(0))
                 past_seen_token_num = request.max_beam_num_tokens - 1
             else:
