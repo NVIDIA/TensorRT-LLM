@@ -1840,7 +1840,7 @@ void WindowBlockManager::updateSequenceBlocks(GenerationRequest& sequence, bool 
         auto const numTokensWithoutSink = newNumTokens - sinkBlockTokenLength;
         auto const minTokensForBlockDetach = metadata.numNonSinkTokensInWindow + getTokensPerBlock();
         auto const canDetachBlock = (numTokensWithoutSink >= minTokensForBlockDetach)
-            && ((numTokensWithoutSink - minTokensForBlockDetach) % getTokensPerBlock() == 0) && !isCrossKv;
+            && ((numTokensWithoutSink - minTokensForBlockDetach) % getTokensPerBlock() == 0);
 
         if (canDetachBlock)
         {
