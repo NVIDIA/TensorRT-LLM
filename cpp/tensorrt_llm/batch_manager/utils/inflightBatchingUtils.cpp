@@ -80,7 +80,7 @@ void copyGenerationLogits(RuntimeBuffers::GenerationLogitsCache& generationLogit
     TLLM_CHECK_WITH_INFO(
         !beforeDecoder || numDroppedTokens.empty(), "numDroppedTokens are only possible after decoder.");
 
-    auto const reqBeamWidth = llmReq.mSamplingConfig.beamWidth;
+    auto const reqBeamWidth = llmReq.getBeamWidthByIter();
     TLLM_CHECK_WITH_INFO(numDroppedTokens.empty() || numDroppedTokens.size() == static_cast<size_t>(reqBeamWidth),
         "Dropped tokens have to be defined for all beams.");
 
@@ -182,7 +182,7 @@ void copyAdditionalOutputs(std::vector<executor::AdditionalModelOutput> const& a
 
                 auto const srcTensorIndex = gatherContext ? srcTensorIndexWithContext : srcTensorIndexWithoutContext;
                 auto srcView = ITensor::slice(tensor, srcTensorIndex - 1, 1);
-                for (SizeType32 beam = 0; beam < llmReq->mSamplingConfig.beamWidth; beam++)
+                for (SizeType32 beam = 0; beam < llmReq->getBeamWidthByIter(); beam++)
                 {
                     auto dstView = ITensor::slice(outputTensor.second, {beam, 0}, 1);
                     manager.copy(*srcView, *dstView);
@@ -193,7 +193,7 @@ void copyAdditionalOutputs(std::vector<executor::AdditionalModelOutput> const& a
 
     for (auto const& llmReq : generationRequests)
     {
-        auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
+        auto const reqBeamWidth = llmReq->getBeamWidthByIter();
         for (auto const& outputTensor : llmReq->getAdditionalGenerationOutputs())
         {
             auto const& [tensor, gatherContext]
@@ -266,6 +266,20 @@ void terminateRequest(SequenceSlotManager& seqSlotManager, LlmRequest& llmReq, S
         peftCacheManager->markRequestDone(llmReq, pause);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+std::vector<SizeType32> getRequestBeamWidths(
+    RequestVector const& contextRequests, RequestVector const& generationRequests)
+{
+    std::vector<SizeType32> beamWidths{};
+    for (auto const& requests : {contextRequests, generationRequests})
+    {
+        for (auto const& llmReq : requests)
+        {
+            beamWidths.push_back(llmReq->getBeamWidthByIter());
+        }
+    }
+    return beamWidths;
 }
 
 void CudaGraphExecutor::create(cudaGraph_t const& graph)

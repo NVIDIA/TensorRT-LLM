@@ -61,11 +61,8 @@ struct BeamHypotheses
     float const* lengthPenalties{nullptr};          // [BS]
     int const* earlyStoppings{nullptr};             // [BS]
     int const* beamWidthArraysHost{nullptr};        // [BS, kMaxBeamWidthArrayLength]                           for VBWS
-    int const* beamWidthArraysDevice{nullptr};      // [BS, kMaxBeamWidthArrayLength]                           for VBWS
     int* nBeamWidthInHost{nullptr};                 // [BS], cpu                                                for VBWS, beam width of last forward computation
     int* nBeamWidthOutHost{nullptr};                // [BS], cpu                                                for VBWS, beam width of next forward computation
-    int* nBeamWidthInDevice{nullptr};               // [BS]                                                     for VBWS, beam width of last forward computation
-    int* nBeamWidthOutDevice{nullptr};              // [BS]                                                     for VBWS, beam width of next forward computation
 
     // Pointers from input
     int const* inputLengths{nullptr};               // [BS, BM]         %% context_length

@@ -409,7 +409,7 @@ void RuntimeBuffers::setBufferSizes(RequestVector const& contextRequests, Reques
     numGenTokens = 0;
     for (auto const& llmReq : genRequests)
     {
-        auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
+        auto const reqBeamWidth = llmReq->getBeamWidthByIter();
         numGenSequences += reqBeamWidth;
         auto const draftLen = llmReq->getNumDraftTokens();
         numGenTokens += draftLen + reqBeamWidth;
@@ -635,8 +635,7 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
         auto numSequences = numContextRequests;
         for (auto const& llmReq : genRequests)
         {
-            auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
-
+            auto const reqBeamWidth = llmReq->getBeamWidthByIter();
             auto const draftLength = llmReq->getNumDraftTokens();
             auto const& draftTokens = llmReq->getDraftTokens();
             auto const numLogits = draftLength + reqBeamWidth;
@@ -735,8 +734,7 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
         numSequences = numContextRequests;
         for (auto const& llmReq : genRequests)
         {
-            auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
-
+            auto const reqBeamWidth = llmReq->getBeamWidthByIter();
             auto const draftLength = llmReq->getNumDraftTokens();
 
             auto const contextQLength = llmReq->mPromptLen + draftLength;
