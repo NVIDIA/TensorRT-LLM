@@ -8,7 +8,7 @@ from transformers import AutoTokenizer
 
 from tensorrt_llm.bindings.internal.batch_manager import (BlockKey,
                                                           BlockKeyHasher)
-from tensorrt_llm.llmapi.disagg_utils import RouterConfig
+from tensorrt_llm.llmapi.disagg_utils import RouterConfig, ServerRole
 from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest)
@@ -144,10 +144,12 @@ class KvCacheAwareServerState(ServerState):
 class Router(ABC):
 
     def __init__(self,
+                 server_role: ServerRole,
                  servers: List[str] = None,
                  metadata_server: JsonDictionary = None):
         self._servers = servers
         self._metadata_server = metadata_server
+        self._server_role = server_role
 
     @abstractmethod
     async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
@@ -191,10 +193,11 @@ class Router(ABC):
 class RoundRobinRouter(Router):
 
     def __init__(self,
+                 server_role: ServerRole,
                  servers: List[str] = None,
                  metadata_server: JsonDictionary = None,
                  **kwargs):
-        super().__init__(servers, metadata_server)
+        super().__init__(server_role, servers, metadata_server)
         self._server_idx = 0
 
     async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
@@ -209,11 +212,12 @@ class RoundRobinRouter(Router):
 class LoadBalancingRouter(Router):
 
     def __init__(self,
+                 server_role: ServerRole,
                  servers: List[str] = None,
                  metadata_server: JsonDictionary = None,
                  use_tokens: bool = False,
                  **kwargs):
-        super().__init__(servers, metadata_server)
+        super().__init__(server_role, servers, metadata_server)
         self._lock = asyncio.Lock()
         # Load map between servers and their number of tokens processed
         self._server_state = {}
