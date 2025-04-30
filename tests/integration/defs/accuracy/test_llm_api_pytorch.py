@@ -73,8 +73,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
-    @pytest.mark.parametrize("tp_size,pp_size", [(4, 1), (2, 2)],
-                             ids=["tp4", "tp2pp2"])
+    @pytest.mark.parametrize("tp_size,pp_size", [(4, 1), (2, 2), (1, 4)],
+                             ids=["tp4", "tp2pp2", "pp4"])
     def test_bfloat16_4gpus(self, tp_size, pp_size, attn_backend,
                             torch_compile):
         if torch_compile and pp_size > 1:
@@ -130,8 +130,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     @parametrize_with_ids("fp8kv", [False, True])
-    @pytest.mark.parametrize("tp_size,pp_size", [(4, 1), (2, 2)],
-                             ids=["tp4", "tp2pp2"])
+    @pytest.mark.parametrize("tp_size,pp_size", [(4, 1), (2, 2), (1, 4)],
+                             ids=["tp4", "tp2pp2", "pp4"])
     def test_fp8_4gpus(self, tp_size, pp_size, fp8kv, attn_backend,
                        torch_compile):
         if pp_size > 1:
@@ -373,6 +373,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_fp8_block_scales_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                                     attention_dp, cuda_graph,
                                     overlap_scheduler):
+        if pp_size > 1:
+            pytest.skip("https://nvbugs/5241627")
         # OOM on H100 with default free_gpu_memory_fraction=0.9
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         pytorch_config = PyTorchConfig(

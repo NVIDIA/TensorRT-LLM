@@ -18,7 +18,8 @@ import unittest
 import pytest
 import torch
 from parameterized import parameterized
-from utils.util import skip_pre_blackwell_unittest, unittest_name_func
+from utils.util import (skip_blackwell_geforce, skip_pre_blackwell_unittest,
+                        unittest_name_func)
 
 import tensorrt_llm
 
@@ -92,6 +93,7 @@ class TestFunctional(unittest.TestCase):
         name_func=unittest_name_func,
     )
     @skip_pre_blackwell_unittest
+    @skip_blackwell_geforce
     def test_fp4_quantize_gemm_trtllmgen(self, m, n, k):
         a = torch.randn([m, k], dtype=torch.float32)
         b = torch.randn([n, k], dtype=torch.float32)

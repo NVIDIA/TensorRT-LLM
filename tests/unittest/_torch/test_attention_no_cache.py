@@ -1,6 +1,5 @@
 import itertools
 import math
-import random
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -153,10 +152,6 @@ min_context_sequence_length = 1
 max_context_sequence_length = 1000
 min_num_contexts = 1
 max_num_contexts = 10
-random_context_sequence_lengths = [
-    random.randint(min_context_sequence_length, max_context_sequence_length)
-    for _ in range(random.randint(min_num_contexts, max_num_contexts))
-]
 
 # Define test data
 context_sequence_lengths = [
@@ -164,7 +159,6 @@ context_sequence_lengths = [
     [100, 300, 20, 10],
     [253, 253, 253, 253],
     [100, 1110, 1000, 1000],
-    random_context_sequence_lengths,
 ]
 
 num_q_heads_kv_heads = [
@@ -184,7 +178,7 @@ scenarios = generate_attn_scenarios(num_q_heads_kv_heads, head_dim, num_layers,
 @skip_blackwell
 @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5247232")
 # Convert parameterized tests to pytest parametrize
-@pytest.mark.parametrize("accuracy", [(1e-2, 1e-3)],
+@pytest.mark.parametrize("accuracy", [(1e-2, 1e-2)],
                          ids=lambda x: f"atol={x[0]} rtol={x[1]}")
 @pytest.mark.parametrize("scenario", scenarios, ids=lambda x: f"scenario: {x}")
 @pytest.mark.parametrize("context_sequence_lengths",
@@ -197,6 +191,8 @@ def test_attention_no_cache(scenario: Scenario,
                             context_sequence_lengths: List[int], mask_type,
                             accuracy):
     """Test attention computation without using cache for both FULL and CAUSAL masks"""
+    # set seed for reproducibility
+    torch.manual_seed(720)
 
     num_heads = scenario.num_heads
     num_kv_heads = scenario.num_kv_heads

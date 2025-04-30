@@ -28,14 +28,16 @@ def quantize_layers(
     quant_map,
     preprocess_init_params=None,
 ):
-    exclude_modules = quant_config.exclude_modules or [
-        '*lm_head',
-        '*router',
-        '*vocab_embedding',
-        '*position_embedding',
-        '*block_embedding',
-        '*shared_expert_gate',
-    ]
+    exclude_modules = quant_config.exclude_modules
+    if exclude_modules is None:
+        exclude_modules = [
+            '*lm_head',
+            '*router',
+            '*vocab_embedding',
+            '*position_embedding',
+            '*block_embedding',
+            '*shared_expert_gate',
+        ]
 
     for name, module, parent in model.named_modules_with_parent():
         module_name = name.rsplit('.', 1)[-1]
@@ -244,9 +246,12 @@ def fp8_rowwise_quantize(model, quant_config: QuantConfig):
         Attention: Fp8RowwiseAttention,
     }
 
+    exclude_modules = quant_config.exclude_modules
+    if exclude_modules is None:
+        exclude_modules = []
+    # Always exclude these modules for FP8 rowwise
     exclude_modules = list(
-        set((quant_config.exclude_modules or []) +
-            ['*ln_f', '*ln_embed', '*lm_head']))
+        set(exclude_modules + ['*ln_f', '*ln_embed', '*lm_head']))
 
     def extract_layer_idx(name):
         ss = name.split('.')

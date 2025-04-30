@@ -7,8 +7,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._utils import (mpi_broadcast, str_dtype_to_binding,
-                                 torch_dtype_to_str)
+from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, load_torch_hf_lora
@@ -71,8 +70,11 @@ def get_cache_size_per_token(model_config, mapping):
         head_dim = config.kv_lora_rank + config.qk_rope_head_dim
         kv_factor = 1
     else:
-        head_dim = (config.hidden_size * num_key_value_heads /
-                    config.num_attention_heads / tp_size)
+        head_dim = getattr(
+            config,
+            "head_dim",
+            config.hidden_size // config.num_attention_heads,
+        ) * num_key_value_heads // tp_size
 
     num_hidden_layers = len(mapping.pp_layers(config.num_hidden_layers))
     mem_per_token *= num_hidden_layers * head_dim
@@ -205,11 +207,13 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
             py_executor.decoder) == TRTLLMDecoder else origin_seq_len
         req = create_dummy_context_requests(max_num_tokens, seq_len, vocab_size)
         req_ids = py_executor.enqueue_requests(req)
-    req_ids = mpi_broadcast(req_ids, root=0)
+    req_ids = py_executor.dist.broadcast(req_ids, root=0)
     py_executor.is_warmup = True
     py_executor.start_worker()
     py_executor.await_responses(req_ids)
     # TODO check why call mpi_barrier() here will hang-on, but call mpi_allgather(0) is fine.
+    # sync all ranks after processing dummy requests. mpi barrier causes hang, so allgather is used.
+    py_executor.dist.allgather(0)
 
     torch_peak_memory = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
 
@@ -255,6 +259,8 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     if py_executor.dist.mapping.rank == 0:
         py_executor.shutdown()
 
+    py_executor.dist.allgather(0)
+
     return kv_cache_max_tokens
 
 
@@ -269,7 +275,8 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
         num_attention_heads = config.num_attention_heads
         num_key_value_heads = getattr(config, 'num_key_value_heads',
                                       num_attention_heads)
-        head_dim = hidden_size // num_attention_heads
+        head_dim = getattr(config, "head_dim",
+                           hidden_size // num_attention_heads)
 
         if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
         ):

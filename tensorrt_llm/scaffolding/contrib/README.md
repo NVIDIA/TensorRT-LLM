@@ -8,11 +8,11 @@ We will continue to move some generic works on this directory back to the main c
 
 ### How to create a new project?
 
-Just create a new directory and add your code there.
+Just create a new directory in `tensorrt_llm/scaffolding/contrib/` and add your code there.
 
 ### How to make your code include Controller/Task/Worker can be reused by other projects?
 
-Just add your Controller/Task/Worker to the `__init__.py` file of scaffolding.
+Just add your Controller/Task/Worker to the `__init__.py` file of `tensorrt_llm/scaffolding/contrib/`.
 
 ### How to show examples of your project?
 

@@ -422,11 +422,9 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config
         self.has_fp8_kv_cache = False
-        if self.quant_config and self.quant_config.layer_quant_mode.has_any_quant(
-        ):
-            quant_mode = self.quant_config.layer_quant_mode
-            if quant_mode.has_fp8_kv_cache():
-                self.has_fp8_kv_cache = True
+        if self.quant_config:
+            self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
+            )
 
     def forward(self,
                 q: torch.Tensor,

@@ -11,9 +11,9 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
-from tensorrt_llm.mapping import Mapping
-
 from ...logger import logger
+from ...mapping import Mapping
+from ...models.modeling_utils import QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
@@ -295,7 +295,6 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
             layer for layer in self.layers[:config.num_hidden_layers]
             if not layer.is_missing()
         ]
-        print(f"{self._local_layers=}, {self.pp_layer_list=}")
 
         # add create_pipeline_interface method
         pp_interface_keys = ["hidden_states", "residual"]
@@ -432,7 +431,13 @@ class DecoderModelForCausalLM(nn.Module,
                 # TODO: support MLA
 
         # 2. skip quant for modules in QuantConfig.exclude_modules
+        # kv_cache_quant_algo takes precedence over exclude_modules
         quant_config = self.model_config.quant_config
+        kv_cache_quant_algo = None
+        if quant_config:
+            kv_cache_quant_algo = quant_config.kv_cache_quant_algo
+        new_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
+
         if quant_config is not None:
             if quant_config.exclude_modules is not None:
                 for name, module in self.named_modules():
@@ -440,7 +445,7 @@ class DecoderModelForCausalLM(nn.Module,
                         name)
                     if is_excluded and getattr(module, "quant_config",
                                                None) is not None:
-                        module.quant_config = None
+                        module.quant_config = new_config
 
         for _, module in self.named_modules():
             if callable(getattr(module, "create_weights", None)):
