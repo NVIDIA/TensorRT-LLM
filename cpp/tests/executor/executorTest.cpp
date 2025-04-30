@@ -62,6 +62,11 @@ auto const LORA_DATA_PATH = DATA_PATH / "lora-test-weights-gpt2-tp1";
 auto const LORA_WEIGHTS_FILE = LORA_DATA_PATH / "source.npy";
 auto const LORA_CONFIG_FILE = LORA_DATA_PATH / "config.npy";
 
+auto constexpr LLAMA_INPUT_FILE = "input_tokens_llama.npy";
+auto constexpr LLAMA_VOCAB_SIZE_PADDED = 128256;
+auto constexpr LLAMA_PAD_ID = 128001;
+auto constexpr LLAMA_END_ID = 128001;
+
 } // namespace
 
 void testInvalidCtor(std::filesystem::path const& enginePath, ModelType modelType, ExecutorConfig executorConfig,
@@ -2148,6 +2153,8 @@ TEST_P(AllParamsTest, TokenComparison)
     ModelIds modelIds{50256, 50256};
     bool isSpeculativeDecoding{false};
 
+    SizeType32 vocabSizePadded = 50257;
+
     // NOTE: This can be used to disable checks for certain prompt batch entries
     FlakyTestInfo flakyTestInfo;
 
@@ -2182,9 +2189,11 @@ TEST_P(AllParamsTest, TokenComparison)
     else if (modelName == "llama_tp4_pp1_cp1" || modelName == "llama_tp1_pp4_cp1" || modelName == "llama_tp2_pp2_cp1"
         || modelName == "llama_tp1_pp2_cp1")
     {
-        inputPath = DATA_PATH / "input_tokens_llama.npy";
-        modelIds.padId = 128001;
-        modelIds.endId = 128001;
+        inputPath = DATA_PATH / LLAMA_INPUT_FILE;
+        modelIds.padId = LLAMA_PAD_ID;
+        modelIds.endId = LLAMA_END_ID;
+
+        vocabSizePadded = LLAMA_VOCAB_SIZE_PADDED;
 
         auto const resultsPath
             = LLAMA_DATA_PATH / ((beamWidth == 1) ? "sampling" : "beam_search_" + std::to_string(beamWidth));
@@ -2368,9 +2377,6 @@ TEST_P(AllParamsTest, TokenComparison)
             }
         }
     }
-
-    // SizeType32 constexpr vocabSizePadded{50257}; // gpt vocabSizePadded
-    SizeType32 constexpr vocabSizePadded{128256}; // gpt vocabSizePadded
 
     // Returning logits will bring higher latency
     if (streaming && (outConfig.returnContextLogits || outConfig.returnGenerationLogits))
