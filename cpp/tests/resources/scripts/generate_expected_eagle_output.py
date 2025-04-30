@@ -15,21 +15,19 @@
 # limitations under the License.
 
 import argparse as _arg
+import os
 from pathlib import Path
 
+# isort: off
 import run
-from build_engines_utils import init_model_spec_module
-
-init_model_spec_module()
-import os
-
-import model_spec
+# isort: on
 
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.bindings.internal.testing import ModelSpec
 
 
 def generate_output(engine: str,
-                    model_spec_obj: model_spec.ModelSpec,
+                    model_spec_obj: ModelSpec,
                     max_output_len: int = 8):
 
     model = 'vicuna-7b-v1.3'
@@ -64,8 +62,7 @@ def generate_output(engine: str,
 def generate_outputs():
     print(f'Generating outputs for Vicuna 7B v1.3 FP16')
     max_output_len = 128
-    model_spec_obj = model_spec.ModelSpec('input_tokens_long.npy',
-                                          _tb.DataType.HALF)
+    model_spec_obj = ModelSpec('input_tokens_long.npy', _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.set_max_output_length(max_output_len)
     model_spec_obj.use_packed_input()
