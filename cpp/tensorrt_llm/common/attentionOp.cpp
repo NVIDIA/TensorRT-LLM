@@ -2476,7 +2476,7 @@ int AttentionOp::initialize() noexcept
                 // Instantiate the mTllmGenFMHARunner used for MLA
                 mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(qDataType, kvDataType, outputDataType));
             }
-            else if (mIsGenerationMLA && !mUseFlashMLA)
+            else if (mIsGenerationMLA && !mUseGenFlashMLA)
             {
                 // Construct the fmha runner for generation.
                 if (mFP8GenerationMLA)
