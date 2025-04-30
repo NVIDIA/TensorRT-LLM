@@ -30,6 +30,7 @@ from typing import Iterable, Sequence
 import defs.ci_profiler
 import psutil
 import pytest
+import torch
 import tqdm
 import yaml
 from _pytest.mark import ParameterSet
@@ -1888,19 +1889,8 @@ def skip_by_device_memory(request):
 
 def get_sm_version():
     "get compute capability"
-    with tempfile.TemporaryDirectory() as temp_dirname:
-        suffix = ".exe" if is_windows() else ""
-        # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
-        cmd = " ".join([
-            "nvidia-smi" + suffix, "--query-gpu=compute_cap",
-            "--format=csv,noheader"
-        ])
-        output = check_output(cmd, shell=True, cwd=temp_dirname)
-
-    compute_cap = output.strip().split("\n")[0]
-    sm_major, sm_minor = list(map(int, compute_cap.split(".")))
-
-    return sm_major * 10 + sm_minor
+    prop = torch.cuda.get_device_properties(0)
+    return prop.major * 10 + prop.minor
 
 
 skip_pre_ada = pytest.mark.skipif(

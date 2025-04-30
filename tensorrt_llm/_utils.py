@@ -30,7 +30,6 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import nvtx
-from cuda import cuda
 from mpi4py import MPI
 from packaging import version
 
@@ -115,29 +114,6 @@ def copy_torch_to_numpy(x: torch.Tensor, ndarray: np.array):
     else:
         torch.from_numpy(ndarray).copy_(x)
     return ndarray
-
-
-# ref: https://github.com/NVIDIA/cuda-python/blob/main/examples/extra/jit_program_test.py
-def get_sm_version():
-    # Init
-    err, = cuda.cuInit(0)
-    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
-
-    # Device
-    err, cuDevice = cuda.cuDeviceGet(0)
-    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
-
-    # Get target architecture
-    err, sm_major = cuda.cuDeviceGetAttribute(
-        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-        cuDevice)
-    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
-    err, sm_minor = cuda.cuDeviceGetAttribute(
-        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-        cuDevice)
-    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
-
-    return sm_major * 10 + sm_minor
 
 
 def trt_version():
