@@ -778,7 +778,7 @@ Refer to the {ref}`support-matrix-software` section for a list of supported mode
 - System prompt caching
 - Enabled split-k for weight-only cutlass kernels
 - FP8 KV cache support for XQA kernel
-- New Python builder API and `trtllm-build` command (already applied to [blip2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/blip2) and [OPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/opt#3-build-tensorrt-engines))
+- New Python builder API and `trtllm-build` command (already applied to [blip2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/blip2) and [OPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/opt#3-build-tensorrt-engines))
 - Support `StoppingCriteria` and `LogitsProcessor` in Python generate API
 - FHMA support for chunked attention and paged KV cache
 - Performance enhancements include:
