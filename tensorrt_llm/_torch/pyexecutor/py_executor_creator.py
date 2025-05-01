@@ -64,7 +64,7 @@ def create_py_executor(executor_config: ExecutorConfig,
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=executor_config.enable_chunked_context,
         cache_reuse=executor_config.kv_cache_config.enable_block_reuse,
-        has_speculative_draft_tokens=has_draft_model_engine,
+        has_speculative_draft_tokens=has_draft_model_engine or has_ngram_drafter,
     )
 
     model_engine = PyTorchModelEngine(
