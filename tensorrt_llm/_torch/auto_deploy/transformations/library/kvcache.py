@@ -13,6 +13,7 @@ from ...custom_ops.attention_interface import (
     GetAttentionInfo,
     PositionalEmbeddingConfig,
 )
+from ...distributed.common import get_world_size
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
 from ...utils.node_utils import get_all_input_output_nodes, is_op
@@ -230,7 +231,6 @@ def insert_mla_with_kv_cache(
 def resize_kv_cache(
     egm: GraphModule,
     cm: CachedSequenceInterface,
-    world_size: int,
     free_mem_ratio: float = 0.8,
 ) -> None:
     """Inflate the kv cache to occupy the available GPU memory.
@@ -261,7 +261,7 @@ def resize_kv_cache(
         new_num_pages = int(new_cache_size // (current_cache_size // current_num_pages))
 
         # Need to sync all the GPUs
-        gathered_pages = [None] * world_size
+        gathered_pages = [None] * get_world_size()
         torch.distributed.all_gather_object(gathered_pages, new_num_pages)
         new_num_pages = min(gathered_pages)
         ad_logger.info(f"After all_gather - new_num_pages: {new_num_pages}")
