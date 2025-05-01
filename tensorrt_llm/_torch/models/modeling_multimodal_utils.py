@@ -52,6 +52,14 @@ def fuse_input_embeds(
     text_token_indices = torch.where(input_ids < vocab_size)[0]
     mm_token_indices = torch.where(input_ids >= vocab_size)[0]
 
+    max_valid_tokens = min(mm_embed.shape[0], mm_token_indices.shape[0])
+    mm_embed = mm_embed[:max_valid_tokens]
+    mm_token_indices = mm_token_indices[:max_valid_tokens]
+    assert mm_embed.shape[0] == mm_token_indices.shape[0],\
+              f"Embed/Index mismatch: {mm_embed.shape[0]} vs {mm_token_indices.shape[0]}"
+    new_input_length = text_token_indices.shape[0] + mm_token_indices.shape[0]
+    input_ids = input_ids[:new_input_length] # Trim unused tokens
+
     text_embed = embedding_layer(input_ids[text_token_indices])
     input_embeds = torch.empty(input_ids.shape[0],
                                mm_embed.shape[-1],
