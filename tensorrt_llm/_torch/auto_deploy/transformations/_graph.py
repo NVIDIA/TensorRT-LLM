@@ -113,6 +113,21 @@ def move_to_device(gm: fx.GraphModule, device: DeviceLikeType) -> fx.GraphModule
         )
 
 
+def _is_impure_node(node: Node) -> bool:
+    """We use the default is_impure function for the node but avoid RNG check."""
+    # temporarily disable RNG check
+    is_set_to_true = False
+    if getattr(node.target, "_nondeterministic_seeded", False):
+        is_set_to_true = True
+        node.target._nondeterministic_seeded = False
+    try:
+        return node.is_impure()
+    finally:
+        # restore RNG check
+        if is_set_to_true:
+            node.target._nondeterministic_seeded = True
+
+
 def canonicalize_graph(
     gm: GraphModule, shape_prop: bool = False, args_static: Optional[Tuple[Any, ...]] = None
 ) -> GraphModule:
@@ -133,8 +148,8 @@ def canonicalize_graph(
     """
     ad_logger.debug(f"Before canonicalizing: {gm}")
 
-    # clean up graph
-    gm.graph.eliminate_dead_code()
+    # clean up graph (needs to be done repeatedly until no more dead code)
+    gm.graph.eliminate_dead_code(is_impure_node=_is_impure_node)
 
     # recompile to propagate all graph changes to the graph module
     gm.recompile()

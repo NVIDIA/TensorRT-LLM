@@ -49,7 +49,6 @@ def _joint_transform(gm: GraphModule) -> GraphModule:
     gm = match_grouped_attention(gm)
     gm = match_causal_attn_mask(gm)
     gm = match_attention_layout(gm, MockAttentionDescriptor())
-    # gm = eliminate_redundant_transposes(gm)
     return gm
 
 
