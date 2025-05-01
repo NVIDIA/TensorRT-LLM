@@ -50,6 +50,7 @@ class Llama4Attention(Attention):
         nope_layer: bool = False,
         attn_temperature_tuning: bool = True,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        attention_chunk_size: Optional[int] = None,
     ):
         config = model_config.pretrained_config
 
@@ -86,6 +87,7 @@ class Llama4Attention(Attention):
         self.attn_temperature_tuning = attn_temperature_tuning and nope_layer
         self.floor_scale = getattr(config, "floor_scale", 8192.0)
         self.attn_scale = getattr(config, "attn_scale", 0.1)
+        self.attention_chunk_size = attention_chunk_size
 
     def apply_qk_norm(self, q, k):
 
@@ -321,14 +323,19 @@ class Llama4DecoderLayer(DecoderLayer):
         # TODO: re-enable these fusions
         self.fusion_config.PRE_MOE_FUSION = False
         self.fusion_config.POST_MLP_FUSION = False
-
+        self.attention_chunk_size = getattr(config, "attention_chunk_size",
+                                            None)
         self.self_attn = Llama4Attention(
             model_config,
             layer_idx=layer_idx,
             use_qk_norm=getattr(config, "use_qk_norm", False),
             nope_layer=config.no_rope_layers[layer_idx] == 0,
             attn_temperature_tuning=config.attn_temperature_tuning > 0,
-            aux_stream=aux_stream)
+            aux_stream=aux_stream,
+            attention_chunk_size=self.attention_chunk_size
+            if config.no_rope_layers[layer_idx] != 0 else
+            None,  # apply attention chunking only on RoPE layers
+        )
 
         is_mlp_layer = (layer_idx + 1) % config.interleave_moe_layer_step != 0
 
