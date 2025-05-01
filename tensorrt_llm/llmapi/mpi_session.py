@@ -270,18 +270,15 @@ class RemoteMpiCommSessionClient(MpiSession):
         self,
         addr: str,
         hmac_key: Optional[bytes] = None,
-        additional_serializable_classes: Optional[Dict] = None,
     ):
         # FIXME: this is a hack to avoid circular import, resolve later
         from tensorrt_llm.executor.ipc import ZeroMqQueue
         self.addr = addr
         print_colored_debug(
             f"RemoteMpiCommSessionClient connecting to {addr}\n", "yellow")
-        self.queue = ZeroMqQueue(
-            (addr, hmac_key),
-            is_server=False,
-            use_hmac_encryption=bool(hmac_key),
-            additional_serializable_classes=additional_serializable_classes)
+        self.queue = ZeroMqQueue((addr, hmac_key),
+                                 is_server=False,
+                                 use_hmac_encryption=bool(hmac_key))
         self._is_shutdown = False
 
     def submit(self,

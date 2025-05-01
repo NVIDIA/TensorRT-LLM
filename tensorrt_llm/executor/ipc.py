@@ -4,7 +4,7 @@ import os
 import time
 import traceback
 from queue import Queue
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import zmq
 import zmq.asyncio
@@ -33,7 +33,6 @@ class ZeroMqQueue:
                  is_server: bool,
                  is_async: bool = False,
                  name: Optional[str] = None,
-                 additional_serializable_classes: Optional[Dict] = None,
                  use_hmac_encryption: bool = True):
         '''
         Parameters:
@@ -57,11 +56,6 @@ class ZeroMqQueue:
         self._setup_done = False
         self.name = name
         self.socket = self.context.socket(socket_type)
-
-        # Initialize SERIALIZABLE_CLASSES with base classes plus provided additional classes
-        self.SERIALIZABLE_CLASSES = serialization.BASE_ZMQ_CLASSES.copy()
-        if additional_serializable_classes:
-            self.SERIALIZABLE_CLASSES.update(additional_serializable_classes)
 
         self.hmac_key = address[1] if address is not None else None
         self.use_hmac_encryption = use_hmac_encryption
@@ -169,12 +163,12 @@ class ZeroMqQueue:
                 raise RuntimeError("HMAC verification failed")
 
             obj = serialization.loads(
-                data, approved_imports=self.SERIALIZABLE_CLASSES)
+                data, approved_imports=serialization.BASE_ZMQ_CLASSES)
         else:
             # Receive data without HMAC
             data = self.socket.recv()
             obj = serialization.loads(
-                data, approved_imports=self.SERIALIZABLE_CLASSES)
+                data, approved_imports=serialization.BASE_ZMQ_CLASSES)
         return obj
 
     async def get_async(self) -> Any:
@@ -193,12 +187,12 @@ class ZeroMqQueue:
                 raise RuntimeError("HMAC verification failed")
 
             obj = serialization.loads(
-                data, approved_imports=self.SERIALIZABLE_CLASSES)
+                data, approved_imports=serialization.BASE_ZMQ_CLASSES)
         else:
             # Receive data without HMAC
             data = await self.socket.recv()
             obj = serialization.loads(
-                data, approved_imports=self.SERIALIZABLE_CLASSES)
+                data, approved_imports=serialization.BASE_ZMQ_CLASSES)
         return obj
 
     def close(self):

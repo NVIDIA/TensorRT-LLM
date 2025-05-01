@@ -7,8 +7,8 @@ import traceback
 from abc import ABC, abstractmethod
 from pathlib import Path
 from queue import Queue
-from typing import (TYPE_CHECKING, AsyncIterable, Dict, Generator, List,
-                    Optional, Union)
+from typing import (TYPE_CHECKING, AsyncIterable, Generator, List, Optional,
+                    Union)
 
 import numpy as np
 import torch
@@ -347,7 +347,6 @@ class GenerationExecutor(ABC):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
-        additional_serializable_classes: Optional[Dict] = None,
     ) -> Union["ExecutorBindingsProxy", "ExecutorBindingsWorker"]:
         # local imports to avoid cyclic importing
         from .proxy import ExecutorBindingsProxy
@@ -391,8 +390,7 @@ class GenerationExecutor(ABC):
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
-                is_llm_executor=is_llm_executor,
-                additional_serializable_classes=additional_serializable_classes)
+                is_llm_executor=is_llm_executor)
 
         # WAR: For the performance of gathering logits, we use single process worker
         # for TP1 to avoid the large overhead of IPC.
@@ -415,8 +413,7 @@ class GenerationExecutor(ABC):
                 model_world_size=model_world_size,
                 mpi_session=None,  # use mpi4py
                 postproc_worker_config=postproc_worker_config,
-                is_llm_executor=is_llm_executor,
-                additional_serializable_classes=additional_serializable_classes)
+                is_llm_executor=is_llm_executor)
         else:
             ctx = multiprocessing.get_context("spawn")
             # The ProcessPoolExecutorSession is used to support Windows, as mpi4py cannot.
@@ -427,8 +424,7 @@ class GenerationExecutor(ABC):
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
-                is_llm_executor=is_llm_executor,
-                additional_serializable_classes=additional_serializable_classes)
+                is_llm_executor=is_llm_executor)
 
     def wait_first_completed(
         self, futures: List[GenerationResult]
