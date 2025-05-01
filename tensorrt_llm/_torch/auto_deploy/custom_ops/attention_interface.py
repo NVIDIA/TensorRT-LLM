@@ -263,7 +263,7 @@ class SequenceInfo:
     def _get_sanitized_num_sequences(input_ids: torch.Tensor, seq_len: torch.Tensor) -> int:
         """Get number of sequences.
 
-        We makes sure that this function is compatible with both torch graph capture and cudagraph.
+        We make sure that this function is compatible with both torch graph capture and cudagraph.
         Both can be a bit temparamental when trying to extract the number of sequences from a tensor
         with max_batch_size or max_batch_size*max_seq_len.
         """

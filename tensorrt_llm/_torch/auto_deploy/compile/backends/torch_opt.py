@@ -182,7 +182,7 @@ class TorchOptCompiler(BackendCompiler):
         )
 
         # try capturing cudagraph
-        if self.args is not None or self.kwargs is not None:
-            compiled_gm.capture_graph(*self.args, **self.kwargs)
+        # if self.args is not None or self.kwargs is not None:
+        #    compiled_gm.capture_graph(*self.args, **self.kwargs)
 
         return compiled_gm
