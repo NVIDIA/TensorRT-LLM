@@ -77,63 +77,6 @@ if(NOT WIN32)
   set(DECODER_SHARED_TARGET_1 decoder_attention_1)
 endif()
 
-# Build internal cutlass kernels as subproject
-if(INTERNAL_CUTLASS_KERNELS_PATH)
-  set(BUILD_INTERNAL_CUTLASS_KERNELS ON)
-  set(BUILD_NVRTC_WRAPPER ON)
-  if(NOT EXISTS ${INTERNAL_CUTLASS_KERNELS_PATH}/CMakeLists.txt
-     AND EXISTS ${INTERNAL_CUTLASS_KERNELS_PATH}/cpp/CMakeLists.txt)
-    set(INTERNAL_CUTLASS_KERNELS_PATH ${INTERNAL_CUTLASS_KERNELS_PATH}/cpp)
-  endif()
-
-  add_subdirectory(${INTERNAL_CUTLASS_KERNELS_PATH}
-                   ${PROJECT_BINARY_DIR}/internal_cutlass_kernels)
-endif()
-
-# Import internal cutlass kernels
-set(INTERNAL_CUTLASS_KERNELS_TARGET
-    tensorrt_llm_internal_cutlass_kernels_static)
-set(INTERNAL_CUTLASS_KERNELS_TARGET_ARCH ${TARGET_ARCH})
-if(NOT INTERNAL_CUTLASS_KERNELS_PATH)
-  add_library(${INTERNAL_CUTLASS_KERNELS_TARGET} STATIC IMPORTED)
-  set(INTERNAL_CUTLASS_KERNELS_LIB_TARBALL
-      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/internal_cutlass_kernels/${INTERNAL_CUTLASS_KERNELS_TARGET_ARCH}/${INTERNAL_CUTLASS_KERNELS_TARGET}.tar.xz"
-  )
-  if(NOT WIN32) # Linux
-    set(INTERNAL_CUTLASS_KERNELS_LIB_NAME
-        "lib${INTERNAL_CUTLASS_KERNELS_TARGET}.a")
-  else() # Windows
-    set(INTERNAL_CUTLASS_KERNELS_LIB_NAME
-        "${INTERNAL_CUTLASS_KERNELS_TARGET}.lib")
-  endif()
-  set(INTERNAL_CUTLASS_KERNELS_LIB_PATH
-      "${CMAKE_CURRENT_BINARY_DIR}/${INTERNAL_CUTLASS_KERNELS_LIB_NAME}")
-  add_custom_command(
-    OUTPUT ${INTERNAL_CUTLASS_KERNELS_LIB_PATH}
-    COMMAND ${CMAKE_COMMAND} -E tar xf ${INTERNAL_CUTLASS_KERNELS_LIB_TARBALL}
-    DEPENDS ${INTERNAL_CUTLASS_KERNELS_LIB_TARBALL}
-    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-    VERBATIM)
-  add_custom_target(${INTERNAL_CUTLASS_KERNELS_TARGET}_helper
-                    DEPENDS ${INTERNAL_CUTLASS_KERNELS_LIB_PATH})
-  add_dependencies(${INTERNAL_CUTLASS_KERNELS_TARGET}
-                   ${INTERNAL_CUTLASS_KERNELS_TARGET}_helper)
-  set_property(TARGET ${INTERNAL_CUTLASS_KERNELS_TARGET}
-               PROPERTY IMPORTED_LOCATION ${INTERNAL_CUTLASS_KERNELS_LIB_PATH})
-  target_include_directories(
-    ${INTERNAL_CUTLASS_KERNELS_TARGET}
-    INTERFACE
-      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/internal_cutlass_kernels/include")
-  file(SIZE ${INTERNAL_CUTLASS_KERNELS_LIB_TARBALL}
-       INTERNAL_CUTLASS_KERNELS_LIB_SIZE)
-  if(INTERNAL_CUTLASS_KERNELS_LIB_SIZE LESS 1024)
-    message(
-      FATAL_ERROR
-        "The internal_cutlass_kernels library is truncated or incomplete. This is usually caused by using Git LFS (Large File Storage) incorrectly. Please try running command `git lfs install && git lfs pull`."
-    )
-  endif()
-endif()
-
 add_subdirectory(common)
 add_subdirectory(kernels)
 add_subdirectory(layers)
@@ -185,7 +128,6 @@ set(TRTLLM_LINK_LIBS
     ${CMAKE_DL_LIBS}
     ${TRT_LIB}
     common_src
-    kernels_src
     flash_mla_src
     context_attention_src
     decoder_attention_src
@@ -200,7 +142,6 @@ set(TRTLLM_LINK_LIBS
     # moe_gemm_src
     fb_gemm_src
     gemm_swiglu_sm90_src
-    cutlass_src
     layers_src
     runtime_src
     testing_src
@@ -260,10 +201,18 @@ endif()
 
 target_link_libraries(
   ${SHARED_TARGET}
-  PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,${BATCH_MANAGER_TARGET}>
-          $<LINK_LIBRARY:WHOLE_ARCHIVE,${EXECUTOR_TARGET}>
-          $<LINK_LIBRARY:WHOLE_ARCHIVE,fp8_blockscale_gemm_src>
-          $<LINK_LIBRARY:WHOLE_ARCHIVE,${INTERNAL_CUTLASS_KERNELS_TARGET}>)
+  PRIVATE
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,${BATCH_MANAGER_TARGET}>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,${EXECUTOR_TARGET}>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,fp8_blockscale_gemm_src>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,$<GENEX_EVAL:$<TARGET_PROPERTY:tensorrt_llm_internal_cutlass::tensorrt_llm_internal_cutlass,INTERFACE_LINK_LIBRARIES>>>
+)
+
+target_include_directories(
+  ${SHARED_TARGET}
+  INTERFACE
+    $<TARGET_PROPERTY:tensorrt_llm_internal_cutlass::tensorrt_llm_internal_cutlass,INTERFACE_INCLUDE_DIRECTORIES>
+)
 
 # Link kernel_src and cutlass_src. static internal cutlass lib overridden.
 target_link_libraries(${SHARED_TARGET} PUBLIC kernels_src cutlass_src)
