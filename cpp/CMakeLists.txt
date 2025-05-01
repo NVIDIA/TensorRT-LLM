@@ -63,21 +63,6 @@ endif()
 add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
 add_compile_definitions("TLLM_ENABLE_CUDA")
 
-set(INTERNAL_CUTLASS_KERNELS_PATH
-    ""
-    CACHE
-      PATH
-      "The path to internal cutlass kernels sources. Prebuilt binary for internal cutlass kernels will be used if this is not set."
-)
-if(INTERNAL_CUTLASS_KERNELS_PATH)
-  message(
-    STATUS
-      "Building internal cutlass kernels from source at ${INTERNAL_CUTLASS_KERNELS_PATH}"
-  )
-else()
-  message(STATUS "Importing internal cutlass kernels")
-endif()
-
 if(BUILD_PYT)
   message(STATUS "Building PyTorch")
 else()
@@ -173,6 +158,8 @@ endif()
 # TRT dependencies
 find_package(TensorRT 10 REQUIRED COMPONENTS OnnxParser)
 set(TRT_LIB TensorRT::NvInfer)
+
+find_package(tensorrt_llm_internal_cutlass REQUIRED)
 
 get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
