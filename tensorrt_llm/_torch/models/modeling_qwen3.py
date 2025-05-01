@@ -58,8 +58,8 @@ class Qwen3Attention(Attention):
                                    eps=1e-6,
                                    dtype=config.torch_dtype,
                                    has_weights=True)
-       self.aux_stream = torch.cuda.Stream()
-       self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.aux_stream = torch.cuda.Stream()
+        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
 class Qwen3DecoderLayer(DecoderLayer):
 

@@ -181,11 +181,11 @@ class Attention(nn.Module):
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
+        q, k, v = qkv, None, None
         if self.apply_rotary_emb and position_ids is not None:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
                                 dim=-1)
             # Add qk-norm
-            q, k = self.rotary_emb(position_ids, [q, k])
             q_l2norm = lambda: self.q_norm(q.reshape(-1, self.head_dim)).reshape(-1, self.q_size)
             k_l2norm = lambda: self.k_norm(k.reshape(-1, self.head_dim)).reshape(-1, self.kv_size)
             q, k = maybe_execute_in_parallel(
@@ -195,6 +195,7 @@ class Attention(nn.Module):
                     self.ln_events[1],
                     self.aux_stream,
                 )
+            q, k = self.rotary_emb(position_ids, [q, k])
         out_scale = None
 
         if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
