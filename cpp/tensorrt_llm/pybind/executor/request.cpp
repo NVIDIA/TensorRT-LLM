@@ -533,7 +533,7 @@ void initRequestBindings(pybind11::module_& m)
             state[30].cast<std::optional<tle::Tensor>>(), state[31].cast<std::optional<tle::GuidedDecodingParams>>());
     };
 
-    py::class_<tle::Request> request(m, "Request");
+    py::class_<tle::Request> request(m, "Request", pybind11::dynamic_attr());
     request
         // A modified version of constructor to accpect deprecated args maxNewTokens
         // TODO(enweiz): use the original constructor after the deprecated args are removed

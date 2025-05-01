@@ -357,9 +357,9 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 context_phase_params = request.disaggregated_params.get_context_phase_params(
                 )
 
-        is_overlap_enabled = hasattr(
-            self._executor_config, "backend"
-        ) and self._executor_config.backend == "pytorch" and self._executor_config.pytorch_backend_config.enable_overlap_scheduler
+        is_pytorch_backend = getattr(self._executor_config, "backend",
+                                     None) == "pytorch"
+        is_overlap_enabled = is_pytorch_backend and self._executor_config.pytorch_backend_config.enable_overlap_scheduler
         if is_overlap_enabled:
             is_disaggregated = self.engine.kv_cache_transceiver is not None
             if is_disaggregated and (
@@ -399,10 +399,18 @@ class ExecutorBindingsWorker(GenerationExecutor):
                     tllm.Request.BATCHED_POST_PROCESSOR_NAME
                     if request.sampling_params.apply_batched_logits_processor
                     else None),
-                logits_post_processor=request.sampling_params.logits_processor,
+                logits_post_processor=None if is_pytorch_backend else
+                request.sampling_params.logits_processor,
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 type=request_type)
+
+            if is_pytorch_backend and request.sampling_params.logits_processor:
+                # For PyTorch backend, we attach logits processors as a dynamic Python attribute
+                # instead of using the C++ binding, since the latter will cause PyCapsule pickling issues.
+                lp = request.sampling_params.logits_processor
+                executor_request.py_logits_post_processors = lp if isinstance(
+                    lp, list) else [lp]
 
             if request.query_token_ids is not None:
                 # pytorch star attention workflow

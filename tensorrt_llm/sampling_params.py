@@ -57,7 +57,7 @@ class LogitsProcessor(ABC):
 
     @abstractmethod
     def __call__(self, req_id: int, logits: torch.Tensor,
-                 token_ids: List[List[int]], stream_ptr: int,
+                 token_ids: List[List[int]], stream_ptr: Optional[int],
                  client_id: Optional[int]) -> None:
         """Logits processing callback. The callback is expected to inplace modify the logits.
 
@@ -65,7 +65,7 @@ class LogitsProcessor(ABC):
             req_id (int): Request id.
             logits (torch.Tensor): Logits tensor to be modified.
             token_ids (List[List[int]]): Token ids produced by the request so far. The shape is beam_width * sequence_length.
-            stream_ptr (int): The operation stream used by the logits tensor.
+            stream_ptr (int, optional): The operation stream used by the logits tensor. Not required for PyTorch backend.
             client_id (int, optional): An optional client id.
         """
         pass  # noqa
@@ -125,8 +125,8 @@ class SamplingParams:
         stop_token_ids (List[int], optional): A list of token ids that stop the generation when they are generated. Defaults to None.
         include_stop_str_in_output (bool): Whether to include the stop strings in output text. Defaults to False.
         embedding_bias (torch.Tensor, optional): The embedding bias tensor. Expected type is kFP32 and shape is [vocab_size]. Defaults to None.
-        logits_processor (tensorrt_llm.sampling_params.LogitsProcessor, optional): The logits postprocessor callback. Defaults to None.
-            The LogitsProcessor class is recommended for callback creation.
+        logits_processor (tensorrt_llm.sampling_params.LogitsProcessor, List[tensorrt_llm.sampling_params.LogitsProcessor], optional): The logits postprocessor callback(s). Defaults to None.
+            If a list, each processor is applied in order during generation (supported in PyTorch backend only).
         apply_batched_logits_processor (bool): Whether to apply batched logits postprocessor callback. Defaults to False.
             The BatchedLogitsProcessor class is recommended for callback creation. The callback must be provided when initializing LLM.
 
@@ -204,7 +204,8 @@ class SamplingParams:
                                                       repr=False)
 
     embedding_bias: Optional[torch.Tensor] = None
-    logits_processor: Optional[LogitsProcessor] = None
+    logits_processor: Optional[Union[LogitsProcessor,
+                                     List[LogitsProcessor]]] = None
     apply_batched_logits_processor: bool = False
 
     n: int = 1
