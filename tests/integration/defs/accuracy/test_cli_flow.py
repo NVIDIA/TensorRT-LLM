@@ -369,7 +369,7 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
         mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
 
         extra_summarize_args = [
-            "--eagle_use_dynamic_tree", "--eagle_dynamic_tree_max_top_k 10"
+            "--eagle_use_dynamic_tree", "--eagle_dynamic_tree_max_top_k=10"
         ]
         if cuda_graph:
             extra_summarize_args.append("--cuda_graph_mode")
