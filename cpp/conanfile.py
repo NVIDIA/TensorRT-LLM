@@ -13,6 +13,9 @@ class TensorRT_LLM(ConanFile):
 
     def requirements(self):
         self.requires("libnuma/system")
+        self.requires(
+            f"tensorrt_llm_internal_cutlass/{self.conan_data['internal_cutlass_version']}"
+        )
 
     def generate(self):
         cmake = CMakeDeps(self)
