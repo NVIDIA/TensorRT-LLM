@@ -9,6 +9,7 @@ import torch
 import zmq
 import zmq.asyncio
 
+import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm.logger import logger
 
 from .._utils import mpi_rank
@@ -35,17 +36,14 @@ __all__ = [
 class ExecutorBindingsProxy(GenerationExecutor):
     READY_SIGNAL = b"READY"
 
-    def __init__(
-        self,
-        worker_kwargs: dict,
-        model_world_size: int = 1,
-        mpi_session: Optional[MpiSession] = None,
-        *,
-        worker_cls: type = ExecutorBindingsWorker,
-        postproc_worker_config: Optional[PostprocWorkerConfig] = None,
-        is_llm_executor: Optional[bool] = None,
-        additional_serializable_classes: Optional[Dict] = None,
-    ) -> None:
+    def __init__(self,
+                 worker_kwargs: dict,
+                 model_world_size: int = 1,
+                 mpi_session: Optional[MpiSession] = None,
+                 *,
+                 worker_cls: type = ExecutorBindingsWorker,
+                 postproc_worker_config: Optional[PostprocWorkerConfig] = None,
+                 is_llm_executor: Optional[bool] = None) -> None:
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
         )
         super().__init__(
@@ -55,7 +53,6 @@ class ExecutorBindingsProxy(GenerationExecutor):
             postprocess_tokenizer_dir,
             is_llm_executor=is_llm_executor,
         )
-        self.additional_serializable_classes = additional_serializable_classes
 
         self.workers_started = False
         self.doing_pre_shutdown = False
@@ -96,8 +93,6 @@ class ExecutorBindingsProxy(GenerationExecutor):
         if "log_level" not in worker_kwargs:
             worker_kwargs["log_level"] = logger.level
 
-        worker_kwargs[
-            "additional_serializable_classes"] = self.additional_serializable_classes
         self.dispatch_result_thread: Optional[ManagedThread] = None
         self.dispatch_stats_thread: Optional[ManagedThread] = None
         self.dispatch_kv_cache_events_thread: Optional[ManagedThread] = None
@@ -115,14 +110,9 @@ class ExecutorBindingsProxy(GenerationExecutor):
     def _setup_queues(self) -> WorkerCommIpcAddrs:
 
         self.request_queue = IpcQueue(is_server=True,
-                                      name="proxy_request_queue",
-                                      additional_serializable_classes=self.
-                                      additional_serializable_classes)
-        self.request_error_queue = IpcQueue(
-            is_server=True,
-            name="proxy_request_error_queue",
-            additional_serializable_classes=self.additional_serializable_classes
-        )
+                                      name="proxy_request_queue")
+        self.request_error_queue = IpcQueue(is_server=True,
+                                            name="proxy_request_error_queue")
         # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
         # Use PULL mode when enable_postprocess_parallel as there are
         # multiple senders from multiple processes.
@@ -131,21 +121,14 @@ class ExecutorBindingsProxy(GenerationExecutor):
             fuse_message=False,
             socket_type=zmq.PULL
             if self.enable_postprocess_parallel else zmq.PAIR,
-            name="proxy_result_queue",
-            additional_serializable_classes=self.additional_serializable_classes
-        )
-        self.mp_stats_queue = FusedIpcQueue(
-            is_server=True,
-            fuse_message=False,
-            name="proxy_stats_queue",
-            additional_serializable_classes=self.additional_serializable_classes
-        )
+            name="proxy_result_queue")
+        self.mp_stats_queue = FusedIpcQueue(is_server=True,
+                                            fuse_message=False,
+                                            name="proxy_stats_queue")
         self.kv_cache_events_queue = FusedIpcQueue(
             is_server=True,
             fuse_message=False,
-            name="proxy_kv_cache_events_queue",
-            additional_serializable_classes=self.additional_serializable_classes
-        )
+            name="proxy_kv_cache_events_queue")
         return WorkerCommIpcAddrs(
             request_queue_addr=self.request_queue.address,
             request_error_queue_addr=self.request_error_queue.address,
@@ -312,7 +295,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
             worker_cls=self.worker_cls,
             tracer_init_kwargs=tracer_init_kwargs,
             _torch_model_class_mapping=MODEL_CLASS_MAPPING,
-            ready_signal=ExecutorBindingsProxy.READY_SIGNAL)
+            ready_signal=ExecutorBindingsProxy.READY_SIGNAL,
+            BASE_ZMQ_CLASSES=serialization.BASE_ZMQ_CLASSES)
         for fut in self.mpi_futures:
             fut.add_done_callback(mpi_done_callback)
 
