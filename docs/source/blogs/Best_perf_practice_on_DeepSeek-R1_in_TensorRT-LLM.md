@@ -327,7 +327,7 @@ trtllm-bench -m deepseek-ai/DeepSeek-R1 \
     --dataset $YOUR_DATA_PATH \
     --backend pytorch \
     --max_batch_size 128 \
-    --max_num_tokens 1127 \
+    --max_num_tokens 1151 \
     --num_requests 5120 \
     --concurrency 1024 \
     --kv_cache_free_gpu_mem_fraction 0.8 \
