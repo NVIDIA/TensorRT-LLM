@@ -45,7 +45,7 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           DeepseekAllReduce, allgather)
+                           MoEAllReduce, allgather)
 from ..model_config import ModelConfig
 from ..models.modeling_utils import MissingLayer, ModelConfig, support_pp
 from ..modules.attention import MLA
@@ -392,7 +392,7 @@ class Deepseekv3MoE(nn.Module):
             overridden_tp_size=shared_tp_size,
             reduce_output=False)
 
-        self.all_reduce = AllReduce(self.mapping)
+        self.allreduce = AllReduce(self.mapping)
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {
             key: torch.cuda.Event()
@@ -516,7 +516,7 @@ class Deepseekv3MoE(nn.Module):
             ), f'unmatched tensor shape'
             final_hidden_states = shared_output + routed_output
             if not self.use_dp and self.mapping.tp_size > 1:
-                final_hidden_states = self.all_reduce(
+                final_hidden_states = self.allreduce(
                     final_hidden_states,
                     all_reduce_params=final_all_reduce_params)
 
@@ -608,16 +608,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
         self.layer_idx = layer_idx
-        self.all_reduce = AllReduce(self.mapping)
+        self.allreduce = AllReduce(self.mapping)
+        self.moe_allreduce = MoEAllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
-
-        self.deepseek_allreduce_disabled = os.environ.get(
-            "TRTLLM_DEEPSEEK_ALLREDUCE_FUSION_DISABLED", "0") == "1"
-        if mapping.is_multi_node():
-            self.deepseek_allreduce_disabled = True
-
-        if not self.deepseek_allreduce_disabled:
-            self.deepseek_allreduce = DeepseekAllReduce(self.mapping)
 
     def _compute_mlp_tp_size(self, intermediate_size: int,
                              block_size: int) -> int:
@@ -675,19 +668,25 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             **kwargs,
         )
 
-        # deepseek allreduce kernel is better when m < 512, two shot(128~512) has acc bug, waive
-        using_prev_fusion = self.deepseek_allreduce_disabled or hidden_states.size(
-            0) > 128
-
-        min_latency_mode = self._enable_latency_mode(
-            hidden_states.size(0)) and not using_prev_fusion
+        min_latency_mode = self._enable_latency_mode(hidden_states.size(0))
 
         hidden_states_fp4 = None
         if self.fusion_config.PRE_MOE_FUSION:
-            # Custom AR Fusion for DeepseekV3
-            if using_prev_fusion:
-                # Custom AR Fusion for DeepseekV3
-                hidden_states, residual = self.all_reduce(
+            if min_latency_mode:
+                hidden_states, hidden_states_act, hidden_states_sf, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.
+                        RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
+                        residual=residual,
+                        norm_weight=self.post_attention_layernorm.weight,
+                        scale=self.mlp.experts.fc31_input_scale,
+                        eps=self.post_attention_layernorm.variance_epsilon,
+                    ))
+                hidden_states_fp4 = Fp4QuantizedTensor(hidden_states_act,
+                                                       hidden_states_sf)
+            else:
+                hidden_states, residual = self.allreduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
                         fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
@@ -695,52 +694,17 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                         norm_weight=self.post_attention_layernorm.weight,
                         eps=self.post_attention_layernorm.variance_epsilon,
                     ))
-            else:
-                if min_latency_mode:
-                    hidden_states, hidden_states_act, hidden_states_sf, residual = self.deepseek_allreduce(
-                        hidden_states,
-                        [
-                            residual, self.post_attention_layernorm.weight,
-                            self.mlp.experts.fc31_input_scale
-                        ],
-                        self.post_attention_layernorm.variance_epsilon,
-                        AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
-                    )
-                    hidden_states_fp4 = Fp4QuantizedTensor(
-                        hidden_states_act, hidden_states_sf)
-                else:
-                    hidden_states, residual = self.deepseek_allreduce(
-                        hidden_states,
-                        [residual, self.post_attention_layernorm.weight],
-                        self.post_attention_layernorm.variance_epsilon,
-                        AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                    )
         elif self.fusion_config.PRE_MLP_FUSION:
-            # Custom AR Fusion for DeepseekV3 with quant_fp4
-            if using_prev_fusion:
-                hidden_states, residual = self.all_reduce(
-                    hidden_states,
-                    all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                        residual=residual,
-                        norm_weight=self.post_attention_layernorm.weight,
-                        eps=self.post_attention_layernorm.variance_epsilon,
-                    ))
-                act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
-                    hidden_states, self.mlp.gate_up_proj.input_scale,
-                    self.mlp.gate_up_proj.scaling_vector_size, False)
-            else:
-                act_fp4, act_sf, residual = self.deepseek_allreduce(
-                    hidden_states,
-                    [
-                        residual, self.post_attention_layernorm.weight,
-                        self.mlp.gate_up_proj.input_scale
-                    ],
-                    self.post_attention_layernorm.variance_epsilon,
-                    AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
-                )
+            act_fp4, act_sf, residual = self.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+                    residual=residual,
+                    norm_weight=self.post_attention_layernorm.weight,
+                    scale=self.mlp.gate_up_proj.input_scale,
+                    eps=self.post_attention_layernorm.variance_epsilon,
+                ))
             hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
-
         else:
             # No fusion
             hidden_states, residual = self.post_attention_layernorm(
@@ -769,62 +733,39 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             )
 
         if self.fusion_config.POST_MOE_FUSION:
-            if using_prev_fusion:
-                hidden_states, residual = self.all_reduce(
-                    hidden_states,
-                    all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                        residual=residual,
-                        norm_weight=self.next_layer_layernorm.weight,
-                        eps=self.next_layer_layernorm.variance_epsilon,
-                    ))
-            else:
-                if min_latency_mode:
-                    shared_output = hidden_states[0]
-                    hidden_states_activated_experts = hidden_states[1]
-                    num_activated_experts_per_node = hidden_states[2]
-                    experts_to_token_score = hidden_states[3]
-                    activated_expert_global_ids = hidden_states[4]
+            if min_latency_mode:
+                shared_output = hidden_states[0]
+                hidden_states_activated_experts = hidden_states[1]
+                num_activated_experts_per_node = hidden_states[2]
+                experts_to_token_score = hidden_states[3]
 
-                    hidden_states, residual = self.deepseek_allreduce(
-                        hidden_states_activated_experts,  # not used
-                        [
-                            residual, self.next_layer_layernorm.weight,
-                            num_activated_experts_per_node,
-                            experts_to_token_score,
-                            hidden_states_activated_experts, shared_output,
-                            activated_expert_global_ids
-                        ],
-                        self.next_layer_layernorm.variance_epsilon,
-                        AllReduceFusionOp.MOE_ALLREDUCE_RESIDUAL_RMS_NORM,
-                    )
-                else:
-                    hidden_states, residual = self.deepseek_allreduce(
-                        hidden_states,
-                        [residual, self.next_layer_layernorm.weight],
-                        self.next_layer_layernorm.variance_epsilon,
-                        AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                    )
-        elif self.fusion_config.POST_MLP_FUSION:
-
-            if using_prev_fusion:
-                # Custom AR Fusion for DeepseekV3
-                hidden_states, residual = self.all_reduce(
-                    hidden_states,
-                    all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                        residual=residual,
-                        norm_weight=self.next_layer_layernorm.weight,
-                        eps=self.next_layer_layernorm.variance_epsilon,
-                    ))
-            else:
-                hidden_states, residual = self.deepseek_allreduce(
-                    hidden_states,
-                    [residual, self.next_layer_layernorm.weight],
-                    self.next_layer_layernorm.variance_epsilon,
-                    AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                hidden_states, residual = self.moe_allreduce(
+                    residual,
+                    self.next_layer_layernorm.weight,
+                    device_num_experts=num_activated_experts_per_node,
+                    scale_input=experts_to_token_score,
+                    active_experts_token_input=hidden_states_activated_experts,
+                    token_input=shared_output,
+                    eps=self.next_layer_layernorm.variance_epsilon,
                 )
-
+            else:
+                hidden_states, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=self.next_layer_layernorm.weight,
+                        eps=self.next_layer_layernorm.variance_epsilon,
+                    ))
+        elif self.fusion_config.POST_MLP_FUSION:
+            hidden_states, residual = self.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=self.next_layer_layernorm.weight,
+                    eps=self.next_layer_layernorm.variance_epsilon,
+                ))
         else:
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
@@ -878,9 +819,6 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         # deepseek allreduce kernel is better when m < 512
-        using_prev_fusion = self.deepseek_allreduce_disabled or hidden_states.size(
-            0) >= 512
-
         inputs_embeds = self.enorm(embed_tokens(input_ids))
         hidden_states = self.hnorm(hidden_states)
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
@@ -902,24 +840,14 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
 
         # MTP Layer Must have sparse MOE
         if self.fusion_config.PRE_MOE_FUSION:
-            # Custom AR Fusion for DeepseekV3
-            if using_prev_fusion:
-                # Custom AR Fusion for DeepseekV3
-                hidden_states, residual = self.all_reduce(
-                    hidden_states,
-                    all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                        residual=residual,
-                        norm_weight=self.post_attention_layernorm.weight,
-                        eps=self.post_attention_layernorm.variance_epsilon,
-                    ))
-            else:
-                hidden_states, residual = self.deepseek_allreduce(
-                    hidden_states,
-                    [residual, self.post_attention_layernorm.weight],
-                    self.post_attention_layernorm.variance_epsilon,
-                    AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                )
+            hidden_states, residual = self.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=self.post_attention_layernorm.weight,
+                    eps=self.post_attention_layernorm.variance_epsilon,
+                ))
         else:
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
@@ -933,22 +861,14 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         )
 
         if self.fusion_config.POST_MOE_FUSION:
-            if using_prev_fusion:
-                hidden_states, residual = self.all_reduce(
-                    hidden_states,
-                    all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                        residual=residual,
-                        norm_weight=self.shared_head.norm.weight,
-                        eps=self.shared_head.norm.variance_epsilon,
-                    ))
-            else:
-                hidden_states, residual = self.deepseek_allreduce(
-                    hidden_states,
-                    [residual, self.shared_head.norm.weight],
-                    self.shared_head.norm.variance_epsilon,
-                    AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                )
+            hidden_states, residual = self.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=self.shared_head.norm.weight,
+                    eps=self.shared_head.norm.variance_epsilon,
+                ))
         else:
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
 
