@@ -32,14 +32,15 @@ class Request::Impl
 {
 
 public:
-    // 34 parameters, 34 items in initialization list
+    // 35 parameters, 35 items in initialization list
     Impl(VecTokens inputTokenIds, SizeType32 maxNewTokens, bool streaming, SamplingConfig const& samplingConfig,
         OutputConfig outputConfig, std::optional<TokenIdType> const& endId, std::optional<TokenIdType> const& padId,
         std::optional<std::vector<SizeType32>> positionIds, std::optional<std::list<VecTokens>> badWords,
         std::optional<std::list<VecTokens>> stopWords, std::optional<Tensor> embeddingBias,
         std::optional<ExternalDraftTokensConfig> externalDraftTokensConfig,
-        std::optional<PromptTuningConfig> pTuningConfig, std::optional<MropeConfig> mRopeConfig,
-        std::optional<LoraConfig> loraConfig, std::optional<LookaheadDecodingConfig> lookaheadConfig,
+        std::optional<PromptTuningConfig> pTuningConfig, std::optional<Tensor> multimodalEmbedding,
+        std::optional<MropeConfig> mRopeConfig, std::optional<LoraConfig> loraConfig,
+        std::optional<LookaheadDecodingConfig> lookaheadConfig,
         std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig,
         std::optional<std::string> logitsPostProcessorName, std::optional<LogitsPostProcessor> logitsPostProcessor,
         std::optional<VecTokens> encoderInputTokenIds, std::optional<IdType> clientId, bool returnAllGeneratedTokens,
@@ -61,6 +62,7 @@ public:
         , mEmbeddingBias(checkEmbeddingBias(std::move(embeddingBias)))
         , mExternalDraftTokensConfig(std::move(externalDraftTokensConfig))
         , mPTuningConfig(std::move(pTuningConfig))
+        , mMultimodalEmbedding(std::move(multimodalEmbedding))
         , mMropeConfig(std::move(mRopeConfig))
         , mLoraConfig(std::move(loraConfig))
         , mLookaheadConfig(lookaheadConfig)
@@ -173,6 +175,11 @@ public:
     [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const
     {
         return mPTuningConfig;
+    }
+
+    [[nodiscard]] std::optional<Tensor> getMultimodalEmbedding() const
+    {
+        return mMultimodalEmbedding;
     }
 
     [[nodiscard]] std::optional<MropeConfig> getMropeConfig() const
@@ -338,6 +345,11 @@ public:
         mPTuningConfig = pTuningConfig;
     }
 
+    void setMultimodalEmbedding(Tensor const& multimodalEmbedding)
+    {
+        mMultimodalEmbedding = multimodalEmbedding;
+    }
+
     void setMropeConfig(MropeConfig const& mRopeConfig)
     {
         mMropeConfig = mRopeConfig;
@@ -498,6 +510,7 @@ private:
         lambda(mEmbeddingBias);
         lambda(mExternalDraftTokensConfig);
         lambda(mPTuningConfig);
+        lambda(mMultimodalEmbedding);
         lambda(mMropeConfig);
         lambda(mLoraConfig);
         lambda(mLookaheadConfig);
@@ -533,6 +546,7 @@ private:
     std::optional<Tensor> mEmbeddingBias;
     std::optional<ExternalDraftTokensConfig> mExternalDraftTokensConfig;
     std::optional<PromptTuningConfig> mPTuningConfig;
+    std::optional<Tensor> mMultimodalEmbedding;
     std::optional<MropeConfig> mMropeConfig;
     std::optional<LoraConfig> mLoraConfig;
     std::optional<LookaheadDecodingConfig> mLookaheadConfig;

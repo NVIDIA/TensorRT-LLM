@@ -662,7 +662,7 @@ def prepare_model_tests(model_name: str,
         if model_name == 'gpt':
             script_model_name = 'gpt2'
         elif model_name == 'llama':
-            script_model_name = 'llama-7b-hf'
+            script_model_name = 'Llama-3.2-1B'
         generate_tokenizer_info = [
             python_exe, "examples/generate_xgrammar_tokenizer_info.py",
             f"--model_dir={str(resources_dir / 'models' / script_model_name)}",

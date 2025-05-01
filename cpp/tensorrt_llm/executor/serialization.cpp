@@ -621,6 +621,7 @@ Request Serialization::deserializeRequest(std::istream& is)
     auto embeddingBias = su::deserialize<std::optional<Tensor>>(is);
     auto externalDraftTokensConfig = su::deserialize<std::optional<ExternalDraftTokensConfig>>(is);
     auto pTuningConfig = su::deserialize<std::optional<PromptTuningConfig>>(is);
+    auto multimodalEmbedding = su::deserialize<std::optional<Tensor>>(is);
     auto mRopeConfig = su::deserialize<std::optional<MropeConfig>>(is);
     auto loraConfig = su::deserialize<std::optional<LoraConfig>>(is);
     auto lookaheadConfig = su::deserialize<std::optional<LookaheadDecodingConfig>>(is);
@@ -645,15 +646,15 @@ Request Serialization::deserializeRequest(std::istream& is)
         ? std::optional<std::chrono::milliseconds>(std::chrono::milliseconds(*allottedTimeInt))
         : std::nullopt;
 
-    // 33 parameters
+    // 34 parameters
     return Request(std::move(inputTokenIds), maxNewTokens, streaming, samplingConfig, outputConfig, endId, padId,
         std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
-        std::move(externalDraftTokensConfig), std::move(pTuningConfig), std::move(mRopeConfig), std::move(loraConfig),
-        lookaheadConfig, std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName), std::nullopt,
-        std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, requestType,
-        std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
-        std::move(crossAttentionMask), numReturnSequences, std::move(eagleConfig), std::move(skipCrossAttnBlocks),
-        std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs);
+        std::move(externalDraftTokensConfig), std::move(pTuningConfig), std::move(multimodalEmbedding),
+        std::move(mRopeConfig), std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig),
+        std::move(logitsPostProcessorName), std::nullopt, std::move(encoderInputTokenIds), clientId,
+        returnAllGeneratedTokens, priority, requestType, std::move(contextPhaseParams), std::move(encoderInputFeatures),
+        encoderOutputLength, std::move(crossAttentionMask), numReturnSequences, std::move(eagleConfig),
+        std::move(skipCrossAttnBlocks), std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs);
 }
 
 void Serialization::serialize(Request const& request, std::ostream& os)
