@@ -1710,6 +1710,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                 [
                     "The image shows a scenic landscape with a prominent rock formation, which appears to be a large, flat-topped mountain or butte. The rock formation is rugged and has a smooth, flat top, suggesting it could be a natural landmark or a geological feature. The sky is clear with a few",
                     "The image shows a majestic mountain with a flat top, which is characteristic of buttes. The mountain is prominently featured in the background, with a clear blue sky above it and a few scattered clouds. The weather appears to be and clear, with no visible signs of rain or storms.",
+                    "The image shows a scenic landscape with a large, prominent rock formation in the background. The rock appears to be a significant landmark, possibly a mountain or a cliff face, with a smooth, rounded surface that suggests it might be a natural formation or a man-made structure designed to resemble a rock.",
                 ],
                 "The image shows a multi-lane highway with several vehicles in motion. There are cars and a bus visible, and the traffic appears to be moderate, with no significant congestion. The road is divided by a central divider, and there are green trees lining the sides of the highway, indicating a suburban",
             ],
@@ -1718,7 +1719,8 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             "image": [
                 [
                     "The image depicts a vast ocean with waves crashing against the shore. The sky is filled with dark clouds, creating a dramatic and moody atmosphere. The waves are powerful and turbulent, suggesting a stormy weather condition. The overall scene conveys a sense of raw natural beauty and the raw power of the ocean.",
-                    "The image depicts a vast ocean with waves crashing against the shore. The sky is filled with dark clouds, creating a dramatic and moody atmosphere. The waves are powerful and turbulent, with white foam at their crests, indicating strong winds and rough sea conditions. The overall scene conveys a sense of raw natural power and"
+                    "The image depicts a vast ocean with waves crashing against the shore. The sky is filled with dark clouds, creating a dramatic and moody atmosphere. The waves are powerful and turbulent, with white foam at their crests, indicating strong winds and rough sea conditions. The overall scene conveys a sense of raw natural power and",
+                    "The image depicts a vast ocean with waves crashing against the shore. The sky above is filled with dark, heavy clouds, suggesting a stormy or overcast weather condition. The waves are powerful and turbulent, with white foam at their crests, indicating strong winds and rough sea conditions. The overall atmosphere of the image is",
                 ],
                 [
                     "The image depicts a scenic mountainous landscape. The central object is a large, prominent rock formation known as Half Dome, which is a well-known landmark in Yosemite National Park, California. The weather appears to be clear and sunny, with a bright blue sky and some scattered clouds. The visibility is excellent, allowing for a",
@@ -1761,6 +1763,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             "video":
             [[
                 "The video depicts a woman walking down a vibrant, neon-lit street at night. She is dressed in a stylish outfit, featuring a black leather jacket, a red dress, and red boots. She carries a small handbag and wears large sunglasses. The street is wet, reflecting the colorful lights from the surrounding buildings,",
+                "The video depicts a woman walking down a vibrant, neon-lit street at night. She is dressed in a stylish outfit, including a black leather jacket, a red dress, and red boots, and she carries a small black handbag. The street is wet, reflecting the colorful lights from the surrounding buildings, which are",
             ],
              [
                  "The video shows a rotating Earth at night. The illuminated areas represent cities and populated regions, with lights visible in various parts of the world. The Earth is depicted with a dark blue ocean and a lighter blue landmass, and the night sky is black. The rotation of the Earth is smooth, giving a sense of continuous",
