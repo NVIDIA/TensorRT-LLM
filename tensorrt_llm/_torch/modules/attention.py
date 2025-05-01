@@ -41,8 +41,11 @@ class Attention(nn.Module):
         config = config or ModelConfig()
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
-        self.head_dim = getattr(config.pretrained_config, "head_dim",
-                                self.hidden_size // self.num_heads)
+        if config:
+            self.head_dim = getattr(config.pretrained_config, "head_dim",
+                                    self.hidden_size // self.num_heads)
+        else:
+            self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_heads = num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = max_position_embeddings
@@ -129,6 +132,8 @@ class Attention(nn.Module):
         self.rotary_emb = None
         self.apply_rotary_emb = (not self.enable_rope_fusion
                                  and pos_embd_params is not None)
+        if config.pretrained_config and config.pretrained_config.model_type == 'qwen3' or config.pretrained_config and config.pretrained_config.model_type == 'qwen3_moe':
+            self.apply_rotary_emb = True
         if self.apply_rotary_emb:
             self.rotary_emb = RotaryEmbedding(
                 pos_embd_params.rope,
@@ -178,13 +183,34 @@ class Attention(nn.Module):
                 qkv = qkv + qkv_lora
 
         q, k, v = qkv, None, None
-
         if self.apply_rotary_emb and position_ids is not None:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
                                 dim=-1)
-            q, k = self.rotary_emb(position_ids, [q, k])
+            if hasattr(self, 'q_norm') and hasattr(self, 'k_norm'):
+                # Add qk-norm
+                if hasattr(self, 'ln_events'):
+                    q_l2norm = lambda: self.q_norm(q.reshape(-1, self.head_dim)
+                                                   ).reshape(-1, self.q_size)
+                    k_l2norm = lambda: self.k_norm(k.reshape(-1, self.head_dim)
+                                                   ).reshape(-1, self.kv_size)
+                    q, k = maybe_execute_in_parallel(
+                        q_l2norm,
+                        k_l2norm,
+                        self.ln_events[0],
+                        self.ln_events[1],
+                        self.aux_stream,
+                    )
+                else:
+                    q_by_head = q.reshape(-1, self.head_dim)
+                    q_by_head = self.q_norm(q_by_head)
+                    q = q_by_head.view(q.shape)
+                    k_by_head = k.reshape(-1, self.head_dim)
+                    k_by_head = self.k_norm(k_by_head)
+                    k = k_by_head.view(k.shape)
 
+            q, k = self.rotary_emb(position_ids, [q, k])
         out_scale = None
+
         if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
             out_scale = self.o_proj.inv_input_scale
 
