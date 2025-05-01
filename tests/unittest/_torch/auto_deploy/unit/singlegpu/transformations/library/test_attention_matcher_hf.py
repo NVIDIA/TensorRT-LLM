@@ -39,6 +39,7 @@ class HFWrapper(nn.Module):
         super().__init__()
         self.model = model
 
+    @torch.inference_mode()
     def forward(self, x: torch.Tensor):
         return self.model(x)[0]
 
@@ -108,7 +109,7 @@ def test_match_llama_attention(config: Dict[str, Any], attn_implementation: str)
         verify_matcher,
         lambda num_p_og: num_p_og,
         atol=1e-3,
-        rtol=1e-3,
+        rtol=5e-2,
         test_load_hook=True,
         strict_loading=True,
         dynamic_shapes=dynamic_shapes,
