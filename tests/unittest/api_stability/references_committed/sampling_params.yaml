@@ -123,6 +123,9 @@ methods:
         annotation: bool
         default: true
       # Returning controls
+      return_log_probs: # to be removed after PyTorch flow migrate to use `logprobs`
+        annotation: bool
+        default: false
       logprobs:
         annotation: Optional[int]
         default: None

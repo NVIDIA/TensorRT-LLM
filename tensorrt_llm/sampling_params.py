@@ -157,6 +157,7 @@ class SamplingParams:
         min_p (float, optional): scale the most likely token to determine the minimum token probability. None means using C++ runtime default 0.0. Defaults to None.
         beam_width_array (List[int], optional): The array of beam width using in Variable-Beam-Width-Search. Defaults to None.
 
+        return_log_probs (bool): Controls if Result should contain log probabilities. Defaults to False.
         logprobs (int, optional): Number of log probabilities to return per output token. Defaults to None.
         prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. Defaults to None.
         return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.
@@ -234,6 +235,7 @@ class SamplingParams:
     beam_width_array: Optional[List[int]] = None
 
     # Keep the below fields in sync with tllme.OutputConfig
+    return_log_probs: bool = False  # TODO: to be removed after PyTorch flow migrate to use `logprobs`
     logprobs: Optional[int] = None
     prompt_logprobs: Optional[int] = None
     return_context_logits: bool = False
