@@ -96,6 +96,13 @@ def add_llm_args(parser):
     parser.add_argument('--spec_decode_nextn', type=int, default=1)
     parser.add_argument('--eagle_model_dir', type=str, default=None)
 
+    # Relaxed acceptance
+    parser.add_argument('--use_relaxed_acceptance_for_thinking',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--relaxed_topk', type=int, default=1)
+    parser.add_argument('--relaxed_delta', type=float, default=0.)
+
     return parser
 
 
@@ -128,7 +135,11 @@ def setup_llm(args):
 
     if spec_decode_algo == 'MTP':
         spec_config = MTPDecodingConfig(
-            num_nextn_predict_layers=args.spec_decode_nextn)
+            num_nextn_predict_layers=args.spec_decode_nextn,
+            use_relaxed_acceptance_for_thinking=args.
+            use_relaxed_acceptance_for_thinking,
+            relaxed_topk=args.relaxed_topk,
+            relaxed_delta=args.relaxed_delta)
     elif spec_decode_algo == "EAGLE3":
         spec_config = EagleDecodingConfig(
             max_draft_len=args.spec_decode_nextn,

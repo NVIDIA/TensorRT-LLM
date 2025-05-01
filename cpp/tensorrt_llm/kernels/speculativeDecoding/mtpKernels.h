@@ -90,6 +90,29 @@ struct MTPUpdateHiddenStatesParam
 template <typename T>
 void invokeMTPUpdateHiddenStates(MTPUpdateHiddenStatesParam& params, cudaStream_t const stream = 0);
 
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Relaxed acceptance
+struct MTPRelaxedAcceptanceParam
+{
+    int numMTPModules;
+    int batchSize;
+    int numContextRequest;
+    int relaxedTopK;
+    float relaxedDelta;
+    int beginThinkingTokens;
+    int endThinkingTokens;
+    void* __restrict__ topKValue;
+    int* reqSlotIds;
+    int64_t* topKIndices;
+    int* draftTokens;
+    float* mtpRelaxedDelta;
+    int* numAcceptedTokens;
+    int* acceptedTokens;
+};
+
+template <typename T>
+void invokeMTPRelaxedAcceptance(MTPRelaxedAcceptanceParam& params, cudaStream_t const stream = 0);
+
 } // namespace kernels
 
 } // namespace tensorrt_llm

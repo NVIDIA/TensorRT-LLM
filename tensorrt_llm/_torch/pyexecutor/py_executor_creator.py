@@ -9,12 +9,13 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist
-from ..speculative import Eagle3Config
+from ..speculative import Eagle3Config, get_spec_resource_manager
 from ._util import (create_kv_cache_manager, create_py_executor_instance,
                     estimate_max_kv_cache_tokens, get_token_num_for_estimation,
                     is_mla)
 from .config import PyTorchConfig
-from .model_engine import DRAFT_KV_CACHE_MANAGER_KEY, PyTorchModelEngine
+from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
+                           PyTorchModelEngine)
 
 
 def create_py_executor(executor_config: ExecutorConfig,
@@ -144,6 +145,7 @@ def create_py_executor(executor_config: ExecutorConfig,
 
     kv_cache_manager = None
     draft_kv_cache_manager = None
+    resources = {}
     origin_executor_config = copy.deepcopy(executor_config)
     if executor_config.pytorch_backend_config.use_kv_cache:
         if 'cp_type' not in mapping.cp_config:
@@ -154,13 +156,21 @@ def create_py_executor(executor_config: ExecutorConfig,
         draft_kv_cache_manager = create_kv_cache_manager(
             draft_model_engine, mapping,
             executor_config) if draft_model_engine is not None else None
+        resources[KV_CACHE_MANAGER_KEY] = kv_cache_manager
+        resources[DRAFT_KV_CACHE_MANAGER_KEY] = draft_kv_cache_manager
 
     # KVCacheManager modifies these fields, update them to executor_config
     if kv_cache_manager is not None:
         executor_config.max_seq_len = kv_cache_manager.max_seq_len
 
-    py_executor = create_py_executor_instance(dist, kv_cache_manager,
-                                              draft_kv_cache_manager, mapping,
+    # resource managers for speculative decoding
+    if spec_config is not None:
+        spec_resource_manager = get_spec_resource_manager(
+            spec_config, model_engine.model.config, model_engine.batch_size * 2)
+        if spec_resource_manager is not None:
+            resources["spec_resource_manager"] = spec_resource_manager
+
+    py_executor = create_py_executor_instance(dist, resources, mapping,
                                               pytorch_backend_config,
                                               executor_config, ctx_chunk_config,
                                               model_engine, draft_model_engine,
@@ -176,6 +186,7 @@ def create_py_executor(executor_config: ExecutorConfig,
 
             kv_cache_manager = create_kv_cache_manager(model_engine, mapping,
                                                        executor_config)
+            resources[KV_CACHE_MANAGER_KEY] = kv_cache_manager
 
             if model_engine.attn_metadata is not None and kv_cache_manager is not None:
                 if pytorch_backend_config.use_cuda_graph:
@@ -186,6 +197,7 @@ def create_py_executor(executor_config: ExecutorConfig,
             if draft_model_engine is not None:
                 draft_kv_cache_manager = create_kv_cache_manager(
                     draft_model_engine, mapping, executor_config)
+                resources[DRAFT_KV_CACHE_MANAGER_KEY] = draft_kv_cache_manager
                 if draft_model_engine.attn_metadata is not None and draft_kv_cache_manager is not None:
                     if pytorch_backend_config.use_cuda_graph:
                         draft_model_engine._release_cuda_graphs()
@@ -193,9 +205,9 @@ def create_py_executor(executor_config: ExecutorConfig,
                     draft_model_engine.attn_metadata = None
 
             py_executor = create_py_executor_instance(
-                dist, kv_cache_manager, draft_kv_cache_manager, mapping,
-                pytorch_backend_config, executor_config, ctx_chunk_config,
-                model_engine, draft_model_engine, False, lora_config)
+                dist, resources, mapping, pytorch_backend_config,
+                executor_config, ctx_chunk_config, model_engine,
+                draft_model_engine, False, lora_config)
 
     py_executor.start_worker()
     return py_executor
