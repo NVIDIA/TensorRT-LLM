@@ -71,7 +71,7 @@ def buildImage(action, type)
             stage ("Perform '${action}' action on image") {
                 retry(3)
                 {
-                    sh "cd ${LLM_ROOT} && make -C docker devel_${action} IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${tag} TORCH_INSTALL_TYPE=${type}" +
+                    sh "cd ${LLM_ROOT} && make -C docker devel_${action} IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${tag} TORCH_INSTALL_TYPE=${type} BUILD_TRITON=1" +
                     " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
                 }
             }

@@ -1,18 +1,21 @@
 import math
+import os
 from enum import Enum
 from typing import Dict, List, NamedTuple, Optional, Union
 
 import torch
 from torch import nn
 
+from tensorrt_llm._mnnvl_utils import MnnvlMoe, MoEAlltoallInfo
 from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)
 
 from ...quantization.utils.fp4_utils import float4_sf_dtype
 from ..distributed import allgather, reducescatter
 from ..model_config import ModelConfig
+from ..pyexecutor.cuda_graph_runner import is_graph_capturing
 from ..utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
-                     reswizzle_sf)
+                     reswizzle_sf, swizzle_sf, unswizzle_sf)
 from .linear import TensorParallelMode, load_weight_shard
 
 # The declarations aligns with moe_kernels.h
@@ -228,6 +231,46 @@ class FusedMoE(nn.Module):
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
+        enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
+
+    MoE torch custom op:
+        cutlass Backend
+            In min-latency mode:
+            Quant:
+                fp8 block scales (SM90 Hopper only):
+                    FusedMoE Op: dynamic quant + gemm1 + swiglu + gemm2 (return tensor list).
+                fp8 qdq, nvfp4:
+                    FusedMoE Op: gemm1 + swiglu + gemm2 (return tensor list).
+
+            In max-throughput mode:
+            Quant:
+                fp8 block scales (SM90 Hopper only):
+                    FusedMoE Op: dynamic quant + scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute (return one tensor)
+                p8 qdq, nvfp4:
+                    FusedMoE Op: scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute (return one tensor)
+
+        trtllm_gen backend:
+            Only support min-latency mode now (SM100 Blackwell only).
+            Quant: fp8 block scales quant and nvfp4 quant
+                FusedMoE Op: routing(topK, etc.) + scatter + gemm1 + swiglu + gemm2 + finalize MoeRoute
+
+    FusedMoE module:
+        cutlass Backend (moe_backend="CUTLASS"):
+            min-latency mode:
+                routing(topK, etc.) + FusedMoE Op
+                equals to: routing(topK, etc.) [+ dynamic quant fp8 qdq | optional dynamic quant nvfp4] + gemm1 + swiglu + gemm2
+
+            max-throughput mode:
+                routing(topK, etc.) [+ dynamic quant for fp8 qdq and nvfp4 ] [+ fp4_allgather] + FusedMoe Op[no allreduce] + reducescatter, with AttentionDP on
+                equals to: dynamic quant + routing(topK, etc.) [+ fp4_allgather] + scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute [no allreduce] + reducescatter
+
+        trtllm_gen backend (moe_backend="TRTLLM"):
+            min-latency mode (min_latency_mode flag of forward has no effect when trtllm_gen is used):
+                dynamic quant + FusedMoe Op
+                equals to: dynamic quant + routing(topK, etc.) + scatter + gemm1 + swiglu + gemm2 + finalize MoeRoute
+
+    In min-latency mode, setting `reduce_results=False` disables the AllReduce in the FusedMoE module, so any necessary AllReduce operations must be added explicitly in the model definition.
+    AttentionDP should be turned off for min-latency mode.
     """
 
     def __init__(
@@ -240,10 +283,11 @@ class FusedMoE(nn.Module):
         dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
-        aux_stream: torch.cuda.Stream = torch.cuda.Stream(),
+        aux_stream: torch.cuda.Stream = None,
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         apply_router_weight_on_input: bool = False,
+        enable_alltoall: bool = False,
     ):
         from ..distributed import AllReduce
 
@@ -254,7 +298,10 @@ class FusedMoE(nn.Module):
         self.intermediate_size = intermediate_size
         self.weight_loading_mode = weight_loading_mode
 
-        self.aux_stream = aux_stream
+        if aux_stream is None:
+            self.aux_stream = torch.cuda.Stream()
+        else:
+            self.aux_stream = aux_stream
         self.event_dict = {
             key: torch.cuda.Event()
             for key in [EventType.Main, EventType.MoeChunkingOverlap]
@@ -306,12 +353,49 @@ class FusedMoE(nn.Module):
         self.has_been_profiled = False
         self.has_been_profiled_min_latency = False
 
+        self.enable_alltoall = enable_alltoall
+        self.use_postquant_alltoall = False
+        if self.enable_alltoall:
+            assert self.use_dp and self.parallel_size > 1,\
+                "alltoall should only enabled with attention dp and parallel_size > 1"
+            qm = self.quant_config.quant_mode
+            self.use_postquant_alltoall = (os.environ.get(
+                "TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1")
+                                           == "1") and qm.has_nvfp4()
+        self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
+            model_config.mapping) if enable_alltoall else None
+
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
+        self._check_configs()
+
+    def _check_configs(self):
+        if self.enable_alltoall:
+            assert self.use_dp and self.parallel_size > 1,\
+                "alltoall should only enabled with attention dp and parallel_size > 1"
+
+        if self.is_trtllm():
+            # trtllm_gen backend only support min-latency mode now
+            assert not self.reduce_results
+            assert self.quant_config and (
+                self.quant_config.quant_mode.has_nvfp4()
+                | self.quant_config.quant_mode.has_fp8_block_scales()
+            ), "The TRTLLM backend of FusedMoE only supports fp8_block_scaling and nvfp4 dtypes."
+        else:
+            if self.apply_router_weight_on_input:
+                assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
+            if self.quant_config and self.quant_config.quant_mode.has_any_quant(
+                    exclude_kv_cache=True):
+                if not (self.quant_config.quant_mode.has_nvfp4()
+                        | self.quant_config.quant_mode.has_fp8_block_scales()
+                        | self.quant_config.quant_mode.has_fp8_qdq()):
+                    raise ValueError(
+                        f"unsupported quantization mode: {self.quant_config.quant_mode}"
+                    )
 
     def setup_quant_scales(self):
         self.quant_scales = None
@@ -390,7 +474,8 @@ class FusedMoE(nn.Module):
         self.has_fp8_qdq = False
         self.has_fp8_block_scales = False
         self.has_nvfp4 = False
-        if self.quant_config and self.quant_config.quant_mode.has_any_quant():
+        if self.quant_config and self.quant_config.quant_mode.has_any_quant(
+                exclude_kv_cache=True):
             self.has_any_quant = True
             qc = self.quant_config
             if qc.quant_mode.has_fp8_qdq():
@@ -590,7 +675,7 @@ class FusedMoE(nn.Module):
 
     def reducescatter_or_allreduce(self, inputs):
         outputs = inputs
-        if self.parallel_size > 1:
+        if self.parallel_size > 1 and not self.enable_alltoall:
             if self.use_dp:
                 outputs = reducescatter(inputs, self.mapping, scatter_dim=0)
             elif self.reduce_results:
@@ -603,8 +688,8 @@ class FusedMoE(nn.Module):
         router_logits: torch.Tensor,
         min_latency_mode: bool = False,
         output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens=None,
     ) -> torch.Tensor:
-
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
             output_dtype = output_dtype
@@ -624,10 +709,20 @@ class FusedMoE(nn.Module):
         assert token_selected_experts.dtype == torch.int32
 
         if self.apply_router_weight_on_input:
-            assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
             x = x * token_final_scales.to(x.dtype)
             # TODO: remove this once we have correct fusedmoe kernel ready
             token_final_scales = None
+
+        token_count = x.shape[0]
+
+        alltoall_info = None
+
+        if self.enable_alltoall:
+            x, token_selected_experts, token_final_scales, alltoall_info = \
+                self.alltoall_prepare_maybe_dispatch(all_rank_num_tokens,
+                                                     x,
+                                                     token_selected_experts,
+                                                     token_final_scales)
 
         x_sf = None
         if self.has_any_quant:
@@ -635,7 +730,7 @@ class FusedMoE(nn.Module):
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     x, self.fc31_input_dequant)
             elif self.has_nvfp4:
-                if not disable_fp4_allgather():
+                if not disable_fp4_allgather() or self.use_postquant_alltoall:
                     if isinstance(x, Fp4QuantizedTensor):
                         x, x_sf = x.fp4_tensor, x.scaling_factor
                         x_row = x.shape[0]
@@ -656,7 +751,7 @@ class FusedMoE(nn.Module):
                 )
 
         if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
-        ):
+        ) and not self.enable_alltoall:
             x_sf, token_selected_experts, token_final_scales = self.all_gather(
                 [x_sf, token_selected_experts, token_final_scales])
             x = allgather(x, self.mapping, gather_dim=0)
@@ -690,6 +785,10 @@ class FusedMoE(nn.Module):
             cluster_rank = self.cluster_rank
             quant_scales = self.quant_scales
 
+        if self.use_postquant_alltoall:
+            x, x_sf = self.alltoall_postquant_dispatch(x, x_sf, x_row, x_col,
+                                                       alltoall_info)
+
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
             token_selected_experts,
@@ -718,10 +817,14 @@ class FusedMoE(nn.Module):
             # Otherwise, the output should be unpacked as a single tensor.
             final_hidden_states = final_hidden_states[0]
 
-        if self.reduce_results and self.parallel_size > 1:
-            return self.all_reduce(final_hidden_states)
+        if not self.enable_alltoall:
+            if self.reduce_results and self.parallel_size > 1:
+                return self.all_reduce(final_hidden_states)
+            else:
+                return final_hidden_states
         else:
-            return final_hidden_states
+            return self.alltoall_combine(final_hidden_states, alltoall_info,
+                                         token_count)
 
     def forward(
         self,
@@ -731,6 +834,9 @@ class FusedMoE(nn.Module):
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
+        """
+        min_latency_mode has no effect when trtllm_gen backend is enabled.
+        """
         if self.is_cutlass():
             return self.forward_cutlass(x, router_logits, min_latency_mode,
                                         output_dtype, all_rank_num_tokens)
@@ -756,10 +862,8 @@ class FusedMoE(nn.Module):
             assert all_rank_num_tokens is not None
             if not disable_fp4_allgather():
                 max_chunk_size //= len(all_rank_num_tokens)
-        if isinstance(x, Fp4QuantizedTensor):
-            num_rows = x.fp4_tensor.shape[0]
-        else:
-            num_rows = x.shape[0]
+
+        num_rows = x.shape[0]
         num_chunks = (num_rows + max_chunk_size - 1) // max_chunk_size
 
         if min_latency_mode:
@@ -768,44 +872,91 @@ class FusedMoE(nn.Module):
             ), "min_latency_mode must be used with a single chunk and reduce_results must be False"
 
         if num_chunks == 1:
-            outputs = self.forward_chunk(x, router_logits, min_latency_mode,
-                                         output_dtype)
+            outputs = self.forward_chunk(
+                x,
+                router_logits,
+                min_latency_mode,
+                output_dtype,
+                all_rank_num_tokens=all_rank_num_tokens)
             outputs = self.reducescatter_or_allreduce(outputs)
         else:
-            val_div = x.shape[0] // num_chunks
-            val_mod = x.shape[0] % num_chunks
-            chunk_size_list = [val_div + 1
-                               ] * val_mod + [val_div] * (num_chunks - val_mod)
+
+            def split_chunk(split_token_num: int, split_num_chunks: int):
+                val_div = split_token_num // split_num_chunks
+                val_mod = split_token_num % split_num_chunks
+                split_chunk_size_list = [val_div + 1] * val_mod + [val_div] * (
+                    split_num_chunks - val_mod)
+                return split_chunk_size_list
+
+            chunk_size_list = split_chunk(x.shape[0], num_chunks)
+
             x_list = x.split(chunk_size_list)
             router_logits_list = router_logits.split(chunk_size_list)
             outputs_list = []
+            all_rank_num_tokens_list = [None] * num_chunks
+            if self.use_dp and self.enable_alltoall:
+                all_rank_chunk_size_list = []
+                for single_rank_num_tokens in all_rank_num_tokens:
+                    single_rank_num_chunks = (single_rank_num_tokens +
+                                              max_chunk_size -
+                                              1) // max_chunk_size
+                    assert single_rank_num_chunks == num_chunks,\
+                        "num_chunks should be the same for attention dp and ep"
+                    all_rank_chunk_size_list.append(
+                        split_chunk(single_rank_num_tokens,
+                                    single_rank_num_chunks))
+
+                for chunk_id in range(num_chunks):
+                    chunk_all_rank_num_tokens = [
+                        all_rank_chunk_size_list[r][chunk_id]
+                        for r in range(len(all_rank_num_tokens))
+                    ]
+                    all_rank_num_tokens_list[
+                        chunk_id] = chunk_all_rank_num_tokens
+
             self.event_dict[EventType.Main].record()
             with torch.cuda.stream(self.aux_stream):
                 self.event_dict[EventType.Main].wait()
             # Postpone reduce-scatter/all-reduce to the next iteration to achieve better overlap
             for idx_chunk, (x, router_logits) in enumerate(
                     zip(x_list, router_logits_list)):
-                if idx_chunk % 2 == 0:
-                    with torch.cuda.stream(self.aux_stream):
-                        outputs = self.forward_chunk(x, router_logits)
-                    if idx_chunk > 0:
-                        outputs_list[-1] = self.reducescatter_or_allreduce(
-                            outputs_list[-1])
+                if not self.enable_alltoall:
+                    if idx_chunk % 2 == 0:
+                        with torch.cuda.stream(self.aux_stream):
+                            outputs = self.forward_chunk(
+                                x,
+                                router_logits,
+                                all_rank_num_tokens=all_rank_num_tokens_list[
+                                    idx_chunk])
+                        if idx_chunk > 0:
+                            outputs_list[-1] = self.reducescatter_or_allreduce(
+                                outputs_list[-1])
+                    else:
+                        outputs = self.forward_chunk(
+                            x,
+                            router_logits,
+                            all_rank_num_tokens=all_rank_num_tokens_list[
+                                idx_chunk])
+                        with torch.cuda.stream(self.aux_stream):
+                            outputs_list[-1] = self.reducescatter_or_allreduce(
+                                outputs_list[-1])
                 else:
-                    outputs = self.forward_chunk(x, router_logits)
-                    with torch.cuda.stream(self.aux_stream):
-                        outputs_list[-1] = self.reducescatter_or_allreduce(
-                            outputs_list[-1])
+                    outputs = self.forward_chunk(
+                        x,
+                        router_logits,
+                        all_rank_num_tokens=all_rank_num_tokens_list[idx_chunk])
+
                 outputs_list.append(outputs)
-            if num_chunks % 2 == 0:
-                outputs_list[-1] = self.reducescatter_or_allreduce(
-                    outputs_list[-1])
-            else:
-                with torch.cuda.stream(self.aux_stream):
+            if not self.enable_alltoall:
+                if num_chunks % 2 == 0:
                     outputs_list[-1] = self.reducescatter_or_allreduce(
                         outputs_list[-1])
-            with torch.cuda.stream(self.aux_stream):
-                self.event_dict[EventType.MoeChunkingOverlap].record()
+                else:
+                    with torch.cuda.stream(self.aux_stream):
+                        outputs_list[-1] = self.reducescatter_or_allreduce(
+                            outputs_list[-1])
+                with torch.cuda.stream(self.aux_stream):
+                    self.event_dict[EventType.MoeChunkingOverlap].record()
             self.event_dict[EventType.MoeChunkingOverlap].wait()
             outputs = torch.cat(outputs_list)
         if self.use_dp:
@@ -888,6 +1039,86 @@ class FusedMoE(nn.Module):
 
         return final_hidden_states
 
+    def alltoall_prepare_maybe_dispatch(self, all_rank_num_tokens: list,
+                                        x: torch.Tensor,
+                                        token_selected_experts: torch.Tensor,
+                                        token_final_scales: torch.Tensor):
+        using_cuda_graph = is_graph_capturing()
+        top_k = self.routing_method.experts_per_token
+        expert_count = self.num_experts
+        use_real_size = not using_cuda_graph
+        # gather router info
+        max_num_token = max(all_rank_num_tokens)
+        token_selected_experts = torch.nn.functional.pad(
+            token_selected_experts,
+            (0, 0, 0, max_num_token - token_selected_experts.shape[0]),
+            'constant', self.num_experts)
+        token_final_scales = torch.nn.functional.pad(
+            token_final_scales,
+            (0, 0, 0, max_num_token - token_final_scales.shape[0]))
+        gathered_token_selected_experts, gathered_token_final_scales = self.all_gather(
+            [token_selected_experts, token_final_scales])
+        gathered_token_selected_experts = torch.flatten(
+            gathered_token_selected_experts.contiguous(),
+            start_dim=0,
+            end_dim=-2)
+        gathered_token_final_scales = torch.flatten(
+            gathered_token_final_scales.contiguous(), start_dim=0, end_dim=-2)
+        gathered_target_rank_ids = MnnvlMoe.compute_target_rank_id(
+            gathered_token_selected_experts, self.num_experts, self.ep_size)
+        alltoall_info, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv_prepare(
+            gathered_target_rank_ids, None, gathered_token_selected_experts,
+            gathered_token_final_scales, max_num_token, expert_count, top_k,
+            self.ep_rank, self.ep_size, use_real_size)
+
+        if not self.use_postquant_alltoall:
+            assert not isinstance(
+                x, Fp4QuantizedTensor
+            ), "pre-quant alltoall doesn't support fp4 tensor"
+            x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info,
+                                             self.alltoall_workspace,
+                                             self.ep_rank, self.ep_size)
+
+        return x, token_selected_experts, token_final_scales, alltoall_info
+
+    def alltoall_postquant_dispatch(self, x: torch.Tensor, x_sf: torch.Tensor,
+                                    x_row: int, x_col: int,
+                                    alltoall_info: MoEAlltoallInfo):
+        x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info,
+                                         self.alltoall_workspace, self.ep_rank,
+                                         self.ep_size)
+
+        if x_sf is not None:
+            if self.has_nvfp4:
+                x_sf = unswizzle_sf(x_sf, x_row, x_col,
+                                    self.scaling_vector_size)
+
+            x_sf = MnnvlMoe.mnnvl_moe_alltoallv(x_sf, alltoall_info,
+                                                self.alltoall_workspace,
+                                                self.ep_rank, self.ep_size)
+
+            if self.has_nvfp4:
+                x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
+                                  self.scaling_vector_size)
+
+        return x, x_sf
+
+    def alltoall_combine(self, final_hidden_states: torch.Tensor,
+                         alltoall_info: MoEAlltoallInfo, token_count: int):
+        top_k = self.routing_method.experts_per_token
+        if isinstance(final_hidden_states, list):
+            final_hidden_states = final_hidden_states[0]
+        final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
+            final_hidden_states,
+            alltoall_info,
+            self.alltoall_workspace,
+            ep_rank=self.ep_rank,
+            ep_size=self.ep_size,
+            top_k=top_k,
+            token_count=token_count)
+
+        return final_hidden_states
+
     def load_weights(self, weights: List[Dict]):
         assert self._weights_created
         assert len(weights) == 1
@@ -961,7 +1192,8 @@ class FusedMoE(nn.Module):
             load_expert_w2_weight(w2_weight, self.w2_weight.data[expert_idx],
                                   is_trtllm_nvfp4)
 
-        if self.quant_config and self.quant_config.quant_mode.has_any_quant():
+        if self.quant_config and self.quant_config.quant_mode.has_any_quant(
+                exclude_kv_cache=True):
             if self.quant_config.quant_mode.has_fp8_qdq():
                 self._load_fp8_qdq_scales(weights)
             elif self.quant_config.quant_mode.has_nvfp4():

@@ -37,7 +37,8 @@ from .request import (CancellingRequest, GenerationRequest, LoRARequest,
                       PromptAdapterRequest)
 from .result import GenerationResult, IterationResult
 from .utils import (PERIODICAL_RESP_IN_AWAIT, ErrorResponse, IntraProcessQueue,
-                    RequestError, WorkerCommIpcAddrs, has_event_loop)
+                    RequestError, WorkerCommIpcAddrs, has_event_loop,
+                    is_llm_response)
 
 __all__ = [
     "ExecutorBindingsWorker",
@@ -329,10 +330,11 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
         prompt_token_ids = copy.deepcopy(request.prompt_token_ids)
         prompt_tuning_config = None
+        multimodal_embedding = None
         mrope_config = None
+        if request.multimodal_embedding is not None:
+            multimodal_embedding = request.multimodal_embedding
         if request.prompt_adapter_request is not None:
-            assert request.prompt_tuning_config is None, \
-                "cannot accept both prompt_adapter_request and prompt_tuning_config in one request"
             self._load_prompt_adapter(request.prompt_adapter_request)
             uid = str(request.prompt_adapter_request.adapter_id)
             prompt_tuning_config = tllm.PromptTuningConfig(
@@ -341,9 +343,6 @@ class ExecutorBindingsWorker(GenerationExecutor):
             pa_length = prompt_tuning_config.embedding_table.size(0)
             prompt_token_ids = list(range(
                 vocab_size, vocab_size + pa_length)) + prompt_token_ids
-        elif request.prompt_tuning_config is not None:
-            prompt_tuning_config = tllm.PromptTuningConfig(
-                request.prompt_tuning_config[0])
 
         if request.mrope_config is not None:
             mrope_config = tllm.MropeConfig(**request.mrope_config)
@@ -392,6 +391,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 embedding_bias=request.sampling_params.embedding_bias,
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
+                multimodal_embedding=multimodal_embedding,
                 mrope_config=mrope_config,
                 logits_post_processor_name=(
                     tllm.Request.BATCHED_POST_PROCESSOR_NAME
@@ -885,7 +885,7 @@ def _send_rsp(
 
     # Eliminate the finished GenerationRequest instances timely, which may
     # take considerable memory.
-    if isinstance(response, tllm.Response):
+    if is_llm_response(response):
         if response.has_error() or response.result.is_final:
             worker._pop_result(response.client_id)
     elif isinstance(response, ErrorResponse):

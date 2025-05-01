@@ -1113,7 +1113,7 @@ def test_llm_llama_v1_2gpu_summary(llama_example_root, llama_model_root,
 
     print("Run summarize...")
     summary_cmd = [
-        f"{llama_example_root}/../summarize.py", "--test_trt_llm",
+        f"{llama_example_root}/../../../summarize.py", "--test_trt_llm",
         "--check_accuracy", f"--hf_model_dir={llama_model_root}",
         f"--engine_dir={engine_dir}", f"--num_beams={num_beams}",
         f"--dataset_dir={llm_datasets_root}", f"--rouge_dir={llm_rouge_root}"
@@ -1210,7 +1210,7 @@ def test_llm_llama_v1_1gpu_paged_kv_cache(llama_example_root, llama_model_root,
 
     print("Run inference")
     summary_cmd = [
-        f"{llama_example_root}/../summarize.py", "--test_trt_llm",
+        f"{llama_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", f"{llama_model_root}", "--data_type", "fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}",
         f"--num_beams={num_beams}", f"--dataset_dir={llm_datasets_root}",
@@ -4207,7 +4207,7 @@ def test_llm_llama_v3_1_1node_multi_gpus(llama_example_root, llama_model_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     gen_cmd = [
-        f"{llama_example_root}/../infinitebench/construct_synthetic_dataset.py",
+        f"{llama_example_root}/../../../infinitebench/construct_synthetic_dataset.py",
         "--test_case=build_passkey",
         "--test_level=3",
     ]
@@ -4656,6 +4656,7 @@ def test_llm_llama_lookahead_xqa_fp8_1gpu(llama_example_root, llama_model_root,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_pre_ada
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("code_llama_model_root", ['CodeLlama-7b-Instruct'],
                          indirect=True)
@@ -4826,6 +4827,6 @@ def test_llm_llama_lookahead_single_gpu_summary(llama_example_root,
                                        tensorrt_llm_rouge1_threshold=15,
                                        dataset_dir=llm_datasets_root,
                                        rouge_dir=llm_rouge_root,
-                                       lookahead_config=[7, 7, 7])
+                                       lookahead_config='[7, 7, 7]')
 
     venv_check_call(llm_venv, summary_cmd)

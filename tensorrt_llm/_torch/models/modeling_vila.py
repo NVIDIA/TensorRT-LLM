@@ -1108,7 +1108,7 @@ class VilaInputProcessor(InputProcessor):
         mm_features = self._process(mm_tensor, block_sizes)
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
         return fused_input_ids.to(torch.int32).tolist(), {
-            "prompt_tuning_config": [mm_features, None, None]
+            "mm_embedding": mm_features
         }
 
 
@@ -1167,7 +1167,8 @@ class VilaModel(PreTrainedModel):
             mm_embed
         ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
 
-        input_ids, inputs_embeds = fuse_input_embeds(self, input_ids, mm_embed)
+        input_ids, inputs_embeds = fuse_input_embeds(
+            self.llm.model.embed_tokens, input_ids, mm_embed)
         logits = self.llm.forward(attn_metadata=attn_metadata,
                                   input_ids=input_ids,
                                   position_ids=position_ids,

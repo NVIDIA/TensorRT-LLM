@@ -21,7 +21,7 @@ import torch
 from tensorrt_llm._utils import global_mpi_rank, nvtx_range
 from tensorrt_llm.bindings.executor import (FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
-                                            RequestType)
+                                            RequestType, StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
 from tensorrt_llm.logger import logger
 
@@ -174,6 +174,7 @@ class PyExecutor:
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
         self.gc_nvtx_watcher_handle = _gc_nvtx_watcher()
+        self.is_warmup = False  # During warmup, we don't enable the profiler
 
         # related modules
         self.resource_manager = resource_manager
@@ -226,14 +227,13 @@ class PyExecutor:
         self.has_context_request = False
         self.ctx_in_transmission_requests = []
         self.previous_batch: Optional[BatchState] = None
+        self.num_scheduled_requests: int = 0
 
         # list of requests in each PP micro batch
         self.num_micro_batches = self.dist.pp_size + enable_overlap_scheduler
         self.micro_batches: List[BatchStatePP
                                  | None] = [None] * self.num_micro_batches
         self.send_handles = [None] * self.num_micro_batches
-        # one handle each for metadata and serialized new_reqs buffer
-        self.send_new_reqs_handle = [None] * 2
 
         self.inflight_req_ids = ReqIdsSet()
         self.canceled_req_ids = ReqIdsSet()
@@ -445,7 +445,7 @@ class PyExecutor:
 
         def profile_step():
             nonlocal it, enabled, start_time
-            if it in self.profile_stop_iters:
+            if it in self.profile_stop_iters and not self.is_warmup:
                 assert enabled, "Inconsistent CUDA profiling state"
                 if enable_torch_trace:
                     torch_profiler.stop()
@@ -467,11 +467,12 @@ class PyExecutor:
                     f"currank_total_requests = {self.num_fetch_requests_cur_rank}/{self.num_fetch_requests}, "
                     f"elapsed_time = {end_time - start_time}s, "
                     f"timestamp = {formatted_timestamp}, "
+                    f"num_scheduled_requests: {self.num_scheduled_requests}, "
                     f"states = {self.model_engine.iter_states}")
 
             it += 1
 
-            if it in self.profile_start_iters:
+            if it in self.profile_start_iters and not self.is_warmup:
                 assert not enabled, "Inconsistent CUDA profiling state"
                 torch.cuda.cudart().cudaProfilerStart()
                 if enable_torch_trace:
@@ -495,11 +496,15 @@ class PyExecutor:
     def _get_init_iter_stats(self, num_new_active_requests,
                              new_active_requests_queue_latency_ms):
         stats = IterationStats()
-        stats.timestamp = ""
+        stats.timestamp = datetime.datetime.now().strftime(
+            "%m-%d-%Y %H:%M:%S.%f")
 
         stats.num_new_active_requests = num_new_active_requests
         stats.num_active_requests = len(self.active_requests)
         stats.new_active_requests_queue_latency_ms = new_active_requests_queue_latency_ms
+        stats.inflight_batching_stats = InflightBatchingStats()
+        # staticBatchingStats is not used in pytorch path
+        stats.static_batching_stats = StaticBatchingStats()
         return stats
 
     def _update_iter_stats(self, stats, iter_latency_ms, num_completed_requests,
@@ -533,17 +538,17 @@ class PyExecutor:
             kv_stats_to_save.cache_hit_rate = kv_stats.cache_hit_rate
             stats.kv_cache_stats = kv_stats_to_save
 
-        model_stats = InflightBatchingStats()
-        model_stats.num_scheduled_requests = len(
+        stats.inflight_batching_stats.num_scheduled_requests = len(
             scheduled_batch.context_requests) + len(
                 scheduled_batch.generation_requests)
-        model_stats.num_context_requests = len(scheduled_batch.context_requests)
-        model_stats.num_gen_requests = len(scheduled_batch.generation_requests)
-        model_stats.num_paused_requests = len(scheduled_batch.paused_requests)
-        model_stats.avg_num_decoded_tokens_per_iter = 0
-        model_stats.num_ctx_tokens = 0
-        model_stats.micro_batch_id = 0
-        stats.inflight_batching_stats = model_stats
+        stats.inflight_batching_stats.num_context_requests = len(
+            scheduled_batch.context_requests)
+        stats.inflight_batching_stats.num_gen_requests = len(
+            scheduled_batch.generation_requests)
+        stats.inflight_batching_stats.num_paused_requests = len(
+            scheduled_batch.paused_requests)
+        stats.inflight_batching_stats.avg_num_decoded_tokens_per_iter = 0
+        stats.inflight_batching_stats.micro_batch_id = 0
         return stats
 
     def _append_iter_stats(self, stats):
@@ -599,6 +604,13 @@ class PyExecutor:
                     self._merge_dummy_request(num_dummy_request)
                 scheduled_batch, _, _ = self._schedule()
 
+                self.num_scheduled_requests = scheduled_batch.batch_size
+                logger.debug(
+                    f'has {len(self.active_requests)} active_request, '
+                    f'scheduled {len(scheduled_batch.context_requests)} context requests and '
+                    f'{len(scheduled_batch.generation_requests)} generation requests'
+                )
+
                 if self.enable_attention_dp:
                     tp_batch_sizes = self.dist.tp_allgather(
                         scheduled_batch.batch_size)
@@ -624,6 +636,10 @@ class PyExecutor:
                     else:
                         decoder_state = self._forward_step_inter_pp(
                             scheduled_batch)
+
+                    if self.enable_iter_perf_stats:
+                        iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
+                            'num_ctx_tokens']
 
                     batch_state = BatchStatePP(
                         decoder_state=decoder_state,
@@ -690,6 +706,13 @@ class PyExecutor:
                     self._merge_dummy_request(num_dummy_request)
                 scheduled_batch, _, _ = self._schedule()
 
+                self.num_scheduled_requests = scheduled_batch.batch_size
+                logger.debug(
+                    f'has {len(self.active_requests)} active_request, '
+                    f'scheduled {len(scheduled_batch.context_requests)} context requests and '
+                    f'{len(scheduled_batch.generation_requests)} generation requests'
+                )
+
                 if self.enable_attention_dp:
                     tp_batch_sizes = self.dist.tp_allgather(
                         scheduled_batch.batch_size)
@@ -718,6 +741,9 @@ class PyExecutor:
                                 scheduled_batch, batch_outputs)
                             self._update_request_states(scheduled_batch)
 
+                    if self.enable_iter_perf_stats:
+                        iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
+                            'num_ctx_tokens']
                     batch_state = BatchStatePP(
                         decoder_state=decoder_state,
                         iter_start_time=iter_start_time,
@@ -838,6 +864,7 @@ class PyExecutor:
                         "fail to schedule any pending request, "
                         "probably run out of resource.")
 
+                self.num_scheduled_requests = scheduled_batch.batch_size
                 logger.debug(
                     f'has {len(self.active_requests)} active_request, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
@@ -888,6 +915,8 @@ class PyExecutor:
                 self._gather_dp_requests_num()
 
                 if self.enable_iter_perf_stats:
+                    iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
+                        'num_ctx_tokens']
                     self._process_iter_stats(
                         finished_requests,
                         BatchState(decoder_state=DecoderState(
@@ -906,16 +935,10 @@ class PyExecutor:
                     continue
                 req.py_last_draft_tokens = req.py_draft_tokens
                 max_draft_len = self.model_engine.spec_config.max_draft_tokens
-                max_seq_len = self.model_engine.max_seq_len
 
-                # Subtract 1 to account for the token we will add on this forward
-                # pass.
-                draft_len = min(max_seq_len - 1 - req.get_num_tokens(0),
-                                max_draft_len)
-
-                if draft_len > 0:
-                    req.py_draft_tokens = [0] * draft_len
-                    req.py_draft_pages_allocated = draft_len
+                if max_draft_len > 0:
+                    req.py_draft_tokens = [0] * max_draft_len
+                    req.py_draft_pages_allocated = max_draft_len
                 else:
                     req.py_draft_tokens = None
                     req.py_draft_pages_allocated = 0
@@ -975,6 +998,7 @@ class PyExecutor:
                         "fail to schedule any pending request, "
                         "probably run out of resource.")
 
+                self.num_scheduled_requests = scheduled_batch.batch_size
                 logger.debug(
                     f'has {len(self.active_requests)} active_request, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
@@ -1040,6 +1064,10 @@ class PyExecutor:
                         r for r in scheduled_batch.context_requests
                         if r.get_context_remaining_length() == 0
                     ]
+
+                    if self.enable_iter_perf_stats:
+                        iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
+                            'num_ctx_tokens']
 
                     self.previous_batch = BatchState(
                         decoder_state=decoder_state,
@@ -1157,10 +1185,7 @@ class PyExecutor:
             self.dist.recv(metadata_arr, self.dist.prev_pp_rank, tag)
 
         if not self.dist.is_last_pp_rank:
-            if self.send_new_reqs_handle[0] is not None:
-                self.send_new_reqs_handle[0].Wait()
-            self.send_new_reqs_handle[0] = self.dist.isend(
-                metadata_arr, self.dist.next_pp_rank, tag)
+            self.dist.send(metadata_arr, self.dist.next_pp_rank, tag)
 
         # 2. send serialized buffer when new requests is not empty
         num_new_requests = metadata_arr[0]
@@ -1171,10 +1196,7 @@ class PyExecutor:
                 self.dist.recv(buf, self.dist.prev_pp_rank, tag)
 
             if not self.dist.is_last_pp_rank:
-                if self.send_new_reqs_handle[1] is not None:
-                    self.send_new_reqs_handle[1].Wait()
-                self.send_new_reqs_handle[1] = self.dist.isend(
-                    buf, self.dist.next_pp_rank, tag)
+                self.dist.send(buf, self.dist.next_pp_rank, tag)
 
             if not self.dist.is_first_pp_rank:
                 new_requests = dill.loads(buf.tobytes())  # nosec B301
@@ -1808,8 +1830,19 @@ class PyExecutor:
 
                 return new_requests
 
+            # The TRTLLM attention kernels cannot handle generation requests with
+            # different seqlens. No issues with flashinfer, should we look into removing
+            # this? Just needs proper kernel support.
+            def _pad_to_max_draft_tokens():
+                for req in scheduled_requests.generation_requests:
+                    max_draft_tokens = spec_metadata.max_draft_tokens
+                    num_draft_tokens = len(req.py_draft_tokens)
+                    req.py_draft_tokens.extend(
+                        0 for _ in range(max_draft_tokens - num_draft_tokens))
+
             new_requests = _process_decoded_tokens()
             if not new_requests:
+                _pad_to_max_draft_tokens()
                 return
 
             draft_batch.generation_requests = new_requests
@@ -1835,8 +1868,10 @@ class PyExecutor:
 
                 new_requests = _process_decoded_tokens()
                 if not new_requests:
-                    return
+                    break
                 draft_batch.generation_requests = new_requests
+
+            _pad_to_max_draft_tokens()
 
         except Exception as e:
             traceback.print_exc()

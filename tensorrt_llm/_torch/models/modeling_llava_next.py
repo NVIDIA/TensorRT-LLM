@@ -147,7 +147,7 @@ class LlavaNextInputProcessor(InputProcessor):
             [self._process(tensor) for tensor in mm_tensor])
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
         return fused_input_ids.to(torch.int32).tolist(), {
-            "prompt_tuning_config": [mm_features, None, None]
+            "mm_embedding": mm_features
         }
 
 
@@ -221,7 +221,8 @@ class LlavaNextModel(PreTrainedModel):
             mm_embed
         ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
 
-        input_ids, inputs_embeds = fuse_input_embeds(self, input_ids, mm_embed)
+        input_ids, inputs_embeds = fuse_input_embeds(
+            self.llm.model.embed_tokens, input_ids, mm_embed)
         logits = self.llm.forward(attn_metadata, input_ids, position_ids,
                                   inputs_embeds, return_context_logits)
         return logits

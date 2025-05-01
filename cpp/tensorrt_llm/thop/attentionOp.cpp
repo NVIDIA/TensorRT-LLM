@@ -293,7 +293,7 @@ public:
             // Current mlaGeneration will using fmha to do attention, so we don't go into enqueueGeneration
             if (op.isMLAEnabled())
             {
-                if (op.mUseFlashMLA == true)
+                if (op.mUseGenFlashMLA == true)
                 {
                     TORCH_CHECK(block_ids_per_seq.has_value());
                     int const* block_ids_per_seq_ptr = static_cast<int*>(block_ids_per_seq->data_ptr());
@@ -452,14 +452,18 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     {
         TLLM_CHECK(host_kv_cache_pool_mapping.has_value());
         int32_t const layer_num = host_kv_cache_pool_mapping.value().size(0);
+
         op->mIsMLAEnabled = true;
-        op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache();
-        // only enable flash mla on sm90 and head_size == 576 and tokens_per_block == 64
-        op->mUseFlashMLA = tensorrt_llm::common::getSMVersion() == 90 && head_size == 576 && tokens_per_block == 64;
         op->mMLAParams = {static_cast<int>(q_lora_rank.value()), static_cast<int>(kv_lora_rank.value()),
             static_cast<int>(qk_nope_head_dim.value()), static_cast<int>(qk_rope_head_dim.value()),
             static_cast<int>(v_head_dim.value()), static_cast<int>(predicted_tokens_per_seq),
             static_cast<int>(layer_num)};
+
+        op->mIsGenerationMLA = head_size == op->mMLAParams.kv_lora_rank + op->mMLAParams.qk_rope_head_dim;
+        op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache();
+        // only enable flash mla on sm90 and head_size == 576 and tokens_per_block == 64
+        op->mUseGenFlashMLA = tensorrt_llm::common::getSMVersion() == 90 && tokens_per_block == 64;
+
         // The following two parameters are used to compute kvcache related parameters such as kvcache block_size. So
         // they need to be set to 1 and 512 + 64 for both context and generation. For MLA attention kernel configs,
         // mNumKVHeads/mHeadSize are overwritten in common/attentionOp.cpp.
@@ -518,6 +522,17 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
         = beam_width == 1 ? attention_window_size : cache_indirection.value().size(2);
     int64_t const workspace_size = runner->getWorkspaceSize(*op, num_tokens, max_attention_window_size, num_gen_tokens);
     TLLM_LOG_TRACE("Expected workspace size is %ld bytes", workspace_size);
+
+    if (workspace_size >= (16l << 30))
+    {
+        auto const [free_mem, total_mem] = tensorrt_llm::common::getDeviceMemoryInfo(false);
+        if (workspace_size >= static_cast<int64_t const>(free_mem))
+        {
+            throw std::runtime_error("attention workspace size " + std::to_string(workspace_size)
+                + " bytes, exceeds available CUDA memory " + std::to_string(free_mem) + " bytes");
+        }
+    }
+
     torch::Tensor workspace;
     if (workspace_.has_value())
     {

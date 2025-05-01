@@ -44,7 +44,7 @@ namespace
 auto const TEST_RESOURCE_PATH = fs::path{TOP_LEVEL_DIR} / "cpp/tests/resources";
 auto const ENGINE_PATH = TEST_RESOURCE_PATH / "models/rt_engine";
 auto const GPT_MODEL_PATH = ENGINE_PATH / "gpt2";
-auto const LLAMA_MODEL_PATH = ENGINE_PATH / "llama-7b-hf";
+auto const LLAMA_MODEL_PATH = ENGINE_PATH / "Llama-3.2-1B";
 } // namespace
 
 namespace tensorrt_llm::batch_manager
@@ -966,8 +966,8 @@ TEST_F(TrtGptModelTest, PauseRequestStats)
     auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{1, 2, 3, 4});
     auto llmRequest = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false,
-        false, std::nullopt, std::nullopt, false, std::nullopt, false, std::nullopt, false, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        false, false, false, std::nullopt, std::nullopt, false, std::nullopt, false, std::nullopt, false, std::nullopt,
         executor::Request::kDefaultPriority, std::nullopt, std::nullopt, std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, 1, std::nullopt, std::nullopt,
         true /* returnPerfMetrics */);

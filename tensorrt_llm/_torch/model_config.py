@@ -108,10 +108,18 @@ class ModelConfig(Generic[TConfig]):
                 mixed_quant_config_file = model_dir / 'quant_cfg.json'
                 with open(mixed_quant_config_file) as fm:
                     mixed_quant_configs = json.load(fm)
+                    # kv_cache_quant_algo is global regardless of MIXED_PRECISION
                     kv_cache_quant_algo = mixed_quant_configs[
                         'kv_cache_quant_algo']
                     mixed_quant_configs = mixed_quant_configs[
                         'quantized_layers']
+                    if kv_cache_quant_algo is not None and quant_config.kv_cache_quant_algo is not None:
+                        if kv_cache_quant_algo != quant_config.kv_cache_quant_algo:
+                            raise RuntimeError(
+                                f"The kvcache config in 'quant_cfg.json', {kv_cache_quant_algo},"
+                                f"is different from 'hf_quant_config.json', {quant_config.kv_cache_quant_algo}!"
+                            )
+                    kv_cache_quant_algo = kv_cache_quant_algo or quant_config.kv_cache_quant_algo
 
                     for layer in mixed_quant_configs:
                         config = QuantConfig()
@@ -122,6 +130,9 @@ class ModelConfig(Generic[TConfig]):
                             'group_size', None)
                         mixed_quant_configs[layer] = config
                 layer_quant_config = mixed_quant_configs
+            elif quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
+                if quant_config.group_size is None:
+                    quant_config.group_size = 128
 
             if kwargs.get(
                     'moe_backend'

@@ -1598,6 +1598,31 @@ def test_ptq_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
     ])
 
 
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("model_name,model_path", [
+    pytest.param('DeepSeek-V3', 'DeepSeek-V3', marks=skip_pre_hopper),
+])
+def test_ptp_quickstart_advanced_deepseek_v3_2nodes_8gpus(
+        llm_root, llm_venv, model_name, model_path):
+    # "RCCA https://nvbugs/5163844"
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--enable_overlap_scheduler",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--moe_ep_size=8",
+        "--tp_size=16",
+        "--use_cuda_graph",
+        "--kv_cache_fraction=0.5",
+        "--max_batch_size=32",
+        "--max_num_tokens=2048",
+        "--kv_cache_enable_block_reuse",
+    ])
+
+
 @pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
     ("Llama-3.1-8b-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct",
      "EAGLE3-LLaMA3.1-Instruct-8B"),
@@ -1647,6 +1672,41 @@ def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
     ])
 
 
+@pytest.mark.skip_less_device_memory(110000)
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("model_name,model_path", [
+    pytest.param(
+        'DeepSeek-R1', 'DeepSeek-R1/DeepSeek-R1', marks=skip_pre_hopper),
+])
+def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
+        llm_root, llm_venv, model_name, model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--enable_overlap_scheduler",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--moe_tp_size=1",
+        "--moe_ep_size=8",
+        "--tp_size=8",
+        "--use_cuda_graph",
+        "--kv_cache_fraction=0.95",
+        "--max_batch_size=1",
+        "--max_seq_len=3000",
+        "--disable_kv_cache_reuse",
+        "--spec_decode_algo",
+        "MTP",
+        "--spec_decode_nextn",
+        "5",
+        "--use_relaxed_acceptance_for_thinking",
+        "--relaxed_topk=10",
+        "--relaxed_delta=0.5",
+    ])
+    # TODO: relaxed acceptance is incompatible with attention dp
+    # "--enable_attention_dp"
+
+
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("model_name,model_path", [
@@ -1661,9 +1721,11 @@ def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
     pytest.param('Mixtral-8x7B-NVFP4',
                  'nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1',
                  marks=skip_pre_blackwell),
-    pytest.param('Nemotron-Ultra-253B',
-                 'nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
-                 marks=skip_pre_hopper),
+    pytest.param(
+        'Nemotron-Ultra-253B',
+        'nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
+        marks=[skip_pre_hopper,
+               pytest.mark.skip_less_device_memory(140000)]),
 ])
 def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
                                        model_path):
@@ -1937,7 +1999,8 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
     tllm_logits = []
     for output in outputs:
         prompt = output.prompt
-        tllm_logit = output.context_logits.cpu()
+        tllm_logit = output.context_logits.cpu(
+        )[:, 0]  # drop vocab_size dimension.
         print(f"Prompt: {prompt!r}, Context logits: {tllm_logit}")
         tllm_logits += [tllm_logit]
     # Stack the output
@@ -1992,8 +2055,8 @@ def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
     example_root = Path(os.path.join(llm_root, "examples", "scaffolding"))
     input_file = Path(os.path.join(example_root, "test.jsonl"))
     llm_venv.run_cmd([
-        str(example_root / "aime24_test.py"),
-        "--generation_dir",
+        str(example_root / "run_majority_vote_aime24.py"),
+        "--model_dir",
         f"{llm_models_root()}/{model_path}",
         f"--jsonl_file={input_file}",
         "--threshold=0.5",

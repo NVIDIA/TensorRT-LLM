@@ -71,7 +71,11 @@ class PipelineInterface:
 
     def send(self):
         """Send tensors to next rank."""
+        # pp_comm.send returns after nccl send kernel is enqueued. Event sync waits till prev kernel
+        # finishes and avoids earlier PP rank executing multiple microbatches ahead of later rank.
+        self._pp_comm.send_event.synchronize()
         if self.hidden_states is not None:
             self._pp_comm.send(self.hidden_states, tag=self.tag)
         if self.residual is not None:
             self._pp_comm.send(self.residual, tag=self.tag)
+        self._pp_comm.send_event.record()
