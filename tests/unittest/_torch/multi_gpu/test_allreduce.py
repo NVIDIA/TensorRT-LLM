@@ -255,7 +255,8 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="Requires at least 2 GPUs for this test")
-@pytest.mark.parametrize("seq_len", [16, 256], ids=lambda x: f"seqlen:{x}")
+@pytest.mark.parametrize("seq_len", [16, 256, 8192],
+                         ids=lambda x: f"seqlen:{x}")
 @pytest.mark.parametrize("hidden_size", [128, 7168],
                          ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize(
