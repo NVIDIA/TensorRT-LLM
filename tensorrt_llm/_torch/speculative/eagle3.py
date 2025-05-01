@@ -382,7 +382,7 @@ class Eagle3OneModelWorker(nn.Module):
         '''
 
         draft_tokens = torch.argmax(logits, dim=-1).type(torch.int32)
-        if draft_model.model.d2t is not None:
+        if hasattr(draft_model.model, "d2t") and draft_model.model.d2t is not None:
             draft_tokens = draft_model.model.d2t[draft_tokens] + draft_tokens
         return draft_tokens
 
