@@ -318,6 +318,11 @@ class LLM:
                 prompt=prompt,
                 multi_modal_data=inputs.get("multi_modal_data"),
                 mm_processor_kwargs=inputs.get("mm_processor_kwargs"))
+            if sampling_params.add_special_tokens:
+                logger.debug(
+                    "Setting add_special_tokens to False because prompt_token_ids were provided to generate. VLMs will re-encode the prompt."
+                )
+                sampling_params.add_special_tokens = False
 
         query_token_ids = None
         multimodal_embedding = None

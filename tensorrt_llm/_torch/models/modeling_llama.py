@@ -846,7 +846,7 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
 
 
 @register_auto_model("Llama4ForCausalLM")
-class Llama4ForCausalLM(DecoderModelForCausalLM[LlamaModel, Llama4Config]):
+class Llama4ForCausalLM(DecoderModelForCausalLM[Llama4Model, Llama4Config]):
 
     def __init__(
         self,
@@ -922,13 +922,21 @@ class Llama4InputProcessor(InputProcessor):
             do_rescale = (img_type == Image)
             assert all(isinstance(img, img_type) for img in mm_data["image"])
 
+        truncate_kwargs = {}
+        if sampling_params.truncate_prompt_tokens is not None:
+            truncate_kwargs[
+                "max_length"] = sampling_params.truncate_prompt_tokens
+            truncate_kwargs["truncation"] = True
+
         # preprocess images and insert image tokens
-        processed = self.processor(text=text_prompt,
-                                   images=images,
-                                   return_tensors="pt",
-                                   device="cuda",
-                                   do_rescale=do_rescale,
-                                   add_special_tokens=False)
+        processed = self.processor(
+            text=text_prompt,
+            images=images,
+            return_tensors="pt",
+            device="cuda",
+            do_rescale=do_rescale,
+            add_special_tokens=sampling_params.add_special_tokens,
+            **truncate_kwargs)
         if images:
             token_ids, pixel_values = processed["input_ids"].squeeze(
             ), processed["pixel_values"]
