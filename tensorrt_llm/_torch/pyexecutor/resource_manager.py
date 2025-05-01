@@ -323,7 +323,6 @@ class KVCacheManager(BaseResourceManager):
                 req.py_prompt_len = req.prompt_len
                 if max_num_draft_tokens > 0:
                     req.py_draft_tokens = [0] * max_num_draft_tokens
-            req.is_dummy = True
             requests.append(req)
         return requests
 
