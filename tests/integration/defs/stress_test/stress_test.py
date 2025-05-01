@@ -228,25 +228,19 @@ def launch_process(cmd,
     stderr_reader = None
 
     try:
-        if filter_pattern != None:
-            stdout = subprocess.PIPE
-            stderr = subprocess.PIPE
-        else:
-            stdout = None
-            stderr = None
-        # Setup pipes for stdout and stderr
-        process = Popen(
-            cmd,
-            start_new_session=start_new_session,
-            stdout=stdout,
-            stderr=stderr,
-            bufsize=1,  # Line buffered
-            universal_newlines=True)  # Text mode
-
-        print_info(f"Process started with PID: {process.pid}")
-
-        # Start threads to filter and process output
+        # Only create pipes if we plan to filter output
         if filter_pattern:
+            process = Popen(
+                cmd,
+                start_new_session=start_new_session,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=1,  # Line buffered
+                universal_newlines=True)  # Text mode
+
+            print_info(f"Process started with PID: {process.pid}")
+
+            # Start threads to filter and process output
             stdout_reader = threading.Thread(
                 target=filter_server_output,
                 args=(process.stdout, filter_pattern, request_counter),
@@ -260,6 +254,13 @@ def launch_process(cmd,
                 daemon=True  # Make sure thread doesn't block program exit
             )
             stderr_reader.start()
+        else:
+            process = Popen(cmd,
+                            start_new_session=start_new_session,
+                            stdout=None,
+                            stderr=None)
+
+            print_info(f"Process started with PID: {process.pid}")
 
         yield process
     finally:
