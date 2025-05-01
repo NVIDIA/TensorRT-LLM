@@ -269,11 +269,7 @@ class RemoteMpiCommSessionClient(MpiSession):
     RemoteMpiCommSessionClient is a variant of MpiCommSession that is used to connect to a remote MPI pool.
     '''
 
-    def __init__(
-        self,
-        addr: str,
-        hmac_key: Optional[bytes] = None,
-    ):
+    def __init__(self, addr: str, hmac_key: Optional[bytes] = None):
         # FIXME: this is a hack to avoid circular import, resolve later
         from tensorrt_llm.executor.ipc import ZeroMqQueue
         self.addr = addr
