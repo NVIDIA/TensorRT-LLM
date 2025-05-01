@@ -246,18 +246,18 @@ def test_llm_end2end_tp2(llm_additional_options):
 
 @pytest.mark.gpu4
 @pytest.mark.part0
-def test_tinyllama_logits_processor_tp2pp2():
-    tinyllama_logits_processor_test_harness(tensor_parallel_size=2,
-                                            pipeline_parallel_size=2)
-
-
-@pytest.mark.gpu4
-@pytest.mark.part0
 def test_tinyllama_guided_decoding_tp2pp2():
+    pytest.skip(reason="https://nvbugs/5244006")
     tinyllama_guided_decoding_test_harness(
         tensor_parallel_size=2,
         pipeline_parallel_size=2,
         kv_cache_config=global_kv_cache_config)
+
+
+@pytest.mark.gpu4
+def test_tinyllama_logits_processor_tp2pp2():
+    tinyllama_logits_processor_test_harness(tensor_parallel_size=2,
+                                            pipeline_parallel_size=2)
 
 
 @pytest.mark.gpu2

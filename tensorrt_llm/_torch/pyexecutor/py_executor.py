@@ -1220,7 +1220,26 @@ class PyExecutor:
                 self.request_queue, timeout,
                 total_max_num_active_requests - total_num_active_requests)
 
-        new_requests = self._broadcast_new_requests(new_requests)
+        if self.dist.rank == 0:
+            py_request_objects = self._collect_py_objects_from_requests(
+                new_requests, "py_logits_post_processors")
+        else:
+            py_request_objects = None
+
+        if self.dist.rank == 0 and not self.dist.has_pp:
+            # Preserve original `new_requests` on rank 0 since it may contain
+            # Python-only objects (e.g., custom logits processors) not serializable by pybind.
+            _ = self._broadcast_new_requests(new_requests)
+        else:
+            new_requests = self._broadcast_new_requests(new_requests)
+
+        py_request_objects = self.dist.broadcast(py_request_objects, root=0)
+
+        if py_request_objects and (self.dist.tp_size > 1
+                                   or self.dist.has_pp) and self.dist.rank > 0:
+            attr_name, req_obj_dict = py_request_objects
+            self._attach_py_objects_to_requests(new_requests, attr_name,
+                                                req_obj_dict)
 
         if not self.enable_attention_dp:
             self._update_new_active_requests_queue_latency(new_requests)
@@ -1352,6 +1371,37 @@ class PyExecutor:
                 self.inflight_req_ids.erase(req.request_id)
                 self._terminate_request(req)
                 self.active_requests.remove(req)
+
+    def _collect_py_objects_from_requests(
+            self, requests, attribute_name: str) -> Optional[tuple[str, dict]]:
+        """WAR to gather dynamic Python-only attributes (e.g., custom logits processors)
+        that cannot be handled by pybind serialization during MP communication.
+
+        Returns:
+            A tuple of (attribute_name, {request_id: object}) or None.
+        """
+        req_id_to_obj = {}
+        for item in requests:
+            if item is None:
+                continue
+            req_id, req = item[:2]
+            obj = getattr(req, attribute_name, None)
+            if obj is not None:
+                req_id_to_obj[req_id] = obj
+        return None if not req_id_to_obj else (attribute_name, req_id_to_obj)
+
+    def _attach_py_objects_to_requests(self, requests, attribute_name: str,
+                                       py_request_objects: dict):
+        """Attaches Python-only objects (e.g., dynamic attributes not handled by pybind)
+        to each request.
+        """
+        for item in requests:
+            if item is None:
+                continue
+            req_id, req = item[:2]
+            py_obj = py_request_objects.get(req_id)
+            if py_obj is not None:
+                setattr(req, attribute_name, py_obj)
 
     def _partition_context(self, ctx_ids_list):
         ctx_ids = torch.tensor(ctx_ids_list).unsqueeze(0)
