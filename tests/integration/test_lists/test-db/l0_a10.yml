@@ -34,11 +34,11 @@ l0_a10:
       backend: cpp
   tests:
   # ------------- CPP tests ---------------
-  - test_cpp.py::test_model[-medusa-86]
-  - test_cpp.py::test_model[-redrafter-86]
-  - test_cpp.py::test_model[-mamba-86]
-  - test_cpp.py::test_model[-recurrentgemma-86]
-  - test_cpp.py::test_model[-eagle-86]
+  - cpp/test_e2e.py::test_model[-medusa-86]
+  - cpp/test_e2e.py::test_model[-redrafter-86]
+  - cpp/test_e2e.py::test_model[-mamba-86]
+  - cpp/test_e2e.py::test_model[-recurrentgemma-86]
+  - cpp/test_e2e.py::test_model[-eagle-86]
 - condition:
     ranges:
       system_gpu_count:
