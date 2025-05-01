@@ -222,6 +222,11 @@ def convert_and_save_hf(config, args):
                     tllm_weights.update(loader.load(tllm_key))
             loader.fill(tllm_weights)
         else:
+            # get eagle_net config from config.json
+            with open(eagle_model_dir + '/' + 'config.json') as f:
+                eagle_checkpoint_config = json.load(f)
+            # Default eagle net to have bias. Eagle-Llama has no bias.
+            eagle_net_has_bias = eagle_checkpoint_config.get('bias', True)
             # Double checkpoint for HF
             for idx, eagle_net in enumerate(model.eagle_nets):
                 check_and_update(eagle_net.drafter.fc, {"fc": "fc"})
@@ -246,6 +251,17 @@ def convert_and_save_hf(config, args):
             eagle_loader = ModelWeightsLoader(eagle_model_dir, customized_dict)
             eagle_loader.update_key_mapping(model)
             for tllm_key, _ in tqdm(model.eagle_nets.named_parameters()):
+                if not eagle_net_has_bias and tllm_key.endswith("fc.bias"):
+                    # a WAR to skip bias loading for eagle-llama
+                    fc_weight = list(
+                        eagle_loader.load("eagle_nets." + tllm_key.replace(
+                            "fc.bias", "fc.weight")).values())[0]
+                    # manually create a zero bias, if not, TRTLLM will use random initialization for bias
+                    dummy_zero_bias = torch.zeros(fc_weight.shape[0],
+                                                  dtype=fc_weight.dtype)
+                    tllm_weights.update(
+                        {f'eagle_nets.{tllm_key}': dummy_zero_bias})
+                    continue
                 if not tllm_key.endswith("lm_head.weight"):
                     if any([
                             tllm_key.startswith(prefix)
