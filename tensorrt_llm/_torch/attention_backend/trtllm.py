@@ -297,11 +297,13 @@ class TrtllmAttentionWrapper:
                 ## context lengths of requests in context phase
                 num_contexts = (self.host_request_types == 0).sum().item()
                 if num_contexts > 0:
+                    current_device_idx = torch.cuda.current_device()
+                    current_device = torch.device(f"cuda:{current_device_idx}")
                     attention_mask_chunk = torch.tril(
                         torch.ones(attention_chunk_size,
                                    attention_chunk_size,
                                    dtype=torch.bool,
-                                   device=q.device)
+                                   device=current_device)
                     )  ## creating a mask of shape (attention_chunk_size,attention_chunk_size) dtype bool. TODO: shift to intiliaze it once
                     ## context lengths of requests in context phase
                     host_context_lengths_reqs = self.host_context_lengths[:
@@ -314,7 +316,7 @@ class TrtllmAttentionWrapper:
                     num_ctx_tokens = host_context_lengths_reqs.sum().item()
                     full_attention_mask = torch.empty(
                         (num_ctx_tokens, seq_len_max_for_padding),
-                        device=q.device)
+                        device=current_device)
                     token_count = 0
                     for total_prompt_len, context_len in zip(
                             host_past_key_value_lengths_reqs,
@@ -323,59 +325,81 @@ class TrtllmAttentionWrapper:
                             raise ValueError(
                                 "Context length is greater than attention chunk size"
                             )
+                        # if self.layer_idx == 0 and q.device == torch.device("cuda:0"):
+                        #     print("total prompt len",total_prompt_len)
+                        #     print("context len",context_len)
+                        # start_of_chunk = total_prompt_len - context_len  # context chunk size
+                        # end_of_chunk = total_prompt_len - 1  # because of zero indexing on tokens
 
-                        start_of_chunk = total_prompt_len - context_len  # context chunk size
-                        end_of_chunk = total_prompt_len - 1  # because of zero indexing on tokens
+                        # block_idx_for_start_of_chunk = start_of_chunk // attention_chunk_size  # to find which block the start of the chunk lies in
+                        # block_idx_for_end_of_chunk = end_of_chunk // attention_chunk_size  # to find which block the end of the chunk lies in
 
-                        block_idx_for_start_of_chunk = start_of_chunk // attention_chunk_size  # to find which block the start of the chunk lies in
-                        block_idx_for_end_of_chunk = end_of_chunk // attention_chunk_size  # to find which block the end of the chunk lies in
+                        # ## if the start and end of chunk are in the same block that means that the context chunk lies in the same block of chunked attention mask
+                        # if block_idx_for_start_of_chunk == block_idx_for_end_of_chunk:
+                        #     start_row = start_of_chunk % attention_chunk_size
+                        #     end_row = end_of_chunk % attention_chunk_size
+                        #     chunked_attention_mask = torch.nn.functional.pad(
+                        #         attention_mask_chunk[start_row:end_row + 1, :],
+                        #         (block_idx_for_start_of_chunk *
+                        #          attention_chunk_size, 0))  # padding on left
 
-                        ## if the start and end of chunk are in the same block that means that the context chunk lies in the same block of chunked attention mask
-                        if block_idx_for_start_of_chunk == block_idx_for_end_of_chunk:
-                            start_row = start_of_chunk % attention_chunk_size
-                            end_row = end_of_chunk % attention_chunk_size
-                            chunked_attention_mask = torch.nn.functional.pad(
-                                attention_mask_chunk[start_row:end_row + 1, :],
-                                (block_idx_for_start_of_chunk *
-                                 attention_chunk_size, 0))  # padding on left
-
-                        ## the chunk lies in different blocks of chunked attention mask. so rows would be taken from prev and next block
-                        else:
-                            pads_on_left_start_chunk = block_idx_for_start_of_chunk * attention_chunk_size
-                            pads_on_left_end_chunk = block_idx_for_end_of_chunk * attention_chunk_size
-                            rows_to_be_taken_from_mask_from_prev_block = block_idx_for_end_of_chunk * attention_chunk_size - start_of_chunk
-                            rows_to_be_taken_from_mask_from_next_block = end_of_chunk % attention_chunk_size + 1
-                            ## here for the last rows taken from the prev block we are padding on the left and right (this will be equal to attention chunk size as we have assumed the max chunked context length can be equal to attention chunk size) both and for the rows taken from the next block we are padding on the left only
-                            chunked_attention_mask = torch.cat([
-                                torch.nn.functional.pad(
-                                    attention_mask_chunk[
-                                        -rows_to_be_taken_from_mask_from_prev_block:, :],
-                                    (pads_on_left_start_chunk,
-                                     attention_chunk_size)),
-                                torch.nn.functional.pad(
-                                    attention_mask_chunk[:
-                                                         rows_to_be_taken_from_mask_from_next_block, :],
-                                    (pads_on_left_end_chunk, 0))
-                            ],
-                                                               dim=0)
-
-                        chunked_attention_mask = chunked_attention_mask[:, :seq_len_max_for_padding] if chunked_attention_mask.shape[
-                            1] > seq_len_max_for_padding else torch.nn.functional.pad(
-                                chunked_attention_mask,
-                                (0, seq_len_max_for_padding -
-                                 chunked_attention_mask.shape[1]))
+                        # ## the chunk lies in different blocks of chunked attention mask. so rows would be taken from prev and next block
+                        # else:
+                        #     pads_on_left_start_chunk = block_idx_for_start_of_chunk * attention_chunk_size
+                        #     pads_on_left_end_chunk = block_idx_for_end_of_chunk * attention_chunk_size
+                        #     rows_to_be_taken_from_mask_from_prev_block = block_idx_for_end_of_chunk * attention_chunk_size - start_of_chunk
+                        #     rows_to_be_taken_from_mask_from_next_block = end_of_chunk % attention_chunk_size + 1
+                        #     ## here for the last rows taken from the prev block we are padding on the left and right (this will be equal to attention chunk size as we have assumed the max chunked context length can be equal to attention chunk size) both and for the rows taken from the next block we are padding on the left only
+                        #     chunked_attention_mask = torch.cat([
+                        #         torch.nn.functional.pad(
+                        #             attention_mask_chunk[
+                        #                 -rows_to_be_taken_from_mask_from_prev_block:, :],
+                        #             (pads_on_left_start_chunk,
+                        #              attention_chunk_size)),
+                        #         torch.nn.functional.pad(
+                        #             attention_mask_chunk[:
+                        #                                  rows_to_be_taken_from_mask_from_next_block, :],
+                        #             (pads_on_left_end_chunk, 0))
+                        #     ],
+                        #                                        dim=0)
+                        # if q.device == torch.device("cuda:0") and self.layer_idx == 0:
+                        #     print("chunked attention mask shape before padding or slicing",chunked_attention_mask.shape)
+                        #     print("seq len max for padding",seq_len_max_for_padding)
+                        #     print("num_contexts",num_contexts)
+                        #     print("host context lengths reqs",self.host_context_lengths)
+                        #     print("host past key value lengths reqs",self.host_past_key_value_lengths)
+                        #     print("sequence length",self.sequence_length)
+                        # chunked_attention_mask = chunked_attention_mask[:, :seq_len_max_for_padding] if chunked_attention_mask.shape[
+                        #     1] > seq_len_max_for_padding else torch.nn.functional.pad(
+                        #         chunked_attention_mask,
+                        #         (0, seq_len_max_for_padding -
+                        #          chunked_attention_mask.shape[1]))
+                        # if q.device == torch.device("cuda:0") and self.layer_idx == 0:
+                        #     print("chunked attention mask after padding or slicing",chunked_attention_mask.shape)
 
                         ## but now when we are assigning the mask we will only take tokens which are in context phase right now. This matters for when chunked context is enabled
-                        full_attention_mask[
-                            token_count:token_count +
-                            context_len, :] = chunked_attention_mask
+                        full_attention_mask[token_count:token_count +
+                                            context_len, :] = torch.tril(
+                                                torch.ones(
+                                                    context_len,
+                                                    seq_len_max_for_padding,
+                                                    dtype=torch.bool,
+                                                    device=current_device))
                         token_count += context_len.item()
-
+                        if q.device == torch.device(
+                                "cuda:0") and self.layer_idx == 0:
+                            print("full attention mask",
+                                  full_attention_mask.shape)
                     ## full attention mask is of shape (num_ctx_tokens, seq_len_max_for_padding)
+
                     attention_packed_mask = torch.ops.tensorrt_llm.pack_fmha_mask_by_input(
                         full_attention_mask,
                         self.sequence_length[:num_contexts],
                         self.sequence_length[:num_contexts], 1.0)
+                    if q.device == torch.device(
+                            "cuda:0") and self.layer_idx == 0:
+                        print("attention packed mask",
+                              attention_packed_mask.shape)
                 else:
                     mask_type = AttentionMaskType.causal
             elif attention_mask == PredefinedAttentionMask.CAUSAL:
