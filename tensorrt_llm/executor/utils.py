@@ -3,7 +3,7 @@ import concurrent.futures
 import os
 from concurrent.futures import ProcessPoolExecutor
 from queue import Empty, Queue
-from typing import Any, Callable, Dict, List, NamedTuple, Optional
+from typing import Any, Callable, List, NamedTuple, Optional
 
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.bindings.executor import Response
@@ -33,9 +33,7 @@ if PERIODICAL_RESP_IN_AWAIT:
 
 
 def create_mpi_comm_session(
-    n_workers: int,
-    additional_serializable_classes: Optional[Dict] = None
-) -> RemoteMpiCommSessionClient | MpiPoolSession:
+        n_workers: int) -> RemoteMpiCommSessionClient | MpiPoolSession:
     assert mpi_rank(
     ) == 0, f"create_mpi_comm_session must be called by rank 0, but it was called by rank {mpi_rank()}"
     if get_spawn_proxy_process_env():
@@ -49,9 +47,7 @@ def create_mpi_comm_session(
         if hmac_key is not None:
             hmac_key = bytes.fromhex(hmac_key)
         return RemoteMpiCommSessionClient(
-            addr=get_spawn_proxy_process_ipc_addr_env(),
-            hmac_key=hmac_key,
-            additional_serializable_classes=additional_serializable_classes)
+            addr=get_spawn_proxy_process_ipc_addr_env(), hmac_key=hmac_key)
     else:
         print_colored_debug(
             f"Using MpiCommSession to bind to external MPI processes\n",

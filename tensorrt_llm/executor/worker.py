@@ -12,6 +12,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
+import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm.logger import logger
 
 from .._utils import (KVCacheEventSerializer, global_mpi_rank, mpi_comm,
@@ -528,8 +529,9 @@ def worker_main(
     is_llm_executor: Optional[
         bool] = True,  # whether it's the main executor instance
     lora_config: Optional[LoraConfig] = None,
-    additional_serializable_classes: Optional[Dict] = None,
+    BASE_ZMQ_CLASSES: Dict = serialization.BASE_ZMQ_CLASSES,
 ) -> None:
+    serialization.BASE_ZMQ_CLASSES = BASE_ZMQ_CLASSES
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
                         "green")
@@ -565,28 +567,21 @@ def worker_main(
         # Only set the log level for the leader process, the other processes will
         # inherit the log level from "TLLM_LOG_LEVEL" environment variable
         logger.set_level(log_level)
-        request_queue = IpcQueue(
-            worker_queues.request_queue_addr,
-            is_server=False,
-            name="worker_request_queue",
-            additional_serializable_classes=additional_serializable_classes)
-        request_error_queue = IpcQueue(
-            worker_queues.request_error_queue_addr,
-            is_server=False,
-            name="worker_request_error_queue",
-            additional_serializable_classes=additional_serializable_classes)
-        mp_stats_queue = FusedIpcQueue(
-            worker_queues.stats_queue_addr,
-            is_server=False,
-            fuse_message=True,
-            name="worker_stats_queue",
-            additional_serializable_classes=additional_serializable_classes)
+        request_queue = IpcQueue(worker_queues.request_queue_addr,
+                                 is_server=False,
+                                 name="worker_request_queue")
+        request_error_queue = IpcQueue(worker_queues.request_error_queue_addr,
+                                       is_server=False,
+                                       name="worker_request_error_queue")
+        mp_stats_queue = FusedIpcQueue(worker_queues.stats_queue_addr,
+                                       is_server=False,
+                                       fuse_message=True,
+                                       name="worker_stats_queue")
         kv_cache_events_queue = FusedIpcQueue(
             worker_queues.kv_cache_events_queue_addr,
             is_server=False,
             fuse_message=False,
-            name="worker_kv_cache_events_queue",
-            additional_serializable_classes=additional_serializable_classes)
+            name="worker_kv_cache_events_queue")
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel
@@ -594,20 +589,16 @@ def worker_main(
             result_queues = [
                 FusedIpcQueue(is_server=True,
                               fuse_message=PERIODICAL_RESP_IN_AWAIT,
-                              name=f"postprocess_{i}_feedin_queue",
-                              additional_serializable_classes=
-                              additional_serializable_classes)
+                              name=f"postprocess_{i}_feedin_queue")
                 for i in range(postproc_worker_config.num_postprocess_workers)
             ]
         else:
             # IPC queue for sending results back to the proxy, and let the
             # Proxy process to handle the postprocess
-            result_queue = FusedIpcQueue(
-                worker_queues.result_queue_addr,
-                is_server=False,
-                fuse_message=PERIODICAL_RESP_IN_AWAIT,
-                name="worker_result_queue",
-                additional_serializable_classes=additional_serializable_classes)
+            result_queue = FusedIpcQueue(worker_queues.result_queue_addr,
+                                         is_server=False,
+                                         fuse_message=PERIODICAL_RESP_IN_AWAIT,
+                                         name="worker_result_queue")
 
     def notify_proxy_threads_to_quit():
         # Signal the dispatcher thread in the proxy to quit
@@ -635,12 +626,11 @@ def worker_main(
         assert isinstance(proxy_result_queue, tuple)
         for i in range(postproc_worker_config.num_postprocess_workers):
             fut = postproc_worker_pool.submit(
-                postproc_worker_main,
-                result_queues[i].address,
+                postproc_worker_main, result_queues[i].address,
                 proxy_result_queue,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
-                additional_serializable_classes=additional_serializable_classes)
+                serialization.BASE_ZMQ_CLASSES)
             postprocess_worker_futures.append(fut)
 
     # Error handling in the Worker/MPI process

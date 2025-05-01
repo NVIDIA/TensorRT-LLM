@@ -5,7 +5,7 @@ import shutil
 import tempfile
 import weakref
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Sequence, Union
+from typing import Any, List, Literal, Optional, Sequence, Union
 
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
@@ -105,11 +105,9 @@ class LLM:
                  dtype: str = "auto",
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
-                 additional_serializable_classes: Optional[Dict] = None,
                  **kwargs: Any) -> None:
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
-        self.additional_serializable_classes = additional_serializable_classes
         try:
             self.pytorch_backend_config = kwargs.pop('pytorch_backend_config',
                                                      None)
@@ -155,9 +153,7 @@ class LLM:
                     print_colored_debug(f"LLM create MpiCommSession\n",
                                         "yellow")
                     self.mpi_session = create_mpi_comm_session(
-                        self.args.parallel_config.world_size,
-                        additional_serializable_classes=self.
-                        additional_serializable_classes)
+                        self.args.parallel_config.world_size)
 
         try:
             # Due to the Executor can only accept a engine path, we need to save the engine to a directory
@@ -619,9 +615,7 @@ class LLM:
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
             is_llm_executor=True,
-            lora_config=self.args.lora_config,
-            additional_serializable_classes=self.additional_serializable_classes
-        )
+            lora_config=self.args.lora_config)
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
         if self.args.skip_tokenizer_init:
