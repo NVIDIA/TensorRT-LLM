@@ -13,7 +13,7 @@ from ...custom_ops.attention_interface import (
     GetAttentionInfo,
     PositionalEmbeddingConfig,
 )
-from ...distributed.common import get_world_size
+from ...distributed.common import all_gather_object, get_world_size
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
 from ...utils.node_utils import get_all_input_output_nodes, is_op
@@ -261,9 +261,9 @@ def resize_kv_cache(
         new_num_pages = int(new_cache_size // (current_cache_size // current_num_pages))
 
         # Need to sync all the GPUs
-        gathered_pages = [None] * get_world_size()
-        torch.distributed.all_gather_object(gathered_pages, new_num_pages)
-        new_num_pages = min(gathered_pages)
+        gathered_num_pages = [None] * get_world_size()
+        all_gather_object(gathered_num_pages, new_num_pages)
+        new_num_pages = min(gathered_num_pages)
         ad_logger.info(f"After all_gather - new_num_pages: {new_num_pages}")
 
         cm.resize_cache(new_num_pages)
