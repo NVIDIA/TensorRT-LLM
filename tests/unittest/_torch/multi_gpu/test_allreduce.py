@@ -26,7 +26,7 @@ from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams)
+                                             AllReduceParams, MoEAllReduce)
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.mapping import Mapping
@@ -66,6 +66,21 @@ def run_single_rank(tensor_parallel_size, single_rank_forward_func, input,
     try:
         single_rank_forward_func(input, residual, hidden_size, dtype,
                                  tensor_parallel_size, rank, weights, fusion_op)
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+def run_moe_single_rank(tensor_parallel_size, single_rank_forward_func,
+                        token_input, residual, active_experts_token_input,
+                        scale, l0_weight):
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        single_rank_forward_func(token_input, residual,
+                                 active_experts_token_input, scale,
+                                 tensor_parallel_size, rank, l0_weight)
     except Exception:
         traceback.print_exc()
         raise
@@ -238,28 +253,29 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
             assert mismatch_percentage < 0.01, f"Large mismatched elements encountered"
 
 
-@skip_pre_blackwell
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="Requires at least 2 GPUs for this test")
 @pytest.mark.parametrize("seq_len", [16, 256], ids=lambda x: f"seqlen:{x}")
 @pytest.mark.parametrize("hidden_size", [128, 7168],
                          ids=lambda x: f"hidden:{x}")
-@pytest.mark.parametrize("fusion_op", [
-    AllReduceFusionOp.NONE,
-    AllReduceFusionOp.RESIDUAL_RMS_NORM,
-    AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
-    AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
-    AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
-    AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
-],
-                         ids=[
-                             "none",
-                             "residual_rms_norm",
-                             "residual_rms_norm_quant_fp8",
-                             "residual_rms_norm_out_quant_fp8",
-                             "residual_rms_norm_quant_nvfp4",
-                             "residual_rms_norm_out_quant_nvfp4",
-                         ])
+@pytest.mark.parametrize(
+    "fusion_op",
+    [
+        pytest.param(AllReduceFusionOp.NONE, id="none"),
+        pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                     id="residual_rms_norm"),
+        pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
+                     id="residual_rms_norm_quant_fp8"),
+        pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
+                     id="residual_rms_norm_out_quant_fp8"),
+        pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+                     id="residual_rms_norm_quant_nvfp4",
+                     marks=skip_pre_blackwell),
+        pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
+                     id="residual_rms_norm_out_quant_nvfp4",
+                     marks=skip_pre_blackwell),
+    ],
+)
 def test_allreduce_fusion_patterns(seq_len, hidden_size, fusion_op):
     torch.manual_seed(0)
     dtype = torch.bfloat16
@@ -272,6 +288,166 @@ def test_allreduce_fusion_patterns(seq_len, hidden_size, fusion_op):
             run_single_rank,
             *zip(*[(tensor_parallel_size, run_allreduce_op, x, residual,
                     [linear_weight], hidden_size, dtype, fusion_op)] *
+                 tensor_parallel_size),
+        )
+        for r in results:
+            assert r is True
+
+
+@torch.inference_mode()
+def run_moe_allreduce_op(token_input: torch.Tensor, residual: torch.Tensor,
+                         active_experts_token_input: torch.Tensor,
+                         scale: torch.Tensor, tensor_parallel_size: int,
+                         tensor_parallel_rank: int, l0_weight: torch.Tensor):
+    torch.manual_seed(42)
+
+    # * token_input:
+    #   [num_token, 7168]
+    #   different val for different device
+    # * active_experts_token_input
+    #   [num_global_exp, num_token, 7168]
+    #   need to slice to [num_device_exp, num_token, 7168] before use
+    # * scale
+    #   [num_global_exp, num_token]
+    #   per expert per token scale
+    #   need to slice to [num_device_exp, num_token, 7168] before use
+    #   different value for each device
+
+    token_input = token_input.cuda()
+    residual = residual.cuda()
+    active_experts_token_input = active_experts_token_input.cuda()
+    scale = scale.cuda()
+
+    dtype = token_input.dtype
+    num_global_experts = scale.size(0)
+    num_device_experts = num_global_experts // tensor_parallel_size
+    tensor_num_device_experts = torch.tensor(num_device_experts,
+                                             dtype=torch.int32,
+                                             device="cuda")
+    # num_token = token_input.shape[0]
+    hidden_size = token_input.shape[1]
+
+    # Setup parameters
+    eps = 1e-5
+    norm_weight = torch.randn((hidden_size, ), dtype=dtype, device="cuda")
+
+    # Initialize MoEAllreduce
+    moe_allreduce = MoEAllReduce(mapping=Mapping(
+        world_size=tensor_parallel_size,
+        tp_size=tensor_parallel_size,
+        rank=tensor_parallel_rank,
+    )).cuda()
+
+    # Initialize RMSNorm
+    norm = RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype).cuda()
+    norm.weight.data.copy_(norm_weight)
+
+    l0 = Linear(
+        in_features=hidden_size,
+        out_features=hidden_size,
+        bias=False,
+        dtype=dtype,
+        mapping=Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=tensor_parallel_rank,
+        ),
+        tensor_parallel_mode=TensorParallelMode.ROW,
+    ).cuda()
+    l0.load_weights([dict(weight=l0_weight)])
+    token_input_chunked = torch.chunk(token_input.clone(),
+                                      tensor_parallel_size,
+                                      dim=-1)
+    fc2_output = l0(
+        token_input_chunked[tensor_parallel_rank],
+        all_reduce_params=AllReduceParams(
+            fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+            residual=residual,
+            norm_weight=norm_weight,
+            eps=eps,
+            enable_allreduce=False,
+        ),
+    )
+
+    # Define fusion operation
+    # slice [num_global_exp, num_token, 7168] -> [num_device_exp, num_token, 7168]
+    active_experts_token_input_parallel = torch.chunk(
+        active_experts_token_input.clone(), tensor_parallel_size, dim=0)
+    active_experts_token_equalized = active_experts_token_input_parallel[
+        tensor_parallel_rank]
+
+    # slice [num_global_exp, num_token] -> [num_device_exp, num_token]
+    scale_parallel = torch.chunk(scale.clone(), tensor_parallel_size, dim=0)
+    scale_equalized = scale_parallel[tensor_parallel_rank]
+
+    # Run with fusion
+    output_hidden_states, output_residual = moe_allreduce(
+        residual,
+        norm_weight,
+        tensor_num_device_experts,
+        scale_equalized,
+        active_experts_token_equalized,
+        fc2_output,
+        eps,
+    )
+
+    torch_l0 = torch.nn.Linear(in_features=hidden_size,
+                               out_features=hidden_size,
+                               bias=False,
+                               dtype=dtype)
+    torch_l0.weight.data.copy_(l0_weight)
+    torch_l0.cuda()
+
+    torch_linear_output = torch_l0(token_input)
+    # Verify with torch reference implementation
+    expert_reduction = torch.sum(active_experts_token_input *
+                                 scale.unsqueeze(-1),
+                                 dim=0)
+    torch_before_residual = expert_reduction + torch_linear_output
+    torch_residual = torch_before_residual + residual
+    torch_residual = torch_residual.to(torch.float32)
+    torch_output_hidden_states = rms_norm(torch_residual, norm_weight,
+                                          eps).to(dtype)
+
+    # Verify results are close to reference
+    torch.testing.assert_close(
+        output_hidden_states,
+        torch_output_hidden_states,
+        rtol=0.2,
+        atol=0.2,
+    )
+
+    return True
+
+
+@torch.inference_mode()
+def test_moe_allreduce_patterns():
+    torch.manual_seed(42)
+
+    seq_len = 16
+    hidden_size = 7168
+    dtype = torch.bfloat16
+    tensor_parallel_size = 2
+    num_global_experts = 4
+
+    # [num_token, 7168]
+    token_input = torch.randn((seq_len, hidden_size), dtype=dtype)
+    # [num_global_exp, num_token, 7168]
+    active_experts_token_input = torch.randn(
+        (num_global_experts, seq_len, hidden_size), dtype=dtype, device="cuda")
+    # [num_global_exp, num_token]
+    scale = torch.randn((num_global_experts, seq_len),
+                        dtype=torch.float32,
+                        device="cuda")
+    # [num_token, 7168]
+    residual = torch.randn_like(token_input)
+
+    l0_weight = torch.randn((hidden_size, hidden_size), dtype=dtype)
+    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
+        results = executor.map(
+            run_moe_single_rank,
+            *zip(*[(tensor_parallel_size, run_moe_allreduce_op, token_input,
+                    residual, active_experts_token_input, scale, l0_weight)] *
                  tensor_parallel_size),
         )
         for r in results:

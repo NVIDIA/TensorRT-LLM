@@ -273,11 +273,10 @@ private:
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias) noexcept
     {
+
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
         int size = input.numel();
         int hidden_size = input.size(-1);
-
-        torch::Tensor output = torch::empty_like(input);
 
         if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
         {
@@ -815,14 +814,14 @@ std::vector<torch::Tensor> allreduce(torch::Tensor input, torch::optional<torch:
 
 // residual [m, hidden_dim]
 // norm_weight [hidden_dim]
-// moe_reduction_device_num_experts [1]
-// moe_reduction_scale_input [global_num_experts, m]
-// moe_reduction_active_experts_token_input [device_num_experts, m, hidden_dim]
-// moe_reduction_token_input [m, hidden_dim]
-std::vector<torch::Tensor> moe_allreduce(torch::Tensor residual, torch::Tensor norm_weight,
-    torch::Tensor moe_reduction_device_num_experts, torch::Tensor moe_reduction_scale_input,
-    torch::Tensor moe_reduction_active_experts_token_input, torch::Tensor moe_reduction_token_input,
-    torch::optional<torch::Tensor> workspace, int64_t const rank, int64_t const nranks, double const eps)
+// device_num_experts [1]
+// scale_input [global_num_experts, m]
+// active_experts_token_input [device_num_experts, m, hidden_dim]
+// token_input [m, hidden_dim]
+std::vector<torch::Tensor> moe_allreduce(torch::Tensor const& residual, torch::Tensor const& norm_weight,
+    torch::Tensor const& device_num_experts, torch::Tensor const& scale_input,
+    torch::Tensor const& active_experts_token_input, torch::Tensor const& token_input, torch::Tensor workspace,
+    int64_t const rank, int64_t const nranks, double const eps)
 {
     auto allreduce_fusion_params = tensorrt_llm::kernels::ar_fusion::moe::MoeReductionAllReduceFusionParams();
 
@@ -833,14 +832,13 @@ std::vector<torch::Tensor> moe_allreduce(torch::Tensor residual, torch::Tensor n
 
     allreduce_fusion_params.nranks = static_cast<int>(nranks);
     allreduce_fusion_params.rank = static_cast<int>(rank);
-    allreduce_fusion_params.dtype
-        = tensorrt_llm::runtime::TorchUtils::dataType(moe_reduction_token_input.scalar_type());
+    allreduce_fusion_params.dtype = tensorrt_llm::runtime::TorchUtils::dataType(token_input.scalar_type());
     // size: num_token * hidden_dim
-    allreduce_fusion_params.size = static_cast<int>(moe_reduction_token_input.numel());
-    allreduce_fusion_params.hidden_dim = static_cast<int>(moe_reduction_active_experts_token_input.size(-1));
+    allreduce_fusion_params.size = static_cast<int>(token_input.numel());
+    allreduce_fusion_params.hidden_dim = static_cast<int>(active_experts_token_input.size(-1));
 
     // workspace: AR scratch space
-    allreduce_fusion_params.workspace = reinterpret_cast<void**>(workspace.value().mutable_data_ptr());
+    allreduce_fusion_params.workspace = reinterpret_cast<void**>(workspace.mutable_data_ptr());
 
     allreduce_fusion_params.rms_gamma = norm_weight.data_ptr();
     allreduce_fusion_params.rms_eps = static_cast<float>(eps);
@@ -850,15 +848,13 @@ std::vector<torch::Tensor> moe_allreduce(torch::Tensor residual, torch::Tensor n
 
     // MOE Reduction specific params
     allreduce_fusion_params.allreduce_in = nullptr; // for safety, set nullptr
-    allreduce_fusion_params.moe_reduction_device_num_experts
-        = static_cast<int*>(moe_reduction_device_num_experts.data_ptr());
-    allreduce_fusion_params.moe_reduction_scale_input = static_cast<float*>(moe_reduction_scale_input.data_ptr());
-    allreduce_fusion_params.moe_reduction_active_experts_token_input
-        = moe_reduction_active_experts_token_input.data_ptr();
-    allreduce_fusion_params.moe_reduction_token_input = moe_reduction_token_input.data_ptr();
+    allreduce_fusion_params.moe_reduction_device_num_experts = static_cast<int*>(device_num_experts.data_ptr());
+    allreduce_fusion_params.moe_reduction_scale_input = static_cast<float*>(scale_input.data_ptr());
+    allreduce_fusion_params.moe_reduction_active_experts_token_input = active_experts_token_input.data_ptr();
+    allreduce_fusion_params.moe_reduction_token_input = token_input.data_ptr();
 
     // output tensors
-    torch::Tensor norm_out = torch::empty_like(moe_reduction_token_input);
+    torch::Tensor norm_out = torch::empty_like(token_input);
     torch::Tensor residual_out = torch::empty_like(residual);
 
     allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
@@ -874,15 +870,29 @@ std::vector<torch::Tensor> moe_allreduce(torch::Tensor residual, torch::Tensor n
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "allreduce(Tensor input, Tensor? residual, Tensor? norm_weight, Tensor? scale, Tensor? bias, Tensor? "
-        "workspace, int[] group, int "
-        "strategy, int op, float eps) -> Tensor[]");
+        "allreduce("
+        "Tensor input,"
+        "Tensor? residual,"
+        "Tensor? norm_weight,"
+        "Tensor? scale,"
+        "Tensor? bias,"
+        "Tensor? workspace,"
+        "int[] group,"
+        "int strategy,"
+        "int op,"
+        "float eps) -> Tensor[]");
     m.def(
-        "moe_allreduce(Tensor residual, Tensor norm_weight, Tensor "
-        "moe_reduction_device_num_experts, "
-        "Tensor moe_reduction_scale_input, Tensor moe_reduction_active_experts_token_input, Tensor "
-        "moe_reduction_token_input, Tensor? workspace, "
-        "int rank, int nranks, float eps) -> Tensor[]");
+        "moe_allreduce("
+        "Tensor residual,"
+        "Tensor norm_weight,"
+        "Tensor device_num_experts,"
+        "Tensor scale_input,"
+        "Tensor active_experts_token_input,"
+        "Tensor token_input,"
+        "Tensor workspace,"
+        "int rank,"
+        "int nranks,"
+        "float eps) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
