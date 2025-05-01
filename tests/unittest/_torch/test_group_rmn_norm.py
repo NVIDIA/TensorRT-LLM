@@ -16,7 +16,8 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.rms_norm import GroupRMSNorm, RMSNorm
+from tensorrt_llm._torch.modules.rms_norm import (RMSNorm, group_rms_norm,
+                                                  group_rms_norm_large_batch)
 
 
 @torch.inference_mode()
@@ -61,21 +62,18 @@ def test_group_rms_norm(batch_size, hidden_dims, eps, dtype, enable_weights):
             norm = RMSNorm(hidden_size=dim, eps=eps, dtype=dtype, device=device)
             ref_outputs.append(norm(inputs[i]))
 
-    weight_bias = 0.0
     # Test torch.ops.trtllm.group_rms_norm
     torch.ops.trtllm.group_rms_norm(inputs,
                                     group_outputs,
-                                    weights,
-                                    eps,
-                                    weight_bias,
-                                    enable_weights=enable_weights)
+                                    weights if enable_weights else [],
+                                    eps=eps,
+                                    weight_bias=0.0)
 
-    # Test tensorrt_llm._torch.modules.rms_norm.GroupRMSNorm
-    group_rms_norm_op = GroupRMSNorm(eps=eps,
-                                     dtype=dtype,
-                                     device=device,
-                                     enable_weights=enable_weights)
-    group_outputs_op = group_rms_norm_op(inputs, weights=weights)
+    # Test tensorrt_llm._torch.modules.rms_norm.group_rms_norm
+    if enable_weights:
+        group_outputs_op = group_rms_norm(inputs, weights=weights, eps=eps)
+    else:
+        group_outputs_op = group_rms_norm(inputs, eps=eps)
 
     assert len(group_outputs) == len(ref_outputs), \
         f"Expected {len(ref_outputs)} outputs, got {len(group_outputs)}"
@@ -90,16 +88,13 @@ def test_group_rms_norm(batch_size, hidden_dims, eps, dtype, enable_weights):
                                    rtol=1e-2,
                                    atol=1e-2)
     if len(hidden_dims) == 2:
-        large_batch_group_outputs = [
-            torch.empty_like(input) for input in inputs
-        ]
-        torch.ops.trtllm.group_rms_norm_large_batch(
-            inputs,
-            large_batch_group_outputs,
-            weights,
-            eps,
-            weight_bias,
-            enable_weights=enable_weights)
+        large_batch_group_outputs = []
+        if enable_weights:
+            large_batch_group_outputs = group_rms_norm_large_batch(
+                inputs, weights=weights, eps=eps)
+        else:
+            large_batch_group_outputs = group_rms_norm_large_batch(inputs,
+                                                                   eps=eps)
         for i, (group_out, ref_out) in enumerate(
                 zip(large_batch_group_outputs, ref_outputs)):
             torch.testing.assert_close(group_out, ref_out, rtol=1e-2, atol=1e-2)

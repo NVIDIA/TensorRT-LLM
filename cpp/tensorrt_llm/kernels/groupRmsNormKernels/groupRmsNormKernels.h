@@ -27,10 +27,10 @@ namespace tensorrt_llm::kernels::group_rms_norm
 template </*number of inputs*/ int n>
 struct GroupRMSParams
 {
-    float4* inputs[n];
+    float4 const* inputs[n];
     float4* outputs[n];
     float4 const* weights[n];
-    int input_dims[n];
+    int input_last_dims[n];
     int input_strides[n];
     int output_strides[n];
     int warp_input_idx[32];

@@ -23,10 +23,6 @@
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/groupRmsNormKernels/groupRmsNormKernels.h"
 
-using tensorrt_llm::common::deviceMalloc;
-using tensorrt_llm::common::cudaAutoCpy;
-using tensorrt_llm::common::deviceFree;
-
 namespace tensorrt_llm::kernels::group_rms_norm
 {
 // Allocate more warps to deal with the second input
@@ -72,7 +68,7 @@ __global__ void GroupRMSNormKernel(GroupRMSParams<n> params, int rounds)
 
     uint32_t block_offset = batch_idx * params.input_strides[input_idx];
     uint32_t round_offset = warp_size * kPackedSize;
-    const uint32_t input_dim = params.input_dims[input_idx];
+    const uint32_t input_dim = params.input_last_dims[input_idx];
 
     uint32_t idx_round0 = block_offset + local_warp_idx * round_offset * rounds + lane_idx * kPackedSize;
 
@@ -130,7 +126,7 @@ __global__ void GroupRMSNormKernel(GroupRMSParams<n> params, int rounds)
             warp_acc = smem_warp_sum_sqs[lane_idx];
         }
         smem_rsqrts[warp_idx]
-            = rsqrtf(tensorrt_llm::common::warpReduceSum(warp_acc) / params.input_dims[warp_idx] + params.eps);
+            = rsqrtf(tensorrt_llm::common::warpReduceSum(warp_acc) / params.input_last_dims[warp_idx] + params.eps);
     }
 
     __syncthreads();
@@ -251,8 +247,8 @@ __global__ void GroupRMSNormKernelLargeBatch(
     const uint32_t block_offset_0 = batch_idx * params.input_strides[0];
     const uint32_t block_offset_1 = batch_idx * params.input_strides[1];
 
-    const uint32_t input_dim_0 = params.input_dims[0];
-    const uint32_t input_dim_1 = params.input_dims[1];
+    const uint32_t input_dim_0 = params.input_last_dims[0];
+    const uint32_t input_dim_1 = params.input_last_dims[1];
 
     uint32_t idx_0 = block_offset_0 + warp_idx * round_offset * rounds_0 + lane_idx * kPackedSize;
     uint32_t idx_1 = block_offset_1 + warp_idx * round_offset * rounds_1 + lane_idx * kPackedSize;
@@ -500,14 +496,15 @@ void GroupRMSNormKernel(GroupRMSParams<n> params)
     uint32_t input_chunk_per_warp = 32 * kPackedSize;
     for (uint32_t i = 0; i < params.num_inputs; i++)
     {
-        TLLM_CHECK_WITH_INFO(params.input_dims[i] % 32 == 0, "Input dimension must be divisible by 32.");
-        TLLM_CHECK_WITH_INFO(params.input_dims[i] % kPackedSize == 0,
+        TLLM_CHECK_WITH_INFO(
+            params.input_last_dims[i] % 32 == 0, "The last dimension of input must be divisible by 32.");
+        TLLM_CHECK_WITH_INFO(params.input_last_dims[i] % kPackedSize == 0,
             "Input[%u] dimension %u is not divisible by %u (128b / sizeof(dype)). Finer granularity is not "
             "supported yet.",
-            i, params.input_dims[i], kPackedSize);
+            i, params.input_last_dims[i], kPackedSize);
         // Make rounded_input_dims[i] a multiple of 32 * kPackedSize
         rounded_input_dims[i]
-            = (params.input_dims[i] + input_chunk_per_warp - 1) / input_chunk_per_warp * input_chunk_per_warp;
+            = (params.input_last_dims[i] + input_chunk_per_warp - 1) / input_chunk_per_warp * input_chunk_per_warp;
     }
 
     // Calculate total warps to launch and rounds needed
@@ -588,17 +585,18 @@ void GroupRMSNormKernelLargeBatch(GroupRMSParams<n> params)
 
     for (uint32_t i = 0; i < params.num_inputs; i++)
     {
-        TLLM_CHECK_WITH_INFO(params.input_dims[i] % 32 == 0, "Input dimension must be divisible by 32.");
-        TLLM_CHECK_WITH_INFO(params.input_dims[i] % kPackedSize == 0,
+        TLLM_CHECK_WITH_INFO(
+            params.input_last_dims[i] % 32 == 0, "The last dimension of input must be divisible by 32.");
+        TLLM_CHECK_WITH_INFO(params.input_last_dims[i] % kPackedSize == 0,
             "Input[%u] dimension %u is not divisible by %u (128b / sizeof(dype)). Finer granularity is not "
             "supported yet.",
-            i, params.input_dims[i], kPackedSize);
+            i, params.input_last_dims[i], kPackedSize);
     }
 
     // Calculate warps needed for each input
     uint32_t input_chunk_per_warp = 32 * kPackedSize;
-    uint32_t warps_needed_0 = (params.input_dims[0] + input_chunk_per_warp - 1) / input_chunk_per_warp;
-    uint32_t warps_needed_1 = (params.input_dims[1] + input_chunk_per_warp - 1) / input_chunk_per_warp;
+    uint32_t warps_needed_0 = (params.input_last_dims[0] + input_chunk_per_warp - 1) / input_chunk_per_warp;
+    uint32_t warps_needed_1 = (params.input_last_dims[1] + input_chunk_per_warp - 1) / input_chunk_per_warp;
     uint32_t num_warps_to_launch_0 = std::min((uint32_t) 32, warps_needed_0);
     uint32_t num_warps_to_launch_1 = std::min((uint32_t) 32, warps_needed_1);
 

@@ -328,7 +328,6 @@ def _register_fake():
         weights: List[torch.Tensor],
         eps: float,
         weight_bias: float,
-        enable_weights: bool = False,
     ) -> None:
         pass
 
@@ -339,9 +338,8 @@ def _register_fake():
         weights: List[torch.Tensor],
         eps: float,
         weight_bias: float,
-        enable_weights: bool = False,
-    ) -> None:
-        pass
+    ) -> List[torch.Tensor]:
+        return outputs
 
     @torch.library.custom_op("trtllm::group_rms_norm_large_batch",
                              mutates_args=("outputs", ))
@@ -351,7 +349,6 @@ def _register_fake():
         weights: List[torch.Tensor],
         eps: float,
         weight_bias: float,
-        enable_weights: bool = False,
     ) -> None:
         pass
 
@@ -362,6 +359,5 @@ def _register_fake():
         weights: List[torch.Tensor],
         eps: float,
         weight_bias: float,
-        enable_weights: bool = False,
-    ) -> None:
-        pass
+    ) -> List[torch.Tensor]:
+        return outputs
