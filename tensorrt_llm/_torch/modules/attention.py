@@ -42,8 +42,9 @@ class Attention(nn.Module):
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
         if config:
-            self.head_dim = getattr(config.pretrained_config, "head_dim", self.hidden_size // self.num_heads)
-        else: 
+            self.head_dim = getattr(config.pretrained_config, "head_dim",
+                                    self.hidden_size // self.num_heads)
+        else:
             self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_heads = num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
@@ -186,15 +187,17 @@ class Attention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
                                 dim=-1)
             # Add qk-norm
-            q_l2norm = lambda: self.q_norm(q.reshape(-1, self.head_dim)).reshape(-1, self.q_size)
-            k_l2norm = lambda: self.k_norm(k.reshape(-1, self.head_dim)).reshape(-1, self.kv_size)
+            q_l2norm = lambda: self.q_norm(q.reshape(-1, self.head_dim)
+                                           ).reshape(-1, self.q_size)
+            k_l2norm = lambda: self.k_norm(k.reshape(-1, self.head_dim)
+                                           ).reshape(-1, self.kv_size)
             q, k = maybe_execute_in_parallel(
-                    q_l2norm,
-                    k_l2norm,
-                    self.ln_events[0],
-                    self.ln_events[1],
-                    self.aux_stream,
-                )
+                q_l2norm,
+                k_l2norm,
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
             q, k = self.rotary_emb(position_ids, [q, k])
         out_scale = None
 
