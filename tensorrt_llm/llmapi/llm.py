@@ -108,6 +108,7 @@ class LLM:
                  **kwargs: Any) -> None:
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
+
         try:
             self.pytorch_backend_config = kwargs.pop('pytorch_backend_config',
                                                      None)

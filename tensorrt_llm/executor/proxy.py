@@ -36,14 +36,16 @@ __all__ = [
 class ExecutorBindingsProxy(GenerationExecutor):
     READY_SIGNAL = b"READY"
 
-    def __init__(self,
-                 worker_kwargs: dict,
-                 model_world_size: int = 1,
-                 mpi_session: Optional[MpiSession] = None,
-                 *,
-                 worker_cls: type = ExecutorBindingsWorker,
-                 postproc_worker_config: Optional[PostprocWorkerConfig] = None,
-                 is_llm_executor: Optional[bool] = None) -> None:
+    def __init__(
+        self,
+        worker_kwargs: dict,
+        model_world_size: int = 1,
+        mpi_session: Optional[MpiSession] = None,
+        *,
+        worker_cls: type = ExecutorBindingsWorker,
+        postproc_worker_config: Optional[PostprocWorkerConfig] = None,
+        is_llm_executor: Optional[bool] = None,
+    ) -> None:
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
         )
         super().__init__(
