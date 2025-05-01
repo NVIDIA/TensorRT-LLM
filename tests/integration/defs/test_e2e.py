@@ -1672,6 +1672,41 @@ def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
     ])
 
 
+@pytest.mark.skip_less_device_memory(110000)
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("model_name,model_path", [
+    pytest.param(
+        'DeepSeek-R1', 'DeepSeek-R1/DeepSeek-R1', marks=skip_pre_hopper),
+])
+def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
+        llm_root, llm_venv, model_name, model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--enable_overlap_scheduler",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--moe_tp_size=1",
+        "--moe_ep_size=8",
+        "--tp_size=8",
+        "--use_cuda_graph",
+        "--kv_cache_fraction=0.95",
+        "--max_batch_size=1",
+        "--max_seq_len=3000",
+        "--disable_kv_cache_reuse",
+        "--spec_decode_algo",
+        "MTP",
+        "--spec_decode_nextn",
+        "5",
+        "--use_relaxed_acceptance_for_thinking",
+        "--relaxed_topk=10",
+        "--relaxed_delta=0.5",
+    ])
+    # TODO: relaxed acceptance is incompatible with attention dp
+    # "--enable_attention_dp"
+
+
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("model_name,model_path", [

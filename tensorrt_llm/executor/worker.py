@@ -35,7 +35,8 @@ from .postproc_worker import (PostprocParams, PostprocWorker,
                               PostprocWorkerConfig, postproc_worker_main)
 from .request import (CancellingRequest, GenerationRequest, LoRARequest,
                       PromptAdapterRequest)
-from .result import GenerationResult, IterationResult
+from .result import (GenerationResult, IterationResult, LogProbsResult,
+                     ResponseWrapper, compute_logprobs)
 from .utils import (PERIODICAL_RESP_IN_AWAIT, ErrorResponse, IntraProcessQueue,
                     RequestError, WorkerCommIpcAddrs, has_event_loop,
                     is_llm_response)
@@ -215,6 +216,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 logger.warning(
                     f"Request of client_id {client_id} is finished, cannot abort it."
                 )
+                return
             self.engine.cancel_request(request_id)
 
     def _engine_response_callback(self, response: tllm.Response):
@@ -330,10 +332,11 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
         prompt_token_ids = copy.deepcopy(request.prompt_token_ids)
         prompt_tuning_config = None
+        multimodal_embedding = None
         mrope_config = None
+        if request.multimodal_embedding is not None:
+            multimodal_embedding = request.multimodal_embedding
         if request.prompt_adapter_request is not None:
-            assert request.prompt_tuning_config is None, \
-                "cannot accept both prompt_adapter_request and prompt_tuning_config in one request"
             self._load_prompt_adapter(request.prompt_adapter_request)
             uid = str(request.prompt_adapter_request.adapter_id)
             prompt_tuning_config = tllm.PromptTuningConfig(
@@ -342,9 +345,6 @@ class ExecutorBindingsWorker(GenerationExecutor):
             pa_length = prompt_tuning_config.embedding_table.size(0)
             prompt_token_ids = list(range(
                 vocab_size, vocab_size + pa_length)) + prompt_token_ids
-        elif request.prompt_tuning_config is not None:
-            prompt_tuning_config = tllm.PromptTuningConfig(
-                request.prompt_tuning_config[0])
 
         if request.mrope_config is not None:
             mrope_config = tllm.MropeConfig(**request.mrope_config)
@@ -393,6 +393,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 embedding_bias=request.sampling_params.embedding_bias,
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
+                multimodal_embedding=multimodal_embedding,
                 mrope_config=mrope_config,
                 logits_post_processor_name=(
                     tllm.Request.BATCHED_POST_PROCESSOR_NAME
@@ -437,11 +438,14 @@ class ExecutorBindingsWorker(GenerationExecutor):
         if request.id is None:
             request.set_id(client_id)
 
+        logprob_params = self._get_logprob_params(request)
+
         result = GenerationResult(
             request,
             background_error_handler=self._handle_background_error,
             executor=self,
-            disaggregated_params=request.disaggregated_params)
+            disaggregated_params=request.disaggregated_params,
+            logprob_params=logprob_params)
 
         self._results[client_id] = result
 
@@ -772,6 +776,10 @@ class AwaitResponseHelper:
             assert response is not None
             queue = self.worker.return_queue(response.client_id)
 
+            logprobs_result = _get_logprobs(self.worker, response)
+            if logprobs_result:
+                response = ResponseWrapper(response, logprobs_result)
+
             # For AsyncQueue.sync_q, we will batch the events to avoid too many
             # event notifications, thus put without wait here.
             if isinstance(queue, _SyncQueue):
@@ -808,6 +816,10 @@ class AwaitResponseHelper:
                     response = ErrorResponse(response.client_id,
                                              response.error_msg,
                                              response.request_id)
+                else:
+                    logprobs_result = _get_logprobs(self.worker, response)
+                    if logprobs_result:
+                        response = ResponseWrapper(response, logprobs_result)
 
                 # TODO: To verify the performance of using ZMQ instead of SharedMemory
                 # to send the logits tensor back to the Proxy process.
@@ -830,6 +842,10 @@ class AwaitResponseHelper:
                 # serialized when it has error.
                 response = ErrorResponse(response.client_id, response.error_msg,
                                          response.request_id)
+            else:
+                logprobs_result = _get_logprobs(self.worker, response)
+                if logprobs_result:
+                    response = ResponseWrapper(response, logprobs_result)
 
             _send_rsp(self.worker,
                       response,
@@ -856,9 +872,38 @@ def _get_params_for_first_rsp(
     return None, None
 
 
+def _get_logprobs(worker, response: tllm.Response) -> Optional[LogProbsResult]:
+    """Compute logprob and prompt logprob and clear out logits if applicable.
+    """
+    logprobs_result = None
+    generation_result = worker._results.get(response.client_id, None)
+
+    if not generation_result:
+        return
+
+    logprob_params = getattr(generation_result, "_logprob_params", None)
+    if logprob_params:
+        logprobs_result = compute_logprobs(logprob_params.prompt_logprobs,
+                                           logprob_params.logprobs,
+                                           response.result.context_logits,
+                                           response.result.generation_logits,
+                                           response.result.output_token_ids[0])
+
+        if logprob_params.drop_context_logits:
+            response.clear_context_logits()
+
+        if logprob_params.drop_generation_logits:
+            response.clear_generation_logits()
+
+    if response.result.is_final:
+        generation_result.clear_logprob_params()
+
+    return logprobs_result
+
+
 def _send_rsp(
         worker,
-        response: Union[tllm.Response, ErrorResponse],
+        response: Union[tllm.Response, ResponseWrapper, ErrorResponse],
         postproc_batches: Optional[List[List["PostprocWorker.Input"]]] = None,
         rsp_batch: Optional[List[tllm.Response]] = None):
     # if postproc_batches is set, append to batch instead of putting to IpcQueue

@@ -4827,6 +4827,6 @@ def test_llm_llama_lookahead_single_gpu_summary(llama_example_root,
                                        tensorrt_llm_rouge1_threshold=15,
                                        dataset_dir=llm_datasets_root,
                                        rouge_dir=llm_rouge_root,
-                                       lookahead_config=[7, 7, 7])
+                                       lookahead_config='[7, 7, 7]')
 
     venv_check_call(llm_venv, summary_cmd)

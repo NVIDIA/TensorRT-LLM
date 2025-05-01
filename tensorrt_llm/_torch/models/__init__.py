@@ -13,6 +13,8 @@ from .modeling_nemotron_nas import NemotronNASForCausalLM
 from .modeling_qwen import (Qwen2ForCausalLM, Qwen2ForProcessRewardModel,
                             Qwen2ForRewardModel)
 from .modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
+from .modeling_qwen3 import Qwen3ForCausalLM
+from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .modeling_qwen_moe import Qwen2MoeForCausalLM
 from .modeling_utils import get_model_architecture
 from .modeling_vila import VilaModel
@@ -37,6 +39,8 @@ __all__ = [
     "VilaModel",
     "Qwen2VLModel",
     "Qwen2_5_VLModel",
+    "Qwen3ForCausalLM",
+    "Qwen3MoeForCausalLM",
 ]
 
 if transformers.__version__ >= "4.45.1":
