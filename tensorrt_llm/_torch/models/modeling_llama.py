@@ -846,7 +846,7 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
 
 
 @register_auto_model("Llama4ForCausalLM")
-class Llama4ForCausalLM(DecoderModelForCausalLM[LlamaModel, Llama4Config]):
+class Llama4ForCausalLM(DecoderModelForCausalLM[Llama4Model, Llama4Config]):
 
     def __init__(
         self,
