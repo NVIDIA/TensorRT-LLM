@@ -508,7 +508,9 @@ class DecoderModelForCausalLM(nn.Module,
 
     def load_weights(self, weights: Dict):
         tp_size = self.model_config.mapping.tp_size
-        head_dim = self.config.hidden_size // self.config.num_attention_heads
+        head_dim = getattr(
+            self.config, "head_dim",
+            self.config.hidden_size // self.config.num_attention_heads)
 
         def filter_weights(prefix, weights: Dict):
             result = {}
