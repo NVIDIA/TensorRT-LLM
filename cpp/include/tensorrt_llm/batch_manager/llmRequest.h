@@ -95,7 +95,7 @@ public:
     using RequestPtr = std::shared_ptr<GenericLlmRequest>;
     using MillisecondsType = std::chrono::milliseconds;
 
-    // 45 parameters, 52 items in initialization list
+    // 46 parameters, 53 items in initialization list
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -103,6 +103,7 @@ public:
         std::optional<std::shared_ptr<std::vector<SizeType32>>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
+        std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
@@ -147,6 +148,7 @@ public:
         , mPositionIds(std::move(positionIds))
         , mPromptEmbeddingTable(std::move(promptEmbeddingTable))
         , mPromptVocabSize(promptVocabSize)
+        , mMultimodalEmbedding(std::move(multimodalEmbedding))
         , mMropeRotaryCosSin(std::move(mropeRotaryCosSin))
         , mMropePositionDeltas(mropePositionDeltas)
         , mLoraTaskId(loraTaskId)
@@ -852,6 +854,11 @@ public:
     [[nodiscard]] std::optional<SizeType32> getPromptVocabSize() const
     {
         return mPromptVocabSize;
+    }
+
+    [[nodiscard]] std::optional<TensorPtr> getMultimodalEmbedding() const
+    {
+        return mMultimodalEmbedding;
     }
 
     [[nodiscard]] std::optional<TensorPtr> getMropeRotaryCosSin() const
@@ -1818,6 +1825,7 @@ protected:
 
     std::optional<TensorPtr> mPromptEmbeddingTable{std::nullopt};
     std::optional<SizeType32> mPromptVocabSize{std::nullopt};
+    std::optional<TensorPtr> mMultimodalEmbedding{std::nullopt};
     std::optional<TensorPtr> mMropeRotaryCosSin{std::nullopt};
     std::optional<SizeType32> mMropePositionDeltas{std::nullopt};
 
@@ -2076,7 +2084,7 @@ public:
     using TokenExtraIdType = Base::TokenExtraIdType;
     using VecTokenExtraIds = Base::VecTokenExtraIds;
 
-    // 45 parameters, 45 parameters in Base class constructor
+    // 46 parameters, 46 parameters in Base class constructor
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -2084,6 +2092,7 @@ public:
         std::optional<std::shared_ptr<std::vector<SizeType32>>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
+        std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
@@ -2111,19 +2120,19 @@ public:
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
         : Base(requestId, maxNewTokens, std::move(inputTokens), samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList), std::move(positionIds),
-            std::move(promptEmbeddingTable), promptVocabSize, std::move(mropeRotaryCosSin), mropePositionDeltas,
-            loraTaskId, std::move(loraWeights), std::move(loraConfig), std::move(lookaheadConfig),
-            std::move(kvCacheRetentionConfig), returnLogProbs, returnContextLogits, returnGenerationLogits,
-            std::move(draftTokens), std::move(draftLogits), excludeInputFromOutput, std::move(logitsPostProcessor),
-            applyLogitsPostProcessorBatched, std::move(encoderInputTokens), returnEncoderOutput, clientId, priority,
-            std::move(encoderInputFeatures), std::move(encoderOutputLength), std::move(crossAttentionMask),
-            llmRequestType, std::move(inputTokenExtraIds), numReturnSequences, std::move(eagleConfig),
-            std::move(skipCrossAttnBlocks), returnPerfMetrics, std::move(guidedDecodingParams), languageAdapterUid,
-            allottedTimeMs, contextPhaseParams)
+            std::move(promptEmbeddingTable), promptVocabSize, std::move(multimodalEmbedding),
+            std::move(mropeRotaryCosSin), mropePositionDeltas, loraTaskId, std::move(loraWeights),
+            std::move(loraConfig), std::move(lookaheadConfig), std::move(kvCacheRetentionConfig), returnLogProbs,
+            returnContextLogits, returnGenerationLogits, std::move(draftTokens), std::move(draftLogits),
+            excludeInputFromOutput, std::move(logitsPostProcessor), applyLogitsPostProcessorBatched,
+            std::move(encoderInputTokens), returnEncoderOutput, clientId, priority, std::move(encoderInputFeatures),
+            std::move(encoderOutputLength), std::move(crossAttentionMask), llmRequestType,
+            std::move(inputTokenExtraIds), numReturnSequences, std::move(eagleConfig), std::move(skipCrossAttnBlocks),
+            returnPerfMetrics, std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams)
     {
     }
 
-    // 45 parameters, 45 parameters in Base class constructor
+    // 46 parameters, 46 parameters in Base class constructor
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -2131,6 +2140,7 @@ public:
         std::optional<std::vector<SizeType32>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
+        std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
@@ -2159,9 +2169,10 @@ public:
             std::move(stopWordsList),
             positionIds.has_value() ? std::make_shared<std::vector<SizeType32>>(std::move(positionIds.value()))
                                     : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
-            std::move(promptEmbeddingTable), promptVocabSize, std::move(mropeRotaryCosSin), mropePositionDeltas,
-            loraTaskId, std::move(loraWeights), std::move(loraConfig), lookaheadConfig,
-            std::move(kvCacheRetentionConfig), returnLogProbs, returnContextLogits, returnGenerationLogits,
+            std::move(promptEmbeddingTable), promptVocabSize, std::move(multimodalEmbedding),
+            std::move(mropeRotaryCosSin), mropePositionDeltas, loraTaskId, std::move(loraWeights),
+            std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig), returnLogProbs,
+            returnContextLogits, returnGenerationLogits,
             draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))
                                     : std::make_shared<VecTokens>(),
             std::move(draftLogits), excludeInputFromOutput, std::move(logitsPostProcessor),

@@ -937,9 +937,7 @@ class Llama4InputProcessor(InputProcessor):
             mm_embeds = self.encoder.multi_modal_projector(mm_embeds)
             # for fuse_input_embeds
             token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
-            return token_ids.tolist(), {
-                "prompt_tuning_config": [mm_embeds, None, None]
-            }
+            return token_ids.tolist(), {"mm_embedding": mm_embeds}
         else:
             return processed["input_ids"].squeeze().tolist(), {}
 
