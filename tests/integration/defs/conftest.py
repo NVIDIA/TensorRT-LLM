@@ -183,6 +183,13 @@ def llm_root():
 
 
 @pytest.fixture(scope="session")
+def llm_backend_root():
+    llm_root_directory = get_llm_root()
+    llm_backend_repo_root = os.path.join(llm_root_directory, "triton_backend")
+    return llm_backend_repo_root
+
+
+@pytest.fixture(scope="session")
 def llm_datasets_root() -> str:
     return os.path.join(llm_models_root(), "datasets")
 
@@ -2316,3 +2323,12 @@ def disaggregated_test_root(llm_root, llm_venv):
                                       "tests/integration/defs/disaggregated")
 
     return disaggregated_root
+
+
+@pytest.fixture(scope="function")
+def tritonserver_test_root(llm_root):
+    "Get tritonserver test root"
+    tritonserver_root = os.path.join(llm_root,
+                                     "tests/integration/defs/triton_server")
+
+    return tritonserver_root
