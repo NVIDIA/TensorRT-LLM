@@ -2,7 +2,7 @@ import json
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
-from typing import List, Optional, Tuple, Union
+from typing import List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from pydantic import BaseModel
@@ -35,6 +35,15 @@ class GuidedDecodingParams:
             raise ValueError(
                 f"Only one guide can be used for a request, but got {num_guides}."
             )
+
+
+class LogprobParams(NamedTuple):
+    prompt_logprobs: Optional[int] = None
+    logprobs: Optional[int] = None
+    # Drop the logits once the logprobs are computed
+    drop_context_logits: bool = False
+    # Drop the geneation_logits once the logprobs are computed
+    drop_generation_logits: bool = False
 
 
 class LogitsProcessor(ABC):
@@ -149,6 +158,8 @@ class SamplingParams:
         beam_width_array (List[int], optional): The array of beam width using in Variable-Beam-Width-Search. Defaults to None.
 
         return_log_probs (bool): Controls if Result should contain log probabilities. Defaults to False.
+        logprobs (int, optional): Number of log probabilities to return per output token. Defaults to None.
+        prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. Defaults to None.
         return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.
         return_generation_logits (bool): Controls if Result should contain the generation logits. Defaults to False.
         exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Defaults to True.
@@ -224,13 +235,20 @@ class SamplingParams:
     beam_width_array: Optional[List[int]] = None
 
     # Keep the below fields in sync with tllme.OutputConfig
-    return_log_probs: bool = False
+    return_log_probs: bool = False  # TODO: to be removed after PyTorch flow migrate to use `logprobs`
+    logprobs: Optional[int] = None
+    prompt_logprobs: Optional[int] = None
     return_context_logits: bool = False
     return_generation_logits: bool = False
     exclude_input_from_output: bool = True
     return_encoder_output: bool = False
     return_perf_metrics: bool = False
     additional_model_outputs: Optional[List[AdditionalModelOutput]] = None
+
+    # Used in logprobs calculation in TRT flow to drop logits early if user did not explicitly request them.
+    # Can be deprecated after migration to PyTorch backend.
+    _context_logits_auto_enabled: bool = False
+    _generation_logits_auto_enabled: bool = False
 
     # Lookahead decoding config
     lookahead_config: Optional[tllme.LookaheadDecodingConfig] = None
@@ -280,13 +298,6 @@ class SamplingParams:
 
         self.best_of = self.best_of or self.n
 
-        if (not self.use_beam_search and self.n < self.best_of
-                and not self.return_log_probs):
-            logger.info(
-                f"Enable 'return_log_probs' to trim the {self.n}-best among "
-                f"{self.best_of} outputs under sampling decoding.")
-            self.return_log_probs = True
-
         self._validate()
 
     def _validate(self):
@@ -326,6 +337,14 @@ class SamplingParams:
         return (not self.use_beam_search
                 and (self.top_k is None or self.top_k == 1)
                 and (self.top_p is None or self.top_p == 0.0))
+
+    @property
+    def _need_return_context_logits(self) -> bool:
+        return self.return_context_logits and not self._context_logits_auto_enabled
+
+    @property
+    def _need_return_generation_logits(self) -> bool:
+        return self.return_generation_logits and not self._generation_logits_auto_enabled
 
     def _setup(self,
                tokenizer,
@@ -429,7 +448,11 @@ class SamplingParams:
         return tllme.SamplingConfig(**llmapi_to_rt_param_map)
 
     def _get_output_config(self) -> tllme.OutputConfig:
-        fields = [f for f in dir(tllme.OutputConfig) if not f.startswith('__')]
+        sampling_param_fields = set(dir(SamplingParams))
+        fields = [
+            f for f in dir(tllme.OutputConfig)
+            if not f.startswith('__') and f in sampling_param_fields
+        ]
         return tllme.OutputConfig(**{f: getattr(self, f) for f in fields})
 
     def _get_guided_decoding_params(self) -> tllme.GuidedDecodingParams:

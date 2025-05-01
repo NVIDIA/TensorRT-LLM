@@ -770,6 +770,24 @@ void initRequestBindings(pybind11::module_& m)
         .def("has_error", &tle::Response::hasError)
         .def_property_readonly("error_msg", &tle::Response::getErrorMsg)
         .def_property_readonly("result", &tle::Response::getResult)
+        .def("clear_context_logits",
+            [](tle::Response& self)
+            {
+                if (!self.hasError())
+                {
+                    auto& result = const_cast<tle::Result&>(self.getResult());
+                    result.contextLogits.reset();
+                }
+            })
+        .def("clear_generation_logits",
+            [](tle::Response& self)
+            {
+                if (!self.hasError())
+                {
+                    auto& result = const_cast<tle::Result&>(self.getResult());
+                    result.generationLogits.reset();
+                }
+            })
         .def(py::pickle(responseGetstate, responseSetstate));
 }
 
