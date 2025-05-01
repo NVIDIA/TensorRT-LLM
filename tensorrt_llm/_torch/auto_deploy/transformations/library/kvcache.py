@@ -230,8 +230,7 @@ def insert_mla_with_kv_cache(
 def resize_kv_cache(
     egm: GraphModule, 
     cm: CachedSequenceInterface, 
-    local_rank, 
-    world_size, 
+    world_size: int, 
     free_mem_ratio: float = 0.8, 
 ) -> None:
     """Inflate the kv cache to occupy the available GPU memory.
