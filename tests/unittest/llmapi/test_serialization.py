@@ -12,6 +12,9 @@ class TestClass:
 def test_serialization_allowed_class():
     obj = TestClass("test")
     serialization.register_approved_ipc_class(TestClass)
+    module = TestClass.__module__
+    assert module in serialization.BASE_ZMQ_CLASSES
+    assert "TestClass" in serialization.BASE_ZMQ_CLASSES[module]
     a = serialization.dumps(obj)
     b = serialization.loads(a, approved_imports=serialization.BASE_ZMQ_CLASSES)
     assert type(obj) == type(b) and obj.name == b.name
