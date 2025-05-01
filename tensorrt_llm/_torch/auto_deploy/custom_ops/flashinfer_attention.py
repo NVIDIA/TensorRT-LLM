@@ -253,20 +253,12 @@ def prepare_flashinfer_metadata(
     paged_kv_indptr_decode[1:] = torch.cumsum(pages_per_seq[num_context_requests:num_seq], 0)
 
     # paged_kv_indices for prefill and decode
-    paged_kv_indices_prefill = paged_kv_indices[:num_context_pages]
-    paged_kv_indices_decode = paged_kv_indices[num_context_pages:]
+    paged_kv_indices_prefill = paged_kv_indices[:num_context_pages].clone()
+    paged_kv_indices_decode = paged_kv_indices[num_context_pages:].clone()
 
-    paged_kv_last_page_len_prefill = paged_kv_last_page_len[:num_context_requests]
-    paged_kv_last_page_len_decode = paged_kv_last_page_len[num_context_requests:]
+    paged_kv_last_page_len_prefill = paged_kv_last_page_len[:num_context_requests].clone()
+    paged_kv_last_page_len_decode = paged_kv_last_page_len[num_context_requests:].clone()
 
-    print(f"paged_kv_indptr: {paged_kv_indptr}")
-
-    print(f"paged_kv_indptr_prefill: {paged_kv_indptr_prefill}")
-    print(f"paged_kv_indptr_decode: {paged_kv_indptr_decode}")
-    print(f"paged_kv_indices_prefill: {paged_kv_indices_prefill}")
-    print(f"paged_kv_indices_decode: {paged_kv_indices_decode}")
-    print(f"paged_kv_last_page_len_prefill: {paged_kv_last_page_len_prefill}")
-    print(f"paged_kv_last_page_len_decode: {paged_kv_last_page_len_decode}")
     # return metadata
     return (
         qo_indptr,
@@ -276,7 +268,11 @@ def prepare_flashinfer_metadata(
         paged_kv_indptr_prefill,
         paged_kv_indptr_decode,
         paged_kv_indices,
+        paged_kv_indices_prefill,
+        paged_kv_indices_decode,
         paged_kv_last_page_len,
+        paged_kv_last_page_len_prefill,
+        paged_kv_last_page_len_decode,
         offsets,
     )
 
@@ -291,6 +287,12 @@ def prepare_flashinfer_metadata_fake(
     paged_kv_indptr = torch.empty_like(qo_indptr)
     paged_kv_indptr_prefill = torch.empty_like(qo_indptr)
     paged_kv_indptr_decode = torch.empty_like(qo_indptr)
+    paged_kv_indices = torch.empty_like(cache_loc)
+    paged_kv_indices_prefill = torch.empty_like(cache_loc)
+    paged_kv_indices_decode = torch.empty_like(cache_loc)
+    paged_kv_last_page_len = torch.empty_like(seq_len)
+    paged_kv_last_page_len_prefill = torch.empty_like(seq_len)
+    paged_kv_last_page_len_decode = torch.empty_like(seq_len)
     return (
         qo_indptr,  # qo_indptr
         qo_indptr_prefill,
@@ -298,6 +300,12 @@ def prepare_flashinfer_metadata_fake(
         paged_kv_indptr,  # paged_kv_indptr
         paged_kv_indptr_prefill,
         paged_kv_indptr_decode,
+        paged_kv_indices,
+        paged_kv_indices_prefill,
+        paged_kv_indices_decode,
+        paged_kv_last_page_len,
+        paged_kv_last_page_len_prefill,
+        paged_kv_last_page_len_decode,
         torch.empty_like(cache_loc),  # paged_kv_indices
         torch.empty_like(seq_len),  # paged_kv_last_page_len
         torch.empty_like(input_pos),  # offsets
@@ -318,7 +326,11 @@ def flashinfer_mha_with_cache(
     paged_kv_indptr_prefill: torch.Tensor,
     paged_kv_indptr_decode: torch.Tensor,
     paged_kv_indices: torch.Tensor,
+    paged_kv_indices_prefill: torch.Tensor,
+    paged_kv_indices_decode: torch.Tensor,
     paged_kv_last_page_len: torch.Tensor,
+    paged_kv_last_page_len_prefill: torch.Tensor,
+    paged_kv_last_page_len_decode: torch.Tensor,
     offsets: torch.Tensor,
     # CACHES
     k_cache: torch.Tensor,
@@ -377,6 +389,7 @@ def flashinfer_mha_with_cache(
         paged_kv_last_page_len,
     )
 
+    num_context_tokens = qo_indptr_prefill[-1]
     y = []
     # Batch containing context requests
     if len(qo_indptr_prefill) > 1:
@@ -396,13 +409,13 @@ def flashinfer_mha_with_cache(
         _GlobalFlashInferPlanner.plan_prefill(
             qo_indptr_prefill,
             paged_kv_indptr_prefill,
-            paged_kv_indices,
-            paged_kv_last_page_len,
+            paged_kv_indices_prefill,
+            paged_kv_last_page_len_prefill,
             pp,
         )
         y.append(
             _GlobalFlashInferPlanner.prefill_wrapper.run(
-                q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale
+                q[:num_context_tokens], (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale
             )
         )
     # Batch containing generate requests
@@ -422,13 +435,13 @@ def flashinfer_mha_with_cache(
         )
         _GlobalFlashInferPlanner.plan_decode(
             paged_kv_indptr_decode,
-            paged_kv_indices,
-            paged_kv_last_page_len,
+            paged_kv_indices_decode,
+            paged_kv_last_page_len_decode,
             pp,
         )
         y.append(
             _GlobalFlashInferPlanner.decode_wrapper.run(
-                q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale
+                q[num_context_tokens:], (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale
             )
         )
 
@@ -451,7 +464,11 @@ def flashinfer_mha_with_cache_fake(
     paged_kv_indptr_prefill: torch.Tensor,
     paged_kv_indptr_decode: torch.Tensor,
     paged_kv_indices: torch.Tensor,
+    paged_kv_indices_prefill: torch.Tensor,
+    paged_kv_indices_decode: torch.Tensor,
     paged_kv_last_page_len: torch.Tensor,
+    paged_kv_last_page_len_prefill: torch.Tensor,
+    paged_kv_last_page_len_decode: torch.Tensor,
     offsets: torch.Tensor,
     # CACHES
     k_cache: torch.Tensor,
@@ -482,7 +499,7 @@ class FlashInferAttention(AttentionDescriptor):
 
     @classmethod
     def get_prepare_metadata_op(cls):
-        return torch.ops.attention.prepare_flashinfer_metadata, 9
+        return torch.ops.attention.prepare_flashinfer_metadata, 13
 
     @classmethod
     def get_cache_initializers(cls, get_info):

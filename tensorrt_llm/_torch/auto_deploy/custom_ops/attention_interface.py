@@ -330,7 +330,7 @@ class SequenceInfo:
             dtype=torch.int,
             device=self.device,
         )
-        self.pages_per_seq.fill_(seq_len // self.page_size)
+        self.pages_per_seq.fill_((seq_len + self.page_size - 1) // self.page_size)
         self.nest_sequences(input_ids)
 
     def _set_generate_only_batch(self) -> None:
