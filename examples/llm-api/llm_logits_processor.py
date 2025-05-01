@@ -3,6 +3,7 @@ from typing import List, Optional
 
 import torch
 
+import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm import LLM
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
                                           LogitsProcessor, SamplingParams)
@@ -68,12 +69,13 @@ class MyBatchedLogitsProcessor(BatchedLogitsProcessor):
 
 def main():
 
+    serialization.register_approved_ipc_class(MyLogitsProcessor)
+
     # Batched logits processor (only supported in TensorRT backend)
     # should be specified when initializing LLM.
     llm = LLM(
         model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        batched_logits_processor=MyBatchedLogitsProcessor(allowed_token_id=42),
-        additional_serializable_classes={"__main__": ["MyLogitsProcessor"]})
+        batched_logits_processor=MyBatchedLogitsProcessor(allowed_token_id=42))
 
     # Sample prompts
     prompts = [

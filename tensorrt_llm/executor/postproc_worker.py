@@ -8,6 +8,8 @@ from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
 import zmq
 import zmq.asyncio
 
+import tensorrt_llm.executor.serialization as serialization
+
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..llmapi.tokenizer import TransformersTokenizer, load_hf_tokenizer
@@ -77,7 +79,7 @@ class PostprocWorker:
         tokenizer_dir: str,
         record_creator: Callable[
             ["PostprocWorker.Input", TransformersTokenizer], Any],
-        additional_serializable_classes: Optional[Dict] = None,
+        BASE_ZMQ_CLASSES: Dict,
     ):
         '''
         Args:
@@ -87,22 +89,18 @@ class PostprocWorker:
             record_creator (Callable[["ResponsePostprocessWorker.Input"], Any]): A creator for creating a record for a request.
             result_handler (Optional[Callable[[GenerationResultBase], Any]]): A callback handles the final result.
         '''
-
+        serialization.BASE_ZMQ_CLASSES = BASE_ZMQ_CLASSES
         self._records: Dict[int, GenerationResult] = {}
         self._record_creator = record_creator
-        self._pull_pipe = ZeroMqQueue(
-            address=pull_pipe_addr,
-            is_async=True,
-            is_server=False,
-            name="postprocess_pull_pipe",
-            additional_serializable_classes=additional_serializable_classes)
-        self._push_pipe = ZeroMqQueue(
-            address=push_pipe_addr,
-            is_async=True,
-            is_server=False,
-            socket_type=zmq.PUSH,
-            name="postprocess_push_pipe",
-            additional_serializable_classes=additional_serializable_classes)
+        self._pull_pipe = ZeroMqQueue(address=pull_pipe_addr,
+                                      is_async=True,
+                                      is_server=False,
+                                      name="postprocess_pull_pipe")
+        self._push_pipe = ZeroMqQueue(address=push_pipe_addr,
+                                      is_async=True,
+                                      is_server=False,
+                                      socket_type=zmq.PUSH,
+                                      name="postprocess_push_pipe")
         self._to_stop = asyncio.Event()
 
         self._q = deque()
@@ -216,16 +214,13 @@ class PostprocWorker:
 
 
 @print_traceback_on_error
-def postproc_worker_main(
-        feedin_ipc_addr: tuple[str, Optional[bytes]],
-        feedout_ipc_addr: tuple[str, Optional[bytes]],
-        tokenizer_dir: str,
-        record_creator: Callable,
-        additional_serializable_classes: Optional[Dict] = None):
-    worker = PostprocWorker(
-        feedin_ipc_addr,
-        feedout_ipc_addr,
-        tokenizer_dir=tokenizer_dir,
-        record_creator=record_creator,
-        additional_serializable_classes=additional_serializable_classes)
+def postproc_worker_main(feedin_ipc_addr: tuple[str, Optional[bytes]],
+                         feedout_ipc_addr: tuple[str, Optional[bytes]],
+                         tokenizer_dir: str, record_creator: Callable,
+                         BASE_ZMQ_CLASSES: Dict):
+    worker = PostprocWorker(feedin_ipc_addr,
+                            feedout_ipc_addr,
+                            tokenizer_dir=tokenizer_dir,
+                            record_creator=record_creator,
+                            BASE_ZMQ_CLASSES=BASE_ZMQ_CLASSES)
     worker.start()

@@ -5,8 +5,8 @@ import pickle  # nosec B403
 
 # These are the base classes that are generally serialized by the ZeroMQ IPC.
 # If a class is needed by ZMQ routinely it should be added here. If
-# it is only needed in a single instance the class can be passed into the ZMQ
-# constructor as additional_serializable_classes.
+# it is only needed in a single instance the class can be added at runtime
+# using register_approved_ipc_class.
 BASE_ZMQ_CLASSES = {
     "builtins": ["Exception"],
     "tensorrt_llm.executor.request":
@@ -29,8 +29,23 @@ BASE_ZMQ_CLASSES = {
     "datetime": ["timedelta"],
     "tensorrt_llm.llmapi.llm_args": ["LookaheadDecodingConfig"],
     "tensorrt_llm._torch.pyexecutor.llm_request":
-    ["LogitsStorage", "PyResult", "LlmResult", "LlmResponse", " "],
+    ["LogitsStorage", "PyResult", "LlmResult", "LlmResponse", "LogProbStorage"],
+    "tensorrt_llm.executor.utils": ["ErrorResponse"],
 }
+
+
+def _register_class(dict, obj):
+    name = getattr(obj, '__qualname__', None)
+    if name is None:
+        name = obj.__name__
+    module = pickle.whichmodule(obj, name)
+    if module not in BASE_ZMQ_CLASSES.keys():
+        BASE_ZMQ_CLASSES[module] = []
+    BASE_ZMQ_CLASSES[module].append(name)
+
+
+def register_approved_ipc_class(obj):
+    _register_class(BASE_ZMQ_CLASSES, obj)
 
 
 class Unpickler(pickle.Unpickler):
