@@ -228,7 +228,11 @@ def insert_mla_with_kv_cache(
 
 
 def resize_kv_cache(
-    egm: GraphModule, cm: CachedSequenceInterface, free_mem_ratio: float = 0.8
+    egm: GraphModule, 
+    cm: CachedSequenceInterface, 
+    local_rank, 
+    world_size, 
+    free_mem_ratio: float = 0.8, 
 ) -> None:
     """Inflate the kv cache to occupy the available GPU memory.
 
@@ -256,6 +260,13 @@ def resize_kv_cache(
 
         new_cache_size = free_mem_post * free_mem_ratio + current_cache_size
         new_num_pages = int(new_cache_size // (current_cache_size // current_num_pages))
+        # Need to sync all the GPUs
+#        if world_size > 1:
+        gathered_pages = [None] * world_size
+        torch.distributed.all_gather_object(gathered_pages, new_num_pages)
+        new_num_pages = min(gathered_pages)
+        ad_logger.info(f"After all_gather - new_num_pages: {new_num_pages}")
+    
         ad_logger.info(f"New cache size: {new_cache_size}, New num pages: {new_num_pages}")
         cm.resize_cache(new_num_pages)
     except Exception as e:
