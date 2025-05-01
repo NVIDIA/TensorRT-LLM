@@ -68,7 +68,7 @@ class MyBatchedLogitsProcessor(BatchedLogitsProcessor):
 
 
 def main():
-
+    # Register MyLogitsProcessor as an approved class for deserialization across IPC boundaries.
     serialization.register_approved_ipc_class(MyLogitsProcessor)
 
     # Batched logits processor (only supported in TensorRT backend)
