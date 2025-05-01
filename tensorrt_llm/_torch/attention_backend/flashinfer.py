@@ -13,6 +13,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ..utils import get_global_attrs, get_model_extra_attrs
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
                         PredefinedAttentionMask)
+from .utils import create_context_chunk_mask
 
 try:
     check_cuda_arch()
@@ -497,11 +498,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 print(
                     f"Processing context {i}: ctx_len={ctx_len}, kv_len={kv_len}"
                 )
-
-                # Create the standard causal mask directly on the target device
-                # torch.ones requires integer dimensions
-                attention_mask = torch.tril(
-                    torch.ones((ctx_len, kv_len), dtype=torch.bool, device=dev))
+                attention_mask = create_context_chunk_mask(
+                    kv_len, ctx_len, attention_chunk_size, dev)
 
                 # Flatten the attention mask (this creates a new tensor or view)
                 attention_mask_flat = attention_mask.flatten()

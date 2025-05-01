@@ -6,12 +6,28 @@ from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
                                  MTPDecodingConfig)
 
-example_prompts = [
-    "Hello, my name is",
-    "The president of the United States is",
-    "The capital of France is",
-    "The future of AI is",
+# example_prompts = [
+#     "Hello, my name is",
+#     "The president of the United States is",
+#     "The capital of France is",
+#     "The future of AI is",
+# ]
+
+example_prompts = []
+import os
+
+chunk_files = [
+    f for f in os.listdir('/my_scratch_space_1/opensource/')
+    if f.startswith('chunk_')
 ]
+print(chunk_files)
+for chunk_file in chunk_files:
+    print("Reading chunk file: ", chunk_file)
+    with open(chunk_file, "r", encoding="utf-8") as f:
+        chunk_text = f.read()
+        print("Reading only one chunk")
+        example_prompts.append(chunk_text)
+    break
 
 
 def add_llm_args(parser):
