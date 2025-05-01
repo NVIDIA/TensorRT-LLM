@@ -139,4 +139,6 @@ class WorkerCommIpcAddrs(NamedTuple):
 def is_llm_response(instance):
     from tensorrt_llm._torch.pyexecutor.llm_request import \
         LlmResponse as PyLlmResponse
-    return isinstance(instance, (Response, PyLlmResponse))
+
+    from .result import ResponseWrapper
+    return isinstance(instance, (Response, PyLlmResponse, ResponseWrapper))

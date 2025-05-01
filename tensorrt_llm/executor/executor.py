@@ -26,7 +26,8 @@ from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
 from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
                             enable_worker_single_process_for_tp1, print_colored,
                             print_colored_debug)
-from ..sampling_params import BatchedLogitsProcessor, SamplingParams
+from ..sampling_params import (BatchedLogitsProcessor, LogprobParams,
+                               SamplingParams)
 from .ipc import FusedIpcQueue
 from .postproc_worker import PostprocParams, PostprocWorkerConfig
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
@@ -203,6 +204,24 @@ class GenerationExecutor(ABC):
         # (self._last_client_id + 1) % UINT64_MAX
         self._last_client_id = (self._last_client_id + 1) & ((1 << 64) - 1)
         return self._last_client_id
+
+    def _get_logprob_params(
+            self, request: GenerationRequest) -> Optional[LogprobParams]:
+        """Store logprobs-related fields from request for the later logprob calculation."""
+        logprob_params = None
+        if request.sampling_params.logprobs or request.sampling_params.prompt_logprobs:
+            logprob_params = LogprobParams(
+                logprobs=request.sampling_params.logprobs,
+                prompt_logprobs=request.sampling_params.prompt_logprobs,
+                # drop logits if users didn't explicitly ask for it, or if it's using PostProcess flow
+                drop_context_logits=(
+                    not request.sampling_params._need_return_context_logits)
+                or self.postproc_config.num_postprocess_workers > 0,
+                drop_generation_logits=(
+                    not request.sampling_params._need_return_generation_logits)
+                or self.postproc_config.num_postprocess_workers > 0)
+
+        return logprob_params
 
     def _maybe_initialize_iteration_results(self):
         if self._is_llm_executor:

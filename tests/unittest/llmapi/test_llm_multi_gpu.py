@@ -3,6 +3,7 @@ import json
 import os
 import subprocess  # nosec B404
 import tempfile
+from typing import Optional
 
 import pytest
 from parameterized import parameterized
@@ -18,11 +19,12 @@ from tensorrt_llm.models.llama.model import LLaMAForCausalLM
 from .test_llm import (
     DummyError, DummyExecutorWorker3, _test_llm_capture_request_error,
     _test_llm_generate_async, check_llm_return_context_logits,
-    check_llm_return_generation_logits, default_model_name, get_model_path,
-    llama_7b_multi_lora_test_harness, llama_model_path,
-    llama_v2_7b_prompt_adapter_test_harness, llama_v2_13b_lora_test_harness,
-    llm_check_output, llm_get_stats_async_test_harness,
-    llm_get_stats_test_harness, llm_test_harness, mixtral_model_name, prompts,
+    check_llm_return_generation_logits, llm_return_logprobs_test_harness,
+    default_model_name, get_model_path, llama_7b_multi_lora_test_harness,
+    llama_model_path, llama_v2_7b_prompt_adapter_test_harness,
+    llama_v2_13b_lora_test_harness, llm_check_output,
+    llm_get_stats_async_test_harness, llm_get_stats_test_harness,
+    llm_test_harness, mixtral_model_name, prompts,
     tinyllama_guided_decoding_test_harness,
     tinyllama_logits_processor_test_harness, run_llm_with_postprocess_parallel,
     run_llm_with_postprocess_parallel_and_result_handler, run_llm_abort_request,
@@ -112,6 +114,23 @@ def test_llm_return_context_logits_tp2():
 @skip_single_gpu
 def test_llm_return_generation_logits_tp2():
     check_llm_return_generation_logits(tp_size=2)
+
+
+@skip_single_gpu
+@pytest.mark.parametrize(
+    "prompt_logprobs, logprobs, return_context_logits, return_generation_logits",
+    [
+        (2, 2, False, True),
+    ])
+def test_llm_return_logprobs_tp2(prompt_logprobs: Optional[int],
+                                 logprobs: Optional[int],
+                                 return_context_logits: bool,
+                                 return_generation_logits: bool):
+    llm_return_logprobs_test_harness(prompt_logprobs,
+                                     logprobs,
+                                     return_context_logits,
+                                     return_generation_logits,
+                                     tp_size=2)
 
 
 @pytest.mark.parametrize("use_auto_parallel", [True, False],
