@@ -1909,7 +1909,6 @@ protected:
     std::shared_ptr<std::vector<bool>> mSequenceFinalVec;
 
     std::optional<TensorPtr> mSkipCrossAttnBlocks{std::nullopt};
-    SizeType32 mNumVocabs; 
 
     // Performance metrics.
     bool mReturnPerfMetrics{false};

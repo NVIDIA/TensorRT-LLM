@@ -711,12 +711,7 @@ public:
     [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const;
     [[nodiscard]] std::optional<MillisecondsType> getAllottedTimeMs() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
-<<<<<<< HEAD
-
-=======
-    [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const;
     [[nodiscard]] SizeType32 getNumVocabs() const;
->>>>>>> Fixes to compilation
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
     void setOutputConfig(OutputConfig const& outputConfig);
@@ -748,12 +743,8 @@ public:
     void setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks);
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
     void setLanguageAdapterUid(SizeType32 languageAdapterUid);
-<<<<<<< HEAD
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
-
-=======
     void setNumVocabs(SizeType32 numVocabs);
->>>>>>> Fixes to compilation
 private:
     friend class Serialization;
     class Impl;
