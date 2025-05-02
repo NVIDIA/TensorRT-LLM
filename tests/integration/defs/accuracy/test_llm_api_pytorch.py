@@ -576,3 +576,90 @@ class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+
+class TestQwen3_8B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen3/Qwen3-8B"
+
+    @skip_pre_hopper
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
+        [(1, 1, 1, False, False, True)],
+        ids=["latency"])
+    def test_fp8_block_scales(self, tp_size, pp_size, ep_size, attention_dp,
+                              cuda_graph, overlap_scheduler):
+        pytorch_config = PyTorchConfig(
+            enable_overlap_scheduler=overlap_scheduler,
+            use_cuda_graph=cuda_graph)
+
+        llm = LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8",
+                  tensor_parallel_size=tp_size,
+                  pipeline_parallel_size=pp_size,
+                  moe_expert_parallel_size=ep_size,
+                  pytorch_backend_config=pytorch_config,
+                  enable_attention_dp=attention_dp)
+        with llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            # task = GSM8K(self.MODEL_NAME)
+            # task.evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+
+class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen3/Qwen3-30B-A3B"
+
+    @skip_pre_hopper
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
+        [(1, 1, 1, False, False, True)],
+        ids=["latency"])
+    def test_fp8_block_scales(self, tp_size, pp_size, ep_size, attention_dp,
+                              cuda_graph, overlap_scheduler):
+        pytorch_config = PyTorchConfig(
+            enable_overlap_scheduler=overlap_scheduler,
+            use_cuda_graph=cuda_graph)
+
+        llm = LLM(f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B-FP8",
+                  tensor_parallel_size=tp_size,
+                  pipeline_parallel_size=pp_size,
+                  moe_expert_parallel_size=ep_size,
+                  pytorch_backend_config=pytorch_config,
+                  enable_attention_dp=attention_dp)
+        with llm:
+            # task = CnnDailymail(self.MODEL_NAME)
+            # task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            # task = GSM8K(self.MODEL_NAME)
+            # task.evaluate(llm)
+
+
+class TestQwen3_32B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen3/Qwen3-32B"
+
+    @skip_pre_hopper
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
+        [(1, 1, 1, False, False, True)],
+        ids=["latency"])
+    def test_fp8_block_scales(self, tp_size, pp_size, ep_size, attention_dp,
+                              cuda_graph, overlap_scheduler):
+        pytorch_config = PyTorchConfig(
+            enable_overlap_scheduler=overlap_scheduler,
+            use_cuda_graph=cuda_graph)
+
+        llm = LLM(f"{llm_models_root()}/Qwen3/Qwen3-32B-FP8",
+                  tensor_parallel_size=tp_size,
+                  pipeline_parallel_size=pp_size,
+                  moe_expert_parallel_size=ep_size,
+                  pytorch_backend_config=pytorch_config,
+                  enable_attention_dp=attention_dp)
+        with llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            # task = GSM8K(self.MODEL_NAME)
+            # task.evaluate(llm)

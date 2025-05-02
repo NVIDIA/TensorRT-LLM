@@ -253,3 +253,9 @@ deepseek-ai/DeepSeek-R1:
   - quant_algo: FP8_BLOCK_SCALES
     spec_dec_algo: MTP
     accuracy: 28.706
+Qwen3/Qwen3-8B:
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 30
+Qwen3/Qwen3-30B-A3B:
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 20

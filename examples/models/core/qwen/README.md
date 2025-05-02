@@ -577,5 +577,31 @@ load rouge done
 [11/09/2023-02:24:06] [TRT-LLM] [I]   rougeLsum : 21.10413175647868
 ```
 
+## Qwen3
+
+TensorRT-LLM now supports Qwen3, the latest version of the Qwen model series. According to the support matrix, TensorRT-LLM provides comprehensive support for various Qwen3 model variants including:
+
+### Quick start
+
+#### Run a single inference
+
+To quickly run Qwen3, examples/pytorch/quickstart_advanced.py:
+
+python3 examples/pytorch/quickstart_advanced.py --model_dir /home/scratch.bhsueh_gpu/models/Qwen3-30B-A3B/ --kv_cache_fraction 0.6
+
+
+<!-- python3 examples/pytorch/quickstart_advanced.py --model_dir /home/scratch.bhsueh_gpu/models/Qwen3-235B-A22B-FP8 --kv_cache_fraction 0.6 --tp_size 8 -->
+
+### Evaluation
+
+1. Evaluate accuracy on the MMLU dataset:
+
+python -m tensorrt_llm.commands.eval --model=/home/scratch.bhsueh_gpu/models/Qwen3-32B/ --tokenizer=/home/scratch.bhsueh_gpu/models/Qwen3-32B/ --backend=pytorch mmlu --dataset_path=/home/scratch.trt_llm_data/llm-models/datasets/mmlu/
+[05/01/2025-13:56:15] [TRT-LLM] [I] MMLU weighted average accuracy: 79.09 (14042)
+
+<!-- python -m tensorrt_llm.commands.eval --model=/home/scratch.bhsueh_gpu/models/Qwen3-30B-A3B/ --tokenizer=/home/scratch.bhsueh_gpu/models/Qwen3-30B-A3B/ --backend=pytorch mmlu --dataset_path=/home/scratch.trt_llm_data/llm-models/datasets/mmlu/
+[05/01/2025-14:03:05] [TRT-LLM] [I] MMLU weighted average accuracy: 48.10 (14042) -->
+
+
 ## Credits
 This Qwen model example exists thanks to Tlntin (TlntinDeng01@gmail.com) and zhaohb (zhaohbcloud@126.com).
