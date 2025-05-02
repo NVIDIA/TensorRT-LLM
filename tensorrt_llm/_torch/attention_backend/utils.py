@@ -1,7 +1,7 @@
 from typing import Optional, Type
 
 from ...models.modeling_utils import QuantConfig
-from . import IS_FLASHINFER_AVAIABLE
+from . import IS_FLASHINFER_AVAILABLE
 from .interface import AttentionBackend, MLAParams, PositionalEmbeddingParams
 from .trtllm import TrtllmAttention
 from .vanilla import VanillaAttention
@@ -12,11 +12,11 @@ def get_attention_backend(backend_name: str) -> Type[AttentionBackend]:
         return VanillaAttention
     elif backend_name == "TRTLLM":
         return TrtllmAttention
-    elif backend_name == "FLASHINFER" and IS_FLASHINFER_AVAIABLE:
+    elif backend_name == "FLASHINFER" and IS_FLASHINFER_AVAILABLE:
         from .flashinfer import FlashInferAttention
 
         return FlashInferAttention
-    elif backend_name == "FLASHINFER_STAR_ATTENTION" and IS_FLASHINFER_AVAIABLE:
+    elif backend_name == "FLASHINFER_STAR_ATTENTION" and IS_FLASHINFER_AVAILABLE:
         from .star_flashinfer import StarAttention
 
         return StarAttention
