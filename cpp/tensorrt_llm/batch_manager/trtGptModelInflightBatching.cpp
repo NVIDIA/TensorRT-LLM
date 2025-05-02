@@ -834,7 +834,7 @@ void TrtGptModelInflightBatching::forwardSync()
                 {
                     if (mReqIdsToTerminate.count(llmReq->mRequestId) != 0U)
                     {
-                        if (!llmReq->isGenerationToCompleteState())
+                        if (!llmReq->isGenerationCompleteState())
                         {
                             TLLM_LOG_DEBUG("Terminating request %lu with finish reason %d", llmReq->mRequestId,
                                 static_cast<int>(mReqIdsToTerminate[llmReq->mRequestId]));
