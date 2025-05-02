@@ -886,37 +886,44 @@ TEST_F(TrtGptModelTest, KVCacheReuseChunked)
 
     for (int const numBlocksExpectedReused : {1, 2})
     {
-        auto trtGptModelIfb = std::make_shared<TrtGptModelIfbHelper>(
-            mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
-        auto const cacheManager = trtGptModelIfb->getKVCacheManager();
-        auto const tokensPerBlock = cacheManager->getTokensPerBlock();
-        constexpr int numPrefillBlocks = 2;
-
-        SamplingConfig inSamplingConfig;
-        inSamplingConfig.temperature = std::vector{2.0f};
-        constexpr int correlationId = 0;
-        constexpr int maxNewTokens = 4;
-
-        auto tokens = std::make_shared<std::vector<int32_t>>(tokensPerBlock * numPrefillBlocks);
-        std::iota(std::begin(*tokens), std::end(*tokens), 1);
-        auto subTokens = std::make_shared<std::vector<int32_t>>(
-            tokens->begin(), tokens->begin() + numBlocksExpectedReused * tokensPerBlock);
-        // Add new token to "start" a new block.
-        subTokens->push_back(0);
+        for (int const maxNumIterations : {2, 6})
         {
-            auto llmRequest
-                = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false);
-            RequestList requests{llmRequest};
-            forwardRequestsToCompletion(trtGptModelIfb, requests, 6);
-            EXPECT_EQ(llmRequest->isGenerationCompleteState(), true);
-        }
-        for (size_t i = 1; i <= 2; ++i)
-        {
-            auto llmRequest
-                = std::make_shared<LlmRequest>(correlationId, maxNewTokens, subTokens, inSamplingConfig, false);
-            RequestList req{llmRequest};
-            forwardRequestsToCompletion(trtGptModelIfb, req, 5);
-            EXPECT_EQ(cacheManager->getBlockManager().getNumReusedBlocks(), i * numBlocksExpectedReused);
+            auto trtGptModelIfb = std::make_shared<TrtGptModelIfbHelper>(
+                mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
+            auto const cacheManager = trtGptModelIfb->getKVCacheManager();
+            auto const tokensPerBlock = cacheManager->getTokensPerBlock();
+            constexpr int numPrefillBlocks = 2;
+
+            SamplingConfig inSamplingConfig;
+            inSamplingConfig.temperature = std::vector{2.0f};
+            int correlationId = 0;
+            constexpr int maxNewTokens = 4;
+
+            auto tokens = std::make_shared<std::vector<int32_t>>(tokensPerBlock * numPrefillBlocks);
+            std::iota(std::begin(*tokens), std::end(*tokens), 1);
+            auto subTokens = std::make_shared<std::vector<int32_t>>(
+                tokens->begin(), tokens->begin() + numBlocksExpectedReused * tokensPerBlock);
+            // Add new token to "start" a new block.
+            subTokens->push_back(0);
+            {
+                auto llmRequest
+                    = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false);
+                RequestList requests{llmRequest};
+                forwardRequestsToCompletion(trtGptModelIfb, requests, maxNumIterations);
+                EXPECT_EQ(llmRequest->isGenerationCompleteState(), maxNumIterations >= maxNewTokens);
+                if (!llmRequest->isGenerationCompleteState())
+                {
+                    correlationId++;
+                }
+            }
+            for (size_t i = 1; i <= 2; ++i)
+            {
+                auto llmRequest
+                    = std::make_shared<LlmRequest>(correlationId, maxNewTokens, subTokens, inSamplingConfig, false);
+                RequestList req{llmRequest};
+                forwardRequestsToCompletion(trtGptModelIfb, req, 5);
+                EXPECT_EQ(cacheManager->getBlockManager().getNumReusedBlocks(), i * numBlocksExpectedReused);
+            }
         }
     }
 }
