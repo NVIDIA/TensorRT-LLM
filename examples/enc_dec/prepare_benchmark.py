@@ -10,6 +10,7 @@ def generate_samples(
         context_mean, context_std, context_min, context_max,
         output_mean, output_std, output_min, output_max,
         output_file,
+        max_input_id,
         num_vocabs=8):
     
     # Create metadata
@@ -35,7 +36,7 @@ def generate_samples(
         output_len = min(max(output_min, int(np.random.normal(output_mean, output_std))), output_max)
         
         # Generate input_ids: random ints in range (0, 2048)
-        input_ids = [random.randint(0, 2047) for _ in range(input_len)]
+        input_ids = [random.randint(0, max_input_id - 1) for _ in range(input_len)]
         
         # Generate context_ids as specified
         context_matrix = np.random.randint(0, 2048, size=(context_len, num_vocabs))
@@ -87,6 +88,7 @@ def main():
                         default=[3 * 75, 0, 3 * 75, 3 * 75], help='Context length parameters: mean, std, max')
     parser.add_argument('--output_len', type=int, nargs=4, metavar=('MEAN', 'STD', 'MIN', 'MAX'),
                         default=[5 * 75, 0, 5 * 75,  5 * 75], help='Output length parameters: mean, std, max')
+    parser.add_argument('--max_input_id', type=int, default=2048, help='Max input id')
     
     args = parser.parse_args()
     
@@ -96,6 +98,7 @@ def main():
         args.context_len[0], args.context_len[1], args.context_len[2], args.context_len[3],
         args.output_len[0], args.output_len[1], args.output_len[2], args.output_len[3],
         args.output,
+        args.max_input_id,
         args.num_vocabs
     )
 
