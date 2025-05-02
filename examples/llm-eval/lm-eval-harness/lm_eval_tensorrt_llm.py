@@ -83,10 +83,12 @@ class TRTLLMEvalBase(TemplateLM):
 
         self.max_gen_toks = max_gen_toks
         self.chunk_size = chunk_size
+        self.temperature = temperature
         self.backend = backend
         self.max_context_length = max_context_length
         self.moe_expert_parallel_size = moe_expert_parallel_size
         self.moe_backend = moe_backend
+        self.tokenized_requests = tokenized_requests
         trt_kv_cache_config = TRT_KvCacheConfig(enable_block_reuse=False)
         trt_kv_cache_config.free_gpu_memory_fraction = free_gpu_memory_fraction
         if max_tokens_kv_cache is not None:
