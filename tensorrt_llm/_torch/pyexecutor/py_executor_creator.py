@@ -12,7 +12,7 @@ from ..distributed import MPIDist
 from ..speculative import Eagle3Config, get_spec_resource_manager
 from ._util import (create_kv_cache_manager, create_py_executor_instance,
                     estimate_max_kv_cache_tokens, get_token_num_for_estimation,
-                    is_mla, instantiate_decoder)
+                    instantiate_decoder, is_mla)
 from .config import PyTorchConfig
 from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
                            PyTorchModelEngine)

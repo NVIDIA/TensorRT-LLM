@@ -366,6 +366,7 @@ def create_py_executor_instance(dist,
                                 lora_config: LoraConfig = None):
     kv_cache_manager = resources.get(KV_CACHE_MANAGER_KEY, None)
 
+    spec_config = model_engine.spec_config
     if mapping.is_last_pp_rank(
     ) and executor_config.guided_decoding_config is not None:
         if spec_config is not None:
@@ -465,8 +466,8 @@ def create_py_executor_instance(dist,
                       start_worker=start_worker)
 
 
-def instantiate_decoder(model_engine, executor_config,
-                        pytorch_backend_config, mapping):
+def instantiate_decoder(model_engine, executor_config, pytorch_backend_config,
+                        mapping):
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         decoder = TorchStarAttentionDecoder(
