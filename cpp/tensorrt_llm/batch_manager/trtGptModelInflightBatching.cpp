@@ -2055,8 +2055,6 @@ runtime::CudaEvent TrtGptModelInflightBatching::updateDecoderBuffers(
 
     if (returnLogProbs)
     {
-        mDecoderBuffers[vocabId]->cumLogProbs = mDecoders[vocabId]->getDecoderState().getCumLogProbs();
-        mDecoderBuffers[vocabId]->logProbs = mDecoders[vocabId]->getDecoderState().getLogProbs();
         mCopyBufferManager.copy(
             *mDecoders[vocabId]->getDecoderState().getCumLogProbs(),
             *mDecoderBuffers[vocabId]->cumLogProbsHost
