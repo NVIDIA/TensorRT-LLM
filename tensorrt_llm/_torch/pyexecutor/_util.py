@@ -425,6 +425,13 @@ def create_py_executor_instance(dist,
             lora_config.lora_target_modules,
             lora_config.trtllm_modules_to_hf_modules)
 
+    num_micro_batches = 1
+    if mapping.has_pp:
+        num_micro_batches = mapping.pp_size + pytorch_backend_config.enable_overlap_scheduler
+
+    resources["seq_slot_manager"] = SeqSlotManager(
+        executor_config.max_batch_size * num_micro_batches)
+
     resource_manager = ResourceManager(resources)
 
     # Make sure the kv cache manager is always invoked last as it could
@@ -432,13 +439,6 @@ def create_py_executor_instance(dist,
     if kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end("kv_cache_manager",
                                                        last=True)
-
-    num_micro_batches = 1
-    if mapping.has_pp:
-        num_micro_batches = mapping.pp_size + pytorch_backend_config.enable_overlap_scheduler
-
-    resources["seq_slot_manager"] = SeqSlotManager(
-        executor_config.max_batch_size * num_micro_batches)
 
     capacity_scheduler = BindCapacityScheduler(
         executor_config.max_batch_size,
