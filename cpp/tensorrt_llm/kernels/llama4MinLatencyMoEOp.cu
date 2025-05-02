@@ -156,7 +156,8 @@ __global__ void moe_mlp_fc13_swiglu_fp8_5120(int num_tokens,
 
     // Perform top1 across threads using Warp reduction.
     // We pack logit and expert index into an int so that we can use integer max op for reduction.
-    int best_result = ((int) (__bfloat16_as_short(best_logit)) << 16) | best_exp;
+    int best_result = ((int) (__bfloat16_as_short(best_logit) ^ (best_logit < __nv_bfloat16(0.f) ? 0x7fff : 0)) << 16) | best_exp;
+
 #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
     {
