@@ -21,7 +21,7 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding, LMHead
 from ..modules.fused_moe import FusedMoE
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
-from ..modules.logits_procesor import LogitsProcessor
+from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..pipeline_interface import PipelineInterface
 from ..speculative import SpecMetadata
@@ -430,8 +430,11 @@ class DecoderModelForCausalLM(nn.Module,
                             break
                 # TODO: support MLA
 
-        # 2. skip quant for modules in QuantConfig.exclude_modules
-        # kv_cache_quant_algo takes precedence over exclude_modules
+        # 2. skip quant for modules in QuantConfig.exclude_modules.
+        # kv_cache_quant_algo takes precedence over exclude_modules.
+        # kv_cache_quant_algo, if not None, is set for non-Attention
+        # modules too, which is the same practice as when there's no
+        # exclude_modules.
         quant_config = self.model_config.quant_config
         kv_cache_quant_algo = None
         if quant_config:
@@ -508,7 +511,9 @@ class DecoderModelForCausalLM(nn.Module,
 
     def load_weights(self, weights: Dict):
         tp_size = self.model_config.mapping.tp_size
-        head_dim = self.config.hidden_size // self.config.num_attention_heads
+        head_dim = getattr(
+            self.config, "head_dim",
+            self.config.hidden_size // self.config.num_attention_heads)
 
         def filter_weights(prefix, weights: Dict):
             result = {}
