@@ -123,19 +123,21 @@ def parse_test_list_lines(test_list, lines, test_prefix):
         marker = None
         reason = None
         timeout = None
-        for marker in kVALID_TEST_LIST_MARKERS:
-            if f" {marker}" in line:
-                test_name, marker, reason_raw = line.partition(f" {marker}")
+        for tmp_marker in kVALID_TEST_LIST_MARKERS:
+            if f" {tmp_marker}" in line:
+                print_info(f"---------------line: {line}")
+                test_name, marker, reason_raw = line.partition(f" {tmp_marker}")
                 test_name = test_name.strip()
                 marker = marker.strip()
                 if marker == "TIMEOUT":
                     # Extract timeout value from parentheses
                     timeout = strip_parens(reason_raw.strip())
+                    print_info(f"time setting: {timeout}")
                     if not timeout or not timeout.isdigit():
                         raise ValueError(
                             f'{test_list}:{lineno}: Invalid syntax for TIMEOUT value: "{reason_raw}". '
                             "Expected a numeric value in parentheses.")
-                    timeout = int(timeout)
+                    timeout = int(timeout) / 60
                 elif len(reason_raw) > 0:
                     reason = strip_parens(reason_raw.strip())
                     if not reason:
@@ -144,7 +146,9 @@ def parse_test_list_lines(test_list, lines, test_prefix):
                              "Did you forget to add parentheses?").format(
                                  test_list, lineno, reason_raw))
                 break
-
+        print_info(f"-----------------------inline marker: {marker}")
+        print_info(f"-----------------------inline reason: {reason}")
+        print_info(f"-----------------------inline timeout: {timeout}")
         # extract full:XXX/ prefix
         full_prefix = ""
         match = re.match(r'(full:.*?/)(.+)', test_name)
@@ -646,10 +650,13 @@ def modify_by_test_list(test_list, items, config):
             selected.append(item)
             # Also update the item based on the marker specified in the file
             marker, reason, timeout = full_test_name_to_marker_dict[name]
+            print_info(f"---------------marker: {marker}")
             if marker:
                 if marker == "TIMEOUT" and timeout:
+                    print_info('Marker is TIMEOUT')
                     item.add_marker(pytest.mark.timeout(timeout))
                 else:
+                    print_info('Marker is others')
                     mark_func = getattr(pytest.mark, marker.lower())
                     mark = mark_func(reason=reason)
                     item.add_marker(mark)
