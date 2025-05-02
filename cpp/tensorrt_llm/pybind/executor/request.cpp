@@ -21,6 +21,7 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 
 #include <pybind11/cast.h>
 #include <pybind11/chrono.h>
@@ -28,9 +29,6 @@
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-
-#include "streamCaster.h"
-#include "tensorCaster.h"
 
 #include <optional>
 #include <vector>
