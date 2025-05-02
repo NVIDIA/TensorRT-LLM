@@ -552,6 +552,8 @@ public:
 
     void storeBlocksForReuse(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
+    void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
+
     //! \brief Release blocks of the sequence.
     void releaseBlocks(GenerationRequest& sequence);
 
@@ -1091,6 +1093,9 @@ public:
     //! \brief Store context blocks
     void storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
+    //! \brief Store newest block for reuse
+    void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
+
     [[nodiscard]] static bool isUseOneMoreBlock(
         SizeType32 windowSize, std::optional<SizeType32> maxSequenceLength, SizeType32 maxBeamWidth)
     {
@@ -1260,6 +1265,10 @@ public:
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.
     virtual void storeContextBlocks(LlmRequest const& llmRequest) = 0;
+
+    //! \brief Store newest block for reuse.
+    //! \details This block become reusable from next step.
+    virtual void storeNewBlock(LlmRequest const& llmRequest) = 0;
 
     //! \brief Get the block ids of a request [per beam] **for a given window size block manager**
     [[nodiscard]] virtual std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
@@ -1566,6 +1575,9 @@ public:
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.
     void storeContextBlocks(LlmRequest const& llmRequest) override;
+
+    //! \brief Store newest blocks for reuse
+    void storeNewBlock(LlmRequest const& llmRequest) override;
 
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
 
