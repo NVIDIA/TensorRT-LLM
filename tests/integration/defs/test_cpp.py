@@ -177,12 +177,6 @@ def build_google_tests(request, build_dir):
 
     _cpp.run_command(make_google_tests, cwd=build_dir, timeout=300)
 
-    script_dir = (_pl.Path(__file__).parent.resolve().parent.parent.parent /
-                  "cpp" / "tests" / "resources" / "scripts")
-
-    assert script_dir.is_dir()
-    _sys.path.append(str(script_dir))
-
 
 @pytest.fixture(scope="session")
 def build_benchmarks(build_google_tests, build_dir):
