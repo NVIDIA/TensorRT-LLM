@@ -118,7 +118,7 @@ void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector co
                     offset += vocabSizes[i];
                 }
                 curVocablogitsView = ITensor::slice(logitsView, {0, offset}, vocabSizes[vocabId]); // [vocabSize,]
-                curVocablogitsView = ITensor::view(curVocablogitsView, ITensor::makeShape({1, 1, vocabSizes[vocabId]}));
+                curVocablogitsView = ITensor::view(curVocablogitsView, ITensor::makeShape({1, vocabSizes[vocabId]})); // [numLogits == 1, vocabSize]
             }
             const auto updateLogitsViewShape = curVocablogitsView->getShape();
             decoderLogits = ITensor::view(

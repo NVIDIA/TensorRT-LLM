@@ -1056,7 +1056,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
             input_lengths = torch.tensor([x.size(0) for x in batch_input_ids],
                                          dtype=torch.int32,
-                                         device=cuda_device)
+                                         device=cuda_device) // len(self.model_config.vocab_sizes)
 
             if output_sequence_lengths:
                 outputs['sequence_lengths'] = torch.tensor(sequence_lengths,
