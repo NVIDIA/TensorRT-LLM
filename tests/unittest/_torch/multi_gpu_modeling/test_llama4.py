@@ -16,10 +16,18 @@ from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
     ids=['maverick', 'scout'])
 @pytest.mark.parametrize("backend", ["TRTLLM", "FLASHINFER"],
                          ids=["trtllm", "flashinfer"])
-@pytest.mark.parametrize("tp_size", [8], ids=["tp8"])
+@pytest.mark.parametrize("tp_size", [1, 8], ids=["tp1", "tp8"])
 @pytest.mark.parametrize("use_cuda_graph", [True, False],
                          ids=["enable_graph", "disable_graph"])
-def test_llama4(model_name, backend, tp_size, use_cuda_graph):
+@pytest.mark.parametrize("ep_size", [4, 1], ids=["ep4", "ep1"])
+@pytest.mark.parametrize("pp_size", [1, 8], ids=["pp1", "pp8"])
+def test_llama4(model_name, backend, tp_size, use_cuda_graph, ep_size, pp_size):
+    if pp_size > 1 and (ep_size > 1 or tp_size > 1):
+        return
+
+    if pp_size == 1 and tp_size == 1:
+        return
+
     prompts = [{
         "prompt": "The president of the United States is"
     }, {
@@ -40,7 +48,10 @@ def test_llama4(model_name, backend, tp_size, use_cuda_graph):
     llm = LLM(
         model=model_dir,
         tensor_parallel_size=tp_size,
+        moe_expert_parallel_size=ep_size,
+        moe_tensor_parallel_size=tp_size // ep_size,
         pytorch_backend_config=pytorch_config,
+        pipeline_parallel_size=pp_size,
     )
     with llm:
         outputs = llm.generate(
