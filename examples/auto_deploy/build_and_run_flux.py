@@ -11,8 +11,6 @@ from tensorrt_llm._torch.auto_deploy.transformations.library.fusion import fuse_
 from tensorrt_llm._torch.auto_deploy.transformations.library.quantization import quantize
 from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
 
-torch._dynamo.config.cache_size_limit = 100
-
 
 def generate_image(pipe: DiffusionPipeline, prompt: str, image_name: str) -> None:
     """Generate an image using the given pipeline and prompt."""

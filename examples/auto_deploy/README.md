@@ -192,12 +192,11 @@ The default level is `INFO`.
 lm-evaluation-harness is supported. To run the evaluation, please use the following command:
 
 ```bash
-# model is defined the same as above. Other config args can also be specified in the model_args (comma separated).
-# You can specify any tasks supported with lm-evaluation-harness.
-cd examples/auto_deploy
-python lm_eval_ad.py \
---model autodeploy --model_args model=meta-llama/Meta-Llama-3.1-8B-Instruct,world_size=2 --tasks mmlu
+cd examples/llm-eval/lm-eval-harness
+python lm_eval_tensorrt_llm.py --model trt-llm --model_args model=<model_name>,backend=autodeploy,max_context_length=<input token length>,max_gen_toks=<output token length>,tp=<tp>,temperature=<temperature, e.g. 0>  --tasks <task_name> --batch_size <max batch size>
 ```
+
+Please also refer to the [lm-eval-harness README](https://github.com/EleutherAI/lm-evaluation-harness) for more details on available tasks and command line arguments.
 
 ### Mixed-precision Quantization using TensorRT Model Optimizer
 
