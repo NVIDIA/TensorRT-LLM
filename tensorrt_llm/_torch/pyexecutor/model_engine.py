@@ -81,6 +81,7 @@ _VALID_KV_CACHE_DTYPES = ("fp8", "auto")
 
 def validate_and_set_kv_cache_quant(model_config: ModelConfig,
                                     pyt_kv_cache_dtype: str) -> QuantAlgo:
+    pyt_kv_cache_dtype = pyt_kv_cache_dtype.lower()
     logger.info(
         f'Validating KV Cache config against kv_cache_dtype="{pyt_kv_cache_dtype}"'
     )

@@ -257,20 +257,23 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
 
     @pytest.mark.skip_less_device_memory(60000)
-    @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
-                          [(False, False, False), (True, False, False),
-                           (False, True, False), (False, False, True),
-                           (True, True, True)])
+    @parametrize_with_ids(
+        "attention_dp,cuda_graph,overlap_scheduler,fp8_kvcache",
+        [(False, False, False, False), (True, False, False, False),
+         (False, True, False, False), (False, False, True, False),
+         (True, True, True, True)])
     # Only Hopper and Blackwell MLA kernel supports MTP
     @parametrize_with_ids("mtp_nextn",
                           [None, pytest.param(2, marks=skip_pre_hopper)])
     def test_bfloat16(self, mtp_nextn, attention_dp, cuda_graph,
-                      overlap_scheduler):
+                      overlap_scheduler, fp8_kvcache):
+        kv_cache_dtype = "fp8" if fp8_kvcache else "auto"
         # OOM on H100 with default free_gpu_memory_fraction=0.9
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
-            use_cuda_graph=cuda_graph)
+            use_cuda_graph=cuda_graph,
+            kv_cache_dtype=kv_cache_dtype)
         if mtp_nextn is not None and mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
         else:
@@ -329,18 +332,21 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 task.evaluate(llm)
 
     @pytest.mark.skip_device_not_contain(["H100"])
-    @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
-                          [(False, False, False), (True, False, False),
-                           (False, True, False), (False, False, True),
-                           (True, True, True)])
+    @parametrize_with_ids(
+        "attention_dp,cuda_graph,overlap_scheduler,fp8_kvcache",
+        [(False, False, False, False), (True, False, False, False),
+         (False, True, False, False), (False, False, True, False),
+         (True, True, True, True)])
     @parametrize_with_ids("mtp_nextn", [None, 2])
     def test_fp8_block_scales(self, mtp_nextn, attention_dp, cuda_graph,
-                              overlap_scheduler):
+                              overlap_scheduler, fp8_kvcache):
+        kv_cache_dtype = "fp8" if fp8_kvcache else "auto"
         # OOM on H100 with default free_gpu_memory_fraction=0.9
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
-            use_cuda_graph=cuda_graph)
+            use_cuda_graph=cuda_graph,
+            kv_cache_dtype=kv_cache_dtype)
         if mtp_nextn is not None and mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
         else:
@@ -403,14 +409,18 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 task.evaluate(llm)
 
     @skip_pre_blackwell
-    @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
-                          [(False, False, False), (True, False, False),
-                           (False, True, False), (False, False, True),
-                           (True, True, True)])
-    def test_nvfp4(self, attention_dp, cuda_graph, overlap_scheduler):
+    @parametrize_with_ids(
+        "attention_dp,cuda_graph,overlap_scheduler,fp8_kvcache",
+        [(False, False, False, False), (True, False, False, False),
+         (False, True, False, False), (False, False, True, False),
+         (True, True, True, True)])
+    def test_nvfp4(self, attention_dp, cuda_graph, overlap_scheduler,
+                   fp8_kvcache):
+        kv_cache_dtype = "fp8" if fp8_kvcache else "auto"
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
-            use_cuda_graph=cuda_graph)
+            use_cuda_graph=cuda_graph,
+            kv_cache_dtype=kv_cache_dtype)
         llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only",
                   pytorch_backend_config=pytorch_config,
                   enable_attention_dp=attention_dp)
