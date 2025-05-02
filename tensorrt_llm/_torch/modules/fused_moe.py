@@ -373,6 +373,11 @@ class FusedMoE(nn.Module):
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self._check_configs()
 
+    @property
+    def has_any_quant(self):
+        return self.quant_config and self.quant_config.quant_mode.has_any_quant(
+            exclude_kv_cache=True)
+
     def _check_configs(self):
         if self.enable_alltoall:
             assert self.use_dp and self.parallel_size > 1,\
@@ -424,7 +429,7 @@ class FusedMoE(nn.Module):
             )
 
     def is_trtllm(self):
-        return self.moe_backend == "TRTLLM" and self.quant_config is not None
+        return self.moe_backend == "TRTLLM" and self.has_any_quant
 
     def is_cutlass(self):
         return not self.is_trtllm()
@@ -470,13 +475,11 @@ class FusedMoE(nn.Module):
         )
 
         self.quant_scales = []
-        self.has_any_quant = False
         self.has_fp8_qdq = False
         self.has_fp8_block_scales = False
         self.has_nvfp4 = False
         if self.quant_config and self.quant_config.quant_mode.has_any_quant(
                 exclude_kv_cache=True):
-            self.has_any_quant = True
             qc = self.quant_config
             if qc.quant_mode.has_fp8_qdq():
                 self.has_fp8_qdq = True
