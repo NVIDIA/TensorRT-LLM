@@ -118,17 +118,6 @@ def _insert_quantized_bmm(
             partial(quantization_impl.load_hook, weight_name=param_name)
         )
 
-        # Register load state dict hook with explicit debugging
-        # def debug_load_hook(state_dict, prefix, *args, **kwargs):
-        #     ad_logger.info(f"Debug load hook called with prefix: {prefix}")
-        #     ad_logger.info(f"State dict keys: {list(state_dict.keys())}")
-        #     ad_logger.info(f"Looking for param: {param_name}")
-        #     return quantization_impl.load_hook(
-        #         state_dict, prefix, *args, weight_name=param_name, **kwargs
-        #     )
-
-        # gm._register_load_state_dict_pre_hook(debug_load_hook)
-
         # Change node target to quantized bmm op
         node.target = quantization_impl.target_op()
 

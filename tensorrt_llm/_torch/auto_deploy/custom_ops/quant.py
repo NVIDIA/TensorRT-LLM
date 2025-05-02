@@ -286,69 +286,6 @@ def fp8_bmm_fake(
     return torch.bmm(input, weight_fp8.to(input.dtype))
 
 
-@torch.library.custom_op("quant::fp4_bmm", mutates_args=())
-@torch.compile(dynamic=True)
-def fp4_bmm(
-    input: torch.Tensor,
-    weight_fp4: torch.Tensor,
-    input_scale: torch.Tensor,
-    weight_scale: torch.Tensor,
-    alpha: torch.Tensor,
-) -> torch.Tensor:
-    """FP4 BMM op similar to torch.bmm.
-
-    Args:
-        input: unquantized input tensor with shape (B, M, K)
-        weight_fp4: pre-quantized weight tensor with shape (B, N, K/2),
-                    with dtype torch.uint8 (1 uint8 == 2 elements)
-        input_scale: a scalar tensor for input quantization
-        weight_scale: scale tensor for weight quantization
-        alpha: a scalar tensor for scaling the result
-
-    Returns:
-        The BMM output with shape (B, M, N) and the original dtype as the input.
-    """
-    assert TRTLLM_FP4_OP_AVAILABLE, "TRT-LLM FP4 operators are not available."
-
-    # Get dimensions
-    B, M, K = input.shape
-    B2, N, K2_div_2 = weight_fp4.shape
-    assert B == B2, f"Batch dimensions must match: {B} vs {B2}"
-    assert K // 2 == K2_div_2, f"Inner dimensions must match: {K // 2} vs {K2_div_2}"
-    assert K % 16 == 0, "K must be divisible by 16"
-
-    # Process each batch separately
-    output = torch.empty((B, M, N), dtype=input.dtype, device=input.device)
-    for b in range(B):
-        # Quantize this batch's input to FP4
-        x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
-            input[b], input_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False
-        )
-
-        # Perform GEMM - note that weight_fp4 is already in (N, K/2) format per batch
-        with autotune():
-            output[b] = torch.ops.trtllm.nvfp4_gemm(
-                x_fp4, weight_fp4[b], x_sf_block, weight_scale, alpha, False, input.dtype
-            )
-
-    return output
-
-
-@fp4_bmm.register_fake
-def fp4_bmm_fake(
-    input: torch.Tensor,
-    weight_fp4: torch.Tensor,
-    input_scale: torch.Tensor,
-    weight_scale: torch.Tensor,
-    alpha: torch.Tensor,
-) -> torch.Tensor:
-    """Fake implementation of fp4_bmm for testing and tracing."""
-    weight_fp4 = weight_fp4.transpose(1, 2)
-    expanded_weight = weight_fp4.repeat(1, 1, 2).to(input.dtype)
-
-    return torch.bmm(input, expanded_weight)
-
-
 QUANT_LINEAR_OPS = [
     torch.ops.quant.fp8_linear,
     torch.ops.quant.fp4_linear,
@@ -356,7 +293,6 @@ QUANT_LINEAR_OPS = [
 
 QUANT_BMM_OPS = [
     torch.ops.quant.fp8_bmm,
-    torch.ops.quant.fp4_bmm,
 ]
 
 QUANT_OPS = QUANT_LINEAR_OPS + QUANT_BMM_OPS

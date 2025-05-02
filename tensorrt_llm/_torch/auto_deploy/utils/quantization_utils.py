@@ -73,20 +73,17 @@ class QuantizationImpl:
                 quantization_impl_map = {
                     "": None,
                     "FP8": FP8BMMQuantizationImpl,
-                    "NVFP4": FP4BMMQuantizationImpl,
                 }
             else:
                 quantization_impl_map = {
                     "": None,
                     "FP8": FP8QuantizationImpl,
-                    "NVFP4": FP4QuantizationImpl,
                 }
             return quantization_impl_map[quant_type_or_node]
 
         for q in [
             FP4QuantizationImpl,
             FP8QuantizationImpl,
-            FP4BMMQuantizationImpl,
             FP8BMMQuantizationImpl,
         ]:
             if is_op(quant_type_or_node, q.target_op()):
@@ -430,12 +427,3 @@ class FP8BMMQuantizationImpl(QuantizationImpl):
                     torch.float8_e4m3fn
                 )
                 state_dict[weight_name + "_scale"] = weight_scale
-
-
-# TODO: complete this once FP4 HF ckpt format is finalized
-class FP4BMMQuantizationImpl(QuantizationImpl):
-    """Implementation of FP4 quantization for BMM operations."""
-
-    @staticmethod
-    def target_op():
-        return torch.ops.quant.fp4_bmm
