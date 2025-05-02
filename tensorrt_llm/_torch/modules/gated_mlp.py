@@ -7,7 +7,7 @@ from torch import nn
 
 from tensorrt_llm.mapping import Mapping
 
-from ..custom_ops import IS_FLASHINFER_AVAIABLE
+from ..custom_ops import IS_FLASHINFER_AVAILABLE
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
@@ -16,7 +16,7 @@ from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 
 
 def swiglu(x):
-    if IS_FLASHINFER_AVAIABLE:
+    if IS_FLASHINFER_AVAILABLE:
         # WAR for flashinfer activation since it does not support custom op properly
         from ..custom_ops import flashinfer_silu_and_mul
         return flashinfer_silu_and_mul(x)
@@ -74,7 +74,7 @@ class GatedMLP(nn.Module):
                 weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
             quant_config=config.get_quant_config(),
             reduce_output=False,
-            skip_create_weights=config.skip_create_weights,
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
         )
         self.down_proj = Linear(
             self.intermediate_size,
@@ -85,7 +85,7 @@ class GatedMLP(nn.Module):
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
             reduce_output=reduce_output,
-            skip_create_weights=config.skip_create_weights,
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
         )
 
         # These two modules are mutually exclusive - either splitted_gate_up_lora or fused_gate_up_lora will be used,
@@ -114,9 +114,27 @@ class GatedMLP(nn.Module):
 
         if self.activation == F.silu:
             h1 = self.gate_up_proj(x)
+            if bool(lora_params):
+                assert self.layer_idx is not None, "layer_idx is required for lora"
+                h1_lora = self.splitted_gate_up_lora(x, lora_params,
+                                                     self.layer_idx)
+                if h1_lora is not None:
+                    h1 = h1 + h1_lora
+
+                h1_lora = self.fused_gate_up_lora(x, lora_params,
+                                                  self.layer_idx)
+
+                if h1_lora is not None:
+                    h1 = h1 + h1_lora
+
             h2 = swiglu(h1)
             output = self.down_proj(h2,
                                     all_reduce_params=final_all_reduce_params)
+            if bool(lora_params):
+                output_lora = self.down_lora(h2, lora_params, self.layer_idx)
+                if output_lora is not None:
+                    output = output + output_lora
+
             return output
         else:
             raise NotImplementedError(

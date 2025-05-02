@@ -335,10 +335,10 @@ def _process_rope_v1(
 
     with graph.inserting_before(q_match["add_node"]):
         if need_transpose:
-            q_for_op = graph.call_function(torch.ops.aten.transpose, args=(q_node, 1, 2))
-            k_for_op = graph.call_function(torch.ops.aten.transpose, args=(k_node, 1, 2))
-            q_for_op_contig = graph.call_method("contiguous", (q_for_op,))
-            k_for_op_contig = graph.call_method("contiguous", (k_for_op,))
+            q_for_op = graph.call_function(torch.ops.aten.transpose.int, args=(q_node, 1, 2))
+            k_for_op = graph.call_function(torch.ops.aten.transpose.int, args=(k_node, 1, 2))
+            q_for_op_contig = graph.call_function(torch.ops.aten.contiguous, args=(q_for_op,))
+            k_for_op_contig = graph.call_function(torch.ops.aten.contiguous, args=(k_for_op,))
         else:
             q_for_op_contig, k_for_op_contig = q_node, k_node
 
@@ -360,7 +360,9 @@ def _process_rope_v1(
                 torch.ops.aten.cat, args=((cos_prefix, sin_prefix), -1)
             )
             fused_cos_sin = graph.call_function(operator.getitem, args=(fused_cos_sin, 0))
-            fused_cos_sin = graph.call_method("to", (fused_cos_sin, torch.float32))
+            fused_cos_sin = graph.call_function(
+                torch.ops.aten.to.dtype, args=(fused_cos_sin, torch.float32)
+            )
             cache[cache_key] = fused_cos_sin
 
         position_ids = _get_position_ids(
@@ -382,9 +384,9 @@ def _process_rope_v1(
 
     if need_transpose:
         with graph.inserting_after(raw_q):
-            new_q = graph.call_function(torch.ops.aten.transpose, args=(raw_q, 1, 2))
+            new_q = graph.call_function(torch.ops.aten.transpose.int, args=(raw_q, 1, 2))
         with graph.inserting_after(raw_k):
-            new_k = graph.call_function(torch.ops.aten.transpose, args=(raw_k, 1, 2))
+            new_k = graph.call_function(torch.ops.aten.transpose.int, args=(raw_k, 1, 2))
     else:
         new_q, new_k = raw_q, raw_k
 
@@ -445,7 +447,9 @@ def _process_rope_v2(
         with graph.inserting_after(cos_sin_flash_3d):
             cos_sin_flash = graph.call_function(operator.getitem, args=(cos_sin_flash_3d, 0))
         with graph.inserting_after(cos_sin_flash):
-            cos_sin_flash = graph.call_method("to", (cos_sin_flash, torch.float32))
+            cos_sin_flash = graph.call_function(
+                torch.ops.aten.to.dtype, args=(cos_sin_flash, torch.float32)
+            )
         cache[inv_freq_node] = cos_sin_flash
 
     with graph.inserting_before(q_match["out"]):

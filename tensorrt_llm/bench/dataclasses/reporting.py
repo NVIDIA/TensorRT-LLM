@@ -162,6 +162,7 @@ class ReportUtility:
             logger (Logger): A logger for logging.
             streaming (bool, optional): Streaming benchmark used. Defaults to False.
         """
+        self.raw_statistics = statistics
         self.statistics = statistics.generate_statistics_summary()
         self.dataset_metadata = dataset_metadata
         self.rt_cfg = rt_cfg
@@ -211,6 +212,13 @@ class ReportUtility:
         """Output throughput per user in tokens per second."""
         return self.convert_rate_to_s(
             self.statistics.output_throughput_tok_ns_per_user)
+
+    def get_output_tokens(self, tokenizer) -> Dict[int, List[str]]:
+        retval = {}
+        for req_id, request in self.raw_statistics.requests.items():
+            output_str = tokenizer.decode(request.tokens)
+            retval[req_id] = output_str
+        return dict(sorted(retval.items()))
 
     def get_statistics_dict(self) -> Dict[str, Any]:
         """Get statistics as a dictionary.
@@ -332,9 +340,11 @@ class ReportUtility:
         }
 
         if self.streaming:
+            avg_tpot = self.convert_to_ms(
+                self.statistics.per_user_time_per_output_token_ns)
+
             stats_dict["streaming_metrics"] = {
-                # Token output speed (1 / time-per-output-token)
-                # NOTE: Excludes TTFT by nature of using TPOT.
+                # NOTE: Excludes TTFT by nature as this is a genphase calculation.
                 "token_output_speed_tok_s":
                 self.per_user_generation_token_throughput_s,
                 # Average per request time-to-first-token (TTFT)
@@ -343,8 +353,7 @@ class ReportUtility:
                     self.statistics.per_user_time_to_first_token_ns),
                 # Average per request token time-per-output-token (TPOT)
                 "avg_tpot_ms":
-                self.convert_to_ms(
-                    self.statistics.per_user_time_per_output_token_ns),
+                avg_tpot,
                 # Average per request Time-per-output-token percentiles (TPOT)
                 "tpot_percentiles":
                 self.statistics.tpot_percentiles.model_dump(
@@ -360,7 +369,14 @@ class ReportUtility:
                         k: self.convert_to_ms(v)
                         for k, v in
                         self.statistics.ttft_percentiles.model_dump().items()
-                    }
+                    },
+                "gen_tps_percentiles":
+                self.statistics.generation_tp_percentiles.model_dump(
+                    exclude_none=True, by_alias=True, mode='json') | {
+                        k: self.convert_to_ms(v)
+                        for k, v in self.statistics.generation_tp_percentiles.
+                        model_dump().items()
+                    },
             }
 
         spec_decoding, decoding_mode = False, None
@@ -477,11 +493,12 @@ class ReportUtility:
         perf_stats = (
             f"Request Throughput (req/sec):                     {perf['request_throughput_req_s']:.4f}\n"
             f"Total Output Throughput (tokens/sec):             {perf['system_output_throughput_tok_s']:.4f}\n"
-            f"Per User Output Throughput (tokens/sec/user):     {perf['output_throughput_per_user_tok_s']:.4f}\n"
-            f"Per GPU Output Throughput (tokens/sec/gpu):       {perf['output_throughput_per_gpu_tok_s']:.4f}\n"
             f"Total Token Throughput (tokens/sec):              {perf['system_total_throughput_tok_s']:.4f}\n"
             f"Total Latency (ms):                               {perf['total_latency_ms']:.4f}\n"
             f"Average request latency (ms):                     {perf['avg_request_latency_ms']:.4f}\n"
+            # Output Throughput includes context/first token.
+            f"Per User Output Throughput [w/ ctx] (tps/user):   {perf['output_throughput_per_user_tok_s']:.4f}\n"
+            f"Per GPU Output Throughput (tps/gpu):              {perf['output_throughput_per_gpu_tok_s']:.4f}\n"
         )
 
         if streaming:
@@ -497,14 +514,21 @@ class ReportUtility:
                 f"[TTFT] {key.upper():<7}: {ttft[key]:.4f}" for key in
                 ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
 
+            gen_tps_stats = "\n".join(
+                f"[GTPS] {key.upper():<7}: {streaming['gen_tps_percentiles'][key]:.4f}"
+                for key in
+                ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
+
             perf_stats += (
-                f"Per User Output Speed [1/TPOT] (tokens/sec/user): {streaming['token_output_speed_tok_s']:.4f}\n"
-                f"Average time-to-first-token [TTFT] (ms):          {streaming['avg_ttft_ms']:.4f}\n"
-                f"Average time-per-output-token [TPOT] (ms):        {streaming['avg_tpot_ms']:.4f}\n"
+                f"Average time-to-first-token [TTFT] (ms):   {streaming['avg_ttft_ms']:.4f}\n"
+                f"Average time-per-output-token [TPOT] (ms): {streaming['avg_tpot_ms']:.4f}\n"
+                f"Per User Output Speed (tps/user):          {streaming['token_output_speed_tok_s']:.4f}\n"
                 "\n-- Per-Request Time-per-Output-Token [TPOT] Breakdown (ms)\n\n"
                 f"{tpot_stats}\n"
                 "\n-- Per-Request Time-to-First-Token [TTFT] Breakdown (ms) \n\n"
-                f"{ttft_stats}\n")
+                f"{ttft_stats}\n"
+                "\n-- Per-Request Generation Throughput [GTPS] Breakdown (tps/user)\n\n"
+                f"{gen_tps_stats}\n")
 
         perf_stats += (
             "\n-- Request Latency Breakdown (ms) -----------------------\n\n"

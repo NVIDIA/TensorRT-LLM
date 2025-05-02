@@ -4,6 +4,33 @@ NVIDIA has announced world-record DeepSeek-R1 inference performance at NVIDIA GT
 
 In this blog, we share the configurations and procedures about how to reproduce the number on both B200 and H200 with PyTorch workflow.
 
+## Table of Contents
+
+- [How to get best performance on DeepSeek-R1 in TensorRT-LLM](#how-to-get-best-performance-on-deepseek-r1-in-tensorrt-llm)
+  - [Table of Contents](#table-of-contents)
+  - [Prerequisites: Install TensorRT-LLM and download models](#prerequisites-install-tensorrt-llm-and-download-models)
+      - [1. Download TensorRT-LLM](#1-download-tensorrt-llm)
+      - [2. Download the DeepSeek R1 models](#2-download-the-deepseek-r1-models)
+      - [3. Build and run TensorRT-LLM container](#3-build-and-run-tensorrt-llm-container)
+      - [4. Compile and Install TensorRT-LLM](#4-compile-and-install-tensorrt-llm)
+      - [5. Optional: Tune GPU clocks](#5-optional-tune-gpu-clocks)
+      - [6. Dataset preparation](#6-dataset-preparation)
+  - [Reproducing steps](#reproducing-steps)
+    - [B200 min-latency](#b200-min-latency)
+      - [Expected Results](#expected-results)
+    - [B200 max-throughput](#b200-max-throughput)
+      - [Benchmark](#benchmark)
+      - [Expected Result Format](#expected-result-format)
+    - [H200 min-latency](#h200-min-latency)
+      - [Expected Result Format](#expected-result-format-1)
+    - [H200 max-throughput](#h200-max-throughput)
+      - [Expected Result Format](#expected-result-format-2)
+  - [Exploring more ISL/OSL combinations](#exploring-more-islosl-combinations)
+    - [WIP: Enable more features by default](#wip-enable-more-features-by-default)
+    - [WIP: Chunked context support on DeepSeek models](#wip-chunked-context-support-on-deepseek-models)
+    - [Out of memory issues](#out-of-memory-issues)
+
+
 ## Prerequisites: Install TensorRT-LLM and download models
 
 This section can be skipped if you already have TensorRT-LLM installed and have already downloaded the DeepSeek R1 model checkpoint.
@@ -110,6 +137,7 @@ cat >./extra-llm-api-config.yml<<EOF
 pytorch_backend_config:
     enable_overlap_scheduler: true
     use_cuda_graph: true
+    moe_backend: TRTLLM
 speculative_config:
     decoding_type: MTP
     num_nextn_predict_layers: 3
@@ -125,7 +153,7 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
     --concurrency 1 \
     --max_batch_size 1 \
     --tp 8 \
-    --ep 4 \
+    --ep 2 \
     --extra_llm_api_options ./extra-llm-api-config.yml
 ```
 
@@ -147,12 +175,13 @@ The perf can be different when using different datasets and different machines.
 ===========================================================
 = PERFORMANCE OVERVIEW
 ===========================================================
-Request Throughput (req/sec):                     0.1244
-Total Output Throughput (tokens/sec):             254.5535
-Per User Output Throughput (tokens/sec/user):     254.7634
-Per GPU Output Throughput (tokens/sec/gpu):       31.8192
-Total Latency (ms):                               80368.1616
-Average request latency (ms):                     8036.7546
+Request Throughput (req/sec):                     0.1341
+Total Output Throughput (tokens/sec):             274.4168
+Per User Output Throughput (tokens/sec/user):     274.7188
+Per GPU Output Throughput (tokens/sec/gpu):       34.3021
+Total Token Throughput (tokens/sec):              414.0461
+Total Latency (ms):                               74561.7520
+Average request latency (ms):                     7456.1219
 ```
 
 ### B200 max-throughput
@@ -322,3 +351,25 @@ Total Token Throughput (tokens/sec):              15707.0888
 Total Latency (ms):                               993548.8470
 Average request latency (ms):                     197768.0434
 ```
+
+## Exploring more ISL/OSL combinations
+
+To benchmark TensorRT-LLM on DeepSeek models with more ISL/OSL combinations, you can use `prepare_dataset.py` to generate the dataset and use similar commands mentioned in the previous section. TensorRT-LLM is working on enhancements that can make the benchmark process smoother.
+### WIP: Enable more features by default
+
+Currently, there are some features that need to be enabled through a user-defined file `extra-llm-api-config.yml`, such as CUDA graph, overlap scheduler and attention dp. We're working on to enable those features by default, so that users can get good out-of-the-box performance on DeepSeek models.
+
+Note that, `max_batch_size` and `max_num_tokens` can easily affect the performance. The default values for them are already carefully designed and should deliver good performance on overall cases, however, you may still need to tune it for peak performance.
+
+Generally, you should make sure that `max_batch_size` is not too low to bottleneck the throughput, and `max_num_tokens` needs to be large enough so that it covers the max input sequence length of the samples in dataset, as mentioned in below section "WIP: Chunked context support on DeepSeek models".
+
+For more details on `max_batch_size` and `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
+
+### WIP: Chunked context support on DeepSeek models
+
+TensorRT-LLM team is actively working on chunked context support for DeepSeek models. Because of that missing feature, there is currently a limitation that `max_num_tokens` has to be at least larger than the max input sequence length of the samples in dataset.
+For more details on `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
+
+### Out of memory issues
+
+It's possible seeing OOM issues on some cases. Considering reducing `kv_cache_free_gpu_mem_fraction` to a smaller value as a workaround. We're working on the investigation and addressing the problem.

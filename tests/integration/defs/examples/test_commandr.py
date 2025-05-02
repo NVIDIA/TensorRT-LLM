@@ -56,7 +56,7 @@ def test_llm_commandr_v01_single_gpu_summary(commandr_example_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     summary_cmd = [
-        f"{commandr_example_root}/../summarize.py",
+        f"{commandr_example_root}/../../../summarize.py",
         "--test_trt_llm",
         "--hf_model_dir",
         f"{llm_commandr_v01_model_root}",
@@ -111,7 +111,7 @@ def test_llm_commandr_plus_4gpus_summary(commandr_example_root,
     ]
 
     run_cmd = [
-        f"{commandr_example_root}/../run.py",
+        f"{commandr_example_root}/../../../run.py",
         f"--max_output_len={50}",
         f"--tokenizer_dir={llm_commandr_plus_model_root}",
         f"--engine_dir={engine_dir}",

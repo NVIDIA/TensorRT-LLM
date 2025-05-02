@@ -91,6 +91,39 @@ std::vector<BlockKey> buildBlockKeys(
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
+size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) noexcept
+{
+    size_t seed = blockKey.uniqueTokens.size() ^ parentHash * UINT64_C(0xbf58476d1ce4e5b9);
+
+    for (auto const& uniqueToken : blockKey.uniqueTokens)
+    {
+        uint32_t a = static_cast<uint32_t>(uniqueToken.tokenId);
+        a = ((a >> 16) ^ a) * 0x45d9f3b;
+        a = ((a >> 16) ^ a) * 0x45d9f3b;
+        a = (a >> 16) ^ a;
+        seed ^= a + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        if (blockKey.usesExtraIds)
+        {
+            uint64_t b = uniqueToken.tokenExtraId;
+            b = (b ^ (b >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+            b = (b ^ (b >> 27)) * UINT64_C(0x94d049bb133111eb);
+            b = b ^ (b >> 31);
+            seed ^= b + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        }
+    }
+
+    if (blockKey.loraTaskId)
+    {
+        uint64_t c = blockKey.loraTaskId.value();
+        c = (c ^ (c >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+        c = (c ^ (c >> 27)) * UINT64_C(0x94d049bb133111eb);
+        c = c ^ (c >> 31);
+        seed ^= c + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    }
+
+    return seed;
+}
+
 KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx)
     : mBlockId(blockId)
     , mMemoryPoolBlockIndex{blockIdx}
@@ -2017,7 +2050,7 @@ void KVCacheManager::getBlockOffsetsOfBatch(
 
 std::tuple<SizeType32, SizeType32> BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& config,
     nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
-    runtime::BufferManager const& bufferManager, SizeType32 kvFactor)
+    runtime::BufferManager const& bufferManager, SizeType32 kvFactor, size_t extraCostMemory)
 {
     auto const freeMemFraction = config.freeGpuMemoryFraction.value_or(KvCacheConfig::kDefaultGpuMemFraction);
     TLLM_CHECK_WITH_INFO(freeMemFraction < 1.0F,
@@ -2028,10 +2061,14 @@ std::tuple<SizeType32, SizeType32> BaseKVCacheManager::calculateMaxNumBlocks(KvC
     TLLM_CUDA_CHECK(::cudaDeviceSynchronize());
     auto const [freeMem, totalMem] = tc::getDeviceMemoryInfo(config.useUvm);
     auto maxTokens = static_cast<SizeType32>(freeMemFraction
-        * static_cast<double>(freeMem + bufferManager.memoryPoolFree()) / static_cast<double>(cacheSizeBytesPerToken));
-    TLLM_LOG_INFO("Memory usage when calculating max tokens in paged kv cache: total: %0.2f GiB, available: %0.2f GiB",
+        * static_cast<double>(freeMem - extraCostMemory + bufferManager.memoryPoolFree())
+        / static_cast<double>(cacheSizeBytesPerToken));
+    TLLM_LOG_INFO(
+        "Memory usage when calculating max tokens in paged kv cache: total: %0.2f GiB, available: %0.2f GiB, "
+        "extraCostMemory: %0.2f GiB",
         (totalMem / static_cast<double>(1 << 30)),
-        ((freeMem + bufferManager.memoryPoolFree()) / static_cast<double>(1 << 30)));
+        ((freeMem + bufferManager.memoryPoolFree()) / static_cast<double>(1 << 30)),
+        extraCostMemory / static_cast<double>(1 << 30));
 
     // If user specified a number of tokens
     if (config.maxTokens.has_value())

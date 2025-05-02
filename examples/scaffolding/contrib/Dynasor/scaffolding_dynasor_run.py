@@ -1,16 +1,18 @@
 import argparse
 
-from dynasor_controller import DynasorGenerationController
-
 from tensorrt_llm.scaffolding import (MajorityVoteController, ScaffoldingLlm,
                                       TRTLLMWorker)
+from tensorrt_llm.scaffolding.contrib import DynasorGenerationController
 
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--generation_dir",
-                        type=str,
-                        default="./models/DeepSeek-R1-Distill-Qwen-7B")
+    # .e.g. /home/scratch.trt_llm_data/llm-models/DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B
+    parser.add_argument(
+        '--model_dir',
+        type=str,
+        required=True,
+        help="Path to the directory containing the generation model")
     parser.add_argument("--max_num_tokens", type=int, default=7000)
     parser.add_argument("--majority_vote", action='store_true')
     parser.add_argument('--sample_num', type=int, default=3)
@@ -18,9 +20,9 @@ def parse_arguments():
     return args
 
 
-def test_sync(prompts, proposer_worker, args):
+def test(prompts, proposer_worker, args):
     dynasor_generation_controller = DynasorGenerationController(
-        generation_dir=args.generation_dir, max_tokens=args.max_num_tokens)
+        generation_dir=args.model_dir, max_tokens=args.max_num_tokens)
 
     # If majority voting is requested, wrap the controller in MajorityVoteController
     if args.majority_vote:
@@ -65,11 +67,9 @@ def main():
     ]
 
     llm_worker = TRTLLMWorker.init_with_new_llm(
-        args.generation_dir,
-        backend="pytorch",
-        max_num_tokens=args.max_num_tokens)
+        args.model_dir, backend="pytorch", max_num_tokens=args.max_num_tokens)
 
-    test_sync(prompts, llm_worker, args)
+    test(prompts, llm_worker, args)
 
 
 if __name__ == "__main__":

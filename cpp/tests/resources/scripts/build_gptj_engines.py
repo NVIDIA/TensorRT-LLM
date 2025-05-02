@@ -30,7 +30,9 @@ import tensorrt_llm.bindings as _tb
 
 
 def get_ckpt_without_quatization(model_dir, output_dir):
-    build_args = [_sys.executable, "examples/gptj/convert_checkpoint.py"] + [
+    build_args = [
+        _sys.executable, "examples/models/contrib/gpt/convert_checkpoint.py"
+    ] + [
         '--model_dir={}'.format(model_dir),
         '--output_dir={}'.format(output_dir),
     ]

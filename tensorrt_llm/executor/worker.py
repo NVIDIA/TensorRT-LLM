@@ -24,7 +24,7 @@ from ..llmapi.tracer import VizTracer, global_tracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             clear_sched_affinity, print_colored_debug,
                             print_traceback_on_error)
-from ..lora_manager import LoraManager
+from ..lora_manager import LoraConfig, LoraManager
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
 from ..runtime.model_runner import _engine_config_to_model_config
@@ -35,9 +35,11 @@ from .postproc_worker import (PostprocParams, PostprocWorker,
                               PostprocWorkerConfig, postproc_worker_main)
 from .request import (CancellingRequest, GenerationRequest, LoRARequest,
                       PromptAdapterRequest)
-from .result import GenerationResult, IterationResult
+from .result import (GenerationResult, IterationResult, LogProbsResult,
+                     ResponseWrapper, compute_logprobs)
 from .utils import (PERIODICAL_RESP_IN_AWAIT, ErrorResponse, IntraProcessQueue,
-                    RequestError, WorkerCommIpcAddrs, has_event_loop)
+                    RequestError, WorkerCommIpcAddrs, has_event_loop,
+                    is_llm_response)
 
 __all__ = [
     "ExecutorBindingsWorker",
@@ -56,6 +58,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
+        lora_config: Optional[LoraConfig] = None,
     ) -> None:
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
@@ -98,10 +101,16 @@ class ExecutorBindingsWorker(GenerationExecutor):
             if not hasattr(executor_config, "backend"):
                 return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
                                      executor_config)
-            elif executor_config.backend == "pytorch":
+            args = {
+                "executor_config": executor_config,
+                "checkpoint_dir": executor_config.hf_model_dir,
+                "engine_dir": executor_config.trt_engine_dir,
+            }
+            if executor_config.backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
                     create_py_executor
                 create_executor = create_py_executor
+                args["lora_config"] = lora_config
             elif executor_config.backend == "autodeploy":
                 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
                     create_autodeploy_executor
@@ -112,9 +121,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
             device_id = self.global_rank % torch.cuda.device_count()
             torch.cuda.set_device(device_id)
-            return create_executor(executor_config=executor_config,
-                                   checkpoint_dir=executor_config.hf_model_dir,
-                                   engine_dir=executor_config.trt_engine_dir)
+            return create_executor(**args)
 
         self.engine = _create_engine()
 
@@ -133,6 +140,13 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 self._lora_manager = LoraManager()
             if engine_config.build_config.max_prompt_embedding_table_size > 0:
                 self._prompt_adapter_manager = PromptAdapterManager()
+
+        if getattr(executor_config, "backend",
+                   "") == "pytorch" and lora_config is not None:
+            self._lora_manager = LoraManager()
+            lora_model_config = self.engine.model_engine.lora_model_config
+            assert lora_model_config is not None
+            self._lora_model_config = lora_model_config
 
         self.await_response_thread = ManagedThread(
             self.await_response_task,
@@ -202,6 +216,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 logger.warning(
                     f"Request of client_id {client_id} is finished, cannot abort it."
                 )
+                return
             self.engine.cancel_request(request_id)
 
     def _engine_response_callback(self, response: tllm.Response):
@@ -291,7 +306,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
     def _load_lora_adapter(self, lora_request: LoRARequest):
         self._lora_manager.load_from_ckpt(
             [lora_request.path],
-            model_config=self._runtime_model_config,
+            model_config=self._runtime_model_config if
+            self._runtime_model_config is not None else self._lora_model_config,
             runtime_mapping=None,
             uids=[str(lora_request.adapter_id)])
 
@@ -316,10 +332,11 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
         prompt_token_ids = copy.deepcopy(request.prompt_token_ids)
         prompt_tuning_config = None
+        multimodal_embedding = None
         mrope_config = None
+        if request.multimodal_embedding is not None:
+            multimodal_embedding = request.multimodal_embedding
         if request.prompt_adapter_request is not None:
-            assert request.prompt_tuning_config is None, \
-                "cannot accept both prompt_adapter_request and prompt_tuning_config in one request"
             self._load_prompt_adapter(request.prompt_adapter_request)
             uid = str(request.prompt_adapter_request.adapter_id)
             prompt_tuning_config = tllm.PromptTuningConfig(
@@ -328,9 +345,6 @@ class ExecutorBindingsWorker(GenerationExecutor):
             pa_length = prompt_tuning_config.embedding_table.size(0)
             prompt_token_ids = list(range(
                 vocab_size, vocab_size + pa_length)) + prompt_token_ids
-        elif request.prompt_tuning_config is not None:
-            prompt_tuning_config = tllm.PromptTuningConfig(
-                request.prompt_tuning_config[0])
 
         if request.mrope_config is not None:
             mrope_config = tllm.MropeConfig(**request.mrope_config)
@@ -343,9 +357,9 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 context_phase_params = request.disaggregated_params.get_context_phase_params(
                 )
 
-        is_overlap_enabled = hasattr(
-            self._executor_config, "backend"
-        ) and self._executor_config.backend == "pytorch" and self._executor_config.pytorch_backend_config.enable_overlap_scheduler
+        is_pytorch_backend = getattr(self._executor_config, "backend",
+                                     None) == "pytorch"
+        is_overlap_enabled = is_pytorch_backend and self._executor_config.pytorch_backend_config.enable_overlap_scheduler
         if is_overlap_enabled:
             is_disaggregated = self.engine.kv_cache_transceiver is not None
             if is_disaggregated and (
@@ -379,15 +393,24 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 embedding_bias=request.sampling_params.embedding_bias,
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
+                multimodal_embedding=multimodal_embedding,
                 mrope_config=mrope_config,
                 logits_post_processor_name=(
                     tllm.Request.BATCHED_POST_PROCESSOR_NAME
                     if request.sampling_params.apply_batched_logits_processor
                     else None),
-                logits_post_processor=request.sampling_params.logits_processor,
+                logits_post_processor=None if is_pytorch_backend else
+                request.sampling_params.logits_processor,
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 type=request_type)
+
+            if is_pytorch_backend and request.sampling_params.logits_processor:
+                # For PyTorch backend, we attach logits processors as a dynamic Python attribute
+                # instead of using the C++ binding, since the latter will cause PyCapsule pickling issues.
+                lp = request.sampling_params.logits_processor
+                executor_request.py_logits_post_processors = lp if isinstance(
+                    lp, list) else [lp]
 
             if request.query_token_ids is not None:
                 # pytorch star attention workflow
@@ -415,11 +438,14 @@ class ExecutorBindingsWorker(GenerationExecutor):
         if request.id is None:
             request.set_id(client_id)
 
+        logprob_params = self._get_logprob_params(request)
+
         result = GenerationResult(
             request,
             background_error_handler=self._handle_background_error,
             executor=self,
-            disaggregated_params=request.disaggregated_params)
+            disaggregated_params=request.disaggregated_params,
+            logprob_params=logprob_params)
 
         self._results[client_id] = result
 
@@ -489,18 +515,19 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
 @print_traceback_on_error
 def worker_main(
-        engine: Path | Engine,
-        worker_queues: WorkerCommIpcAddrs,
-        log_level: str,
-        executor_config: Optional[tllm.ExecutorConfig] = None,
-        batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
-        worker_cls: type = ExecutorBindingsWorker,
-        tracer_init_kwargs: Optional[dict] = None,
-        _torch_model_class_mapping: Optional[dict] = None,
-        postproc_worker_config: Optional[PostprocWorkerConfig] = None,
-        ready_signal: Optional[str] = None,
-        is_llm_executor: Optional[
-            bool] = True,  # whether it's the main executor instance
+    engine: Path | Engine,
+    worker_queues: WorkerCommIpcAddrs,
+    log_level: str,
+    executor_config: Optional[tllm.ExecutorConfig] = None,
+    batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
+    worker_cls: type = ExecutorBindingsWorker,
+    tracer_init_kwargs: Optional[dict] = None,
+    _torch_model_class_mapping: Optional[dict] = None,
+    postproc_worker_config: Optional[PostprocWorkerConfig] = None,
+    ready_signal: Optional[str] = None,
+    is_llm_executor: Optional[
+        bool] = True,  # whether it's the main executor instance
+    lora_config: Optional[LoraConfig] = None,
 ) -> None:
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
@@ -625,7 +652,8 @@ def worker_main(
             executor_config,
             batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
-            is_llm_executor=is_llm_executor)
+            is_llm_executor=is_llm_executor,
+            lora_config=lora_config)
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())
@@ -748,6 +776,10 @@ class AwaitResponseHelper:
             assert response is not None
             queue = self.worker.return_queue(response.client_id)
 
+            logprobs_result = _get_logprobs(self.worker, response)
+            if logprobs_result:
+                response = ResponseWrapper(response, logprobs_result)
+
             # For AsyncQueue.sync_q, we will batch the events to avoid too many
             # event notifications, thus put without wait here.
             if isinstance(queue, _SyncQueue):
@@ -784,6 +816,10 @@ class AwaitResponseHelper:
                     response = ErrorResponse(response.client_id,
                                              response.error_msg,
                                              response.request_id)
+                else:
+                    logprobs_result = _get_logprobs(self.worker, response)
+                    if logprobs_result:
+                        response = ResponseWrapper(response, logprobs_result)
 
                 # TODO: To verify the performance of using ZMQ instead of SharedMemory
                 # to send the logits tensor back to the Proxy process.
@@ -806,6 +842,10 @@ class AwaitResponseHelper:
                 # serialized when it has error.
                 response = ErrorResponse(response.client_id, response.error_msg,
                                          response.request_id)
+            else:
+                logprobs_result = _get_logprobs(self.worker, response)
+                if logprobs_result:
+                    response = ResponseWrapper(response, logprobs_result)
 
             _send_rsp(self.worker,
                       response,
@@ -832,9 +872,38 @@ def _get_params_for_first_rsp(
     return None, None
 
 
+def _get_logprobs(worker, response: tllm.Response) -> Optional[LogProbsResult]:
+    """Compute logprob and prompt logprob and clear out logits if applicable.
+    """
+    logprobs_result = None
+    generation_result = worker._results.get(response.client_id, None)
+
+    if not generation_result:
+        return
+
+    logprob_params = getattr(generation_result, "_logprob_params", None)
+    if logprob_params:
+        logprobs_result = compute_logprobs(logprob_params.prompt_logprobs,
+                                           logprob_params.logprobs,
+                                           response.result.context_logits,
+                                           response.result.generation_logits,
+                                           response.result.output_token_ids[0])
+
+        if logprob_params.drop_context_logits:
+            response.clear_context_logits()
+
+        if logprob_params.drop_generation_logits:
+            response.clear_generation_logits()
+
+    if response.result.is_final:
+        generation_result.clear_logprob_params()
+
+    return logprobs_result
+
+
 def _send_rsp(
         worker,
-        response: Union[tllm.Response, ErrorResponse],
+        response: Union[tllm.Response, ResponseWrapper, ErrorResponse],
         postproc_batches: Optional[List[List["PostprocWorker.Input"]]] = None,
         rsp_batch: Optional[List[tllm.Response]] = None):
     # if postproc_batches is set, append to batch instead of putting to IpcQueue
@@ -870,7 +939,7 @@ def _send_rsp(
 
     # Eliminate the finished GenerationRequest instances timely, which may
     # take considerable memory.
-    if isinstance(response, tllm.Response):
+    if is_llm_response(response):
         if response.has_error() or response.result.is_final:
             worker._pop_result(response.client_id)
     elif isinstance(response, ErrorResponse):

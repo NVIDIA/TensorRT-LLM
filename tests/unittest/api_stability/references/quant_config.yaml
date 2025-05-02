@@ -38,4 +38,10 @@ methods:
   to_dict:
     parameters: {}
     return_annotation: dict
+  is_module_excluded_from_quantization:
+    parameters:
+      name:
+        annotation: str
+        default: inspect._empty
+    return_annotation: bool
 properties: {}

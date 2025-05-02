@@ -74,5 +74,8 @@ template <typename T>
 void invokeBatchedFP4Quantization(int b, int m, int n, T const* input, float const* globalScale, int64_t* output,
     int32_t* SFOuput, bool useUE8M0, int multiProcessorCount, cudaStream_t stream = 0);
 
+void invokeNVFP4BlockScaleInterleave(
+    int b, int m, int n, uint8_t const* SFIn, uint8_t* SFOutput, int multiProcessorCount, cudaStream_t stream = 0);
+
 } // namespace kernels
 } // namespace tensorrt_llm

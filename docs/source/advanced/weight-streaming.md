@@ -12,7 +12,7 @@ Here is an example to run llama-7b with Weight Streaming:
 ```bash
 
 # Convert model as normal. Assume hugging face model is in llama-7b-hf/
-python3 examples/llama/convert_checkpoint.py \
+python3 examples/models/core/llama/convert_checkpoint.py \
     --model_dir llama-7b-hf/ \
     --output_dir /tmp/llama_7b/trt_ckpt/fp16/1-gpu/ \
     --dtype float16

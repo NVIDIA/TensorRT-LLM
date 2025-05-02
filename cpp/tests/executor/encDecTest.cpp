@@ -125,8 +125,8 @@ TEST_P(EncDecParamsTest, validEncDecCtor)
     std::filesystem::path encEnginePath = ENC_DEC_ENGINE_BASE / enginePathName / "encoder";
     std::filesystem::path decEnginePath = ENC_DEC_ENGINE_BASE / enginePathName / "decoder";
     ExecutorConfig executorConfig{};
-    FloatType freeGpuMemoryFraction = 0.5f;
-    FloatType crossKvCacheFraction = 0.5f;
+    FloatType freeGpuMemoryFraction = 0.4f;
+    FloatType crossKvCacheFraction = 0.4f;
     KvCacheConfig kvCacheConfig{false, std::nullopt, std::nullopt, std::nullopt, freeGpuMemoryFraction};
     kvCacheConfig.setCrossKvCacheFraction(crossKvCacheFraction);
     executorConfig.setKvCacheConfig(kvCacheConfig);

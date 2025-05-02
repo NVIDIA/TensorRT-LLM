@@ -106,76 +106,6 @@ FusedMHARunnerV2::FusedMHARunnerV2(MHARunnerFixedParams fixedParams)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// For debugging purposes.
-inline void dumpFmhaParams(Fused_multihead_attention_params_v2 const& p, FILE* fd = stdout)
-{
-    fprintf(fd, "d = %d\ndv = %d\ns = %d\nb = %d\nh = %d\nh_kv = %d\nh_q_per_kv = %d\n", p.d, p.dv, p.s, p.b, p.h,
-        p.h_kv, p.h_q_per_kv);
-    auto dump_scale_bmm = [&](char const* name, uint32_t const* ptr, uint32_t val)
-    {
-        if (ptr)
-        {
-            cudaError err = cudaMemcpy(&val, ptr, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-            if (err != cudaSuccess)
-            {
-                throw std::runtime_error("failed to cudaMemcpy()");
-            }
-        }
-        fprintf(fd, "%s = %f\n", name, reinterpret_cast<float&>(val));
-    };
-    dump_scale_bmm("scale_bmm1", p.scale_bmm1_d, p.scale_bmm1);
-    dump_scale_bmm("scale_bmm2", p.scale_bmm2_d, p.scale_bmm2);
-    fprintf(fd, "softcapping_scale_bmm1 = %f\nscale_softmax = %f\n",
-        reinterpret_cast<float const&>(p.softcapping_scale_bmm1), reinterpret_cast<float const&>(p.scale_softmax));
-    auto to_bool = [](bool v) -> char const* { return v ? "true" : "false"; };
-    fprintf(fd, "sliding_window_size = %d\nhas_alibi = %s\nis_s_padded = %s\n", p.sliding_window_size,
-        to_bool(p.has_alibi), to_bool(p.is_s_padded));
-    auto dump_cu_array = [&](char const* name, int const* cu_array)
-    {
-        if (!cu_array)
-        {
-            fprintf(fd, "%s = None\n", name);
-            return;
-        }
-        size_t sz = (p.b + 1) * sizeof(int);
-        int* array = (int*) malloc(sz);
-        if (!array)
-        {
-            throw std::runtime_error("failed to malloc()");
-        }
-        cudaError err = cudaMemcpy(array, cu_array, sz, cudaMemcpyDeviceToHost);
-        if (err != cudaSuccess)
-        {
-            throw std::runtime_error("failed to cudaMemcpy()");
-        }
-        fprintf(fd, "%s = [", name);
-        for (int i = 0; i <= p.b; i++)
-        {
-            fprintf(fd, i == 0 ? "%d" : ", %d", array[i]);
-        }
-        fprintf(fd, "]\n");
-        free(array);
-    };
-    dump_cu_array("cu_q_seqlens", p.cu_q_seqlens);
-    dump_cu_array("cu_kv_seqlens", p.cu_kv_seqlens);
-    dump_cu_array("cu_mask_rows", p.cu_mask_rows);
-    fprintf(fd,
-        "tile_id_counter_ptr = %p\nnum_tiles = %u\nnum_tiles_per_head = %u\n"
-        "use_balanced_scheduling = %s\n",
-        p.tile_id_counter_ptr, p.num_tiles, p.num_tiles_per_head, to_bool(p.use_balanced_scheduling));
-    fprintf(fd,
-        "qkv_stride_in_bytes = %ld\nq_stride_in_bytes = %ld\nkv_stride_in_bytes = %ld\n"
-        "v_stride_in_bytes = %ld\npacked_mask_stride_in_bytes = %ld\no_stride_in_bytes = %ld\n",
-        p.qkv_stride_in_bytes, p.q_stride_in_bytes, p.kv_stride_in_bytes, p.v_stride_in_bytes,
-        p.packed_mask_stride_in_bytes, p.o_stride_in_bytes);
-    auto& kv_cache = p.paged_kv_cache;
-    fprintf(fd,
-        "# paged_kv_cache\nmMaxSeqs = %d\nmMaxBlocksPerSeq = %d\nmTokensPerBlock = %d\n"
-        "mTokensPerBlockLog2 = %d\nmBytesPerBlock = %d\n\n",
-        kv_cache.mMaxSeqs, kv_cache.mMaxBlocksPerSeq, kv_cache.mTokensPerBlock, kv_cache.mTokensPerBlockLog2,
-        kv_cache.mBytesPerBlock);
-}
-
 // Shared setup function.
 void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
 {
@@ -316,11 +246,6 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     mKernelParams.sage.q.max_nblock = runnerParams.qMaxNBlock;
     mKernelParams.sage.k.max_nblock = runnerParams.kMaxNBlock;
     mKernelParams.sage.v.max_nblock = runnerParams.vMaxNBlock;
-
-    // For debugging purposes.
-    // if (mFixedParams.dataType == DATA_TYPE_E4M3) {
-    //     dumpFmhaParams(mKernelParams);
-    // }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -471,9 +396,9 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
 
         // Now we have SM90 generation MLA kernels. These treatments are only for context MLA and non SM90 generation
         // MLA.
-        bool isFP8GenerationMLA = mFixedParams.dataType == DATA_TYPE_E4M3
-            && (mFixedParams.headSize == 576 && mFixedParams.headSizeV == 512);
-        if (!isFP8GenerationMLA)
+        bool isFP8GenerationMLAOnHopper = mFixedParams.dataType == DATA_TYPE_E4M3
+            && (mFixedParams.headSize == 576 && mFixedParams.headSizeV == 512) && isSm90;
+        if (!isFP8GenerationMLAOnHopper)
         {
             mLaunchParams.granular_tiling = true;
             // Even on SM90, we use ampere-style kernel, will be optimized later

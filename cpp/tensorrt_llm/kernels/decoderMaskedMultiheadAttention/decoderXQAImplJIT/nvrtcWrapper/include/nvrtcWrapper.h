@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,18 +17,6 @@
  */
 #pragma once
 #include <stddef.h>
-
-#ifdef _WIN32
-
-#if COMPILING_DLL
-#define DLLEXPORT __declspec(dllexport)
-#else
-#define DLLEXPORT __declspec(dllimport)
-#endif
-
-#else             // _WIN32
-#define DLLEXPORT // Nothing.
-#endif
 
 #if __cplusplus
 extern "C"
@@ -86,18 +74,17 @@ extern "C"
     } tllmXqaJitStatus;
 
     // context must outlive prog.
-    DLLEXPORT tllmXqaJitStatus tllmXqaJitCreateAndCompileProgram(
-        tllmXqaJitProgram* prog, tllmXqaJitContext const* context);
-    DLLEXPORT tllmXqaJitStatus tllmXqaJitGetCUBINSize(tllmXqaJitProgram prog, size_t* cubinSizeRet);
-    DLLEXPORT tllmXqaJitStatus tllmXqaJitGetCUBIN(tllmXqaJitProgram prog, char* cubin);
-    DLLEXPORT tllmXqaJitStatus tllmXqaJitDestroyProgram(tllmXqaJitProgram* prog);
+    tllmXqaJitStatus tllmXqaJitCreateAndCompileProgram(tllmXqaJitProgram* prog, tllmXqaJitContext const* context);
+    tllmXqaJitStatus tllmXqaJitGetCUBINSize(tllmXqaJitProgram prog, size_t* cubinSizeRet);
+    tllmXqaJitStatus tllmXqaJitGetCUBIN(tllmXqaJitProgram prog, char* cubin);
+    tllmXqaJitStatus tllmXqaJitDestroyProgram(tllmXqaJitProgram* prog);
 
     // Returns the size of the error string associated with the last non-success tllmXqaJit function call (including the
     // trailing \0). Returns 0 if there is no such non-success function call.
-    DLLEXPORT size_t tllmXqaJitGetLastErrorStringSize();
+    size_t tllmXqaJitGetLastErrorStringSize();
     // Returns the error string.
     // Output can be nullptr if the returned value of tllmGetLastErrorStringSize() is 0.
-    DLLEXPORT void tllmXqaJitGetLastErrorString(char* output);
+    void tllmXqaJitGetLastErrorString(char* output);
 
 #if __cplusplus
 } // extern "C"

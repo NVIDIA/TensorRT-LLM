@@ -17,6 +17,7 @@ import os
 import subprocess
 
 import pytest
+from defs.conftest import skip_no_hopper
 
 
 def kill_disaggregated_processes():
@@ -93,6 +94,8 @@ def get_test_config(test_desc, example_dir, test_root):
         (2,
          f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp_attention_dp_overlap.yaml"
          ),
+        "load_balance":
+        (4, f"{test_configs_root}/disagg_config_load_balance.yaml"),
     }
 
     if test_desc not in config_map:
@@ -345,13 +348,13 @@ def test_disaggregated_load_balance(disaggregated_test_root, llm_venv,
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
 
-    cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} load_balance"
-    check_call(cmd,
-               shell=True,
-               env=llm_venv._new_env,
-               cwd=llm_venv.get_working_directory())
+    run_disaggregated_test(disaggregated_example_root,
+                           "load_balance",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
 
 
+@skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8(disaggregated_test_root,
@@ -372,6 +375,7 @@ def test_disaggregated_deepseek_v3_lite_fp8(disaggregated_test_root,
                            cwd=llm_venv.get_working_directory())
 
 
+@skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu(
@@ -392,6 +396,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu(
                            cwd=llm_venv.get_working_directory())
 
 
+@skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
@@ -412,12 +417,14 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
                            cwd=llm_venv.get_working_directory())
 
 
+@skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
                                                 disaggregated_example_root,
                                                 llm_venv,
                                                 deepseek_v3_model_root):
+
     src_dst_dict = {
         deepseek_v3_model_root:
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
@@ -435,6 +442,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
                            cwd=llm_venv.get_working_directory())
 
 
+@skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
@@ -458,6 +466,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
                            cwd=llm_venv.get_working_directory())
 
 
+@skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp(
@@ -479,6 +488,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp(
                            cwd=llm_venv.get_working_directory())
 
 
+@skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
@@ -499,6 +509,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
                            cwd=llm_venv.get_working_directory())
 
 
+@skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph(
@@ -521,6 +532,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph(
         cwd=llm_venv.get_working_directory())
 
 
+@skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_overlap_cuda_graph(
@@ -542,6 +554,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_overlap_cuda_graph(
                            cwd=llm_venv.get_working_directory())
 
 
+@skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one(
@@ -563,6 +576,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one(
                            cwd=llm_venv.get_working_directory())
 
 
+@skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp(
@@ -584,11 +598,13 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp(
                            cwd=llm_venv.get_working_directory())
 
 
+@skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         deepseek_v3_model_root):
+
     src_dst_dict = {
         deepseek_v3_model_root:
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",

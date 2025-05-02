@@ -18,12 +18,12 @@ import os
 import uuid
 
 import pytest
-from defs.common import (convert_weights, generate_mmlu_cmd,
-                         generate_summary_cmd, quantize_data, venv_check_call,
-                         venv_mpi_check_call)
+from defs.common import (convert_weights, generate_summary_cmd, quantize_data,
+                         venv_check_call, venv_mpi_check_call)
 from defs.conftest import (evaltool_mmlu_post_process,
                            evaltool_wikilingua_post_process, llm_models_root,
-                           skip_pre_ada, skip_pre_blackwell)
+                           skip_post_blackwell, skip_pre_ada,
+                           skip_pre_blackwell)
 from defs.trt_test_alternative import check_call
 from evaltool.constants import (EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT,
                                 EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT,
@@ -102,16 +102,11 @@ def test_llm_mixtral_4gpus_fp8_mmlu_llmapi(
 
     print("Run MMLU test")
     mmlu_cmd = [
-        f"{llmapi_example_root}/../mmlu_llmapi.py",
-        f"--data_dir={mmlu_dataset_root}",
-        f"--hf_model_dir={model_dir}",
-        "--backend=tensorrt",
-        "--check_accuracy",
-        "--tp_size=4",
-        "--accuracy_threshold=69.5",
+        "trtllm-eval", f"--model={model_dir}", f"--tp_size={4}",
+        "--backend=tensorrt", "mmlu", f"--dataset_path={mmlu_dataset_root}",
+        "--check_accuracy", f"--accuracy_threshold={69.5}"
     ]
-
-    venv_check_call(llm_venv, mmlu_cmd)
+    check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
 @skip_pre_ada
@@ -181,13 +176,13 @@ def test_llm_mixtral_fp8_4gpus_summary(llama_example_root,
         summary_cmd)
 
     print("Run mmlu...")
-    mmlu_cmd = generate_mmlu_cmd(llama_example_root,
-                                 tokenizer_dir=llm_mixtral_model_root,
-                                 engine_dir=engine_dir,
-                                 accuracy_threshold=70,
-                                 data_dir=f"{llm_datasets_root}/mmlu")
-
-    venv_check_call(llm_venv, mmlu_cmd)
+    mmlu_cmd = [
+        "trtllm-eval", f"--model={engine_dir}",
+        f"--tokenizer={llm_mixtral_model_root}", "--backend=tensorrt", "mmlu",
+        f"--dataset_path={llm_datasets_root}/mmlu", "--check_accuracy",
+        f"--accuracy_threshold={70}"
+    ]
+    check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
 @pytest.mark.skip_less_device(4)
@@ -246,12 +241,13 @@ def test_llm_mixtral_fp8_managed_weights_4gpus_summary(llama_example_root,
         summary_cmd)
 
     print("Run mmlu...")
-    mmlu_cmd = generate_mmlu_cmd(llama_example_root,
-                                 tokenizer_dir=llm_mixtral_model_root,
-                                 engine_dir=engine_dir,
-                                 accuracy_threshold=70,
-                                 data_dir=f"{llm_datasets_root}/mmlu")
-    venv_check_call(llm_venv, mmlu_cmd)
+    mmlu_cmd = [
+        "trtllm-eval", f"--model={engine_dir}",
+        f"--tokenizer={llm_mixtral_model_root}", "--backend=tensorrt", "mmlu",
+        f"--dataset_path={llm_datasets_root}/mmlu", "--check_accuracy",
+        f"--accuracy_threshold={70}"
+    ]
+    check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
 @pytest.mark.skip_less_device(4)
@@ -605,7 +601,7 @@ def test_llm_mixtral_moe_plugin_lora_4gpus(
     input_text = "我爱吃蛋糕"
     print("Run inference with lora id 0...")
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=5",
         f"--input_text={input_text}",
         "--lora_task_uids=0",
@@ -626,7 +622,7 @@ def test_llm_mixtral_moe_plugin_lora_4gpus(
     print("Run inference with lora id -1...")
     input_text = "I love french quiche"
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=5",
         f"--input_text={input_text}",
         "--lora_task_uids=-1",
@@ -700,7 +696,7 @@ def test_llm_mixtral_moe_plugin_fp8_lora_4gpus(
     input_text = "我爱吃蛋糕"
     print("Run inference with lora id 0...")
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=5",
         f"--input_text={input_text}",
         "--lora_task_uids=0",
@@ -726,7 +722,7 @@ def test_llm_mixtral_moe_plugin_fp8_lora_4gpus(
     print("Run inference with lora id -1...")
     input_text = "I love french quiche. I"
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=5",
         f"--input_text={input_text}",
         "--lora_task_uids=-1",
@@ -853,15 +849,12 @@ def test_llm_mixtral_1gpu_fp4(
     print("Run MMLU test")
     acc_thres = 68.0
     mmlu_cmd = [
-        f"{llama_example_root}/../mmlu_llmapi.py",
-        f"--data_dir={mmlu_dataset_root}",
-        f"--hf_model_dir={llm_mixtral_model_root}",
-        f"--engine_dir={engine_dir}",
-        "--check_accuracy",
-        f"--accuracy_threshold={acc_thres}",
+        "trtllm-eval", f"--model={engine_dir}",
+        f"--tokenizer={llm_mixtral_model_root}", "--backend=tensorrt", "mmlu",
+        f"--dataset_path={mmlu_dataset_root}", "--check_accuracy",
+        f"--accuracy_threshold={acc_thres}"
     ]
-
-    venv_check_call(llm_venv, mmlu_cmd)
+    check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
 @skip_pre_blackwell
@@ -877,19 +870,15 @@ def test_llm_mixtral_1gpu_fp4_llmapi(
 
     print("Run MMLU test")
     mmlu_cmd = [
-        f"{llmapi_example_root}/../mmlu_llmapi.py",
-        f"--data_dir={mmlu_dataset_root}",
-        f"--hf_model_dir={model_dir}",
-        "--backend=tensorrt",
-        "--check_accuracy",
-        f"--accuracy_threshold=68.0",
+        "trtllm-eval", f"--model={model_dir}", "--backend=tensorrt", "mmlu",
+        f"--dataset_path={mmlu_dataset_root}", "--check_accuracy",
+        f"--accuracy_threshold={68.0}"
     ]
+    check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
-    venv_check_call(llm_venv, mmlu_cmd)
 
-
-@pytest.mark.parametrize(
-    "model_name", ['mixtral-8x7b-v0.1-AWQ', 'Mixtral-8x7B-Instruct-v0.1'])
+@skip_post_blackwell
+@pytest.mark.parametrize("model_name", ['mixtral-8x7b-v0.1-AWQ'])
 def test_llm_mixtral_int4_awq_1gpu_summary(llama_example_root,
                                            llm_datasets_root, model_name,
                                            llm_rouge_root, llm_venv, cmodel_dir,
@@ -899,28 +888,15 @@ def test_llm_mixtral_int4_awq_1gpu_summary(llama_example_root,
     model_dir = os.path.join(models_root, model_name)
     ckpt_dir = os.path.join(cmodel_dir, model_name)
 
-    if 'AWQ' in model_name:
-        print("Convert checkpoint...")
-        convert_cmd = [
-            f"{llama_example_root}/convert_checkpoint.py",
-            "--model_dir",
-            model_dir,
-            "--output_dir",
-            ckpt_dir,
-        ]
-        venv_check_call(llm_venv, convert_cmd)
-    else:
-        print("Quantizing model...")
-        ckpt_dir = quantize_data(
-            llm_venv,
-            llama_example_root,
-            model_dir=model_dir,
-            calib_dataset=f"{llm_datasets_root}/cnn_dailymail",
-            dtype="float16",
-            qformat="int4_awq",
-            quantize_dir=qcache_dir_without_install_package,
-            tp_size=1,
-            calib_size=32)
+    print("Convert checkpoint...")
+    convert_cmd = [
+        f"{llama_example_root}/convert_checkpoint.py",
+        "--model_dir",
+        model_dir,
+        "--output_dir",
+        ckpt_dir,
+    ]
+    venv_check_call(llm_venv, convert_cmd)
 
     print("Build engines...")
     build_cmd = [
@@ -940,3 +916,63 @@ def test_llm_mixtral_int4_awq_1gpu_summary(llama_example_root,
                                        rouge_dir=llm_rouge_root)
 
     venv_check_call(llm_venv, summary_cmd)
+
+
+@skip_post_blackwell
+@pytest.mark.skip_less_device(2)
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize(
+    "model_name", ['mixtral-8x7b-v0.1-AWQ', 'Mixtral-8x7B-Instruct-v0.1'])
+def test_llm_mixtral_int4_awq_2gpu_summary(llama_example_root,
+                                           llm_datasets_root, model_name,
+                                           llm_rouge_root, llm_venv, cmodel_dir,
+                                           engine_dir,
+                                           qcache_dir_without_install_package):
+    models_root = llm_models_root()
+    model_dir = os.path.join(models_root, model_name)
+    ckpt_dir = os.path.join(cmodel_dir, model_name)
+
+    if 'AWQ' in model_name:
+        print("Convert checkpoint...")
+        convert_cmd = [
+            f"{llama_example_root}/convert_checkpoint.py",
+            "--model_dir",
+            model_dir,
+            "--output_dir",
+            ckpt_dir,
+            "--tp_size",
+            2,
+        ]
+        venv_check_call(llm_venv, convert_cmd)
+    else:
+        print("Quantizing model...")
+        ckpt_dir = quantize_data(
+            llm_venv,
+            llama_example_root,
+            model_dir=model_dir,
+            calib_dataset=f"{llm_datasets_root}/cnn_dailymail",
+            dtype="float16",
+            qformat="int4_awq",
+            quantize_dir=qcache_dir_without_install_package,
+            tp_size=2,
+            calib_size=32)
+
+    print("Build engines...")
+    build_cmd = [
+        "trtllm-build",
+        f"--checkpoint_dir={ckpt_dir}",
+        f"--output_dir={engine_dir}",
+    ]
+    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+
+    print("Run inference")
+    summary_cmd = generate_summary_cmd(llama_example_root,
+                                       hf_model_dir=model_dir,
+                                       data_type="fp16",
+                                       tensorrt_llm_rouge1_threshold=19.5,
+                                       engine_dir=engine_dir,
+                                       dataset_dir=llm_datasets_root,
+                                       rouge_dir=llm_rouge_root)
+
+    venv_mpi_check_call(llm_venv, ["mpirun", "-n", "2", "--allow-run-as-root"],
+                        summary_cmd)

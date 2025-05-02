@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
@@ -43,7 +44,8 @@ public:
         kv_cache_manager::BaseKVCacheManager* cacheManager, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig,
         executor::kv_cache::CacheState::AttentionType attentionType
-        = executor::kv_cache::CacheState::AttentionType::kDEFAULT);
+        = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
+        std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt);
 };
 
 class BaseCacheTransceiver
@@ -58,9 +60,9 @@ public:
     virtual void requestAndReceiveSync(LlmRequest* llmRequest) = 0;
     virtual void requestAndReceiveAsync(LlmRequest* llmRequest) = 0;
 
-    virtual void checkContextTransferStatus(bool blocking = false) = 0;
+    virtual void checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
 
-    virtual void checkGenTransferStatus(int atLeastRequestNum = 0) = 0;
+    virtual void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
 
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 };
@@ -79,16 +81,18 @@ public:
         executor::kv_cache::CacheState::ModelConfig const& cacheStateModelCfg, runtime::WorldConfig const& worldConfig,
         nvinfer1::DataType dataType,
         executor::kv_cache::CacheState::AttentionType attentionType
-        = executor::kv_cache::CacheState::AttentionType::kDEFAULT);
+        = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
+        std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt);
 
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, CommType commType,
         std::vector<SizeType32> numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         runtime::WorldConfig const& worldConfig, nvinfer1::DataType dataType,
         executor::kv_cache::CacheState::AttentionType attentionType
-        = executor::kv_cache::CacheState::AttentionType::kDEFAULT)
+        = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
+        std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt)
         : CacheTransceiver(cacheManager, commType,
             executor::kv_cache::CacheState::ModelConfig{numKvHeadsPerLayer, sizePerHead, tokensPerBlock}, worldConfig,
-            dataType, attentionType)
+            dataType, attentionType, cacheTransceiverConfig)
     {
     }
 
@@ -102,9 +106,9 @@ public:
     void requestAndReceiveSync(LlmRequest* llmRequest) override;
     void requestAndReceiveAsync(LlmRequest* llmRequest) override;
 
-    void checkContextTransferStatus(bool blocking = false) override;
+    void checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override;
 
-    void checkGenTransferStatus(int atLeastRequestNum = 0) override;
+    void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override;
 
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
@@ -116,7 +120,7 @@ private:
     CommType mCommType;
     std::unique_ptr<DataResponder> mDataResponder;
     std::unique_ptr<DataRequester> mDataRequester;
-    std::map<LlmRequest*, std::future<void>> mResponderFutures;
+    std::vector<std::pair<LlmRequest*, std::future<void>>> mResponderFutures;
     std::vector<std::pair<LlmRequest*, std::future<void>>> mRequesterFutures;
     mpi::MpiComm const *mMpiGroupComm{nullptr}, *mMpiWorldComm{nullptr};
     std::shared_ptr<mpi::MpiComm> mMpiGroupTensorParaComm, mMpiGroupPipeParaComm, mMpiGroupDataComm,
@@ -124,7 +128,8 @@ private:
     executor::kv_cache::CommState const* mCommState;
     std::unique_ptr<executor::kv_cache::CacheState> mCacheState;
     std::unique_ptr<executor::kv_cache::ConnectionManager> mManager;
-
+    std::optional<executor::CacheTransceiverConfig> mCacheTransceiverConfig;
+    std::unique_ptr<kv_cache_manager::CacheTransBufferManager> mCacheTransBufferManager;
     // library handle to the communicator related features,
     // this is used to defer dependency resolution until needed.
     static std::mutex mDllMutex;

@@ -2,7 +2,7 @@ import json
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
-from typing import List, Optional, Tuple, Union
+from typing import List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from pydantic import BaseModel
@@ -37,6 +37,15 @@ class GuidedDecodingParams:
             )
 
 
+class LogprobParams(NamedTuple):
+    prompt_logprobs: Optional[int] = None
+    logprobs: Optional[int] = None
+    # Drop the logits once the logprobs are computed
+    drop_context_logits: bool = False
+    # Drop the geneation_logits once the logprobs are computed
+    drop_generation_logits: bool = False
+
+
 class LogitsProcessor(ABC):
     """Base class for logits processor.
 
@@ -48,7 +57,7 @@ class LogitsProcessor(ABC):
 
     @abstractmethod
     def __call__(self, req_id: int, logits: torch.Tensor,
-                 token_ids: List[List[int]], stream_ptr: int,
+                 token_ids: List[List[int]], stream_ptr: Optional[int],
                  client_id: Optional[int]) -> None:
         """Logits processing callback. The callback is expected to inplace modify the logits.
 
@@ -56,7 +65,7 @@ class LogitsProcessor(ABC):
             req_id (int): Request id.
             logits (torch.Tensor): Logits tensor to be modified.
             token_ids (List[List[int]]): Token ids produced by the request so far. The shape is beam_width * sequence_length.
-            stream_ptr (int): The operation stream used by the logits tensor.
+            stream_ptr (int, optional): The operation stream used by the logits tensor. Not required for PyTorch backend.
             client_id (int, optional): An optional client id.
         """
         pass  # noqa
@@ -116,8 +125,8 @@ class SamplingParams:
         stop_token_ids (List[int], optional): A list of token ids that stop the generation when they are generated. Defaults to None.
         include_stop_str_in_output (bool): Whether to include the stop strings in output text. Defaults to False.
         embedding_bias (torch.Tensor, optional): The embedding bias tensor. Expected type is kFP32 and shape is [vocab_size]. Defaults to None.
-        logits_processor (tensorrt_llm.sampling_params.LogitsProcessor, optional): The logits postprocessor callback. Defaults to None.
-            The LogitsProcessor class is recommended for callback creation.
+        logits_processor (tensorrt_llm.sampling_params.LogitsProcessor, List[tensorrt_llm.sampling_params.LogitsProcessor], optional): The logits postprocessor callback(s). Defaults to None.
+            If a list, each processor is applied in order during generation (supported in PyTorch backend only).
         apply_batched_logits_processor (bool): Whether to apply batched logits postprocessor callback. Defaults to False.
             The BatchedLogitsProcessor class is recommended for callback creation. The callback must be provided when initializing LLM.
 
@@ -149,6 +158,8 @@ class SamplingParams:
         beam_width_array (List[int], optional): The array of beam width using in Variable-Beam-Width-Search. Defaults to None.
 
         return_log_probs (bool): Controls if Result should contain log probabilities. Defaults to False.
+        logprobs (int, optional): Number of log probabilities to return per output token. Defaults to None.
+        prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. Defaults to None.
         return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.
         return_generation_logits (bool): Controls if Result should contain the generation logits. Defaults to False.
         exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Defaults to True.
@@ -193,7 +204,8 @@ class SamplingParams:
                                                       repr=False)
 
     embedding_bias: Optional[torch.Tensor] = None
-    logits_processor: Optional[LogitsProcessor] = None
+    logits_processor: Optional[Union[LogitsProcessor,
+                                     List[LogitsProcessor]]] = None
     apply_batched_logits_processor: bool = False
 
     n: int = 1
@@ -224,13 +236,20 @@ class SamplingParams:
     beam_width_array: Optional[List[int]] = None
 
     # Keep the below fields in sync with tllme.OutputConfig
-    return_log_probs: bool = False
+    return_log_probs: bool = False  # TODO: to be removed after PyTorch flow migrate to use `logprobs`
+    logprobs: Optional[int] = None
+    prompt_logprobs: Optional[int] = None
     return_context_logits: bool = False
     return_generation_logits: bool = False
     exclude_input_from_output: bool = True
     return_encoder_output: bool = False
     return_perf_metrics: bool = False
     additional_model_outputs: Optional[List[AdditionalModelOutput]] = None
+
+    # Used in logprobs calculation in TRT flow to drop logits early if user did not explicitly request them.
+    # Can be deprecated after migration to PyTorch backend.
+    _context_logits_auto_enabled: bool = False
+    _generation_logits_auto_enabled: bool = False
 
     # Lookahead decoding config
     lookahead_config: Optional[tllme.LookaheadDecodingConfig] = None
@@ -280,13 +299,6 @@ class SamplingParams:
 
         self.best_of = self.best_of or self.n
 
-        if (not self.use_beam_search and self.n < self.best_of
-                and not self.return_log_probs):
-            logger.info(
-                f"Enable 'return_log_probs' to trim the {self.n}-best among "
-                f"{self.best_of} outputs under sampling decoding.")
-            self.return_log_probs = True
-
         self._validate()
 
     def _validate(self):
@@ -326,6 +338,14 @@ class SamplingParams:
         return (not self.use_beam_search
                 and (self.top_k is None or self.top_k == 1)
                 and (self.top_p is None or self.top_p == 0.0))
+
+    @property
+    def _need_return_context_logits(self) -> bool:
+        return self.return_context_logits and not self._context_logits_auto_enabled
+
+    @property
+    def _need_return_generation_logits(self) -> bool:
+        return self.return_generation_logits and not self._generation_logits_auto_enabled
 
     def _setup(self,
                tokenizer,
@@ -429,7 +449,11 @@ class SamplingParams:
         return tllme.SamplingConfig(**llmapi_to_rt_param_map)
 
     def _get_output_config(self) -> tllme.OutputConfig:
-        fields = [f for f in dir(tllme.OutputConfig) if not f.startswith('__')]
+        sampling_param_fields = set(dir(SamplingParams))
+        fields = [
+            f for f in dir(tllme.OutputConfig)
+            if not f.startswith('__') and f in sampling_param_fields
+        ]
         return tllme.OutputConfig(**{f: getattr(self, f) for f in fields})
 
     def _get_guided_decoding_params(self) -> tllme.GuidedDecodingParams:

@@ -31,7 +31,7 @@ def build_engine(base_model_dir: _pl.Path, eagle_model_dir: _pl.Path,
                  engine_dir: _pl.Path, build_base_model: bool, *args):
 
     if build_base_model:
-        checkpoint_path = "examples/llama/convert_checkpoint.py"
+        checkpoint_path = "examples/models/core/llama/convert_checkpoint.py"
     else:
         checkpoint_path = "examples/eagle/convert_checkpoint.py"
 

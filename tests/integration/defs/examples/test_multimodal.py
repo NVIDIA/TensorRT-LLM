@@ -17,14 +17,15 @@ import os
 
 import pytest
 from defs.common import convert_weights, venv_check_call, venv_mpi_check_call
-from defs.conftest import get_device_memory, skip_pre_ada
+from defs.conftest import get_device_memory, skip_post_blackwell, skip_pre_ada
 from defs.trt_test_alternative import check_call
 
 
 @pytest.fixture(scope="module")
 def multimodal_example_root(llm_root):
     "Get multimodal example root"
-    example_root = os.path.join(llm_root, "examples", "multimodal")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "multimodal")
 
     return example_root
 
@@ -182,7 +183,7 @@ def _test_llm_multimodal_general(llm_venv,
                    env=llm_venv._new_env)
     if qformat == 'fp8':
         convert_cmd = [
-            f"{multimodal_example_root}/../quantization/quantize.py",
+            f"{multimodal_example_root}/../../../quantization/quantize.py",
             f"--model_dir={model_ckpt_path}",
             f"--calib_dataset={llm_datasets_root}/{dataset_path_mapping[calibration_dataset]}",
             f"--dtype={data_type}",
@@ -616,7 +617,7 @@ def _test_llm_multimodal_general(llm_venv,
     'neva-22b',
     'kosmos-2',
     'video-neva',
-    'Phi-3-vision-128k-instruct',
+    pytest.param('Phi-3-vision-128k-instruct', marks=skip_post_blackwell),
     'Phi-3.5-vision-instruct',
     'Phi-4-multimodal-instruct',
     'Llama-3.2-11B-Vision',

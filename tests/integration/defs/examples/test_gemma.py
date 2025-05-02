@@ -17,8 +17,8 @@ import uuid
 from pathlib import Path
 
 import pytest
-from defs.common import (generate_mmlu_cmd, generate_summary_cmd,
-                         test_multi_lora_support, venv_check_call)
+from defs.common import (generate_summary_cmd, test_multi_lora_support,
+                         venv_check_call)
 from defs.conftest import (evaltool_mmlu_post_process,
                            evaltool_wikilingua_post_process, get_device_memory,
                            skip_fp8_pre_ada, skip_post_blackwell,
@@ -140,7 +140,7 @@ def hf_gemma_quantization_1gpu(batch_size,
     print("Convert checkpoint by modelopt...")
     kv_cache_dtype = 'fp8' if qformat == 'fp8' else 'int8'
     convert_cmd = [
-        f"{gemma_example_root}/../quantization/quantize.py",
+        f"{gemma_example_root}/../../../quantization/quantize.py",
         f"--model_dir={gemma_model_root}",
         f"--calib_dataset={llm_datasets_root}/cnn_dailymail",
         f"--dtype={data_type}",
@@ -179,7 +179,7 @@ def hf_gemma_quantization_1gpu(batch_size,
     ] if max_attention_window is not None else []
 
     summary_cmd = [
-        f"{gemma_example_root}/../summarize.py",
+        f"{gemma_example_root}/../../../summarize.py",
         "--test_trt_llm",
         f"--hf_model_dir={gemma_model_root}",
         f"--tokenizer_dir={gemma_model_root}",
@@ -401,20 +401,13 @@ def test_llm_gemma_1gpu_mmlu(batch_size, data_type, gemma_model_root, llm_venv,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     print("Run mmlu...")
-    summary_cmd = generate_mmlu_cmd(gemma_example_root,
-                                    engine_dir=engine_dir,
-                                    accuracy_threshold=37,
-                                    data_dir=f"{llm_datasets_root}/mmlu")
-
-    if ckpt_type == "hf":
-        summary_cmd.extend([
-            f"--hf_model_dir={gemma_model_root}",
-            f"--tokenizer_dir={gemma_model_root}"
-        ])
-    else:
-        summary_cmd.append(f"--vocab_file={vocab_file}")
-
-    venv_check_call(llm_venv, summary_cmd)
+    mmlu_cmd = [
+        "trtllm-eval", f"--model={engine_dir}",
+        f"--tokenizer={gemma_model_root}", "--backend=tensorrt", "mmlu",
+        f"--dataset_path={llm_datasets_root}/mmlu", "--check_accuracy",
+        f"--accuracy_threshold={37}"
+    ]
+    check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
 @pytest.mark.parametrize("gemma_model_root", ["gemma-2b", "gemma-7b"],
@@ -541,7 +534,7 @@ def test_hf_gemma_fp8_base_bf16_multi_lora(gemma_model_root,
     print("Convert checkpoint by modelopt...")
     kv_cache_dtype = 'fp8' if qformat == 'fp8' else 'int8'
     convert_cmd = [
-        f"{gemma_example_root}/../quantization/quantize.py",
+        f"{gemma_example_root}/../../../quantization/quantize.py",
         f"--model_dir={gemma_model_root}",
         f"--calib_dataset={llm_datasets_root}/cnn_dailymail",
         f"--dtype={data_type}",

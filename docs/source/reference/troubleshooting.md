@@ -76,7 +76,7 @@ Here is an example to print the values of the MLP output tensor in the GPT model
 Enable the `--enable_debug_output` option when building engines with `trtllm-build`
 
 ```bash
-cd examples/gpt
+cd examples/models/core/gpt
 
 # Download hf gpt2 model
 rm -rf gpt2 && git clone https://huggingface.co/gpt2-medium gpt2
@@ -323,6 +323,6 @@ As a rule of thumb, if you are running TensorRT-LLM interactively on a Slurm
 node, prefix your commands with `mpirun -n 1` to run TensorRT-LLM in a
 dedicated MPI environment, not the one provided by your Slurm allocation.
 
-For example: `mpirun -n 1 python3 examples/gpt/build.py ...`
+For example: `mpirun -n 1 python3 examples/models/core/gpt/build.py ...`
 
 It's critical that it's always `-n 1` regardless of how many GPUs are being used. If you'd use `-n 2` for a 2 GPU program it will not work. `mpirun` here isn't being used to orchestrate multiple processes, but to invoke the right environment on SLURM. The internal MPI implementation deals with spawning the additional processes.

@@ -59,30 +59,6 @@ class BaseResourceManager(ABC):
         pass
 
 
-class DummyKvCacheManager(BaseResourceManager):
-
-    def __init__(self,
-                 block_count: int,
-                 max_num_tokens: int,
-                 block_size: int = 64):
-        super(BaseResourceManager, self).__init__()
-        self.block_count = block_count
-        self.max_num_tokens = max_num_tokens
-        self.block_size = block_size
-
-    def get_max_resource_count(self) -> int:
-        return self.block_count
-
-    def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
-        max_new_tokens = request.max_new_tokens if request.max_new_tokens is not None else self.max_num_tokens - request.orig_prompt_len
-        context_token_count = request.orig_prompt_len
-        num_context_blocks = context_token_count // self.block_size
-        remaining_tokens = context_token_count + max_new_tokens - num_context_blocks * self.block_size
-        need_blocks = num_context_blocks + math.ceil(
-            remaining_tokens / self.block_size)
-        return need_blocks
-
-
 class KVCacheManager(BaseResourceManager):
 
     def __init__(
@@ -694,9 +670,9 @@ class SlotManager:
         return slot
 
     def remove_slot(self, request_id: int):
-        assert request_id in self.slot_mapping
-        slot = self.slot_mapping.pop(request_id)
-        self.free_slots.add(slot)
+        if request_id in self.slot_mapping:
+            slot = self.slot_mapping.pop(request_id)
+            self.free_slots.add(slot)
 
 
 class ResourceManager:
@@ -763,18 +739,14 @@ class PeftCacheManager(BaseResourceManager):
         world_config = _tb.WorldConfig()
 
         BufferManager = tensorrt_llm.bindings.internal.runtime.BufferManager
-        CudaStream = tensorrt_llm.bindings.internal.runtime.CudaStream
-        self._stream = torch.cuda.Stream().cuda_stream  # FIXME
-        cuda_stream = CudaStream(self._stream)
-        buffer_manager = BufferManager(cuda_stream, True)
+        buffer_manager = BufferManager(torch.cuda.current_stream().cuda_stream,
+                                       True)
         self.impl = PeftCacheManagerCpp(config=peft_cache_manager_config,
                                         model_config=model_config,
                                         world_config=world_config,
                                         buffer_manager=buffer_manager)
 
     def add_request_peft(self, request: LlmRequest):
-        # TODO smor- a helper function to add a request to the peft cache manager.
-        # Cosnider replacing in favor of prepare_resources
         self.impl.add_request_peft(request, True)
 
     def ensure_batch(self,
@@ -800,8 +772,6 @@ class PeftCacheManager(BaseResourceManager):
                 req.lora_config = req.lora_config.reshape(
                     [1] + list(req.lora_config.shape))
             self.impl.add_request_peft(req, True)
-            import time
-            time.sleep(0.1)  # FIXME
 
         py_lora_task_layer_module_configs = self.impl.ensure_batch(
             context_batch, generation_batch, False)

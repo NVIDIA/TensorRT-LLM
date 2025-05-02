@@ -11,7 +11,7 @@ class Run(RunCMDMixin):
         for beam in args.beams_tuple:
             ret.append((
                 mpi_run,
-                f'python3 examples/enc_dec/run.py --engine_dir {args.engines_dir}',
+                f'python3 examples/models/core/enc_dec/run.py --engine_dir {args.engines_dir}',
                 f'--engine_name {args.ckpt}',
                 f'--model_name "{args.hf_models_dir}"',
                 f'--max_new_tokens={args.max_new_tokens}',

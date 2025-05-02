@@ -41,22 +41,6 @@ include_test_map = {
 }
 
 
-def generate_excluded_model_tests() -> Generator[str, None, None]:
-    yield "Gpt[^j]"
-    yield "GptExecutor"
-    yield "Gptj"
-    yield "Llama"
-    yield "ChatGlm"
-    yield "Medusa"
-    yield "Eagle"
-    yield "ExplicitDraftTokensDecoding"
-    yield "Mamba"
-    yield "RecurrentGemma"
-    yield "Encoder"
-    yield "EncDec"
-    yield "SpeculativeDecoding"
-
-
 def generate_included_model_tests(
         test_list: List[str]) -> Generator[str, None, None]:
 
@@ -678,7 +662,7 @@ def prepare_model_tests(model_name: str,
         if model_name == 'gpt':
             script_model_name = 'gpt2'
         elif model_name == 'llama':
-            script_model_name = 'llama-7b-hf'
+            script_model_name = 'Llama-3.2-1B'
         generate_tokenizer_info = [
             python_exe, "examples/generate_xgrammar_tokenizer_info.py",
             f"--model_dir={str(resources_dir / 'models' / script_model_name)}",
@@ -737,15 +721,7 @@ def run_single_gpu_tests(build_dir: _pl.Path,
         if excluded_tests:
             ctest.extend(["-E", "|".join(excluded_tests)])
 
-        gpt_tests = {"gpt", "gpt_session", "gpt_tests", "gpt_executor"}
-
-        # gpt* tests are not parallelized as it would cause OOM because kv cache memory allocations
-        # exist in multiple running tests
-        if gpt_tests.intersection(test_list):
-            parallel = 1
-        else:
-            parallel = default_test_parallel
-
+        parallel = default_test_parallel
         if parallel_override := _os.environ.get("LLM_TEST_PARALLEL_OVERRIDE",
                                                 None):
             parallel = int(parallel_override)

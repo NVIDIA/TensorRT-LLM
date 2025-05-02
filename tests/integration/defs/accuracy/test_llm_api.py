@@ -18,7 +18,7 @@ from tensorrt_llm.llmapi import LLM
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import llm_models_root, skip_pre_ada
+from ..conftest import llm_models_root, skip_post_blackwell, skip_pre_ada
 from .accuracy_core import MMLU, CnnDailymail, LlmapiAccuracyTestHarness
 
 
@@ -27,6 +27,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Meta-Llama-3.1-8B"
 
     @skip_pre_ada
+    @skip_post_blackwell
     def test_fp8_rowwise(self):
         quant_config = QuantConfig(QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
 
@@ -65,6 +66,7 @@ class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
+    @skip_post_blackwell
     def test_weight_only(self):
         quant_config = QuantConfig(QuantAlgo.W8A16)
         with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
@@ -133,6 +135,7 @@ class TestQwen2_5_1_5BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_post_blackwell
     def test_weight_only(self):
         quant_config = QuantConfig(QuantAlgo.W8A16)
         with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
