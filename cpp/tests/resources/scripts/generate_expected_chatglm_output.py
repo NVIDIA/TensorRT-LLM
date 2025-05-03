@@ -14,18 +14,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from pathlib import Path
 
 import numpy as np
+
+# isort: off
 import run
-from build_engines_utils import init_model_spec_module
-
-init_model_spec_module()
-import os
-
-import model_spec
+# isort: on
 
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.bindings.internal.testing import ModelSpec
 
 resources_dir = Path(__file__).parent.resolve().parent
 model_path = resources_dir / "models"
@@ -54,10 +53,10 @@ def generate_output(
     output_dir.mkdir(exist_ok=True, parents=True)
 
     model_spec_obj_list = [
-        model_spec.ModelSpec(
-            input_file, _tb.DataType.HALF).use_gpt_plugin().set_kv_cache_type(
-                _tb.KVCacheType.CONTINUOUS),
-        model_spec.ModelSpec(input_file, _tb.DataType.HALF).use_gpt_plugin().
+        ModelSpec(input_file,
+                  _tb.DataType.HALF).use_gpt_plugin().set_kv_cache_type(
+                      _tb.KVCacheType.CONTINUOUS),
+        ModelSpec(input_file, _tb.DataType.HALF).use_gpt_plugin().
         use_packed_input().set_kv_cache_type(_tb.KVCacheType.PAGED),
     ]
 

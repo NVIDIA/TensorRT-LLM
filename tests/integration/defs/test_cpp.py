@@ -175,30 +175,7 @@ def build_google_tests(request, build_dir):
         "google-tests",
     ]
 
-    # Build engine and generate output scripts need modelSpec
-    make_modelSpec = [
-        "cmake",
-        "--build",
-        ".",
-        "--config",
-        "Release",
-        "-j",
-        "--target",
-        "modelSpec",
-    ]
-
     _cpp.run_command(make_google_tests, cwd=build_dir, timeout=300)
-    _cpp.run_command(make_modelSpec, cwd=build_dir, timeout=300)
-
-    script_dir = (_pl.Path(__file__).parent.resolve().parent.parent.parent /
-                  "cpp" / "tests" / "resources" / "scripts")
-
-    assert script_dir.is_dir()
-    _sys.path.append(str(script_dir))
-
-    from build_engines_utils import init_model_spec_module
-
-    init_model_spec_module(force_init_trtllm_bindings=False)
 
 
 @pytest.fixture(scope="session")

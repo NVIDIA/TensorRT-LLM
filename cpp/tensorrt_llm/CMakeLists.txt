@@ -38,6 +38,7 @@ add_subdirectory(common)
 add_subdirectory(kernels)
 add_subdirectory(layers)
 add_subdirectory(runtime)
+add_subdirectory(testing)
 add_subdirectory(executor_worker)
 
 set(TARGET_ARCH "unknown")
@@ -166,6 +167,7 @@ set(TRTLLM_LINK_LIBS
     cutlass_src
     layers_src
     runtime_src
+    testing_src
     userbuffers_src
     ${DECODER_SHARED_TARGET_0}
     ${DECODER_SHARED_TARGET_1})
