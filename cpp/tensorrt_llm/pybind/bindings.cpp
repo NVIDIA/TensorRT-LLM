@@ -35,6 +35,7 @@
 #include "tensorrt_llm/pybind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/pybind/executor/bindings.h"
 #include "tensorrt_llm/pybind/runtime/bindings.h"
+#include "tensorrt_llm/pybind/testing/modelSpecBinding.h"
 #include "tensorrt_llm/pybind/userbuffers/bindings.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -556,6 +557,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 
     auto mInternalRuntime = mInternal.def_submodule("runtime", "Runtime internal bindings");
     tensorrt_llm::pybind::runtime::initBindings(mInternalRuntime);
+
+    auto mInternalTesting = mInternal.def_submodule("testing", "Testing internal bindings");
+    tensorrt_llm::pybind::testing::initBindings(mInternalTesting);
 
     auto mInternalBatchManager = mInternal.def_submodule("batch_manager", "Batch manager internal bindings");
     tpb::initBindings(mInternalBatchManager);
