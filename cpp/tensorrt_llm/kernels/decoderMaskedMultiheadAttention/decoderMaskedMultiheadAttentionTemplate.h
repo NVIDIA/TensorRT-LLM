@@ -1980,6 +1980,8 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 }
                 int const seqIdx = batch_idx * beam_width + beam_offset;
 
+                valid_time_now = tlength - valid_time_now - 1;
+
                 // Base pointer to k cache block for beam's batch
                 TKcache* k_cache_batch = reinterpret_cast<TKcache*>(pastKCache.getKBlockPtr(seqIdx, valid_time_now));
 
@@ -2170,9 +2172,9 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         // Trigger the stores to global memory.
         Qk_vec_k k_vec = *reinterpret_cast<Qk_vec_k*>(&k_smem[qk_vec_idx]);
         auto const k_idx = QK_VEC_SIZE * tidx;
-        int const inBlockIdx = kvCacheBuffer.getKVLocalIdx(cyclic_tlength, hi_kv, Dh, k_idx);
+        int const inBlockIdx = kvCacheBuffer.getKVLocalIdx(tlength, hi_kv, Dh, k_idx);
         // The base pointer for the value in the cache buffer.
-        Tcache* k_cache = reinterpret_cast<Tcache*>(kvCacheBuffer.getKBlockPtr(batch_beam_idx, cyclic_tlength));
+        Tcache* k_cache = reinterpret_cast<Tcache*>(kvCacheBuffer.getKBlockPtr(batch_beam_idx, tlength));
 
         if constexpr (ENABLE_8BITS_KV_CACHE)
         {
@@ -2346,6 +2348,8 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 }
                 int rowIdx = batch_idx * beam_width + beam_offset;
 
+                time_idx = tlength - time_idx - 1;
+
                 int const inBlockIdx = kvCacheBuffer.getKVLocalIdx(time_idx, hi_kv, Dh, vi);
                 // The base pointer for the value in the cache buffer.
                 Tcache* v_cache_batch = reinterpret_cast<Tcache*>(kvCacheBuffer.getVBlockPtr(rowIdx, time_idx));
@@ -2378,9 +2382,9 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // One group of threads computes the product(s) for the current timestep.
     if (vo == kv_loop_length % V_PER_ITER && is_valid_vi && (!MULTI_BLOCK_FLAG || (c_tile == current_step_ctile_idx)))
     {
-        int const inBlockIdx = kvCacheBuffer.getKVLocalIdx(cyclic_tlength, hi_kv, Dh, vi);
+        int const inBlockIdx = kvCacheBuffer.getKVLocalIdx(tlength, hi_kv, Dh, vi);
         // The base pointer for the value in the cache buffer.
-        Tcache* v_cache_base = reinterpret_cast<Tcache*>(kvCacheBuffer.getVBlockPtr(batch_beam_idx, cyclic_tlength));
+        Tcache* v_cache_base = reinterpret_cast<Tcache*>(kvCacheBuffer.getVBlockPtr(batch_beam_idx, tlength));
 
         V_vec_k v;
         if (DO_CROSS_ATTENTION)

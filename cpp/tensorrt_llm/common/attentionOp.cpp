@@ -1598,11 +1598,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         mFmhaDispatcher->run(fmhaParams);
         sync_check_cuda_error(stream);
 
-        // The kv cache might need to be updated after FMHA (only when sliding window attention + chunked context is
-        // used together). Reuse the preprocessingParams.
-        invokeKvCachePostprocessing(preprocessingParams, stream);
-        sync_check_cuda_error(stream);
-
         if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
         {
             this->template ulyssesContextPostprocess<T>(gatherOutBuffer, reinterpret_cast<T*>(params.context_buf),
