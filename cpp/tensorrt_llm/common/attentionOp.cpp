@@ -2092,6 +2092,8 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
             TLLM_CHECK_WITH_INFO(false, "No available kernels are found for FP4 output.");
         }
     }
+    
+    assert(false);
 
     // This is the number of kv tokens that q needs to visit, but excluding one as it will be processed before the kv
     // loop.
