@@ -531,7 +531,7 @@ def main(*,
         )
 
     if install:
-        build_run(f"\"{venv_python}\" -m pip install -e .[devel]")
+        build_run(f"\"{sys.executable}\" -m pip install -e .[devel]")
 
 
 def add_arguments(parser: ArgumentParser):
