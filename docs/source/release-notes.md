@@ -40,8 +40,8 @@ All published functionality in the Release Notes has been fully tested and verif
     - Added support for enabling MTP with CUDA graph padding.
     - Added initial EAGLE-3 implementation.
     - Added support for FP8 MLA on NVIDIA Hopper and Blackwell GPUs.
-  - **AutoDeploy workflow**.
-    - The AutoDeploy workflow is an **experimental** feature in `tensorrt_llm._torch.auto_deploy`.
+  - **AutoDeploy for PyTorch workflow**.
+    - The AutoDeploy for PyTorch workflow is an **experimental** feature in `tensorrt_llm._torch.auto_deploy`.
     - AutoDeploy provides an automated path from off-the-shelf models to optimized deployment in the TensorRT-LLM runtime.
     - Check out `examples/auto_deploy/README.md` for more details.
   - LLM API
@@ -57,8 +57,7 @@ All published functionality in the Release Notes has been fully tested and verif
   - Added STDiT for OpenSoRA text-to-video support. Refer to `examples/stdit/README.md`.
   - Added vision encoders with tensor parallelism and context parallelism support. Refer to `examples/vit/README.md`.
   - Added EXAONE-Deep support. Refer to `examples/exaone/README.md`.
-  - Added support for Phi-4-mini.
-  - Added support for Phi‑4‑MM.
+  - Added support for Phi-4-mini and Phi‑4‑MM.
   - Added Gemma3 text‑only model support. Refer to "Run Gemma 3" section at `examples/gemma/README.md`.
   - Added FP8 quantization support for Qwen2-VL.
   - Added batched inference support for the LLM API MMLU example `examples/mmlu_llmapi.py`.
@@ -119,6 +118,7 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### Known Issues
   - The PyTorch workflow on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) for optimal support on SBSA platforms.
+
 
 ## TensorRT-LLM Release 0.18.2
 
@@ -186,7 +186,7 @@ All published functionality in the Release Notes has been fully tested and verif
 ### Known Issues
   - Need `--extra-index-url https://pypi.nvidia.com` when running `pip install tensorrt-llm` due to new third-party dependencies.
   - The PYPI SBSA wheel is incompatible with PyTorch 2.5.1 due to a break in the PyTorch ABI/API, as detailed in the related [GitHub issue](https://github.com/pytorch/pytorch/issues/144966).
-  - The PyTorch workflow on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the [PyTorch NGC Container (https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) for optimal support on SBSA platforms.
+  - The PyTorch workflow on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) for optimal support on SBSA platforms.
 
 ### Fixed Issues
   - Fixed incorrect LoRA output dimension. Thanks for the contribution from @akhoroshev in #2484.
