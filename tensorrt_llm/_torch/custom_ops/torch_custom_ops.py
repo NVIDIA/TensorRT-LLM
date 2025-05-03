@@ -7,6 +7,7 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from ..attention_backend.interface import AttentionInputType
 from ..autotuner import AutoTuner, TunableRunner, TuningConfig
 from ..utils import (get_last_power_of_2_num_tokens_buckets,
+                     get_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2, next_positive_power_of_2)
 
 
@@ -301,8 +302,11 @@ def nvfp4_gemm(
     tuner = AutoTuner.get()
 
     tuning_config = TuningConfig(
-        dynamic_tensors=((0, 0, (get_last_power_of_2_num_tokens_buckets,
-                                 last_positive_power_of_2)), ),
+        dynamic_tensors=((0, 0, (
+            lambda x: get_power_of_2_num_tokens_buckets(8192)
+            if not to_userbuffers else get_last_power_of_2_num_tokens_buckets(
+                x), lambda x: next_positive_power_of_2(x)
+            if not to_userbuffers else last_positive_power_of_2(x))), ),
         constraints=((2, 0, fp4_scale_dims), ),
     )
 
