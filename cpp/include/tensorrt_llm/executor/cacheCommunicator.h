@@ -16,20 +16,12 @@
 
 #pragma once
 
-#include <future>
-#include <variant>
-
-#include "tensorrt_llm/executor/dataTransceiverState.h"
-#include "tensorrt_llm/runtime/iBuffer.h"
-
-namespace tensorrt_llm::batch_manager
-{
-class RequestInfo;
-class UcxEndpoint;
-} // namespace tensorrt_llm::batch_manager
+#include <vector>
 
 namespace tensorrt_llm::executor::kv_cache
 {
+
+class CommState;
 
 struct DataContext
 {
