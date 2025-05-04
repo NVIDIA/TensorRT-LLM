@@ -448,14 +448,14 @@ test_e2e.py::test_benchmark_sanity_enable_fp8[llama_7b]
 test_e2e.py::test_llama_e2e[use_cpp_session-remove_input_padding-]
 test_e2e.py::test_llama_e2e[use_py_session-remove_input_padding-]
 test_e2e.py::test_llama_e2e[use_py_session--]
-test_e2e.py::test_llmapi_load_engine_from_build_command[llama-codellama/CodeLlama-7b-Instruct-hf] # 5min
-test_e2e.py::test_llmapi_load_engine_from_build_command[llama-llama-models/llama-7b-hf] # 5min
+llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command[llama-codellama/CodeLlama-7b-Instruct-hf] # 5min
+llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command[llama-llama-models/llama-7b-hf] # 5min
 test_e2e.py::test_mistral_e2e[use_cpp_session-remove_input_padding--]
 test_e2e.py::test_mistral_e2e[use_py_session-remove_input_padding--]
 test_e2e.py::test_mistral_e2e[use_py_session---]
 test_e2e.py::test_openai_multi_chat_example
 test_e2e.py::test_openai_consistent_chat
-test_e2e.py::test_llmapi_server_example
+llmapi/test_llm_examples.py::test_llmapi_server_example
 # Pivot to Pytorch test cases.
 test_e2e.py::test_ptp_quickstart
 test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
