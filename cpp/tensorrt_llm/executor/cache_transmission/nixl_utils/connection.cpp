@@ -50,7 +50,8 @@ void NixlConnection::sendRequestInfo(std::string serializedInfo, runtime::ITenso
     std::string bufferDescStr = bufferDesc.serialize();
 
     // Create a notification message that includes both the request info and buffer descriptor
-    std::string notifMsg = serializedInfo + "$" + bufferDescStr; // TODO: check with TRTLLM team
+    // Format: <serializedInfo.length>:<serializedInfo>:<bufferDescStr>
+    std::string notifMsg = std::to_string(serializedInfo.length()) + ":" + serializedInfo + ":" + bufferDescStr;
 
     // Use genNotif to send the request info and buffer descriptor
     agent_->genNotif(remote_agent_.c_str(), notifMsg);
@@ -244,11 +245,18 @@ Connection const* NixlConnectionManager::recvRequestInfo(std::string& retSeriali
                     mUnhandledNotifications.erase(agent);
                 }
 
-                // Parse notification
+                // Parse length-prefixed notification
                 std::istringstream iss(notif);
-                std::string serializedInfo, bufferDescStr;
-                std::getline(iss, serializedInfo, '$'); // TODO: check with TRTLLM team
-                std::getline(iss, bufferDescStr);
+                std::string lengthStr;
+                std::getline(iss, lengthStr, ':');
+                size_t infoLength = std::stoul(lengthStr);
+                
+                // Extract serializedInfo using the length
+                std::string serializedInfo = notif.substr(lengthStr.length() + 1, infoLength);
+                
+                // Extract bufferDescStr (everything after serializedInfo and its delimiter)
+                std::string bufferDescStr = notif.substr(lengthStr.length() + 1 + infoLength + 1);
+                
                 retBufferDescStr = bufferDescStr;
                 retSerializedInfo = serializedInfo;
 
@@ -257,8 +265,6 @@ Connection const* NixlConnectionManager::recvRequestInfo(std::string& retSeriali
                 if (it_connection != connections_by_name_.end())
                 {
                     Connection const* connection = it_connection->second.get();
-                    // TLLM_LOG_DEBUG("NIXL: get connection for agent %s with rank %d", agent.c_str(),
-                    // connection->getRank());
                     return connection;
                 }
                 else
