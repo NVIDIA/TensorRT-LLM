@@ -1762,12 +1762,13 @@ void TrtGptModelInflightBatching::postProcessRequest(
         {
             if (mWorldConfig.isLastPipelineParallelRank())
             {
-                mMpiCommPipelinePara->send(*(llmReq.getContextLogitsHost()), 0, 1);
+                mMpiCommPipelinePara->send(
+                    *(llmReq.getContextLogitsHost()), 0, mpi::MpiTag::kTrtGptModelInflightBatchingContextLogits);
             }
             else if (mWorldConfig.isFirstPipelineParallelRank())
             {
-                mMpiCommPipelinePara->recv(
-                    *(llmReq.getContextLogitsHost()), mWorldConfig.getPipelineParallelism() - 1, 1);
+                mMpiCommPipelinePara->recv(*(llmReq.getContextLogitsHost()), mWorldConfig.getPipelineParallelism() - 1,
+                    mpi::MpiTag::kTrtGptModelInflightBatchingContextLogits);
             }
         }
 
@@ -1776,12 +1777,14 @@ void TrtGptModelInflightBatching::postProcessRequest(
         {
             if (mWorldConfig.isLastPipelineParallelRank())
             {
-                mMpiCommPipelinePara->send(*(llmReq.getGenerationLogitsHost()), 0, 2);
+                mMpiCommPipelinePara->send(
+                    *(llmReq.getGenerationLogitsHost()), 0, mpi::MpiTag::kTrtGptModelInflightBatchingGenerationLogits);
             }
             else if (mWorldConfig.isFirstPipelineParallelRank())
             {
-                mMpiCommPipelinePara->recv(
-                    *(llmReq.getGenerationLogitsHost()), mWorldConfig.getPipelineParallelism() - 1, 2);
+                mMpiCommPipelinePara->recv(*(llmReq.getGenerationLogitsHost()),
+                    mWorldConfig.getPipelineParallelism() - 1,
+                    mpi::MpiTag::kTrtGptModelInflightBatchingGenerationLogits);
             }
         }
     }
