@@ -494,5 +494,6 @@ def instantiate_decoder(model_engine, executor_config, spec_decoder,
     else:
         decoder = TorchDecoder(
             max_seq_len=model_engine.max_seq_len,
+            executor_config=executor_config,
             mixed_decoder=pytorch_backend_config.mixed_decoder)
     return decoder
