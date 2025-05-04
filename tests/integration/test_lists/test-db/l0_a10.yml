@@ -34,11 +34,11 @@ l0_a10:
       backend: cpp
   tests:
   # ------------- CPP tests ---------------
-  - test_cpp.py::test_model[medusa-86]
-  - test_cpp.py::test_model[redrafter-86]
-  - test_cpp.py::test_model[mamba-86]
-  - test_cpp.py::test_model[recurrentgemma-86]
-  - test_cpp.py::test_model[eagle-86]
+  - test_cpp.py::test_model[-medusa-86]
+  - test_cpp.py::test_model[-redrafter-86]
+  - test_cpp.py::test_model[-mamba-86]
+  - test_cpp.py::test_model[-recurrentgemma-86]
+  - test_cpp.py::test_model[-eagle-86]
 - condition:
     ranges:
       system_gpu_count:
@@ -75,9 +75,9 @@ l0_a10:
   - test_e2e.py::test_openai_completions_example
   - test_e2e.py::test_openai_chat_example
   - test_e2e.py::test_openai_chat_multimodal_example
-  - test_e2e.py::test_trtllm_bench_sanity[non-streaming-FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
+  - test_e2e.py::test_trtllm_bench_sanity[--non-streaming-FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_latency_sanity[FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
-  - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency]
+  - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
   - unittest/trt/quantization # 18 mins
   - accuracy/test_cli_flow.py::TestLlama7B::test_streamingllm # 2 mins
   - unittest/trt/functional # 37 mins
@@ -127,9 +127,9 @@ l0_a10:
       stage: post_merge
       backend: tensorrt
   tests:
-  - test_e2e.py::test_mistral_e2e[use_py_session]
-  - test_e2e.py::test_mistral_e2e[use_cpp_session-remove_input_padding]
-  - test_e2e.py::test_mistral_e2e[use_py_session-remove_input_padding]
+  - test_e2e.py::test_mistral_e2e[use_py_session---]
+  - test_e2e.py::test_mistral_e2e[use_cpp_session-remove_input_padding--]
+  - test_e2e.py::test_mistral_e2e[use_py_session-remove_input_padding--]
   - examples/test_bert.py::test_llm_bert_general[compare_hf-disable_remove_input_padding-disable_attention_plugin-disable_context_fmha-tp:1-pp:1-float32-BertModel-bert/bert-base-uncased]
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:1-pp:1-float16-RobertaModel-bert/roberta-base]
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-disable_attention_plugin-disable_context_fmha-tp:1-pp:1-float16-RobertaForSequenceClassification-bert/twitter-roberta-base-emotion]
