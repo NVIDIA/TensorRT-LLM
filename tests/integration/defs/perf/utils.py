@@ -536,8 +536,6 @@ class AbstractPerfScriptTestClass(abc.ABC):
             "original_test_name":
             original_test_name
             if original_test_name is not None else full_test_name,
-            "raw_result":
-            raw_result,
             "perf_metric":
             self._perf_result,
             "total_time__sec":

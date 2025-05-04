@@ -1237,6 +1237,14 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     ${llmSrc}/tests/integration/defs/perf/base_perf.csv
                 """
             }
+            stage("Create perf report") {
+                sh """
+                    python3 ${llmSrc}/tests/integration/defs/perf/create_perf_comparison_report.py \
+                    --output-path ${stageName}/report.pdf \
+                    --files ${stageName}/perf_script_test_results.csv \
+                    ${llmSrc}/tests/integration/defs/perf/base_perf.csv
+                """
+            }
         }
     }
 }
