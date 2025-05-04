@@ -1,3 +1,4 @@
+import itertools
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from typing import Optional
@@ -34,6 +35,16 @@ class ScheduledRequests:
     @property
     def batch_size(self) -> int:
         return len(self.context_requests) + len(self.generation_requests)
+
+    def all_requests(self) -> itertools.chain[LlmRequest]:
+        return itertools.chain(self.context_requests, self.generation_requests)
+
+    @property
+    def beam_width(self) -> int:
+        for request in self.all_requests():
+            return request.sampling_config.beam_width
+        raise ValueError(
+            "No requests are present, so no beam width can be inferred")
 
 
 class RequestScheduler(ABC):

@@ -1,5 +1,5 @@
 import math
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Union
 
@@ -54,10 +54,25 @@ class PyTorchConfig:
     moe_backend: str = 'CUTLASS'
     # If true, will iterate over sampling_params of each request and use the
     # corresponding decoding way, like top-k, top-p, etc.
-    mixed_decoder: bool = False
-    # If true, will use the TRTLLM decoder instead of the PyTorch decoder.
-    # The TRTLLM decoder has a wide coverage of decoding strategies.
-    enable_trtllm_decoder: bool = False
+
+    mixed_sampler: bool = False
+    enable_trtllm_sampler: bool = False
+    """
+    If true, will use the TRTLLM sampler instead of the PyTorch sampler.
+    The TRTLLM sampler has a wide coverage of sampling strategies.
+    """
+
+    mixed_decoder: bool = field(default=MISSING)
+    """Deprecated, use `mixed_sampler` instead"""
+    enable_trtllm_decoder: bool = field(default=MISSING)
+    """Deprecated, use `enable_trtllm_sampler` instead"""
+
+    def _update_from_deprecated_fields(self):
+        if self.mixed_decoder is not MISSING:
+            self.mixed_sampler = self.mixed_decoder
+        if self.enable_trtllm_decoder is not MISSING:
+            self.enable_trtllm_sampler = self.enable_trtllm_decoder
+
     kv_cache_dtype: str = "auto"
     use_kv_cache: bool = True
     enable_iter_perf_stats: bool = False

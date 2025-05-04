@@ -14,14 +14,14 @@ from tensorrt_llm.lora_manager import LoraConfig, load_torch_hf_lora
 from tensorrt_llm.mapping import Mapping
 
 from ..speculative import get_num_spec_layers, get_spec_decoder
-from .decoder import (EarlyStopDecoder, TorchDecoder, TorchStarAttentionDecoder,
-                      TRTLLMDecoder)
 from .kv_cache_transceiver import (AttentionTypeCpp, CacheTransBufferManager,
                                    create_kv_cache_transceiver)
 from .model_engine import KV_CACHE_MANAGER_KEY, PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
                                PeftCacheManager, ResourceManager)
+from .sampler import (CppSampler, EarlyStopSampler, TorchSampler,
+                      TorchStarAttentionSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
@@ -199,10 +199,10 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     py_executor.enable_iter_perf_stats = False
     req_ids = []
     if py_executor.dist.mapping.rank == 0:
-        # NOTE: TRTLLMDecoder requires origin_seq_len - 1 for requests.
+        # NOTE: CppSampler requires origin_seq_len - 1 for requests.
         #       Spec decoders with overlap require origin_seq_len.
         seq_len = origin_seq_len - 1 if type(
-            py_executor.decoder) == TRTLLMDecoder else origin_seq_len
+            py_executor.decoder) == CppSampler else origin_seq_len
         req = create_dummy_context_requests(max_num_tokens, seq_len, vocab_size)
         req_ids = py_executor.enqueue_requests(req)
     req_ids = py_executor.dist.broadcast(req_ids, root=0)
@@ -457,13 +457,13 @@ def create_py_executor_instance(dist,
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, kv_cache_manager, attention_type, cache_transceiver_config)
 
-    decoder = instantiate_decoder(model_engine, executor_config, spec_decoder,
+    sampler = instantiate_sampler(model_engine, executor_config, spec_decoder,
                                   pytorch_backend_config, mapping)
 
     return PyExecutor(resource_manager,
                       scheduler,
                       model_engine=model_engine,
-                      decoder=decoder,
+                      sampler=sampler,
                       dist=dist,
                       enable_overlap_scheduler=pytorch_backend_config.
                       enable_overlap_scheduler,
@@ -475,24 +475,24 @@ def create_py_executor_instance(dist,
                       start_worker=start_worker)
 
 
-def instantiate_decoder(model_engine, executor_config, spec_decoder,
+def instantiate_sampler(model_engine, executor_config, spec_decoder,
                         pytorch_backend_config, mapping):
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
-        decoder = TorchStarAttentionDecoder(
+        sampler = TorchStarAttentionSampler(
             max_seq_len=model_engine.max_seq_len)
     elif spec_decoder is not None:
-        decoder = spec_decoder
-    elif pytorch_backend_config.enable_trtllm_decoder:
+        sampler = spec_decoder
+    elif pytorch_backend_config.enable_trtllm_sampler:
         decoding_mode = executor_config.decoding_config.decoding_mode if executor_config.decoding_config and executor_config.decoding_config.decoding_mode else DecodingMode.TopK(
         )
-        decoder = TRTLLMDecoder(executor_config, model_engine.model,
-                                model_engine.dtype, mapping, decoding_mode)
+        sampler = CppSampler(executor_config, model_engine.model,
+                             model_engine.dtype, mapping, decoding_mode)
     elif not model_engine.model.model_config.is_generation:
-        # NOTE: choose decoder based on model type
-        decoder = EarlyStopDecoder()
+        # NOTE: choose sampler based on model type
+        sampler = EarlyStopSampler()
     else:
-        decoder = TorchDecoder(
+        sampler = TorchSampler(
             max_seq_len=model_engine.max_seq_len,
-            mixed_decoder=pytorch_backend_config.mixed_decoder)
-    return decoder
+            mixed_sampler=pytorch_backend_config.mixed_sampler)
+    return sampler
