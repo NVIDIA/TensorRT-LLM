@@ -60,14 +60,14 @@ enum class MpiTag : int
     kTrtGptModelInflightBatchingGenerationLogits = 23,
 
     // Orchestrator
-    kID_TAG = 127,
-    kSTATS_ID_TAG = 128,
-    kDATA_TAG = 1023,
-    kSTATS_DATA_TAG = 1024,
+    kOrchestratorId = 127,
+    kOrchestratorData = 1023,
+    kOrchestratorStatsId = 128,
+    kOrchestratorStatsData = 1024,
 
     // LogitsThread
-    kSPEC_DEC_ID_TAG = 129,
-    kSPEC_DEC_DATA_TAG = 1025,
+    kSpecDecLogitsId = 129,
+    kSpecDecLogitsData = 1025,
 };
 
 } // namespace tensorrt_llm::mpi

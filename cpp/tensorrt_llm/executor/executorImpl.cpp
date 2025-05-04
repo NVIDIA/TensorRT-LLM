@@ -685,7 +685,8 @@ void Executor::Impl::initializeOrchestrator(SizeType32 tp, SizeType32 pp, SizeTy
     mOrchSendReqThread = std::thread(&Impl::orchSendReqThread, this);
 
     // Spawn the thread responsible for receiving new responses from the leader of the model
-    mOrchRecvThread = std::thread([&]() { this->orchRecvThread(mpi::MpiTag::kID_TAG, mpi::MpiTag::kDATA_TAG); });
+    mOrchRecvThread
+        = std::thread([&]() { this->orchRecvThread(mpi::MpiTag::kOrchestratorId, mpi::MpiTag::kOrchestratorData); });
 
 #endif // ENABLE_MULTI_DEVICE
 }
@@ -819,8 +820,8 @@ void Executor::Impl::initializeWorkers(SizeType32 tp, SizeType32 pp, SizeType32 
         mLeaderRecvReqThread = std::thread(&Impl::leaderRecvReqThread, this);
 
         // Spawn the thread responsible for sending new responses to the orchestrator
-        mLeaderSendThread
-            = std::thread([&]() { this->leaderSendThread(mSendQueue, mpi::MpiTag::kID_TAG, mpi::MpiTag::kDATA_TAG); });
+        mLeaderSendThread = std::thread([&]()
+            { this->leaderSendThread(mSendQueue, mpi::MpiTag::kOrchestratorId, mpi::MpiTag::kOrchestratorData); });
     }
 #endif // ENABLE_MULTI_DEVICE
 }
@@ -2405,7 +2406,7 @@ void Executor::Impl::orchSendReqThread()
 
         if (message.id == MpiId::TERMINATION)
         {
-            mOrchLeaderComm->send(&message.id, 1, mpi::MpiType::kUINT64, mLeaderRank, mpi::MpiTag::kID_TAG);
+            mOrchLeaderComm->send(&message.id, 1, mpi::MpiType::kUINT64, mLeaderRank, mpi::MpiTag::kOrchestratorId);
             TLLM_LOG_INFO("Orchestrator sendReq thread exiting");
             break;
         }
@@ -2434,18 +2435,18 @@ void Executor::Impl::orchSendReqThread()
             }
             else
             {
-                mOrchLeaderComm->send(&message.id, 1, mpi::MpiType::kUINT64, mLeaderRank, mpi::MpiTag::kID_TAG);
+                mOrchLeaderComm->send(&message.id, 1, mpi::MpiType::kUINT64, mLeaderRank, mpi::MpiTag::kOrchestratorId);
                 mOrchLeaderComm->send(
-                    packed.data(), packed.size(), mpi::MpiType::kCHAR, mLeaderRank, mpi::MpiTag::kDATA_TAG);
+                    packed.data(), packed.size(), mpi::MpiType::kCHAR, mLeaderRank, mpi::MpiTag::kOrchestratorData);
             }
         }
         else if (message.id == MpiId::CANCEL_REQUEST)
         {
             auto& data = std::get<RequestIdsData>(message.data);
 
-            mOrchLeaderComm->send(&message.id, 1, mpi::MpiType::kUINT64, mLeaderRank, mpi::MpiTag::kID_TAG);
+            mOrchLeaderComm->send(&message.id, 1, mpi::MpiType::kUINT64, mLeaderRank, mpi::MpiTag::kOrchestratorId);
             mOrchLeaderComm->send(
-                data.ids.data(), data.ids.size(), mpi::MpiType::kUINT64, mLeaderRank, mpi::MpiTag::kDATA_TAG);
+                data.ids.data(), data.ids.size(), mpi::MpiType::kUINT64, mLeaderRank, mpi::MpiTag::kOrchestratorData);
         }
         else
         {
@@ -2465,13 +2466,13 @@ void Executor::Impl::leaderRecvReqThread()
     {
         if (mRecvPollPeriodMs > 0)
         {
-            mOrchLeaderComm->recvPoll(mOrchRank, mpi::MpiTag::kID_TAG, mRecvPollPeriodMs);
+            mOrchLeaderComm->recvPoll(mOrchRank, mpi::MpiTag::kOrchestratorId, mRecvPollPeriodMs);
         }
 
         // Blocking is okay: terminate message is expected to arrive here
         MPI_Message msg = nullptr;
         MPI_Status status;
-        mOrchLeaderComm->mprobe(mOrchRank, mpi::MpiTag::kID_TAG, &msg, &status);
+        mOrchLeaderComm->mprobe(mOrchRank, mpi::MpiTag::kOrchestratorId, &msg, &status);
 
         int32_t count = 0;
         MPICHECK(MPI_Get_count(&status, MPI_UINT64_T, &count)); // NOLINT
@@ -2493,7 +2494,7 @@ void Executor::Impl::leaderRecvReqThread()
         }
         if (mpiId == MpiId::PENDING_REQUEST)
         {
-            mOrchLeaderComm->mprobe(mOrchRank, mpi::MpiTag::kDATA_TAG, &msg, &status);
+            mOrchLeaderComm->mprobe(mOrchRank, mpi::MpiTag::kOrchestratorData, &msg, &status);
             MPICHECK(MPI_Get_count(&status, MPI_CHAR, &count));                 // NOLINT
             std::vector<char> buffer(count);
             MPICHECK(MPI_Mrecv(buffer.data(), count, MPI_CHAR, &msg, &status)); // NOLINT
@@ -2531,7 +2532,7 @@ void Executor::Impl::leaderRecvReqThread()
         else if (mpiId == MpiId::CANCEL_REQUEST)
         {
             // Prepare receiving data
-            mOrchLeaderComm->mprobe(mOrchRank, mpi::MpiTag::kDATA_TAG, &msg, &status);
+            mOrchLeaderComm->mprobe(mOrchRank, mpi::MpiTag::kOrchestratorData, &msg, &status);
             MPICHECK(MPI_Get_count(&status, MPI_UINT64_T, &count));                          // NOLINT
             std::vector<uint64_t> cancelledReqIds(count);
             MPICHECK(MPI_Mrecv(cancelledReqIds.data(), count, MPI_UINT64_T, &msg, &status)); // NOLINT
@@ -2606,7 +2607,7 @@ void Executor::Impl::orchRecvThread(mpi::MpiTag idTag, mpi::MpiTag dataTag)
     {
         if (mRecvPollPeriodMs > 0)
         {
-            mOrchLeaderComm->recvPoll(mOrchRank, mpi::MpiTag::kID_TAG, mRecvPollPeriodMs);
+            mOrchLeaderComm->recvPoll(mOrchRank, mpi::MpiTag::kOrchestratorId, mRecvPollPeriodMs);
         }
 
         MPI_Message msg = nullptr;
