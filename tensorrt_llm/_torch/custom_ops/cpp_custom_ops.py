@@ -218,9 +218,9 @@ def _register_fake():
     def _(max_sm_count: int):
         pass
 
-    @torch.library.custom_op("trtllm::group_rms_norm",
+    @torch.library.custom_op("trtllm::group_rms_norm_base",
                              mutates_args=("outputs", ))
-    def group_rms_norm(
+    def group_rms_norm_base(
         inputs: List[torch.Tensor],
         outputs: List[torch.Tensor],
         weights: List[torch.Tensor],
@@ -229,7 +229,7 @@ def _register_fake():
     ) -> None:
         pass
 
-    @group_rms_norm.register_fake
+    @group_rms_norm_base.register_fake
     def _(
         inputs: List[torch.Tensor],
         outputs: List[torch.Tensor],
@@ -251,6 +251,28 @@ def _register_fake():
         pass
 
     @group_rms_norm_large_batch.register_fake
+    def _(
+        inputs: List[torch.Tensor],
+        outputs: List[torch.Tensor],
+        weights: List[torch.Tensor],
+        eps: float,
+        weight_bias: float,
+    ) -> List[torch.Tensor]:
+        return outputs
+
+    # Use groupRMSNormHeuristic which automatically selects between regular and large batch kernels
+    @torch.library.custom_op("trtllm::group_rms_norm_heuristic",
+                             mutates_args=("outputs", ))
+    def group_rms_norm_heuristic(
+        inputs: List[torch.Tensor],
+        outputs: List[torch.Tensor],
+        weights: List[torch.Tensor],
+        eps: float,
+        weight_bias: float,
+    ) -> None:
+        pass
+
+    @group_rms_norm_heuristic.register_fake
     def _(
         inputs: List[torch.Tensor],
         outputs: List[torch.Tensor],

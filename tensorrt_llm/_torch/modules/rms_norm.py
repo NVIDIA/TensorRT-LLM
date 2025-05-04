@@ -1,3 +1,4 @@
+import enum
 from typing import Optional, Tuple, Union
 
 import torch
@@ -58,34 +59,61 @@ class RMSNorm(nn.Module):
             return hidden_states, residual
 
 
+class GroupRMSNormKernelSelection(enum.Enum):
+    heuristic = 0
+    base = 1
+    large_batch = 2
+
+
 def group_rms_norm(
         inputs: list[torch.Tensor],
         weights: Optional[list[torch.Tensor]] = [],
         eps: Optional[float] = 1e-5,
         weight_bias: Optional[float] = 0.0,
+        kernel: GroupRMSNormKernelSelection = GroupRMSNormKernelSelection.
+    heuristic,
         outputs: Optional[list[torch.Tensor]] = None) -> list[torch.Tensor]:
-    '''
-    Group RMS Normalization for multiple inputs.
+    '''Group RMS Normalization for up to 2 inputs.
+
+    This function applies RMS normalization to up to 2 inputs simultaneously,
+    which can be more efficient than normalizing each tensor using multi-stream.
+
+    Available kernel implementations:
+    - Base kernel: Allocates warps proportional to the sum of last dimension of inputs,
+      providing better SM occupancy for most cases.
+    - Large batch kernel: Allocates warps proportional to the maximum last dimension of inputs,
+      which can be more efficient for large batch sizes with 2 inputs.
+
+    The heuristic mode uses a logistic regression model to dynamically select the optimal
+    kernel based on batch size, input dimensions, and GPU architecture.
+    The selection model was trained on benchmark data from various configurations
+    and is optimized for Compute Capabilities 9.x and 10.x.
+
+    Args:
+        inputs: List of input tensors to normalize
+        weights: Optional list of weight tensors for each input
+        eps: Small constant added to variance for numerical stability
+        weight_bias: Optional bias to apply to weights
+        heuristic: Kernel selection strategy:
+            - heuristic: Automatically select between base and large batch kernels
+            - base: Always use the base kernel
+            - large_batch: Always use the large batch kernel
+        outputs: Optional pre-allocated output tensors
+
+    Returns:
+        List of normalized tensors with the same shapes as inputs
     '''
     out = outputs
     if out is None:
         out = [torch.empty_like(input) for input in inputs]
-    torch.ops.trtllm.group_rms_norm(inputs, out, weights, eps, weight_bias)
-    return out
-
-
-def group_rms_norm_large_batch(
-        inputs: list[torch.Tensor],
-        weights: Optional[list[torch.Tensor]] = [],
-        eps: Optional[float] = 1e-5,
-        weight_bias: Optional[float] = 0.0,
-        outputs: Optional[list[torch.Tensor]] = None) -> list[torch.Tensor]:
-    '''
-    Group RMS Normalization for 2 inputs with large batch size.
-    '''
-    out = outputs
-    if out is None:
-        out = [torch.empty_like(input) for input in inputs]
-    torch.ops.trtllm.group_rms_norm_large_batch(inputs, out, weights, eps,
-                                                weight_bias)
+    match kernel:
+        case GroupRMSNormKernelSelection.heuristic:
+            torch.ops.trtllm.group_rms_norm_heuristic(inputs, out, weights, eps,
+                                                      weight_bias)
+        case GroupRMSNormKernelSelection.base:
+            torch.ops.trtllm.group_rms_norm_base(inputs, out, weights, eps,
+                                                 weight_bias)
+        case GroupRMSNormKernelSelection.large_batch:
+            torch.ops.trtllm.group_rms_norm_large_batch(inputs, out, weights,
+                                                        eps, weight_bias)
     return out
