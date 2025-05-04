@@ -37,7 +37,7 @@ class TensorsHost:
 
 
 @dataclass(frozen=True, kw_only=True)
-class DecoderState:
+class SamplerState:
     scheduled_requests: ScheduledRequests
 
     logits: torch.Tensor = None
@@ -58,11 +58,11 @@ class Decoder(ABC):
 
     @abstractmethod
     def decode_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs) -> DecoderState:
+                     model_outputs) -> SamplerState:
         raise NotImplementedError
 
     @abstractmethod
-    def update_requests(self, decoder_state: DecoderState) -> None:
+    def update_requests(self, decoder_state: SamplerState) -> None:
         raise NotImplementedError
 
 
@@ -73,11 +73,11 @@ class EarlyStopDecoder(Decoder):
     """
 
     def decode_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs) -> DecoderState:
-        return DecoderState(scheduled_requests=scheduled_requests,
+                     model_outputs) -> SamplerState:
+        return SamplerState(scheduled_requests=scheduled_requests,
                             logits=model_outputs['logits'])
 
-    def update_requests(self, decoder_state: DecoderState) -> None:
+    def update_requests(self, decoder_state: SamplerState) -> None:
         scheduled_requests = decoder_state.scheduled_requests
         assert (not scheduled_requests.generation_requests)
         for idx, request in enumerate(scheduled_requests.context_requests):
@@ -244,7 +244,7 @@ class TorchDecoder(Decoder):
 
         return False
 
-    def update_requests(self, decoder_state: DecoderState) -> None:
+    def update_requests(self, decoder_state: SamplerState) -> None:
         if decoder_state.decoder_event:
             decoder_state.decoder_event.synchronize()
         new_tokens_list = decoder_state.new_tensors_host.new_tokens_host.tolist(
@@ -343,7 +343,7 @@ class TorchDecoder(Decoder):
             advance_idx()
 
     def _mixed_decode(self, scheduled_requests: ScheduledRequests,
-                      model_outputs: torch.Tensor) -> DecoderState:
+                      model_outputs: torch.Tensor) -> SamplerState:
         logits = model_outputs["logits"]
         log_probs = []
         new_tokens_device_array = []
@@ -375,7 +375,7 @@ class TorchDecoder(Decoder):
         decoder_event = torch.cuda.Event()
         decoder_event.record()
 
-        return DecoderState(
+        return SamplerState(
             scheduled_requests=scheduled_requests,
             logits=logits,
             new_tensors_device=TensorsDevice(
@@ -385,13 +385,13 @@ class TorchDecoder(Decoder):
             log_probs=log_probs)
 
     def _batch_decode(self, scheduled_requests: ScheduledRequests,
-                      model_outputs: torch.Tensor) -> DecoderState:
+                      model_outputs: torch.Tensor) -> SamplerState:
         logits = model_outputs["logits"]
         new_tokens_device = torch.argmax(logits, dim=-1)
         new_tokens_host = new_tokens_device.to('cpu', non_blocking=True)
         decoder_event = torch.cuda.Event()
         decoder_event.record()
-        return DecoderState(
+        return SamplerState(
             scheduled_requests=scheduled_requests,
             logits=logits,
             new_tensors_device=TensorsDevice(
@@ -400,7 +400,7 @@ class TorchDecoder(Decoder):
             decoder_event=decoder_event)
 
     def decode_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs) -> DecoderState:
+                     model_outputs) -> SamplerState:
         if self.mixed_decoder:
             return self._mixed_decode(scheduled_requests, model_outputs)
         else:
@@ -427,7 +427,7 @@ class TorchStarAttentionDecoder(TorchDecoder):
         if request.state != LlmRequestState.GENERATION_COMPLETE:
             request.py_decoding_iter += 1
 
-    def update_requests(self, decoder_state: DecoderState):
+    def update_requests(self, decoder_state: SamplerState):
         if decoder_state.decoder_event:
             decoder_state.decoder_event.synchronize()
         new_tokens_list = decoder_state.new_tensors_host.new_tokens_host.tolist(
@@ -652,13 +652,13 @@ class TRTLLMDecoder(Decoder):
         decoder_event = torch.cuda.Event()
         decoder_event.record()
 
-        return DecoderState(scheduled_requests=scheduled_requests,
+        return SamplerState(scheduled_requests=scheduled_requests,
                             logits=logits,
                             new_tensors_device=new_tensors_device,
                             new_tensors_host=new_tensors_host,
                             decoder_event=decoder_event)
 
-    def update_requests(self, decoder_state: DecoderState):
+    def update_requests(self, decoder_state: SamplerState):
         scheduled_requests = decoder_state.scheduled_requests
         new_tensors_host = decoder_state.new_tensors_host
         decoder_event = decoder_state.decoder_event

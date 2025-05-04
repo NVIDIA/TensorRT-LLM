@@ -7,7 +7,7 @@ from torch import nn
 from tensorrt_llm.bindings.executor import FinishReason
 
 from ..attention_backend import AttentionMetadata
-from ..pyexecutor.decoder import DecoderState, TorchDecoder
+from ..pyexecutor.decoder import SamplerState, TorchDecoder
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
@@ -221,7 +221,7 @@ class MTPDecoder(TorchDecoder):
             request.state = LlmRequestState.GENERATION_COMPLETE
             request.set_finished_reason(FinishReason.LENGTH, beam_idx)
 
-    def update_requests(self, decoder_state: DecoderState) -> None:
+    def update_requests(self, decoder_state: SamplerState) -> None:
         decoder_state.decoder_event.synchronize()
         new_tensors_host = decoder_state.new_tensors_host
         new_tokens_list = new_tensors_host["new_tokens_host"].tolist()
@@ -277,7 +277,7 @@ class MTPDecoder(TorchDecoder):
             idx += 1
 
     def decode_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs) -> DecoderState:
+                     model_outputs) -> SamplerState:
         # new_tokens_device: all of the accepted tokens, device tensor
         # new_tokens_lens_device: the accepted lengths, device tensor
         # next_draft_tokens_device: predicted draft tokens, device tensor
@@ -308,7 +308,7 @@ class MTPDecoder(TorchDecoder):
         # with the max draft token length
         for request in scheduled_requests.context_requests:
             request.py_draft_tokens = [1] * self.draft_len
-        return DecoderState(scheduled_requests=scheduled_requests,
+        return SamplerState(scheduled_requests=scheduled_requests,
                             logits=model_outputs['logits'],
                             new_tensors_device=new_tensors_device,
                             new_tensors_host=new_tensors_host,

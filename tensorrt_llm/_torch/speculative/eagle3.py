@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from ..pyexecutor.decoder import DecoderState, TorchDecoder
+from ..pyexecutor.decoder import SamplerState, TorchDecoder
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 
 
@@ -125,7 +125,7 @@ class Eagle3Decoder(TorchDecoder):
         new_tensors_host = {"new_tokens_host": new_tokens_host}
         decoder_event = torch.cuda.Event()
         decoder_event.record()
-        return DecoderState(scheduled_requests=scheduled_requests,
+        return SamplerState(scheduled_requests=scheduled_requests,
                             logits=logits,
                             new_tensors_device=new_tensors_device,
                             new_tensors_host=new_tensors_host,
