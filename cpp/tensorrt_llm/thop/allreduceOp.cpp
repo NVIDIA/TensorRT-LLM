@@ -44,6 +44,7 @@
 // using namespace nvinfer1;
 using tensorrt_llm::kernels::AllReduceFusionOp;
 using tensorrt_llm::kernels::AllReduceStrategyType;
+using tensorrt_llm::mpi::MpiTag;
 
 namespace torch_ext
 {
@@ -89,34 +90,37 @@ std::set<int> getLocalGroup(std::set<int> const& group)
             ranks.push_back(myRank);
             for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
             {
-                LOCAL_COMM_SESSION.recvValue(rank, *it, 0);
+                LOCAL_COMM_SESSION.recvValue(rank, *it, MpiTag::kDefault);
                 ranks.push_back(rank);
             }
             for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
             {
-                LOCAL_COMM_SESSION.send(ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *it, 0);
+                LOCAL_COMM_SESSION.send(
+                    ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *it, MpiTag::kDefault);
             }
 
             localRanks.clear();
             localRanks.push_back(myLocalRank);
             for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
             {
-                LOCAL_COMM_SESSION.recvValue(rank, *it, 0);
+                LOCAL_COMM_SESSION.recvValue(rank, *it, MpiTag::kDefault);
                 localRanks.push_back(rank);
             }
             for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
             {
-                LOCAL_COMM_SESSION.send(localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *it, 0);
+                LOCAL_COMM_SESSION.send(
+                    localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *it, MpiTag::kDefault);
             }
         }
         else
         {
-            LOCAL_COMM_SESSION.sendValue(myRank, *group.begin(), 0);
-            LOCAL_COMM_SESSION.recv(ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *group.begin(), 0);
-
-            LOCAL_COMM_SESSION.sendValue(myLocalRank, *group.begin(), 0);
+            LOCAL_COMM_SESSION.sendValue(myRank, *group.begin(), MpiTag::kDefault);
             LOCAL_COMM_SESSION.recv(
-                localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *group.begin(), 0);
+                ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *group.begin(), MpiTag::kDefault);
+
+            LOCAL_COMM_SESSION.sendValue(myLocalRank, *group.begin(), MpiTag::kDefault);
+            LOCAL_COMM_SESSION.recv(
+                localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *group.begin(), MpiTag::kDefault);
         }
     }
 

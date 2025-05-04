@@ -16,7 +16,6 @@
  */
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
-#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 namespace tensorrt_llm::batch_manager
 {
