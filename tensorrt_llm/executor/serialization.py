@@ -8,31 +8,35 @@ import pickle  # nosec B403
 # it is only needed in a single instance the class can be added at runtime
 # using register_approved_ipc_class.
 BASE_ZMQ_CLASSES = {
-    "builtins": ["Exception", "ValueError"], # each Exception Error class needs to be added explicitly
-    "tensorrt_llm.executor.request":
-    ["CancellingRequest", "GenerationRequest", "LoRARequest"],
-    "tensorrt_llm.sampling_params":
-    ["SamplingParams", "GuidedDecodingParams", "GreedyDecodingParams"],
-    "tensorrt_llm.executor.postproc_worker":
-    ["PostprocParams", "PostprocWorker.Input", "PostprocWorker.Output"],
-    "tensorrt_llm.serve.postprocess_handlers":
-    ["CompletionPostprocArgs", "completion_response_post_processor"],
+    "builtins": ["Exception", "ValueError"
+                 ],  # each Exception Error class needs to be added explicitly
+    "collections": ["OrderedDict"],
+    "datetime": ["timedelta"],
+    "tensorrt_llm._torch.pyexecutor.llm_request":
+    ["LogitsStorage", "PyResult", "LlmResult", "LlmResponse", "LogProbStorage"],
     "tensorrt_llm.bindings.executor": [
-        "ContextPhaseParams", "Response", "Result", "FinishReason", "KvCacheRetentionConfig",
+        "ContextPhaseParams", "Response", "Result", "FinishReason",
+        "KvCacheRetentionConfig",
         "KvCacheRetentionConfig.TokenRangeRetentionConfig"
     ],
     "tensorrt_llm.disaggregated_params": ["DisaggregatedParams"],
+    "tensorrt_llm.executor.postproc_worker":
+    ["PostprocParams", "PostprocWorker.Input", "PostprocWorker.Output"],
+    "tensorrt_llm.executor.request":
+    ["CancellingRequest", "GenerationRequest", "LoRARequest"],
+    "tensorrt_llm.executor.utils": ["ErrorResponse"],
+    "tensorrt_llm.llmapi.llm_args": ["LookaheadDecodingConfig"],
+    "tensorrt_llm.sampling_params":
+    ["SamplingParams", "GuidedDecodingParams", "GreedyDecodingParams"],
     "tensorrt_llm.serve.openai_protocol":
     ["CompletionResponse", "CompletionResponseChoice", "UsageInfo"],
+    "tensorrt_llm.serve.postprocess_handlers": [
+        "completion_stream_post_processor",
+        "completion_response_post_processor", "CompletionPostprocArgs",
+        "ChatPostprocArgs"
+    ],
     "torch._utils": ["_rebuild_tensor_v2"],
     "torch.storage": ["_load_from_bytes"],
-    "collections": ["OrderedDict"],
-    "datetime": ["timedelta"],
-    "tensorrt_llm.llmapi.llm_args": ["LookaheadDecodingConfig"],
-    "tensorrt_llm._torch.pyexecutor.llm_request":
-    ["LogitsStorage", "PyResult", "LlmResult", "LlmResponse", "LogProbStorage"],
-    "tensorrt_llm.executor.utils": ["ErrorResponse"],
-    "tensorrt_llm.serve.postprocess_handlers": ["completion_stream_post_processor", "completion_response_post_processor", "CompletionPostprocArgs", "ChatPostprocArgs"],
 }
 
 
