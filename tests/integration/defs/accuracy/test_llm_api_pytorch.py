@@ -202,6 +202,40 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
+class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-4-Maverick-17B-128E-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Maverick-17B-128E-Instruct"
+
+    @pytest.mark.skip_less_device(8)
+    @parametrize_with_ids("cuda_graph", [False, True])
+    def test_auto_dtype_tp8(self, cuda_graph):
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=8,
+                 use_cuda_graph=cuda_graph) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+
+
+class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct"
+
+    @pytest.mark.skip_less_device(8)
+    @parametrize_with_ids("cuda_graph", [False, True])
+    def test_auto_dtype_tp8(self, cuda_graph):
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=8,
+                 use_cuda_graph=cuda_graph) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+
+
 class TestMistral7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-7B-v0.1"
     MODEL_PATH = f"{llm_models_root()}/mistral-7b-v0.1"
