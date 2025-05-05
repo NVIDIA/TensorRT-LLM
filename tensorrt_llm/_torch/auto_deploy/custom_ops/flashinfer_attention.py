@@ -190,8 +190,8 @@ def prepare_flashinfer_metadata(
     # for all the layers
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr,
-        flashinfer.get_seq_lens(paged_kv_indptr, paged_kv_last_page_len, page_size),
-        input_ids.numel(),
+        seq_len,
+        position_ids.numel(),
     )
 
     # return metadata
