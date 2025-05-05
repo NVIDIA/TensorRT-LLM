@@ -56,7 +56,7 @@ from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
                           AutoModelForSeq2SeqLM, AutoTokenizer,
                           GenerationConfig)
 from utils import (add_common_args, load_tokenizer, prepare_enc_dec_inputs,
-                   read_model_name)
+                   read_is_enc_dec, read_model_name)
 
 import tensorrt_llm
 from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
@@ -399,15 +399,14 @@ def main():
     cat_cors = {cat: [] for cat in get_categories()}
 
     # different handling if encoder-decoder models
-    is_enc_dec = {'encoder', 'decoder'}.issubset({
-        name
-        for name in os.listdir(args.engine_dir)
-        if os.path.isdir(os.path.join(args.engine_dir, name))
-    })
+    is_enc_dec = read_is_enc_dec(
+        args.engine_dir if not args.test_hf else args.hf_model_dir,
+        args.test_hf)
 
     model_name, model_version = read_model_name(
-        args.engine_dir if not is_enc_dec else os.path.
-        join(args.engine_dir, 'encoder'))
+        (args.engine_dir if not is_enc_dec else os.path.join(
+            args.engine_dir, 'encoder'))
+        if not args.test_hf else args.hf_model_dir, args.test_hf)
 
     tokenizer, pad_id, end_id = load_tokenizer(
         tokenizer_dir=args.tokenizer_dir,
