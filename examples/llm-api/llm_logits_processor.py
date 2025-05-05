@@ -3,7 +3,6 @@ from typing import List, Optional
 
 import torch
 
-import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm import LLM
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
                                           LogitsProcessor, SamplingParams)
@@ -16,6 +15,7 @@ from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
 # This simple callback will output a specific token at each step irrespective of prompt.
 # Refer to ../bindings/executor/example_logits_processor.py for a more
 # sophisticated callback that generates JSON structured output.
+# Please also refer to sampling_params.py for adding subclass to the approved class list for deserialization
 class MyLogitsProcessor(LogitsProcessor):
 
     def __init__(self, allowed_token_id: int):
@@ -68,8 +68,6 @@ class MyBatchedLogitsProcessor(BatchedLogitsProcessor):
 
 
 def main():
-    # Register MyLogitsProcessor as an approved class for deserialization across IPC boundaries.
-    serialization.register_approved_ipc_class(MyLogitsProcessor)
 
     # Batched logits processor (only supported in TensorRT backend)
     # should be specified when initializing LLM.

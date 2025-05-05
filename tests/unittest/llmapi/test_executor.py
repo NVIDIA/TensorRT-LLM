@@ -408,6 +408,8 @@ def test_ZeroMqQueue_serialization_complicated_dataclass():
 
     print(res.result())
     assert res.result() == iterations * (iterations - 1) / 2
+    pool.shutdown()
+    push_pipe.close()
 
 
 Input = PostprocWorker.Input

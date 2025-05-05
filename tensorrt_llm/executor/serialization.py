@@ -12,29 +12,59 @@ BASE_ZMQ_CLASSES = {
                  ],  # each Exception Error class needs to be added explicitly
     "collections": ["OrderedDict"],
     "datetime": ["timedelta"],
+    "pathlib": ["PosixPath"],
     "tensorrt_llm._torch.pyexecutor.llm_request":
     ["LogitsStorage", "PyResult", "LlmResult", "LlmResponse", "LogProbStorage"],
+    "tensorrt_llm.auto_parallel.config": ["AutoParallelConfig", "CostModel"],
     "tensorrt_llm.bindings.executor": [
-        "ContextPhaseParams", "Response", "Result", "FinishReason",
-        "KvCacheRetentionConfig",
-        "KvCacheRetentionConfig.TokenRangeRetentionConfig"
+        "BatchingType", "CapacitySchedulerPolicy", "ContextPhaseParams",
+        "ExecutorConfig", "ExtendedRuntimePerfKnobConfig", "Response", "Result",
+        "FinishReason", "KvCacheConfig", "KvCacheRetentionConfig",
+        "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
+        "SchedulerConfig"
     ],
+    "tensorrt_llm.builder": ["BuildConfig"],
     "tensorrt_llm.disaggregated_params": ["DisaggregatedParams"],
-    "tensorrt_llm.executor.postproc_worker":
-    ["PostprocParams", "PostprocWorker.Input", "PostprocWorker.Output"],
-    "tensorrt_llm.executor.request":
-    ["CancellingRequest", "GenerationRequest", "LoRARequest"],
-    "tensorrt_llm.executor.utils": ["ErrorResponse"],
-    "tensorrt_llm.llmapi.llm_args": ["LookaheadDecodingConfig"],
+    "tensorrt_llm.executor.postproc_worker": [
+        "PostprocArgs", "PostprocParams", "PostprocWorkerConfig",
+        "PostprocWorker.Input", "PostprocWorker.Output"
+    ],
+    "tensorrt_llm.executor.request": [
+        "CancellingRequest", "GenerationRequest", "LoRARequest",
+        "PromptAdapterRequest"
+    ],
+    "tensorrt_llm.executor.result": [
+        "CompletionOutput", "DetokenizedGenerationResultBase",
+        "GenerationResult", "GenerationResultBase", "IterationResult",
+        "Logprob", "LogProbsResult", "ResponseWrapper"
+    ],
+    "tensorrt_llm.executor.utils": ["ErrorResponse", "WorkerCommIpcAddrs"],
+    "tensorrt_llm.executor.worker": ["ExecutorBindingsWorker", "worker_main"],
+    "tensorrt_llm.llmapi._perf_evaluator": ["perform_faked_oai_postprocess"],
+    "tensorrt_llm.llmapi.llm_args": [
+        "_ModelFormatKind", "_ParallelConfig", "CalibConfig",
+        "CapacitySchedulerPolicy", "KvCacheConfig", "LlmArgs",
+        "LookaheadDecodingConfig", "SchedulerConfig"
+    ],
+    "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
+    "tensorrt_llm.llmapi.llm_utils":
+    ["CachedModelLoader._node_build_task", "LlmBuildStats"],
+    "tensorrt_llm.lora_manager": ["LoraConfig"],
+    "tensorrt_llm.mapping": ["Mapping"],
+    "tensorrt_llm.models.modeling_utils":
+    ["QuantConfig", "SpeculativeDecodingMode"],
+    "tensorrt_llm.plugin.plugin": ["PluginConfig"],
     "tensorrt_llm.sampling_params":
     ["SamplingParams", "GuidedDecodingParams", "GreedyDecodingParams"],
-    "tensorrt_llm.serve.openai_protocol":
-    ["CompletionResponse", "CompletionResponseChoice", "UsageInfo"],
     "tensorrt_llm.serve.postprocess_handlers": [
+        "chat_response_post_processor", "chat_stream_post_processor",
         "completion_stream_post_processor",
         "completion_response_post_processor", "CompletionPostprocArgs",
         "ChatPostprocArgs"
     ],
+    # There are 23 model classes need to be included with the similar module pattern , so use wildcards instead.
+    # They are used in test_llm_multi_gpu.py.
+    "tensorrt_llm._torch.models.": ["*"],
     "torch._utils": ["_rebuild_tensor_v2"],
     "torch.storage": ["_load_from_bytes"],
 }
@@ -62,13 +92,18 @@ class Unpickler(pickle.Unpickler):
 
     # only import approved classes, this is the security boundary.
     def find_class(self, module, name):
-        if name not in self.approved_imports.get(module, []):
+        if not self._class_in_approved_list(module, name):
             # If this is triggered when it shouldn't be, then the module
             # and class should be added to the approved_imports. If the class
             # is being used as part of a routine scenario, then it should be added
             # to the appropriate base classes above.
             raise ValueError(f"Import {module} | {name} is not allowed")
         return super().find_class(module, name)
+
+    def _class_in_approved_list(self, module, name):
+        if module.startswith("tensorrt_llm._torch.models."):
+            return True
+        return name in BASE_ZMQ_CLASSES.get(module, [])
 
 
 # these are taken from the pickle module to allow for this to be a drop in replacement
