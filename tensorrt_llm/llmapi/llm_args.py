@@ -1402,7 +1402,7 @@ def get_model_format(model_dir: str) -> _ModelFormatKind:
             PretrainedConfig.from_checkpoint(model_dir)
         else:
             model_format = _ModelFormatKind.HF
-            AutoConfig.from_hugging_face(model_dir)
+            AutoConfig.from_hugging_face(model_dir, trust_remote_code=True)
     except Exception as e:
         raise ValueError(
             f"Inferred model format {model_format}, but failed to load config.json: {e}"
