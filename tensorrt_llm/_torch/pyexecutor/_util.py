@@ -485,6 +485,8 @@ def instantiate_decoder(model_engine, executor_config, pytorch_backend_config,
 
 
 def get_decoding_mode(executor_config):
+    '''This implementation is based off trtGptModelInflightBatching.cpp getDecodingMode().'''
+
     if executor_config.decoding_config and executor_config.decoding_config.decoding_mode and not executor_config.decoding_config.decoding_mode.is_auto(
     ):
         decoding_mode = executor_config.decoding_config.decoding_mode
