@@ -372,7 +372,7 @@ def test_disaggregated_cache_aware_balance(disaggregated_test_root, llm_venv,
                            "cache_aware_balance",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
-    
+
 
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
