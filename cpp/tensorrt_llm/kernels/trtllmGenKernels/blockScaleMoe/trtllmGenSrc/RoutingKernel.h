@@ -17,6 +17,7 @@
 #pragma once
 
 #include "Dtype.h"
+#include "IntFastDiv.h"
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
@@ -97,11 +98,12 @@ struct Data
     int32_t* mPtrPermutedIdxToExpandedIdx{nullptr};
 };
 
-template <typename Type_, typename TypeExpW_, bool UsePdl_>
+template <typename Type_, typename TypeExpW_, bool UseGroups_, bool UsePdl_>
 struct KernelParams
 {
     using Type = Type_;
     using TypeExpW = TypeExpW_;
+    static constexpr bool UseGroups = UseGroups_;
     static constexpr bool UsePdl = UsePdl_;
 
     int32_t* mPtrExpertIdx;
@@ -128,7 +130,7 @@ struct KernelParams
     int32_t mNumExpertGroups;
     int32_t mNumExpertsPerGroup;
     int32_t mNumLimitedGroups;
-    int32_t mTopK;
+    trtllm::dev::IntFastDiv mTopK;
     int32_t mPaddingLog2;
     int32_t mLocalExpertsStartIdx;
     int32_t mLocalExpertsStrideLog2;
@@ -165,7 +167,7 @@ struct KernelParams
         params.mNumExpertGroups = data.mNumExpertGroups;
         params.mNumExpertsPerGroup = data.mNumExperts / data.mNumExpertGroups;
         params.mNumLimitedGroups = data.mNumLimitedGroups;
-        params.mTopK = data.mTopK;
+        params.mTopK = trtllm::dev::IntFastDiv(data.mTopK);
         params.mPaddingLog2 = data.mPaddingLog2;
         params.mLocalExpertsStartIdx = data.mLocalExpertsStartIdx;
         params.mLocalExpertsStrideLog2 = data.mLocalExpertsStrideLog2;
