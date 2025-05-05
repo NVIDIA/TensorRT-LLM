@@ -9,7 +9,7 @@ from tensorrt_llm.mapping import Mapping
 from ..attention_backend import AttentionInputType, AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
-from ..attention_backend.utils import create_attention
+from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
@@ -115,25 +115,30 @@ class Attention(nn.Module):
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
+        self.use_qk_norm = (
+            config.pretrained_config
+            and (config.pretrained_config.model_type == 'qwen3'
+                 or config.pretrained_config.model_type == 'qwen3_moe'))
+        attn_cls = get_attention_backend(self.attn_backend)
+        self.enable_rope_fusion = attn_cls.support_fused_rope(
+        ) and not self.use_qk_norm
         self.attn = create_attention(
             self.attn_backend,
             self.layer_idx,
             self.num_heads,
             self.head_dim,
             self.num_key_value_heads,
-            pos_embd_params=self.pos_embd_params,
+            pos_embd_params=self.pos_embd_params
+            if self.enable_rope_fusion else None,
             quant_config=self.quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
         )
 
-        self.enable_rope_fusion = self.attn.support_fused_rope()
         self.support_fused_qkv = self.attn.support_fused_qkv()
 
         self.rotary_emb = None
         self.apply_rotary_emb = (not self.enable_rope_fusion
                                  and pos_embd_params is not None)
-        if config.pretrained_config and config.pretrained_config.model_type == 'qwen3' or config.pretrained_config and config.pretrained_config.model_type == 'qwen3_moe':
-            self.apply_rotary_emb = True
         if self.apply_rotary_emb:
             self.rotary_emb = RotaryEmbedding(
                 pos_embd_params.rope,
