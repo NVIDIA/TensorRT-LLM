@@ -26,6 +26,7 @@ class GuidedDecodingParams:
     regex: Optional[str] = None
     grammar: Optional[str] = None
     json_object: bool = False
+    structural_tag: Optional[str] = None
 
     def _validate(self):
         num_guides = 0
@@ -441,7 +442,7 @@ class SamplingParams:
                 tllme.GuidedDecodingParams.GuideType.JSON)
         elif self.guided_decoding.json is not None:
             json_schema = self.guided_decoding.json
-            if isinstance(json, BaseModel):
+            if isinstance(json_schema, BaseModel):
                 json_schema = json_schema.model_json_schema()
             if isinstance(json_schema, dict):
                 json_schema = json.dumps(json_schema)
@@ -455,5 +456,9 @@ class SamplingParams:
             return tllme.GuidedDecodingParams(
                 tllme.GuidedDecodingParams.GuideType.EBNF_GRAMMAR,
                 self.guided_decoding.grammar)
+        elif self.guided_decoding.structural_tag is not None:
+            return tllme.GuidedDecodingParams(
+                tllme.GuidedDecodingParams.GuideType.STRUCTURAL_TAG,
+                self.guided_decoding.structural_tag)
         else:
             return None
