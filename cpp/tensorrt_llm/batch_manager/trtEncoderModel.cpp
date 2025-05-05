@@ -402,6 +402,14 @@ void TrtEncoderModel::terminateRequest(std::shared_ptr<LlmRequest> const& llmReq
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+void TrtEncoderModel::terminateRequestSync(
+    std::shared_ptr<LlmRequest> const& llmReq, executor::FinishReason finishReason)
+{
+    terminateRequest(llmReq, false);
+    llmReq->finishByReason(finishReason);
+    llmReq->clearGeneratedTokens();
+}
+
 void TrtEncoderModel::fillEncoderOutputSync(RequestVector const& requestList, TensorMap outputTensors)
 {
     auto const totalTokensNb = outputTensors["encoder_output"]->getShape().d[0];
