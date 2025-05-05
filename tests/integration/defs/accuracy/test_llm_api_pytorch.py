@@ -600,7 +600,7 @@ class TestNemotronSuper(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     def test_auto_dtype_tp2(self):
-        with LLM(self.MODEL_PATH) as llm:
+        with LLM(self.MODEL_PATH, tensor_parallel_size=2) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)

@@ -418,6 +418,12 @@ accuracy/test_llm_api.py::TestQwen2_7BInstruct::test_fp8
 accuracy/test_llm_api.py::TestQwen2_5_0_5BInstruct::test_fp8
 accuracy/test_llm_api.py::TestQwen2_5_1_5BInstruct::test_fp8
 accuracy/test_llm_api.py::TestQwen2_5_7BInstruct::test_fp8
+accuracy/test_llm_api.py::TestNemotronSuper::test_fp8_tp2
+accuracy/test_llm_api.py::TestNemotronSuper::test_nvfp4_tp2
+accuracy/test_llm_api.py::TestNemotronNano::test_fp8
+accuracy/test_llm_api.py::TestNemotronNano::test_nvfp4
+accuracy/test_llm_api.py::TestNemotronH::test_fp8
+accuracy/test_llm_api.py::TestNemotronH::test_nvfp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4
