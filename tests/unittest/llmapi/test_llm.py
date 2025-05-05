@@ -16,7 +16,6 @@ import transformers
 from pydantic import BaseModel
 from utils.util import skip_single_gpu
 
-import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (ExecutorBindingsWorker, LoRARequest,
                                    PromptAdapterRequest, RequestError)
@@ -1002,9 +1001,6 @@ class MyLogitsProcessor(LogitsProcessor):
 
 
 def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
-    # Register MyLogitsProcessor as an approved class for deserialization across IPC boundaries.
-    serialization.register_approved_ipc_class(MyLogitsProcessor)
-
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
     sampling_params = SamplingParams(
