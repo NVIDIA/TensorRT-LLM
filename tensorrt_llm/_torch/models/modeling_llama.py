@@ -262,6 +262,7 @@ class Llama4MoE(nn.Module):
 
         super().__init__()
         config = model_config.pretrained_config
+        self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.top_k = top_k
         self.experts = FusedMoE(
             routing_method=Llama4RenormalizeMoeRoutingMethod(top_k),
