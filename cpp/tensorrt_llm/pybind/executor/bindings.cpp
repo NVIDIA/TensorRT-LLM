@@ -29,6 +29,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "tensorCaster.h"
+
 #include <optional>
 
 namespace py = pybind11;
@@ -63,71 +65,27 @@ void initBindings(pybind11::module_& m)
         }
         return tle::DecodingMode(state[0].cast<tle::DecodingMode::UnderlyingType>());
     };
-
     py::class_<tle::DecodingMode>(m, "DecodingMode")
-        // Static factory methods
-        .def_static("Auto", &tle::DecodingMode::Auto)
-        .def_static("TopK", &tle::DecodingMode::TopK)
-        .def_static("TopP", &tle::DecodingMode::TopP)
-        .def_static("TopKTopP", &tle::DecodingMode::TopKTopP)
-        .def_static("BeamSearch", &tle::DecodingMode::BeamSearch)
-        .def_static("Medusa", &tle::DecodingMode::Medusa)
-        .def_static("Lookahead", &tle::DecodingMode::Lookahead)
-        .def_static("ExplicitDraftTokens", &tle::DecodingMode::ExplicitDraftTokens)
-        .def_static("ExternalDraftTokens", &tle::DecodingMode::ExternalDraftTokens)
-        .def_static("Eagle", &tle::DecodingMode::Eagle)
-
-        // Mode type checks
-        .def_property_readonly("is_auto", &tle::DecodingMode::isAuto)
-        .def_property_readonly("is_top_k", &tle::DecodingMode::isTopK)
-        .def_property_readonly("is_top_p", &tle::DecodingMode::isTopP)
-        .def_property_readonly("is_top_k_or_top_p", &tle::DecodingMode::isTopKorTopP)
-        .def_property_readonly("is_top_k_and_top_p", &tle::DecodingMode::isTopKandTopP)
-        .def_property_readonly("is_beam_search", &tle::DecodingMode::isBeamSearch)
-        .def_property_readonly("is_medusa", &tle::DecodingMode::isMedusa)
-        .def_property_readonly("is_lookahead", &tle::DecodingMode::isLookahead)
-        .def_property_readonly("is_explicit_draft_tokens", &tle::DecodingMode::isExplicitDraftTokens)
-        .def_property_readonly("is_external_draft_tokens", &tle::DecodingMode::isExternalDraftTokens)
-        .def_property_readonly("is_eagle", &tle::DecodingMode::isEagle)
-
-        // Feature flags
-        .def_property_readonly("is_use_temperature", &tle::DecodingMode::isUseTemperature)
-        .def_property_readonly("is_use_occurrence_penalties", &tle::DecodingMode::isUseOccurrencePenalty)
-        .def_property_readonly("is_use_presence_penalty", &tle::DecodingMode::isUsePresencePenalty)
-        .def_property_readonly("is_use_repetition_penalty", &tle::DecodingMode::isUseRepetitionPenalty)
-        .def_property_readonly("is_use_frequency_penalty", &tle::DecodingMode::isUseFrequencyPenalty)
-        .def_property_readonly("is_use_min_length", &tle::DecodingMode::isUseMinLength)
-        .def_property_readonly("is_use_ban_words", &tle::DecodingMode::isUseBanWords)
-        .def_property_readonly("is_use_ban_tokens", &tle::DecodingMode::isUseBanTokens)
-        .def_property_readonly("is_use_no_repeat_ngram_size", &tle::DecodingMode::isUseNoRepeatNgramSize)
-        .def_property_readonly("is_use_stop_words", &tle::DecodingMode::isUseStopWords)
-        .def_property_readonly("is_use_max_length_stop", &tle::DecodingMode::isUseMaxLengthStop)
-        .def_property_readonly("is_use_explicit_eos_stop", &tle::DecodingMode::isUseExplicitEosStop)
-        .def_property_readonly("is_use_min_p", &tle::DecodingMode::isUseMinP)
-        .def_property_readonly("is_use_variable_beam_width_search", &tle::DecodingMode::isUseVariableBeamWidthSearch)
-        .def_property_readonly("is_use_stop_criteria", &tle::DecodingMode::isUseStopCriteria)
-
-        // Configuration methods
-        .def("use_temperature", &tle::DecodingMode::useTemperature, py::arg("use_temp"))
-        .def("use_occurrence_penalties", &tle::DecodingMode::useOccurrencePenalties, py::arg("use_penalty"))
-        .def("use_presence_penalty", &tle::DecodingMode::usePresencePenalty, py::arg("use_penalty"))
-        .def("use_repetition_penalty", &tle::DecodingMode::useRepetitionPenalty, py::arg("use_penalty"))
-        .def("use_frequency_penalty", &tle::DecodingMode::useFrequencyPenalty, py::arg("use_penalty"))
-        .def("use_min_length", &tle::DecodingMode::useMinLength, py::arg("use_min_len"))
-        .def("use_ban_words", &tle::DecodingMode::useBanWords, py::arg("ban_words"))
-        .def("use_ban_tokens", &tle::DecodingMode::useBanTokens, py::arg("ban_tokens"))
-        .def("use_no_repeat_ngram_size", &tle::DecodingMode::useNoRepeatNgramSize, py::arg("no_repeat_ngram_size"))
-        .def("use_stop_words", &tle::DecodingMode::useStopWords, py::arg("stop_words"))
-        .def("use_max_length_stop", &tle::DecodingMode::useMaxLengthStop, py::arg("max_length_stop"))
-        .def("use_explicit_eos_stop", &tle::DecodingMode::useExplicitEosStop, py::arg("explicit_eos_stop"))
-        .def("use_min_p", &tle::DecodingMode::useMinP, py::arg("use_min_p"))
-        .def("use_variable_beam_width_search", &tle::DecodingMode::useVariableBeamWidthSearch,
-            py::arg("use_variable_beam_width_search"))
-
-        // Utility methods
+        .def("Auto", &tle::DecodingMode::Auto)
+        .def("TopK", &tle::DecodingMode::TopK)
+        .def("TopP", &tle::DecodingMode::TopP)
+        .def("TopKTopP", &tle::DecodingMode::TopKTopP)
+        .def("BeamSearch", &tle::DecodingMode::BeamSearch)
+        .def("Medusa", &tle::DecodingMode::Medusa)
+        .def("Lookahead", &tle::DecodingMode::Lookahead)
+        .def("ExplicitDraftTokens", &tle::DecodingMode::ExplicitDraftTokens)
+        .def("Eagle", &tle::DecodingMode::Eagle)
+        .def("isAuto", &tle::DecodingMode::isAuto)
+        .def("isTopK", &tle::DecodingMode::isTopK)
+        .def("isTopP", &tle::DecodingMode::isTopP)
+        .def("isTopKorTopP", &tle::DecodingMode::isTopKorTopP)
+        .def("isTopKandTopP", &tle::DecodingMode::isTopKandTopP)
+        .def("isBeamSearch", &tle::DecodingMode::isBeamSearch)
+        .def("isMedusa", &tle::DecodingMode::isMedusa)
+        .def("isLookahead", &tle::DecodingMode::isLookahead)
+        .def("isExplicitDraftTokens", &tle::DecodingMode::isExplicitDraftTokens)
+        .def("isEagle", &tle::DecodingMode::isEagle)
         .def_property_readonly("name", &tle::DecodingMode::getName)
-        .def("__eq__", &tle::DecodingMode::operator==)
-        .def("__str__", &tle::DecodingMode::getName)
         .def(py::pickle(decodingModeGetstate, decodingModeSetstate));
 
     py::enum_<tle::CapacitySchedulerPolicy>(m, "CapacitySchedulerPolicy")
