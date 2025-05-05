@@ -125,19 +125,18 @@ def parse_test_list_lines(test_list, lines, test_prefix):
         timeout = None
         for tmp_marker in kVALID_TEST_LIST_MARKERS:
             if f" {tmp_marker}" in line:
-                print_info(f"---------------line: {line}")
                 test_name, marker, reason_raw = line.partition(f" {tmp_marker}")
                 test_name = test_name.strip()
                 marker = marker.strip()
                 if marker == "TIMEOUT":
                     # Extract timeout value from parentheses
                     timeout = strip_parens(reason_raw.strip())
-                    print_info(f"time setting: {timeout}")
+                    print_info(f"Timeout setting: {timeout}")
                     if not timeout or not timeout.isdigit():
                         raise ValueError(
                             f'{test_list}:{lineno}: Invalid syntax for TIMEOUT value: "{reason_raw}". '
                             "Expected a numeric value in parentheses.")
-                    timeout = int(timeout) / 60
+                    timeout = int(timeout) * 60
                 elif len(reason_raw) > 0:
                     reason = strip_parens(reason_raw.strip())
                     if not reason:
@@ -146,9 +145,7 @@ def parse_test_list_lines(test_list, lines, test_prefix):
                              "Did you forget to add parentheses?").format(
                                  test_list, lineno, reason_raw))
                 break
-        print_info(f"-----------------------inline marker: {marker}")
-        print_info(f"-----------------------inline reason: {reason}")
-        print_info(f"-----------------------inline timeout: {timeout}")
+
         # extract full:XXX/ prefix
         full_prefix = ""
         match = re.match(r'(full:.*?/)(.+)', test_name)
@@ -685,7 +682,7 @@ def apply_waives(waives_file, items, config):
     # For each item in the list, apply waives if a waive entry exists
     for item in items:
         if item.nodeid in test_name_to_marker_dict:
-            marker, reason = test_name_to_marker_dict[item.nodeid]
+            marker, reason, _ = test_name_to_marker_dict[item.nodeid]
             if marker:
                 mark_func = getattr(pytest.mark, marker.lower())
                 mark = mark_func(reason=reason)
