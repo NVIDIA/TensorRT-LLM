@@ -8,8 +8,9 @@ import pickle  # nosec B403
 # it is only needed in a single instance the class can be added at runtime
 # using register_approved_ipc_class.
 BASE_ZMQ_CLASSES = {
-    "builtins": ["Exception", "ValueError"
-                 ],  # each Exception Error class needs to be added explicitly
+    "builtins":
+    ["Exception",
+     "ValueError"],  # each Exception Error class needs to be added explicitly
     "collections": ["OrderedDict"],
     "datetime": ["timedelta"],
     "tensorrt_llm._torch.pyexecutor.llm_request":
@@ -20,17 +21,22 @@ BASE_ZMQ_CLASSES = {
         "KvCacheRetentionConfig.TokenRangeRetentionConfig"
     ],
     "tensorrt_llm.disaggregated_params": ["DisaggregatedParams"],
-    "tensorrt_llm.executor.postproc_worker":
-    ["PostprocParams", "PostprocWorker.Input", "PostprocWorker.Output"],
-    "tensorrt_llm.executor.request":
-    ["CancellingRequest", "GenerationRequest", "LoRARequest"],
+    "tensorrt_llm.executor.postproc_worker": [
+        "PostprocArgs", "PostprocParams", "PostprocWorker.Input",
+        "PostprocWorker.Output"
+    ],
+    "tensorrt_llm.executor.request": [
+        "CancellingRequest", "GenerationRequest", "LoRARequest",
+        "PromptAdapterRequest"
+    ],
+    "tensorrt_llm.executor.result": ["CompletionOutput"],
     "tensorrt_llm.executor.utils": ["ErrorResponse"],
+    "tensorrt_llm.llmapi._perf_evaluator": ["perform_faked_oai_postprocess"],
     "tensorrt_llm.llmapi.llm_args": ["LookaheadDecodingConfig"],
     "tensorrt_llm.sampling_params":
     ["SamplingParams", "GuidedDecodingParams", "GreedyDecodingParams"],
-    "tensorrt_llm.serve.openai_protocol":
-    ["CompletionResponse", "CompletionResponseChoice", "UsageInfo"],
     "tensorrt_llm.serve.postprocess_handlers": [
+        "chat_response_post_processor", "chat_stream_post_processor",
         "completion_stream_post_processor",
         "completion_response_post_processor", "CompletionPostprocArgs",
         "ChatPostprocArgs"
