@@ -122,6 +122,7 @@ if __name__ == "__main__":
                                        help="Path to the GPU chip mapping file")
 
     args = parser.parse_args()
+    print_info(f"Arguments chip_mapping_file: {args.chip_mapping_file}")
 
     if args.command == "render_test_db":
         render_test_db(args.test_context, args.llm_src, args.stage_name,
