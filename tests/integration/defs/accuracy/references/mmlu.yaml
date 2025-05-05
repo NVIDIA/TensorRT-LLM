@@ -84,4 +84,4 @@ Qwen3/Qwen3-8B:
     accuracy: 70
 Qwen3/Qwen3-30B-A3B:
   - quant_algo: FP8_BLOCK_SCALES
-    accuracy: 48
+    accuracy: 79.53
