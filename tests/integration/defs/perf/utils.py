@@ -536,6 +536,8 @@ class AbstractPerfScriptTestClass(abc.ABC):
             "original_test_name":
             original_test_name
             if original_test_name is not None else full_test_name,
+            "raw_result":
+            raw_result,
             "perf_metric":
             self._perf_result,
             "total_time__sec":
@@ -564,8 +566,7 @@ class AbstractPerfScriptTestClass(abc.ABC):
         if "csv" in session_data_writer._output_formats:
             csv_name = "perf_script_test_results.csv"
             cvs_result_dict = {**test_description_dict, **test_result_dict}
-            cvs_result_dict["raw_result"] = cvs_result_dict[
-                "raw_result"].replace("\n", "\\n")
+            cvs_result_dict.pop("raw_result")
             write_csv(output_dir,
                       csv_name, [cvs_result_dict],
                       list(cvs_result_dict.keys()),
