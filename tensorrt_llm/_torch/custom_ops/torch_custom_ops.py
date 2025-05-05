@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -254,6 +254,24 @@ class NVFP4GemmRunner(TunableRunner):
             self.to_userbuffers,
             tactic,
         )
+
+    def find_nearest_profile(
+            self, shapes: Tuple[torch.Size],
+            dynamic_tensors: Tuple[Tuple[int, int, Tuple[Union[Tuple[int],
+                                                               Callable],
+                                                         Callable]]],
+            constraints: Tuple[Tuple[int, int, Callable]]) -> Tuple:
+        """Generate a unique profile to reduce host overhead during inference.
+        """
+        _, _, (_, shape_round_rule) = dynamic_tensors[0]
+        m, n, k = shape_round_rule(shapes[0][0]), shapes[1][0], shapes[1][1] * 2
+
+        return (m, n, k)
+
+    def get_cache_key_specifc(self, profile: Tuple) -> Tuple:
+        """Generate a unique cache key for the given profile.
+        """
+        return (self.sf_use_ue8m0, self.output_dtype), profile
 
 
 def fp4_scale_dims(input_shapes: List[torch.Tensor], sf_vec_size: int = 16):
