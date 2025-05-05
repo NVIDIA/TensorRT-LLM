@@ -574,7 +574,7 @@ using ParamStatsType = std::tuple<int, bool>;
 using AllParamsType = std::tuple<BatchingType, bool, int, bool, bool, bool, bool, std::string, bool, bool, int>;
 using LogitsProcParamsType = std::tuple<std::string, bool, bool>;
 using GuidedDecodingParamsType = std::tuple<std::string>;
-using TimeoutTestParamsType = std ::tuple<std::string, bool>;
+using TimeoutTestParamsType = std ::tuple<std::string, bool, int>;
 
 std::string generateTestName(testing::TestParamInfo<ParamType> const& info)
 {
@@ -666,6 +666,7 @@ std::string generateTestNameTimeoutTest(testing::TestParamInfo<TimeoutTestParams
 {
     auto const modelName = std::get<0>(info.param);
     auto const& useOrchestratorMode = std::get<1>(info.param);
+    auto const beamWidth = std::get<2>(info.param);
 
     std::string name = "ExecutorTest";
     name.append("_" + modelName);
@@ -678,6 +679,7 @@ std::string generateTestNameTimeoutTest(testing::TestParamInfo<TimeoutTestParams
     {
         name.append("_LeaderMode");
     }
+    name.append("_BW" + std::to_string(beamWidth));
     return name;
 }
 
@@ -4087,7 +4089,7 @@ TEST_P(TimeoutTest, TimeoutStreamingTest)
 {
     auto const modelName = std::get<0>(GetParam());
     auto const useOrchestratorMode = std::get<1>(GetParam());
-    SizeType32 constexpr beamWidth = 2;
+    auto const beamWidth = std::get<2>(GetParam());
 
     auto executorConfig = ExecutorConfig(beamWidth);
     std::filesystem::path modelPath;
@@ -4123,25 +4125,19 @@ TEST_P(TimeoutTest, TimeoutStreamingTest)
     {
         GTEST_SKIP() << "Skipping MultiGpu tests";
     }
-    else
+    if (val != NULL && !isMultiGpu)
     {
-        if (val != NULL && !isMultiGpu)
-        {
-            GTEST_SKIP() << "Skipping SingleGpu tests";
-        }
-
-        if (!isMultiGpu && !useOrchestratorMode)
-        {
-            GTEST_SKIP() << "Leader mode on single GPU crashes";
-        }
-
+        GTEST_SKIP() << "Skipping SingleGpu tests";
+    }
+    if (val != NULL && isMultiGpu)
+    {
         // Check that it was launched with right number of MPI ranks
         if (!useOrchestratorMode && COMM_SESSION.getSize() != 4)
         {
             // No orchestrator, need worldSize to match TP*PP
             FAIL() << "Leader mode and world size is not equal to 4";
         }
-        else if (useOrchestratorMode && COMM_SESSION.getSize() != 1)
+        if (useOrchestratorMode && COMM_SESSION.getSize() != 1)
         {
             // No orchestrator, need worldSize to match TP*PP
             FAIL() << "Orchestrator mode and World size is not equal to 1";
@@ -4199,7 +4195,7 @@ TEST_P(TimeoutTest, TimeoutStreamingTest)
     finishedRequest.setReturnAllGeneratedTokens(true);
     finishedRequest.setAllottedTimeMs(std::chrono::milliseconds(5000));
     SizeType32 constexpr finishedMinLength = 5;
-    SizeType32 constexpr finishedMaxLength = maxNewTokens + 1;
+    SizeType32 constexpr finishedMaxLength = maxNewTokens;
 
     std::vector<FinishReason> referenceFinishReasons
         = {FinishReason::kTIMED_OUT, FinishReason::kTIMED_OUT, FinishReason::kLENGTH};
@@ -4262,8 +4258,8 @@ TEST_P(TimeoutTest, TimeoutStreamingTest)
                         TLLM_LOG_DEBUG("%s", tokenStr.c_str());
                     }
 
-                    TLLM_LOG_DEBUG("beams' length must be bigger than %d and smaller than %d", minLengths[reqId - 1],
-                        maxLengths[reqId - 1]);
+                    TLLM_LOG_DEBUG(
+                        "beams' length must be in range [%d, %d]", minLengths[reqId - 1], maxLengths[reqId - 1]);
 
                     if (result.isFinal)
                     {
@@ -4281,7 +4277,7 @@ TEST_P(TimeoutTest, TimeoutStreamingTest)
                     EXPECT_EQ(beamWidth, actualResponse.size());
                     for (int beam = 0; beam < beamWidth; beam++)
                     {
-                        EXPECT_LT(actualResponse.at(beam).size(), maxLengths[reqId - 1]) << "for request " << reqId;
+                        EXPECT_LE(actualResponse.at(beam).size(), maxLengths[reqId - 1]) << "for request " << reqId;
                         achievedLength[reqId - 1] = std::max(
                             achievedLength[reqId - 1], static_cast<SizeType32>(actualResponse.at(beam).size()));
                     }
@@ -4301,7 +4297,8 @@ TEST_P(TimeoutTest, TimeoutNonstreamingTest)
 {
     auto const modelName = std::get<0>(GetParam());
     auto const useOrchestratorMode = std::get<1>(GetParam());
-    SizeType32 constexpr beamWidth = 2;
+    auto const beamWidth = std::get<2>(GetParam());
+
     std::optional<std::vector<SizeType32>> deviceIds = std::nullopt;
 
     auto executorConfig = ExecutorConfig(beamWidth);
@@ -4336,25 +4333,19 @@ TEST_P(TimeoutTest, TimeoutNonstreamingTest)
     {
         GTEST_SKIP() << "Skipping MultiGpu tests";
     }
-    else
+    if (val != NULL && !isMultiGpu)
     {
-        if (val != NULL && !isMultiGpu)
-        {
-            GTEST_SKIP() << "Skipping SingleGpu tests";
-        }
-
-        if (!isMultiGpu && !useOrchestratorMode)
-        {
-            GTEST_SKIP() << "Leader mode on single GPU crashes";
-        }
-
+        GTEST_SKIP() << "Skipping SingleGpu tests";
+    }
+    if (val != NULL && isMultiGpu)
+    {
         // Check that it was launched with right number of MPI ranks
         if (!useOrchestratorMode && COMM_SESSION.getSize() != 4)
         {
             // No orchestrator, need worldSize to match TP*PP
             FAIL() << "Leader mode and world size is not equal to 4";
         }
-        else if (useOrchestratorMode && COMM_SESSION.getSize() != 1)
+        if (useOrchestratorMode && COMM_SESSION.getSize() != 1)
         {
             // No orchestrator, need worldSize to match TP*PP
             FAIL() << "Orchestrator mode and World size is not equal to 1";
@@ -4500,8 +4491,8 @@ INSTANTIATE_TEST_SUITE_P(LlamaExecutorTest, ParamCancelReqTest,
     generateTestNameCancelReq);
 
 INSTANTIATE_TEST_SUITE_P(LlamaExecutorTest, TimeoutTest,
-    testing::Combine(
-        testing::Values("llama_tp1_pp4_cp1", "llama_tp4_pp1_cp1", "llama_tp1_pp1_cp1"), testing::Values(false, true)),
+    testing::Combine(testing::Values("llama_tp1_pp4_cp1", "llama_tp4_pp1_cp1", "llama_tp1_pp1_cp1"),
+        testing::Values(false, true), testing::Values(2)),
     generateTestNameTimeoutTest);
 
 INSTANTIATE_TEST_SUITE_P(LlamaExecutorTest, LeaderApiUsageTest,
