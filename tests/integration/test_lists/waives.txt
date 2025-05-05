@@ -470,8 +470,6 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[ep4-mt
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=2-attention_dp-cuda_graph-overlap_scheduler] SKIP (https://nvbugs/5239087)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[ep4-mtp_nextn=2-attention_dp-cuda_graph-overlap_scheduler] SKIP (https://nvbugs/5239087)
 unittest/_torch/multi_gpu_modeling/test_llama4.py::test_llama4[tp8-trtllm-scout] SKIP (https://nvbugs/5244009)
-accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp2pp2-attn_backend=TRTLLM] SKIP (https://nvbugs/5241627)
-accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp2pp2-attn_backend=FLASHINFER] SKIP (https://nvbugs/5241627)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[] SKIP (https://nvbugs/5234002)
 test_e2e.py::test_ptp_star_attention_example[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B] SKIP (https://nvbugs/5245262)
 test_e2e.py::test_ptp_scaffolding[DeepSeek-R1-Distill-Qwen-7B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B] SKIP (https://nvbugs/5245264)
