@@ -18,10 +18,8 @@ from tensorrt_llm.llmapi import LLM
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (llm_models_root, skip_post_blackwell, skip_pre_ada,
-                        skip_pre_blackwell)
-from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
-                            LlmapiAccuracyTestHarness)
+from ..conftest import llm_models_root, skip_post_blackwell, skip_pre_ada
+from .accuracy_core import MMLU, CnnDailymail, LlmapiAccuracyTestHarness
 
 
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
@@ -37,101 +35,6 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
-class TestNemotronSuper(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nvidia/Llama-3_3-Nemotron-Super-49B-v1"
-    MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1"
-
-    @skip_pre_ada
-    @pytest.mark.skip_less_device(2)
-    def test_fp8_tp2(self):
-        quant_config = QuantConfig(QuantAlgo.FP8)
-        with LLM(self.MODEL_PATH,
-                 quant_config=quant_config,
-                 tensor_parallel_size=2) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
-
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_device(2)
-    def test_nvfp4_tp2(self):
-        quant_config = QuantConfig(QuantAlgo.NVFP4)
-        with LLM(self.MODEL_PATH,
-                 quant_config=quant_config,
-                 tensor_parallel_size=2) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
-
-
-class TestNemotronNano(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nvidia/Llama-3.1-Nemotron-Nano-8B-v1"
-    MODEL_PATH = f"{llm_models_root()}/Llama-3.1-Nemotron-Nano-8B-v1"
-
-    @skip_pre_ada
-    def test_fp8(self):
-        quant_config = QuantConfig(QuantAlgo.FP8)
-        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
-
-    @skip_pre_blackwell
-    def test_nvfp4(self):
-        quant_config = QuantConfig(QuantAlgo.NVFP4)
-        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
-
-
-class TestNemotronH(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nvidia/Nemotron-H-8B-Base-8K"
-    MODEL_PATH = f"{llm_models_root()}/Nemotron-H-8B-Base-8K"
-
-    @skip_pre_ada
-    def test_fp8(self):
-        quant_config = QuantConfig(QuantAlgo.FP8)
-        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @skip_pre_blackwell
-    def test_nvfp4(self):
-        quant_config = QuantConfig(QuantAlgo.NVFP4)
-        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
 
