@@ -18,6 +18,7 @@ def get_mako_opts(get_mako_script, mako_args=None, chip_mapping_file=None):
         mako_opt_args = [f"--mako-opt {arg}" for arg in mako_args]
         list_mako_cmd.extend(mako_opt_args)
 
+    print(f"chip_mapping_file: {chip_mapping_file}")
     if chip_mapping_file:
         list_mako_cmd.append(f"--chip-mapping-file {chip_mapping_file}")
 
@@ -122,7 +123,7 @@ if __name__ == "__main__":
                                        help="Path to the GPU chip mapping file")
 
     args = parser.parse_args()
-    print_info(f"Arguments chip_mapping_file: {args.chip_mapping_file}")
+    print(f"Arguments chip_mapping_file: {args.chip_mapping_file}")
 
     if args.command == "render_test_db":
         render_test_db(args.test_context, args.llm_src, args.stage_name,
