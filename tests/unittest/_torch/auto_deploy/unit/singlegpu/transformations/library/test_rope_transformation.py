@@ -11,6 +11,7 @@ from torch.export import Dim
 from tensorrt_llm._torch.auto_deploy.transformations.library.rope import (
     match_complex_rope,
     match_explicit_rope,
+    match_explicit_rope_with_pm,
     match_rope_layout,
     optimize_rope,
 )
@@ -74,7 +75,7 @@ class RoPEModel(torch.nn.Module):
         q = self.linear_q(x)
         k = self.linear_k(x)
 
-        if self.variant == "explicit":
+        if self.variant == "explicit" or self.variant == "explicit_pm":
             # reshape and permute if BNSD layout
             q = q.view(b, s, self.num_heads, self.head_dim)
             k = k.view(b, s, self.num_kv_heads, self.head_dim)
@@ -143,6 +144,8 @@ class RoPEModel(torch.nn.Module):
     "transformation,variant,layout,batch_size,seq_len,num_heads,num_kv_heads,atol,rtol",
     [
         ("match", "explicit", "BNSD", 8, 16, 8, 8, 1e-3, 1e-3),
+        ("match", "explicit_pm", "BNSD", 4, 8, 16, 8, 1e-3, 1e-3),
+        ("match", "explicit_pm", "BSND", 2, 4, 16, 4, 1e-3, 1e-3),
         ("match", "explicit", "BSND", 8, 16, 8, 4, 1e-2, 1e-2),
         ("match", "complex", "BNSD", 8, 16, 8, 8, 1e-3, 1e-3),
         ("match", "complex", "BSND", 8, 16, 8, 4, 1e-3, 1e-3),
@@ -192,7 +195,7 @@ def test_rope_variants(
     atol,
     rtol,
 ):
-    hidden_size = 512
+    hidden_size = 1024
     model = RoPEModel(
         hidden_size,
         seq_len,
@@ -207,9 +210,11 @@ def test_rope_variants(
 
     if transformation == "match":
         fn = match_explicit_rope if variant == "explicit" else match_complex_rope
+        if variant == "explicit_pm":
+            fn = match_explicit_rope_with_pm
         check_op = (
             torch.ops.rope.torch_apply_rope_with_explicit_cos_sin
-            if variant == "explicit"
+            if variant == "explicit" or variant == "explicit_pm"
             else torch.ops.rope.torch_apply_rope_with_complex_freqs
         )
 
