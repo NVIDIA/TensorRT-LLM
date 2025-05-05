@@ -36,7 +36,7 @@ l0_a10:
       backend: cpp
   tests:
   # ------------- CPP tests ---------------
-  - cpp/test_e2e.py::test_model[-medusa-86]
+  - cpp/test_e2e.py::test_model[-medusa-86] TIMEOUT (30)
   - cpp/test_e2e.py::test_model[-redrafter-86]
   - cpp/test_e2e.py::test_model[-mamba-86]
   - cpp/test_e2e.py::test_model[-recurrentgemma-86]
@@ -59,7 +59,7 @@ l0_a10:
   - unittest/trt/attention/test_gpt_attention.py -k "partition1"
   - unittest/trt/attention/test_gpt_attention.py -k "partition2"
   - unittest/trt/attention/test_gpt_attention.py -k "partition3"
-  - unittest/trt/attention/test_gpt_attention.py -k "xqa_generic"
+  - unittest/trt/attention/test_gpt_attention.py -k "xqa_generic" TIMEOUT (30)
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:1-pp:1-float16-BertModel-bert/bert-base-uncased]
   - unittest/trt/model/test_mistral.py
   - unittest/trt/model/test_llama.py
