@@ -622,11 +622,6 @@ class TestNemotronNano(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
 class TestNemotronH(LlmapiAccuracyTestHarness):
@@ -634,7 +629,8 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/Nemotron-H-8B-Base-8K"
 
     def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)

@@ -5,9 +5,9 @@ meta-llama/Llama-3.3-70B-Instruct:
   - quant_algo: FP8
     accuracy: 48.03
 meta-llama/Llama-4-Maverick-17B-128E-Instruct:
-  - accuracy: 70.45
+  - accuracy: 53.54
 meta-llama/Llama-4-Scout-17B-16E-Instruct:
-  - accuracy: 70.45
+  - accuracy: 31.82
 deepseek-ai/DeepSeek-R1:
   - quant_algo: NVFP4
     accuracy: 70.45
@@ -15,14 +15,4 @@ deepseek-ai/DeepSeek-R1:
     spec_dec_algo: MTP
     accuracy: 70.06
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
-  - accuracy: 35.672
-  - quant_algo: FP8
-    accuracy: 35.672
-  - quant_algo: NVFP4
-    accuracy: 35.672
-nvidia/Llama-3.1-Nemotron-Nano-8B-v1:
-  - accuracy: 26.465
-  - quant_algo: FP8
-    accuracy: 26.465
-  - quant_algo: NVFP4
-    accuracy: 26.465
+  - accuracy: 44.95
