@@ -45,11 +45,12 @@ All published functionality in the Release Notes has been fully tested and verif
     - AutoDeploy provides an automated path from off-the-shelf models to optimized deployment in the TensorRT-LLM runtime.
     - Check out `examples/auto_deploy/README.md` for more details.
   - LLM API
+    - [BREAKING CHANGE] Added dynamic logits processor support, and deprecated static logits processor.
     - Added batched logits processor support.
     - Added EAGLE support.
     - Added abort request support.
     - Added `get_stats` support.
-    - [BREAKING CHANGE] Added dynamic logits processor support, and deprecated static logits processor.
+    - Added multi-node support for Slurm-based clusters, refer to `examples/llm-api/llm_mgmn_*.sh`.
   - Added InternLM-XComposer2 support. Refer to “InternLM-XComposer2” section in `examples/multimodal/README.md`.
   - Added INT4-AWQ support for MoE models. Refer to the “AWQ Quantization” section in `examples/mixtral/README.md`.
   - Added Qwen2-Audio support. Refer to `examples/qwen2audio/README.md`.
