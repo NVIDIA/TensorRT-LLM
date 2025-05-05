@@ -336,6 +336,34 @@ def getSSHConnectionPorts(portConfigFile, stageName)
     return [userPort, monitorPort]
 }
 
+def renderTestDB(testContext, llmSrc, stageName) {
+    def scriptPath = "${llmSrc}/scripts/mako_utils.py"
+    def testList = ""
+
+    withCredentials([file(credentialsId: 'gpu-chip-mapping', variable: 'GPU_CHIP_MAPPING')]) {
+        def command = [
+            "python3",
+            scriptPath,
+            "render_test_db",
+            "--test-context", testContext,
+            "--llm-src", llmSrc,
+            "--stage-name", stageName,
+            "--chip-mapping-file", GPU_CHIP_MAPPING
+        ].join(" ")
+
+        echo "Running renderTestDB command: ${command}"
+
+        try {
+            testList = sh(label: "Render test list from test-db", script: command, returnStdout: true).trim()
+        } catch (Exception e) {
+            error("Failed to render test DB: ${e.message}")
+        }
+    }
+
+    echo "Test list generated at: ${testList}"
+    return testList
+}
+
 def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
 {
     // Step 1: create LLM_ROOT dir
@@ -481,7 +509,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // CPP test execution is timing out easily, so we always override the timeout to 7200
         extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=7200"
 
-        def testDBList = trtllm_utils.renderTestDB(testList, llmSrc, stageName)
+        def testDBList = renderTestDB(testList, llmSrc, stageName)
         testList = "${testList}_${splitId}"
         def testCmdLine = [
             "LLM_ROOT=${llmSrc}",
