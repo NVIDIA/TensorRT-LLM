@@ -9,7 +9,7 @@ from tensorrt_llm.mapping import Mapping
 from ..attention_backend import AttentionInputType, AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
-from ..attention_backend.utils import create_attention
+from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
@@ -119,7 +119,8 @@ class Attention(nn.Module):
             config.pretrained_config
             and (config.pretrained_config.model_type == 'qwen3'
                  or config.pretrained_config.model_type == 'qwen3_moe'))
-        self.enable_rope_fusion = self.attn.support_fused_rope(
+        attn_cls = get_attention_backend(self.attn_backend)
+        self.enable_rope_fusion = attn_cls.support_fused_rope(
         ) and not self.use_qk_norm
         self.attn = create_attention(
             self.attn_backend,
