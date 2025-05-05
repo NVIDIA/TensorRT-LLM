@@ -40,8 +40,9 @@ torch::Tensor fp8_block_scale_moe_runner(torch::Tensor const& routing_logits, to
     TORCH_CHECK(routing_bias.dim() == 1, "routing_bias must be 1D.");
     TORCH_CHECK(routing_bias.sizes()[0] == num_experts, "routing_bias has incorrect shape.");
 
-    TORCH_CHECK(top_k == 8, "Current routing kernel only supports top_k=8.");
-    TORCH_CHECK(topk_group == 4, "Current routing kernel only supports topk_group=4.");
+    TORCH_CHECK(top_k <= 8, "Current routing kernel only supports top_k<=8.");
+    TORCH_CHECK(topk_group <= 4, "Current routing kernel only supports topk_group<=4.");
+    TORCH_CHECK(topk_group <= n_group, "n_group must not be smaller than topk_group.");
     TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");
     TORCH_CHECK(num_experts % n_group == 0, "num_experts must be divisible by n_group");
     TORCH_CHECK(num_experts > top_k, "num_experts must be greater than top_k");
