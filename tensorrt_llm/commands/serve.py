@@ -70,6 +70,7 @@ def get_llm_args(model: str,
         "tensor_parallel_size": tensor_parallel_size,
         "pipeline_parallel_size": pipeline_parallel_size,
         "moe_expert_parallel_size": moe_expert_parallel_size,
+        "moe_cluster_parallel_size":
         "gpus_per_node": gpus_per_node,
         "trust_remote_code": trust_remote_code,
         "build_config": build_config,
@@ -248,7 +249,6 @@ def serve(
         except ValueError:
             raise ValueError(f"Invalid server role: {server_role}. " \
                              f"Must be one of: {', '.join([role.name for role in ServerRole])}")
-
     launch_server(host, port, llm_args, metadata_server_cfg, server_role)
 
 

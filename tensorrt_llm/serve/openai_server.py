@@ -56,6 +56,8 @@ class OpenAIServer:
         self.llm = llm
         self.tokenizer = llm.tokenizer
         self.metadata_server = create_metadata_server(metadata_server_cfg)
+        self.server_role = server_role
+        self.binding_addr = None  # Will be set in __call__
         try:
             hf_tokenizer_path = llm._hf_model_dir or self.tokenizer.tokenizer.name_or_path
             self.processor = AutoProcessor.from_pretrained(hf_tokenizer_path)
@@ -78,9 +80,11 @@ class OpenAIServer:
                     "model": self.model,
                     "version": VERSION,
                     "timestamp": datetime.now().isoformat(),
-                    "server_role": server_role.name
+                    "server_role": server_role.name,
+                    "url": self.binding_addr
                 }
                 # TODO: add more metadata
+                # Register with ETCD using the existing key format
                 self.metadata_server.put(f"trtllm/{self.llm.llm_id}", metadata)
                 logger.info(f"trtllm/{self.llm.llm_id} is registered")
 
@@ -382,11 +386,12 @@ class OpenAIServer:
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
-            print(f"Encountered an exception: {str(e)}")
             traceback.print_exc()
             return self.create_error_response(str(e))
 
     async def __call__(self, host, port):
+        # Store the binding address for server registration
+        self.binding_addr = f"http://{host}:{port}"
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,
