@@ -712,7 +712,7 @@ public:
     /// @brief Erases all previous generated tokens, only leaving the prompt.
     void clearGeneratedTokens()
     {
-        TLLM_LOG_DEBUG("emptying generated tokens for request %ld with promptlen", mRequestId, mPromptLen);
+        TLLM_LOG_DEBUG("Clearing generated tokens for request %ld with promptlen %d", mRequestId, mPromptLen);
         for (auto& beam : mTokens)
         {
             beam.resize(mPromptLen);
@@ -723,7 +723,7 @@ public:
     /// @param generatedBeamTokens The generated tokens for all beams (vector of vector of tokens)
     void setGeneratedTokens(BeamTokens const& generatedBeamTokens)
     {
-        TLLM_LOG_DEBUG("setting generated tokens for request %ld", mRequestId);
+        TLLM_LOG_DEBUG("Setting generated tokens for request %ld", mRequestId);
         assert(generatedBeamTokens.size() == static_cast<size_t>(mSamplingConfig.beamWidth));
 
         for (size_t beamId = 0; beamId < generatedBeamTokens.size(); ++beamId)

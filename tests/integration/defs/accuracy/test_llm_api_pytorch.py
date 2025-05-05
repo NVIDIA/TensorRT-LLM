@@ -373,8 +373,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_fp8_block_scales_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                                     attention_dp, cuda_graph,
                                     overlap_scheduler):
-        if pp_size > 1:
-            pytest.skip("https://nvbugs/5241627")
         # OOM on H100 with default free_gpu_memory_fraction=0.9
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         pytorch_config = PyTorchConfig(

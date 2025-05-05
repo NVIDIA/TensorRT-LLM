@@ -14,8 +14,8 @@ import safetensors
 import torch
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
-from tensorrt_llm._utils import (nvtx_range, release_gc, torch_dtype_to_str,
-                                 trace_func)
+from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
+                                 torch_dtype_to_str, trace_func)
 from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, LoraModelConfig
@@ -1852,8 +1852,7 @@ class PyTorchModelEngine(ModelEngine):
             return outputs
 
     def model_forward(self, **kwargs):
-        if self.mapping.rank == 0 and int(
-                os.environ.get("TLLM_TRACE_MODEL_FORWARD", "0")) == 1:
+        if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
             return trace_func(self.model.forward)(**kwargs)
         else:
             return self.model.forward(**kwargs)

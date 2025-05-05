@@ -776,9 +776,7 @@ class CustomAllReduceHelper:
         lamport_buffers_size = size * mapping.tp_size
         lamport_buffers = IpcMemory(mapping, 3 * lamport_buffers_size,
                                     is_p2p_supported)
-        rank = mapping.rank
-        tp_rank = mapping.tp_rank
-        if rank == tp_rank and is_p2p_supported:
+        if is_p2p_supported:
             lamport_initialize(
                 lamport_buffers.local_ptr,
                 3 * lamport_buffers_size,
