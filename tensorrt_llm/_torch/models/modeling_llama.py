@@ -281,6 +281,7 @@ class Llama4MoE(nn.Module):
             bias=False,
             dtype=dtype,
             config=model_config,
+            overridden_tp_size=1 if self.enable_attention_dp else None,
             reduce_output=False)
 
         self.router = Linear(hidden_size,
@@ -329,7 +330,7 @@ class Llama4MoE(nn.Module):
         assert shared_output.size() == routed_output.size(
         ), f'unmatched tensor shape'
         final_hidden_states = shared_output + routed_output
-        if self.mapping.tp_size > 1:
+        if not self.enable_attention_dp and self.mapping.tp_size > 1:
             final_hidden_states = self.all_reduce(
                 final_hidden_states, all_reduce_params=final_all_reduce_params)
 
@@ -377,6 +378,7 @@ class Llama4DecoderLayer(DecoderLayer):
                 bias=getattr(config, "mlp_bias", False),
                 dtype=config.torch_dtype,
                 config=model_config,
+                overridden_tp_size=1 if self.enable_attention_dp else None,
                 layer_idx=layer_idx,
             )
 

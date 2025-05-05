@@ -625,8 +625,8 @@ class LLM:
             lora_config=self.args.lora_config)
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
-        if self.args.skip_tokenizer_init:
-            return None
+        # if self.args.skip_tokenizer_init:
+        #     return None
 
         if self.args.tokenizer is not None:
             assert isinstance(self.args.tokenizer, TokenizerBase)
