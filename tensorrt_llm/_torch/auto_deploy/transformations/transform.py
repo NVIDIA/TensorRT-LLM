@@ -32,6 +32,7 @@ from .library import (
     match_moe_pattern,
     match_repeat_kv,
     match_rope_layout,
+    optimize_rope,
     quantize,
     resize_kv_cache,
 )
@@ -119,8 +120,6 @@ class InferenceOptimizer:
         egm = match_attention_layout(egm, self.attention_op)
 
         # Match rope
-        # TODO (lucaslie): let's move this to perf optimization once TP sharding is improved
-        # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
         egm = match_explicit_rope(egm)
         egm = match_complex_rope(egm)
         # Match RoPE layout expected by our backend
@@ -132,6 +131,10 @@ class InferenceOptimizer:
 
         # eliminate redundant transpose operations
         egm = eliminate_redundant_transposes(egm)
+
+        # TODO (lucaslie): let's move this to perf optimization once TP sharding is improved
+        # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
+        egm = optimize_rope(egm)
 
         # run TP sharding across ranks
         egm = column_row_shard(egm, local_rank, world_size)
