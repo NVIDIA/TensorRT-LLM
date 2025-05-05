@@ -55,6 +55,7 @@ class MetadataServerConfig():
     server_type: Literal['etcd']
     hostname: str = "localhost"
     port: int = 2379
+    health_check_timeout: float = 5.0
 
 
 
