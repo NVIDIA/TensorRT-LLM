@@ -16,6 +16,7 @@ import copy
 import gc
 import inspect
 import json
+import linecache
 import math
 import os
 import struct
@@ -631,11 +632,56 @@ def get_sm_version():
     return prop.major * 10 + prop.minor
 
 
+def is_trace_enabled(env_var: str):
+    value = os.environ.get(env_var, "-1")
+    if value == "ALL":
+        return True
+    try:
+        return int(value) == global_mpi_rank()
+    except ValueError:
+        return False
+
+
 def trace_func(func):
 
     @wraps(func)
     def wrapper(*args, **kwargs):
-        tracer = trace.Trace(trace=1, count=0)
+        import dill  # nosec B403
+
+        def globaltrace(frame, why, arg):
+            if why == "call":
+                code = frame.f_code
+                filename = frame.f_globals.get('__file__', None)
+                if filename:
+                    modulename = trace._modname(filename)
+                    if modulename is not None:
+                        ignore_it = tracer.ignore.names(filename, modulename)
+                        if not ignore_it:
+                            print(
+                                f"[rank{rank}] --- path: {filename}, funcname: {code.co_name}"
+                            )
+                            return localtrace
+                else:
+                    return None
+
+        def localtrace(frame, why, arg):
+            if why == "line":
+                filename = frame.f_code.co_filename
+                lineno = frame.f_lineno
+                bname = os.path.basename(filename)
+                print(
+                    f"[rank{rank}] {bname}:{lineno}: {linecache.getline(filename, lineno)}",
+                    end="")
+            return localtrace
+
+        ignoredirs = [
+            os.path.dirname(package.__file__)
+            for package in [os, torch, trace, dill]
+        ]
+        tracer = trace.Trace(trace=1, count=0, ignoredirs=ignoredirs)
+        rank = global_mpi_rank()
+        tracer.globaltrace = globaltrace
+        tracer.localtrace = localtrace
         result = tracer.runfunc(func, *args, **kwargs)
         return result
 
