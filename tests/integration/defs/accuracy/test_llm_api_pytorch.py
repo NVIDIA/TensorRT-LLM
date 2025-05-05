@@ -387,7 +387,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (False, True, False, False),
                            (False, False, True, False),
                            (False, False, False, True),
-                           (True, True, True, True)])
+                           (False, True, True, True), (True, True, True, True)])
     @parametrize_with_ids("mtp_nextn", [None, 2])
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
                                                          (2, 2, 1), (1, 4, 1)],
