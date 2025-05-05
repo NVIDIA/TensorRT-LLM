@@ -427,7 +427,7 @@ def test_trt_gpt_model_optional_params():
     assert not opt_params.decoding_config.decoding_mode
     opt_params.decoding_config.decoding_mode = _tb.executor.DecodingMode.TopKTopP(
     )
-    assert opt_params.decoding_config.decoding_mode.isTopKandTopP()
+    assert opt_params.decoding_config.decoding_mode.is_top_k_top_p()
 
     assert not opt_params.max_beam_width
     opt_params.max_beam_width = 4
@@ -605,3 +605,133 @@ def test_ReqIdsSet_pickle():
     ids2.insert(1)
     ids2.insert(2)
     assert ids1 == ids2
+
+
+def test_decoding_mode():
+    mode = _tb.DecodingMode.Auto()
+    assert mode.is_auto
+
+    mode = _tb.DecodingMode.TopK()
+    assert mode.is_top_k
+    assert mode.is_use_temperature
+    assert mode.is_use_occurrence_penalties
+    assert mode.is_use_ban_tokens
+    assert mode.is_use_stop_criteria
+    assert mode.is_use_min_p
+
+    mode = _tb.DecodingMode.TopP()
+    assert mode.is_top_p
+    assert mode.is_use_temperature
+    assert mode.is_use_occurrence_penalties
+    assert mode.is_use_ban_tokens
+    assert mode.is_use_stop_criteria
+    assert mode.is_use_min_p
+
+    mode = _tb.DecodingMode.TopKTopP()
+    assert mode.is_top_k_and_top_p
+    assert mode.is_use_temperature
+    assert mode.is_use_occurrence_penalties
+    assert mode.is_use_ban_tokens
+    assert mode.is_use_stop_criteria
+    assert mode.is_use_min_p
+
+    mode = _tb.DecodingMode.BeamSearch()
+    assert mode.is_beam_search
+    assert mode.is_use_temperature
+    assert mode.is_use_occurrence_penalties
+    assert mode.is_use_ban_tokens
+    assert mode.is_use_stop_criteria
+    assert not mode.is_use_min_p
+
+    mode = _tb.DecodingMode.Medusa()
+    assert mode.is_medusa
+
+    mode = _tb.DecodingMode.Lookahead()
+    assert mode.is_lookahead
+
+    mode = _tb.DecodingMode.ExplicitDraftTokens()
+    assert mode.is_explicit_draft_tokens
+
+    mode = _tb.DecodingMode.ExternalDraftTokens()
+    assert mode.is_external_draft_tokens
+
+    mode = _tb.DecodingMode.Eagle()
+    assert mode.is_eagle
+
+    # Test feature flags
+    mode = _tb.DecodingMode.TopK()
+    mode.use_temperature(False)
+    assert not mode.is_use_temperature
+    mode.use_temperature(True)
+    assert mode.is_use_temperature
+
+    mode.use_occurrence_penalties(False)
+    assert not mode.is_use_occurrence_penalties
+    mode.use_occurrence_penalties(True)
+    assert mode.is_use_occurrence_penalties
+
+    mode.use_presence_penalty(False)
+    assert not mode.is_use_presence_penalty
+    mode.use_presence_penalty(True)
+    assert mode.is_use_presence_penalty
+
+    mode.use_repetition_penalty(False)
+    assert not mode.is_use_repetition_penalty
+    mode.use_repetition_penalty(True)
+    assert mode.is_use_repetition_penalty
+
+    mode.use_frequency_penalty(False)
+    assert not mode.is_use_frequency_penalty
+    mode.use_frequency_penalty(True)
+    assert mode.is_use_frequency_penalty
+
+    mode.use_min_length(False)
+    assert not mode.is_use_min_length
+    mode.use_min_length(True)
+    assert mode.is_use_min_length
+
+    mode.use_ban_words(False)
+    assert not mode.is_use_ban_words
+    mode.use_ban_words(True)
+    assert mode.is_use_ban_words
+
+    mode.use_ban_tokens(False)
+    assert not mode.is_use_ban_tokens
+    mode.use_ban_tokens(True)
+    assert mode.is_use_ban_tokens
+
+    mode.use_no_repeat_ngram_size(False)
+    assert not mode.is_use_no_repeat_ngram_size
+    mode.use_no_repeat_ngram_size(True)
+    assert mode.is_use_no_repeat_ngram_size
+
+    mode.use_stop_words(False)
+    assert not mode.is_use_stop_words
+    mode.use_stop_words(True)
+    assert mode.is_use_stop_words
+
+    mode.use_max_length_stop(False)
+    assert not mode.is_use_max_length_stop
+    mode.use_max_length_stop(True)
+    assert mode.is_use_max_length_stop
+
+    mode.use_explicit_eos_stop(False)
+    assert not mode.is_use_explicit_eos_stop
+    mode.use_explicit_eos_stop(True)
+    assert mode.is_use_explicit_eos_stop
+
+    mode.use_min_p(False)
+    assert not mode.is_use_min_p
+    mode.use_min_p(True)
+    assert mode.is_use_min_p
+
+    mode.use_variable_beam_width_search(False)
+    assert not mode.is_use_variable_beam_width_search
+    mode.use_variable_beam_width_search(True)
+    assert mode.is_use_variable_beam_width_search
+
+    # Test utility methods
+    assert mode.name == "TopK"
+    assert str(mode) == "TopK"
+    assert mode == _tb.DecodingMode.TopK()
+    assert mode != _tb.DecodingMode.TopP()
