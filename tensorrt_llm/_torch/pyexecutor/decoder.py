@@ -189,15 +189,9 @@ def chain_all_requests(
 
 class TorchDecoder(Decoder):
 
-    def __init__(self,
-                 *,
-                 max_seq_len: int,
-                 executor_config: ExecutorConfig,
-                 mixed_decoder: bool = False):
+    def __init__(self, *, max_seq_len: int, mixed_decoder: bool = False):
         self.max_seq_len = max_seq_len
         self.mixed_decoder = mixed_decoder
-        self.batch_size = executor_config.max_batch_size
-        self.beam_width = executor_config.max_beam_width
 
     def _meet_max_token_stop_criteria(self, request: LlmRequest,
                                       num_tokens: int):
@@ -573,21 +567,17 @@ class TRTLLMDecoder(Decoder):
 
     def decode_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs):
-        self.batch_size = scheduled_requests.batch_size
-        for req in itertools.chain(scheduled_requests.context_requests,
-                                   scheduled_requests.generation_requests):
-            self.beam_width = req.sampling_config.beam_width
-            break
+        batch_size = scheduled_requests.batch_size
+        beam_width = scheduled_requests.beam_width
 
-        logits = model_outputs["logits"].reshape(
-            (self.batch_size, self.beam_width, -1))
+        logits = model_outputs["logits"].reshape((batch_size, beam_width, -1))
 
         self.setup_decoder_step(scheduled_requests.context_requests)
 
         # Note: In runtimeBuffers.cpp, num_context_logits is set to:
         #       numContextLogits.at(batchIdx) = modelConfig.computeContextLogits() ? contextChunkSize : 1;
         # Revisit this when we support chunked context.
-        num_context_logits = [1] * self.batch_size
+        num_context_logits = [1] * batch_size
         logits_index = self.algs.handle_context_logits(
             scheduled_requests.context_requests, num_context_logits, logits,
             self.store["decoder_buffers"], self.model_config,
@@ -603,8 +593,8 @@ class TRTLLMDecoder(Decoder):
             scheduled_requests.generation_requests,
             self.store["decoder_buffers"], self.store["decoder_input_buffers"],
             self.algs.decoder.decoder_state, self.model_config,
-            self.max_num_sequences, self.beam_width,
-            self.store["buffer_manager"], self.store["cuda_stream"])
+            self.max_num_sequences, beam_width, self.store["buffer_manager"],
+            self.store["cuda_stream"])
 
         self.algs.decoder.forward_async(self.decoding_output, decoding_input)
 
@@ -660,6 +650,7 @@ class TRTLLMDecoder(Decoder):
 
     def update_requests(self, decoder_state: SamplerState):
         scheduled_requests = decoder_state.scheduled_requests
+        beam_width = decoder_state.scheduled_requests.beam_width
         new_tensors_host = decoder_state.new_tensors_host
         decoder_event = decoder_state.decoder_event
 
@@ -671,7 +662,7 @@ class TRTLLMDecoder(Decoder):
         finish_reasons_host = new_tensors_host.finish_reasons_host
         sequence_lengths_host_data = new_tensors_host.sequence_lengths_host
 
-        for request in chain_all_requests(scheduled_requests):
+        for request in scheduled_requests.all_requests():
             if request.is_context_init_state:
                 continue
 
@@ -679,12 +670,12 @@ class TRTLLMDecoder(Decoder):
             num_generated_tokens = request.num_draft_tokens + 1
             current_num_of_tokens = request.max_beam_num_tokens
 
-            num_new_tokens = [0] * self.beam_width
-            num_dropped_tokens = [0] * self.beam_width
+            num_new_tokens = [0] * beam_width
+            num_dropped_tokens = [0] * beam_width
 
-            for beam in range(self.beam_width):
-                seq_len = sequence_lengths_host_data[seq_slot * self.beam_width
-                                                     + beam].item()
+            for beam in range(beam_width):
+                seq_len = sequence_lengths_host_data[seq_slot * beam_width +
+                                                     beam].item()
                 num_new_tokens[beam] = min(
                     num_generated_tokens,
                     seq_len - request.get_num_tokens(beam))
@@ -695,7 +686,7 @@ class TRTLLMDecoder(Decoder):
                     new_token = new_tokens_host[step][seq_slot][beam]
                     request.add_new_token(new_token, beam)
 
-                finish_reason = finish_reasons_host[seq_slot * self.beam_width +
+                finish_reason = finish_reasons_host[seq_slot * beam_width +
                                                     beam].item()
                 request.set_finished_reason(FinishReason(finish_reason), beam)
 
@@ -708,5 +699,5 @@ class TRTLLMDecoder(Decoder):
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 request.py_decoding_iter += 1
 
-            if finished_sum_host[seq_slot] == self.beam_width:
+            if finished_sum_host[seq_slot] == beam_width:
                 request.state = LlmRequestState.GENERATION_COMPLETE
