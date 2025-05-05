@@ -239,13 +239,16 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
                          server_start_timeout_secs)
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
         self.kv_cache_block_maps: dict[str, KvCacheAwareServerState] = {}
+        self.kv_cache_event_maps: dict[str, list[dict]] = {}
         for ctx_server in ctx_servers:
             self.kv_cache_block_maps[ctx_server] = KvCacheAwareServerState(
                 ctx_server)
+            self.kv_cache_event_maps[ctx_server] = []
         for gen_server in gen_servers:
             if gen_server not in self.kv_cache_block_maps:
                 self.kv_cache_block_maps[gen_server] = KvCacheAwareServerState(
                     gen_server)
+                self.kv_cache_event_maps[gen_server] = []
 
     async def send_request(self, session: aiohttp.ClientSession, url: str,
                            request: dict) -> dict:
@@ -253,6 +256,7 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
         events = await self.query_kv_cache_events(session, url)
         async with self.kv_cache_block_maps[url]._lock:
             self.kv_cache_block_maps[url].update_with_events(events)
+        self.kv_cache_event_maps[url].extend(events)
         return response
 
     async def multi_round_request(self,
@@ -269,6 +273,14 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
         tokens_per_block = 32  # TODO: read from config
         prev_ctx_match_count = 0
         prev_gen_match_count = 0
+        assert len(self.ctx_servers) == 1 and len(self.gen_servers) == 1, \
+            "This test assumes 1P1D"
+        ctx_server = self.ctx_servers[0]
+        gen_server = self.gen_servers[0]
+        ctx_blocks = self.kv_cache_block_maps[ctx_server]
+        gen_blocks = self.kv_cache_block_maps[gen_server]
+        ctx_events = self.kv_cache_event_maps[ctx_server]
+        gen_events = self.kv_cache_event_maps[gen_server]
         for i in range(max_rounds):
             # split tokens into blocks and check block match count by hash
             tokens = self.tokenizer(request["prompt"])["input_ids"]
@@ -278,17 +290,25 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
                 block_hashes.append(
                     block_key_hasher(tokens[t:t_end],
                                      None if t == 0 else block_hashes[-1]))
-            ctx_match_count = await self.kv_cache_block_maps[
-                self.ctx_servers[0]].match_blocks([block_hashes])
-            gen_match_count = await self.kv_cache_block_maps[
-                self.gen_servers[0]].match_blocks([block_hashes])
-            assert ctx_match_count >= prev_ctx_match_count
-            assert gen_match_count >= prev_gen_match_count
+            ctx_match_count = await ctx_blocks.match_blocks([block_hashes])
+            gen_match_count = await gen_blocks.match_blocks([block_hashes])
+            ctx_evicted = False
+            gen_evicted = False
+            for event in ctx_events:
+                if event["type"] == "removed":
+                    ctx_evicted = True
+                    break
+            for event in gen_events:
+                if event["type"] == "removed":
+                    gen_evicted = True
+                    break
+            assert ctx_evicted or ctx_match_count >= prev_ctx_match_count
+            assert gen_evicted or gen_match_count >= prev_gen_match_count
+            ctx_events.clear()
+            gen_events.clear()
 
-            response = await self.send_disagg_request(session,
-                                                      self.ctx_servers[0],
-                                                      self.gen_servers[0],
-                                                      request)
+            response = await self.send_disagg_request(session, ctx_server,
+                                                      gen_server, request)
             logger.info(
                 f"Received response {i}: {repr(response['choices'][0]['text'])}"
             )
