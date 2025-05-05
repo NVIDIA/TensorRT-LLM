@@ -47,9 +47,9 @@ l0_a30:
   - test_cpp.py::test_unit_tests[runtime-80]
   - test_cpp.py::test_unit_tests[thop-80]
   - test_cpp.py::test_unit_tests[utils-80]
-  - test_cpp.py::test_model[gpt-80]
-  - test_cpp.py::test_model[gpt_executor-80]
-  - test_cpp.py::test_model[gpt_tests-80]
+  - test_cpp.py::test_model[-gpt-80]
+  - test_cpp.py::test_model[-gpt_executor-80]
+  - test_cpp.py::test_model[-gpt_tests-80]
 - condition:
     ranges:
       system_gpu_count:
@@ -163,5 +163,5 @@ l0_a30:
       stage: post_merge
       backend: cpp
   tests:
-  - test_cpp.py::test_model[gpt_session-80]
+  - test_cpp.py::test_model[-gpt_session-80]
   - test_cpp.py::test_benchmarks[gpt-80]

@@ -4,9 +4,6 @@ methods:
       cumulative_logprob:
         annotation: Optional[float]
         default: null
-      logprobs:
-        annotation: Optional[List[float]]
-        default: null
       disaggregated_params:
         annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
         default: null

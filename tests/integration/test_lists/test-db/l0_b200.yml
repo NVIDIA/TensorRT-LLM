@@ -15,12 +15,12 @@ l0_b200:
   tests:
   # ------------- PyTorch tests ---------------
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[attention_dp]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[cuda_graph]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[overlap_scheduler]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[attention_dp-cuda_graph-overlap_scheduler]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[-]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[-attention_dp]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[-cuda_graph]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[-attention_dp-cuda_graph-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-cuda_graph]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-overlap_scheduler]

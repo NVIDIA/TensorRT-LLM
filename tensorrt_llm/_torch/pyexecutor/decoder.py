@@ -5,8 +5,8 @@ from dataclasses import dataclass
 import torch
 
 from tensorrt_llm._utils import torch_dtype_to_binding
-from tensorrt_llm.bindings import (DataType, ModelConfig, WorldConfig,
-                                   make_sampling_config)
+from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
+                                   WorldConfig, make_sampling_config)
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import (
@@ -14,7 +14,7 @@ from tensorrt_llm.bindings.internal.algorithms import (
     HandleGenerationLogits, MakeDecodingBatchInputOutput)
 from tensorrt_llm.bindings.internal.batch_manager import (DecoderBuffers,
                                                           DecoderInputBuffers)
-from tensorrt_llm.bindings.internal.runtime import (BufferManager, CudaStream,
+from tensorrt_llm.bindings.internal.runtime import (BufferManager,
                                                     GptDecoderBatched,
                                                     SpeculativeDecodingMode)
 from tensorrt_llm.mapping import Mapping
@@ -467,9 +467,9 @@ class TRTLLMDecoder(Decoder):
         self._instantiate_algorithms()
 
     def _initialize_store(self):
-        torch_stream = torch.cuda.current_stream()
-        cuda_stream = CudaStream(torch_stream.cuda_stream)
-        buffer_manager = BufferManager(stream=cuda_stream)
+        torch_stream = torch.cuda.current_stream().cuda_stream
+        cuda_stream = CudaStream(torch_stream)
+        buffer_manager = BufferManager(stream=torch_stream)
 
         self.store = {
             "torch_stream":
@@ -505,7 +505,7 @@ class TRTLLMDecoder(Decoder):
     def _instantiate_algorithms(self):
         self.algs = Algorithms()
         self.algs.decoder = GptDecoderBatched(
-            stream=self.store["cuda_stream"],
+            stream=self.store["torch_stream"],
             speculative_decoding_mode=SpeculativeDecodingMode.NoneType(),
             dtype=self.logits_datatype)
         self.algs.decoder.setup(

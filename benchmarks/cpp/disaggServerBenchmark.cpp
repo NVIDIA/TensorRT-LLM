@@ -535,6 +535,7 @@ texec::Request makeExecutorContextRequest(Sample const& sample, SizeType32 const
             std::nullopt,    // embeddingBias
             std::nullopt,    // speculativeDecoding
             std::nullopt,    // pTuning
+            std::nullopt,    // multimodalEmbedding
             std::nullopt,    // mRopeConfig
             loraConfig,      // loraConfig
             lookaheadConfig, // lookaheadConfig

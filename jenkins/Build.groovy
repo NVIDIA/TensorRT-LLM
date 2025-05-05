@@ -402,7 +402,9 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
         trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, "cp312")
     }
 
-    sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]} --benchmarks --extra-make-targets modelSpec"
+    withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
+        sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]} --benchmarks"
+    }
     if (is_linux_x86_64) {
         sh "cd ${LLM_ROOT} && python3 scripts/build_cpp_examples.py"
     }
@@ -417,11 +419,6 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     sh "cp ${LLM_ROOT}/cpp/build/benchmarks/gptManagerBenchmark TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/libtensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
-    sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.so TensorRT-LLM/benchmarks/cpp"
-
-    // Copy model_spec.so (pybinding for ModelSpec) since various tests will need it.
-    sh "mkdir -p TensorRT-LLM/src/cpp/tests/batch_manager"
-    sh "cp ${LLM_ROOT}/cpp/build/tests/batch_manager/model_spec.so TensorRT-LLM/src/cpp/tests/batch_manager/"
 
     if (is_linux_x86_64) {
         sh "rm -rf ${tarName}"
@@ -469,7 +466,9 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
     }
     sh "bash -c 'git config --global --add safe.directory \"*\"'"
     // Because different architectures involve different macros, a comprehensive test is conducted here.
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c \"cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${extra_args}\"")
+    withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c \"cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${extra_args}\"")
+    }
 }
 
 def prepareBuildLib(pipeline, triple, pre_cxx11abi)
@@ -482,7 +481,6 @@ def prepareBuildLib(pipeline, triple, pre_cxx11abi)
     if ((triple == X86_64_TRIPLE && pre_cxx11abi) || (triple == AARCH64_TRIPLE && !pre_cxx11abi)) {
         libraries += [
             "ucx_wrapper",
-            "nvrtc_wrapper",
         ]
     }
 
@@ -496,8 +494,6 @@ def prepareBuildLib(pipeline, triple, pre_cxx11abi)
         } else if (library_name == "executor") {
             libdir = "tensorrt_llm/executor"
             is_static = true
-        } else if (library_name == "nvrtc_wrapper") {
-            libdir = "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper"
         } else if (library_name == "internal_cutlass_kernels"){
             libdir = "tensorrt_llm/kernels/internal_cutlass_kernels"
             is_static = true

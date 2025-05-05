@@ -22,6 +22,7 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/utils/mpiTags.h"
 
 using namespace tensorrt_llm::runtime;
 
@@ -170,25 +171,29 @@ DecoderStepAsyncSend::DecoderStepAsyncSend(DecoderOutputBuffers const& decoderOu
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_LOG_DEBUG("start send outputs of DecoderBuffers to rank %d", peer);
 
-    mRequest1 = commSession.sendAsync(*decoderOutputBuffers.newOutputTokensHost, peer, kMpiTagOffset);
-    mRequest2 = commSession.sendAsync(*decoderOutputBuffers.finishedSumHost, peer, kMpiTagOffset + 1);
-    mRequest3 = commSession.sendAsync(*decoderOutputBuffers.sequenceLengthsHost, peer, kMpiTagOffset + 2);
-    mRequest4 = returnLogProbs ? commSession.sendAsync(*decoderOutputBuffers.cumLogProbsHost, peer, kMpiTagOffset + 3)
-                               : nullptr;
-    mRequest5
-        = returnLogProbs ? commSession.sendAsync(*decoderOutputBuffers.logProbsHost, peer, kMpiTagOffset + 4) : nullptr;
-    mRequest6 = maxBeamWidth > 1
-        ? commSession.sendAsync(*decoderBuffers.cacheIndirectionOutput, peer, kMpiTagOffset + 5)
+    mRequest1 = commSession.sendAsync(
+        *decoderOutputBuffers.newOutputTokensHost, peer, mpi::MpiTag::kDecoderStepNewOutputTokensHost);
+    mRequest2
+        = commSession.sendAsync(*decoderOutputBuffers.finishedSumHost, peer, mpi::MpiTag::kDecoderStepFinishedSumHost);
+    mRequest3 = commSession.sendAsync(
+        *decoderOutputBuffers.sequenceLengthsHost, peer, mpi::MpiTag::kDecoderStepSequenceLengthsHost);
+    mRequest4 = returnLogProbs
+        ? commSession.sendAsync(*decoderOutputBuffers.cumLogProbsHost, peer, mpi::MpiTag::kDecoderStepCumLogProbsHost)
         : nullptr;
-    mRequest7 = useMedusa
-        ? commSession.sendAsync(*decoderBuffers.draftBuffers.acceptedLengthsCumSumDevice, peer, kMpiTagOffset + 6)
+    mRequest5 = returnLogProbs
+        ? commSession.sendAsync(*decoderOutputBuffers.logProbsHost, peer, mpi::MpiTag::kDecoderStepLogProbsHost)
         : nullptr;
-    mRequest8 = useMedusa
-        ? commSession.sendAsync(*decoderBuffers.draftBuffers.acceptedPackedPathsDevice, peer, kMpiTagOffset + 7)
-        : nullptr;
-    mRequest9 = commSession.sendAsync(*decoderOutputBuffers.finishReasonsHost, peer, kMpiTagOffset + 8);
-
-    static_assert(kMpiTagUpperBound >= kMpiTagOffset + 9);
+    mRequest6 = maxBeamWidth > 1 ? commSession.sendAsync(
+                    *decoderBuffers.cacheIndirectionOutput, peer, mpi::MpiTag::kDecoderStepCacheIndirectionOutput)
+                                 : nullptr;
+    mRequest7 = useMedusa ? commSession.sendAsync(*decoderBuffers.draftBuffers.acceptedLengthsCumSumDevice, peer,
+                    mpi::MpiTag::kDecoderStepAcceptedLengthsCumSumDevice)
+                          : nullptr;
+    mRequest8 = useMedusa ? commSession.sendAsync(*decoderBuffers.draftBuffers.acceptedPackedPathsDevice, peer,
+                    mpi::MpiTag::kDecoderStepAcceptedPackedPathsDevice)
+                          : nullptr;
+    mRequest9 = commSession.sendAsync(
+        *decoderOutputBuffers.finishReasonsHost, peer, mpi::MpiTag::kDecoderStepFinishReasonsHost);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -200,26 +205,26 @@ void DecoderStepAsyncSend::recv(DecoderOutputBuffers const& decoderOutputBuffers
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_LOG_DEBUG("start recv outputs of DecoderBuffers from rank %d", peer);
 
-    commSession.recv(*decoderOutputBuffers.newOutputTokensHost, peer, DecoderStepAsyncSend::kMpiTagOffset);
-    commSession.recv(*decoderOutputBuffers.finishedSumHost, peer, DecoderStepAsyncSend::kMpiTagOffset + 1);
-    commSession.recv(*decoderOutputBuffers.sequenceLengthsHost, peer, DecoderStepAsyncSend::kMpiTagOffset + 2);
+    commSession.recv(*decoderOutputBuffers.newOutputTokensHost, peer, mpi::MpiTag::kDecoderStepNewOutputTokensHost);
+    commSession.recv(*decoderOutputBuffers.finishedSumHost, peer, mpi::MpiTag::kDecoderStepFinishedSumHost);
+    commSession.recv(*decoderOutputBuffers.sequenceLengthsHost, peer, mpi::MpiTag::kDecoderStepSequenceLengthsHost);
     if (returnLogProbs)
     {
-        commSession.recv(*decoderOutputBuffers.cumLogProbsHost, peer, DecoderStepAsyncSend::kMpiTagOffset + 3);
-        commSession.recv(*decoderOutputBuffers.logProbsHost, peer, DecoderStepAsyncSend::kMpiTagOffset + 4);
+        commSession.recv(*decoderOutputBuffers.cumLogProbsHost, peer, mpi::MpiTag::kDecoderStepCumLogProbsHost);
+        commSession.recv(*decoderOutputBuffers.logProbsHost, peer, mpi::MpiTag::kDecoderStepLogProbsHost);
     }
     if (maxBeamWidth > 1)
     {
-        commSession.recv(*decoderBuffers.cacheIndirectionOutput, peer, DecoderStepAsyncSend::kMpiTagOffset + 5);
+        commSession.recv(*decoderBuffers.cacheIndirectionOutput, peer, mpi::MpiTag::kDecoderStepCacheIndirectionOutput);
     }
     if (useMedusa)
     {
-        commSession.recv(
-            *decoderBuffers.draftBuffers.acceptedLengthsCumSumDevice, peer, DecoderStepAsyncSend::kMpiTagOffset + 6);
-        commSession.recv(
-            *decoderBuffers.draftBuffers.acceptedPackedPathsDevice, peer, DecoderStepAsyncSend::kMpiTagOffset + 7);
+        commSession.recv(*decoderBuffers.draftBuffers.acceptedLengthsCumSumDevice, peer,
+            mpi::MpiTag::kDecoderStepAcceptedLengthsCumSumDevice);
+        commSession.recv(*decoderBuffers.draftBuffers.acceptedPackedPathsDevice, peer,
+            mpi::MpiTag::kDecoderStepAcceptedPackedPathsDevice);
     }
-    commSession.recv(*decoderOutputBuffers.finishReasonsHost, peer, DecoderStepAsyncSend::kMpiTagOffset + 8);
+    commSession.recv(*decoderOutputBuffers.finishReasonsHost, peer, mpi::MpiTag::kDecoderStepFinishReasonsHost);
 
     TLLM_LOG_DEBUG("end recv outputs of DecoderBuffers from rank %d", peer);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -293,12 +298,11 @@ DecoderSlotAsyncSend::DecoderSlotAsyncSend(TensorPtr const& outputIds, TensorPtr
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_LOG_DEBUG("start send outputs of SlotDecoderBuffers to rank %d", peer);
 
-    mRequest1 = commSession.sendAsync(*outputIds, peer, kMpiTagOffset);
-    mRequest2 = commSession.sendAsync(*sequenceLengths, peer, kMpiTagOffset + 1);
-    mRequest3 = returnLogProbs ? commSession.sendAsync(*cumLogProbs, peer, kMpiTagOffset + 2) : nullptr;
-    mRequest4 = returnLogProbs ? commSession.sendAsync(*logProbs, peer, kMpiTagOffset + 3) : nullptr;
-
-    static_assert(kMpiTagUpperBound >= kMpiTagOffset + 4);
+    mRequest1 = commSession.sendAsync(*outputIds, peer, mpi::MpiTag::kDecoderSlotOutputIds);
+    mRequest2 = commSession.sendAsync(*sequenceLengths, peer, mpi::MpiTag::kDecoderSlotSequenceLengths);
+    mRequest3
+        = returnLogProbs ? commSession.sendAsync(*cumLogProbs, peer, mpi::MpiTag::kDecoderSlotCumLogProbs) : nullptr;
+    mRequest4 = returnLogProbs ? commSession.sendAsync(*logProbs, peer, mpi::MpiTag::kDecoderSlotLogProbs) : nullptr;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -316,12 +320,12 @@ void DecoderSlotAsyncSend::recv(SlotDecoderBuffers const& slotDecoderBuffers, bo
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_LOG_DEBUG("start recv outputs of SlotDecoderBuffers from rank %d", peer);
 
-    commSession.recv(*slotDecoderBuffers.outputIds, peer, DecoderSlotAsyncSend::kMpiTagOffset);
-    commSession.recv(*slotDecoderBuffers.sequenceLengths, peer, DecoderSlotAsyncSend::kMpiTagOffset + 1);
+    commSession.recv(*slotDecoderBuffers.outputIds, peer, mpi::MpiTag::kDecoderSlotOutputIds);
+    commSession.recv(*slotDecoderBuffers.sequenceLengths, peer, mpi::MpiTag::kDecoderSlotSequenceLengths);
     if (returnLogProbs)
     {
-        commSession.recv(*slotDecoderBuffers.cumLogProbs, peer, DecoderSlotAsyncSend::kMpiTagOffset + 2);
-        commSession.recv(*slotDecoderBuffers.logProbs, peer, DecoderSlotAsyncSend::kMpiTagOffset + 3);
+        commSession.recv(*slotDecoderBuffers.cumLogProbs, peer, mpi::MpiTag::kDecoderSlotCumLogProbs);
+        commSession.recv(*slotDecoderBuffers.logProbs, peer, mpi::MpiTag::kDecoderSlotLogProbs);
     }
 
     TLLM_LOG_DEBUG("end recv outputs of SlotDecoderBuffers from rank %d", peer);
