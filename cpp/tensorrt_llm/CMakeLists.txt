@@ -22,25 +22,6 @@ set(API_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/cutlass_extensions/include
                     ${API_INCLUDE_DIR})
 
-if(ENABLE_MULTI_DEVICE)
-  find_package(MPI REQUIRED)
-  message(STATUS "Using MPI_C_INCLUDE_DIRS: ${MPI_C_INCLUDE_DIRS}")
-  message(STATUS "Using MPI_C_LIBRARIES: ${MPI_C_LIBRARIES}")
-  include_directories(${MPI_C_INCLUDE_DIRS})
-endif()
-
-if(NOT WIN32)
-  set(DECODER_SHARED_TARGET_0 decoder_attention_0)
-  set(DECODER_SHARED_TARGET_1 decoder_attention_1)
-endif()
-
-add_subdirectory(common)
-add_subdirectory(kernels)
-add_subdirectory(layers)
-add_subdirectory(runtime)
-add_subdirectory(testing)
-add_subdirectory(executor_worker)
-
 set(TARGET_ARCH "unknown")
 
 message(STATUS "CMAKE_SYSTEM_PROCESSOR: ${CMAKE_SYSTEM_PROCESSOR}")
@@ -84,21 +65,36 @@ else() # Windows
   endif()
 endif()
 
-set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
-set(BATCH_MANAGER_TARGET_ARCH ${TARGET_ARCH})
-add_subdirectory(batch_manager)
+if(ENABLE_MULTI_DEVICE)
+  find_package(MPI REQUIRED)
+  message(STATUS "Using MPI_C_INCLUDE_DIRS: ${MPI_C_INCLUDE_DIRS}")
+  message(STATUS "Using MPI_C_LIBRARIES: ${MPI_C_LIBRARIES}")
+  include_directories(${MPI_C_INCLUDE_DIRS})
+endif()
 
-set(EXECUTOR_TARGET tensorrt_llm_executor_static)
-set(EXECUTOR_TARGET_ARCH ${TARGET_ARCH})
-set(UCX_WRAPPER_TARGET tensorrt_llm_ucx_wrapper)
-add_subdirectory(executor)
+if(NOT WIN32)
+  set(DECODER_SHARED_TARGET_0 decoder_attention_0)
+  set(DECODER_SHARED_TARGET_1 decoder_attention_1)
+endif()
 
+# Build internal cutlass kernels as subproject
+if(INTERNAL_CUTLASS_KERNELS_PATH)
+  set(BUILD_INTERNAL_CUTLASS_KERNELS ON)
+  set(BUILD_NVRTC_WRAPPER ON)
+  if(NOT EXISTS ${INTERNAL_CUTLASS_KERNELS_PATH}/CMakeLists.txt
+     AND EXISTS ${INTERNAL_CUTLASS_KERNELS_PATH}/cpp/CMakeLists.txt)
+    set(INTERNAL_CUTLASS_KERNELS_PATH ${INTERNAL_CUTLASS_KERNELS_PATH}/cpp)
+  endif()
+
+  add_subdirectory(${INTERNAL_CUTLASS_KERNELS_PATH}
+                   ${PROJECT_BINARY_DIR}/internal_cutlass_kernels)
+endif()
+
+# Import internal cutlass kernels
 set(INTERNAL_CUTLASS_KERNELS_TARGET
     tensorrt_llm_internal_cutlass_kernels_static)
 set(INTERNAL_CUTLASS_KERNELS_TARGET_ARCH ${TARGET_ARCH})
-if(BUILD_INTERNAL_CUTLASS_KERNELS)
-  add_subdirectory(kernels/internal_cutlass_kernels)
-else()
+if(NOT INTERNAL_CUTLASS_KERNELS_PATH)
   add_library(${INTERNAL_CUTLASS_KERNELS_TARGET} STATIC IMPORTED)
   set(INTERNAL_CUTLASS_KERNELS_LIB_TARBALL
       "${CMAKE_CURRENT_SOURCE_DIR}/kernels/internal_cutlass_kernels/${INTERNAL_CUTLASS_KERNELS_TARGET_ARCH}/${INTERNAL_CUTLASS_KERNELS_TARGET}.tar.xz"
@@ -124,8 +120,10 @@ else()
                    ${INTERNAL_CUTLASS_KERNELS_TARGET}_helper)
   set_property(TARGET ${INTERNAL_CUTLASS_KERNELS_TARGET}
                PROPERTY IMPORTED_LOCATION ${INTERNAL_CUTLASS_KERNELS_LIB_PATH})
-  target_link_libraries(${INTERNAL_CUTLASS_KERNELS_TARGET}
-                        INTERFACE ${INTERNAL_CUTLASS_KERNELS_LIB_PATH})
+  target_include_directories(
+    ${INTERNAL_CUTLASS_KERNELS_TARGET}
+    INTERFACE
+      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/internal_cutlass_kernels/include")
   file(SIZE ${INTERNAL_CUTLASS_KERNELS_LIB_TARBALL}
        INTERNAL_CUTLASS_KERNELS_LIB_SIZE)
   if(INTERNAL_CUTLASS_KERNELS_LIB_SIZE LESS 1024)
@@ -135,6 +133,22 @@ else()
     )
   endif()
 endif()
+
+add_subdirectory(common)
+add_subdirectory(kernels)
+add_subdirectory(layers)
+add_subdirectory(runtime)
+add_subdirectory(testing)
+add_subdirectory(executor_worker)
+
+set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
+set(BATCH_MANAGER_TARGET_ARCH ${TARGET_ARCH})
+add_subdirectory(batch_manager)
+
+set(EXECUTOR_TARGET tensorrt_llm_executor_static)
+set(EXECUTOR_TARGET_ARCH ${TARGET_ARCH})
+set(UCX_WRAPPER_TARGET tensorrt_llm_ucx_wrapper)
+add_subdirectory(executor)
 
 find_package(Threads REQUIRED)
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE Threads::Threads)
@@ -211,9 +225,6 @@ target_link_libraries(${SHARED_TARGET} PUBLIC kernels_src cutlass_src)
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${SHARED_TARGET})
 # Cyclic dependency of executor on TRT-LLM
 target_link_libraries(${EXECUTOR_TARGET} INTERFACE ${SHARED_TARGET})
-# Cyclic dependency of internal_cutlass_kernels on TRT-LLM
-target_link_libraries(${INTERNAL_CUTLASS_KERNELS_TARGET}
-                      INTERFACE ${SHARED_TARGET})
 
 # Cyclic dependency of UCX data transceiver on TRT-LLM
 if(TARGET ${UCX_WRAPPER_TARGET})
