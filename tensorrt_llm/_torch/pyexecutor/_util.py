@@ -471,8 +471,7 @@ def instantiate_decoder(model_engine, executor_config, pytorch_backend_config,
         decoder = get_spec_decoder(max_seq_len=model_engine.max_seq_len,
                                    spec_config=model_engine.spec_config)
     elif pytorch_backend_config.enable_trtllm_decoder:
-        decoding_mode = executor_config.decoding_config.decoding_mode if executor_config.decoding_config and executor_config.decoding_config.decoding_mode else DecodingMode.TopK(
-        )
+        decoding_mode = get_decoding_mode(executor_config)
         decoder = TRTLLMDecoder(executor_config, model_engine.model,
                                 model_engine.dtype, mapping, decoding_mode,
                                 pytorch_backend_config.enable_overlap_scheduler)
@@ -484,3 +483,110 @@ def instantiate_decoder(model_engine, executor_config, pytorch_backend_config,
             max_seq_len=model_engine.max_seq_len,
             mixed_decoder=pytorch_backend_config.mixed_decoder)
     return decoder
+
+
+def get_decoding_mode(executor_config):
+    '''This implementation is based off trtGptModelInflightBatching.cpp getDecodingMode().'''
+
+    if executor_config.decoding_config and executor_config.decoding_config.decoding_mode and not executor_config.decoding_config.decoding_mode.isAuto(
+    ):
+        decoding_mode = executor_config.decoding_config.decoding_mode
+    elif executor_config.max_beam_width == 1:
+        decoding_mode = DecodingMode.TopKTopP()
+    else:
+        decoding_mode = DecodingMode.BeamSearch()
+
+    # Override decoding mode when beam width is one
+    if executor_config.max_beam_width == 1 and decoding_mode.isBeamSearch():
+        logger.warning(
+            "Beam width is set to 1, but decoding mode is BeamSearch. Overwriting decoding mode to TopKTopP."
+        )
+        decoding_mode = DecodingMode.TopKTopP()
+
+    # Override decoding mode when Medusa is used
+    if executor_config.speculative_config and executor_config.speculative_config.is_medusa and not decoding_mode.isMedusa(
+    ):
+        logger.warning(
+            "Model is Medusa, but decoding mode is not Medusa. Overwriting decoding mode to Medusa."
+        )
+        decoding_mode = DecodingMode.Medusa()
+
+    # Override decoding mode when Medusa is not used
+    if (not executor_config.speculative_config
+            or not executor_config.speculative_config.is_medusa
+        ) and decoding_mode.isMedusa():
+        logger.warning(
+            "Model is not Medusa, but decoding mode is Medusa. Overwriting decoding mode."
+        )
+        if executor_config.max_beam_width == 1:
+            decoding_mode = DecodingMode.TopKTopP()
+        else:
+            decoding_mode = DecodingMode.BeamSearch()
+
+    # Override decoding mode when lookahead decoding is used
+    if executor_config.speculative_config and executor_config.speculative_config.is_lookahead and not decoding_mode.isLookahead(
+    ):
+        logger.warning(
+            "Model is Lookahead, but decoding mode is not Lookahead. Overwriting decoding mode to Lookahead."
+        )
+        decoding_mode = DecodingMode.Lookahead()
+
+    # Override decoding mode when lookahead decoding is not used
+    if (not executor_config.speculative_config
+            or not executor_config.speculative_config.is_lookahead
+        ) and decoding_mode.isLookahead():
+        logger.warning(
+            "Model is not built with Lookahead decoding, but decoding mode is Lookahead. Overwriting decoding mode."
+        )
+        if executor_config.max_beam_width == 1:
+            decoding_mode = DecodingMode.TopKTopP()
+        else:
+            decoding_mode = DecodingMode.BeamSearch()
+
+    # Override decoding mode when 'explicit draft tokens' is used
+    if executor_config.speculative_config and executor_config.speculative_config.is_explicit_draft_tokens and not decoding_mode.isExplicitDraftTokens(
+    ):
+        logger.warning(
+            "Model is built with 'explicit draft tokens' decoding, but decoding mode is something else. Overwriting decoding mode."
+        )
+        decoding_mode = DecodingMode.ExplicitDraftTokens()
+
+    # Override decoding mode when 'explicit draft tokens' is not used
+    if (not executor_config.speculative_config
+            or not executor_config.speculative_config.is_explicit_draft_tokens
+        ) and decoding_mode.isExplicitDraftTokens():
+        logger.warning(
+            "Model is not built with 'explicit draft tokens' decoding, but decoding mode is set to it. Overwriting decoding mode to default."
+        )
+        if executor_config.max_beam_width == 1:
+            decoding_mode = DecodingMode.TopKTopP()
+        else:
+            decoding_mode = DecodingMode.BeamSearch()
+
+    # Override decoding mode when EAGLE is used
+    if executor_config.speculative_config and executor_config.speculative_config.is_eagle and not decoding_mode.isEagle(
+    ):
+        logger.warning(
+            "Model is Eagle, but decoding mode is not Eagle. Overwriting decoding mode to Eagle."
+        )
+        decoding_mode = DecodingMode.Eagle()
+
+    # Override decoding mode when Eagle is not used
+    if (not executor_config.speculative_config
+            or not executor_config.speculative_config.is_eagle
+        ) and decoding_mode.isEagle():
+        logger.warning(
+            "Model is not Eagle, but decoding mode is Eagle. Overwriting decoding mode."
+        )
+        if executor_config.max_beam_width == 1:
+            decoding_mode = DecodingMode.TopKTopP()
+        else:
+            decoding_mode = DecodingMode.BeamSearch()
+
+    # Override decoding mode when draft tokens are external
+    if executor_config.speculative_config and executor_config.speculative_config.is_draft_tokens_external:
+        logger.warning("Overwriting decoding mode to external draft token")
+        decoding_mode = DecodingMode.ExternalDraftTokens()
+
+    logger.debug(f"DecodingMode: {decoding_mode.name}")
+    return decoding_mode
