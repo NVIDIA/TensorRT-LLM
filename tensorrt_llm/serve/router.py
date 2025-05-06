@@ -16,7 +16,7 @@ OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest]
 
 
 def get_request_num_tokens(request: OpenAIRequest) -> int:
-    if request.disaggregated_params.request_type == "context_only":
+    if request.disaggregated_params is None or request.disaggregated_params.request_type == "context_only":
         if isinstance(request, ChatCompletionRequest):
             raise ValueError(
                 "LoadBalancing router with tokens doesn't support ChatCompletionRequest yet"
