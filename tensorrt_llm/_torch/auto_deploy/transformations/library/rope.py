@@ -65,10 +65,7 @@ def _rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-# Torch-Inductor matcher only sees literal numeric args (e.g. unsqueeze dim),
-# so we register one pattern per possible dimension.
-def _rope_pattern1(q, k, cos, sin):
-    unsqueeze_dim = 1
+def _rope_pattern(q, k, cos, sin, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (_rotate_half(q) * sin)
@@ -76,22 +73,7 @@ def _rope_pattern1(q, k, cos, sin):
     return q_embed, k_embed
 
 
-def _rope_repl1(q, k, cos, sin):
-    unsqueeze_dim = 1
-    return torch.ops.rope.torch_apply_rope_with_explicit_cos_sin(q, k, cos, sin, unsqueeze_dim)
-
-
-def _rope_pattern2(q, k, cos, sin):
-    unsqueeze_dim = 2
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-def _rope_repl2(q, k, cos, sin):
-    unsqueeze_dim = 2
+def _rope_repl(q, k, cos, sin, unsqueeze_dim):
     return torch.ops.rope.torch_apply_rope_with_explicit_cos_sin(q, k, cos, sin, unsqueeze_dim)
 
 
@@ -99,45 +81,27 @@ def match_explicit_rope_with_pm(gm: GraphModule) -> GraphModule:
     graph = gm.graph
     patterns = PatternMatcherPass()
 
-    # dummy shapes: symbolic dims can be arbitrary, but any literal args must match real model.
+    # dummy shapes: can be arbitrary
     batch_size = 8
     seq_len = 16
-    # head_dim must match with runtime
     num_heads = 8
     hidden_size = 512
     head_dim = hidden_size // num_heads
-    example_input = torch.randn(
-        batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16
-    )
 
-    # pattern for unsqueeze_dim = 1
-    dummy1 = [
+    dummy = [
         torch.randn(batch_size, num_heads, seq_len, head_dim, device="cuda", dtype=torch.float16),
         torch.randn(batch_size, num_heads, seq_len, head_dim, device="cuda", dtype=torch.float16),
         torch.randn(batch_size, seq_len, head_dim, device="cuda", dtype=torch.float16),
         torch.randn(batch_size, seq_len, head_dim, device="cuda", dtype=torch.float16),
     ]
     register_pattern(
-        search_fn=_rope_pattern1,
-        replace_fn=_rope_repl1,
+        search_fn=_rope_pattern,
+        replace_fn=_rope_repl,
         patterns=patterns,
-        example_inputs=[example_input],
-        dummy_args=dummy1,
-    )
-
-    # pattern for unsqueeze_dim = 2
-    dummy2 = [
-        torch.randn(batch_size, seq_len, num_heads, head_dim, device="cuda", dtype=torch.float16),
-        torch.randn(batch_size, seq_len, num_heads, head_dim, device="cuda", dtype=torch.float16),
-        torch.randn(batch_size, seq_len, head_dim, device="cuda", dtype=torch.float16),
-        torch.randn(batch_size, seq_len, head_dim, device="cuda", dtype=torch.float16),
-    ]
-    register_pattern(
-        search_fn=_rope_pattern2,
-        replace_fn=_rope_repl2,
-        patterns=patterns,
-        example_inputs=[example_input],
-        dummy_args=dummy2,
+        example_inputs=[None],
+        dummy_args=dummy,
+        op_ignore_types={torch.ops.aten.slice.Tensor: (int,)},
+        scalar_workaround={"unsqueeze_dim": 1},
     )
 
     patterns.apply(graph)
