@@ -17,7 +17,7 @@ include(FetchContent)
 set(SRCS
     utils/mpiUtils.cpp
     utils/numpyUtils.cpp
-    utils/sessionUtils.cpp
+    utils/runtimeUtils.cpp
     utils/debugUtils.cu
     utils/speculativeChoicesUtils.cpp
     bufferManager.cpp
