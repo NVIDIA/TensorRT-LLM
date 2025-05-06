@@ -636,6 +636,7 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-H-8B-Base-8K"
     MODEL_PATH = f"{llm_models_root()}/Nemotron-H-8B-Base-8K"
 
+    @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5264431")
     def test_auto_dtype(self):
         kv_cache_config = KvCacheConfig(enable_block_reuse=False)
         with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
