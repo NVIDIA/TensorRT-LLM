@@ -1298,6 +1298,9 @@ void TrtGptModelInflightBatching::createRuntimeContexts()
 namespace
 {
 // TODO: move this somewhere else?
+/**
+ * This function logic is also implemented in tensorrt_llm/_torch/pyexecutor/_util.py get_decoding_mode().
+ */
 executor::DecodingMode getDecodingMode(SpeculativeDecodingMode specDecodingMode,
     std::optional<executor::DecodingMode> const& decodingModeOpt, runtime::SizeType32 const beamWidth)
 {
