@@ -353,7 +353,7 @@ class Linear(nn.Module):
                         input, self.input_scale)
                 else:
                     qinput = input
-                if self.use_llama4_qkv and (qinput.shape[0] <= 8):
+                if self.use_llama4_qkv and (qinput.shape[0] <= 4):
                     # Kernel is only supported when M <= 8
                     output = torch.ops.trtllm.llama4_qkv_gemm(
                         qinput,
@@ -361,6 +361,24 @@ class Linear(nn.Module):
                         self.combined_scale,
                         position_ids,
                     )
+                elif self.use_llama4_qkv and (4 < qinput.shape[0] <= 8):
+                    if position_ids is not None:
+                        # Kernel is only supported when M <= 8
+                        output = torch.ops.trtllm.llama4_qkv_gemm(
+                            qinput,
+                            weight.t(),
+                            self.combined_scale,
+                            position_ids,
+                        )
+                    else:
+                        output = torch.ops.trtllm.fp8_per_tensor_scaling_tllmg_gemm(
+                            qinput,
+                            weight,
+                            global_scale=self.combined_scale,
+                            out_dtype=torch.bfloat16,
+                            low_latency_kernel=True,
+                            gated_silu=False,
+                        )
                 elif self.use_llama4_fc_swiglu_kernel and qinput.shape[0] <= 4:
                     # Outputing fp8 even though self.dtype is bfloat16
                     # That is why we need inv_input_scale from next linear layer to
@@ -487,11 +505,20 @@ class Linear(nn.Module):
             else:
                 output = self.apply_linear(input, self.weight, bias)
         elif self.tp_mode == TensorParallelMode.COLUMN:
-            if self.use_llama4_qkv and position_ids is not None:
-                output = self.apply_linear(input,
-                                           self.weight,
-                                           self.bias,
-                                           position_ids=position_ids)
+            if self.use_llama4_qkv:
+                if input.shape[0] <= 8 and position_ids is not None:
+                    output = self.apply_linear(input,
+                                               self.weight,
+                                               self.bias,
+                                               position_ids=position_ids)
+                elif 4 < input.shape[0] <= 8 and position_ids is None:
+                    output = self.apply_linear(input,
+                                               self.trtllm_gen_weight,
+                                               self.bias)
+                else:
+                    output = self.apply_linear(input,
+                                               self.weight,
+                                               self.bias)
             elif self.use_llama4_fc_swiglu_kernel:
                 if 4 < input.shape[0] <= 16:
                     output = self.apply_linear(input,
@@ -646,6 +673,11 @@ class Linear(nn.Module):
                     torch.float8_e4m3fn)
 
             copy(self.weight, fused_weight)
+            if self.use_llama4_qkv:
+                # Shuffling is needed for low latency mode. Assuming always low latency mode for now.
+                # epilogue_tile_m is hardcoded as 128 for now.
+                epilogue_tile_m = 128
+                self.trtllm_gen_weight = shuffle_matrix_a(fused_weight.view(torch.uint8), epilogue_tile_m).view(torch.float8_e4m3fn)
 
             if self.bias is not None:
                 q_bias = load_weight_shard(weights[0]['bias'], self.tp_size,
