@@ -4,10 +4,6 @@ meta-llama/Llama-3.3-70B-Instruct:
     accuracy: 45.55
   - quant_algo: FP8
     accuracy: 48.03
-meta-llama/Llama-4-Maverick-17B-128E-Instruct:
-  - accuracy: 41.41
-meta-llama/Llama-4-Scout-17B-16E-Instruct:
-  - accuracy: 31.82
 deepseek-ai/DeepSeek-R1:
   - quant_algo: NVFP4
     accuracy: 70.45

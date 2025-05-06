@@ -219,9 +219,8 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
                  use_cuda_graph=cuda_graph) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
@@ -241,9 +240,8 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
                  use_cuda_graph=cuda_graph) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 class TestMistral7B(LlmapiAccuracyTestHarness):
