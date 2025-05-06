@@ -155,6 +155,8 @@ void LookaheadRuntimeBuffers::reshape(SizeType32 numCtxSequences, SizeType32 num
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
+    // `numGenSequences` is 0 in context phase
+
     auto packedMaskShape = packedMasksDevice->getShape();
     packedMaskShape.d[0] = numGenSequences * tokensPerStep;
     packedMasksDevice->reshape(packedMaskShape);

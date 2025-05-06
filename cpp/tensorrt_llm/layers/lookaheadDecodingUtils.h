@@ -257,7 +257,7 @@ public:
         {
             for (auto i = 0; i < shape.d[0]; i++)
             {
-                buf << "\n [" << i << "]: ";
+                buf << "\n [" << std::setw(3) << i << "]: ";
                 line(tensorRange.begin() + i * shape.d[1], shape.d[1]);
             }
         }
@@ -267,7 +267,7 @@ public:
             {
                 for (auto j = 0; j < shape.d[1]; j++)
                 {
-                    buf << "\n [" << i << "," << j << "]: ";
+                    buf << "\n [" << std::setw(3) << i << "," << std::setw(3) << j << "]: ";
                     line(tensorRange.begin() + (i * shape.d[0] + j) * shape.d[1], shape.d[2]);
                 }
             }
@@ -318,7 +318,7 @@ public:
         {
             for (auto i = 0; i < shape.d[0]; i++)
             {
-                buf << "\n [" << i << "]: ";
+                buf << "\n [" << std::setw(3) << i << "]: ";
                 line(tensorRange.begin() + i * shape.d[1], shape.d[1]);
             }
         }
@@ -328,7 +328,7 @@ public:
             {
                 for (auto j = 0; j < shape.d[1]; j++)
                 {
-                    buf << "\n [" << i << "," << j << "]: ";
+                    buf << "\n [" << std::setw(3) << i << "," << std::setw(3) << j << "]: ";
                     line(tensorRange.begin() + (i * shape.d[0] + j) * shape.d[1], shape.d[2]);
                 }
             }

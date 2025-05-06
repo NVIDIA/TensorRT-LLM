@@ -243,36 +243,6 @@ size_t LookaheadDecodingLayer<T>::getWorkspaceSize() const noexcept
     return std::max(mWorkspaceSize, mSetupWorkspaceSize);
 }
 
-inline void initAttentionMask(TensorPtr const& mask, std::shared_ptr<runtime::BufferManager>& bufferManager)
-{
-    bufferManager->setZero(*mask);
-    BufferLocation<bool> maskLocation(*mask);
-    auto maskShape = mask->getShape();
-    for (SizeType32 i = 0; i < maskShape.d[0]; i++)
-    {
-        maskLocation.at(i, 0) = true;
-    }
-}
-
-inline void convertBoolToInt32(TensorPtr const& dst, TensorConstPtr const& src)
-{
-    auto dstShape = dst->getShape();
-    auto srcShape = src->getShape();
-    TLLM_CHECK(dstShape.d[0] == srcShape.d[0]);
-    TLLM_CHECK(dstShape.d[1] * 32 >= srcShape.d[1]);
-    BufferLocation<SizeType32> dstLocation(*dst);
-    BufferLocation<bool const> srcLocation(*src);
-
-    auto setBit = [](SizeType32& x, SizeType32 idx, bool value) { x |= (value << idx); };
-    for (auto i = 0; i < srcShape.d[0]; i++)
-    {
-        for (auto j = 0; j < srcShape.d[1]; j++)
-        {
-            setBit(dstLocation.at(i, j / 32), j % 32, srcLocation.at(i, j));
-        }
-    }
-}
-
 template <typename T>
 void LookaheadDecodingLayer<T>::forwardSyncCPU(
     std::shared_ptr<LookaheadDecodingOutputs> const& outputs, std::shared_ptr<LookaheadDecodingInputs> const& inputs)
@@ -281,6 +251,21 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
 
     TLLM_LOG_TRACE("Before LookaheadDecodingLayer<T>::forwardSyncCPU");
     printLookaheadDecodingLayer(__LINE__);
+
+    PRINT_TOKENS(outputs->generationLengths); // wili, debug
+    PRINT_TOKENS(outputs->positionOffsets);
+    PRINT_TOKENS(outputs->positionIds);
+
+    PRINT_TOKENS(outputs->nextDraftTokens);
+    PRINT_TOKENS(outputs->nextDraftPosIds);
+    PRINT_TOKENS(outputs->prevDraftLengths);
+    PRINT_TOKENS(outputs->nextDraftLengths);
+
+    PRINT_TOKENS(outputs->numNewTokensCumSum);
+    PRINT_TOKENS(outputs->pathsOffsets);
+    PRINT_TOKENS(outputs->packedMasks);
+
+    PRINT_TOKENS(outputs->outputIds);
 
     NVTX3_SCOPED_RANGE(LookaheadDecodingLayer_forwardSyncCPU);
 
@@ -345,11 +330,11 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
                 ITensor::at(mCpuAlgo->mPathsOffsets, {gbi}), //
                 ITensor::at(mCpuAlgo->mNumNewTokens, {gbi}), //
                 sampledTokens,                               //
-                ITensor::at(mCpuAlgo->mEndIds, {gbi}));
+                ITensor::at(mCpuAlgo->mEndIds, {gbi})        //
+            );
         }
 
         printLookaheadDecodingLayer(__LINE__);
-
         auto maxNumNewTokens = mCpuAlgo->mOutputIds->getShape().d[1];
         TLLM_LOG_TRACE("L%d, maxNumNewTokens=%d", __LINE__, maxNumNewTokens);
 
@@ -360,17 +345,14 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
 
         initAttentionMask(mCpuAlgo->mAttentionMask, mBufferManager);
 
-        printLookaheadDecodingLayer(__LINE__);
-
+        SizeType32 const offset = BufferRange<SizeType32 const>(*ITensor::at(mCpuAlgo->mSequenceLengths, {gbi}))[0];
+        TokenIdType const lastToken
+            = BufferRange<TokenIdType const>(*ITensor::at(mCpuAlgo->mOutputIds, {gbi, numNewTokensRange[gbi] - 1}))[0];
         theAlgo.prepare(                                     //
             ITensor::at(mCpuAlgo->mNextDraftTokens, {gbi}),  //
             ITensor::at(mCpuAlgo->mNextDraftPosIds, {gbi}),  //
             ITensor::at(mCpuAlgo->mNextDraftLengths, {gbi}), //
-            mCpuAlgo->mAttentionMask,                        //
-            1,                                               //
-            ITensor::at(mCpuAlgo->mSequenceLengths, {gbi}),  //
-            ITensor::at(mCpuAlgo->mOutputIds, {gbi, numNewTokensRange[gbi] - 1}));
-
+            mCpuAlgo->mAttentionMask, offset, lastToken);
         convertBoolToInt32(ITensor::at(mCpuAlgo->mPackedMask, {gbi}), mCpuAlgo->mAttentionMask);
 
         printLookaheadDecodingLayer(__LINE__);
@@ -458,41 +440,44 @@ void LookaheadDecodingLayer<T>::printLookaheadDecodingLayer(int const lineNumber
     // PRINT_TOKENS(mCurandStatesDevice);
     PRINT_TOKENS(mTargetTokensDevice);
 
-    if (mCpuAlgo.has_value())
+    if (!mCpuAlgo.has_value())
     {
-        auto const cpuAlgoValue = mCpuAlgo.value();
-        TLLM_LOG_TRACE("mPrompts:");
-        for (long unsigned int i = 0; i < cpuAlgoValue.mPrompts.size(); ++i)
-        {
-            TLLM_LOG_TRACE("i=%d", (int) i);
-            PRINT_TOKENS(cpuAlgoValue.mPrompts[i]);
-        }
+        TLLM_LOG_TRACE("================ printLookaheadDecodingLayer @L%d end without mCpuAlgo", lineNumber);
+        return;
+    }
 
-        PRINT_TOKENS(cpuAlgoValue.mBatchSlots);
-        PRINT_TOKENS(cpuAlgoValue.mTargetTokens);
-        PRINT_TOKENS(cpuAlgoValue.mTokensPerStep);
-        PRINT_TOKENS(cpuAlgoValue.mEndIds);
-        PRINT_TOKENS(cpuAlgoValue.mOutputIds);
-        PRINT_TOKENS(cpuAlgoValue.mPathsOffsets);
-        PRINT_TOKENS(cpuAlgoValue.mPathsOffsetsBatch);
-        PRINT_TOKENS(cpuAlgoValue.mNumNewTokens);
-        PRINT_TOKENS(cpuAlgoValue.mNumNewTokensCumSum);
-        PRINT_TOKENS(cpuAlgoValue.mNewTokens);
-        PRINT_TOKENS(cpuAlgoValue.mNextDraftTokens);
-        PRINT_TOKENS(cpuAlgoValue.mNextDraftPosIds);
-        PRINT_TOKENS(cpuAlgoValue.mNextDraftLengths);
-        PRINT_TOKENS(cpuAlgoValue.mSequenceLengths);
-        PRINT_TOKENS(cpuAlgoValue.mGenerationLengths);
-        PRINT_VALUES(cpuAlgoValue.mAttentionMask);
-        PRINT_TOKENS(cpuAlgoValue.mPackedMask);
-        PRINT_TOKENS(cpuAlgoValue.mPositionOffsets);
-        PRINT_TOKENS(cpuAlgoValue.mPositionIds);
+    auto const cpuAlgoValue = mCpuAlgo.value();
+    TLLM_LOG_TRACE("mPrompts:");
+    for (long unsigned int i = 0; i < cpuAlgoValue.mPrompts.size(); ++i)
+    {
+        TLLM_LOG_TRACE("i=%d", (int) i);
+        PRINT_TOKENS(cpuAlgoValue.mPrompts[i]);
+    }
 
-        for (long unsigned int i = 0; i < cpuAlgoValue.mAlgos.size(); ++i)
-        {
-            TLLM_LOG_TRACE("mAlgos[%d]:", (int) i);
-            cpuAlgoValue.mAlgos[i].printAlgorithm();
-        }
+    PRINT_TOKENS(cpuAlgoValue.mBatchSlots);
+    PRINT_TOKENS(cpuAlgoValue.mTargetTokens);
+    PRINT_TOKENS(cpuAlgoValue.mTokensPerStep);
+    PRINT_TOKENS(cpuAlgoValue.mEndIds);
+    PRINT_TOKENS(cpuAlgoValue.mOutputIds);
+    PRINT_TOKENS(cpuAlgoValue.mPathsOffsets);
+    PRINT_TOKENS(cpuAlgoValue.mPathsOffsetsBatch);
+    PRINT_TOKENS(cpuAlgoValue.mNumNewTokens);
+    PRINT_TOKENS(cpuAlgoValue.mNumNewTokensCumSum);
+    PRINT_TOKENS(cpuAlgoValue.mNewTokens);
+    PRINT_TOKENS(cpuAlgoValue.mNextDraftTokens);
+    PRINT_TOKENS(cpuAlgoValue.mNextDraftPosIds);
+    PRINT_TOKENS(cpuAlgoValue.mNextDraftLengths);
+    PRINT_TOKENS(cpuAlgoValue.mSequenceLengths);
+    PRINT_TOKENS(cpuAlgoValue.mGenerationLengths);
+    PRINT_VALUES(cpuAlgoValue.mAttentionMask);
+    PRINT_TOKENS(cpuAlgoValue.mPackedMask);
+    PRINT_TOKENS(cpuAlgoValue.mPositionOffsets);
+    PRINT_TOKENS(cpuAlgoValue.mPositionIds);
+
+    for (long unsigned int i = 0; i < cpuAlgoValue.mAlgos.size(); ++i)
+    {
+        TLLM_LOG_TRACE("mAlgos[%d]:", (int) i);
+        cpuAlgoValue.mAlgos[i].printAlgorithm();
     }
 
     TLLM_LOG_TRACE("================ printLookaheadDecodingLayer @L%d end", lineNumber);
