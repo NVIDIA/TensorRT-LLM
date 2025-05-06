@@ -16,20 +16,18 @@
 #pragma once
 #include "cubinObj.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/xqaParams.h"
-#include <string>
-#include <vector>
 
-namespace tensorrt_llm
-{
-namespace kernels
-{
-namespace jit
+namespace tensorrt_llm::kernels::jit
 {
 
 // A thin wrapper around NVRTC for compiling CUDA programs.
 class CompileEngine
 {
 public:
+    CompileEngine(CompileEngine const&) = default;
+    CompileEngine(CompileEngine&&) = delete;
+    CompileEngine& operator=(CompileEngine const&) = delete;
+    CompileEngine& operator=(CompileEngine&&) = delete;
     CompileEngine(int SM, XQAParams const& xqaParams);
 
     CubinObj compile() const;
@@ -41,6 +39,4 @@ private:
     XQAParams const& mXqaParams;
 };
 
-} // namespace jit
-} // namespace kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels::jit

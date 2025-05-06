@@ -19,11 +19,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 
-namespace tensorrt_llm
-{
-namespace kernels
-{
-namespace jit
+namespace tensorrt_llm::kernels::jit
 {
 
 template <typename T>
@@ -47,6 +43,4 @@ void writeToBuffer(T output, uint8_t*& buffer, size_t& remaining_buffer_size)
     remaining_buffer_size -= sizeof(T);
 }
 
-} // namespace jit
-} // namespace kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels::jit

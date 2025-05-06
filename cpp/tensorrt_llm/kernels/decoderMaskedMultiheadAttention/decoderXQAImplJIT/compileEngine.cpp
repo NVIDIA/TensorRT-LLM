@@ -44,16 +44,12 @@ void CHECK_TLLM_XQA_JIT_ERROR_(tllmXqaJitStatus result, char const* const func, 
 
 } // anonymous namespace
 
-namespace tensorrt_llm
-{
-namespace kernels
-{
-namespace jit
+namespace tensorrt_llm::kernels::jit
 {
 
 CubinObj CompileEngine::compile() const
 {
-    tllmXqaJitProgram program;
+    tllmXqaJitProgram program = nullptr;
     bool const useQGMMAKernel = supportConfigQGMMA(mXqaParams, mSM, true);
     tllmXqaJitRopeStyle ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NONE;
     bool const applyRoPEInXqaKernel = !mXqaParams.multi_query_tokens && useQGMMAKernel
@@ -87,7 +83,7 @@ CubinObj CompileEngine::compile() const
     {
         TLLM_CHECK(ropeStyle == tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NONE);
     }
-    tllmXqaJitContext context{/*sm=*/mSM,
+    tllmXqaJitContext const context{/*sm=*/mSM,
         /*head_size=*/static_cast<uint32_t>(mXqaParams.head_size),
         /*num_q_heads=*/static_cast<uint32_t>(mXqaParams.num_q_heads),
         /*num_kv_heads=*/static_cast<uint32_t>(mXqaParams.num_kv_heads),
@@ -107,10 +103,10 @@ CubinObj CompileEngine::compile() const
 
     CHECK_TLLM_XQA_JIT_ERROR(tllmXqaJitCreateAndCompileProgram(&program, &context));
 
-    size_t cubinSize;
+    size_t cubinSize = 0;
     CHECK_TLLM_XQA_JIT_ERROR(tllmXqaJitGetCUBINSize(program, &cubinSize));
     std::string cubinContent(cubinSize, ' ');
-    CHECK_TLLM_XQA_JIT_ERROR(tllmXqaJitGetCUBIN(program, const_cast<char*>(cubinContent.c_str())));
+    CHECK_TLLM_XQA_JIT_ERROR(tllmXqaJitGetCUBIN(program, cubinContent.data()));
 
     CHECK_TLLM_XQA_JIT_ERROR(tllmXqaJitDestroyProgram(&program));
 
@@ -123,6 +119,4 @@ CompileEngine::CompileEngine(int SM, XQAParams const& xqaParams)
 {
 }
 
-} // namespace jit
-} // namespace kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels::jit
