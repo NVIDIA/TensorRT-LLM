@@ -16,43 +16,90 @@
  */
 
 #include "tensorrt_llm/batch_manager/generateRequestOptions.h"
+#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/utils/logitsThread.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+#include "tensorrt_llm/runtime/decoderState.h"
+#include "tensorrt_llm/runtime/runtimeKernels.h"
 
 #include <NvInferRuntimeBase.h>
 
 using namespace tensorrt_llm::runtime;
 
 namespace te = tensorrt_llm::executor;
+namespace tr = tensorrt_llm::runtime;
 
 namespace tensorrt_llm::batch_manager
 {
+using SizeType32 = GenerateRequestOptions::SizeType32;
+using TensorPtr = GenerateRequestOptions::TensorPtr;
 
-std::tuple<ITensor::SharedPtr, std::vector<decoder_batch::Request>, std::vector<SamplingConfig>>
+namespace
+{
+void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffers const& inputBuffers,
+    TensorPtr const& sequenceLengths, SizeType32 beamWidth, runtime::BufferManager const& manager,
+    runtime::CudaStream const& stream)
+{
+    auto const batchSize = contextRequests.size();
+    auto batchSlotsView = tr::ITensor::slice(inputBuffers.forwardBatchSlotsRequestOrder, 0, batchSize);
+    auto fillValuesView = tr::ITensor::slice(inputBuffers.fillValues, 0, batchSize);
+
+    auto batchSlotsRange = tr::BufferRange<SizeType32>(*batchSlotsView);
+    auto fillValuesRange = tr::BufferRange<SizeType32>(*fillValuesView);
+
+    // fill buffers on host
+    SizeType32 batchIdx{0};
+    for (auto const& llmReq : contextRequests)
+    {
+        if (llmReq->isLastContextChunk())
+        {
+            auto const currentSequenceLen = llmReq->mPromptLen + llmReq->getMaxNumGeneratedTokens();
+            // Get position of the current sequence in the decoder
+            auto const seqSlot = llmReq->mSeqSlot.value();
+            batchSlotsRange[batchIdx] = seqSlot;
+            fillValuesRange[batchIdx] = currentSequenceLen;
+            ++batchIdx;
+        }
+    }
+
+    // copy sequence lengths
+    {
+        auto batchSlotsDeviceView = tr::ITensor::slice(inputBuffers.forwardBatchSlotsRequestOrderDevice, 0, batchSize);
+        auto fillValuesViewDevice = tr::ITensor::slice(inputBuffers.fillValuesDevice, 0, batchSize);
+
+        manager.copy(*batchSlotsView, *batchSlotsDeviceView);
+        manager.copy(*fillValuesView, *fillValuesViewDevice);
+        tr::kernels::invokeFillBatch(*sequenceLengths, *batchSlotsDeviceView, beamWidth, *fillValuesViewDevice, stream);
+    }
+}
+} // namespace
+
+std::tuple<TensorPtr, std::vector<decoder_batch::Request>, std::vector<SamplingConfig>>
 GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
     te::DecodingConfig const& decodingConfig, RequestVector const& contextRequests, BufferManager const& bufferManager,
     nvinfer1::DataType logitsType, DecoderInputBuffers const& inputBuffers,
+    runtime::decoder::DecoderState& decoderState, SizeType32 beamWidth, runtime::CudaStream const& stream,
     OptionalRef<RuntimeBuffers const> buffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(GenerateRequestOptions);
 
+    copySequenceLengths(
+        contextRequests, inputBuffers, decoderState.getJointDecodingOutput().lengths, beamWidth, bufferManager, stream);
+
     SizeType32 batchSize{0};
     unsigned decoderInputSize{0};
-    if (!contextRequests.empty())
+    for (auto const& llmReq : contextRequests)
     {
-        for (auto const& llmReq : contextRequests)
+        if (llmReq->isLastContextChunk())
         {
             auto const& reqTokens = llmReq->getTokens(0);
-            if (llmReq->isLastContextChunk())
-            {
-                decoderInputSize += reqTokens.size();
-                ++batchSize;
-            }
+            decoderInputSize += reqTokens.size();
+            ++batchSize;
         }
     }
     inputBuffers.inputsIds->resize(decoderInputSize);
