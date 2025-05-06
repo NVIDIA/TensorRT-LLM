@@ -40,6 +40,7 @@ using TensorPtr = GenerateRequestOptions::TensorPtr;
 
 namespace
 {
+
 void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffers const& inputBuffers,
     TensorPtr const& sequenceLengths, SizeType32 beamWidth, runtime::BufferManager const& manager,
     runtime::CudaStream const& stream)
@@ -76,6 +77,44 @@ void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffe
         tr::kernels::invokeFillBatch(*sequenceLengths, *batchSlotsDeviceView, beamWidth, *fillValuesViewDevice, stream);
     }
 }
+
+/// @brief Retrieve the embedding bias from the request. This potentially makes a copy of the tensor
+/// to the appropriate type if the input tensor does not match it.
+[[nodiscard]] TensorPtr getEmbeddingBias(nvinfer1::DataType logitsType, TensorPtr const& tensor)
+{
+    // Check that embedding bias type is same as logits type. If so, we can return the tensor right away
+    if (tensor->getDataType() == logitsType)
+    {
+        return tensor;
+    }
+
+    // Support FP32 input for FP16 embedding bias (in the case of FP8 models)
+    if (tensor->getDataType() == nvinfer1::DataType::kFLOAT && logitsType == nvinfer1::DataType::kHALF)
+    {
+        // Do a deep copy of the tensor to the expected type
+        TLLM_LOG_WARNING(
+            "Embedding bias data type must be same as model logits type, will copy the tensor from float to half");
+
+        TLLM_CHECK_WITH_INFO(
+            tensor->getMemoryType() != MemoryType::kGPU, "Embedding bias tensor needs to be in CPU memory for casting");
+
+        auto const shape = tensor->getShape();
+        TLLM_CHECK(shape.nbDims == 2); // [1, vocabSizePadded]
+        TLLM_CHECK(shape.d[0] == 1);
+        auto newTensor = tensorrt_llm::runtime::BufferManager::pinnedPool(shape, logitsType);
+
+        auto const tensorRange = BufferRange<float>(*tensor);
+        auto newTensorRange = BufferRange<half>(*newTensor);
+
+        std::transform(tensorRange.begin(), tensorRange.end(), newTensorRange.begin(),
+            [](float value) -> half { return static_cast<half>(value); });
+
+        return newTensor;
+    }
+
+    TLLM_THROW("Embedding bias data type must be same as model logits type.");
+}
+
 } // namespace
 
 std::tuple<TensorPtr, std::vector<decoder_batch::Request>, std::vector<SamplingConfig>>
@@ -244,41 +283,5 @@ std::shared_ptr<runtime::ITensor> GenerateRequestOptions::retrieveDraftLogits(tr
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return logits;
 };
-
-GenerateRequestOptions::TensorPtr GenerateRequestOptions::getEmbeddingBias(
-    nvinfer1::DataType logitsType, TensorPtr const& tensor) const
-{
-    // Check that embedding bias type is same as logits type. If so, we can return the tensor right away
-    if (tensor->getDataType() == logitsType)
-    {
-        return tensor;
-    }
-
-    // Support FP32 input for FP16 embedding bias (in the case of FP8 models)
-    if (tensor->getDataType() == nvinfer1::DataType::kFLOAT && logitsType == nvinfer1::DataType::kHALF)
-    {
-        // Do a deep copy of the tensor to the expected type
-        TLLM_LOG_WARNING(
-            "Embedding bias data type must be same as model logits type, will copy the tensor from float to half");
-
-        TLLM_CHECK_WITH_INFO(
-            tensor->getMemoryType() != MemoryType::kGPU, "Embedding bias tensor needs to be in CPU memory for casting");
-
-        auto const shape = tensor->getShape();
-        TLLM_CHECK(shape.nbDims == 2); // [1, vocabSizePadded]
-        TLLM_CHECK(shape.d[0] == 1);
-        auto newTensor = tensorrt_llm::runtime::BufferManager::pinnedPool(shape, logitsType);
-
-        auto const tensorRange = BufferRange<float>(*tensor);
-        auto newTensorRange = BufferRange<half>(*newTensor);
-
-        std::transform(tensorRange.begin(), tensorRange.end(), newTensorRange.begin(),
-            [](float value) -> half { return static_cast<half>(value); });
-
-        return newTensor;
-    }
-
-    TLLM_THROW("Embedding bias data type must be same as model logits type.");
-}
 
 } // namespace tensorrt_llm::batch_manager

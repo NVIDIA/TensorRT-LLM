@@ -68,10 +68,6 @@ private:
         runtime::WorldConfig const& worldConfig, std::shared_ptr<runtime::ITensor> const& tensor,
         BufferManager const& bufferManager) const;
 
-    /// @brief Retrieve the embedding bias from the request. This potentially makes a copy of the tensor
-    /// to the appropriate type if the input tensor does not match it.
-    [[nodiscard]] TensorPtr getEmbeddingBias(nvinfer1::DataType logitsType, TensorPtr const& tensor) const;
-
     bool mSpeculativeDecodingFastLogits;
     bool mIsLeaderInOrchMode;
     bool mIsNormalizeLogProbs;
