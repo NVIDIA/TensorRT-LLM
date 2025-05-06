@@ -27,9 +27,11 @@
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/thop/fp4Quantize.h"
+#include "tensorrt_llm/thop/fp8Op.h"
 #include "tensorrt_llm/thop/thUtils.h"
+#include "tensorrt_llm/thop/userbuffersTensor.h"
 
-#include "userbuffersTensor.h"
 #if ENABLE_MULTI_DEVICE
 #include <ATen/cuda/EmptyTensor.h>
 #include <nccl.h>
@@ -282,34 +284,70 @@ private:
         int size = input.numel();
         int hidden_size = input.size(-1);
 
+        // Treat any other cases as fallback to NCCL.
+        auto op = mOp;
+        if (op != AllReduceFusionOp::NONE && op != AllReduceFusionOp::RESIDUAL_RMS_NORM)
+        {
+            TLLM_LOG_WARNING(
+                "Fallback to NCCL with unfused operations for pattern: " + tensorrt_llm::kernels::toString(op));
+            op = AllReduceFusionOp::RESIDUAL_RMS_NORM;
+        }
+
+        torch::Tensor reduce_output = torch::empty_like(input);
+        NCCLCHECK(ncclAllReduce(input.data_ptr(), reduce_output.mutable_data_ptr(), size, (*getDtypeMap())[mType],
+            ncclSum, *mNcclComm, stream));
+
+        if (mOp == AllReduceFusionOp::NONE)
+        {
+            return {reduce_output};
+        }
+
+        // If we reach here, it means the extra fallback operations are required.
+        // All patterns are broken into ALlReduce + residual_rms_norm + following operations (quantization, etc.)
+        torch::Tensor norm_out = torch::empty_like(input);
+
+        tensorrt_llm::kernels::AllReduceParams params;
+        params.fusion_params.bias_buffer = bias ? bias.value().data_ptr() : nullptr;
+        params.fusion_params.residual_buffer = residual ? residual.value().data_ptr() : nullptr;
+        params.fusion_params.weight_buffer = norm_weight ? norm_weight.value().data_ptr() : nullptr;
+        params.local_output_buffer_ptr = norm_out.mutable_data_ptr();
+        params.elts_total = size;
+
+        params.fusion_params.hidden_size = hidden_size;
+        params.fusion_params.eps = mEps;
+        params.fusion_params.intermediate_buffer = reduce_output.mutable_data_ptr();
+        tensorrt_llm::kernels::residualRmsNorm(params, mType, stream, AllReduceFusionOp::RESIDUAL_RMS_NORM);
+
+        // Attached the corresponding following operations after the residual rms norm allreduce and return the final
+        // outputs
         if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
         {
-            torch::Tensor norm_out = torch::empty_like(input);
-            torch::Tensor residual_out = torch::empty_like(input);
-
-            NCCLCHECK(ncclAllReduce(input.data_ptr(), residual_out.mutable_data_ptr(), size, (*getDtypeMap())[mType],
-                ncclSum, *mNcclComm, stream));
-            tensorrt_llm::kernels::AllReduceParams params;
-            params.fusion_params.bias_buffer = bias ? bias.value().data_ptr() : nullptr;
-            params.fusion_params.residual_buffer = residual ? residual.value().data_ptr() : nullptr;
-            params.fusion_params.weight_buffer = norm_weight ? norm_weight.value().data_ptr() : nullptr;
-            params.local_output_buffer_ptr = norm_out.mutable_data_ptr();
-            params.elts_total = size;
-
-            params.fusion_params.hidden_size = hidden_size;
-            params.fusion_params.eps = mEps;
-            params.fusion_params.intermediate_buffer = residual_out.mutable_data_ptr();
-            tensorrt_llm::kernels::residualRmsNorm(params, mType, stream, mOp);
-            return {norm_out, residual_out};
+            return {norm_out, reduce_output};
         }
-        else if (mOp == AllReduceFusionOp::NONE)
+
+        TORCH_CHECK(scale, "scale is required for quantization");
+
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8)
         {
-            torch::Tensor output = torch::empty_like(input);
-            NCCLCHECK(ncclAllReduce(input.data_ptr(), output.mutable_data_ptr(), size, (*getDtypeMap())[mType], ncclSum,
-                *mNcclComm, stream));
-            return {output};
+            auto [quant_out, scale_out] = torch_ext::symmetric_static_quantize_per_tensor(norm_out, scale.value());
+            return {quant_out, reduce_output};
         }
-        TORCH_CHECK(false, "NCCL encounters unsupported fusion operation: " + tensorrt_llm::kernels::toString(mOp));
+        else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
+        {
+            auto [quant_out, scale_out] = torch_ext::fp4_quantize(norm_out, scale.value(), 16, false, true);
+            return {quant_out, scale_out, reduce_output};
+        }
+        else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8)
+        {
+            auto [quant_out, scale_out] = torch_ext::symmetric_static_quantize_per_tensor(norm_out, scale.value());
+            return {norm_out, quant_out, reduce_output};
+        }
+        else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
+        {
+            auto [quant_out, scale_out] = torch_ext::fp4_quantize(norm_out, scale.value(), 16, false, true);
+            return {norm_out, quant_out, scale_out, reduce_output};
+        }
+        TORCH_CHECK(false, "Unsupported fusion operation: " + tensorrt_llm::kernels::toString(mOp));
         return {};
     }
 
@@ -682,6 +720,16 @@ private:
         // Check that heuristic is only applied when AUTO is set.
         bool const isAuto = (mStrategy == AllReduceStrategyType::AUTO);
 
+        auto const messageSizeBytes = messageSize * tensorrt_llm::common::getDTypeSize(type);
+        // TODO: use binding instead of manually set.
+        auto const maxWorkspaceSize = tensorrt_llm::utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(worldSize);
+
+        // If messageSize is less than maxWorkspaceSize, use NCCL, regardless of the fusion type.
+        if (messageSizeBytes > maxWorkspaceSize)
+        {
+            return AllReduceStrategyType::NCCL;
+        }
+
         // This rule based heuristic only chooses  NCCL and MIN_LATENCY strategies.
 
         // Only the intersection of the supported fusion types of two implementations will go through the heuristic.
@@ -701,7 +749,7 @@ private:
         TORCH_CHECK(mOp == AllReduceFusionOp::NONE || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM,
             "Only NONE and RESIDUAL_RMS_NORM are supported for heuristic.");
 
-        // If AUTO is set, but P2P is not supported, fallback to NCCL.
+        // If Peer to Peer is not supported, fallback to NCCL.
         if (!mIsP2PSupported)
         {
             if (!isAuto)
@@ -711,70 +759,60 @@ private:
             return AllReduceStrategyType::NCCL;
         }
 
-        // If AUTO is set, but NVLINK is not supported, fallback to NCCL.
-        if (isAuto && !mIsNVLINKSupported)
+        // If NVLINK is not supported, fallback to NCCL.
+        if (!mIsNVLINKSupported)
         {
+            if (!isAuto)
+            {
+                TLLM_LOG_WARNING("Since NVLINK not supported, fallback to AllReduceStrategy: NCCL");
+            }
             return AllReduceStrategyType::NCCL;
         }
 
-        auto const maxWorkspaceSize = tensorrt_llm::utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(worldSize);
-
+        // Default to NCCL.
         AllReduceStrategyType strat = AllReduceStrategyType::NCCL;
-        auto const messageSizeBytes = messageSize * tensorrt_llm::common::getDTypeSize(type);
 
-        if (messageSizeBytes <= maxWorkspaceSize)
+        // Currently we will not remove ONESHOT and TWOSHOT from the strategy list
+        // But torch flow user should not use them, but use AUTO or MIN_LATENCY instead.
+        // NOTICE: When a fusion type is not supported by the corresponding strategy but strategy is not AUTO,
+        // user should guarantee the correctness of the fusion pattern dispatching.
+        if (!isAuto)
         {
-            // Currently we will not remove ONESHOT and TWOSHOT from the strategy list
-            // But torch flow user should not use them, but use AUTO or MIN_LATENCY instead.
-            // NOTICE: When a fusion type is not supported by the corresponding strategy but strategy is not AUTO,
-            // user should guarantee the correctness of the fusion pattern dispatching.
-            if (!isAuto)
-            {
-                if (mStrategy == AllReduceStrategyType::ONESHOT || mStrategy == AllReduceStrategyType::TWOSHOT)
-                {
-                    strat = AllReduceStrategyType::MIN_LATENCY;
-                }
-                else
-                {
-                    strat = mStrategy;
-                }
-            }
-            else if (worldSize <= 2)
+            if (mStrategy == AllReduceStrategyType::ONESHOT || mStrategy == AllReduceStrategyType::TWOSHOT)
             {
                 strat = AllReduceStrategyType::MIN_LATENCY;
             }
-            else if (worldSize <= 4)
+            else
             {
-                if (messageSizeBytes < 1 * 1000 * 1000)
-                {
-                    strat = AllReduceStrategyType::MIN_LATENCY;
-                }
-                else
-                {
-                    strat = AllReduceStrategyType::NCCL;
-                }
+                strat = mStrategy;
+            }
+        }
+        else if (worldSize <= 2)
+        {
+            strat = AllReduceStrategyType::MIN_LATENCY;
+        }
+        else if (worldSize <= 4)
+        {
+            if (messageSizeBytes < 1 * 1000 * 1000)
+            {
+                strat = AllReduceStrategyType::MIN_LATENCY;
             }
             else
             {
-                if (messageSizeBytes < 500 * 1000)
-                {
-                    strat = AllReduceStrategyType::MIN_LATENCY;
-                }
-                else
-                {
-                    strat = AllReduceStrategyType::NCCL;
-                }
+                strat = AllReduceStrategyType::NCCL;
             }
         }
         else
         {
-            if (!isAuto)
+            if (messageSizeBytes < 500 * 1000)
             {
-                TLLM_LOG_WARNING("Since messageSize > maxWorkspace, fallback to AllReduceStrategy: NCCL");
+                strat = AllReduceStrategyType::MIN_LATENCY;
             }
-            strat = AllReduceStrategyType::NCCL;
+            else
+            {
+                strat = AllReduceStrategyType::NCCL;
+            }
         }
-
         return strat;
     }
 
@@ -793,10 +831,10 @@ private:
 
 #endif // ENABLE_MULTI_DEVICE
 
-std::vector<torch::Tensor> allreduce(torch::Tensor input, torch::optional<torch::Tensor> residual,
-    torch::optional<torch::Tensor> norm_weight, torch::optional<torch::Tensor> scale,
-    torch::optional<torch::Tensor> bias, torch::optional<torch::Tensor> workspace, torch::List<int64_t> group_,
-    int64_t const strategy_, int64_t const fusion_op_, double const eps_)
+std::vector<torch::Tensor> allreduce(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
+    torch::optional<torch::Tensor> const& norm_weight, torch::optional<torch::Tensor> const& scale,
+    torch::optional<torch::Tensor> const& bias, torch::optional<torch::Tensor> const& workspace,
+    torch::List<int64_t> const& group_, int64_t const strategy_, int64_t const fusion_op_, double const eps_)
 {
 #if ENABLE_MULTI_DEVICE
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
