@@ -921,6 +921,11 @@ class LlmArgs(BaseModel):
         description="The postprocess tokenizer directory.",
         alias="_postprocess_tokenizer_dir")
 
+    reasoning_parser: Optional[str] = Field(
+        default=None,
+        description="The parser to separate reasoning content from output.",
+        alias="_reasoning_parser")
+
     # TODO[Superjomn]: To deprecate this config.
     decoding_config: Optional[object] = Field(
         default=None,
