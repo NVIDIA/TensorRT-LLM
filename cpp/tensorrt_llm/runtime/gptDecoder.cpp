@@ -378,9 +378,8 @@ void prepareLookaheadInputs(DecodingInput const& inputs, std::shared_ptr<tl::Dec
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto inputParams = std::dynamic_pointer_cast<tl::LookaheadDecodingInputs>(baseInputs);
-    auto const& lookaheadInputs = inputs.lookaheadInputs.value();
-    inputParams->curTokensPerStep = lookaheadInputs.tokensPerStep;
+    auto lookaheadDecodingInputs = std::dynamic_pointer_cast<tl::LookaheadDecodingInputs>(baseInputs);
+    lookaheadDecodingInputs->curTokensPerStep = inputs.lookaheadInputs.value().tokensPerStep;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

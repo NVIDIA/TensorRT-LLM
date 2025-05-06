@@ -87,19 +87,20 @@ void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorC
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto setupParams = std::dynamic_pointer_cast<DynamicDecodeSetupParams>(baseSetupParams);
-
     TLLM_CHECK_WITH_INFO(setupParams->decodingParams, "decodingParams for setup is not set");
 
+    char const* decodingModeStr = mDecodingMode.getName();
     if (mDecodingMode.isBeamSearch())
     {
+        // Beam search needs beamWidth > 1
         TLLM_CHECK_WITH_INFO(
-            beamWidth > 1, "Decoding mode is %s, but beamWidth <= 1 (%d <= 1)", mDecodingMode.getName(), beamWidth);
+            beamWidth > 1, "Decoding mode is %s, but beamWidth <= 1 (%d <= 1)", decodingModeStr, beamWidth);
     }
-    else if (mDecodingMode.isTopKorTopP() || mDecodingMode.isMedusa() || mDecodingMode.isLookahead()
-        || mDecodingMode.isExplicitDraftTokens() || mDecodingMode.isExternalDraftTokens() || mDecodingMode.isEagle())
+    else if (decodingModeStr != std::string("Unknown"))
     {
+        // All other decoding modes need beamWidth == 1
         TLLM_CHECK_WITH_INFO(
-            beamWidth == 1, "Decoding mode is %s, but beamWidth != 1 (%d != 1)", mDecodingMode.getName(), beamWidth);
+            beamWidth == 1, "Decoding mode is %s, but beamWidth != 1 (%d != 1)", decodingModeStr, beamWidth);
     }
     else
     {

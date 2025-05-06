@@ -85,7 +85,7 @@ TEST(LookaheadPoolManagerTest, fillAndUpdate)
     auto list = pm.guess(lastToken, G);
     for (auto const& ngram : list)
     {
-        PRINT_TOKENS(ngram);
+        PRINT_TOKEN(ngram);
     }
     /***
      l: (l,o, ,),(o, ,w,),(d,., ,),(i,v,e,),(i,f,e,),
@@ -117,7 +117,7 @@ TEST(LookaheadPoolManagerTest, fillAndUpdate)
     list = pm.guess(lastToken, G);
     for (auto const& ngram : list)
     {
-        PRINT_TOKENS(ngram);
+        PRINT_TOKEN(ngram);
     }
     /**
      w: (o,r,l,),(2,3,4,),

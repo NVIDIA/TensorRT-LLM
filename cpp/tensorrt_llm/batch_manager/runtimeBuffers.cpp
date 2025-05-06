@@ -54,10 +54,9 @@ RuntimeBuffers::RuntimeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     executor::DecodingConfig const& decodingConfig, bool gatherGenerationLogits, std::optional<SizeType32> maxNumTokens,
     std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs,
     bool promptTableOffloadingParam)
+    : promptTableOffloading(promptTableOffloadingParam)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    promptTableOffloading = promptTableOffloadingParam;
 
     create(maxBatchSize, maxBeamWidth, maxAttentionWindowVec, maxAttentionWindow, sinkTokenLen, runtime, modelConfig,
         worldConfig, decodingConfig, gatherGenerationLogits, additionalModelOutputs);

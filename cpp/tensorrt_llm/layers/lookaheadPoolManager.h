@@ -63,6 +63,9 @@ public:
         return mTokenMap;
     }
 
+    //! @brief print content of the pool
+    void print(char const* functionName, int const lineNumber) const noexcept;
+
 private:
     void insertOne(Key key, TensorConstPtr const& ngram);
 

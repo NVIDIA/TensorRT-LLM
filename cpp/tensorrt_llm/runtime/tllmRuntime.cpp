@@ -557,6 +557,21 @@ void TllmRuntime::setInputTensorsImpl(SizeType32 contextIndex, TensorMap const& 
         if (static_cast<bool>(data))
         {
             context.setInputTensorAddress(name.c_str(), data);
+            if (tensorrt_llm::common::Logger::getLogger()->isEnabled(tensorrt_llm::common::Logger::TRACE))
+            {
+                int const nRow = (tensorShape.nbDims == 1) ? 1 : tensorShape.d[0];
+                int const nCol = ITensor::volume(tensorShape) / nRow;
+                if (tensorDtype == nvinfer1::DataType::kINT32) // For int32 and int64 only yet
+                {
+                    auto const* p = static_cast<int*>(data);
+                    tensorrt_llm::common::printMatrix(name.c_str(), p, nRow, nCol);
+                }
+                else if (tensorDtype == nvinfer1::DataType::kINT64)
+                {
+                    auto const* p = static_cast<uint64_t*>(data);
+                    tensorrt_llm::common::printMatrix(name.c_str(), p, nRow, nCol);
+                }
+            }
         }
         else
         {
