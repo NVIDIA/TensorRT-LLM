@@ -43,7 +43,7 @@ def create_llm(model_dir, enable_overlap_scheduler, enable_trtllm_decoder):
     )
 
 
-@pytest.mark.parametrize("enable_trtllm_decoder", [False])
+@pytest.mark.parametrize("enable_trtllm_decoder", [False, True])
 def test_overlap_scheduler_consistency(model_path, test_case,
                                        enable_trtllm_decoder):
     # Test configuration

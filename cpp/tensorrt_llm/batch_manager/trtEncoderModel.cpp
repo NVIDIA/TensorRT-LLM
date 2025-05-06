@@ -47,22 +47,14 @@ TrtEncoderModel::TrtEncoderModel(runtime::ModelConfig const& modelConfig, WorldC
     , mLogger{logger ? std::move(logger) : std::make_shared<TllmLogger>()}
     , mRuntime{std::make_shared<TllmRuntime>(
           rawEngine, mLogger.get(), optionalParams.useGpuDirectStorage, optionalParams.gpuWeightsPercent)}
-    , mMicroBatchId(0)
+    , mNumMicroBatches{1}
+    , mNumBuffers{mNumMicroBatches}
     , mCopyBufferManager{std::make_shared<CudaStream>()}
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    if (mWorldConfig.isPipelineParallel())
-    {
-        TLLM_THROW("Pipeline parallelism is currently not supported for encoder models.");
-        mNumMicroBatches = mWorldConfig.getPipelineParallelism();
-    }
-    else
-    {
-        mNumMicroBatches = isTrtOverlap() ? 2 : 1;
-    }
-
-    mNumBuffers = mNumMicroBatches;
+    TLLM_CHECK_WITH_INFO(
+        !mWorldConfig.isPipelineParallel(), "Pipeline parallelism is currently not supported for encoder models.");
 
     createRuntimeContexts();
 

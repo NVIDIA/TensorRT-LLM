@@ -1590,6 +1590,8 @@ def test_executor_config():
     assert config.gather_generation_logits is False
     assert config.use_variable_beam_width_search is False
     assert config.use_gpu_direct_storage is False
+    assert config.mm_embedding_offloading is False
+    assert config.enable_trt_overlap is False
 
     kwargs = {
         "max_beam_width":
@@ -1641,7 +1643,11 @@ def test_executor_config():
         "use_variable_beam_width_search":
         True,
         "use_gpu_direct_storage":
-        True
+        True,
+        "mm_embedding_offloading":
+        True,
+        "enable_trt_overlap":
+        True,
     }
     config = trtllm.ExecutorConfig(**kwargs)
     for k, v in kwargs.items():
@@ -1666,6 +1672,8 @@ def test_executor_config():
     assert config.gather_generation_logits is True
     assert config.use_variable_beam_width_search is True
     assert config.use_gpu_direct_storage is True
+    assert config.mm_embedding_offloading is True
+    assert config.enable_trt_overlap is True
 
 
 def test_parallel_config():
@@ -2398,11 +2406,25 @@ def test_executor_config_pickle():
         "max_seq_idle_microseconds":
         240 * 1000 * 1000,
         "spec_dec_config":
-        trtllm.SpeculativeDecodingConfig(fast_logits=True)
+        trtllm.SpeculativeDecodingConfig(fast_logits=True),
+        "guided_decoding_config":
+        trtllm.GuidedDecodingConfig(
+            trtllm.GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
+            encoded_vocab=["eos", "a", "b", "c", "d"]),
+        "additional_model_outputs":
+        [trtllm.AdditionalModelOutput("topKLogits")],
+        "gather_generation_logits":
+        True,
+        "use_variable_beam_width_search":
+        False,
+        "mm_embedding_offloading":
+        True,
+        "enable_trt_overlap":
+        True,
     }
     config = trtllm.ExecutorConfig(**kwargs)
     for k, v in kwargs.items():
-        if "config" not in k:
+        if "config" not in k and k != "additional_model_outputs":
             assert getattr(config, k) == v
 
     config.backend = 'pytorch'
@@ -2428,6 +2450,21 @@ def test_executor_config_pickle():
     assert config.backend == config_copy.backend
     assert config.spec_dec_config.fast_logits == config_copy.spec_dec_config.fast_logits
     assert config.use_gpu_direct_storage == config_copy.use_gpu_direct_storage
+
+    assert config_copy.guided_decoding_config.backend == config.guided_decoding_config.backend
+    assert config_copy.guided_decoding_config.encoded_vocab == config.guided_decoding_config.encoded_vocab
+    assert config_copy.guided_decoding_config.tokenizer_str == config.guided_decoding_config.tokenizer_str
+    assert config_copy.guided_decoding_config.stop_token_ids == config.guided_decoding_config.stop_token_ids
+
+    assert config.additional_model_outputs[
+        0].name == config_copy.additional_model_outputs[0].name
+    assert config.additional_model_outputs[
+        0].gather_context == config_copy.additional_model_outputs[
+            0].gather_context
+    assert config.gather_generation_logits == config_copy.gather_generation_logits
+    assert config.use_variable_beam_width_search == config_copy.use_variable_beam_width_search
+    assert config.mm_embedding_offloading == config_copy.mm_embedding_offloading
+    assert config.enable_trt_overlap == config_copy.enable_trt_overlap
 
 
 def test_return_full_tokens():

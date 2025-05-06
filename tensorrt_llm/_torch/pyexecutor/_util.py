@@ -474,7 +474,8 @@ def instantiate_decoder(model_engine, executor_config, pytorch_backend_config,
         decoding_mode = executor_config.decoding_config.decoding_mode if executor_config.decoding_config and executor_config.decoding_config.decoding_mode else DecodingMode.TopK(
         )
         decoder = TRTLLMDecoder(executor_config, model_engine.model,
-                                model_engine.dtype, mapping, decoding_mode)
+                                model_engine.dtype, mapping, decoding_mode,
+                                pytorch_backend_config.enable_overlap_scheduler)
     elif not model_engine.model.model_config.is_generation:
         # NOTE: choose decoder based on model type
         decoder = EarlyStopDecoder()

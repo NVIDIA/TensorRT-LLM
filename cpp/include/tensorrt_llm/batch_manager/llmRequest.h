@@ -32,7 +32,6 @@
 #include <memory>
 #include <optional>
 #include <utility>
-#include <valarray>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager
@@ -665,6 +664,12 @@ public:
     [[nodiscard]] SizeType32 getMaxNumGeneratedTokens() const
     {
         return getMaxBeamNumTokens() - mPromptLen;
+    }
+
+    /// @brief Returns true if request reaches max number of tokens in the next iteration.
+    [[nodiscard]] bool willCompleteNextIteration() const
+    {
+        return getMaxNumGeneratedTokens() + mNumTokensPerIteration >= mMaxNewTokens;
     }
 
     [[nodiscard]] LlmRequestType getLlmRequestType() const
@@ -1543,7 +1548,7 @@ public:
     }
 
     /// Determines whether the current position is only one chunk away from the end of the context.
-    [[nodiscard]] bool isLastContextChunk() const noexcept
+    [[nodiscard]] bool isLastContextChunk() const
     {
         return isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete()
             || getContextCurrentPosition() + getContextChunkSize() == mPromptLen;
