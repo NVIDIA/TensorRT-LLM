@@ -51,7 +51,7 @@ Append “python-gil” to Nsys “-t” option.
 1. Set environment variable `TLLM_PROFILE_START_STOP=A-B` to specify the range of the iterations to be collected.
 2. Set environment variable `TLLM_TORCH_PROFILE_TRACE=<path>`, and the results will be saved to `<path>`.
 
-### Visialize the PyTorch profiler results
+### Visualize the PyTorch profiler results
 Use [chrome://tracing/](chrome://tracing/) to inspect the saved profile.
 
 
@@ -60,7 +60,7 @@ Consult the Nsight Systems User Guide for full overview of MPI-related options.
 
 ### Profiling specific iterations on a trtllm-bench/trtllm-serve run
 
-Say we want to profile iterations 100 to 150 on a trtllm-bench/trtllm-serve run, we want to collect as more information as possible for debugging, such as GIL, debugging NVTX markers, etc:
+Say we want to profile iterations 100 to 150 on a trtllm-bench/trtllm-serve run, we want to collect as much information as possible for debugging, such as GIL, debugging NVTX markers, etc:
 
 ```bash
 #!/bin/bash
