@@ -168,6 +168,7 @@ def main(*,
          extra_make_targets: str = "",
          trt_root: str = '/usr/local/tensorrt',
          nccl_root: str = None,
+         internal_cutlass_kernels_root: str = None,
          clean: bool = False,
          clean_wheel: bool = False,
          configure_cmake: bool = False,
@@ -311,6 +312,10 @@ def main(*,
             cmake_def_args.append(
                 f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"
             )
+            if internal_cutlass_kernels_root:
+                cmake_def_args.append(
+                    f"-DINTERNAL_CUTLASS_KERNELS_PATH={internal_cutlass_kernels_root}"
+                )
             cmake_def_args = " ".join(cmake_def_args)
             cmake_configure_command = (
                 f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}"'
@@ -321,6 +326,7 @@ def main(*,
             print("CMake Configure command: ")
             print(cmake_configure_command)
             build_run(cmake_configure_command)
+
         cmake_build_command = (
             f'cmake --build . --config {build_type} --parallel {job_count} '
             f'--target build_wheel_targets {" ".join(extra_make_targets)}')
@@ -589,6 +595,12 @@ def add_arguments(parser: ArgumentParser):
                         help="Directory to find TensorRT headers/libs")
     parser.add_argument("--nccl_root",
                         help="Directory to find NCCL headers/libs")
+    parser.add_argument(
+        "--internal-cutlass-kernels-root",
+        default="",
+        help=
+        "Directory to the internal_cutlass_kernels sources. If specified, the internal_cutlass_kernels and NVRTC wrapper libraries will be built from source."
+    )
     parser.add_argument("--build_dir",
                         type=Path,
                         help="Directory where cpp sources are built")
