@@ -60,4 +60,4 @@ def apply_rope_with_input_pos_flashinfer_fake(
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    return q, k
+    return torch.empty_like(q), torch.empty_like(k)
