@@ -26,8 +26,9 @@ from defs.trt_test_alternative import check_call
 @pytest.mark.parametrize("use_dynamic_tree", [False, True],
                          ids=['eagle1', 'eagle2'])
 @pytest.mark.parametrize("batch_size", [1, 8], ids=['bs1', 'bs8'])
-@pytest.mark.parametrize("data_type", ['float16'])
-@pytest.mark.parametrize("eagle_model_roots", ["EAGLE-Vicuna-7B-v1.3"],
+@pytest.mark.parametrize("data_type", ['float16', 'fp8'])
+@pytest.mark.parametrize("eagle_model_roots",
+                         ["EAGLE-Vicuna-7B-v1.3", "EAGLE-LLaMA3.1-Instruct-8B"],
                          indirect=True)
 def test_llm_eagle_1gpu(batch_size, data_type, use_dynamic_tree,
                         eagle_model_roots, eagle_example_root,
@@ -35,6 +36,23 @@ def test_llm_eagle_1gpu(batch_size, data_type, use_dynamic_tree,
                         engine_dir):
     print("Build engines...")
     model_name = "eagle"
+
+    if data_type == 'fp8':
+        merged_model_path = os.path.join(cmodel_dir, model_name,
+                                         f"{data_type}_merged")
+        quant_cmd = [
+            f"{eagle_example_root}/quantize.py",
+            f"--model_dir={eagle_model_roots[0]}",
+            f"--eagle_model_dir={eagle_model_roots[1]}",
+            f"--output_dir={merged_model_path}",
+            f"--dtype=float16",
+            f"--qformat=fp8",
+            f"--kv_cache_dtype=fp8",
+            f"--calib_size=512",
+        ]
+        venv_check_call(llm_venv, quant_cmd)
+        eagle_model_roots = merged_model_path
+        data_type = 'float16'
 
     model_dir = convert_weights(llm_venv=llm_venv,
                                 example_root=eagle_example_root,
@@ -47,8 +65,8 @@ def test_llm_eagle_1gpu(batch_size, data_type, use_dynamic_tree,
         "trtllm-build",
         f"--checkpoint_dir={model_dir}",
         f"--output_dir={engine_dir}",
-        f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}",
+        f"--gpt_attention_plugin={data_type if data_type=='float16' else 'auto'}",
+        f"--gemm_plugin={data_type if data_type=='float16' else 'auto'}",
         f"--max_beam_width=1",
         "--remove_input_padding=enable",
         "--context_fmha=enable",
@@ -82,14 +100,16 @@ def test_llm_eagle_1gpu(batch_size, data_type, use_dynamic_tree,
         "--hf_model_dir", f"{eagle_model_roots[0]}", "--tokenizer_dir",
         f"{eagle_model_roots[0]}", f"--engine_dir={engine_dir}",
         "--check_accuracy", "--tensorrt_llm_rouge1_threshold=24",
-        "--eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]",
         f"--max_ite=40", f"--batch_size={batch_size}",
         f"--dataset_dir={llm_datasets_root}", f"--rouge_dir={llm_rouge_root}"
     ]
     if use_dynamic_tree:
         summary_cmd.extend(
             [f"--eagle_dynamic_tree_max_top_k={3}", "--eagle_use_dynamic_tree"])
-
+    else:
+        summary_cmd.extend([
+            "--eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]"
+        ])
     venv_check_call(llm_venv, summary_cmd)
 
 

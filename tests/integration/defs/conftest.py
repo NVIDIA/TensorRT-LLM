@@ -1184,6 +1184,20 @@ def eagle_model_roots(request):
             modelopt_checkpoint_root_for_eagle
         ), f"EAGLE ModelOpt checkpoint path {modelopt_checkpoint_root_for_eagle} does not exist under NFS LLM_MODELS_ROOT dir"
         return modelopt_checkpoint_root_for_eagle
+    elif request.param == "EAGLE-LLaMA3.1-Instruct-8B":
+        # Test the checkpoint released from HF, which requires two separate weights,
+        # one for the base model and one for the EagleNets.
+        base_model_root_for_eagle = os.path.join(models_root, "llama-3.1-model",
+                                                 "Llama-3.1-8B-Instruct")
+        eagle_heads_model_root = os.path.join(models_root,
+                                              "EAGLE-LLaMA3.1-Instruct-8B")
+        assert os.path.exists(
+            base_model_root_for_eagle
+        ), f"EAGLE base model path {base_model_root_for_eagle} does not exist under NFS LLM_MODELS_ROOT dir"
+        assert os.path.exists(
+            eagle_heads_model_root
+        ), f"EAGLE heads model path {eagle_heads_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+        return base_model_root_for_eagle, eagle_heads_model_root
     else:
         assert "Error Eagle weight's name"
 
