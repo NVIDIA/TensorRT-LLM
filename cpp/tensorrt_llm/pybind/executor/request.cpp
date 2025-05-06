@@ -21,6 +21,7 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 
 #include <pybind11/cast.h>
 #include <pybind11/chrono.h>
@@ -28,9 +29,6 @@
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-
-#include "streamCaster.h"
-#include "tensorCaster.h"
 
 #include <optional>
 #include <vector>
@@ -533,7 +531,7 @@ void initRequestBindings(pybind11::module_& m)
             state[30].cast<std::optional<tle::Tensor>>(), state[31].cast<std::optional<tle::GuidedDecodingParams>>());
     };
 
-    py::class_<tle::Request> request(m, "Request");
+    py::class_<tle::Request> request(m, "Request", pybind11::dynamic_attr());
     request
         // A modified version of constructor to accpect deprecated args maxNewTokens
         // TODO(enweiz): use the original constructor after the deprecated args are removed
@@ -770,6 +768,24 @@ void initRequestBindings(pybind11::module_& m)
         .def("has_error", &tle::Response::hasError)
         .def_property_readonly("error_msg", &tle::Response::getErrorMsg)
         .def_property_readonly("result", &tle::Response::getResult)
+        .def("clear_context_logits",
+            [](tle::Response& self)
+            {
+                if (!self.hasError())
+                {
+                    auto& result = const_cast<tle::Result&>(self.getResult());
+                    result.contextLogits.reset();
+                }
+            })
+        .def("clear_generation_logits",
+            [](tle::Response& self)
+            {
+                if (!self.hasError())
+                {
+                    auto& result = const_cast<tle::Result&>(self.getResult());
+                    result.generationLogits.reset();
+                }
+            })
         .def(py::pickle(responseGetstate, responseSetstate));
 }
 

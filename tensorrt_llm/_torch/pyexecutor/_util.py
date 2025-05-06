@@ -209,9 +209,6 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     py_executor.is_warmup = True
     py_executor.start_worker()
     py_executor.await_responses(req_ids)
-    # TODO check why call mpi_barrier() here will hang-on, but call mpi_allgather(0) is fine.
-    # sync all ranks after processing dummy requests. mpi barrier causes hang, so allgather is used.
-    py_executor.dist.allgather(0)
 
     torch_peak_memory = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
 
@@ -256,8 +253,6 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     py_executor.is_warmup = False
     if py_executor.dist.mapping.rank == 0:
         py_executor.shutdown()
-
-    py_executor.dist.allgather(0)
 
     return kv_cache_max_tokens
 
@@ -362,25 +357,16 @@ def create_py_executor_instance(dist,
                                 model_engine,
                                 draft_model_engine,
                                 start_worker,
+                                decoder,
                                 lora_config: LoraConfig = None):
     kv_cache_manager = resources.get(KV_CACHE_MANAGER_KEY, None)
 
-    # decoder for speculative decoding
     spec_config = model_engine.spec_config
-    if spec_config is not None:
-        spec_decoder = get_spec_decoder(max_seq_len=model_engine.max_seq_len,
-                                        spec_config=spec_config)
-    else:
-        spec_decoder = None
-
     if mapping.is_last_pp_rank(
     ) and executor_config.guided_decoding_config is not None:
         if spec_config is not None:
             raise ValueError(
                 "Guided decoding is not supported with speculative decoding.")
-
-    resources["seq_slot_manager"] = SeqSlotManager(
-        executor_config.max_batch_size)
 
     logger.info(
         f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}"
@@ -428,6 +414,13 @@ def create_py_executor_instance(dist,
             lora_config.lora_target_modules,
             lora_config.trtllm_modules_to_hf_modules)
 
+    num_micro_batches = 1
+    if mapping.has_pp:
+        num_micro_batches = mapping.pp_size + pytorch_backend_config.enable_overlap_scheduler
+
+    resources["seq_slot_manager"] = SeqSlotManager(
+        executor_config.max_batch_size * num_micro_batches)
+
     resource_manager = ResourceManager(resources)
 
     # Make sure the kv cache manager is always invoked last as it could
@@ -435,10 +428,6 @@ def create_py_executor_instance(dist,
     if kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end("kv_cache_manager",
                                                        last=True)
-
-    num_micro_batches = 1
-    if mapping.has_pp:
-        num_micro_batches = mapping.pp_size + pytorch_backend_config.enable_overlap_scheduler
 
     capacity_scheduler = BindCapacityScheduler(
         executor_config.max_batch_size,
@@ -457,9 +446,6 @@ def create_py_executor_instance(dist,
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, kv_cache_manager, attention_type, cache_transceiver_config)
 
-    decoder = instantiate_decoder(model_engine, executor_config, spec_decoder,
-                                  pytorch_backend_config, mapping)
-
     return PyExecutor(resource_manager,
                       scheduler,
                       model_engine=model_engine,
@@ -475,14 +461,15 @@ def create_py_executor_instance(dist,
                       start_worker=start_worker)
 
 
-def instantiate_decoder(model_engine, executor_config, spec_decoder,
-                        pytorch_backend_config, mapping):
+def instantiate_decoder(model_engine, executor_config, pytorch_backend_config,
+                        mapping):
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         decoder = TorchStarAttentionDecoder(
             max_seq_len=model_engine.max_seq_len)
-    elif spec_decoder is not None:
-        decoder = spec_decoder
+    elif model_engine.spec_config is not None:
+        decoder = get_spec_decoder(max_seq_len=model_engine.max_seq_len,
+                                   spec_config=model_engine.spec_config)
     elif pytorch_backend_config.enable_trtllm_decoder:
         decoding_mode = executor_config.decoding_config.decoding_mode if executor_config.decoding_config and executor_config.decoding_config.decoding_mode else DecodingMode.TopK(
         )

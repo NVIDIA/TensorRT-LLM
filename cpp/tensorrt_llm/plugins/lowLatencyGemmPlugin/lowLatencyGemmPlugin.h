@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/low_latency_gemm.h"
+#include "low_latency_gemm.h"
 
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"

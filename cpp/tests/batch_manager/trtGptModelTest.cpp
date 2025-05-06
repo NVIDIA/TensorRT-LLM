@@ -15,7 +15,6 @@
 #endif
 
 #include "tensorrt_llm/batch_manager/trtGptModel.h"
-#include "modelSpec.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/trtGptModelInflightBatching.h"
 #include "tensorrt_llm/batch_manager/trtGptModelV1.h"
@@ -23,6 +22,7 @@
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
+#include "tensorrt_llm/testing/modelSpec.h"
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>

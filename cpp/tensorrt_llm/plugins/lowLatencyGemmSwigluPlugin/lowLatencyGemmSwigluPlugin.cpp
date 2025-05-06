@@ -17,10 +17,10 @@
  */
 
 #include "lowLatencyGemmSwigluPlugin.h"
+#include "low_latency_gemm_swiglu.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/low_latency_gemm_swiglu.h"
 #include <NvInferRuntime.h>
 #include <NvInferRuntimeBase.h>
 #include <NvInferRuntimePlugin.h>

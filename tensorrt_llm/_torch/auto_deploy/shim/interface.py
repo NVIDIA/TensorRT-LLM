@@ -28,9 +28,25 @@ class CachedSequenceInterface:
         return (*self.info.args, *self._caches.values())
 
     @property
+    def args_original(self) -> Tuple[torch.Tensor, ...]:
+        """Return the original graph arguments expected by the model."""
+        return self.info.args_original
+
+    @property
     def dynamic_shapes(self) -> Tuple[Dict[int, Any], ...]:
         """Return the dynamic shapes of all graph arguments owned by this interface (all static)."""
         return self.info.dynamic_shapes + ({},) * len(self._caches)
+
+    @property
+    def original_dynamic_shapes(self) -> Tuple[Dict[int, Any], ...]:
+        """Return the dynamic shapes of the original graph arguments."""
+        return self.info.original_dynamic_shapes
+
+    def to(self, *args, **kwargs) -> None:
+        self.info.to(*args, **kwargs)
+        if self._caches:
+            for cache in self._caches.values():
+                cache.to(*args, **kwargs)
 
     def add_cache(self, name: str, get_cache: GetCacheCallable) -> None:
         """Add a cache initializer to the cache interface."""
@@ -71,6 +87,9 @@ GetInferenceModel = Callable[[CachedSequenceInterface], nn.Module]
 
 @dataclass
 class AutoDeployConfig(PyTorchConfig):
+    # model factory to choose from
+    model_factory: str = "hf"  # only 'hf' supported for "trtllm" runtime
+
     ### MODEL EXTRA KWARGS ###
     # Extra kwargs for the model config class to customize the model config. Those arguments will
     # take precedence over the default values or config values in the model config file in the HF

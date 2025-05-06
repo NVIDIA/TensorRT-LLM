@@ -723,6 +723,14 @@ void TrtGptModelInflightBatching::terminateRequest(LlmRequestPtr const& llmReq, 
         *mSeqSlotManager, *llmReq, getMaxInputLen(), mKvCacheManager, mCrossKvCacheManager, mPeftCacheManager, pause);
 }
 
+void TrtGptModelInflightBatching::terminateRequestSync(
+    LlmRequestPtr const& llmRequest, executor::FinishReason finishReason)
+{
+    TLLM_LOG_DEBUG("Registering termination for request %lu with finish reason %d", llmRequest->mRequestId,
+        static_cast<int>(finishReason));
+    mReqIdsToTerminate.try_emplace(llmRequest->mRequestId, finishReason);
+}
+
 TrtGptModelInflightBatching::IterationStatsIFB TrtGptModelInflightBatching::fillIterationStats(
     ScheduledRequests const& scheduledRequests, RequestVector const& requestsToPause)
 {
@@ -817,6 +825,28 @@ void TrtGptModelInflightBatching::forwardSync()
             mKvCacheManager, mCrossKvCacheManager, mPeftCacheManager);
         (*mPauseRequests)(currRequests.generationRequests, mInflightReqIds, mReqIdsToPause, true, *mSeqSlotManager,
             mKvCacheManager, mCrossKvCacheManager, mPeftCacheManager);
+
+        if (!mReqIdsToTerminate.empty())
+        {
+            for (auto const& requests : {currRequests.contextRequests, currRequests.generationRequests})
+            {
+                for (auto const& llmReq : requests)
+                {
+                    if (mReqIdsToTerminate.count(llmReq->mRequestId) != 0U)
+                    {
+                        if (!llmReq->isGenerationCompleteState())
+                        {
+                            TLLM_LOG_DEBUG("Terminating request %lu with finish reason %d", llmReq->mRequestId,
+                                static_cast<int>(mReqIdsToTerminate[llmReq->mRequestId]));
+                            terminateRequest(llmReq);
+                            llmReq->finishByReason(mReqIdsToTerminate[llmReq->mRequestId]);
+                            llmReq->clearGeneratedTokens();
+                        }
+                        mReqIdsToTerminate.erase(llmReq->mRequestId);
+                    }
+                }
+            }
+        }
 
         for (auto const& llmReq : currRequests.contextRequests)
         {
@@ -1762,12 +1792,13 @@ void TrtGptModelInflightBatching::postProcessRequest(
         {
             if (mWorldConfig.isLastPipelineParallelRank())
             {
-                mMpiCommPipelinePara->send(*(llmReq.getContextLogitsHost()), 0, 1);
+                mMpiCommPipelinePara->send(
+                    *(llmReq.getContextLogitsHost()), 0, mpi::MpiTag::kTrtGptModelInflightBatchingContextLogits);
             }
             else if (mWorldConfig.isFirstPipelineParallelRank())
             {
-                mMpiCommPipelinePara->recv(
-                    *(llmReq.getContextLogitsHost()), mWorldConfig.getPipelineParallelism() - 1, 1);
+                mMpiCommPipelinePara->recv(*(llmReq.getContextLogitsHost()), mWorldConfig.getPipelineParallelism() - 1,
+                    mpi::MpiTag::kTrtGptModelInflightBatchingContextLogits);
             }
         }
 
@@ -1776,12 +1807,14 @@ void TrtGptModelInflightBatching::postProcessRequest(
         {
             if (mWorldConfig.isLastPipelineParallelRank())
             {
-                mMpiCommPipelinePara->send(*(llmReq.getGenerationLogitsHost()), 0, 2);
+                mMpiCommPipelinePara->send(
+                    *(llmReq.getGenerationLogitsHost()), 0, mpi::MpiTag::kTrtGptModelInflightBatchingGenerationLogits);
             }
             else if (mWorldConfig.isFirstPipelineParallelRank())
             {
-                mMpiCommPipelinePara->recv(
-                    *(llmReq.getGenerationLogitsHost()), mWorldConfig.getPipelineParallelism() - 1, 2);
+                mMpiCommPipelinePara->recv(*(llmReq.getGenerationLogitsHost()),
+                    mWorldConfig.getPipelineParallelism() - 1,
+                    mpi::MpiTag::kTrtGptModelInflightBatchingGenerationLogits);
             }
         }
     }
