@@ -135,13 +135,17 @@ TEST_P(LookaheadAlgorithmTest, predict)
             amaskLocation.at(i, 0) = true;
         }
 
+        SizeType32 const offset = BufferRange<SizeType32 const>(*sequenceLengthPtr)[0];
+        TokenIdType const lastToken
+            = BufferRange<TokenIdType const>(*ITensor::slice(sequence, sequenceLength - 1, 1))[0];
         algo.prepare(                                                     //
             ITensor::slice(sequence, sequenceLength, maxDraftLenRuntime), //
             ITensor::slice(posidMax, 1, maxDraftLenRuntime),              //
             inputLengthPtr,                                               //
-            attentionMaskMax, 1,                                          //
-            sequenceLengthPtr,                                            //
-            ITensor::slice(sequence, sequenceLength - 1, 1));
+            attentionMaskMax,                                             //
+            offset,                                                       //
+            lastToken                                                     //
+        );
 
         TensorPtr input = ITensor::slice(sequence, sequenceLength - 1, inputLength + 1);
         TensorPtr posid = ITensor::slice(posidMax, 0, inputLength + 1);
