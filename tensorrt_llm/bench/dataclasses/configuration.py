@@ -21,8 +21,6 @@ from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 SPECULATIVE_MAP = {
     SpeculativeDecodingMode.NONE: lambda *args: None,
     SpeculativeDecodingMode.MEDUSA: trtllm.DecodingMode.Medusa,
-    SpeculativeDecodingMode.LOOKAHEAD_DECODING: trtllm.DecodingMode.Lookahead,
-    SpeculativeDecodingMode.EAGLE: trtllm.DecodingMode.Eagle,
 }
 
 
@@ -124,8 +122,6 @@ class PerformanceOptions:
 class DecodingConfig(BaseModel):
     medusa_choices: Optional[List[List[int]]] = None
     decoding_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
-    lookahead_decoding_config: Optional[trtllm.LookaheadDecodingConfig] = None
-    eagle_config: Optional[trtllm.EagleConfig] = None
 
     @field_validator("decoding_mode")
     @classmethod
@@ -141,16 +137,6 @@ class DecodingConfig(BaseModel):
                 "Attempting to use set Medusa choices with a non-Medusa engine."
                 " Verify that you are using a Medusa engine.")
 
-        if self.lookahead_decoding_config and self.decoding_mode != SpeculativeDecodingMode.LOOKAHEAD_DECODING:
-            raise RuntimeError(
-                "Attempting to use lookahead decoding config with a non-lookahead engine."
-                " Verify that you are using a lookahead engine.")
-
-        if self.eagle_config and self.decoding_mode != SpeculativeDecodingMode.EAGLE:
-            raise RuntimeError(
-                "Attempting to use eagle config with a non-eagle engine."
-                " Verify that you are using an eagle engine.")
-
         return self
 
     def get_decoding_config(self) -> trtllm.DecodingConfig:
@@ -159,12 +145,6 @@ class DecodingConfig(BaseModel):
 
         if self.medusa_choices is not None:
             kwargs["medusa_choices"] = self.medusa_choices
-
-        if self.lookahead_decoding_config is not None:
-            kwargs["lookahead_decoding_config"] = self.lookahead_decoding_config
-
-        if self.eagle_config is not None:
-            kwargs["eagle_config"] = self.eagle_config
 
         return trtllm.DecodingConfig(**kwargs)
 
