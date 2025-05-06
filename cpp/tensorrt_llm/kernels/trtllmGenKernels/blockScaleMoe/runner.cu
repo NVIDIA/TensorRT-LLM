@@ -69,7 +69,6 @@ void Runner::run(float* routingLogits, void* routingBias, int32_t num_tokens, in
     int32_t tileN = kernelInfo.tileN;
 
     moe::dev::routing::Data routingData;
-    routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
     routingData.mDtypeExpW = tg::Dtype::Bfloat16;
     routingData.mUsePdl = true;
 

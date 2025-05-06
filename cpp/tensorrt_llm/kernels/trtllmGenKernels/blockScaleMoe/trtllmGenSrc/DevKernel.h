@@ -118,22 +118,21 @@ namespace moe::dev
 #define LAUNCH_EXPW_ONLY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream)                            \
     if (data.mDtypeExpW == tg::Dtype::Fp32 && data.mNumExpertGroups > 1)                                               \
     {                                                                                                                  \
-        LAUNCH_PDL(data, coopLaunch, LAUCNCH_ESC(void, float, true), kernel, numBlocks, numThreads, smemSize, stream); \
+        LAUNCH_PDL(data, coopLaunch, LAUCNCH_ESC(float, true), kernel, numBlocks, numThreads, smemSize, stream);       \
     }                                                                                                                  \
     else if (data.mDtypeExpW == tg::Dtype::Fp32)                                                                       \
     {                                                                                                                  \
-        LAUNCH_PDL(                                                                                                    \
-            data, coopLaunch, LAUCNCH_ESC(void, float, false), kernel, numBlocks, numThreads, smemSize, stream);       \
+        LAUNCH_PDL(data, coopLaunch, LAUCNCH_ESC(float, false), kernel, numBlocks, numThreads, smemSize, stream);      \
     }                                                                                                                  \
     else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && data.mNumExpertGroups > 1)                                      \
     {                                                                                                                  \
-        LAUNCH_PDL(data, coopLaunch, LAUCNCH_ESC(void, cutlass::bfloat16_t, true), kernel, numBlocks, numThreads,      \
-            smemSize, stream);                                                                                         \
+        LAUNCH_PDL(data, coopLaunch, LAUCNCH_ESC(cutlass::bfloat16_t, true), kernel, numBlocks, numThreads, smemSize,  \
+            stream);                                                                                                   \
     }                                                                                                                  \
     else if (data.mDtypeExpW == tg::Dtype::Bfloat16)                                                                   \
     {                                                                                                                  \
-        LAUNCH_PDL(data, coopLaunch, LAUCNCH_ESC(void, cutlass::bfloat16_t, false), kernel, numBlocks, numThreads,     \
-            smemSize, stream);                                                                                         \
+        LAUNCH_PDL(data, coopLaunch, LAUCNCH_ESC(cutlass::bfloat16_t, false), kernel, numBlocks, numThreads, smemSize, \
+            stream);                                                                                                   \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \

@@ -38,7 +38,6 @@ namespace tg = trtllm::gen;
 
 struct Data
 {
-    tg::Dtype mDtypeElt{tg::Dtype::Bfloat16};
     tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
     bool mUsePdl{false};
 
@@ -98,10 +97,9 @@ struct Data
     int32_t* mPtrPermutedIdxToExpandedIdx{nullptr};
 };
 
-template <typename Type_, typename TypeExpW_, bool UseGroups_, bool UsePdl_>
+template <typename TypeExpW_, bool UseGroups_, bool UsePdl_>
 struct KernelParams
 {
-    using Type = Type_;
     using TypeExpW = TypeExpW_;
     static constexpr bool UseGroups = UseGroups_;
     static constexpr bool UsePdl = UsePdl_;
@@ -122,8 +120,7 @@ struct KernelParams
     TypeExpW* mPtrExpertWeights;
     TypeExpW const* mPtrRoutingWeights;
     TypeExpW const* mPtrRoutingBias;
-    Type const* mPtrIn;
-    float* mPtrScores;
+    float const* mPtrScores;
 
     int32_t mHiddenDim;
     int32_t mNumExperts;
@@ -159,7 +156,6 @@ struct KernelParams
         params.mPtrExpertWeights = (TypeExpW*) data.mPtrExpertWeights;
         params.mPtrRoutingWeights = (TypeExpW*) data.mPtrRoutingWeights;
         params.mPtrRoutingBias = (TypeExpW*) data.mPtrRoutingBias;
-        params.mPtrIn = (Type*) data.mPtrIn;
         params.mPtrScores = data.mPtrScores;
 
         params.mHiddenDim = data.mHiddenDim;

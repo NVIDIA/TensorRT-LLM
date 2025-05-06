@@ -187,6 +187,7 @@ def routing_reference_no_aux(expert_logits, routing_bias, top_k, n_groups,
     scores = noaux_tc_ref(routing_logits, routing_bias, n_groups, top_k_groups,
                           top_k, routed_scaling)
     permute_info = routing_reference(scores, top_k, padding)
+    # print("scores: ", scores)
     # print("permute_info: ", permute_info)
     return permute_info, scores
 

@@ -50,7 +50,6 @@ namespace cg = cooperative_groups;
 
 static constexpr int NumThreads = 256;
 static constexpr int NumBlocksPerCluster = 8;
-static constexpr int NumThreadsGemm = 128;
 static constexpr int WarpSize = 32;
 static constexpr int NumWarps = NumThreads / WarpSize;
 static constexpr int MaxNumTopGroups = 4;
@@ -63,8 +62,6 @@ static constexpr int NumEltsPerOffsetTilePerThread = 8;
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 && defined(__CUDA_ARCH_FEAT_SM100_ALL))
 #define TLLM_GEN_ENABLE_FAST_REDUX
 #endif
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -144,20 +141,6 @@ struct TopKRedType
         }
     }
 };
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static __device__ inline float tanh_fast(float x)
-{
-    float res;
-    asm volatile("{ tanh.approx.f32 %0, %1; }\n" : "=f"(res) : "f"(x));
-    return res;
-}
-
-static __device__ inline float sigmoid_fast(float x)
-{
-    return 0.5f * tanh_fast(0.5f * x) + 0.5f;
-}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -256,65 +239,6 @@ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const& warp, Type (&o
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename KernelParams>
-__global__ void routingKernelGemm(KernelParams params)
-{
-    // naive Gemm, to be replaced by performant kernel
-    using Type = typename KernelParams::Type;
-    using TypeExpW = typename KernelParams::TypeExpW;
-    // each thread has space for the dot product of each expert here
-    extern __shared__ char __attribute((aligned(128))) smemBase[];
-    auto* smemDotPartial = reinterpret_cast<float*>(smemBase);
-    static constexpr int SmemStride = NumThreadsGemm + 1;
-
-    auto tokenOff = int64_t{blockIdx.x} * int64_t{params.mHiddenDim};
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    // immediately trigger the secondary kernel when using PDL
-    if constexpr (KernelParams::UsePdl)
-    {
-        cudaTriggerProgrammaticLaunchCompletion();
-    }
-#endif
-
-    // dot product for all experts
-    // entire block must go into this loop
-    for (int32_t dd = threadIdx.x; dd < params.mHiddenDim; dd += NumThreadsGemm)
-    {
-        Type act = params.mPtrIn[tokenOff + dd];
-
-        for (int32_t expertIdx = 0; expertIdx < params.mNumExperts; ++expertIdx)
-        {
-            auto weightOff = int64_t{expertIdx} * int64_t{params.mHiddenDim};
-            TypeExpW weight = params.mPtrRoutingWeights[weightOff + dd];
-            auto val = float{act} * float{weight};
-            if (dd == threadIdx.x)
-            {
-                smemDotPartial[expertIdx * SmemStride + threadIdx.x] = val;
-            }
-            else
-            {
-                smemDotPartial[expertIdx * SmemStride + threadIdx.x] += val;
-            }
-        }
-    }
-    // make all partial dot products available to all threads
-    __syncthreads();
-
-    // finalize dot product and write to output
-    for (int32_t expertIdx = threadIdx.x; expertIdx < params.mNumExperts; expertIdx += NumThreadsGemm)
-    {
-        float dot = 0.F;
-        for (int32_t ii = 0; ii < NumThreadsGemm; ++ii)
-        {
-            dot += smemDotPartial[expertIdx * SmemStride + ii];
-        }
-        params.mPtrScores[int64_t{blockIdx.x} * int64_t{params.mNumExperts} + expertIdx] = dot;
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 template <typename T>
 __host__ __device__ constexpr T mulLog2(T a, T bLog2)
 {
@@ -348,9 +272,9 @@ __global__ void routingMainKernel(KernelParams params)
     // declare shared memory structure
     // number of experts is bounded by number of threads
     __shared__ float __attribute((aligned(128))) smemScoreSigmoid[NumThreads];
-    __shared__ float __attribute((aligned(128))) smemScoreBias[NumThreads];
+    __shared__ TypeExpW __attribute((aligned(128))) smemScoreBias[NumThreads];
     // number of expert groups is bounded by number of warps
-    __shared__ float __attribute((aligned(128))) smemGroupScores[NumWarps];
+    __shared__ TypeExpW __attribute((aligned(128))) smemGroupScores[NumWarps];
 
     // needed for warp reduce
     auto block = cg::this_thread_block();
@@ -404,30 +328,29 @@ __global__ void routingMainKernel(KernelParams params)
     {
         smemScoreSigmoid[threadExpert] = scoreSigmoid;
     }
+    // get the score with bias
+    // note that with invalid values, because sigmoid is < 1 and bias is -1,
+    // we must get a negative value, which is smaller than any valid value
+    auto scoreBias = TypeExpW{scoreSigmoid + float{biasVal}};
+    if (expertSelected)
+    {
+        smemScoreBias[threadExpert] = scoreBias;
+    }
 
     // registers for top group score reduction
-    float topExpGroupScores[NumTopGroupScores];
+    TypeExpW topExpGroupScores[NumTopGroupScores];
     [[maybe_unused]] int32_t topExpGroupIdx[NumTopGroupScores];
-    float topGroups[MaxNumTopGroups]; // params.mNumLimitedGroups
+    TypeExpW topGroups[MaxNumTopGroups]; // bound of params.mNumLimitedGroups
     int32_t topGroupIdx[MaxNumTopGroups];
-    float expertScoreGroup[MaxNumTopGroups];
+    TypeExpW expertScoreGroup[MaxNumTopGroups];
     int32_t expertIdxGroup[MaxNumTopGroups];
-    float topScores[MaxNumTopExperts]; // params.mTopK
+    TypeExpW topScores[MaxNumTopExperts]; // bound of params.mTopK
     int32_t topExperts[MaxNumTopExperts];
 
     if constexpr (KernelParams::UseGroups)
     {
-        // get the score with bias
-        // note that with invalid values, because sigmoid is < 1 and bias is -1,
-        // we must get a negative value, which is smaller than any valid value
-        auto scoreBias = float{scoreSigmoid + float{biasVal}};
-        if (expertSelected)
-        {
-            smemScoreBias[threadExpert] = scoreBias;
-        }
-
         reduceTopK(warp, topExpGroupScores, topExpGroupIdx, scoreBias, threadExpert,
-            /* minValue */ invalidScoreFloat);
+            /* minValue */ invalidScore);
 
         // get the final group score and write it to shared
         if (cute::elect_one_sync())
@@ -446,19 +369,19 @@ __global__ void routingMainKernel(KernelParams params)
         // a single warp performs the selection of top groups, and goes on to select the final experts
         if constexpr (KernelParams::UseGroups)
         {
-            float groupScore = laneIdx < params.mNumExpertGroups ? smemGroupScores[laneIdx] : invalidScoreFloat;
+            TypeExpW groupScore = laneIdx < params.mNumExpertGroups ? smemGroupScores[laneIdx] : invalidScore;
 
             reduceTopK(warp, topGroups, topGroupIdx, groupScore, laneIdx,
-                /* minValue */ invalidScoreFloat);
+                /* minValue */ invalidScore);
 
             // final expert selection: get relevant indexes and scores from shared
 
 #pragma unroll
             for (int ii = 0; ii < MaxNumTopGroups; ++ii)
-            { // params.mNumLimitedGroups
+            { // bound of params.mNumLimitedGroups
                 auto groupIdx = topGroupIdx[ii];
                 expertIdxGroup[ii] = groupIdx * params.mNumExpertsPerGroup + laneIdx;
-                expertScoreGroup[ii] = expertSelected ? smemScoreBias[expertIdxGroup[ii]] : invalidScoreFloat;
+                expertScoreGroup[ii] = expertSelected ? smemScoreBias[expertIdxGroup[ii]] : invalidScore;
             }
         }
         else
@@ -470,19 +393,18 @@ __global__ void routingMainKernel(KernelParams params)
             {
                 auto expertIdx = ii * WarpSize + laneIdx;
                 expertIdxGroup[ii] = expertIdx;
-                expertScoreGroup[ii]
-                    = expertIdx < params.mNumExperts ? TypeExpW{smemScoreSigmoid[expertIdx]} : invalidScore;
+                expertScoreGroup[ii] = expertIdx < params.mNumExperts ? smemScoreBias[expertIdx] : invalidScore;
             }
         }
 
         reduceTopK(warp, topScores, topExperts, expertScoreGroup, expertIdxGroup,
-            /* minValue */ invalidScoreFloat);
+            /* minValue */ invalidScore);
 
         // determine our lane's expert index and write to output
         int32_t expertIdx = 0;
 #pragma unroll
         for (int ii = 0; ii < MaxNumTopExperts; ++ii)
-        { // params.mTopK
+        { // bound of params.mTopK
             expertIdx = laneIdx == ii ? topExperts[ii] : expertIdx;
         }
         // determine whether our expert is local to this GPU
@@ -491,27 +413,25 @@ __global__ void routingMainKernel(KernelParams params)
             && (localExpertIdx & params.mLocalExpertsStrideLog2) == 0;
 
         // write expert idx out already
-        auto idxTopK = blockIdx.x * params.mTopK + laneIdx; // params.mTopK
+        auto idxTopK = blockIdx.x * params.mTopK + laneIdx;
         if (laneIdx < params.mTopK && params.mPtrExpertIdx != nullptr)
-        {                                                   // params.mTopK
+        {
             params.mPtrExpertIdx[idxTopK] = expertIdx;
         }
         float scoreNorm = laneIdx < params.mTopK ? smemScoreSigmoid[expertIdx] : 0.F;
         auto redNorm = cg::reduce(warp, scoreNorm, cg::plus<float>{});
         auto finalScore = TypeExpW{scoreNorm * params.mRouteScale / redNorm};
         if (laneIdx < params.mTopK && params.mPtrExpertWeights != nullptr)
-        { // params.mTopK
+        {
             params.mPtrExpertWeights[idxTopK] = finalScore;
         }
         if (laneIdx < params.mTopK && params.mPtrExpertWeightsFull != nullptr && isLocalExpert)
-        { // params.mTopK
+        {
             auto idxWeightsFull = localExpertIdx * gridDim.x + blockIdx.x;
             params.mPtrExpertWeightsFull[idxWeightsFull] = finalScore;
         }
     }
 }
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -729,6 +649,7 @@ __global__ void routingIndicesClusterKernel(KernelParams params)
     assert(false && "routingIndicesClusterKernel is only supported on SM90+ architectures");
 }
 #endif
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename KernelParams>
