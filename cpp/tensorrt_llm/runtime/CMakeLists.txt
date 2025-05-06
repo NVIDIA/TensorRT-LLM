@@ -33,7 +33,6 @@ set(SRCS
     loraCache.cpp
     decodingOutput.cpp
     decoderState.cpp
-    generationConfig.cpp
     gptDecoder.cpp
     gptDecoderBatched.cpp
     gptJsonConfig.cpp
@@ -45,14 +44,11 @@ set(SRCS
     memoryCounters.cpp
     ncclCommunicator.cpp
     promptTuningParams.cpp
-    runtimeBuffers.cpp
     runtimeKernels.cu
-    rnnStateBuffers.cpp
     tllmBuffers.cpp
     tllmRuntime.cpp
     tllmStreamReaders.cpp
     tllmLogger.cpp
-    transformerBuffers.cpp
     workerPool.cpp
     worldConfig.cpp)
 
