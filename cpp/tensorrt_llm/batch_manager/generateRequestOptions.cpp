@@ -56,15 +56,12 @@ void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffe
     SizeType32 batchIdx{0};
     for (auto const& llmReq : contextRequests)
     {
-        if (llmReq->isLastContextChunk())
-        {
-            auto const currentSequenceLen = llmReq->mPromptLen + llmReq->getMaxNumGeneratedTokens();
-            // Get position of the current sequence in the decoder
-            auto const seqSlot = llmReq->mSeqSlot.value();
-            batchSlotsRange[batchIdx] = seqSlot;
-            fillValuesRange[batchIdx] = currentSequenceLen;
-            ++batchIdx;
-        }
+        auto const currentSequenceLen = llmReq->mPromptLen + llmReq->getMaxNumGeneratedTokens();
+        // Get position of the current sequence in the decoder
+        auto const seqSlot = llmReq->mSeqSlot.value();
+        batchSlotsRange[batchIdx] = seqSlot;
+        fillValuesRange[batchIdx] = currentSequenceLen;
+        ++batchIdx;
     }
 
     // copy sequence lengths
@@ -127,19 +124,20 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(GenerateRequestOptions);
 
-    copySequenceLengths(
-        contextRequests, inputBuffers, decoderState.getJointDecodingOutput().lengths, beamWidth, bufferManager, stream);
+    RequestVector finishedContextRequests;
+    std::copy_if(contextRequests.begin(), contextRequests.end(), std::back_inserter(finishedContextRequests),
+        [](auto const& llmReq) { return llmReq->isLastContextChunk(); });
+
+    copySequenceLengths(finishedContextRequests, inputBuffers, decoderState.getJointDecodingOutput().lengths, beamWidth,
+        bufferManager, stream);
 
     SizeType32 batchSize{0};
     unsigned decoderInputSize{0};
-    for (auto const& llmReq : contextRequests)
+    for (auto const& llmReq : finishedContextRequests)
     {
-        if (llmReq->isLastContextChunk())
-        {
-            auto const& reqTokens = llmReq->getTokens(0);
-            decoderInputSize += reqTokens.size();
-            ++batchSize;
-        }
+        auto const& reqTokens = llmReq->getTokens(0);
+        decoderInputSize += reqTokens.size();
+        ++batchSize;
     }
     inputBuffers.inputsIds->resize(decoderInputSize);
 
@@ -149,13 +147,8 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
     samplingConfigs.reserve(batchSize);
 
     SizeType32 inputOffset{0};
-    for (auto const& llmReq : contextRequests)
+    for (auto const& llmReq : finishedContextRequests)
     {
-        if (!llmReq->isLastContextChunk())
-        {
-            continue;
-        }
-
         auto const promptLen = llmReq->getPromptLen();
         auto const& reqTokens = llmReq->getTokens(0);
         TLLM_CHECK(reqTokens.size() == static_cast<decltype(reqTokens.size())>(promptLen));
