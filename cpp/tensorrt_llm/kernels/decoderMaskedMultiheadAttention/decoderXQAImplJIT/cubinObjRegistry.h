@@ -14,11 +14,10 @@
  * limitations under the License.
  */
 #pragma once
-#include "cubinObj.h"
-
-#include "compileEngine.h"
-#include "serializationUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/compileEngine.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/cubinObj.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/serializationUtils.h"
 
 #include <functional>
 #include <mutex>

@@ -16,11 +16,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
 #include "tensorrt_llm/common/utils.h"
 
-namespace tensorrt_llm
-{
-namespace kernels
-{
-namespace jit
+namespace tensorrt_llm::kernels::jit
 {
 
 namespace
@@ -28,7 +24,7 @@ namespace
 
 using tensorrt_llm::common::contains;
 
-bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
+bool supportConfigCommon(XQAParams const& xqaParams)
 {
     if (xqaParams.unidirectional != 1)
     {
@@ -75,7 +71,7 @@ bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
 
 bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlugin)
 {
-    if (!supportConfigCommon(xqaParams, forConfigurePlugin))
+    if (!supportConfigCommon(xqaParams))
     {
         return false;
     }
@@ -99,7 +95,7 @@ bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlu
     {
         return false;
     }
-    int32_t head_grp_size = xqaParams.num_kv_heads == 0 ? 1 : xqaParams.num_q_heads / xqaParams.num_kv_heads;
+    int32_t const head_grp_size = xqaParams.num_kv_heads == 0 ? 1 : xqaParams.num_q_heads / xqaParams.num_kv_heads;
     if (head_grp_size * xqaParams.beam_width > 32)
     {
         return false;
@@ -113,7 +109,7 @@ bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlu
 
 bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlugin)
 {
-    if (!supportConfigCommon(xqaParams, forConfigurePlugin))
+    if (!supportConfigCommon(xqaParams))
     {
         return false;
     }
@@ -156,7 +152,7 @@ bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlug
     {
         return false;
     }
-    int32_t head_grp_size = xqaParams.num_kv_heads == 0 ? 1 : xqaParams.num_q_heads / xqaParams.num_kv_heads;
+    int32_t const head_grp_size = xqaParams.num_kv_heads == 0 ? 1 : xqaParams.num_q_heads / xqaParams.num_kv_heads;
     if (head_grp_size * xqaParams.beam_width > 32)
     {
         return false;
@@ -168,6 +164,4 @@ bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlug
     return true;
 }
 
-} // namespace jit
-} // namespace kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels::jit

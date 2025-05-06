@@ -15,23 +15,19 @@
  */
 #pragma once
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImpl.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/cubinObjRegistry.h"
 
-#include "compileEngine.h"
-#include "cubinObjRegistry.h"
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
-#include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaRunner.h"
-#include "tensorrt_llm/plugins/common/plugin.h"
-#include <unordered_set>
-
-namespace tensorrt_llm
-{
-namespace kernels
+namespace tensorrt_llm::kernels
 {
 
 class DecoderXQAImplJIT : public DecoderXQAImpl
 {
 public:
-    DecoderXQAImplJIT(DecoderXQARunner* runner);
+    DecoderXQAImplJIT(DecoderXQAImplJIT const&) = default;
+    DecoderXQAImplJIT(DecoderXQAImplJIT&&) = delete;
+    DecoderXQAImplJIT& operator=(DecoderXQAImplJIT const&) = default;
+    DecoderXQAImplJIT& operator=(DecoderXQAImplJIT&&) = delete;
+    explicit DecoderXQAImplJIT(DecoderXQARunner* runner);
 
     bool shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin) override;
     void prepare(XQAParams const& xqaParams) override;
@@ -48,9 +44,9 @@ private:
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
 
     //! Whether DecoderXQAImplJIT supports xqaParams.
-    bool supportConfig(XQAParams const& xqaParams, bool forConfigurePlugin) const;
+    [[nodiscard]] bool supportConfig(XQAParams const& xqaParams, bool forConfigurePlugin) const;
     //! Whether DecoderXQAImplJIT has perf gain over the default (non-XQA-optimized) implementation.
-    bool mayHavePerfGain(XQAParams const& xqaParams) const;
+    [[nodiscard]] bool mayHavePerfGain(XQAParams const& xqaParams) const;
 
     void prepareForActualXQAParams(XQAParams const& xqaParams);
 
@@ -65,8 +61,7 @@ private:
     bool mForceXQA;
     int mSM;
 
-    jit::CubinObjKey getCubinObjKeyFromXQAParams(XQAParams const& xqaParams) const;
+    [[nodiscard]] jit::CubinObjKey getCubinObjKeyFromXQAParams(XQAParams const& xqaParams) const;
 };
 
-} // namespace kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels

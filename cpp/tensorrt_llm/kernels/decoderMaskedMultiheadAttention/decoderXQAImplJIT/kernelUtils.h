@@ -17,11 +17,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/xqaParams.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaRunner.h"
 
-namespace tensorrt_llm
-{
-namespace kernels
-{
-namespace jit
+namespace tensorrt_llm::kernels::jit
 {
 
 bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlugin);
@@ -29,6 +25,4 @@ bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlug
 bool supportConfigTllmGen(
     XQAParams const& xqaParams, int SM, bool forConfigurePlugin, TllmGenFmhaRunner const* tllmRunner);
 
-} // namespace jit
-} // namespace kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels::jit

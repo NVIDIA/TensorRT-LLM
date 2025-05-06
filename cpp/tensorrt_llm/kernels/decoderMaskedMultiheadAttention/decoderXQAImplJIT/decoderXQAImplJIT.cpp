@@ -21,7 +21,6 @@
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/cubin/xqa_kernel_cubin.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h"
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/decoderXQAImplJIT.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/tensorMapUtils.h"
@@ -67,15 +66,15 @@ bool DecoderXQAImplJIT::mayHavePerfGain(XQAParams const& xqaParams) const
     {
         return true;
     }
-    int num_kv_heads = xqaParams.num_kv_heads;
-    int batch_size = static_cast<int>(xqaParams.batch_size);
+    int const num_kv_heads = xqaParams.num_kv_heads;
+    int const batch_size = static_cast<int>(xqaParams.batch_size);
     int multi_block_count = 1;
     if (xqaParams.multi_block_mode)
     {
-        int history_length = xqaParams.max_past_kv_length;
+        int const history_length = xqaParams.max_past_kv_length;
         multi_block_count = history_length / kMinHistoryTokensPerBlock;
     }
-    int block_count = num_kv_heads * batch_size * multi_block_count;
+    int const block_count = num_kv_heads * batch_size * multi_block_count;
     return static_cast<float>(block_count) * kEnableMinBlockFactor >= static_cast<float>(mRunner->mMultiProcessorCount);
 }
 
@@ -94,34 +93,32 @@ bool DecoderXQAImplJIT::shouldUse(XQAParams const& umbrellaXQAParams, bool forCo
         }
         return false;
     }
-    else
-    {
-        auto const& xqaParams = umbrellaXQAParams;
-        return supportConfig(xqaParams, forConfigurePlugin) && mayHavePerfGain(xqaParams);
-    }
+
+    auto const& xqaParams = umbrellaXQAParams;
+    return supportConfig(xqaParams, forConfigurePlugin) && mayHavePerfGain(xqaParams);
 }
 
 jit::CubinObjKey DecoderXQAImplJIT::getCubinObjKeyFromXQAParams(XQAParams const& xqaParams) const
 {
-    XQAKernelLoadHashKey loadKey;
+    XQAKernelLoadHashKey loadKey{};
     loadKey.data_type = xqaParams.data_type;
     loadKey.sm = mSM;
 
-    XQAKernelRuntimeHashKey runtimeKey = getRuntimeHashKeyFromXQAParams(xqaParams, true);
+    XQAKernelRuntimeHashKey const runtimeKey = getRuntimeHashKeyFromXQAParams(xqaParams, true);
     return {loadKey, runtimeKey};
 }
 
 void DecoderXQAImplJIT::prepareForActualXQAParams(XQAParams const& xqaParams)
 {
-    jit::CubinObjKey currentKey = getCubinObjKeyFromXQAParams(xqaParams);
+    jit::CubinObjKey const currentKey = getCubinObjKeyFromXQAParams(xqaParams);
 
     jit::CompileEngine compileEngine(mSM, xqaParams);
 
-    auto registryGlobal = DecoderXQARunner::getResourceGlobal()->getCubinObjRegistry();
+    auto* registryGlobal = DecoderXQARunner::getResourceGlobal()->getCubinObjRegistry();
 
     if (supportConfig(xqaParams, true))
     {
-        jit::CubinObjKey key = getCubinObjKeyFromXQAParams(xqaParams);
+        jit::CubinObjKey const key = getCubinObjKeyFromXQAParams(xqaParams);
         registryGlobal->insertCubinIfNotExists(key, &compileEngine, /*initialize=*/true);
     }
 }
@@ -202,15 +199,15 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
                                               PositionEmbeddingType::kROPE_GPTJ},
             xqaParams.position_embedding_type);
 
-    unsigned int head_size = xqaParams.head_size;
-    int num_q_heads = xqaParams.num_q_heads;
-    int num_kv_heads = xqaParams.num_kv_heads;
+    unsigned int const head_size = xqaParams.head_size;
+    int const num_q_heads = xqaParams.num_q_heads;
+    int const num_kv_heads = xqaParams.num_kv_heads;
     TLLM_CHECK_WITH_INFO(num_q_heads % num_kv_heads == 0, "numQHeads should be multiple of numKVHeads.");
-    unsigned int num_q_heads_over_kv = num_q_heads / num_kv_heads;
-    unsigned int beam_width = xqaParams.beam_width;
-    unsigned int batch_beam_size = xqaParams.batch_size * beam_width;
+    unsigned int const num_q_heads_over_kv = num_q_heads / num_kv_heads;
+    unsigned int const beam_width = xqaParams.beam_width;
+    unsigned int const batch_beam_size = xqaParams.batch_size * beam_width;
 
-    const KvCacheDataType cache_type = xqaParams.kv_cache_quant_mode.hasInt8KvCache()
+    KvCacheDataType const cache_type = xqaParams.kv_cache_quant_mode.hasInt8KvCache()
         ? KvCacheDataType::INT8
         : (xqaParams.kv_cache_quant_mode.hasFp8KvCache() ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
 

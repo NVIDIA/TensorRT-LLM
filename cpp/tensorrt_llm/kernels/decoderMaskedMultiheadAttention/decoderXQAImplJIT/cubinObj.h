@@ -20,11 +20,7 @@
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImpl.h"
 
-namespace tensorrt_llm
-{
-namespace kernels
-{
-namespace jit
+namespace tensorrt_llm::kernels::jit
 {
 
 class CubinObj
@@ -33,7 +29,7 @@ public:
     // Default constructor constructs an empty unusable CubinObj instance.
     CubinObj() = default;
     // Constructs from raw cubin content.
-    explicit CubinObj(std::string const& content);
+    explicit CubinObj(std::string content);
     // Deserializes from a serialization buffer.
     CubinObj(void const* buffer, size_t buffer_size);
 
@@ -41,8 +37,8 @@ public:
     CubinObj& operator=(CubinObj const& other);
 
     // CubinObj can be move-constructed/assigned.
-    CubinObj(CubinObj&& other);
-    CubinObj& operator=(CubinObj&& other);
+    CubinObj(CubinObj&& other) noexcept;
+    CubinObj& operator=(CubinObj&& other) noexcept;
     ~CubinObj();
 
     // Should be called at least once before calling launch().
@@ -50,15 +46,15 @@ public:
     void launch(dim3 gridDim, dim3 blockDim, CUstream hStream, void** kernelParams) const;
 
     // It is safe to call getSerializeSize()/serialize() before calling initialize().
-    size_t getSerializationSize() const noexcept;
+    [[nodiscard]] size_t getSerializationSize() const noexcept;
     void serialize(void* buffer, size_t buffer_size) const noexcept;
 
-    bool isInitialized() const
+    [[nodiscard]] bool isInitialized() const
     {
         return mInitialized;
     }
 
-    XQAKernelType getKernelType() const
+    [[nodiscard]] XQAKernelType getKernelType() const
     {
         return mKernelType;
     }
@@ -71,14 +67,12 @@ private:
     std::string mContent;
 
     // Fields below are undefined prior to initialize() call.
-    bool mInitialized;
+    bool mInitialized{};
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
-    CUmodule mModule;
-    CUfunction mFunction;
-    unsigned int mSharedMemBytes;
+    CUmodule mModule{};
+    CUfunction mFunction{};
+    unsigned int mSharedMemBytes{};
     XQAKernelType mKernelType;
 };
 
-} // namespace jit
-} // namespace kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels::jit

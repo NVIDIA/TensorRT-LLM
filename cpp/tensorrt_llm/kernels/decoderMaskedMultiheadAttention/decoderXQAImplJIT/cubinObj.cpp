@@ -18,7 +18,6 @@
 #include "serializationUtils.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
 #include <cuda_runtime_api.h>
 
@@ -28,17 +27,16 @@ namespace tensorrt_llm::kernels::jit
 CubinObj::CubinObj(void const* buffer_, size_t buffer_size)
     : mInitialized(false)
 {
-    uint8_t const* buffer = static_cast<uint8_t const*>(buffer_);
+    auto const* buffer = static_cast<uint8_t const*>(buffer_);
     size_t remaining_buffer_size = buffer_size;
-    uint32_t len = readFromBuffer<uint32_t>(buffer, remaining_buffer_size);
+    auto const len = readFromBuffer<uint32_t>(buffer, remaining_buffer_size);
     mContent.resize(len);
     TLLM_CHECK(len <= remaining_buffer_size);
     memcpy(mContent.data(), buffer, len);
 }
 
-CubinObj::CubinObj(std::string const& content)
-    : mContent(content)
-    , mInitialized(false)
+CubinObj::CubinObj(std::string content)
+    : mContent(std::move(content))
 {
 }
 
@@ -67,9 +65,10 @@ CubinObj& CubinObj::operator=(CubinObj const& other)
     return *this;
 }
 
-CubinObj::CubinObj(CubinObj&& other)
+CubinObj::CubinObj(CubinObj&& other) noexcept
+    : mContent(std::move(other.mContent))
 {
-    this->mContent = std::move(other.mContent);
+
     if (other.mInitialized)
     {
         this->mInitialized = true;
@@ -87,7 +86,7 @@ CubinObj::CubinObj(CubinObj&& other)
     }
 }
 
-CubinObj& CubinObj::operator=(CubinObj&& other)
+CubinObj& CubinObj::operator=(CubinObj&& other) noexcept
 {
     if (this == &other)
     {
@@ -124,8 +123,8 @@ size_t CubinObj::getSerializationSize() const noexcept
 void CubinObj::serialize(void* buffer_, size_t buffer_size) const noexcept
 {
     size_t remaining_buffer_size = buffer_size;
-    uint8_t* buffer = static_cast<uint8_t*>(buffer_);
-    uint32_t len = mContent.size();
+    auto* buffer = static_cast<uint8_t*>(buffer_);
+    uint32_t const len = mContent.size();
     writeToBuffer<uint32_t>(len, buffer, remaining_buffer_size);
     TLLM_CHECK(len <= remaining_buffer_size);
     memcpy(buffer, mContent.c_str(), len);
