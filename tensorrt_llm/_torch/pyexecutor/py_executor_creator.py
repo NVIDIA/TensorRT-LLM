@@ -207,6 +207,10 @@ def create_py_executor(executor_config: ExecutorConfig,
                     del draft_model_engine.attn_metadata
                     draft_model_engine.attn_metadata = None
 
+            # KVCacheManager modifies these fields, update them to executor_config
+            if kv_cache_manager is not None:
+                executor_config.max_seq_len = kv_cache_manager.max_seq_len
+
             py_executor = create_py_executor_instance(
                 dist, resources, mapping, pytorch_backend_config,
                 executor_config, ctx_chunk_config, model_engine,
