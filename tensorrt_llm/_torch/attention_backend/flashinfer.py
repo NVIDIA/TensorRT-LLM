@@ -510,7 +510,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             attention_mask_data = metadata._attention_mask_data_buffer[:
                                                                        token_offset]
             # print("attention_mask_data", attention_mask_data.shape)
-        if attention_mask == PredefinedAttentionMask.CAUSAL:
+        elif attention_mask == PredefinedAttentionMask.CAUSAL:
             attention_mask_type = int(AttentionMaskType.causal)
             attention_mask_data = None
         elif attention_mask == PredefinedAttentionMask.FULL:
