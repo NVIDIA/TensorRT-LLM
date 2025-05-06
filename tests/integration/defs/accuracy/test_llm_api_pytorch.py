@@ -594,6 +594,53 @@ class TestNemotronNas(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestNemotronSuper(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Llama-3_3-Nemotron-Super-49B-v1"
+    MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1"
+
+    @pytest.mark.skip_less_device(2)
+    def test_auto_dtype_tp2(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+
+
+class TestNemotronNano(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Llama-3.1-Nemotron-Nano-8B-v1"
+    MODEL_PATH = f"{llm_models_root()}/Llama-3.1-Nemotron-Nano-8B-v1"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+
+
+class TestNemotronH(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nemotron-H-8B-Base-8K"
+    MODEL_PATH = f"{llm_models_root()}/Nemotron-H-8B-Base-8K"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen2-7B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Qwen2-7B-Instruct"
