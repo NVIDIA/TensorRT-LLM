@@ -655,7 +655,7 @@ To prepare a dataset, follow the same process as specified in [](#preparing-a-da
 To quantize the checkpoint:
 
 ```shell
-cd tensorrt_llm/examples/llama
+cd tensorrt_llm/examples/models/core/llama
 python ../quantization/quantize.py \
     --model_dir $checkpoint_dir \
     --dtype bfloat16 \

@@ -155,7 +155,7 @@ public:
 
     [[nodiscard]] bool constexpr enableAttentionDP() const noexcept
     {
-        return mEnableAttenionDP;
+        return mEnableAttentionDP;
     }
 
     [[nodiscard]] std::vector<SizeType32> getPipelineParallelGroup() const;
@@ -176,7 +176,7 @@ private:
     SizeType32 mContextParallelism;
     SizeType32 mRank;
     SizeType32 mGpusPerNode;
-    bool mEnableAttenionDP;
+    bool mEnableAttentionDP;
     std::vector<SizeType32> mDeviceIds;
 };
 

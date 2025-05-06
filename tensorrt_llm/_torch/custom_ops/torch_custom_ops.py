@@ -29,6 +29,8 @@ class MoERunner(TunableRunner):
         tp_rank: int,
         ep_size: int,
         ep_rank: int,
+        cluster_size: int,
+        cluster_rank: int,
         use_fp8_block_scaling: bool,
     ):
         self.x_dtype = x_dtype
@@ -39,6 +41,8 @@ class MoERunner(TunableRunner):
         self.tp_rank = tp_rank
         self.ep_size = ep_size
         self.ep_rank = ep_rank
+        self.cluster_size = cluster_size
+        self.cluster_rank = cluster_rank
         self.use_fp8_block_scaling = use_fp8_block_scaling
 
         instance_key = (x_dtype, weight_dtype, output_dtype,
@@ -90,6 +94,8 @@ class MoERunner(TunableRunner):
             self.tp_rank,
             self.ep_size,
             self.ep_rank,
+            self.cluster_size,
+            self.cluster_rank,
             min_latency_mode,
             gemm_idx,
             tactic,
@@ -111,6 +117,8 @@ def fused_moe(
     tp_rank: int = 0,
     ep_size: int = 1,
     ep_rank: int = 0,
+    cluster_size: int = 1,
+    cluster_rank: int = 0,
     use_fp8_block_scaling: bool = False,
     min_latency_mode: bool = False,
 ) -> List[torch.Tensor]:
@@ -120,8 +128,8 @@ def fused_moe(
     # TODO: only profile for min_latency_mode = False due to the error in the moe_kernels
     tuning_config = TuningConfig(dynamic_tensors=(
         # input, dim 0, all valid buckets, map a seq_len to power of 2 bucket index
-        (0, 0, ((16384, 8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4,
-                 2, 1), next_positive_power_of_2)),
+        (0, 0, ((8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1),
+                next_positive_power_of_2)),
         # min_latency_tensor, dim 0, (0 for False, 1 for True), map to it self
         (2, 0, ((0, ), lambda x: x)),
     ))
@@ -139,6 +147,8 @@ def fused_moe(
         tp_rank=tp_rank,
         ep_size=ep_size,
         ep_rank=ep_rank,
+        cluster_size=cluster_size,
+        cluster_rank=cluster_rank,
         use_fp8_block_scaling=use_fp8_block_scaling,
     )
 
@@ -171,6 +181,8 @@ def fused_moe(
         tp_rank,
         ep_size,
         ep_rank,
+        cluster_size,
+        cluster_rank,
         min_latency_mode,
         [gemm_tactic_1, gemm_tactic_2],
     )
@@ -192,6 +204,8 @@ def _(
     tp_rank: int = 0,
     ep_size: int = 1,
     ep_rank: int = 0,
+    cluster_size: int = 1,
+    cluster_rank: int = 0,
     use_fp8_block_scaling: bool = False,
     min_latency_mode: bool = False,
 ):

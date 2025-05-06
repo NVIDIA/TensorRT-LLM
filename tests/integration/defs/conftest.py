@@ -30,6 +30,7 @@ from typing import Iterable, Sequence
 import defs.ci_profiler
 import psutil
 import pytest
+import torch
 import tqdm
 import yaml
 from _pytest.mark import ParameterSet
@@ -194,7 +195,7 @@ def llm_rouge_root() -> str:
 @pytest.fixture(scope="module")
 def bert_example_root(llm_root):
     "Get bert example root"
-    example_root = os.path.join(llm_root, "examples", "bert")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "bert")
 
     return example_root
 
@@ -202,7 +203,8 @@ def bert_example_root(llm_root):
 @pytest.fixture(scope="module")
 def enc_dec_example_root(llm_root):
     "Get encoder-decoder example root"
-    example_root = os.path.join(llm_root, "examples", "enc_dec")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "enc_dec")
 
     return example_root
 
@@ -210,7 +212,8 @@ def enc_dec_example_root(llm_root):
 @pytest.fixture(scope="module")
 def whisper_example_root(llm_root, llm_venv):
     "Get whisper example root"
-    example_root = os.path.join(llm_root, "examples", "whisper")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "whisper")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -236,7 +239,7 @@ def opt_example_root(llm_root, llm_venv):
 def llama_example_root(llm_root, llm_venv):
     "Get llama example root"
 
-    example_root = os.path.join(llm_root, "examples", "llama")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "llama")
     try:
         llm_venv.run_cmd([
             "-m", "pip", "install", "-r",
@@ -270,7 +273,7 @@ def disaggregated_example_root(llm_root, llm_venv):
 def gemma_example_root(llm_root, llm_venv):
     "Get gemma example root"
 
-    example_root = os.path.join(llm_root, "examples", "gemma")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "gemma")
     # https://nvbugs/4559583 Jax dependency broke the entire pipeline in TRT container
     # due to the dependency incompatibility with torch, which forced reinstall everything
     # and caused pipeline to fail. We manually install gemma dependency as a WAR.
@@ -361,7 +364,7 @@ def mistral_nemo_minitron_model_root(request):
 @pytest.fixture(scope="module")
 def gpt_example_root(llm_root, llm_venv):
     "Get gpt example root"
-    example_root = os.path.join(llm_root, "examples", "gpt")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "gpt")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -386,7 +389,8 @@ def gptj_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def glm_4_9b_example_root(llm_root, llm_venv):
     "Get glm-4-9b example root"
-    example_root = os.path.join(llm_root, "examples", "glm-4-9b")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "glm-4-9b")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -398,7 +402,8 @@ def glm_4_9b_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def exaone_example_root(llm_root, llm_venv):
     "Get EXAONE example root"
-    example_root = os.path.join(llm_root, "examples", "exaone")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "exaone")
 
     return example_root
 
@@ -442,7 +447,8 @@ def plugin_gen_path(llm_root):
 @pytest.fixture(scope="module")
 def internlm2_example_root(llm_root, llm_venv):
     "Get internlm2 example root"
-    example_root = os.path.join(llm_root, "examples", "internlm2")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "internlm2")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -454,7 +460,7 @@ def internlm2_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def qwen_example_root(llm_root, llm_venv):
     "Get qwen example root"
-    example_root = os.path.join(llm_root, "examples", "qwen")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "qwen")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -526,7 +532,7 @@ def eagle_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def mamba_example_root(llm_root, llm_venv):
     "Get mamba example root"
-    example_root = os.path.join(llm_root, "examples", "mamba")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "mamba")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -543,7 +549,8 @@ def mamba_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def recurrentgemma_example_root(llm_root, llm_venv):
     "Get recurrentgemma example root"
-    example_root = os.path.join(llm_root, "examples", "recurrentgemma")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "recurrentgemma")
 
     # install requirements
     llm_venv.run_cmd([
@@ -561,7 +568,8 @@ def recurrentgemma_example_root(llm_root, llm_venv):
 
 @pytest.fixture(scope="module")
 def nemotron_nas_example_root(llm_root, llm_venv):
-    example_root = os.path.join(llm_root, "examples", "nemotron_nas")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "nemotron_nas")
 
     yield example_root
 
@@ -569,7 +577,8 @@ def nemotron_nas_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def nemotron_example_root(llm_root, llm_venv):
     "Get nemotron example root"
-    example_root = os.path.join(llm_root, "examples", "nemotron")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "nemotron")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -580,7 +589,8 @@ def nemotron_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def commandr_example_root(llm_root, llm_venv):
     "Get commandr example root"
-    example_root = os.path.join(llm_root, "examples", "commandr")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "commandr")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -1879,19 +1889,8 @@ def skip_by_device_memory(request):
 
 def get_sm_version():
     "get compute capability"
-    with tempfile.TemporaryDirectory() as temp_dirname:
-        suffix = ".exe" if is_windows() else ""
-        # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
-        cmd = " ".join([
-            "nvidia-smi" + suffix, "--query-gpu=compute_cap",
-            "--format=csv,noheader"
-        ])
-        output = check_output(cmd, shell=True, cwd=temp_dirname)
-
-    compute_cap = output.strip().split("\n")[0]
-    sm_major, sm_minor = list(map(int, compute_cap.split(".")))
-
-    return sm_major * 10 + sm_minor
+    prop = torch.cuda.get_device_properties(0)
+    return prop.major * 10 + prop.minor
 
 
 skip_pre_ada = pytest.mark.skipif(
@@ -1903,7 +1902,7 @@ skip_pre_hopper = pytest.mark.skipif(
     reason="This test is not supported in pre-Hopper architecture")
 
 skip_pre_blackwell = pytest.mark.skipif(
-    get_sm_version() < 100,
+    get_sm_version() < 100 or get_sm_version() >= 120,
     reason="This test is not supported in pre-Blackwell architecture")
 
 skip_post_blackwell = pytest.mark.skipif(
@@ -1912,6 +1911,9 @@ skip_post_blackwell = pytest.mark.skipif(
 
 skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
                                   reason="NVLS is not supported")
+skip_no_hopper = pytest.mark.skipif(
+    get_sm_version() != 90,
+    reason="This test is only  supported in Hopper architecture")
 
 
 def skip_fp8_pre_ada(use_fp8):
@@ -1967,22 +1969,6 @@ def get_device_memory():
         memory = int(output.strip().split()[0])
 
     return memory
-
-
-#
-# When test parameters have an empty id, older versions of pytest ignored that parameter when generating the
-# test node's ID completely. This however was actually a bug, and not expected behavior that got fixed in newer
-# versions of pytest:https://github.com/pytest-dev/pytest/pull/6607. TRT test defs however rely on this behavior
-# for quite a few test names. This is a hacky WAR that restores the old behavior back so that the
-# test names do not change. Note: This might break in a future pytest version.
-#
-# TODO: Remove this hack once the test names are fixed.
-#
-
-from _pytest.python import CallSpec2
-
-CallSpec2.id = property(
-    lambda self: "-".join(map(str, filter(None, self._idlist))))
 
 
 def pytest_addoption(parser):

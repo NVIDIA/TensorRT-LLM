@@ -515,7 +515,7 @@ class BertForSequenceClassification(BertBase):
         remove_input_padding = default_net().plugin_config.remove_input_padding
 
         # required as explicit input in remove_input_padding mode
-        # see examples/bert/run_remove_input_padding.py for how to create them from input_ids and input_lengths
+        # see examples/models/core/bert/run_remove_input_padding.py for how to create them from input_ids and input_lengths
         if remove_input_padding:
             assert token_type_ids is not None and \
                    position_ids is not None and \

@@ -43,6 +43,7 @@
 #include <cstdlib>
 #include <memory>
 #include <random>
+#include <tensorrt_llm/batch_manager/cacheTransBuffer.h>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
 #include <tensorrt_llm/executor/cache_transmission/cacheConcatenate.h>
 
@@ -344,9 +345,9 @@ protected:
                 int64_t bufferSize = buffer.size();
                 TLLM_LOG_DEBUG(
                     tensorrt_llm::mpi::MpiComm::world().getRank(), "send bufferSize: %ld to %d", bufferSize, genRank);
-                tensorrt_llm::mpi::MpiComm::world().send(
+                tensorrt_llm::mpi::MpiComm::world().sendRawTag(
                     &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, genRank, 0x1F);
-                tensorrt_llm::mpi::MpiComm::world().send(
+                tensorrt_llm::mpi::MpiComm::world().sendRawTag(
                     buffer.data(), buffer.size(), tensorrt_llm::mpi::MpiType::kCHAR, genRank, 0x2F);
                 TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send buffer to %d", genRank);
                 mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(commState);
@@ -354,11 +355,12 @@ protected:
             else
             {
                 int64_t bufferSize;
-                tensorrt_llm::mpi::MpiComm::world().recv(&bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, 0, 0x1F);
+                tensorrt_llm::mpi::MpiComm::world().recvRawTag(
+                    &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, 0, 0x1F);
                 TLLM_LOG_DEBUG(
                     tensorrt_llm::mpi::MpiComm::world().getRank(), "recv bufferSize: %ld from 0", bufferSize);
                 std::vector<char> recvBuffer(bufferSize);
-                tensorrt_llm::mpi::MpiComm::world().recv(
+                tensorrt_llm::mpi::MpiComm::world().recvRawTag(
                     recvBuffer.data(), bufferSize, tensorrt_llm::mpi::MpiType::kCHAR, 0, 0x2F);
                 TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "recv buffer from 0", bufferSize);
                 std::istringstream iStream(std::string(recvBuffer.begin(), recvBuffer.end()));
@@ -381,15 +383,19 @@ protected:
 
     void setUpCacheTransceiver()
     {
+        int maxNumTokens = 1024;
+        mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
         if (isSender)
         {
-            mResponder = std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
-                mConnectionManager.get(), *mCacheState, mlocalRank, std::make_unique<CacheFormatter>(mManager.get())));
+            mResponder = std::make_unique<DataResponder>(
+                std::make_unique<DataSenderImpl>(mConnectionManager.get(), *mCacheState, mlocalRank,
+                    std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get())));
         }
         else
         {
-            mRequester = std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
-                mConnectionManager.get(), *mCacheState, mlocalRank, std::make_unique<CacheFormatter>(mManager.get())));
+            mRequester = std::make_unique<DataRequester>(
+                std::make_unique<DataReceiverImpl>(mConnectionManager.get(), *mCacheState, mlocalRank,
+                    std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get())));
         }
     }
 
@@ -443,6 +449,7 @@ protected:
     LlmRequest::RequestIdType mRequestId{0};
     SizeType32 mMaxNumSequences{};
     std::unique_ptr<KVCacheManager> mManager;
+    std::unique_ptr<CacheTransBufferManager> mCacheTransBufferManager;
     std::unique_ptr<DataResponder> mResponder;
     std::unique_ptr<DataRequester> mRequester;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;
@@ -679,6 +686,8 @@ protected:
         }
         else if (tensorrt_llm::common::getEnvUseMPIKvCache() || tensorrt_llm::common::getEnvUseUCXKvCache())
         {
+            int maxNumTokens = 1024;
+            mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
             bool isUcx = tensorrt_llm::common::getEnvUseUCXKvCache();
             TLLM_LOG_INFO("Enable %s KV cache transport.", isUcx ? "UCX" : "MPI");
 
@@ -707,8 +716,10 @@ protected:
 
             auto makeFormatter = [this]()
             {
-                return mIsMLA ? std::unique_ptr<IOFormatter>(std::make_unique<MLACacheFormatter>(mManager.get()))
-                              : std::unique_ptr<IOFormatter>(std::make_unique<CacheFormatter>(mManager.get()));
+                return mIsMLA ? std::unique_ptr<IOFormatter>(
+                           std::make_unique<MLACacheFormatter>(mManager.get(), mCacheTransBufferManager.get()))
+                              : std::unique_ptr<IOFormatter>(
+                                  std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get()));
             };
 
             if (mIsContext)
@@ -742,9 +753,9 @@ protected:
                         int64_t bufferSize = buffer.size();
                         TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send bufferSize: %ld to %d",
                             bufferSize, genRank);
-                        tensorrt_llm::mpi::MpiComm::world().send(
+                        tensorrt_llm::mpi::MpiComm::world().sendRawTag(
                             &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, genRank, 0x1F);
-                        tensorrt_llm::mpi::MpiComm::world().send(
+                        tensorrt_llm::mpi::MpiComm::world().sendRawTag(
                             buffer.data(), buffer.size(), tensorrt_llm::mpi::MpiType::kCHAR, genRank, 0x2F);
                         TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send buffer to %d", genRank);
                     }
@@ -753,12 +764,12 @@ protected:
                 if (mIsGeneration)
                 {
                     int64_t bufferSize;
-                    tensorrt_llm::mpi::MpiComm::world().recv(
+                    tensorrt_llm::mpi::MpiComm::world().recvRawTag(
                         &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, 0, 0x1F);
                     TLLM_LOG_DEBUG(
                         tensorrt_llm::mpi::MpiComm::world().getRank(), "recv bufferSize: %ld from 0", bufferSize);
                     std::vector<char> recvBuffer(bufferSize);
-                    tensorrt_llm::mpi::MpiComm::world().recv(
+                    tensorrt_llm::mpi::MpiComm::world().recvRawTag(
                         recvBuffer.data(), bufferSize, tensorrt_llm::mpi::MpiType::kCHAR, 0, 0x2F);
                     TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "recv buffer from 0", bufferSize);
                     std::istringstream iStream(std::string(recvBuffer.begin(), recvBuffer.end()));
@@ -815,7 +826,7 @@ protected:
             mContextCacheState->getParallelConfig().mTensorParallelism,
             mContextCacheState->getParallelConfig().mPipelineParallelism, mContextCacheState->getDataType(),
             mContextCacheState->getAttentionConfig().mAttentionType, mContextCacheState->getAttentionConfig().mKvFactor,
-            mContextCacheState->getParallelConfig().mEnableAttenionDP, contextDpRank,
+            mContextCacheState->getParallelConfig().mEnableAttentionDP, contextDpRank,
             mContextCacheState->getParallelConfig().mTensorParallelism};
         state->setCacheState(cacheState);
         auto stats = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt);
@@ -884,7 +895,7 @@ protected:
         int startLayerId = layerSizePerRank * mPpRank;
         int headSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.at(0);
         int startHeadId = headSizePerRank * mTpRank;
-        bool enableDP = mCacheState->getParallelConfig().mEnableAttenionDP;
+        bool enableDP = mCacheState->getParallelConfig().mEnableAttentionDP;
         if (mIsMLA || enableDP)
         {
             startHeadId = 0;
@@ -948,7 +959,7 @@ protected:
         int startLayerId = layerSizePerRank * mPpRank;
         int headSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.at(0);
         int startHeadId = headSizePerRank * mTpRank;
-        bool enableDP = mCacheState->getParallelConfig().mEnableAttenionDP;
+        bool enableDP = mCacheState->getParallelConfig().mEnableAttentionDP;
         if (mIsMLA || enableDP)
         {
             startHeadId = 0;
@@ -1042,6 +1053,7 @@ protected:
     bool mIsMLA{false};
     SizeType32 mMaxNumSequences{};
     std::unique_ptr<KVCacheManager> mManager;
+    std::unique_ptr<CacheTransBufferManager> mCacheTransBufferManager;
     std::unique_ptr<DataResponder> mResponder;
     std::unique_ptr<DataRequester> mRequester;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;

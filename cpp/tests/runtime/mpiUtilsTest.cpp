@@ -134,7 +134,7 @@ void testSendRecv()
     auto& comm = mpi::MpiComm::world();
     auto const rank = comm.getRank();
     auto constexpr expectedValue = static_cast<T>(42);
-    auto constexpr tag = 0;
+    auto constexpr tag = mpi::MpiTag::kDefault;
     if (rank == 0)
     {
         comm.sendValue(expectedValue, 1, tag);
@@ -171,7 +171,7 @@ void testSendMRecv()
     auto& comm = mpi::MpiComm::world();
     auto const rank = comm.getRank();
     auto constexpr expectedValue = static_cast<T>(42);
-    auto constexpr tag = 0;
+    auto constexpr tag = mpi::MpiTag::kDefault;
     if (rank == 0)
     {
         comm.sendValue(expectedValue, 1, tag);

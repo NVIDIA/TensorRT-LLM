@@ -122,7 +122,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         super().__post_init__()
 
         if self.workspace_buffer is None:
-            self.workspace_buffer = torch.empty(256 * 1024 * 1024,
+            # Note: even though flashinfer only recommends 128 MB, we have to push it
+            # a bit higher to cover all possible CUDA graph cases. If it's too small,
+            # warmup will crash.
+            self.workspace_buffer = torch.empty(320 * 1024 * 1024,
                                                 dtype=torch.uint8,
                                                 device="cuda")
 
@@ -246,12 +249,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                                                paged_kv_indptr_decode
                                                                .size(0)]
         elif self.num_generations == 0:
-            assert not self.is_cuda_graph
             self.paged_kv_indptr = self.paged_kv_indptr_prefill[:
                                                                 paged_kv_indptr_prefill
                                                                 .size(0)]
         else:
-            assert not self.is_cuda_graph
+            assert not self.is_cuda_graph, "Cannot mix decode/prefill with CUDA graphs"
             self.paged_kv_indptr = torch.cumsum(
                 torch.tensor([0] + self.num_blocks, dtype=torch.int32),
                 dtype=torch.int32,
@@ -313,21 +315,24 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 "Make sure you run a few warmup runs before capturing the graph!"
             )
 
-        if not self.is_cuda_graph:
-            if plan_params in self._plan_params_to_wrappers:
-                prefill_wrapper = self._plan_params_to_wrappers[
-                    plan_params].prefill_wrapper
-            else:
-                # flashinfer fa3 backend has accuracy issue in H100 PCIe
-                prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                    self.workspace_buffer, self.kv_layout, backend='fa2')
+        if plan_params in self._plan_params_to_wrappers:
+            prefill_wrapper = self._plan_params_to_wrappers[
+                plan_params].prefill_wrapper
         else:
-            prefill_wrapper = None
+            # flashinfer fa3 backend has accuracy issue in H100 PCIe
+            prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                self.kv_layout,
+                backend='fa2',
+                qo_indptr_buf=self.qo_indptr,
+                paged_kv_indptr_buf=self.paged_kv_indptr_prefill,
+                paged_kv_indices_buf=self._paged_kv_indices,
+                paged_kv_last_page_len_buf=self._paged_kv_last_page_len,
+                use_cuda_graph=self.is_cuda_graph)
 
         is_causal = plan_params.attention_mask_type == AttentionMaskType.causal
 
         def prefill_plan():
-            assert prefill_wrapper is not None, "Prefill not supported w/ CUDA graphs"
             prefill_wrapper.plan(
                 self.qo_indptr[:self.num_contexts + 1],
                 self.paged_kv_indptr_prefill[:self.num_contexts + 1],
@@ -406,16 +411,20 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        skip_create_weights_in_init: bool = False,
         **kwargs,
     ):
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
+        if not skip_create_weights_in_init:
+            self.update_quant_config(self.quant_config)
 
+    def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
+        self.quant_config = new_quant_config
         self.has_fp8_kv_cache = False
-        if quant_config and quant_config.layer_quant_mode.has_any_quant():
-            quant_mode = quant_config.layer_quant_mode
-            if quant_mode.has_fp8_kv_cache():
-                self.has_fp8_kv_cache = True
+        if self.quant_config:
+            self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
+            )
 
     def forward(self,
                 q: torch.Tensor,

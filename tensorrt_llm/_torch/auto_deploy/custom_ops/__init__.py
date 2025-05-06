@@ -1,5 +1,6 @@
 """Custom ops and make sure they are all registered."""
 
+from ._triton_attention_internal import *
 from .dist import *
 from .flashinfer_attention import *
 from .flashinfer_rope import *

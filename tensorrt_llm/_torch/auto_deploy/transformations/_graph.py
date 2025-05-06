@@ -1,7 +1,7 @@
 """Graph-related utilities for transformations."""
 
 from contextlib import contextmanager
-from typing import Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -113,15 +113,43 @@ def move_to_device(gm: fx.GraphModule, device: DeviceLikeType) -> fx.GraphModule
         )
 
 
-def canonicalize_graph(gm: GraphModule, shape_prop: bool = False) -> GraphModule:
+def _is_impure_node(node: Node) -> bool:
+    """We use the default is_impure function for the node but avoid RNG check."""
+    # temporarily disable RNG check
+    is_set_to_true = False
+    if getattr(node.target, "_nondeterministic_seeded", False):
+        is_set_to_true = True
+        node.target._nondeterministic_seeded = False
+    try:
+        return node.is_impure()
+    finally:
+        # restore RNG check
+        if is_set_to_true:
+            node.target._nondeterministic_seeded = True
+
+
+def canonicalize_graph(
+    gm: GraphModule, shape_prop: bool = False, args_static: Optional[Tuple[Any, ...]] = None
+) -> GraphModule:
     """Canonicalize the graph of the given GraphModule.
 
-    This function can be used to clean up the graph representation after a transformation.
+    Args:
+        gm: The GraphModule to canonicalize.
+        shape_prop: Whether to run shape propagation. Shape propagation tends to be finicky and
+            slow, so we only run it optionally.
+        args_static: A tuple of static arguments to use for shape propagation. Shape propagation
+            requires all inputs to the graph ("placeholder" nodes) to have metadata with an
+            appropriate FakeTensor argument (``node.meta["val"]``). ``args_static`` can be used to
+            infer static FakeTensor information if some placeholder nodes do not have metadata.
+            When ``meta["val"]`` is available, it will take precedence over ``args_static``.
+
+    Returns:
+        The canonicalized (cleaned-up) GraphModule.
     """
     ad_logger.debug(f"Before canonicalizing: {gm}")
 
-    # clean up graph
-    gm.graph.eliminate_dead_code()
+    # clean up graph (needs to be done repeatedly until no more dead code)
+    gm.graph.eliminate_dead_code(is_impure_node=_is_impure_node)
 
     # recompile to propagate all graph changes to the graph module
     gm.recompile()
@@ -132,9 +160,24 @@ def canonicalize_graph(gm: GraphModule, shape_prop: bool = False) -> GraphModule
 
     # NOTE: shape_prop can be a littly finicky & slow, so we only run it optionally...
     if shape_prop:
-        inps = tuple([node.meta.get("val") for node in gm.graph.nodes if node.op == "placeholder"])
-        with lift_to_meta(gm):
-            FakeTensorProp(gm, _detect_fake_mode_from_gm(gm)).run(*inps)
+        fake_mode: Optional[FakeTensorMode] = _detect_fake_mode_from_gm(gm)
+
+        # get fake tensors from placeholder nodes
+        inps = [node.meta.get("val") for node in gm.graph.nodes if node.op == "placeholder"]
+
+        # check if we need to use args to create fake tensors
+        if any(inp is None for inp in inps):
+            if args_static is not None and fake_mode is not None and len(args_static) == len(inps):
+                inps = [
+                    fake_t if fake_t is not None else fake_mode.from_tensor(arg, static_shapes=True)
+                    for fake_t, arg in zip(inps, args_static)
+                ]
+
+        # run shape propagation if we have all the fake tensors
+        if all(inp is not None for inp in inps):
+            FakeTensorProp(gm, fake_mode).propagate(*inps)
+        else:
+            ad_logger.warning("No fake tensors and no args available for shape propagation")
 
     # lint the graph
     gm.graph.lint()

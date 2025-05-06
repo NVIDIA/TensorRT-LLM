@@ -784,7 +784,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
 #endif
 
     // Variable sequence length.
-    bool const variable_sequence_length = params.tokens_info != nullptr && params.cu_seq_lens != nullptr;
+    bool const variable_sequence_length = params.tokens_info != nullptr && params.seq_lens != nullptr;
     int const head_dim_vec_idx = (threadIdx.x % VECS_PER_HEAD);
     int const head_dim_idx = head_dim_vec_idx * ELTS_PER_VEC;
     bool const first_half = head_dim_idx < params.half_rotary_dim;
@@ -1603,6 +1603,7 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
     case 32: kernelV2DispatchHeadSize<256, 32, T, TCache, KVCacheBuffer>(params, stream); break;
     case 48: kernelV2DispatchHeadSize<192, 48, T, TCache, KVCacheBuffer>(params, stream); break;
     case 64: kernelV2DispatchHeadSize<256, 64, T, TCache, KVCacheBuffer>(params, stream); break;
+    case 72: kernelV2DispatchHeadSize<288, 72, T, TCache, KVCacheBuffer>(params, stream); break;
     case 80: kernelV2DispatchHeadSize<160, 80, T, TCache, KVCacheBuffer>(params, stream); break;
     case 96: kernelV2DispatchHeadSize<192, 96, T, TCache, KVCacheBuffer>(params, stream); break;
     case 104: kernelV2DispatchHeadSize<416, 104, T, TCache, KVCacheBuffer>(params, stream); break;

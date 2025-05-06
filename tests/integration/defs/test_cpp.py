@@ -5,6 +5,7 @@ import pathlib as _pl
 import platform
 import shutil
 import sys as _sys
+import time
 from typing import List
 
 import defs.cpp_common as _cpp
@@ -138,7 +139,7 @@ def install_additional_requirements(python_exe, root_dir):
                     "pip",
                     "install",
                     "-r",
-                    "examples/recurrentgemma/requirements.txt",
+                    "examples/models/core/recurrentgemma/requirements.txt",
                 ],
                 cwd=root_dir,
                 env=_os.environ,
@@ -154,6 +155,7 @@ def build_google_tests(request, build_dir):
     cuda_arch = f"{request.param}-real"
 
     print(f"Using CUDA arch: {cuda_arch}")
+
     build_trt_llm(
         cuda_architectures=cuda_arch,
         job_count=12,
@@ -173,30 +175,7 @@ def build_google_tests(request, build_dir):
         "google-tests",
     ]
 
-    # Build engine and generate output scripts need modelSpec
-    make_modelSpec = [
-        "cmake",
-        "--build",
-        ".",
-        "--config",
-        "Release",
-        "-j",
-        "--target",
-        "modelSpec",
-    ]
-
     _cpp.run_command(make_google_tests, cwd=build_dir, timeout=300)
-    _cpp.run_command(make_modelSpec, cwd=build_dir, timeout=300)
-
-    script_dir = (_pl.Path(__file__).parent.resolve().parent.parent.parent /
-                  "cpp" / "tests" / "resources" / "scripts")
-
-    assert script_dir.is_dir()
-    _sys.path.append(str(script_dir))
-
-    from build_engines_utils import init_model_spec_module
-
-    init_model_spec_module(force_init_trtllm_bindings=False)
 
 
 @pytest.fixture(scope="session")
@@ -222,6 +201,9 @@ def prepare_model_multi_gpu(python_exe, root_dir, cpp_resources_dir,
 
     def _prepare(model_name: str):
         if platform.system() != "Windows":
+
+            start_time = time.time()
+
             _cpp.prepare_multi_gpu_model_tests(
                 test_list=[model_name],
                 python_exe=python_exe,
@@ -229,6 +211,10 @@ def prepare_model_multi_gpu(python_exe, root_dir, cpp_resources_dir,
                 resources_dir=cpp_resources_dir,
                 model_cache=model_cache,
             )
+
+            duration = time.time() - start_time
+            print(f"Built multi-GPU model: {model_name}")
+            print(f"Duration: {duration} seconds")
 
     return _prepare
 
@@ -245,6 +231,8 @@ def prepare_model(
     def _prepare(model_name: str, run_fp8=False):
         install_additional_requirements(model_name)
 
+        start_time = time.time()
+
         _cpp.prepare_model_tests(
             model_name=model_name,
             python_exe=python_exe,
@@ -252,6 +240,10 @@ def prepare_model(
             resources_dir=cpp_resources_dir,
             model_cache_arg=model_cache_arg,
         )
+
+        duration = time.time() - start_time
+        print(f"Built model: {model_name}")
+        print(f"Duration: {duration} seconds")
 
     return _prepare
 
@@ -301,19 +293,23 @@ def run_model_benchmarks(root_dir, build_dir, cpp_resources_dir, python_exe,
 
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
-def test_unit_tests(build_google_tests, build_dir, lora_setup):
+@pytest.mark.parametrize("test_group", [
+    "batch_manager", "common", "executor", "kernels", "layers", "runtime",
+    "thop", "utils"
+])
+def test_unit_tests(build_google_tests, test_group, build_dir, lora_setup):
+
+    xml_name = f"results-unit-tests-{test_group}.xml"
 
     # Discover and run the actual gtests
     ctest_command = [
         "ctest",
         "--output-on-failure",
+        "--test-dir",
+        f"{build_dir}/tests/unit_tests/{test_group}",
         "--output-junit",
-        "results-unit-tests.xml",
+        f"{build_dir}/{xml_name}",
     ]
-
-    excluded_tests = list(_cpp.generate_excluded_model_tests())
-
-    ctest_command.extend(["-E", "|".join(excluded_tests)])
 
     parallel = _cpp.default_test_parallel
     if parallel_override := _os.environ.get("LLM_TEST_PARALLEL_OVERRIDE", None):

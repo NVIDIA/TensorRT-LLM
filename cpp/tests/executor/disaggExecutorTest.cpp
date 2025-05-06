@@ -25,6 +25,15 @@ using DisaggParamsType = std::tuple<int, std::vector<std::string>, std::vector<s
 
 using CondDisaggParamsType = std::tuple<std::string>;
 
+namespace
+{
+
+auto constexpr LLAMA_INPUT_FILE = "input_tokens_llama.npy";
+auto constexpr LLAMA_END_ID = 128001;
+auto constexpr LLAMA_PAD_ID = 128001;
+
+} // namespace
+
 enum InstanceRole : int
 {
     CONTEXT = 1,
@@ -549,10 +558,12 @@ TEST_P(DisaggParamsTest, DisaggTokenComparison)
     else if (modelName == "llama_tp4_pp1_cp1" || modelName == "llama_tp1_pp4_cp1" || modelName == "llama_tp2_pp2_cp1"
         || modelName == "llama_tp1_pp2_cp1" || modelName == "llama_tp2_pp1_cp1" || modelName == "llama_tp1_pp1_cp1")
     {
+        inputPath = DATA_PATH / LLAMA_INPUT_FILE;
+
         auto const resultsPath
             = LLAMA_DATA_PATH / ((beamWidth == 1) ? "sampling" : "beam_search_" + std::to_string(beamWidth));
-        modelIds.padId = 2;
-        modelIds.endId = 2;
+        modelIds.padId = LLAMA_PAD_ID;
+        modelIds.endId = LLAMA_END_ID;
         if (modelName == "llama_tp4_pp1_cp1")
         {
             beamResult.resultsFile = resultsPath / PathUtil::FP16_PLUGIN_PACKED_PAGED_RESULT_TP4_PP1_FILE();
@@ -754,10 +765,12 @@ TEST_P(DisaggOrchestratorParamsTest, DisaggTokenComparison)
     if (modelName == "llama_tp4_pp1" || modelName == "llama_tp1_pp4" || modelName == "llama_tp2_pp2"
         || modelName == "llama_tp1_pp2" || modelName == "llama_tp2_pp1" || modelName == "llama_tp1_pp1")
     {
+        inputPath = DATA_PATH / LLAMA_INPUT_FILE;
+
         auto const resultsPath
             = LLAMA_DATA_PATH / ((beamWidth == 1) ? "sampling" : "beam_search_" + std::to_string(beamWidth));
-        modelIds.padId = 2;
-        modelIds.endId = 2;
+        modelIds.padId = LLAMA_PAD_ID;
+        modelIds.endId = LLAMA_END_ID;
         if (modelName == "llama_tp4_pp1")
         {
             beamResult.resultsFile = resultsPath / PathUtil::FP16_PLUGIN_PACKED_PAGED_RESULT_TP4_PP1_FILE();
@@ -923,10 +936,12 @@ TEST_P(ConditionalDisaggParamsTest, DisaggTokenComparison)
     }
     else if (modelName == "llama_tp1_pp1_cp1")
     {
+        inputPath = DATA_PATH / LLAMA_INPUT_FILE;
+
         auto const resultsPath
             = LLAMA_DATA_PATH / ((beamWidth == 1) ? "sampling" : "beam_search_" + std::to_string(beamWidth));
-        modelIds.padId = 2;
-        modelIds.endId = 2;
+        modelIds.padId = LLAMA_PAD_ID;
+        modelIds.endId = LLAMA_END_ID;
         beamResult.resultsFile = resultsPath / PathUtil::FP16_PLUGIN_PACKED_PAGED_RESULT_TP1_PP1_FILE();
         modelPath = LLAMA_MODEL_PATH / PathUtil::FP16_GPT_ATTENTION_PACKED_PAGED_DIR() / "tp1-pp1-cp1-gpu";
     }

@@ -41,6 +41,7 @@ GIT_COMMIT         ?= $(shell git rev-parse HEAD)
 TRT_LLM_VERSION    ?= $(shell grep '^__version__' ../tensorrt_llm/version.py | grep -o '=.*' | tr -d '= "')
 GITHUB_MIRROR      ?=
 PYTHON_VERSION     ?=
+INSTALL_TRITON     ?= 1
 
 define add_local_user
 	docker build \
@@ -79,6 +80,7 @@ endef
 		$(if $(GIT_COMMIT), --build-arg GIT_COMMIT="$(GIT_COMMIT)") \
 		$(if $(GITHUB_MIRROR), --build-arg GITHUB_MIRROR="$(GITHUB_MIRROR)") \
 		$(if $(PYTHON_VERSION), --build-arg PYTHON_VERSION="$(PYTHON_VERSION)") \
+		$(if $(INSTALL_TRITON), --build-arg INSTALL_TRITON="$(INSTALL_TRITON)") \
 		$(if $(STAGE), --target $(STAGE)) \
 		--file Dockerfile.multi \
 		--tag $(IMAGE_WITH_TAG) \
@@ -109,6 +111,7 @@ GPU_OPTS          ?= --gpus=all
 SOURCE_DIR        ?= $(shell readlink -f ..)
 CODE_DIR          ?= /code/tensorrt_llm
 CCACHE_DIR        ?= ${CODE_DIR}/cpp/.ccache
+CONAN_DIR         ?= ${CODE_DIR}/cpp/.conan
 RUN_CMD           ?=
 CONTAINER_NAME    ?= tensorrt_llm
 WORK_DIR          ?= $(CODE_DIR)
@@ -126,6 +129,7 @@ endif
     		--volume $(SOURCE_DIR):$(CODE_DIR) \
     		--env "CCACHE_DIR=${CCACHE_DIR}" \
     		--env "CCACHE_BASEDIR=${CODE_DIR}" \
+    	    --env "CONAN_HOME=${CONAN_DIR}" \
     		--workdir $(WORK_DIR) \
     		--hostname $(shell hostname)-$* \
     		--name $(CONTAINER_NAME)-$*-$(USER_NAME) \

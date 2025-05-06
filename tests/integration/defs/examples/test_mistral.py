@@ -93,7 +93,7 @@ def test_llm_mistral_v1_1gpu(run_type, data_type, llama_example_root,
 
         print("Run inference...")
         venv_check_call(llm_venv, [
-            f"{llama_example_root}/../run.py",
+            f"{llama_example_root}/../../../run.py",
             "--max_output_len=512",
             f"--tokenizer_dir={llm_mistral_model_root}",
             f"--engine_dir={engine_dir}",
@@ -125,7 +125,7 @@ def test_llm_mistral_v1_1gpu(run_type, data_type, llama_example_root,
 
         print("Run summarize...")
         summary_cmd = [
-            f"{llama_example_root}/../summarize.py",
+            f"{llama_example_root}/../../../summarize.py",
             "--test_trt_llm",
             "--hf_model_dir",
             f"{llm_mistral_model_root}",
@@ -143,7 +143,7 @@ def test_llm_mistral_v1_1gpu(run_type, data_type, llama_example_root,
 
         print("Run summarize with beam_width = 2...")
         summary_cmd = [
-            f"{llama_example_root}/../summarize.py",
+            f"{llama_example_root}/../../../summarize.py",
             "--test_trt_llm",
             "--hf_model_dir",
             f"{llm_mistral_model_root}",
@@ -163,7 +163,7 @@ def test_llm_mistral_v1_1gpu(run_type, data_type, llama_example_root,
 
         print("Run summarize with beam_width = 4...")
         summary_cmd = [
-            f"{llama_example_root}/../summarize.py",
+            f"{llama_example_root}/../../../summarize.py",
             "--test_trt_llm",
             "--hf_model_dir",
             f"{llm_mistral_model_root}",
@@ -287,7 +287,7 @@ def test_llm_mistral_v1_1gpu(run_type, data_type, llama_example_root,
 
         print("Run long context summarize...")
         summary_cmd = [
-            f"{llama_example_root}/../summarize.py",
+            f"{llama_example_root}/../../../summarize.py",
             "--eval_task=summarize_long", "--test_trt_llm", "--test_hf",
             "--hf_model_dir", f"{llm_mistral_model_root}", "--data_type",
             "fp16", f"--engine_dir={engine_dir}",
@@ -355,6 +355,7 @@ def test_llm_mistral_v1_smooth_quant_4gpus(llama_example_root,
                         summary_cmd)
 
 
+@skip_pre_ada
 @pytest.mark.parametrize("run_type", ['inference', 'summarization'])
 @pytest.mark.parametrize("mistral_nemo_model_root", ['Mistral-Nemo-12b-Base'],
                          indirect=True)
@@ -400,7 +401,7 @@ def test_llm_mistral_nemo_fp8_quantization_1gpu(mistral_nemo_model_root,
     if run_type == "inference":
         print("Run inference...")
         venv_check_call(llm_venv, [
-            f"{llama_example_root}/../run.py",
+            f"{llama_example_root}/../../../run.py",
             "--max_output_len=50",
             f"--tokenizer_dir={mistral_nemo_model_root}",
             f"--engine_dir={engine_dir}",
@@ -686,7 +687,7 @@ def test_llm_mistral_lora_1gpu(llama_example_root, llm_mistral_model_root,
     input_text = "[INST]오늘은 날씨가 아주 좋다 내가 공원에 갔을 때 [/INST]"
 
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         f"--input_text={input_text}",
         f"--tokenizer_dir={llm_mistral_model_root}",
         f"--engine_dir={engine_dir}",
@@ -809,14 +810,9 @@ def test_llm_mistral_quantization_4gpus_llmapi(llama_example_root,
     threshold = 55 if 'int4' in quant else 60
 
     mmlu_cmd = [
-        f"{llama_example_root}/../mmlu_llmapi.py",
-        f"--data_dir={mmlu_dataset_root}",
-        f"--hf_model_dir={llm_mistral_model_root}",
-        f"--engine_dir={engine_dir}",
-        "--backend=tensorrt",
-        "--check_accuracy",
-        f"--accuracy_threshold={threshold}",
-        f"--tp_size={tp_size}",
+        "trtllm-eval", f"--model={engine_dir}",
+        f"--tokenizer={llm_mistral_model_root}", f"--tp_size={tp_size}",
+        "--backend=tensorrt", "mmlu", f"--dataset_path={mmlu_dataset_root}",
+        "--check_accuracy", f"--accuracy_threshold={threshold}"
     ]
-
-    venv_check_call(llm_venv, mmlu_cmd)
+    check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)

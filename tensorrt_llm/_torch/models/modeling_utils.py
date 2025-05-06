@@ -1,5 +1,4 @@
 import contextlib
-import fnmatch
 import math
 import time
 from dataclasses import dataclass
@@ -12,9 +11,9 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
-from tensorrt_llm.mapping import Mapping
-
 from ...logger import logger
+from ...mapping import Mapping
+from ...models.modeling_utils import QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
@@ -22,7 +21,7 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding, LMHead
 from ..modules.fused_moe import FusedMoE
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
-from ..modules.logits_procesor import LogitsProcessor
+from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..pipeline_interface import PipelineInterface
 from ..speculative import SpecMetadata
@@ -241,6 +240,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         input_ids: torch.LongTensor = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        lora_params: Optional = None,  # TODO smor add type hint
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -258,6 +258,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
+                lora_params=lora_params,
             )
 
         hidden_states = self.norm(hidden_states)
@@ -294,7 +295,6 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
             layer for layer in self.layers[:config.num_hidden_layers]
             if not layer.is_missing()
         ]
-        print(f"{self._local_layers=}, {self.pp_layer_list=}")
 
         # add create_pipeline_interface method
         pp_interface_keys = ["hidden_states", "residual"]
@@ -356,6 +356,15 @@ class DecoderModelForCausalLM(nn.Module,
             else:
                 # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
                 # will considering per layer QuantConfig in the future.
+
+                # TODO smor- hack
+                if hasattr(config,
+                           'lora_config') and config.lora_config is not None:
+                    from tensorrt_llm.lora_manager import HfLoraLoader
+                    lora_loader = HfLoraLoader(config.lora_config.lora_dir)
+                    weight = lora_loader.lm_head
+                    vocab_size = lora_loader.vocab_size
+
                 self.lm_head = LMHead(
                     vocab_size,
                     hidden_size,
@@ -364,6 +373,12 @@ class DecoderModelForCausalLM(nn.Module,
                     tensor_parallel_mode=TensorParallelMode.COLUMN,
                     gather_output=True,
                 )
+
+                if hasattr(config,
+                           'lora_config') and config.lora_config is not None:
+                    with torch.no_grad():
+                        x = weight.to(self.lm_head.dtype).cuda()
+                        self.lm_head.weight.data.copy_(x)
 
             # use embedding weights in lm_head if tie word embedding is enabled
             if config.pretrained_config.tie_word_embeddings and not isinstance(
@@ -415,20 +430,25 @@ class DecoderModelForCausalLM(nn.Module,
                             break
                 # TODO: support MLA
 
-        # 2. skip quant for modules in QuantConfig.exclude_modules
+        # 2. skip quant for modules in QuantConfig.exclude_modules.
+        # kv_cache_quant_algo takes precedence over exclude_modules.
+        # kv_cache_quant_algo, if not None, is set for non-Attention
+        # modules too, which is the same practice as when there's no
+        # exclude_modules.
         quant_config = self.model_config.quant_config
+        kv_cache_quant_algo = None
+        if quant_config:
+            kv_cache_quant_algo = quant_config.kv_cache_quant_algo
+        new_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
+
         if quant_config is not None:
             if quant_config.exclude_modules is not None:
-                exclude_modules = quant_config.exclude_modules
                 for name, module in self.named_modules():
-                    is_excluded = False
-                    for exclude_module in exclude_modules:
-                        if fnmatch.fnmatchcase(name, exclude_module):
-                            is_excluded = True
-                            break
+                    is_excluded = quant_config.is_module_excluded_from_quantization(
+                        name)
                     if is_excluded and getattr(module, "quant_config",
                                                None) is not None:
-                        module.quant_config = None
+                        module.quant_config = new_config
 
         for _, module in self.named_modules():
             if callable(getattr(module, "create_weights", None)):
@@ -455,6 +475,7 @@ class DecoderModelForCausalLM(nn.Module,
         pipeline_interface: Optional[PipelineInterface] = None,
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional = None,  # TODO smor add type hint
         **kwargs,
     ) -> torch.Tensor:
         if self._supports_pp and self.pp_size > 1:
@@ -471,12 +492,14 @@ class DecoderModelForCausalLM(nn.Module,
             if self.pp_rank < self.pp_size - 1:
                 return output
         else:
+
             output = self.model(
                 input_ids=input_ids,
                 attn_metadata=attn_metadata,
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
                 spec_metadata=spec_metadata,
+                lora_params=lora_params,
             )
 
         return self.logits_processor.forward(
@@ -487,64 +510,7 @@ class DecoderModelForCausalLM(nn.Module,
         )
 
     def load_weights(self, weights: Dict):
-        tp_size = self.model_config.mapping.tp_size
-        head_dim = self.config.hidden_size // self.config.num_attention_heads
-
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v
-            return result
-
-        params_map = {
-            'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
-            'gate_up_proj': ['gate_proj', 'up_proj']
-        }
-
-        for name, module in tqdm(list(self.named_modules()),
-                                 desc="Loading weights"):
-            if len(module._parameters) > 0:
-                # skip load weights if tie word embeddings is enabled and layer is lm_head
-                if self.config.tie_word_embeddings and name.startswith(
-                        "lm_head"):
-                    continue
-
-                # Skip if parameter belongs to a missing layer
-                if missing_layer_parameter(name, self):
-                    continue
-
-                names = name.split('.')
-                # WAR: better solution is that llama has its own load_weights function.
-                if names[-1] == 'next_layer_layernorm':
-                    continue
-                if names[-1] in params_map:
-                    module_weights = []
-                    for new_name in params_map[names[-1]]:
-                        fw = filter_weights('.'.join(names[:-1] + [new_name]),
-                                            weights)
-                        if new_name in ['k_proj', 'v_proj']:
-                            fw = {
-                                k:
-                                duplicate_kv_weight(
-                                    weight=v[:],
-                                    head_dim=head_dim,
-                                    tensor_parallel_size=tp_size)
-                                if k in ["weight", "bias"] else v
-                                for k, v in fw.items()
-                            }
-
-                        module_weights.append(fw)
-                    module.load_weights(weights=module_weights)
-                else:
-                    module_weights = filter_weights(name, weights)
-                    if hasattr(module, 'load_weights'):
-                        module.load_weights(weights=[module_weights])
-                    else:
-                        for n, p in module._parameters.items():
-                            if p is not None:
-                                p.data.copy_(module_weights[n][:])
+        _load_weights_impl(self, weights)
 
     def infer_max_seq_len(self) -> int:
         # Modified from tensorrt_llm/builder.py _init_max_seq_len
@@ -602,3 +568,129 @@ def get_model_architecture(
 def support_pp(cls: Type) -> Type:
     cls._supports_pp = True
     return cls
+
+
+def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
+    """
+    Rename weight keys according to regex pattern matching.
+
+    Args:
+        pattern_mapping: A dictionary mapping regex patterns to replacement strings. The key is HF name pattern, and the value is corresponding TRT-LLM name pattern.
+            The patterns will be used to match keys in the weights dict and replace
+            them according to the replacement string, which can use regex backreferences.
+            Example:
+            HF name: vision_model.encoder.layers.1.self_attn.out_proj.{weight,bias}
+            TRT-LLM name: vision_model.encoder.layers.1.self_attn.o_proj.{weight,bias}
+            Then the pattern_mapping could be:
+            pattern_mapping = {
+                r'(.*?)out_proj(.*)': r'\1o_proj\2'
+            }
+        weights: A dictionary of weights
+
+    Returns:
+        A dictionary of weights with renamed keys
+    """
+    import re
+
+    # Create a new dictionary to store the renamed weights
+    renamed_weights = {}
+
+    # Keep track of keys that have been matched by a pattern
+    matched_keys = set()
+
+    # Process each key in the weights dictionary
+    for key in list(weights.keys()):
+        # Check each pattern for a match
+        for pattern, replacement in pattern_mapping.items():
+            if re.match(pattern, key):
+                # Create the new key by applying the regex replacement
+                new_key = re.sub(pattern, replacement, key)
+                # Store the weight with the new key
+                renamed_weights[new_key] = weights[key]
+                matched_keys.add(key)
+                break
+
+        # If the key wasn't matched by any pattern, keep it as is
+        if key not in matched_keys:
+            renamed_weights[key] = weights[key]
+
+    return renamed_weights
+
+
+def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
+                       weights: Dict,
+                       params_map: Optional[Dict[str, str]] = None):
+    if not hasattr(model, 'model_config') or not isinstance(
+            model.model_config, ModelConfig):
+        raise ValueError("model must have a model_config attribute")
+    if not hasattr(model, 'config'):
+        raise ValueError("model must have a config attribute")
+
+    if params_map is not None:
+        weights = rename_weights_with_regex(params_map, weights)
+        logger.info(f"Renamed weights with params_map: {params_map}")
+
+    tp_size = model.model_config.mapping.tp_size
+    head_dim = getattr(
+        model.config, "head_dim",
+        model.config.hidden_size // model.config.num_attention_heads)
+
+    def filter_weights(prefix, weights: Dict):
+        result = {}
+        for k, v in weights.items():
+            if k.startswith(prefix):
+                new_k = k[len(prefix) + 1:]
+                result[new_k] = v
+        return result
+
+    params_map = {
+        'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
+        'gate_up_proj': ['gate_proj', 'up_proj']
+    }
+
+    for name, module in tqdm(list(model.named_modules()),
+                             desc="Loading weights"):
+        if len(module._parameters) > 0:
+            # skip load weights if tie word embeddings is enabled and layer is lm_head
+            if model.config.tie_word_embeddings and name.startswith("lm_head"):
+                continue
+
+            # Skip loading weights for embedding and lm_head if LoRA is enabled
+            if hasattr(model.model_config, 'lora_config'
+                       ) and model.model_config.lora_config is not None and (
+                           name == "model.embed_tokens" or name == "lm_head"):
+                continue
+
+            # Skip if parameter belongs to a missing layer
+            if missing_layer_parameter(name, model):
+                continue
+
+            names = name.split('.')
+            # WAR: better solution is that llama has its own load_weights function.
+            if names[-1] == 'next_layer_layernorm':
+                continue
+            if names[-1] in params_map:
+                module_weights = []
+                for new_name in params_map[names[-1]]:
+                    fw = filter_weights('.'.join(names[:-1] + [new_name]),
+                                        weights)
+                    if new_name in ['k_proj', 'v_proj']:
+                        fw = {
+                            k:
+                            duplicate_kv_weight(weight=v[:],
+                                                head_dim=head_dim,
+                                                tensor_parallel_size=tp_size)
+                            if k in ["weight", "bias"] else v
+                            for k, v in fw.items()
+                        }
+
+                    module_weights.append(fw)
+                module.load_weights(weights=module_weights)
+            else:
+                module_weights = filter_weights(name, weights)
+                if hasattr(module, 'load_weights'):
+                    module.load_weights(weights=[module_weights])
+                else:
+                    for n, p in module._parameters.items():
+                        if p is not None:
+                            p.data.copy_(module_weights[n][:])

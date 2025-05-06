@@ -75,7 +75,7 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
         ? std::make_shared<std::vector<TokenIdType>>(*mEncoderTokens.value().get())
         : nullptr;
     auto const optEncoderInputTokens = std::optional<std::shared_ptr<std::vector<TokenIdType>>>(encoderInputTokens);
-    // 45 parameters
+    // 46 parameters
     return std::make_shared<tb::LlmRequest>(                       //
         mRequestId,                                                //
         mMaxNewTokens,                                             //
@@ -90,6 +90,7 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
         mPositionIds,                                              //
         from_torch(mPromptEmbeddingTable),                         //
         mPromptVocabSize,                                          //
+        from_torch(mMultimodalEmbedding),                          //
         from_torch(mMropeRotaryCosSin),                            //
         mMropePositionDeltas,                                      //
         mLoraTaskId,                                               //

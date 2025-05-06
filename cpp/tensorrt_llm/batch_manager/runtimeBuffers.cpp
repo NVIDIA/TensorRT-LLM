@@ -31,8 +31,10 @@
 #include "tensorrt_llm/common/stlUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/utils/sessionUtils.h"
 
@@ -51,9 +53,12 @@ RuntimeBuffers::RuntimeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     std::vector<SizeType32> const& maxAttentionWindowVec, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLen,
     TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
     executor::DecodingConfig const& decodingConfig, bool gatherGenerationLogits, std::optional<SizeType32> maxNumTokens,
-    std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs)
+    std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs,
+    bool promptTableOffloadingParam)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    promptTableOffloading = promptTableOffloadingParam;
 
     create(maxBatchSize, maxBeamWidth, maxAttentionWindowVec, maxAttentionWindow, sinkTokenLen, runtime, modelConfig,
         worldConfig, decodingConfig, gatherGenerationLogits, additionalModelOutputs);
@@ -303,7 +308,8 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
 
     if (modelConfig.usePromptTuning())
     {
-        promptTuningBuffers = std::make_unique<PromptTuningBuffers>(maxBatchSize, manager, modelConfig, worldConfig);
+        promptTuningBuffers = std::make_unique<PromptTuningBuffers>(
+            maxBatchSize, manager, modelConfig, worldConfig, promptTableOffloading);
     }
 
     if (modelConfig.useLoraPlugin())
@@ -449,7 +455,7 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
     kv_cache_manager::BaseKVCacheManager* crossKvCacheManagerPtr,
     rnn_state_manager::RnnStateManager* rnnStateManagerPtr, PeftTable const& peftTable,
     runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
-    runtime::WorldConfig const& worldConfig)
+    runtime::WorldConfig const& worldConfig, bool trtOverlap, OptionalRef<runtime::ITensor const> newOutputTokens)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(runtimeBuffersSetFromInputs);
@@ -637,13 +643,23 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
             TLLM_CHECK(draftLength == 0 || reqBeamWidth == 1);
 
             auto const promptLen = llmReq->mPromptLen;
-            auto const sequenceLen = promptLen + llmReq->getMaxNumGeneratedTokens();
+            auto const sequenceLen
+                = promptLen + llmReq->getMaxNumGeneratedTokens() + static_cast<SizeType32>(trtOverlap);
             auto const& positionIds = llmReq->getPositionIds();
             for (int beam = 0; beam < reqBeamWidth; ++beam)
             {
-                auto const lastToken = llmReq->getLastTokens(beam);
-                auto const numTokens = llmReq->getNumTokens(beam);
-                inputHost.push_back(lastToken);
+                auto const numTokens = llmReq->getNumTokens(beam) + static_cast<SizeType32>(trtOverlap);
+                // TODO: can this be removed completely?
+                if (!trtOverlap)
+                {
+                    auto const lastToken = llmReq->getLastTokens(beam);
+                    inputHost.push_back(lastToken);
+                    if (draftLength > 0)
+                    {
+                        inputHost.insert(inputHost.end(), draftTokens->begin(), draftTokens->end());
+                    }
+                }
+
                 // If model updates generation position ids do not append them here.
                 if (!modelConfig.getSpeculativeDecodingMode().updatesPositionIds())
                 {
@@ -673,11 +689,6 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
                             positionIdsHost.push_back(numTokens - 1);
                         }
                     }
-                }
-
-                if (draftLength > 0)
-                {
-                    inputHost.insert(inputHost.end(), draftTokens->begin(), draftTokens->end());
                 }
 
                 if (modelConfig.useMrope())
@@ -729,7 +740,8 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
             auto const draftLength = llmReq->getNumDraftTokens();
 
             auto const contextQLength = llmReq->mPromptLen + draftLength;
-            auto const sequenceLen = contextQLength + llmReq->getMaxNumGeneratedTokens();
+            auto const sequenceLen
+                = contextQLength + llmReq->getMaxNumGeneratedTokens() + static_cast<SizeType32>(trtOverlap);
 
             std::fill_n(contextLengthsHostPtr + numSequences, reqBeamWidth, contextQLength);
             std::fill_n(sequenceLengthsHostPtr + numSequences, reqBeamWidth, sequenceLen);
@@ -805,7 +817,20 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
 
     {
         NVTX3_SCOPED_RANGE(bufferCopies);
-        manager.copy(inputHost.data(), *inputsIds);
+        if (trtOverlap)
+        {
+            auto contextInputsIds = ITensor::slice(inputsIds, 0, numContextTokens);
+            manager.copy(inputHost.data(), *contextInputsIds);
+
+            auto generationInputsIds = ITensor::slice(inputsIds, numContextTokens);
+            auto seqSlotsDeviceSlice = ITensor::slice(seqSlotsDevice, numContextRequests);
+            runtime::kernels::invokeGatherBatch(
+                *generationInputsIds, *newOutputTokens, *seqSlotsDeviceSlice, maxBeamWidth, stream);
+        }
+        else
+        {
+            manager.copy(inputHost.data(), *inputsIds);
+        }
         // In generation phase, device ptr of context lengths need to be tiled.
         manager.copy(*contextLengthsHost, *contextLengthsDevice);
         manager.copy(*sequenceLengthsHost, *sequenceLengthsDevice);
@@ -901,7 +926,8 @@ std::tuple<SizeType32, RuntimeBuffers::TensorMap const&, RuntimeBuffers::TensorM
     SizeType32 maxAttentionWindow, DecoderBuffers& decoderBuffers, kv_cache_manager::BaseKVCacheManager* kvCacheManager,
     kv_cache_manager::BaseKVCacheManager* crossKvCacheManager, rnn_state_manager::RnnStateManager* rnnStateManager,
     PeftTable const& peftTable, TllmRuntime const& runtime, ModelConfig const& modelConfig,
-    WorldConfig const& worldConfig, bool gatherGenerationLogits)
+    WorldConfig const& worldConfig, bool gatherGenerationLogits, bool trtOverlap,
+    OptionalRef<runtime::ITensor const> newOutputTokens)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(runtimeBuffersPrepareStep);
@@ -910,7 +936,8 @@ std::tuple<SizeType32, RuntimeBuffers::TensorMap const&, RuntimeBuffers::TensorM
     reshape(runtime, modelConfig, worldConfig, gatherGenerationLogits);
 
     setFromInputs(contextRequests, genRequests, maxBeamWidth, maxAttentionWindow, decoderBuffers, kvCacheManager,
-        crossKvCacheManager, rnnStateManager, peftTable, runtime, modelConfig, worldConfig);
+        crossKvCacheManager, rnnStateManager, peftTable, runtime, modelConfig, worldConfig, trtOverlap,
+        newOutputTokens);
 
     fillIOMaps(modelConfig, worldConfig);
 

@@ -49,7 +49,7 @@ def test_nemotron_nas_summary_1gpu(nemotron_nas_example_root, llm_venv,
     print("Running inference...")
 
     summary_cmd = [
-        f"{nemotron_nas_example_root}/../summarize.py",
+        f"{nemotron_nas_example_root}/../../../summarize.py",
         f"--engine_dir={engine_dir}", "--test_hf", "--hf_device_map_auto",
         "--batch_size=1", "--test_trt_llm",
         f"--hf_model_dir={nemotron_nas_model_root}", "--check_accuracy",
@@ -106,7 +106,7 @@ def test_nemotron_nas_summary_2gpu(nemotron_nas_example_root, llm_venv,
     mpi_cmd = ["mpirun", "-n", "2", "--allow-run-as-root"]
 
     summary_cmd = [
-        f"{nemotron_nas_example_root}/../summarize.py",
+        f"{nemotron_nas_example_root}/../../../summarize.py",
         f"--engine_dir={engine_dir}", "--test_hf", "--hf_device_map_auto",
         "--batch_size=1", "--test_trt_llm",
         f"--hf_model_dir={nemotron_nas_model_root}", "--check_accuracy",

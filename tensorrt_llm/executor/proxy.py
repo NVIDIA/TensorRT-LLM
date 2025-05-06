@@ -5,13 +5,13 @@ import time
 import weakref
 from typing import Dict, Optional, Union
 
+import torch
 import zmq
 import zmq.asyncio
 
 from tensorrt_llm.logger import logger
 
 from .._utils import mpi_rank
-from ..bindings import executor as tllm
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
@@ -23,7 +23,8 @@ from .postproc_worker import PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
-                    create_mpi_comm_session, get_spawn_proxy_process_env)
+                    create_mpi_comm_session, get_spawn_proxy_process_env,
+                    is_llm_response)
 from .worker import ExecutorBindingsWorker, worker_main
 
 __all__ = [
@@ -171,8 +172,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
             else:
                 queue.put(res)
 
-            if (isinstance(res, tllm.Response)
-                    and res.result.is_final) or isinstance(res, ErrorResponse):
+            if (is_llm_response(res) and res.result.is_final) or isinstance(
+                    res, ErrorResponse):
                 self._results.pop(client_id)
 
         res = res if isinstance(res, list) else [res]
@@ -288,7 +289,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
         tracer_init_kwargs = get_tracer().init_kwargs if enable_llm_tracer(
         ) else None
         from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
-
+        torch.cuda.Stream()
         self.mpi_futures = self.mpi_session.submit(
             worker_main,
             **worker_kwargs,
@@ -393,12 +394,14 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self._start_dispatch_threads()
 
         request.set_id(self._get_next_client_id())
+        logprob_params = self._get_logprob_params(request)
 
         result = GenerationResult(
             request,
             background_error_handler=self._handle_background_error,
             executor=self,
-            disaggregated_params=request.disaggregated_params)
+            disaggregated_params=request.disaggregated_params,
+            logprob_params=logprob_params)
         self._results[request.id] = result
 
         self.request_queue.put(request)

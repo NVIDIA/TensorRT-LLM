@@ -39,12 +39,17 @@ l0_a30:
       backend: cpp
   tests:
   # ------------- CPP tests ---------------
-  - test_cpp.py::test_unit_tests[80]
-  - test_cpp.py::test_model[gpt-80]
-  - test_cpp.py::test_model[gpt_executor-80]
-  - test_cpp.py::test_model[gpt_session-80]
-  - test_cpp.py::test_model[gpt_tests-80]
-  - test_cpp.py::test_benchmarks[gpt-80]
+  - test_cpp.py::test_unit_tests[batch_manager-80]
+  - test_cpp.py::test_unit_tests[common-80]
+  - test_cpp.py::test_unit_tests[executor-80]
+  - test_cpp.py::test_unit_tests[kernels-80]
+  - test_cpp.py::test_unit_tests[layers-80]
+  - test_cpp.py::test_unit_tests[runtime-80]
+  - test_cpp.py::test_unit_tests[thop-80]
+  - test_cpp.py::test_unit_tests[utils-80]
+  - test_cpp.py::test_model[-gpt-80]
+  - test_cpp.py::test_model[-gpt_executor-80]
+  - test_cpp.py::test_model[-gpt_tests-80]
 - condition:
     ranges:
       system_gpu_count:
@@ -145,3 +150,18 @@ l0_a30:
   - examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[no_streaming-gpt2-use_cpp_session-use_tokens-draft_len_4-float16-bs2] # 1 min
   - examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[no_streaming-gpt2-use_cpp_session-use_logits-draft_len_4-float16-bs2] # 1 min
   - examples/test_prompt_lookup.py::test_llm_prompt_lookup_1gpu[no_streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-prompt_lookup_num_tokens_8-float16-bs2] # 1 min
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a30*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: cpp
+  tests:
+  - test_cpp.py::test_model[-gpt_session-80]
+  - test_cpp.py::test_benchmarks[gpt-80]

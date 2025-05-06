@@ -1,0 +1,31 @@
+dataset_path: Idavidrein/gpqa
+tag: gpqa
+output_type: generate_until
+process_docs: !function utils.process_docs
+training_split: train
+# Because huggingface dataset only has train split
+validation_split: train
+test_split: null
+doc_to_text: "Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD. Think step by step before answering.\n{{Question}}\nA) {{choice1}}\nB) {{choice2}}\nC) {{choice3}}\nD) {{choice4}}"
+doc_to_target: answer
+filter_list:
+  - name: "strict-match"
+    filter:
+      - function: "regex"
+        regex_pattern: '(?i)Answer[ \t]*:[ \t]*([A-D])'
+        group_select: 0
+      - function: "take_first"
+generation_kwargs:
+  until:
+    - "</s>"
+  do_sample: false
+  temperature: 0.0
+num_fewshot: 0
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+    ignore_case: true
+    ignore_punctuation: true
+metadata:
+  version: 1.0

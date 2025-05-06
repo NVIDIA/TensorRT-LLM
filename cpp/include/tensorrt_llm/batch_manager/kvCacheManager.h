@@ -104,7 +104,17 @@ struct BlockKey
 
     BlockKey() = default;
 
-    explicit BlockKey(bool usesExtraIds, std::optional<LoraTaskIdType> loraTaskId, VecUniqueTokens uniqueTokens)
+    explicit BlockKey(VecTokens const& tokens, std::optional<LoraTaskIdType> loraTaskId = std::nullopt)
+        : loraTaskId{loraTaskId}
+    {
+        uniqueTokens.reserve(tokens.size());
+        for (auto const& token : tokens)
+        {
+            uniqueTokens.push_back(UniqueToken{token, 0});
+        }
+    }
+
+    BlockKey(bool usesExtraIds, std::optional<LoraTaskIdType> loraTaskId, VecUniqueTokens uniqueTokens)
         : usesExtraIds(usesExtraIds)
         , loraTaskId{loraTaskId}
         , uniqueTokens{std::move(uniqueTokens)}
@@ -135,37 +145,11 @@ struct BlockKey
 // Based on https://stackoverflow.com/questions/20511347/a-good-hash-function-for-a-vector/72073933#72073933
 struct BlockKeyHasher
 {
+    [[nodiscard]] static size_t hash(BlockKey const& blockKey, std::size_t parentHash = 0) noexcept;
+
     std::size_t operator()(BlockKey const& blockKey, std::size_t parentHash = 0) const noexcept
     {
-        size_t seed = blockKey.uniqueTokens.size() ^ parentHash * UINT64_C(0xbf58476d1ce4e5b9);
-
-        for (auto const& uniqueToken : blockKey.uniqueTokens)
-        {
-            uint32_t a = static_cast<uint32_t>(uniqueToken.tokenId);
-            a = ((a >> 16) ^ a) * 0x45d9f3b;
-            a = ((a >> 16) ^ a) * 0x45d9f3b;
-            a = (a >> 16) ^ a;
-            seed ^= a + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-            if (blockKey.usesExtraIds)
-            {
-                uint64_t b = uniqueToken.tokenExtraId;
-                b = (b ^ (b >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-                b = (b ^ (b >> 27)) * UINT64_C(0x94d049bb133111eb);
-                b = b ^ (b >> 31);
-                seed ^= b + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-            }
-        }
-
-        if (blockKey.loraTaskId)
-        {
-            uint64_t c = blockKey.loraTaskId.value();
-            c = (c ^ (c >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-            c = (c ^ (c >> 27)) * UINT64_C(0x94d049bb133111eb);
-            c = c ^ (c >> 31);
-            seed ^= c + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-        }
-
-        return seed;
+        return hash(blockKey, parentHash);
     }
 };
 
@@ -1303,7 +1287,7 @@ public:
     [[nodiscard]] static std::tuple<SizeType32, SizeType32> calculateMaxNumBlocks(KvCacheConfig const& config,
         nvinfer1::DataType dtype, tensorrt_llm::runtime::ModelConfig const& modelConfig,
         tensorrt_llm::runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager,
-        SizeType32 kvFactor = 2);
+        SizeType32 kvFactor = 2, size_t extraCostMemory = 0);
 
     /// @brief Calculates the maximum batch size that can fit the kv-cache, given that all sequences in the batch have
     /// the provided input and output length.

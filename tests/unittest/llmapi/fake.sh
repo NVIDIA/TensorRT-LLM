@@ -5,7 +5,7 @@ hf_model_dir=$1
 engine_dir=$2
 
 # fake a 1-layer LLaMA model for CI
-python3 ../../examples/llama/build.py \
+python3 ../../examples/models/core/llama/build.py \
     --use_gemm_plugin \
     --enable_context_fmha \
     --use_gpt_attention_plugin \

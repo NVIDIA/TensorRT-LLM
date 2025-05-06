@@ -34,7 +34,7 @@ work_dir = Path(__file__).parent.resolve() / 'check_gpt'
 from utils.llm_data import llm_models_root
 
 gpt_example_root = os.path.join(os.path.dirname(__file__),
-                                '../../../../examples/gpt')
+                                '../../../../examples/models/core/gpt')
 
 
 def run_command(command: Sequence[str], *, cwd=None, **kwargs) -> None:

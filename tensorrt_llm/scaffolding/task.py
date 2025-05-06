@@ -2,6 +2,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, Union
 
+import torch
+
 
 class ScaffoldingOutput:
 
@@ -30,16 +32,17 @@ class TaskStatus(Enum):
 @dataclass
 class GenerationTask(Task):
     # input field
-    input_tokens: Optional[List[int]] = field(default=None)
-    input_str: Optional[str] = field(default=None)
+    input_tokens: Optional[List[int]] = None
+    input_str: Optional[str] = None
     skip_tokenizer: bool = False
     skip_detokenizer: bool = False
     # sampling params
-    #custom_sampling_params: Optional[dict] = None
-    max_tokens: Optional[int] = field(default=None)
-    temperature: Optional[float] = field(default=None)
-    top_p: Optional[float] = field(default=None)
-    top_k: Optional[int] = field(default=None)
+    # custom_sampling_params: Optional[dict] = None
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    return_context_logits: Optional[bool] = False
 
     # suggest to use Controller.WorkerTag
     # anyway, users need to ensure that the value of the worker_tag can be found in the scaffoldingLlm's workers map
@@ -49,7 +52,8 @@ class GenerationTask(Task):
     output_tokens: List[int] = None
     output_str: Optional[str] = None
     cumulative_logprob: Optional[float] = None
-    logprobs: List[float] = field(default_factory=list)
+    logprobs: Optional[List[float]] = None
+    context_logits: Optional[torch.Tensor] = None
 
     @staticmethod
     def create_from_prompt(prompt: str) -> "GenerationTask":

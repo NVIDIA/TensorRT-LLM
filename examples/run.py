@@ -319,7 +319,7 @@ def main(args):
     if is_enc_dec:
         logger.warning(
             "This path is an encoder-decoder model. Using different handling.")
-        assert not args.use_py_session, "Encoder-decoder models don't have a unified python runtime, please use its own examples/enc_dec/run.py instead."
+        assert not args.use_py_session, "Encoder-decoder models don't have a unified python runtime, please use its own examples/models/core/enc_dec/run.py instead."
 
     model_name, model_version = read_model_name(
         args.engine_dir if not is_enc_dec else os.path.

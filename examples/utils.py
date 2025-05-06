@@ -82,12 +82,30 @@ def read_decoder_start_token_id(engine_dir):
     return config['pretrained_config']['decoder_start_token_id']
 
 
-def read_model_name(engine_dir: str):
-    engine_version = get_engine_version(engine_dir)
+def read_is_enc_dec(engine_dir: str, is_hf: bool = False):
+    if is_hf:
+        with open(Path(engine_dir) / "config.json", 'r') as f:
+            config = json.load(f)
+        is_enc_dec = config.get('is_encoder_decoder', False)
+    else:
+        is_enc_dec = {'encoder', 'decoder'}.issubset({
+            name
+            for name in os.listdir(engine_dir)
+            if os.path.isdir(os.path.join(engine_dir, name))
+        })
+    return is_enc_dec
 
+
+def read_model_name(engine_dir: str, is_hf: bool = False):
     with open(Path(engine_dir) / "config.json", 'r') as f:
         config = json.load(f)
 
+    if is_hf:
+        model_arch = config['architectures'][0]
+        model_version = config.get('model_type', None)
+        return model_arch, model_version
+
+    engine_version = get_engine_version(engine_dir)
     if engine_version is None:
         return config['builder_config']['name'], None
 
@@ -199,7 +217,7 @@ def prepare_enc_dec_inputs(batch_input_ids: List[torch.Tensor], model_name: str,
     encoder_input_ids = None
     if 'whisper' in model_name.lower():
         # cannot directly import whisper due to name collision
-        sys.path.append(f"{os.path.dirname(__file__)}/whisper")
+        sys.path.append(f"{os.path.dirname(__file__)}/models/core/whisper")
         from whisper_utils import log_mel_spectrogram
 
         config_path = os.path.join(engine_dir, 'encoder', 'config.json')

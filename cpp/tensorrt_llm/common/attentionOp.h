@@ -379,7 +379,8 @@ public:
     bool mSpecDecodingIsGenerationLengthVariable = false;
     int32_t mSpecDecodingMaxGenerationLength = 1;
     bool mIsMLAEnabled = false;
-    bool mUseFlashMLA = false;
+    bool mIsGenerationMLA = false;
+    bool mUseGenFlashMLA = false;
     tensorrt_llm::kernels::MlaMetaParams mMLAParams;
     int mCpSize = 1;
     int mCpRank = 0;
@@ -422,17 +423,17 @@ public:
             mUnfuseQkvGemm, (int32_t) mType, mMaxContextLength, mQKVBiasEnabled, mCrossAttention, mMaxDistance,
             mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mDenseContextFMHA, mHasFullAttentionMask,
             mIsSpecDecodingEnabled, mUseSpecDecoding, mSpecDecodingIsGenerationLengthVariable,
-            mSpecDecodingMaxGenerationLength, mIsMLAEnabled, mUseFlashMLA, mMLAParams.data(), mCpSize, mCpRank,
-            mCpGroup, mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank, mAttnCpSize,
-            mAttnCpRank, mUlyssesMQABroadcast, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA,
-            mUseKVCache, mSkipAttn, mFuseFp4Quant, mNbMultiBlockSemaphores);
+            mSpecDecodingMaxGenerationLength, mIsMLAEnabled, mIsGenerationMLA, mUseGenFlashMLA, mMLAParams.data(),
+            mCpSize, mCpRank, mCpGroup, mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank,
+            mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode,
+            mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant, mNbMultiBlockSemaphores);
     };
 
 private:
     static constexpr int kReservedMaxSeqLenTilePerSeq = 64;
 
     int mSM = tensorrt_llm::common::getSMVersion();
-    bool mUseTllmGen = (mSM >= 100);
+    bool mUseTllmGen = (mSM >= 100) && (mSM != 120);
     bool mForceMultiBlockWarned = false;
     int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
     int mMaxSharedMemoryPerBlockOptin = tensorrt_llm::common::getMaxSharedMemoryPerBlockOptin();
