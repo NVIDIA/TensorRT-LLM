@@ -61,11 +61,11 @@ def match_explicit_rope(gm: GraphModule) -> GraphModule:
     """
     Identify and replace legacy RoPE subgraphs (explicit cos/sin multiplication pattern):
 
-      - HF style: output = (raw * unsqueeze(cos)) + (rotate_half(raw) * unsqueeze(sin))
+      - HF-style: output = (raw * unsqueeze(cos)) + (rotate_half(raw) * unsqueeze(sin))
       - DS-style: requires interleaving Q/K before the cos/sin mul
 
     If exactly two such branches (query and key) are detected within each region, they're replaced
-    by a call to `torch.ops.rope.flashinfer`.
+    by a call to `rope::apply_rope_with_qk_interleaving` or `rope::torch_apply_rope_with_explicit_cos_sin` respectively.
     """
     ad_logger.info("Match explicit(HF) style RoPE")
     graph = gm.graph
@@ -123,7 +123,7 @@ def match_complex_rope(gm: GraphModule) -> GraphModule:
       output = type_as(flatten(view_as_real(mul(view_as_complex(reshape(to_dtype(x))), unsqueeze(freqs_cis, 2)))), x)
 
     If exactly two such branches (query and key) are detected within each region, they're replaced
-    by a call to `torch.ops.rope.flashinfer`.
+    by a call to `torch.ops.rope.torch_apply_rope_with_complex_freqs`.
     """
     ad_logger.info("Match Complex style RoPE")
     graph = gm.graph
@@ -158,19 +158,27 @@ def match_complex_rope(gm: GraphModule) -> GraphModule:
     return gm
 
 
-def match_rope_layout(gm: GraphModule, layout: str = "bsnd") -> GraphModule:
+def _get_default_unsqueeze_dim(op):
+    schema = next(iter(op._schemas.values()))
+    for a in schema.arguments:
+        if a.name == "unsqueeze_dim" and a.has_default_value:
+            return a.default_value
+    raise RuntimeError(f"No default unsqueeze_dim on {op}")
+
+
+def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphModule:
     """
     Match and transform input and output of rope ops to the layout specified.
     Supported layout is 'bsnd' (batch, seq, head, dim).
     """
-    supported = "bsnd"
-    if layout.lower() != supported:
+    supported = {"bsnd", "bnsd"}
+    if expected_layout.lower() not in supported:
         ad_logger.warning(
-            f"Unsupported RoPE layout '{layout}'; expected '{supported}'. Skipping RoPE layout matching."
+            f"Unsupported RoPE layout '{expected_layout}'; expected '{supported}'. Skipping RoPE layout matching."
         )
         return gm
 
-    ad_logger.info(f"Match RoPE layout to {layout}")
+    ad_logger.info(f"Match RoPE layout to {expected_layout}")
 
     graph = gm.graph
     rope_ops = {
@@ -182,23 +190,31 @@ def match_rope_layout(gm: GraphModule, layout: str = "bsnd") -> GraphModule:
     need_transpose = False
     for node in list(graph.nodes):
         if is_op(node, rope_ops):
+            rope_op = next(op for op in rope_ops if is_op(node, op))
             if is_op(node, torch.ops.rope.torch_apply_rope_with_complex_freqs):
                 q_node, k_node, freqs_node, *rest = node.args
-                unsq = rest[0] if rest else 2
+                unsq = rest[0] if rest else _get_default_unsqueeze_dim(rope_op)
             else:
                 q_node, k_node, cos_node, sin_node, *rest = node.args
-                unsq = rest[0] if rest else 1
+                unsq = rest[0] if rest else _get_default_unsqueeze_dim(rope_op)
 
-            need_transpose = False if unsq == 2 else True
-            ad_logger.debug(
-                f"Inferred RoPE input layout: [{'[b, n, s, d]' if need_transpose else '[b, s, n, d]'}]"
-            )
-            if need_transpose and unsq != 1:
+            if unsq == 2:
+                current_layout = "bsnd"
+            elif unsq == 1:
+                current_layout = "bnsd"
+            else:
                 ad_logger.warning(
                     "Unsqueeze_dim is not one of [1, 2]. "
-                    "Unable to infer layout of q node. Defaulting to [b, n, s, d]."
+                    "Unable to infer layout of q node. Skip layout matching"
                 )
+
+            need_transpose = expected_layout.lower() != current_layout
+
             if need_transpose:
+                ad_logger.debug(
+                    f"Inferred RoPE input layout: '{current_layout}']"
+                    f"Mapping layout to '{expected_layout}']"
+                )
                 with graph.inserting_before(node):
                     q_for_op = graph.call_function(torch.ops.aten.transpose, args=(q_node, 1, 2))
                     k_for_op = graph.call_function(torch.ops.aten.transpose, args=(k_node, 1, 2))
@@ -217,16 +233,16 @@ def match_rope_layout(gm: GraphModule, layout: str = "bsnd") -> GraphModule:
                         q_for_op_contig,
                         k_for_op_contig,
                         freqs_node,
-                        2,
-                    )  # unsqueeze_dim updated to 2
+                        2 if expected_layout.lower() == "bsnd" else 1,
+                    )  # unsqueeze_dim updated
                 else:
                     new_args = (
                         q_for_op_contig,
                         k_for_op_contig,
                         cos_node,
                         sin_node,
-                        2,
-                    )  # unsqueeze_dim updated to 2
+                        2 if expected_layout.lower() == "bsnd" else 1,
+                    )  # unsqueeze_dim updated
                 node.args = new_args
 
                 # retrieve q and k output node from node
