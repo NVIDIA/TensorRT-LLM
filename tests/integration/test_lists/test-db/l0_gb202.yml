@@ -1,0 +1,22 @@
+version: 0.0.1
+l0_gb202:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*gb202*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  # ------------- PyTorch tests ---------------
+  - unittest/_torch/modeling -k "modeling_mllama"
+  - unittest/_torch/modeling -k "modeling_out_of_tree"
+  # - unittest/_torch/modeling -k "modeling_qwen" # https://nvbugs/5234573
+  - unittest/_torch/test_attention_mla.py
+  - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
+  - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]

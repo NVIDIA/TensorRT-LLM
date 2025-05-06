@@ -1,0 +1,33 @@
+import pytest
+
+# isort: off
+from .test_llm import (global_kvcache_config,
+                       tinyllama_guided_decoding_test_harness,
+                       tinyllama_logits_processor_test_harness)
+# isort: on
+
+
+@pytest.mark.gpu4
+def test_tinyllama_guided_decoding_tp2pp2():
+    pytest.skip(reason="https://nvbugs/5244006")
+    tinyllama_guided_decoding_test_harness(
+        tensor_parallel_size=2,
+        pipeline_parallel_size=2,
+        kv_cache_config=global_kvcache_config,
+        backend='pytorch')
+
+
+@pytest.mark.gpu4
+def test_tinyllama_logits_processor_tp2pp2():
+    tinyllama_logits_processor_test_harness(backend="pytorch",
+                                            tensor_parallel_size=2,
+                                            pipeline_parallel_size=2)
+
+
+@pytest.mark.gpu2
+@pytest.mark.part0
+@pytest.mark.parametrize("tp_size, pp_size", [(1, 2), (2, 1)])
+def test_tinyllama_logits_processor_2gpu(tp_size: int, pp_size: int):
+    tinyllama_logits_processor_test_harness(backend="pytorch",
+                                            tensor_parallel_size=tp_size,
+                                            pipeline_parallel_size=pp_size)

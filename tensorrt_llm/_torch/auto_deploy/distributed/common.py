@@ -61,6 +61,13 @@ def broadcast_object_list(object_list, src=0, group=None, device=None):
     return dist.broadcast_object_list(object_list, src=src, group=group, device=device)
 
 
+def all_gather_object(object_list, object, group=None):
+    """Torch's all_gather_object with our default process group."""
+    if group is None:
+        group = DistGroup.get()
+    return dist.all_gather_object(object_list, object, group=group)
+
+
 def get_free_port():
     sock = socket.socket()
     sock.bind(("", 0))

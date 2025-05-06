@@ -24,7 +24,8 @@ from defs.conftest import (LLM_GATE_WAY_CLIENT_ID, LLM_GATE_WAY_TOKEN,
                            evaltool_mmlu_post_process,
                            evaltool_mtbench_post_process,
                            evaltool_wikilingua_post_process, get_device_memory,
-                           skip_fp8_pre_ada, skip_pre_ada)
+                           get_sm_version, skip_fp8_pre_ada,
+                           skip_post_blackwell, skip_pre_ada)
 from defs.trt_test_alternative import check_call
 from evaltool.constants import (EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT,
                                 EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT,
@@ -38,7 +39,7 @@ from evaltool.constants import (EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT,
 @pytest.fixture(scope="module")
 def phi_example_root(llm_root, llm_venv):
     "Get phi example root"
-    example_root = os.path.join(llm_root, "examples", "phi")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "phi")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -124,7 +125,7 @@ def test_llm_phi_single_gpu_summary(phi_example_root, llm_phi_model_root,
 
     print('Run phi...')
     run_cmd = [
-        f"{phi_example_root}/../run.py",
+        f"{phi_example_root}/../../../run.py",
         "--max_output_len=50",
         f"--engine_dir={engine_dir}",
         f"--tokenizer_dir={llm_phi_model_root}",
@@ -195,7 +196,7 @@ def test_llm_phi_1node_2gpus_summary(phi_example_root, llm_phi_model_root,
     rouge1_threshold = 21.2
     if model_name == 'Phi-3.5-MoE-instruct': rouge1_threshold = 24.0
     summary_cmd = [
-        f"{phi_example_root}/../summarize.py", "--test_trt_llm",
+        f"{phi_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", f"{llm_phi_model_root}", "--data_type", "fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}",
         f"--tensorrt_llm_rouge1_threshold={rouge1_threshold}",
@@ -421,6 +422,8 @@ def test_llm_phi_lora_1gpu(data_type, lora_data_type, phi_example_root,
     model_name = 'phi-3-lora'
     if data_type == 'fp8':
         skip_fp8_pre_ada(use_fp8=True)
+        if get_sm_version() >= 100:
+            pytest.skip("FP8 is not supported on post-Blackwell architectures")
         model_dir = quantize_data(
             llm_venv,
             phi_example_root,
@@ -467,7 +470,7 @@ def test_llm_phi_lora_1gpu(data_type, lora_data_type, phi_example_root,
 
     print(f"Run inference with lora id 0...")
     venv_check_call(llm_venv, [
-        f"{phi_example_root}/../run.py",
+        f"{phi_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--input_text={input_text}",
         "--lora_task_uids=0",
@@ -485,7 +488,7 @@ def test_llm_phi_lora_1gpu(data_type, lora_data_type, phi_example_root,
 
     print(f"Run inference with lora id -1...")
     venv_check_call(llm_venv, [
-        f"{phi_example_root}/../run.py",
+        f"{phi_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--input_text={input_text}",
         "--lora_task_uids=-1",
@@ -520,7 +523,7 @@ def test_llm_phi_quantization_1gpu(data_type, llm_phi_model_root, llm_venv,
 
     print("Convert checkpoint by modelopt...")
     convert_cmd = [
-        f"{phi_example_root}/../quantization/quantize.py",
+        f"{phi_example_root}/../../../quantization/quantize.py",
         f"--model_dir={llm_phi_model_root}",
         f"--calib_dataset={llm_datasets_root}/cnn_dailymail",
         f"--dtype={data_type}",
@@ -553,7 +556,7 @@ def test_llm_phi_quantization_1gpu(data_type, llm_phi_model_root, llm_venv,
         threshold_score = 22.0
 
     summary_cmd = [
-        f"{phi_example_root}/../summarize.py",
+        f"{phi_example_root}/../../../summarize.py",
         "--test_trt_llm",
         f"--hf_model_dir={llm_phi_model_root}",
         f"--tokenizer_dir={llm_phi_model_root}",
@@ -570,6 +573,7 @@ def test_llm_phi_quantization_1gpu(data_type, llm_phi_model_root, llm_venv,
 
 
 @skip_pre_ada
+@skip_post_blackwell
 @pytest.mark.parametrize("llm_phi_model_root", [
     "phi-2", "Phi-3-mini-128k-instruct", "Phi-3-small-128k-instruct",
     "Phi-3.5-mini-instruct", "Phi-3.5-MoE-instruct", "Phi-4-mini-instruct"
@@ -594,7 +598,7 @@ def test_phi_fp8_with_bf16_lora(llm_phi_model_root,
     # Quantize the base model to fp8.
     print("Convert checkpoint by modelopt...")
     convert_cmd = [
-        f"{phi_example_root}/../quantization/quantize.py",
+        f"{phi_example_root}/../../../quantization/quantize.py",
         f"--model_dir={llm_phi_model_root}",
         f"--calib_dataset={llm_datasets_root}/cnn_dailymail",
         f"--dtype={data_type}",

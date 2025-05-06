@@ -16,7 +16,9 @@ import copy
 import gc
 import inspect
 import json
+import linecache
 import math
+import os
 import struct
 import trace
 import weakref
@@ -28,7 +30,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
-from cuda import cuda
+import nvtx
 from mpi4py import MPI
 from packaging import version
 
@@ -113,29 +115,6 @@ def copy_torch_to_numpy(x: torch.Tensor, ndarray: np.array):
     else:
         torch.from_numpy(ndarray).copy_(x)
     return ndarray
-
-
-# ref: https://github.com/NVIDIA/cuda-python/blob/main/examples/extra/jit_program_test.py
-def get_sm_version():
-    # Init
-    err, = cuda.cuInit(0)
-    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
-
-    # Device
-    err, cuDevice = cuda.cuDeviceGet(0)
-    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
-
-    # Get target architecture
-    err, sm_major = cuda.cuDeviceGetAttribute(
-        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-        cuDevice)
-    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
-    err, sm_minor = cuda.cuDeviceGetAttribute(
-        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-        cuDevice)
-    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
-
-    return sm_major * 10 + sm_minor
 
 
 def trt_version():
@@ -529,6 +508,14 @@ def mpi_isend(buf, dest, tag=0):
     return None
 
 
+def mpi_send(buf, dest, tag=0):
+    # send in buf-like objects (e.g. numpy array)
+    # return request handle if ENABLE_MULTI_DEVICE
+    if ENABLE_MULTI_DEVICE:
+        mpi_comm().Send(buf, dest, tag=tag)
+    return None
+
+
 def mpi_recv(buf, source, tag):
     # recv in buf-like object (e.g. numpy array)
     if ENABLE_MULTI_DEVICE:
@@ -660,11 +647,56 @@ def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def is_trace_enabled(env_var: str):
+    value = os.environ.get(env_var, "-1")
+    if value == "ALL":
+        return True
+    try:
+        return int(value) == global_mpi_rank()
+    except ValueError:
+        return False
+
+
 def trace_func(func):
 
     @wraps(func)
     def wrapper(*args, **kwargs):
-        tracer = trace.Trace(trace=1, count=0)
+        import dill  # nosec B403
+
+        def globaltrace(frame, why, arg):
+            if why == "call":
+                code = frame.f_code
+                filename = frame.f_globals.get('__file__', None)
+                if filename:
+                    modulename = trace._modname(filename)
+                    if modulename is not None:
+                        ignore_it = tracer.ignore.names(filename, modulename)
+                        if not ignore_it:
+                            print(
+                                f"[rank{rank}] --- path: {filename}, funcname: {code.co_name}"
+                            )
+                            return localtrace
+                else:
+                    return None
+
+        def localtrace(frame, why, arg):
+            if why == "line":
+                filename = frame.f_code.co_filename
+                lineno = frame.f_lineno
+                bname = os.path.basename(filename)
+                print(
+                    f"[rank{rank}] {bname}:{lineno}: {linecache.getline(filename, lineno)}",
+                    end="")
+            return localtrace
+
+        ignoredirs = [
+            os.path.dirname(package.__file__)
+            for package in [os, torch, trace, dill]
+        ]
+        tracer = trace.Trace(trace=1, count=0, ignoredirs=ignoredirs)
+        rank = global_mpi_rank()
+        tracer.globaltrace = globaltrace
+        tracer.localtrace = localtrace
         result = tracer.runfunc(func, *args, **kwargs)
         return result
 
@@ -749,12 +781,76 @@ class QuantModeWrapper:
 
 
 @contextmanager
-def nvtx_range(msg):
-    torch.cuda.nvtx.range_push(msg)
-    try:
-        yield
-    finally:
-        torch.cuda.nvtx.range_pop()
+def _null_context_manager():
+    yield
+
+
+def nvtx_range(msg: str,
+               color: str = "grey",
+               domain: str = "TensorRT-LLM",
+               category: Optional[str] = None):
+    """
+    Creates an NVTX range annotation for profiling.
+
+    This function returns a context manager that marks the beginning and end of a
+    range in NVIDIA Tools Extension (NVTX) profiling tools like Nsight Systems.
+
+    Args:
+        msg (str): The message/name for the NVTX range.
+        color (str, optional): The color to use for the range in the profiler. Defaults to "grey".
+        domain (str, optional): The domain name for the range. Defaults to "TensorRT-LLM".
+        category (str, optional): The category for the range. Defaults to None.
+
+    Returns:
+        contextmanager: A context manager that marks the NVTX range.
+    """
+    return nvtx.annotate(msg, color=color, domain=domain, category=category)
+
+
+def nvtx_range_debug(msg: str,
+                     color: str = "grey",
+                     domain: str = "TensorRT-LLM",
+                     category: Optional[str] = None):
+    """
+    Creates an NVTX range annotation for debugging purposes.
+
+    Similar to nvtx_range, but only creates the range if specific environment
+    variables are set, making it suitable for debug profiling.
+
+    Args:
+        msg (str): The message/name for the NVTX range.
+        color (str, optional): The color to use for the range in the profiler. Defaults to "grey".
+        domain (str, optional): The domain name for the range. Defaults to "TensorRT-LLM".
+        category (str, optional): The category for the range. Defaults to None.
+
+    Returns:
+        contextmanager: A context manager that either marks the NVTX range if enabled,
+                        or a null context manager that does nothing if disabled.
+    """
+    if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
+            os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
+        return nvtx_range(msg, color=color, domain=domain, category=category)
+    else:
+        return _null_context_manager()
+
+
+def nvtx_mark(msg: str,
+              color: str = "grey",
+              domain: str = "TensorRT-LLM",
+              category: Optional[str] = None):
+    """
+    Creates an NVTX marker for profiling.
+
+    This function places a single marker point in NVIDIA Tools Extension (NVTX)
+    profiling tools like Nsight Systems, useful for marking specific events.
+
+    Args:
+        msg (str): The message/name for the NVTX marker.
+        color (str, optional): The color to use for the marker in the profiler. Defaults to "grey".
+        domain (str, optional): The domain name for the marker. Defaults to "TensorRT-LLM".
+        category (str, optional): The category for the marker. Defaults to None.
+    """
+    nvtx.mark(msg, color=color, category=category, domain=domain)
 
 
 def volume(d: Sequence[int]):
@@ -840,34 +936,33 @@ def convert_to_torch_tensor(
 
 class KVCacheEventSerializer:
 
-    def get_event_serialize_func(event_type):
+    @classmethod
+    def get_event_serialize_func(cls, event_type):
         return {
-            "KVCacheCreatedData": KVCacheEventSerializer._created_to_json,
-            "KVCacheStoredData": KVCacheEventSerializer._stored_to_json,
-            "KVCacheStoredBlockData":
-            KVCacheEventSerializer._stored_block_to_json,
-            "KVCacheRemovedData": KVCacheEventSerializer._removed_to_json,
-            "KVCacheUpdatedData": KVCacheEventSerializer._updated_to_json,
+            "KVCacheCreatedData": cls._created_to_json,
+            "KVCacheStoredData": cls._stored_to_json,
+            "KVCacheStoredBlockData": cls._stored_block_to_json,
+            "KVCacheRemovedData": cls._removed_to_json,
+            "KVCacheUpdatedData": cls._updated_to_json,
         }.get(event_type, None)
 
-    @staticmethod
-    def serialize(events):
+    @classmethod
+    def serialize(cls, events):
         if events is None:
             return None
 
         if not isinstance(events, list):
-            events = [events]
+            return cls.to_json_str(events)
 
-        return [KVCacheEventSerializer.to_json_str(event) for event in events]
+        return [cls.to_json_str(event) for event in events]
 
-    @staticmethod
-    def to_json_str(event):
+    @classmethod
+    def to_json_str(cls, event):
         if event is None:
             return {}
 
         event_type = type(event.data).__name__
-        event_serialize_func = KVCacheEventSerializer.get_event_serialize_func(
-            event_type)
+        event_serialize_func = cls.get_event_serialize_func(event_type)
         if event_serialize_func is None:
             raise ValueError(f"Unknown KVCache event data type: {event_type}")
 

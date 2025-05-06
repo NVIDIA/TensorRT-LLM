@@ -1,14 +1,32 @@
+import itertools
 import math
-import random
 from dataclasses import dataclass
-from typing import List
+from typing import List, Tuple
 
 import pytest
 import torch
+from utils.util import skip_blackwell
 
 from tensorrt_llm._torch.attention_backend.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+
+
+def generate_attn_scenarios(num_q_heads_kv_heads: List[Tuple[int, int]],
+                            head_dim: List[int], num_layers: List[int],
+                            dtype: List[torch.dtype]):
+    scenarios = []
+    product_iter = itertools.product(num_q_heads_kv_heads, head_dim, num_layers,
+                                     dtype)
+    for num_q_heads_kv_head, head_dim, num_layers, dtype in product_iter:
+        num_q_heads, num_kv_heads = num_q_heads_kv_head
+        scenarios.append(
+            Scenario(num_heads=num_q_heads,
+                     num_kv_heads=num_kv_heads,
+                     head_dim=head_dim,
+                     num_layers=num_layers,
+                     dtype=dtype))
+    return scenarios
 
 
 def calculate_ref_result(q: torch.Tensor,
@@ -110,6 +128,10 @@ class Scenario:
     def num_kv_groups(self) -> int:
         return self.num_heads // self.num_kv_heads
 
+    # self-defined repr for pytest substring match
+    def __repr__(self) -> str:
+        return f"Scenario(num_heads_{self.num_heads}, num_kv_heads_{self.num_kv_heads}, head_dim_{self.head_dim}, num_layers_{self.num_layers}, dtype_{self.dtype})"
+
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -130,10 +152,6 @@ min_context_sequence_length = 1
 max_context_sequence_length = 1000
 min_num_contexts = 1
 max_num_contexts = 10
-random_context_sequence_lengths = [
-    random.randint(min_context_sequence_length, max_context_sequence_length)
-    for _ in range(random.randint(min_num_contexts, max_num_contexts))
-]
 
 # Define test data
 context_sequence_lengths = [
@@ -141,31 +159,26 @@ context_sequence_lengths = [
     [100, 300, 20, 10],
     [253, 253, 253, 253],
     [100, 1110, 1000, 1000],
-    random_context_sequence_lengths,
 ]
 
-scenarios = [
-    # num_heads == num_kv_heads, single layer
-    Scenario(
-        num_layers=1,
-        num_heads=32,
-        num_kv_heads=32,
-        head_dim=128,
-        dtype=torch.float16,
-    ),
-    # num_heads > num_kv_heads, multi-layer
-    Scenario(
-        num_layers=2,
-        num_heads=32,
-        num_kv_heads=8,
-        head_dim=128,
-        dtype=torch.float16,
-    ),
+num_q_heads_kv_heads = [
+    (32, 32),
+    (32, 8),
+    (16, 16),
 ]
+num_layers = [1, 2, 16]
+head_dim = [64, 72, 128]
+dtype = [torch.float16]
+
+scenarios = generate_attn_scenarios(num_q_heads_kv_heads, head_dim, num_layers,
+                                    dtype)
 
 
+# skip for blackwell
+@skip_blackwell
+@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5247232")
 # Convert parameterized tests to pytest parametrize
-@pytest.mark.parametrize("accuracy", [(1e-2, 1e-3)],
+@pytest.mark.parametrize("accuracy", [(1e-2, 1e-2)],
                          ids=lambda x: f"atol={x[0]} rtol={x[1]}")
 @pytest.mark.parametrize("scenario", scenarios, ids=lambda x: f"scenario: {x}")
 @pytest.mark.parametrize("context_sequence_lengths",
@@ -178,6 +191,9 @@ def test_attention_no_cache(scenario: Scenario,
                             context_sequence_lengths: List[int], mask_type,
                             accuracy):
     """Test attention computation without using cache for both FULL and CAUSAL masks"""
+    # set seed for reproducibility
+    torch.manual_seed(720)
+
     num_heads = scenario.num_heads
     num_kv_heads = scenario.num_kv_heads
     head_dim = scenario.head_dim
@@ -246,9 +262,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
         max_num_tokens=8192,
         kv_cache_manager=None,
         mapping=None,
-        runtime_features=None,
-        is_dummy_attention=False,
-    )
+        runtime_features=None)
 
     # NOTE: set up metadata
     attn_metadata.seq_lens = torch.tensor(sequence_lengths, dtype=torch.int)

@@ -24,6 +24,7 @@
 using namespace nvinfer1;
 using tensorrt_llm::plugins::RecvPluginCreator;
 using tensorrt_llm::plugins::RecvPlugin;
+using tensorrt_llm::mpi::MpiTag;
 
 static char const* RECV_PLUGIN_VERSION{"1"};
 static char const* RECV_PLUGIN_NAME{"Recv"};
@@ -131,7 +132,7 @@ int RecvPlugin::initialize() noexcept
         return 0;
     }
     ncclUniqueId id;
-    COMM_SESSION.recvValue(id, mSrcRank, 0);
+    COMM_SESSION.recvValue(id, mSrcRank, MpiTag::kDefault);
 // Need static connection initialization for accurate KV cache size estimation
 #if defined(_WIN32)
     if (getenv("NCCL_RUNTIME_CONNECT") == nullptr)

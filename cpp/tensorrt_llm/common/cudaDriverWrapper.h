@@ -85,6 +85,8 @@ public:
 
     CUresult cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevice dev) const;
 
+    CUresult cuOccupancyMaxActiveClusters(int* maxActiveClusters, CUfunction f, CUlaunchConfig const* config) const;
+
 private:
     void* handle;
     CUDADriverWrapper();
@@ -114,6 +116,7 @@ private:
         CUtensorMapSwizzle swizzle, CUtensorMapL2promotion l2Promotion, CUtensorMapFloatOOBfill oobFill);
     CUresult (*_cuMemcpyDtoH)(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount);
     CUresult (*_cuDeviceGetAttribute)(int*, CUdevice_attribute attrib, CUdevice dev);
+    CUresult (*_cuOccupancyMaxActiveClusters)(int*, CUfunction f, CUlaunchConfig const* config);
 };
 
 template <typename T>

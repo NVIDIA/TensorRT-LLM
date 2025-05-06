@@ -19,12 +19,10 @@ import pathlib as _pl
 import platform as _pf
 import sys as _sys
 
-from build_engines_utils import init_model_spec_module, run_command, wincopy
-
-init_model_spec_module()
-import model_spec
+from build_engines_utils import run_command, wincopy
 
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.bindings.internal.testing import ModelSpec
 
 
 def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, convert_extra_args,
@@ -32,11 +30,12 @@ def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, convert_extra_args,
 
     ckpt_dir = engine_dir / 'ckpt'
 
-    convert_cmd = [_sys.executable, "examples/llama/convert_checkpoint.py"
-                   ] + ([f'--model_dir={weight_dir}'] if weight_dir else []) + [
-                       f'--output_dir={ckpt_dir}',
-                       '--dtype=float16',
-                   ] + convert_extra_args
+    convert_cmd = [
+        _sys.executable, "examples/models/core/llama/convert_checkpoint.py"
+    ] + ([f'--model_dir={weight_dir}'] if weight_dir else []) + [
+        f'--output_dir={ckpt_dir}',
+        '--dtype=float16',
+    ] + convert_extra_args
 
     run_command(convert_cmd)
 
@@ -61,11 +60,12 @@ def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, convert_extra_args,
 def build_engines(model_cache: str, only_multi_gpu: bool):
     resources_dir = _pl.Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
-    model_name = 'llama-7b-hf'
+    model_name = 'Llama-3.2-1B'
 
     if model_cache:
         print("Copy model from model_cache")
-        model_cache_dir = _pl.Path(model_cache) / 'llama-models' / model_name
+        model_cache_dir = _pl.Path(
+            model_cache) / 'llama-3.2-models' / model_name
         assert (model_cache_dir.is_dir()), model_cache_dir
 
         if _pf.system() == "Windows":
@@ -83,7 +83,7 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
 
     engine_dir = models_dir / 'rt_engine' / model_name
 
-    model_spec_obj = model_spec.ModelSpec('input_tokens.npy', _tb.DataType.HALF)
+    model_spec_obj = ModelSpec('input_tokens_llama.npy', _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.use_packed_input()

@@ -15,13 +15,13 @@
  * limitations under the License.
  */
 
+#include "fp4_gemm.h"
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp4_gemm.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -74,7 +74,7 @@ public:
         allreduce_fusion_params.norm_out = nullptr;
 
         if (fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
-            || fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_AND_QUANT_NVFP4)
+            || fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
         {
             TORCH_CHECK(reduce_fusion_inputs.size() == 3, "Pre-MLP fusion should have 3 inputs.");
 
@@ -101,7 +101,7 @@ public:
             allreduce_fusion_params.scale_out = scale_out.mutable_data_ptr();
             allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
 
-            if (fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_AND_QUANT_NVFP4)
+            if (fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
             {
                 norm_out = torch::empty_like(input);
                 allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
@@ -139,9 +139,10 @@ public:
         allreduce_fusion_params.residual_in = reduce_fusion_inputs[0].data_ptr();
         allreduce_fusion_params.rms_gamma = reduce_fusion_inputs[1].data_ptr();
         allreduce_fusion_params.rms_eps = static_cast<float>(eps);
+        allreduce_fusion_params.use_oneshot = input.size(0) <= tensorrt_llm::kernels::ar_fusion::kOneShotMaxToken;
 
         if (fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
-            || fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_AND_QUANT_NVFP4)
+            || fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
         {
             allreduce_fusion_params.scale_factor = static_cast<float*>(reduce_fusion_inputs[2].data_ptr());
         }
@@ -162,7 +163,7 @@ public:
         {
             return std::vector<torch::Tensor>({norm_out, residual_out});
         }
-        else if (fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_AND_QUANT_NVFP4)
+        else if (fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
         {
             return std::vector<torch::Tensor>({norm_out, quant_out, scale_out, residual_out});
         }
@@ -175,9 +176,6 @@ public:
     std::vector<torch::Tensor> run_moe_allreduce(torch::optional<torch::Tensor> workspace,
         torch::TensorList reduce_fusion_inputs, int64_t rank, int64_t nranks, double eps, int64_t fusion_op) noexcept
     {
-        auto const fusion_op_type = static_cast<AllReduceFusionOp>(int8_t(fusion_op));
-        TORCH_CHECK(fusion_op_type == AllReduceFusionOp::MOE_ALLREDUCE_RESIDUAL_RMS_NORM,
-            "Only support MOE_ALLREDUCE_RESIDUAL_RMS_NORM");
 
         auto allreduce_fusion_params = tensorrt_llm::kernels::ar_fusion::moe::MoeReductionAllReduceFusionParams();
 
@@ -262,14 +260,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     // 0: residual
     // 1. gamma
     // 2. scale_factor: only when fusion_op == RESIDUAL_RMS_NORM_QUANT_NVFP4
-
-    // for moe allreduce
-    // 0: residual
-    // 1: gamma
-    // 2: moe_reduction_device_num_experts [1]
-    // 3: moe_reduction_scale_input [global_num_experts, m]
-    // 4: moe_reduction_active_experts_token_input [device_num_experts, m, 7168]
-    // 5: moe_reduction_token_input [m, 7168]
     m.def(
         "deepseek_allreduce_fusion(Tensor input, Tensor? workspace, Tensor[] reduce_fusion_inputs, "
         "int rank, int nranks, float eps, int fusion_op) -> Tensor[]");

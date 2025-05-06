@@ -14,6 +14,9 @@ methods:
       embedding_parallel_mode:
         annotation: str
         default: SHARDING_ALONG_VOCAB
+      moe_cluster_parallel_size:
+        annotation: Optional[int]
+        default: null
       # Engine building
       build_config:
         annotation: Optional[tensorrt_llm.builder.BuildConfig]
@@ -40,6 +43,9 @@ methods:
       decoding_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.DecodingConfig]
         default: null
+      cache_transceiver_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig]
+        default: null
       # Misc
       backend:
         annotation: Optional[str]
@@ -64,6 +70,9 @@ methods:
         default: null
       workspace:
         annotation: Optional[str]
+        default: null
+      lora_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.LoraConfig]
         default: null
       kwargs:
         annotation: Any

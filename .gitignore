@@ -16,6 +16,7 @@ build
 tmp/
 venv/
 .venv/
+.venv-*/
 .python-version
 .local/
 .hypothesis/

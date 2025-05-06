@@ -26,10 +26,15 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/common/optionalRef.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
+#include "tensorrt_llm/runtime/torch.h"
+#include "tensorrt_llm/runtime/torchView.h"
+
 #include <filesystem>
 #include <pybind11/stl_bind.h>
+#include <torch/extension.h>
 
 // Pybind requires to have a central include in order for type casters to work.
 // Opaque bindings add a type caster, so they have the same requirement.
@@ -37,7 +42,6 @@
 
 // Opaque bindings
 PYBIND11_MAKE_OPAQUE(tensorrt_llm::batch_manager::ReqIdsSet)
-PYBIND11_MAKE_OPAQUE(tensorrt_llm::batch_manager::RequestVector)
 PYBIND11_MAKE_OPAQUE(std::vector<tensorrt_llm::batch_manager::SlotDecoderBuffers>)
 PYBIND11_MAKE_OPAQUE(std::vector<tensorrt_llm::runtime::decoder_batch::Request>)
 PYBIND11_MAKE_OPAQUE(std::vector<tensorrt_llm::runtime::SamplingConfig>)
@@ -150,6 +154,54 @@ public:
 template <>
 struct type_caster<std::filesystem::path> : public PathCaster<std::filesystem::path>
 {
+};
+
+template <>
+class type_caster<tensorrt_llm::executor::StreamPtr>
+{
+public:
+    PYBIND11_TYPE_CASTER(tensorrt_llm::executor::StreamPtr, _("int"));
+
+    bool load([[maybe_unused]] handle src, bool)
+    {
+        auto stream_ptr = src.cast<uintptr_t>();
+        value = std::make_shared<tensorrt_llm::runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream_ptr));
+
+        return true;
+    }
+
+    static handle cast(
+        tensorrt_llm::executor::StreamPtr const& src, return_value_policy /* policy */, handle /* parent */)
+    {
+        // Return cudaStream_t as integer.
+        return PyLong_FromVoidPtr(src->get());
+    }
+};
+
+template <>
+struct type_caster<tensorrt_llm::executor::Tensor>
+{
+public:
+    PYBIND11_TYPE_CASTER(tensorrt_llm::executor::Tensor, _("torch.Tensor"));
+
+    // Convert PyObject(torch.Tensor) -> tensorrt_llm::executor::Tensor
+    bool load(handle src, bool)
+    {
+        PyObject* obj = src.ptr();
+        if (THPVariable_Check(obj))
+        {
+            at::Tensor const& t = THPVariable_Unpack(obj);
+            value = tensorrt_llm::executor::detail::ofITensor(tensorrt_llm::runtime::TorchView::of(t));
+            return true;
+        }
+        return false;
+    }
+
+    // Convert tensorrt_llm::executor::Tensor -> PyObject(torch.Tensor)
+    static handle cast(tensorrt_llm::executor::Tensor const& src, return_value_policy /* policy */, handle /* parent */)
+    {
+        return THPVariable_Wrap(tensorrt_llm::runtime::Torch::tensor(tensorrt_llm::executor::detail::toITensor(src)));
+    }
 };
 
 } // namespace detail

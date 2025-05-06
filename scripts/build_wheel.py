@@ -16,7 +16,6 @@
 
 import os
 import platform
-import re
 import sys
 from argparse import ArgumentParser
 from contextlib import contextmanager
@@ -25,9 +24,10 @@ from multiprocessing import cpu_count
 from pathlib import Path
 from shutil import copy, copytree, rmtree
 from subprocess import DEVNULL, CalledProcessError, check_output, run
-from tempfile import TemporaryDirectory
 from textwrap import dedent
 from typing import List
+
+build_run = partial(run, shell=True, check=True)
 
 
 @contextmanager
@@ -54,17 +54,107 @@ def get_build_dir(build_dir, build_type):
         build_dir = get_source_dir() / ("build" if build_type == "Release" else
                                         f"build_{build_type}")
     else:
-        build_dir = Path(build_dir)
+        build_dir = Path(build_dir).resolve()
     return build_dir
 
 
 def clear_folder(folder_path):
     for item in os.listdir(folder_path):
         item_path = os.path.join(folder_path, item)
-        if os.path.isdir(item_path):
+        if os.path.isdir(item_path) and not os.path.islink(item_path):
             rmtree(item_path)
         else:
             os.remove(item_path)
+
+
+def setup_venv(project_dir: Path, requirements_file: Path):
+    """Creates/updates a venv and installs requirements.
+
+    Args:
+        project_dir: The root directory of the project.
+        requirements_file: Path to the requirements file.
+
+    Returns:
+        Tuple[Path, Path]: Paths to the python and conan executables in the venv.
+    """
+    py_major = sys.version_info.major
+    py_minor = sys.version_info.minor
+    venv_dir = project_dir / f".venv-{py_major}.{py_minor}"
+    print(
+        f"-- Using virtual environment at: {venv_dir} (Python {py_major}.{py_minor})"
+    )
+
+    # Ensure compatible virtualenv version is installed (>=20.29.1, <22.0)
+    print("-- Ensuring virtualenv version >=20.29.1,<22.0 is installed...")
+    build_run(f'"{sys.executable}" -m pip install "virtualenv>=20.29.1,<22.0"')
+
+    # Create venv if it doesn't exist
+    if not venv_dir.exists():
+        print(f"-- Creating virtual environment in {venv_dir}...")
+        build_run(
+            f'"{sys.executable}" -m virtualenv --system-site-packages "{venv_dir}"'
+        )
+    else:
+        print("-- Virtual environment already exists.")
+
+    # Determine venv executable paths
+    scripts_dir = venv_dir / "bin"
+    venv_python = scripts_dir / "python"
+
+    # Install/update requirements
+    print(
+        f"-- Installing requirements from {requirements_file} into {venv_dir}..."
+    )
+    build_run(f'"{venv_python}" -m pip install -r "{requirements_file}"')
+
+    venv_conan = setup_conan(scripts_dir, venv_python)
+
+    return venv_python, venv_conan
+
+
+def setup_conan(scripts_dir, venv_python):
+    build_run(f'"{venv_python}" -m pip install conan==2.14.0')
+    # Determine the path to the conan executable within the venv
+    venv_conan = scripts_dir / "conan"
+    if not venv_conan.exists():
+        # Attempt to find it using shutil.which as a fallback, in case it's already installed in the system
+        try:
+            result = build_run(
+                f'''{venv_python} -c "import shutil; print(shutil.which('conan'))" ''',
+                capture_output=True,
+                text=True)
+            conan_path_str = result.stdout.strip()
+
+            if conan_path_str:
+                venv_conan = Path(conan_path_str)
+                print(
+                    f"-- Found conan executable via PATH search at: {venv_conan}"
+                )
+            else:
+                raise RuntimeError(
+                    f"Failed to locate conan executable in virtual environment {scripts_dir} or system PATH."
+                )
+
+        except CalledProcessError as e:
+            print(f"Fallback search command output: {e.stdout}",
+                  file=sys.stderr)
+            print(f"Fallback search command error: {e.stderr}", file=sys.stderr)
+            raise RuntimeError(
+                f"Failed to locate conan executable in virtual environment {scripts_dir} or system PATH."
+            )
+    else:
+        print(f"-- Found conan executable at: {venv_conan}")
+
+    # Create default profile
+    build_run(f'"{venv_conan}" profile detect -f')
+
+    # Add the tensorrt-llm remote if it doesn't exist
+    build_run(
+        f'"{venv_conan}" remote add --force tensorrt-llm https://edge.urm.nvidia.com/artifactory/api/conan/sw-tensorrt-llm-conan',
+        stdout=DEVNULL,
+        stderr=DEVNULL)
+
+    return venv_conan
 
 
 def main(*,
@@ -78,7 +168,7 @@ def main(*,
          extra_make_targets: str = "",
          trt_root: str = '/usr/local/tensorrt',
          nccl_root: str = None,
-         nvrtc_wrapper_root: str = None,
+         internal_cutlass_kernels_root: str = None,
          clean: bool = False,
          clean_wheel: bool = False,
          configure_cmake: bool = False,
@@ -99,7 +189,6 @@ def main(*,
 
     project_dir = get_project_dir()
     os.chdir(project_dir)
-    build_run = partial(run, shell=True, check=True)
 
     # Get all submodules and check their folder exists. If not,
     # invoke git submodule update
@@ -113,9 +202,13 @@ def main(*,
         build_run('git submodule update --init --recursive')
     on_windows = platform.system() == "Windows"
     requirements_filename = "requirements-dev-windows.txt" if on_windows else "requirements-dev.txt"
-    build_run(f"\"{sys.executable}\" -m pip install -r {requirements_filename}")
-    # Ensure TRT is installed on windows to prevent surprises.
-    reqs = check_output([sys.executable, "-m", "pip", "freeze"])
+
+    # Setup venv and install requirements
+    venv_python, venv_conan = setup_venv(project_dir,
+                                         project_dir / requirements_filename)
+
+    # Ensure base TRT is installed (check inside the venv)
+    reqs = check_output([str(venv_python), "-m", "pip", "freeze"])
     installed_packages = [r.decode().split("==")[0] for r in reqs.split()]
     if "tensorrt" not in installed_packages:
         error_msg = "TensorRT was not installed properly."
@@ -126,7 +219,7 @@ def main(*,
                 " See https://docs.nvidia.com/deeplearning/tensorrt/install-guide/index.html#installing-zip for more details."
             )
         else:
-            error_msg += " Please run `pip install tensorrt` manually and relaunch build_wheel.py"
+            error_msg += f" Please install tensorrt into the venv using \"`{venv_python}` -m pip install tensorrt\" and relaunch build_wheel.py"
         raise RuntimeError(error_msg)
 
     if cuda_architectures is not None:
@@ -139,8 +232,6 @@ def main(*,
 
     cmake_def_args = []
     cmake_generator = ""
-
-    hardware_arch = platform.machine()
 
     if on_windows:
         # Windows does not support multi-device currently.
@@ -167,21 +258,10 @@ def main(*,
         cmake_def_args.extend(set(extra_cmake_vars))
 
     if trt_root is not None:
-        trt_root = trt_root.replace("\\", "/")
-        trt_lib_dir_candidates = (
-            f"{trt_root}/targets/{hardware_arch}-linux-gnu/lib",
-            f"{trt_root}/lib")
-        try:
-            trt_lib_dir = next(
-                filter(lambda x: Path(x).exists(), trt_lib_dir_candidates))
-        except StopIteration:
-            trt_lib_dir = trt_lib_dir_candidates[0]
-        cmake_def_args.append(f"-DTRT_LIB_DIR={trt_lib_dir}")
-        cmake_def_args.append(f"-DTRT_INCLUDE_DIR={trt_root}/include")
+        cmake_def_args.append(f"-DTensorRT_ROOT={trt_root}")
 
     if nccl_root is not None:
-        cmake_def_args.append(f"-DNCCL_LIB_DIR={nccl_root}/lib")
-        cmake_def_args.append(f"-DNCCL_INCLUDE_DIR={nccl_root}/include")
+        cmake_def_args.append(f"-DNCCL_ROOT={nccl_root}")
 
     build_dir = get_build_dir(build_dir, build_type)
     first_build = not Path(build_dir, "CMakeFiles").exists()
@@ -224,75 +304,18 @@ def main(*,
 
     source_dir = get_source_dir()
 
-    def install_conan():
-        # Determine the system ID
-        with Path("/etc/os-release").open("r") as f:
-            for line in f:
-                if line.startswith("ID="):
-                    system_id = line.split("=")[1].strip()
-                    break
-            else:
-                system_id = "unknown"
-        # Install Conan if it's not already installed
-        # TODO move this install to the container image
-        conan_path = "conan"
-        if "rocky" not in system_id:
-            build_run(f"\"{sys.executable}\" -m pip install conan==2.14.0")
-        else:
-            conan_dir = Path(build_dir, "tool/conan")
-            conan_dir.mkdir(parents=True, exist_ok=True)
-            conan_path = conan_dir / "bin/conan"
-            if not conan_path.exists():
-                with TemporaryDirectory() as tmpdir:
-                    tmpdir_p = Path(tmpdir)
-                    archive_p = tmpdir_p / "conan.tgz"
-                    build_run(
-                        f"wget --retry-connrefused -O {archive_p} https://github.com/conan-io/conan/releases/download/2.14.0/conan-2.14.0-linux-x86_64.tgz"
-                    )
-                    build_run(f"tar -C {conan_dir} -xf {archive_p}")
-        # Install dependencies with Conan
-        build_run(
-            f"{conan_path} remote add -verror --force tensorrt-llm https://edge.urm.nvidia.com/artifactory/api/conan/sw-tensorrt-llm-conan"
-        )
-        build_run(f"{conan_path} profile detect -f")
-        return conan_path
-
-    conan_path = install_conan()
-
-    # Build the NVRTC wrapper if the source directory exists
-    if nvrtc_wrapper_root is not None and Path(nvrtc_wrapper_root).exists():
-        print(f"Building the NVRTC wrapper from source in {nvrtc_wrapper_root}")
-        conan_data = Path(source_dir, "conandata.yml").read_text()
-        nvrtc_wrapper_version = re.search(
-            r'tensorrt_llm_nvrtc_wrapper:\s*(\S+)', conan_data).group(1)
-        build_run(
-            f"{conan_path} editable add {nvrtc_wrapper_root}/conan/nvrtc_wrapper --version {nvrtc_wrapper_version}"
-        )
-        nvrtc_wrapper_args = ""
-        if clean:
-            nvrtc_wrapper_args += " -c"
-        if configure_cmake:
-            nvrtc_wrapper_args += " --configure_cmake"
-        if use_ccache:
-            nvrtc_wrapper_args += " --use_ccache"
-        build_run(
-            f'"{sys.executable}" {nvrtc_wrapper_root}/scripts/build_wheel.py {nvrtc_wrapper_args} -a "{cuda_architectures}" -D "USE_CXX11_ABI=1;BUILD_NVRTC_WRAPPER=1" -l'
-        )
-    else:
-        # If the NVRTC wrapper source directory is not present, remove the editable NVRTC wrapper from the conan cache
-        build_run(
-            f"{conan_path} editable remove -r 'tensorrt_llm_nvrtc_wrapper/*'",
-            stdout=DEVNULL,
-            stderr=DEVNULL)
-
     with working_directory(build_dir):
         if clean or first_build or configure_cmake:
             build_run(
-                f"{conan_path} install --remote=tensorrt-llm --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
+                f"\"{venv_conan}\" install --remote=tensorrt-llm --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
             )
             cmake_def_args.append(
                 f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"
             )
+            if internal_cutlass_kernels_root:
+                cmake_def_args.append(
+                    f"-DINTERNAL_CUTLASS_KERNELS_PATH={internal_cutlass_kernels_root}"
+                )
             cmake_def_args = " ".join(cmake_def_args)
             cmake_configure_command = (
                 f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}"'
@@ -303,6 +326,7 @@ def main(*,
             print("CMake Configure command: ")
             print(cmake_configure_command)
             build_run(cmake_configure_command)
+
         cmake_build_command = (
             f'cmake --build . --config {build_type} --parallel {job_count} '
             f'--target build_wheel_targets {" ".join(extra_make_targets)}')
@@ -399,10 +423,6 @@ def main(*,
         install_file(
             build_dir / f"tensorrt_llm/plugins/nvinfer_plugin_tensorrt_llm.dll",
             lib_dir / "nvinfer_plugin_tensorrt_llm.dll")
-        install_file(
-            build_dir /
-            "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/tensorrt_llm_nvrtc_wrapper.dll",
-            lib_dir / "tensorrt_llm_nvrtc_wrapper.dll")
     else:
         install_file(build_dir / "tensorrt_llm/libtensorrt_llm.so",
                      lib_dir / "libtensorrt_llm.so")
@@ -412,10 +432,6 @@ def main(*,
             build_dir /
             "tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so",
             lib_dir / "libnvinfer_plugin_tensorrt_llm.so")
-        install_file(
-            build_dir /
-            "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.so",
-            lib_dir / "libtensorrt_llm_nvrtc_wrapper.so")
         if os.path.exists(
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so"
@@ -459,8 +475,7 @@ def main(*,
         install_file(get_pybind_lib(), pkg_dir)
         if not skip_stubs:
             with working_directory(project_dir):
-                build_run(
-                    f"\"{sys.executable}\" -m pip install pybind11-stubgen")
+                build_run(f"\"{venv_python}\" -m pip install pybind11-stubgen")
             with working_directory(pkg_dir):
                 if on_windows:
                     stubgen = "stubgen.py"
@@ -482,7 +497,7 @@ def main(*,
                         main()
                     """.format(lib_dir=lib_dir)
                     (pkg_dir / stubgen).write_text(dedent(stubgen_contents))
-                    build_run(f"\"{sys.executable}\" {stubgen} -o . bindings")
+                    build_run(f"\"{venv_python}\" {stubgen} -o . bindings")
                     (pkg_dir / stubgen).unlink()
                 else:
                     env_ld = os.environ.copy()
@@ -493,7 +508,7 @@ def main(*,
                     env_ld["LD_LIBRARY_PATH"] = new_library_path
                     try:
                         build_run(
-                            f"\"{sys.executable}\" -m pybind11_stubgen -o . bindings --exit-code",
+                            f"\"{venv_python}\" -m pybind11_stubgen -o . bindings --exit-code",
                             env=env_ld)
                     except CalledProcessError as ex:
                         print(f"Failed to build pybind11 stubgen: {ex}",
@@ -518,7 +533,7 @@ def main(*,
             clear_folder(dist_dir)
 
         build_run(
-            f'\"{sys.executable}\" -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"'
+            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"'
         )
 
     if install:
@@ -581,10 +596,10 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--nccl_root",
                         help="Directory to find NCCL headers/libs")
     parser.add_argument(
-        "--nvrtc_wrapper_root",
-        default="/mnt/src/tensorrt_llm_nvrtc_wrapper",
+        "--internal-cutlass-kernels-root",
+        default="",
         help=
-        "Directory to find internal NVRTC wrapper source code. If the directory exists, the NVRTC wrapper will be built from source."
+        "Directory to the internal_cutlass_kernels sources. If specified, the internal_cutlass_kernels and NVRTC wrapper libraries will be built from source."
     )
     parser.add_argument("--build_dir",
                         type=Path,

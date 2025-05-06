@@ -22,6 +22,7 @@ from defs.conftest import skip_post_blackwell, skip_pre_ada
 from defs.trt_test_alternative import check_call
 
 
+@skip_post_blackwell
 @pytest.mark.parametrize("use_dynamic_tree", [False, True],
                          ids=['eagle1', 'eagle2'])
 @pytest.mark.parametrize("batch_size", [1, 8], ids=['bs1', 'bs8'])
@@ -270,17 +271,6 @@ def test_codellama_eagle_1gpu(code_llama_model_root,
                           llm_datasets_root=llm_datasets_root,
                           llm_rouge_root=llm_rouge_root)
 
-    test_with_dummy_eagle(hf_model_root=code_llama_model_root,
-                          eagle_example_root=eagle_example_root,
-                          llm_venv=llm_venv,
-                          cmodel_dir=cmodel_dir,
-                          engine_dir=engine_dir,
-                          batch_size=batch_size,
-                          data_type=data_type,
-                          use_dynamic_tree=use_dynamic_tree,
-                          llm_datasets_root=llm_datasets_root,
-                          llm_rouge_root=llm_rouge_root)
-
 
 @pytest.mark.parametrize("use_dynamic_tree", [False, True],
                          ids=['eagle1', 'eagle2'])
@@ -298,6 +288,33 @@ def test_mistral_eagle_1gpu(llm_mistral_model_root,
                             data_type='bfloat16'):
 
     test_with_dummy_eagle(hf_model_root=llm_mistral_model_root,
+                          eagle_example_root=eagle_example_root,
+                          llm_venv=llm_venv,
+                          cmodel_dir=cmodel_dir,
+                          engine_dir=engine_dir,
+                          batch_size=batch_size,
+                          data_type=data_type,
+                          use_dynamic_tree=use_dynamic_tree,
+                          llm_datasets_root=llm_datasets_root,
+                          llm_rouge_root=llm_rouge_root)
+
+
+@pytest.mark.parametrize("use_dynamic_tree", [False, True],
+                         ids=['eagle1', 'eagle2'])
+@pytest.mark.parametrize("mistral_nemo_model_root", ['Mistral-Nemo-12b-Base'],
+                         indirect=True)
+def test_mistral_nemo_eagle_1gpu(mistral_nemo_model_root,
+                                 eagle_example_root,
+                                 llm_datasets_root,
+                                 llm_rouge_root,
+                                 llm_venv,
+                                 cmodel_dir,
+                                 engine_dir,
+                                 use_dynamic_tree,
+                                 batch_size=8,
+                                 data_type='bfloat16'):
+
+    test_with_dummy_eagle(hf_model_root=mistral_nemo_model_root,
                           eagle_example_root=eagle_example_root,
                           llm_venv=llm_venv,
                           cmodel_dir=cmodel_dir,

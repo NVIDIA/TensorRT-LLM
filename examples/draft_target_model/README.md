@@ -19,13 +19,11 @@ We provide two styles of running DTM now: using TensorRT-LLM-BLS in Triton Infer
 + We use open-source `llama-7B/13B` as draft and target models in this example, assuming the paths to the models' repository are `DRAFT_MODEL_PATH` and `TARGET_MODEL_PATH`.
 + `--use_paged_context_fmha=enable` must be specified since we need KV-Cache reuse in this approach.
 + `--speculative_decoding_mode=draft_tokens_external` and `--max_draft_len` must be specified for target model.
-+ `--use_paged_context_fmha=enable` are optional, but recommended for the performance.
 + `--gather_generation_logits` is necessary if using generation logits for selecting tokens in target model.
 + `--tp_size` can be modified set if using TP mode for draft / target model.
-+ `--max_batch_size` more than 1 is acceptable in general usage, but we use 1 in this example.
 
 ```bash
-cd examples/llama
+cd examples/models/core/llama
 export DRAFT_CKPT_PATH=/workspace/ckpt-draft
 export TARGET_CKPT_PATH=/workspace/ckpt-target
 export DRAFT_ENGINE_PATH=/workspace/engine-draft
@@ -97,9 +95,9 @@ python3 examples/run.py \
 ### Triton Inference Server workflow
 
 + This example is based on TensorRT-LLM-0.18.0 and TRTLLM-backend-0.18.0 with docker image `nvcr.io/nvidia/tritonserver:25.03-trtllm-python-py3`.
-+ Draft model approach is supported since TensorRT-LLM-0.7.0 (using two separate Tritonserver to maintain draft and target model respectively), but has significant optimization in TensorRT-LLM-0.10.0 (using one Tritonserver with [Business Logic Scripting](https://github.com/triton-inference-server/python_backend?tab=readme-ov-file#business-logic-scripting), BLS).
++ DTM model approach is supported since TensorRT-LLM-0.7.0 (using two separate Tritonserver to maintain draft and target model respectively), but has significant optimization in TensorRT-LLM-0.10.0 (using one Tritonserver with [Business Logic Scripting](https://github.com/triton-inference-server/python_backend?tab=readme-ov-file#business-logic-scripting), BLS).
 
-1. Get related repository inside the container
+#### Get related repository inside the container
 
 ```bash
 git clone https://github.com/triton-inference-server/tensorrtllm_backend.git
@@ -109,50 +107,42 @@ git lfs pull
 git submodule update --init --recursive
 pip install -r requirements.txt
 pip install SentencePiece tritonclient
-```
 
-2. Set necessary variables
-
-+ If draft and target models can be placed in one GPU (llama-7B-FP8 + llama-30B-FP8, totally 40GiB in one H100-80GiB GPU as example), `DRAFT_GPU_DEVICE_IDS` and `TARGET_GPU_DEVICE_IDS` can be the same, (`0` as example). It appears better performance than placing on two separate GPUs.
-+ Elsewise, the draft and target models can be placed in different GPUs, `DRAFT_GPU_DEVICE_IDS="0"` and `TARGET_GPU_DEVICE_IDS="1"` as example.
-+ Furthermore, if TP mode is used, the device ids can be a list, `DRAFT_GPU_DEVICE_IDS="0"` and `TARGET_GPU_DEVICE_IDS="1,2,3,4"` as example.
-
-```bash
 export DRAFT_MODEL_NAME="tensorrt_llm_draft"
 export TARGET_MODEL_NAME="tensorrt_llm"
-export DRAFT_DEVICE_IDS="0"
-export TARGET_DEVICE_IDS="1"
 export TRITON_MODEL_REPO=llama_dtm
 ```
 
-3. Edit model configuration
+#### Simple deploy
+
++ Edit model configuration.
 
 ```bash
+export DRAFT_DEVICE_IDS="0"
+export TARGET_DEVICE_IDS="1"
+
 rm -rf ${TRITON_MODEL_REPO}
 cp -r all_models/inflight_batcher_llm/ ${TRITON_MODEL_REPO}
-
-python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/ensemble/config.pbtxt triton_max_batch_size:${MAX_BATCH_SIZE},logits_datatype:TYPE_FP32
-python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/preprocessing/config.pbtxt triton_max_batch_size:${MAX_BATCH_SIZE},tokenizer_dir:${TARGET_MODEL_PATH},preprocessing_instance_count:1
-python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/postprocessing/config.pbtxt triton_max_batch_size:${MAX_BATCH_SIZE},tokenizer_dir:${TARGET_MODEL_PATH},postprocessing_instance_count:1
-python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm_bls/config.pbtxt triton_max_batch_size:${MAX_BATCH_SIZE},decoupled_mode:False,bls_instance_count:1,accumulate_tokens:False,tensorrt_llm_model_name:${TARGET_MODEL_NAME},tensorrt_llm_draft_model_name:${DRAFT_MODEL_NAME},logits_datatype:TYPE_FP32
-
 cp -r ${TRITON_MODEL_REPO}/tensorrt_llm ${TRITON_MODEL_REPO}/tensorrt_llm_draft
 sed -i 's/name: "tensorrt_llm"/name: "tensorrt_llm_draft"/g' ${TRITON_MODEL_REPO}/tensorrt_llm_draft/config.pbtxt
-python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm/config.pbtxt triton_backend:tensorrtllm,triton_max_batch_size:${MAX_BATCH_SIZE},decoupled_mode:False,max_beam_width:1,engine_dir:${TARGET_ENGINE_PATH},max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:True,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,gpu_device_ids:${TARGET_DEVICE_IDS},encoder_input_features_data_type:TYPE_FP16,logits_datatype:TYPE_FP32
-python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm_draft/config.pbtxt triton_backend:tensorrtllm,triton_max_batch_size:${MAX_BATCH_SIZE},decoupled_mode:False,max_beam_width:1,engine_dir:${DRAFT_ENGINE_PATH},max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:True,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,gpu_device_ids:${DRAFT_DEVICE_IDS},encoder_input_features_data_type:TYPE_FP16,logits_datatype:TYPE_FP32
+
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/ensemble/config.pbtxt            triton_max_batch_size:4,logits_datatype:TYPE_FP32
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/preprocessing/config.pbtxt       triton_max_batch_size:4,tokenizer_dir:${HF_MODEL},preprocessing_instance_count:1
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/postprocessing/config.pbtxt      triton_max_batch_size:4,tokenizer_dir:${HF_MODEL},postprocessing_instance_count:1
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm_bls/config.pbtxt    triton_max_batch_size:4,decoupled_mode:False,logits_datatype:TYPE_FP32,bls_instance_count:1,accumulate_tokens:False,tensorrt_llm_model_name:${TARGET_MODEL_NAME},tensorrt_llm_draft_model_name:${DRAFT_MODEL_NAME}
+
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm/config.pbtxt        triton_max_batch_size:4,decoupled_mode:False,logits_datatype:TYPE_FP32,triton_backend:tensorrtllm,max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:True,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,encoder_input_features_data_type:TYPE_FP16,engine_dir:${TARGET_ENGINE_PATH},gpu_device_ids:${TARGET_DEVICE_IDS}
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm_draft/config.pbtxt  triton_max_batch_size:4,decoupled_mode:False,logits_datatype:TYPE_FP32,triton_backend:tensorrtllm,max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:True,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,encoder_input_features_data_type:TYPE_FP16,engine_dir:${DRAFT_ENGINE_PATH},gpu_device_ids:${DRAFT_DEVICE_IDS}
 ```
 
-4. Start the triton inference server
-
-+ `--multi-model` is necessary if TP mode is used.
-+ Verbose log will be written in to file `triton_log.txt`.
++ Start the triton inference server.
+  + Verbose log will be written in to file `triton_log.txt` if specifying `--log`.
 
 ```bash
 python3 scripts/launch_triton_server.py \
     --model_repo=${TRITON_MODEL_REPO} \
     --multi-model \
-    --world_size=1 \
-    --log &
+    --log
 ```
 
 + You can see the output below in the file if Triton server launches successfully:
@@ -163,7 +153,7 @@ Started GRPCInferenceService at 0.0.0.0:8001
 Started Metrics Service at 0.0.0.0:8002
 ```
 
-5. Send a request for inference
++ Send a request for inference.
 
 ```bash
 python3 inflight_batcher_llm/client/e2e_grpc_speculative_decoding_client.py \
@@ -186,8 +176,8 @@ Ubuntu is a free and open source operating system that runs from the desktop, to
 Ubuntu is a community developed operating system that is perfect for laptops, desktops, servers, and cloud. It is used by millions of people around the world who want to explore new ideas and discover new opportunities.
 ```
 
-6. Test DTM with a script
-+ Prepare a JSON file `input_data.json` containing input data as below (more requests are acceptable).
++ Test DTM with a script.
+  + Prepare a JSON file `input_data.json` containing input data as below (more requests are acceptable).
 
 ```json
 [
@@ -199,9 +189,10 @@ Ubuntu is a community developed operating system that is perfect for laptops, de
 ]
 ```
 
-+ Use command below to launch requests for inference.
++ Use command below to launch test.
 
 ```bash
+### Use BLS speculative decoding
 python3 tools/inflight_batcher_llm/speculative_decoding_test.py \
     --max-input-len 2500 \
     --dataset input_data.json \
@@ -214,8 +205,21 @@ python3 tools/inflight_batcher_llm/speculative_decoding_test.py \
     --execute-bls-speculative-decoding \
     --disable-output-comparison \
     --num-draft-tokens=4 \
-    --use-draft-logits \
-    --verbose
+    --use-draft-logits
+
+### Use client-side speculative decoding
+python3 tools/inflight_batcher_llm/speculative_decoding_test.py \
+    --max-input-len 2500 \
+    --dataset input_data.json \
+    --url-control=localhost:8001 \
+    --url-target=localhost:8001 \
+    --url-draft=localhost:8001 \
+    --draft-tensorrt-llm-model-name="${DRAFT_MODEL_NAME}" \
+    --target-tensorrt-llm-model-name="${TARGET_MODEL_NAME}" \
+    --bls-speculative-tensorrt-llm-model-name="tensorrt_llm_bls" \
+    --disable-output-comparison \
+    --num-draft-tokens=4 \
+    --use-draft-logits
 ```
 
 + You can receive the following results if everything goes smoothly.
@@ -224,84 +228,105 @@ python3 tools/inflight_batcher_llm/speculative_decoding_test.py \
 Ubuntu is a free and open source operating system. It is a Linux based operating system. ...
 ```
 
-7. Stop triton inference server after all work is done
++ Stop triton inference server after all work is done.
 
 ```bash
 pkill tritonserver
 ```
 
-8. Advanced usage: Fast logits D2D transfer.
++ In addition, it appears better performance can be achieved with both draft and target engines deployed on a single GPU (llama-7B-FP8 + llama-30B-FP8, for a total of 40GiB on one H100-80GiB GPU for example).
 
-+ Fast logits boosts the performance (TPS) by hiding the latency of logits transfer from draft engine to target engine supported since TensorRT-LLM-0.15.0.
+#### Usage of Tensor-Parallelization mode.
 
-+ Modify `participant_ids` entry in `tensorrt_llm/config.pbtxt` and `tensorrt_llm_draft/config.pbtxt` to suitable MPI ranks. Usually in this setting, rank 0 is reserved for the orchestrator rank; rank 1 is for draft engine; the rest of the ranks are for target engine. In this example, `particpant_ids` can be set as snippet below. Same logic also applies to TP>1 target engine.
++ In this example, we use draft engine with TP=1 and target engine with TP=2 (both symmetrical or asymmetrical TP size are acceptable), and want to place the draft engine on GPU0, target engine on GPU1 and GPU2.
++ Edit model configuration.
 
-```txt
-### In tensorrt_llm_draft/config.pbtxt
-parameters: {
-    key: "gpu_device_ids"
-    value: {
-        string_value: "0"
-    }
-}
-parameters: {
-    key: "participant_ids"
-    value: {
-        string_value: "1"
-    }
-}
-### In tensorrt_llm/config.pbtxt
-parameters: {
-    key: "gpu_device_ids"
-    value: {
-        string_value: "1"
-    }
-}
-parameters: {
-    key: "participant_ids"
-    value: {
-        string_value: "2"
-    }
-}
+```bash
+export DRAFT_DEVICE_IDS="0"
+export TARGET_DEVICE_IDS="1,2"
+
+rm -rf ${TRITON_MODEL_REPO}
+cp -r all_models/inflight_batcher_llm/ ${TRITON_MODEL_REPO}
+cp -r ${TRITON_MODEL_REPO}/tensorrt_llm ${TRITON_MODEL_REPO}/tensorrt_llm_draft
+sed -i 's/name: "tensorrt_llm"/name: "tensorrt_llm_draft"/g' ${TRITON_MODEL_REPO}/tensorrt_llm_draft/config.pbtxt
+
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/ensemble/config.pbtxt            triton_max_batch_size:4,logits_datatype:TYPE_FP32
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/preprocessing/config.pbtxt       triton_max_batch_size:4,tokenizer_dir:${HF_MODEL},preprocessing_instance_count:1
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/postprocessing/config.pbtxt      triton_max_batch_size:4,tokenizer_dir:${HF_MODEL},postprocessing_instance_count:1
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm_bls/config.pbtxt    triton_max_batch_size:4,decoupled_mode:False,logits_datatype:TYPE_FP32,bls_instance_count:1,accumulate_tokens:False,tensorrt_llm_model_name:${TARGET_MODEL_NAME},tensorrt_llm_draft_model_name:${DRAFT_MODEL_NAME}
+
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm/config.pbtxt        triton_max_batch_size:4,decoupled_mode:False,logits_datatype:TYPE_FP32,triton_backend:tensorrtllm,max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:True,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,encoder_input_features_data_type:TYPE_FP16,engine_dir:${TARGET_ENGINE_PATH}
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm_draft/config.pbtxt  triton_max_batch_size:4,decoupled_mode:False,logits_datatype:TYPE_FP32,triton_backend:tensorrtllm,max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:True,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,encoder_input_features_data_type:TYPE_FP16,engine_dir:${DRAFT_ENGINE_PATH}
+
+sed -i 's/\${gpu_device_ids}/'"${DRAFT_DEVICE_IDS}"'/g' ${TRITON_MODEL_REPO}/tensorrt_llm_draft/config.pbtxt
+sed -i 's/\${gpu_device_ids}/'"${TARGET_DEVICE_IDS}"'/g' ${TRITON_MODEL_REPO}/tensorrt_llm/config.pbtxt
 ```
 
-+ Enable `speculative_decoding_fast_logits` in both `tensorrt_llm/config.pbtxt` and `tensorrt_llm_draft/config.pbtxt`.
++ As you see, the only difference is `gpu_device_ids`, which needs fix manually since comma is not supported in script `python3 tools/fill_template.py`.
 
-```txt
-parameters: {
-    key: "speculative_decoding_fast_logits"
-    value: {
-        string_value: "1"
-    }
-}
-```
-
-+ Launched Triton Server
-  + Use orchestrator mode with `--disable-spawn-process`. See [model config](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/model_config.md) for more information.
-  + `--world_size` has to be set as 1 (orchestrator rank 0) + 1 (draft engine ranks) + 1 (target engine ranks).
++ Start the triton inference server
+  + Use `--multi-model` to enable orchestrator mode in TP>1 scenario. See [model config](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/model_config.md) for more information.
 
 ```bash
 python3 scripts/launch_triton_server.py \
     --model_repo=${TRITON_MODEL_REPO} \
-    --multi-model \
-    --disable-spawn-processes \
-    --world_size=3 \
-    --log &
+    --tensorrt_llm_model_name "tensorrt_llm,tensorrt_llm_draft" \
+    --multi-model
 ```
 
-+ Send request with `use_draft_logits` to tritonserver BLS API:
++ All other operations are the same as `Simple deploy` part.
+
+#### Usage of Fast logits D2D transfer
+
++ Fast logits boosts the performance (TPS) by hiding the latency of logits transfer from draft engine to target engine supported since TensorRT-LLM-0.15.0.
++ In this example, we use draft engine with TP=1 and target engine with TP=2 (both symmetrical or asymmetrical TP size are acceptable), and want to place the draft engine on GPU0, target engine on GPU1 and GPU2.
++ For `participant_ids`, rank 0 is reserved for the orchestrator; rank (`1` ~ `tp_size_draft`) are for draft engine; rank (`tp_size_draft+1` ~ `tp_size_draft+tp_size_target`) are for target engine.
++ Edit model configuration.
+
+```bash
+export DRAFT_DEVICE_IDS="0"
+export TARGET_DEVICE_IDS="1,2"
+export DRAFT_PARTICIPANT_IDS="1"
+export TARGET_PARTICIPANT_IDS="2,3"
+
+cd /work/tekit-backend
+rm -rf ${TRITON_MODEL_REPO}
+cp -r all_models/inflight_batcher_llm/ ${TRITON_MODEL_REPO}
+cp -r ${TRITON_MODEL_REPO}/tensorrt_llm ${TRITON_MODEL_REPO}/tensorrt_llm_draft
+sed -i 's/name: "tensorrt_llm"/name: "tensorrt_llm_draft"/g' ${TRITON_MODEL_REPO}/tensorrt_llm_draft/config.pbtxt
+
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/ensemble/config.pbtxt            triton_max_batch_size:4,logits_datatype:TYPE_FP32
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/preprocessing/config.pbtxt       triton_max_batch_size:4,tokenizer_dir:${HF_MODEL},preprocessing_instance_count:1
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/postprocessing/config.pbtxt      triton_max_batch_size:4,tokenizer_dir:${HF_MODEL},postprocessing_instance_count:1
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm_bls/config.pbtxt    triton_max_batch_size:4,decoupled_mode:False,bls_instance_count:1,accumulate_tokens:False,tensorrt_llm_model_name:${TARGET_MODEL_NAME},logits_datatype:TYPE_FP32,tensorrt_llm_draft_model_name:${DRAFT_MODEL_NAME}
+
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm/config.pbtxt        triton_max_batch_size:4,triton_backend:tensorrtllm,decoupled_mode:False,max_beam_width:1,engine_dir:${TARGET_ENGINE_PATH},max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:True,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,encoder_input_features_data_type:TYPE_FP16,logits_datatype:TYPE_FP32,gpu_device_ids:${TARGET_DEVICE_IDS},participant_ids:2,3,speculative_decoding_fast_logits:1
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm_draft/config.pbtxt  triton_max_batch_size:4,triton_backend:tensorrtllm,decoupled_mode:False,max_beam_width:1,engine_dir:${DRAFT_ENGINE_PATH},max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:True,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,encoder_input_features_data_type:TYPE_FP16,logits_datatype:TYPE_FP32,gpu_device_ids:${DRAFT_DEVICE_IDS},participant_ids:1,speculative_decoding_fast_logits:1
+
+sed -i 's/\${gpu_device_ids}/'"${DRAFT_DEVICE_IDS}"'/g' ${TRITON_MODEL_REPO}/tensorrt_llm_draft/config.pbtxt
+sed -i 's/\${participant_ids}/'"${DRAFT_PARTICIPANT_IDS}"'/g' ${TRITON_MODEL_REPO}/tensorrt_llm_draft/config.pbtxt
+sed -i 's/\${gpu_device_ids}/'"${TARGET_DEVICE_IDS}"'/g' ${TRITON_MODEL_REPO}/tensorrt_llm/config.pbtxt
+sed -i 's/\${participant_ids}/'"${TARGET_PARTICIPANT_IDS}"'/g' ${TRITON_MODEL_REPO}/tensorrt_llm/config.pbtxt
 ```
-curl -X POST "http://localhost:8000/v2/models/tensorrt_llm_bls/generate" \
-    -H "Content-Type: application/json" \
-    -d '{
-        "text_input": "Continue writing the following story: James Best, best known for his",
-        "max_tokens": 128,
-        "num_draft_tokens": 10,
-        "use_draft_logits": true,
-        "stream": false
-        }'
+
++ As you see, the differences are `participant_ids` and `speculative_decoding_fast_logits`.
+
++ Start the triton inference server.
+  + Use `--disable-spawn-process` to enable pre-spawn variant in orchestrator mode.
+  + `--world_size` must be equal to `1 + tp_size_draft + tp_size_target`, which is 4 in this example.
+
+```bash
+python3 scripts/launch_triton_server.py \
+    --model_repo ${TRITON_MODEL_REPO} \
+    --tensorrt_llm_model_name tensorrt_llm,tensorrt_llm_draft \
+    --multi-model \
+    --world_size 4 \
+    --disable-spawn-processes
 ```
+
++ All other operations are the same as the `Simple deploy` part.
 
 ### Additional information
 
 + With the fast logits enabled and following optimization tips in [model configuration](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/model_config.md#some-tips-for-model-configuration), speculative decoding with draft logits achieves 2.x throughput in BS1, 1.x throughput in BS16 comparing to auto-regressive decoding using Llama 3.2 1B draft and Llama 3.1 70B target.
++ Streaming mode or batched-request mode are not supported in DTM yet.

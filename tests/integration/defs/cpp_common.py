@@ -21,6 +21,8 @@ default_test_timeout = 3600
 include_test_map = {
     "gpt": ("Gpt[^j]", ),
     "gpt_executor": ("GptExecutor", ),
+    "gpt_session": ("GptSession", ),
+    "gpt_tests": ("GptTests", ),
     "gptj": ("Gptj", ),
     "llama": ("Llama", ),
     "chatglm": ("ChatGlm", ),
@@ -39,22 +41,6 @@ include_test_map = {
 }
 
 
-def generate_excluded_model_tests() -> Generator[str, None, None]:
-    yield "Gpt[^j]"
-    yield "GptExecutor"
-    yield "Gptj"
-    yield "Llama"
-    yield "ChatGlm"
-    yield "Medusa"
-    yield "Eagle"
-    yield "ExplicitDraftTokensDecoding"
-    yield "Mamba"
-    yield "RecurrentGemma"
-    yield "Encoder"
-    yield "EncDec"
-    yield "SpeculativeDecoding"
-
-
 def generate_included_model_tests(
         test_list: List[str]) -> Generator[str, None, None]:
 
@@ -68,6 +54,16 @@ def generate_result_file_name(test_list: List[str],
 
     if run_fp8:
         yield "fp8"
+
+
+def generate_excluded_test_list(test_list):
+    if "gpt" in test_list:
+        if "gpt_session" not in test_list:
+            yield "GptSession"
+        if "gpt_executor" not in test_list:
+            yield "GptExecutor"
+        if "gpt_tests" not in test_list:
+            yield "GptTests"
 
 
 def find_dir_containing(files: Sequence[str],
@@ -621,8 +617,8 @@ def prepare_model_tests(model_name: str,
             beams_arg = ['--beams', '1,2']
         model_name = 'enc_dec'
 
-    # share the same script for gpt and gpt_executor
-    if model_name == 'gpt_executor':
+    # share the same script for gpt related tests
+    if model_name == 'gpt_executor' or model_name == 'gpt_session' or model_name == 'gpt_tests':
         model_name = 'gpt'
 
     build_engines = [
@@ -666,7 +662,7 @@ def prepare_model_tests(model_name: str,
         if model_name == 'gpt':
             script_model_name = 'gpt2'
         elif model_name == 'llama':
-            script_model_name = 'llama-7b-hf'
+            script_model_name = 'Llama-3.2-1B'
         generate_tokenizer_info = [
             python_exe, "examples/generate_xgrammar_tokenizer_info.py",
             f"--model_dir={str(resources_dir / 'models' / script_model_name)}",
@@ -716,8 +712,7 @@ def run_single_gpu_tests(build_dir: _pl.Path,
 
     excluded_tests = ["FP8"] if not run_fp8 else []
 
-    if "gpt" in test_list and "gpt_executor" not in test_list:
-        excluded_tests.append("GptExecutor")
+    excluded_tests.extend(list(generate_excluded_test_list(test_list)))
 
     ctest = ["ctest", "--output-on-failure", "--output-junit", resultFileName]
 
@@ -785,7 +780,7 @@ def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
             # WAR: Currently importing the bindings here causes a segfault in pybind 11 during shutdown
             # As this just builds a path we hard-code for now to obviate the need for import of bindings
 
-            # model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
+            # model_spec_obj = ModelSpec(input_file, _tb.DataType.HALF)
             # model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
             # model_spec_obj.use_gpt_plugin()
             # model_engine_path = model_engine_dir / model_spec_obj.get_model_path(
@@ -832,7 +827,7 @@ def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
         # WAR: Currently importing the bindings here causes a segfault in pybind 11 during shutdown
         # As this just builds a path we hard-code for now to obviate the need for import of bindings
 
-        # model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
+        # model_spec_obj = ModelSpec(input_file, _tb.DataType.HALF)
         # model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
         # model_spec_obj.use_gpt_plugin()
         # model_spec_obj.use_packed_input()

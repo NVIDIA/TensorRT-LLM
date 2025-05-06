@@ -21,22 +21,21 @@ import platform as _pf
 import sys as _sys
 import typing as _tp
 
-from build_engines_utils import init_model_spec_module, run_command, wincopy
-
-init_model_spec_module()
-import model_spec
+from build_engines_utils import run_command, wincopy
 
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.bindings.internal.testing import ModelSpec
 
 
 def build_engine(weight_dir: _pl.Path, ckpt_dir: _pl.Path, engine_dir: _pl.Path,
                  *args):
-    convert_args = [_sys.executable, "examples/mamba/convert_checkpoint.py"] + (
-        ['--model_dir', str(weight_dir)] if weight_dir else []) + [
-            '--output_dir',
-            str(ckpt_dir),
-            '--dtype=float16',
-        ]
+    convert_args = [
+        _sys.executable, "examples/models/core/mamba/convert_checkpoint.py"
+    ] + (['--model_dir', str(weight_dir)] if weight_dir else []) + [
+        '--output_dir',
+        str(ckpt_dir),
+        '--dtype=float16',
+    ]
     run_command(convert_args)
     build_args = ["trtllm-build"] + ['--checkpoint_dir',
                                      str(ckpt_dir)] + [
@@ -113,7 +112,7 @@ def build_engines(model_cache: _tp.Optional[str] = None):
 
     ckpt_dir = models_dir / 'rt_ckpt' / model_name
     engine_dir = models_dir / 'rt_engine' / model_name
-    model_spec_obj = model_spec.ModelSpec('input_tokens.npy', _tb.DataType.HALF)
+    model_spec_obj = ModelSpec('input_tokens.npy', _tb.DataType.HALF)
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
     model_spec_obj.use_tensor_parallelism(tp_size)
     model_spec_obj.use_pipeline_parallelism(pp_size)

@@ -20,16 +20,12 @@ from pathlib import Path
 # isort: off
 import run
 # isort: on
-from build_engines_utils import init_model_spec_module
-
-init_model_spec_module()
 
 import os
 import shutil
 
-import model_spec
-
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.bindings.internal.testing import ModelSpec, QuantMethod
 
 
 def get_model_data_dir():
@@ -41,7 +37,7 @@ def get_model_data_dir():
 def generate_output(engine: str,
                     num_beams: int,
                     input_name: str,
-                    model_spec_obj: model_spec.ModelSpec,
+                    model_spec_obj: ModelSpec,
                     max_output_len: int = 8,
                     output_logits: bool = False,
                     output_cum_log_probs: bool = False,
@@ -116,7 +112,7 @@ def generate_outputs(num_beams):
     input_name_long = 'input_tokens_long.npy'
 
     print('Generating GPT2 FP32 outputs')
-    model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.FLOAT)
+    model_spec_obj = ModelSpec(input_name, _tb.DataType.FLOAT)
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
     if num_beams == 1:
         generate_output(engine=model_spec_obj.get_model_path(),
@@ -130,7 +126,7 @@ def generate_outputs(num_beams):
                     model_spec_obj=model_spec_obj)
 
     print('Generating GPT2 FP16 outputs')
-    model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.HALF)
+    model_spec_obj = ModelSpec(input_name, _tb.DataType.HALF)
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
     if num_beams == 1:
         generate_output(engine=model_spec_obj.get_model_path(),
@@ -166,7 +162,7 @@ def generate_outputs(num_beams):
                     output_log_probs=True,
                     output_cum_log_probs=True)
 
-    model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.HALF)
+    model_spec_obj = ModelSpec(input_name, _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.use_packed_input()
@@ -193,7 +189,7 @@ def generate_outputs(num_beams):
                     output_logits=False,
                     max_output_len=128)
 
-    model_spec_obj = model_spec.ModelSpec(input_name_long, _tb.DataType.HALF)
+    model_spec_obj = ModelSpec(input_name_long, _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.use_packed_input()
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
@@ -203,11 +199,11 @@ def generate_outputs(num_beams):
                     model_spec_obj=model_spec_obj,
                     output_logits=False)
 
-    model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.HALF)
+    model_spec_obj = ModelSpec(input_name, _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.use_packed_input()
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
-    model_spec_obj.set_quant_method(model_spec.QuantMethod.SMOOTH_QUANT)
+    model_spec_obj.set_quant_method(QuantMethod.SMOOTH_QUANT)
     generate_output(engine=model_spec_obj.get_model_path(),
                     num_beams=num_beams,
                     input_name=input_name,

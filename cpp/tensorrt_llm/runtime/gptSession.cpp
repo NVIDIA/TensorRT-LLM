@@ -83,7 +83,8 @@ GptSession::GptSession(Config const& sessionConfig, ModelConfig const& modelConf
     , mWorldConfig{worldConfig}
     , mDevice{utils::initDevice(worldConfig)}
     , mLogger{logger ? std::move(logger) : std::make_shared<TllmLogger>()}
-    , mRuntime{std::make_shared<TllmRuntime>(rawEngine, mLogger.get(), sessionConfig.gpuWeightsPercent)}
+    , mRuntime{std::make_shared<TllmRuntime>(
+          rawEngine, mLogger.get(), sessionConfig.useGpuDirectStorage, sessionConfig.gpuWeightsPercent)}
     , mGatherGenerationLogits{sessionConfig.gatherGenerationLogits}
 {
     TLLM_LOG_WARNING(
@@ -241,10 +242,10 @@ void GptSession::createKvCacheManager(SizeType32 maxBatchSize, SizeType32 maxBea
     mKvCacheManager = std::make_shared<bmkv::KVCacheManager>(
         std::vector<SizeType32>(numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd), sizePerHead, tokensPerBlock,
         blocksInPrimaryPool, blocksInSecondaryPool, maxBatchSize, maxBeamWidth, mDecoderMaxAttentionWindowVec,
-        /*temporaryAttentionWindow*/ 0, sinkTokenLength, mRuntime->getStreamPtr(), maxSequenceLength, enableBlockReuse,
-        kvCacheConfig.onboardBlocks);
+        /*tempAttentionWindowInputs*/ std::nullopt, kvDtype, sinkTokenLength, mRuntime->getStreamPtr(),
+        maxSequenceLength, enableBlockReuse, kvCacheConfig.onboardBlocks);
 
-    auto const maxBlocksPerSeq = mKvCacheManager->getMaxBlocksPerSeq();
+    auto const maxBlocksPerSeq = mKvCacheManager->getOffsetTableDimensions().maxBlocksPerSeq;
 
     TLLM_CHECK(mBuffers.size() == static_cast<size_t>(mMicroBatchConfig.numGenBatches));
     for (auto& buffers : mBuffers)
@@ -253,7 +254,7 @@ void GptSession::createKvCacheManager(SizeType32 maxBatchSize, SizeType32 maxBea
         buffers->transformerBuffers->reshapeKvTensors(maxBatchSize, maxBeamWidth, maxBlocksPerSeq, *mRuntime);
     }
 
-    mKvCacheManager->allocatePools(kvDtype, kvCacheConfig.useUvm);
+    mKvCacheManager->allocatePools(kvCacheConfig.useUvm);
 
     for (auto& buffers : mBuffers)
     {

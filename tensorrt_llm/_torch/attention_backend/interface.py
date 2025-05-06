@@ -124,7 +124,6 @@ class AttentionMetadata:
     _num_generations: int = field(init=False, default=0, repr=False)
     _num_ctx_tokens: int = field(init=False, default=0, repr=False)
     _num_tokens: int = field(init=False, default=0, repr=False)
-    is_dummy_attention: bool = False
 
     def __post_init__(self) -> None:
         if self.is_cross:
@@ -162,7 +161,16 @@ class AttentionMetadata:
         # The model executor sets seq_lens to None initially.
         if self._seq_lens is not None:
             self._seq_lens = self._seq_lens.pin_memory()
-            self._seq_lens_cuda = self._seq_lens.cuda(non_blocking=True)
+
+            if self.is_cuda_graph and self._seq_lens_cuda is not None:
+                # Very important: do not reallocate if we are using CUDA graphs.
+                # This copy is safe because the batch size is guaranteed to not
+                # change in the CUDA graph case. The seqlens can change if we
+                # are doing spec decode.
+                self._seq_lens_cuda.copy_(self._seq_lens, non_blocking=True)
+            else:
+                self._seq_lens_cuda = self._seq_lens.cuda(non_blocking=True)
+
         if self.has_cross_sub_metadata:
             self.cross._seq_lens = self._seq_lens
             self.cross._seq_lens_cuda = self._seq_lens_cuda
@@ -267,6 +275,9 @@ class AttentionMetadata:
             cuda_graph_metadata.cross = cuda_graph_metadata.cross.create_cuda_graph_metadata(
                 max_batch_size, True)
         if not sub_cross_metadata:
+            # Set to None to force the cuda graph metadata to allocate a tensor
+            # with the correct batch size. See seq_lens setter for how this works.
+            cuda_graph_metadata._seq_lens_cuda = None
             cuda_graph_metadata.seq_lens = torch.ones(
                 (max_batch_size, ), dtype=torch.int) * (1 + max_draft_tokens)
         if self.is_cross:
@@ -363,7 +374,7 @@ class RopeParams:
 
         return rope_params
 
-    def create_rope_const_params(self):
+    def create_rope_const_params(self, interleave: bool = True):
         if self.dim == 0:
             return None, None
 
@@ -371,7 +382,7 @@ class RopeParams:
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is not None:
             cache = extra_attrs.setdefault("rope_const_params", {})
-            rope_const_params = cache.get(self, None)
+            rope_const_params = cache.get((self, interleave), None)
             if rope_const_params is not None and rope_const_params.cos_sin(
             ) is not None:
                 return (
@@ -415,13 +426,17 @@ class RopeParams:
                 dtype=torch.float32,
                 device='cuda',
             )
+        if not interleave:
+            rope_cos_sin = rope_cos_sin.reshape(
+                self.max_positions, -1,
+                2)[:, :self.dim // 2, :].transpose(0, 2, 1).reshape(1, -1)
         rope_cos_sin = torch.torch.tensor(
             rope_cos_sin,
             dtype=torch.float32,
             device='cuda',
         )
         if extra_attrs is not None:
-            cache[self] = RopeConstParams(
+            cache[(self, interleave)] = RopeConstParams(
                 weakref.ref(rope_inv_freq)
                 if rope_inv_freq is not None else None,
                 weakref.ref(rope_cos_sin),
@@ -436,6 +451,7 @@ class PositionalEmbeddingParams:
 
     # RoPE params
     rope: Optional[RopeParams] = None
+    is_neox: bool = True
 
     def __post_init__(self) -> None:
         if self.type.is_deferred():
@@ -479,6 +495,7 @@ class AttentionBackend(Generic[TMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        skip_create_weights_in_init: bool = False,
         **kwargs,
     ):
         """
@@ -495,6 +512,14 @@ class AttentionBackend(Generic[TMetadata]):
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads or self.num_heads
         self.quant_config = quant_config
+
+    def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
+        """
+        To support mixed quantization mode, self.quant_config can be modified after __init__ is called.
+        Any states or set up related to self.quant_config must be moved to this function, which is called
+        after self.quant_config is reset.
+        """
+        self.quant_config = new_quant_config
 
     def forward(self,
                 q: torch.Tensor,
@@ -520,6 +545,18 @@ class AttentionBackend(Generic[TMetadata]):
             torch.Tensor with shape (num_q_tokens, num_heads * head_dim)
         """
         raise NotImplementedError
+
+    @classmethod
+    def support_fused_rope(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_fused_qkv(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_mla(cls) -> bool:
+        return False
 
 
 @dataclass(kw_only=True, unsafe_hash=True)

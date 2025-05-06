@@ -48,10 +48,6 @@ namespace tensorrt_llm::executor
 class RequestWithIdAsyncSend;
 class CancelledRequestsAsyncSend;
 
-std::vector<RequestWithId> requestWithIdRecv(std::shared_ptr<tensorrt_llm::mpi::MpiComm> const& commSession, int peer);
-std::unordered_set<IdType> cancelledRequestsRecv(
-    std::shared_ptr<tensorrt_llm::mpi::MpiComm> const& commSession, int peer);
-
 class MpiMessageQueue
 {
 public:
@@ -131,9 +127,6 @@ public:
     bool isParticipant() const;
 
     std::optional<std::shared_ptr<KVCacheEventManager>> getKVCacheEventManager() const;
-
-    static auto constexpr kMpiTagOffset = 18;
-    static auto constexpr kMpiTagUpperBound = kMpiTagOffset + 4;
 
 private:
     using RtTensorPtr = runtime::ITensor::SharedPtr;
@@ -234,9 +227,9 @@ private:
     void cleanupDynamicLogitsPostProcessors(RequestList const& finishedRequests);
 
     void orchSendReqThread();
-    void orchRecvThread(int32_t idTag, int32_t dataTag);
+    void orchRecvThread(mpi::MpiTag idTag, mpi::MpiTag dataTag);
     void leaderRecvReqThread();
-    void leaderSendThread(MpiMessageQueue& sendQueue, int32_t idTag, int32_t dataTag);
+    void leaderSendThread(MpiMessageQueue& sendQueue, mpi::MpiTag idTag, mpi::MpiTag dataTag);
 
     void addTerminatedReqId(std::vector<Response> const& responses, IdType const& reqId);
 
@@ -317,6 +310,7 @@ private:
     bool mIsSchedulerMaxUtilization;
     bool mIsSchedulerGuaranteedNoEvict;
     bool mIsChunkedContext;
+    bool mPromptTableOffloading;
 
     CommunicationMode mCommMode;
     bool mIsWorker = false;

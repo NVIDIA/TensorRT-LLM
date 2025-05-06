@@ -12,7 +12,6 @@
 
 #include "executorTest.h"
 
-#include "modelSpec.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
@@ -20,6 +19,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
+#include "tensorrt_llm/testing/modelSpec.h"
 #include "tests/utils/common.h"
 
 #include <gmock/gmock.h>
@@ -125,8 +125,8 @@ TEST_P(EncDecParamsTest, validEncDecCtor)
     std::filesystem::path encEnginePath = ENC_DEC_ENGINE_BASE / enginePathName / "encoder";
     std::filesystem::path decEnginePath = ENC_DEC_ENGINE_BASE / enginePathName / "decoder";
     ExecutorConfig executorConfig{};
-    FloatType freeGpuMemoryFraction = 0.5f;
-    FloatType crossKvCacheFraction = 0.5f;
+    FloatType freeGpuMemoryFraction = 0.4f;
+    FloatType crossKvCacheFraction = 0.4f;
     KvCacheConfig kvCacheConfig{false, std::nullopt, std::nullopt, std::nullopt, freeGpuMemoryFraction};
     kvCacheConfig.setCrossKvCacheFraction(crossKvCacheFraction);
     executorConfig.setKvCacheConfig(kvCacheConfig);

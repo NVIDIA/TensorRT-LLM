@@ -225,6 +225,7 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
     if (mUseTllmGen)
     {
         TLLM_LOG_DEBUG("Running TRTLLM-GEN generation kernel.");
+        TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
 
         int num_q_heads = params.num_q_heads;
         int num_kv_heads = params.num_kv_heads;
@@ -265,9 +266,12 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         // The rotary_embedding_inv_freq_cache for QKVPreprocessing.
         // Use the params.rotary_embedding_inv_freq_cache input when the buildDecoderInfoKernel is skipped.
         float const* rotary_inv_freq_buf = params.rotary_embedding_inv_freq_cache;
+        // Use the nullptr for cu_seqlens when it is not computed.
+        int const* cu_seqlens{nullptr};
         if (decoder_params.isBuildDecoderInfoKernelNeeded())
         {
             rotary_inv_freq_buf = launchParams.rotary_inv_freq_buf;
+            cu_seqlens = launchParams.cu_seq_lens;
             invokeBuildDecoderInfo(decoder_params, params.stream);
             sync_check_cuda_error(params.stream);
         }
@@ -301,7 +305,7 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         preprocessingParms.logn_scaling = params.logn_scaling_ptr;
         preprocessingParms.seq_lens = params.spec_decoding_generation_lengths;
         preprocessingParms.cache_seq_lens = params.sequence_lengths;
-        preprocessingParms.cu_seq_lens = params.multi_query_tokens ? launchParams.cu_seq_lens : nullptr;
+        preprocessingParms.cu_seq_lens = cu_seqlens;
         preprocessingParms.rotary_embedding_inv_freq = rotary_inv_freq_buf;
         preprocessingParms.rotary_coef_cache_buffer = params.rotary_cos_sin;
         preprocessingParms.kvScaleOrigQuant = params.kv_scale_orig_quant;
@@ -376,6 +380,7 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         tllmRunnerParams.multiCtasKvCounterPtr = launchParams.semaphores;
         tllmRunnerParams.multiCtasKvScratchPtr = launchParams.scratch;
 
+        tllmRunnerParams.cumSeqLensQPtr = cu_seqlens;
         tllmRunnerParams.cumSeqLensKvPtr = reinterpret_cast<int const*>(launchParams.cu_kv_seq_lens);
         tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(launchParams.bmm2_scale_ptr);
         // TRTLLM-GEN kernels always use the Log2 scale
@@ -395,7 +400,7 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         tllmRunnerParams.mBatchSize = params.batch_size;
         // It is used to construct contiguous kv cache TMA descriptors.
         tllmRunnerParams.mMaxSeqLenCacheKv = params.max_attention_window_size;
-        tllmRunnerParams.mMaxSeqLenQ = 1;
+        tllmRunnerParams.mMaxSeqLenQ = params.generation_input_length;
         tllmRunnerParams.mMaxSeqLenKv = std::min(params.cyclic_attention_window_size, params.max_past_kv_length);
         tllmRunnerParams.mSumOfSeqLensQ = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenQ);
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
@@ -403,10 +408,9 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         tllmRunnerParams.mScaleQ = params.q_scaling;
         if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
         {
-            auto const [freeMemory, totalMemory] = tensorrt_llm::common::getDeviceMemoryInfo(false);
             // The kv cache should be based on the maximum headDim of K and V due to paddings.
             int maxHeadDimKv = std::max(tllmRunnerParams.mHeadDimQk, tllmRunnerParams.mHeadDimV);
-            tllmRunnerParams.mNumPagesInMemPool = totalMemory
+            tllmRunnerParams.mNumPagesInMemPool = mTllmGenFMHARunner->getTotalDeviceMemory()
                 / (tllmRunnerParams.mNumHeadsKv * tllmRunnerParams.mNumTokensPerPage * maxHeadDimKv
                     * get_size_in_bytes(mFixedParams.kvDataType));
         }
@@ -414,7 +418,6 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         tllmRunnerParams.stream = params.stream;
         tllmRunnerParams.mSfStartTokenIdx = params.start_token_idx_sf;
 
-        TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }
     else

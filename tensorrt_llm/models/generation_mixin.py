@@ -339,17 +339,17 @@ class GenerationMixin:
                         math.ceil(kv_cache_range[0][2] / tokens_per_block)
                     ]] * num_profiles
 
-                num_kv_cache_pools = 1 if num_kv_heads_per_layer is None else len(
-                    set(num_kv_heads_per_layer[num_attn_layers_lower_ranks:
-                                               num_attn_layers_lower_ranks +
-                                               len(local_attn_layers)]))
+                NUM_KV_CACHE_POOLS = -1  # the number of unique variable window sizes, which is only known at runtime, affects the number of pools.
+                # dim_range=(min=1, opt=1 (this is the usual case - non vgqa, non vsliding_window), max=num_layers,
+                # TODO(nhaber): Benchmark if making NUM_KV_CACHE_POOLS dynamic has a significant performance hit?
+
+                kv_pools_range = [[1, 1, len(local_attn_layers)]] * num_profiles
                 kv_cache_block_offsets = Tensor(
                     name=f'kv_cache_block_offsets',
                     dtype=trt.int32,
-                    shape=[num_kv_cache_pools, -1, 2, -1],
+                    shape=[NUM_KV_CACHE_POOLS, -1, 2, -1],
                     dim_range=OrderedDict([
-                        ('num_kv_cache_pools',
-                         [num_kv_cache_pools] * num_profiles),
+                        ('num_kv_cache_pools', kv_pools_range),
                         ('batch_size_beam_width', bb_range),
                         ('kv', [2] * num_profiles),
                         ('max_blocks_per_seq', max_blocks_per_seq_range),
@@ -357,10 +357,9 @@ class GenerationMixin:
                 host_kv_cache_block_offsets = Tensor(
                     name=f'host_kv_cache_block_offsets',
                     dtype=trt.int32,
-                    shape=[num_kv_cache_pools, -1, 2, -1],
+                    shape=[NUM_KV_CACHE_POOLS, -1, 2, -1],
                     dim_range=OrderedDict([
-                        ('num_kv_cache_pools',
-                         [num_kv_cache_pools] * num_profiles),
+                        ('num_kv_cache_pools', kv_pools_range),
                         ('batch_size_beam_width', bb_range),
                         ('kv', [2] * num_profiles),
                         ('max_blocks_per_seq', max_blocks_per_seq_range),
@@ -368,10 +367,9 @@ class GenerationMixin:
                 host_kv_cache_pool_pointers = Tensor(
                     name=f'host_kv_cache_pool_pointers',
                     dtype=trt.int64,
-                    shape=[num_kv_cache_pools, 2],
+                    shape=[NUM_KV_CACHE_POOLS, 2],
                     dim_range=OrderedDict([
-                        ('num_pools_layers',
-                         [num_kv_cache_pools] * num_profiles),
+                        ('num_pools_layers', kv_pools_range),
                         ('num_pools_kv', [2] * num_profiles),
                     ]))
 

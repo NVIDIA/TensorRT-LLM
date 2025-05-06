@@ -45,7 +45,8 @@ TrtEncoderModel::TrtEncoderModel(runtime::ModelConfig const& modelConfig, WorldC
     , mWorldConfig{worldConfig}
     , mDevice{runtime::utils::initDevice(worldConfig)}
     , mLogger{logger ? std::move(logger) : std::make_shared<TllmLogger>()}
-    , mRuntime{std::make_shared<TllmRuntime>(rawEngine, mLogger.get(), optionalParams.gpuWeightsPercent)}
+    , mRuntime{std::make_shared<TllmRuntime>(
+          rawEngine, mLogger.get(), optionalParams.useGpuDirectStorage, optionalParams.gpuWeightsPercent)}
     , mMicroBatchId(0)
     , mCopyBufferManager{std::make_shared<CudaStream>()}
 {
@@ -399,6 +400,14 @@ void TrtEncoderModel::terminateRequest(std::shared_ptr<LlmRequest> const& llmReq
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void TrtEncoderModel::terminateRequestSync(
+    std::shared_ptr<LlmRequest> const& llmReq, executor::FinishReason finishReason)
+{
+    terminateRequest(llmReq, false);
+    llmReq->finishByReason(finishReason);
+    llmReq->clearGeneratedTokens();
 }
 
 void TrtEncoderModel::fillEncoderOutputSync(RequestVector const& requestList, TensorMap outputTensors)

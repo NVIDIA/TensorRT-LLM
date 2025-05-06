@@ -16,7 +16,6 @@
 
 #include "executorTest.h"
 
-#include "modelSpec.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
@@ -30,6 +29,7 @@
 #include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
+#include "tensorrt_llm/testing/modelSpec.h"
 #include "tests/utils/common.h"
 
 #include <gmock/gmock.h>
@@ -61,6 +61,11 @@ namespace
 auto const LORA_DATA_PATH = DATA_PATH / "lora-test-weights-gpt2-tp1";
 auto const LORA_WEIGHTS_FILE = LORA_DATA_PATH / "source.npy";
 auto const LORA_CONFIG_FILE = LORA_DATA_PATH / "config.npy";
+
+auto constexpr LLAMA_INPUT_FILE = "input_tokens_llama.npy";
+auto constexpr LLAMA_VOCAB_SIZE_PADDED = 128256;
+auto constexpr LLAMA_PAD_ID = 128001;
+auto constexpr LLAMA_END_ID = 128001;
 
 } // namespace
 
@@ -207,7 +212,7 @@ TEST_F(GptExecutorTest, ReturnAcceptedTokenLogits)
 
     // Enable kv cache reuse of executorConfig
     bool enableBlockReuse = true;
-    FloatType freeGpuMemoryFraction = 0.5;
+    FloatType freeGpuMemoryFraction = 0.4;
     auto kvCacheConfig
         = KvCacheConfig(enableBlockReuse, std::nullopt, std::nullopt, std::nullopt, freeGpuMemoryFraction);
     executorConfig.setKvCacheConfig(kvCacheConfig);
@@ -569,7 +574,7 @@ using ParamStatsType = std::tuple<int, bool>;
 using AllParamsType = std::tuple<BatchingType, bool, int, bool, bool, bool, bool, std::string, bool, bool, int>;
 using LogitsProcParamsType = std::tuple<std::string, bool, bool>;
 using GuidedDecodingParamsType = std::tuple<std::string>;
-using TimeoutTestParamsType = std ::tuple<std::string, bool>;
+using TimeoutTestParamsType = std ::tuple<std::string, bool, int>;
 
 std::string generateTestName(testing::TestParamInfo<ParamType> const& info)
 {
@@ -661,6 +666,7 @@ std::string generateTestNameTimeoutTest(testing::TestParamInfo<TimeoutTestParams
 {
     auto const modelName = std::get<0>(info.param);
     auto const& useOrchestratorMode = std::get<1>(info.param);
+    auto const beamWidth = std::get<2>(info.param);
 
     std::string name = "ExecutorTest";
     name.append("_" + modelName);
@@ -673,6 +679,7 @@ std::string generateTestNameTimeoutTest(testing::TestParamInfo<TimeoutTestParams
     {
         name.append("_LeaderMode");
     }
+    name.append("_BW" + std::to_string(beamWidth));
     return name;
 }
 
@@ -2148,6 +2155,8 @@ TEST_P(AllParamsTest, TokenComparison)
     ModelIds modelIds{50256, 50256};
     bool isSpeculativeDecoding{false};
 
+    SizeType32 vocabSizePadded = 50257;
+
     // NOTE: This can be used to disable checks for certain prompt batch entries
     FlakyTestInfo flakyTestInfo;
 
@@ -2182,6 +2191,12 @@ TEST_P(AllParamsTest, TokenComparison)
     else if (modelName == "llama_tp4_pp1_cp1" || modelName == "llama_tp1_pp4_cp1" || modelName == "llama_tp2_pp2_cp1"
         || modelName == "llama_tp1_pp2_cp1")
     {
+        inputPath = DATA_PATH / LLAMA_INPUT_FILE;
+        modelIds.padId = LLAMA_PAD_ID;
+        modelIds.endId = LLAMA_END_ID;
+
+        vocabSizePadded = LLAMA_VOCAB_SIZE_PADDED;
+
         auto const resultsPath
             = LLAMA_DATA_PATH / ((beamWidth == 1) ? "sampling" : "beam_search_" + std::to_string(beamWidth));
         if (modelName == "llama_tp4_pp1_cp1")
@@ -2364,8 +2379,6 @@ TEST_P(AllParamsTest, TokenComparison)
             }
         }
     }
-
-    SizeType32 constexpr vocabSizePadded{50257}; // gpt vocabSizePadded
 
     // Returning logits will bring higher latency
     if (streaming && (outConfig.returnContextLogits || outConfig.returnGenerationLogits))
@@ -3475,7 +3488,7 @@ TEST_P(GuidedDecodingParamsTest, All)
     else // llama
     {
         inputTokens = {
-            1, 1724, 338, 29871, 29896, 29974, 29896, 29973, 673, 20917, 297, 263, 9657, 297, 4390, 3402, 29901, 29871};
+            128000, 62, 3923, 7037, 62, 16, 10, 16, 30, 62, 16533, 87710, 1265, 4404, 5356, 1265, 9643, 9132, 25, 62};
     }
     SizeType32 maxNewTokens = 10;
     SamplingConfig samplingConfig{};
@@ -3513,11 +3526,11 @@ TEST_P(GuidedDecodingParamsTest, All)
     }
     else // llama
     {
-        expectedOutputTokens.push_back({29896, 29974, 29896, 29922, 29906, 13, 5618, 338, 29871, 29896});
-        expectedOutputTokens.push_back({6377, 29896, 1115, 376, 29896, 613, 376, 29896, 29974, 29896});
-        expectedOutputTokens.push_back({6377, 29874, 1983, 29893, 29872, 29878, 1115, 29871, 29896, 29913});
-        expectedOutputTokens.push_back({29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896});
-        expectedOutputTokens.push_back({29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896});
+        expectedOutputTokens.push_back({16, 10, 16, 28, 17, 198, 62, 3923, 7037, 62});
+        expectedOutputTokens.push_back({5018, 16, 794, 330, 16, 498, 330, 17, 794, 330});
+        expectedOutputTokens.push_back({5018, 9399, 794, 16, 92});
+        expectedOutputTokens.push_back({16});
+        expectedOutputTokens.push_back({16});
     }
 
     if (executor.canEnqueueRequests())
@@ -3548,10 +3561,7 @@ TEST_P(GuidedDecodingParamsTest, All)
                     auto& newTokens = result.outputTokenIds.at(0);
 
                     int reqIdx = std::find(reqIds.begin(), reqIds.end(), reqId) - reqIds.begin();
-                    for (int i = 0; i < maxNewTokens; i++)
-                    {
-                        EXPECT_EQ(newTokens[i], expectedOutputTokens[reqIdx][i]);
-                    }
+                    EXPECT_THAT(newTokens, ::testing::ElementsAreArray(expectedOutputTokens[reqIdx]));
                 }
                 numFinished++;
             }
@@ -4079,7 +4089,7 @@ TEST_P(TimeoutTest, TimeoutStreamingTest)
 {
     auto const modelName = std::get<0>(GetParam());
     auto const useOrchestratorMode = std::get<1>(GetParam());
-    SizeType32 constexpr beamWidth = 2;
+    auto const beamWidth = std::get<2>(GetParam());
 
     auto executorConfig = ExecutorConfig(beamWidth);
     std::filesystem::path modelPath;
@@ -4115,25 +4125,19 @@ TEST_P(TimeoutTest, TimeoutStreamingTest)
     {
         GTEST_SKIP() << "Skipping MultiGpu tests";
     }
-    else
+    if (val != NULL && !isMultiGpu)
     {
-        if (val != NULL && !isMultiGpu)
-        {
-            GTEST_SKIP() << "Skipping SingleGpu tests";
-        }
-
-        if (!isMultiGpu && !useOrchestratorMode)
-        {
-            GTEST_SKIP() << "Leader mode on single GPU crashes";
-        }
-
+        GTEST_SKIP() << "Skipping SingleGpu tests";
+    }
+    if (val != NULL && isMultiGpu)
+    {
         // Check that it was launched with right number of MPI ranks
         if (!useOrchestratorMode && COMM_SESSION.getSize() != 4)
         {
             // No orchestrator, need worldSize to match TP*PP
             FAIL() << "Leader mode and world size is not equal to 4";
         }
-        else if (useOrchestratorMode && COMM_SESSION.getSize() != 1)
+        if (useOrchestratorMode && COMM_SESSION.getSize() != 1)
         {
             // No orchestrator, need worldSize to match TP*PP
             FAIL() << "Orchestrator mode and World size is not equal to 1";
@@ -4191,7 +4195,7 @@ TEST_P(TimeoutTest, TimeoutStreamingTest)
     finishedRequest.setReturnAllGeneratedTokens(true);
     finishedRequest.setAllottedTimeMs(std::chrono::milliseconds(5000));
     SizeType32 constexpr finishedMinLength = 5;
-    SizeType32 constexpr finishedMaxLength = maxNewTokens + 1;
+    SizeType32 constexpr finishedMaxLength = maxNewTokens;
 
     std::vector<FinishReason> referenceFinishReasons
         = {FinishReason::kTIMED_OUT, FinishReason::kTIMED_OUT, FinishReason::kLENGTH};
@@ -4254,8 +4258,8 @@ TEST_P(TimeoutTest, TimeoutStreamingTest)
                         TLLM_LOG_DEBUG("%s", tokenStr.c_str());
                     }
 
-                    TLLM_LOG_DEBUG("beams' length must be bigger than %d and smaller than %d", minLengths[reqId - 1],
-                        maxLengths[reqId - 1]);
+                    TLLM_LOG_DEBUG(
+                        "beams' length must be in range [%d, %d]", minLengths[reqId - 1], maxLengths[reqId - 1]);
 
                     if (result.isFinal)
                     {
@@ -4273,7 +4277,7 @@ TEST_P(TimeoutTest, TimeoutStreamingTest)
                     EXPECT_EQ(beamWidth, actualResponse.size());
                     for (int beam = 0; beam < beamWidth; beam++)
                     {
-                        EXPECT_LT(actualResponse.at(beam).size(), maxLengths[reqId - 1]) << "for request " << reqId;
+                        EXPECT_LE(actualResponse.at(beam).size(), maxLengths[reqId - 1]) << "for request " << reqId;
                         achievedLength[reqId - 1] = std::max(
                             achievedLength[reqId - 1], static_cast<SizeType32>(actualResponse.at(beam).size()));
                     }
@@ -4293,7 +4297,8 @@ TEST_P(TimeoutTest, TimeoutNonstreamingTest)
 {
     auto const modelName = std::get<0>(GetParam());
     auto const useOrchestratorMode = std::get<1>(GetParam());
-    SizeType32 constexpr beamWidth = 2;
+    auto const beamWidth = std::get<2>(GetParam());
+
     std::optional<std::vector<SizeType32>> deviceIds = std::nullopt;
 
     auto executorConfig = ExecutorConfig(beamWidth);
@@ -4328,25 +4333,19 @@ TEST_P(TimeoutTest, TimeoutNonstreamingTest)
     {
         GTEST_SKIP() << "Skipping MultiGpu tests";
     }
-    else
+    if (val != NULL && !isMultiGpu)
     {
-        if (val != NULL && !isMultiGpu)
-        {
-            GTEST_SKIP() << "Skipping SingleGpu tests";
-        }
-
-        if (!isMultiGpu && !useOrchestratorMode)
-        {
-            GTEST_SKIP() << "Leader mode on single GPU crashes";
-        }
-
+        GTEST_SKIP() << "Skipping SingleGpu tests";
+    }
+    if (val != NULL && isMultiGpu)
+    {
         // Check that it was launched with right number of MPI ranks
         if (!useOrchestratorMode && COMM_SESSION.getSize() != 4)
         {
             // No orchestrator, need worldSize to match TP*PP
             FAIL() << "Leader mode and world size is not equal to 4";
         }
-        else if (useOrchestratorMode && COMM_SESSION.getSize() != 1)
+        if (useOrchestratorMode && COMM_SESSION.getSize() != 1)
         {
             // No orchestrator, need worldSize to match TP*PP
             FAIL() << "Orchestrator mode and World size is not equal to 1";
@@ -4399,7 +4398,7 @@ TEST_P(TimeoutTest, TimeoutNonstreamingTest)
         = Request(finishedTokens, maxNewTokens, false, tensorrt_llm::executor::SamplingConfig(beamWidth));
     finishedRequest.setAllottedTimeMs(std::chrono::milliseconds(5000));
     std::vector<std::vector<int>> finishedReponse
-        = {{101, 102, 103, 104, 29889, 13, 13, 20001, 29901}, {101, 102, 103, 104, 29889, 13, 13, 2277, 29937}};
+        = {{101, 102, 103, 104, 49849, 225, 49849, 232, 55742}, {101, 102, 103, 104, 49849, 225, 49849, 232, 29082}};
 
     // assume responses will come in FIFO order
     std::vector<BeamTokens> refResponses = {immediateCancelResponse, oneForwardResponse, finishedReponse};
@@ -4492,8 +4491,8 @@ INSTANTIATE_TEST_SUITE_P(LlamaExecutorTest, ParamCancelReqTest,
     generateTestNameCancelReq);
 
 INSTANTIATE_TEST_SUITE_P(LlamaExecutorTest, TimeoutTest,
-    testing::Combine(
-        testing::Values("llama_tp1_pp4_cp1", "llama_tp4_pp1_cp1", "llama_tp1_pp1_cp1"), testing::Values(false, true)),
+    testing::Combine(testing::Values("llama_tp1_pp4_cp1", "llama_tp4_pp1_cp1", "llama_tp1_pp1_cp1"),
+        testing::Values(false, true), testing::Values(2)),
     generateTestNameTimeoutTest);
 
 INSTANTIATE_TEST_SUITE_P(LlamaExecutorTest, LeaderApiUsageTest,

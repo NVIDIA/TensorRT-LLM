@@ -3,9 +3,10 @@ import concurrent.futures
 import os
 from concurrent.futures import ProcessPoolExecutor
 from queue import Empty, Queue
-from typing import Any, Callable, List, NamedTuple
+from typing import Any, Callable, List, NamedTuple, Optional
 
 from tensorrt_llm._utils import mpi_rank
+from tensorrt_llm.bindings.executor import Response
 from tensorrt_llm.llmapi.utils import print_colored_debug
 from tensorrt_llm.logger import logger
 
@@ -41,8 +42,12 @@ def create_mpi_comm_session(
         print_colored_debug(
             f"Using RemoteMpiPoolSessionClient to bind to external MPI processes at {get_spawn_proxy_process_ipc_addr_env()}\n",
             "yellow")
+        hmac_key = os.getenv("TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY")
+        # Convert the hex string to bytes
+        if hmac_key is not None:
+            hmac_key = bytes.fromhex(hmac_key)
         return RemoteMpiCommSessionClient(
-            get_spawn_proxy_process_ipc_addr_env())
+            addr=get_spawn_proxy_process_ipc_addr_env(), hmac_key=hmac_key)
     else:
         print_colored_debug(
             f"Using MpiCommSession to bind to external MPI processes\n",
@@ -123,9 +128,17 @@ class IntraProcessQueue:
 
 
 class WorkerCommIpcAddrs(NamedTuple):
-    ''' IPC addresses for communication with the worker processes. '''
-    request_queue_addr: str
-    request_error_queue_addr: str
-    result_queue_addr: str
-    stats_queue_addr: str
-    kv_cache_events_queue_addr: str
+    ''' IPC addresses (str) and HMAC keys (bytes) for communication with the worker processes. '''
+    request_queue_addr: tuple[str, Optional[bytes]]
+    request_error_queue_addr: tuple[str, Optional[bytes]]
+    result_queue_addr: tuple[str, Optional[bytes]]
+    stats_queue_addr: tuple[str, Optional[bytes]]
+    kv_cache_events_queue_addr: tuple[str, Optional[bytes]]
+
+
+def is_llm_response(instance):
+    from tensorrt_llm._torch.pyexecutor.llm_request import \
+        LlmResponse as PyLlmResponse
+
+    from .result import ResponseWrapper
+    return isinstance(instance, (Response, PyLlmResponse, ResponseWrapper))

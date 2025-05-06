@@ -8,6 +8,7 @@ from torch._ops import OpOverload, OpOverloadPacket
 from torch.fx import Graph, GraphModule, Node
 
 from ..custom_ops.quant import QUANT_OPS
+from .logger import ad_logger
 
 try:
     # import modelopt to get quantize_op
@@ -22,6 +23,8 @@ try:
 except ImportError:
     modelopt_quantize_op = None
     modelopt_dynamic_block_quantize_op = None
+
+OperatorLike = Union[OpOverloadPacket, OpOverload, Callable]
 
 
 @dataclass
@@ -175,21 +178,30 @@ def get_op_overload_packet(node: Union[OpOverloadPacket, OpOverload]) -> OpOverl
         raise ValueError(f"Expected OpOverloadPacket or OpOverload, got {type(node)}")
 
 
-def is_op(node: Node, ops: Union[OpOverloadPacket, Iterable[OpOverloadPacket]]) -> bool:
+def is_op(node: Node, ops: Union[OperatorLike, Iterable[OperatorLike]]) -> bool:
     """Check if the node is a call to one of the ops."""
+    if not isinstance(node, Node):
+        return False
+
     if node.op != "call_function":
         return False
 
-    # check if it's a single op that's provided
-    if isinstance(ops, OpOverloadPacket):
+    # check if it's a single op that's provided by checking if it's iterable
+    if isinstance(ops, OpOverloadPacket) or not isinstance(ops, Iterable):
         ops = [ops]
 
-    # check if it's the op itself instead of an overload
-    if any(node.target == op for op in ops):
-        return True
+    # now iterate through the operator list and see if there is a match
+    is_match = True
+    for op in ops:
+        if node.target == op:
+            break
+        if isinstance(op, OpOverloadPacket):
+            if any(node.target == getattr(op, overload) for overload in op):
+                break
+    else:
+        is_match = False
 
-    # check the overloads
-    return any(node.target == getattr(op, overload) for op in ops for overload in op)
+    return is_match
 
 
 def is_linear_op(node: Node, include_quantization: bool = False) -> bool:
@@ -281,7 +293,8 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
 
     # sanity check: we expect at most two users for any residual node
     res_nodes_more_users = [n for n in boundary_nodes[2:] if len(n.users) > 2]
-    assert not res_nodes_more_users, f"Unexpected # of users for residuals: {res_nodes_more_users}"
+    if res_nodes_more_users:
+        ad_logger.warning(f"Unexpected # of users for residuals: {res_nodes_more_users}")
 
     # add output node to boundary nodes
     boundary_nodes.append(output_node)

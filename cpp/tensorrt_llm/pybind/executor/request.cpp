@@ -21,6 +21,7 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 
 #include <pybind11/cast.h>
 #include <pybind11/chrono.h>
@@ -28,9 +29,6 @@
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-
-#include "streamCaster.h"
-#include "tensorCaster.h"
 
 #include <optional>
 #include <vector>
@@ -502,16 +500,16 @@ void initRequestBindings(pybind11::module_& m)
         return py::make_tuple(self.getInputTokenIds(), self.getMaxTokens(), self.getStreaming(),
             self.getSamplingConfig(), self.getOutputConfig(), self.getEndId(), self.getPadId(), self.getPositionIds(),
             self.getBadWords(), self.getStopWords(), self.getEmbeddingBias(), self.getExternalDraftTokensConfig(),
-            self.getPromptTuningConfig(), self.getMropeConfig(), self.getLoraConfig(), self.getLookaheadConfig(),
-            self.getKvCacheRetentionConfig(), self.getLogitsPostProcessorName(), self.getLogitsPostProcessor(),
-            self.getEncoderInputTokenIds(), self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(),
-            self.getRequestType(), self.getContextPhaseParams(), self.getEncoderInputFeatures(),
-            self.getEncoderOutputLength(), self.getCrossAttentionMask(), self.getEagleConfig(),
-            self.getSkipCrossAttnBlocks(), self.getGuidedDecodingParams());
+            self.getPromptTuningConfig(), self.getMultimodalEmbedding(), self.getMropeConfig(), self.getLoraConfig(),
+            self.getLookaheadConfig(), self.getKvCacheRetentionConfig(), self.getLogitsPostProcessorName(),
+            self.getLogitsPostProcessor(), self.getEncoderInputTokenIds(), self.getClientId(),
+            self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(), self.getContextPhaseParams(),
+            self.getEncoderInputFeatures(), self.getEncoderOutputLength(), self.getCrossAttentionMask(),
+            self.getEagleConfig(), self.getSkipCrossAttnBlocks(), self.getGuidedDecodingParams());
     };
     auto requestSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 31)
+        if (state.size() != 32)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -521,19 +519,19 @@ void initRequestBindings(pybind11::module_& m)
             state[7].cast<std::optional<std::vector<SizeType32>>>(),
             state[8].cast<std::optional<std::list<VecTokens>>>(), state[9].cast<std::optional<std::list<VecTokens>>>(),
             state[10].cast<std::optional<Tensor>>(), state[11].cast<std::optional<tle::ExternalDraftTokensConfig>>(),
-            state[12].cast<std::optional<tle::PromptTuningConfig>>(), state[13].cast<std::optional<tle::MropeConfig>>(),
-            state[14].cast<std::optional<tle::LoraConfig>>(),
-            state[15].cast<std::optional<tle::LookaheadDecodingConfig>>(),
-            state[16].cast<std::optional<tle::KvCacheRetentionConfig>>(), state[17].cast<std::optional<std::string>>(),
-            state[18].cast<std::optional<tle::LogitsPostProcessor>>(), state[19].cast<std::optional<VecTokens>>(),
-            state[20].cast<std::optional<IdType>>(), state[21].cast<bool>(), state[22].cast<tle::PriorityType>(),
-            state[23].cast<tle::RequestType>(), state[24].cast<std::optional<tle::ContextPhaseParams>>(),
-            state[25].cast<std::optional<tle::Tensor>>(), state[26].cast<std::optional<SizeType32>>(),
-            state[27].cast<std::optional<tle::Tensor>>(), 1, state[28].cast<std::optional<tle::EagleConfig>>(),
-            state[29].cast<std::optional<tle::Tensor>>(), state[30].cast<std::optional<tle::GuidedDecodingParams>>());
+            state[12].cast<std::optional<tle::PromptTuningConfig>>(), state[13].cast<std::optional<Tensor>>(),
+            state[14].cast<std::optional<tle::MropeConfig>>(), state[15].cast<std::optional<tle::LoraConfig>>(),
+            state[16].cast<std::optional<tle::LookaheadDecodingConfig>>(),
+            state[17].cast<std::optional<tle::KvCacheRetentionConfig>>(), state[18].cast<std::optional<std::string>>(),
+            state[19].cast<std::optional<tle::LogitsPostProcessor>>(), state[20].cast<std::optional<VecTokens>>(),
+            state[21].cast<std::optional<IdType>>(), state[22].cast<bool>(), state[23].cast<tle::PriorityType>(),
+            state[24].cast<tle::RequestType>(), state[25].cast<std::optional<tle::ContextPhaseParams>>(),
+            state[26].cast<std::optional<tle::Tensor>>(), state[27].cast<std::optional<SizeType32>>(),
+            state[28].cast<std::optional<tle::Tensor>>(), 1, state[29].cast<std::optional<tle::EagleConfig>>(),
+            state[30].cast<std::optional<tle::Tensor>>(), state[31].cast<std::optional<tle::GuidedDecodingParams>>());
     };
 
-    py::class_<tle::Request> request(m, "Request");
+    py::class_<tle::Request> request(m, "Request", pybind11::dynamic_attr());
     request
         // A modified version of constructor to accpect deprecated args maxNewTokens
         // TODO(enweiz): use the original constructor after the deprecated args are removed
@@ -548,6 +546,7 @@ void initRequestBindings(pybind11::module_& m)
                      std::optional<tle::Tensor> const& embeddingBias,
                      std::optional<tle::ExternalDraftTokensConfig> const& externalDraftTokensConfig,
                      std::optional<tle::PromptTuningConfig> const& pTuningConfig,
+                     std::optional<tle::Tensor> const& multimodalEmbedding,
                      std::optional<tle::MropeConfig> const& mRopeConfig,
                      std::optional<tle::LoraConfig> const& loraConfig,
                      std::optional<tle::LookaheadDecodingConfig> lookaheadConfig,
@@ -576,11 +575,11 @@ void initRequestBindings(pybind11::module_& m)
                      TLLM_CHECK_WITH_INFO(maxTokens.has_value(), "missing required argument max_tokens");
                      return std::make_unique<tle::Request>(inputTokenIds, maxTokens.value(), streaming, samplingConfig,
                          outputConfig, endId, padId, positionIds, badWords, stopWords, embeddingBias,
-                         externalDraftTokensConfig, pTuningConfig, mRopeConfig, loraConfig, lookaheadConfig,
-                         kvCacheRetentionConfig, logitsPostProcessorName, logitsPostProcessor, encoderInputTokenIds,
-                         clientId, returnAllGeneratedTokens, priority, type, contextPhaseParams, encoderInputFeatures,
-                         encoderOutputLength, crossAttentionMask, 1, eagleConfig, skipCrossAttnBlocks,
-                         guidedDecodingParams, languageAdapterUid);
+                         externalDraftTokensConfig, pTuningConfig, multimodalEmbedding, mRopeConfig, loraConfig,
+                         lookaheadConfig, kvCacheRetentionConfig, logitsPostProcessorName, logitsPostProcessor,
+                         encoderInputTokenIds, clientId, returnAllGeneratedTokens, priority, type, contextPhaseParams,
+                         encoderInputFeatures, encoderOutputLength, crossAttentionMask, 1, eagleConfig,
+                         skipCrossAttnBlocks, guidedDecodingParams, languageAdapterUid);
                  }),
             py::arg("input_token_ids"), py::kw_only(), py::arg("max_tokens") = py::none(),
             py::arg("max_new_tokens") = py::none(), py::arg("streaming") = false,
@@ -589,11 +588,12 @@ void initRequestBindings(pybind11::module_& m)
             py::arg("pad_id") = py::none(), py::arg("position_ids") = py::none(), py::arg("bad_words") = py::none(),
             py::arg("stop_words") = py::none(), py::arg("embedding_bias") = py::none(),
             py::arg("external_draft_tokens_config") = py::none(), py::arg("prompt_tuning_config") = py::none(),
-            py::arg("mrope_config") = py::none(), py::arg("lora_config") = py::none(),
-            py::arg("lookahead_config") = py::none(), py::arg("kv_cache_retention_config") = py::none(),
-            py::arg("logits_post_processor_name") = py::none(), py::arg("logits_post_processor") = py::none(),
-            py::arg("encoder_input_token_ids") = py::none(), py::arg("client_id") = py::none(),
-            py::arg("return_all_generated_tokens") = false, py::arg("priority") = tle::Request::kDefaultPriority,
+            py::arg("multimodal_embedding") = py::none(), py::arg("mrope_config") = py::none(),
+            py::arg("lora_config") = py::none(), py::arg("lookahead_config") = py::none(),
+            py::arg("kv_cache_retention_config") = py::none(), py::arg("logits_post_processor_name") = py::none(),
+            py::arg("logits_post_processor") = py::none(), py::arg("encoder_input_token_ids") = py::none(),
+            py::arg("client_id") = py::none(), py::arg("return_all_generated_tokens") = false,
+            py::arg("priority") = tle::Request::kDefaultPriority,
             py::arg_v("type", tle::RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION,
                 "RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION"),
             py::arg("context_phase_params") = py::none(), py::arg("encoder_input_features") = py::none(),
@@ -616,6 +616,8 @@ void initRequestBindings(pybind11::module_& m)
             &tle::Request::setExternalDraftTokensConfig)
         .def_property(
             "prompt_tuning_config", &tle::Request::getPromptTuningConfig, &tle::Request::setPromptTuningConfig)
+        .def_property(
+            "multimodal_embedding", &tle::Request::getMultimodalEmbedding, &tle::Request::setMultimodalEmbedding)
         .def_property("mrope_config", &tle::Request::getMropeConfig, &tle::Request::setMropeConfig)
         .def_property("lora_config", &tle::Request::getLoraConfig, &tle::Request::setLoraConfig)
         .def_property("lookahead_config", &tle::Request::getLookaheadConfig, &tle::Request::setLookaheadConfig)
@@ -766,6 +768,24 @@ void initRequestBindings(pybind11::module_& m)
         .def("has_error", &tle::Response::hasError)
         .def_property_readonly("error_msg", &tle::Response::getErrorMsg)
         .def_property_readonly("result", &tle::Response::getResult)
+        .def("clear_context_logits",
+            [](tle::Response& self)
+            {
+                if (!self.hasError())
+                {
+                    auto& result = const_cast<tle::Result&>(self.getResult());
+                    result.contextLogits.reset();
+                }
+            })
+        .def("clear_generation_logits",
+            [](tle::Response& self)
+            {
+                if (!self.hasError())
+                {
+                    auto& result = const_cast<tle::Result&>(self.getResult());
+                    result.generationLogits.reset();
+                }
+            })
         .def(py::pickle(responseGetstate, responseSetstate));
 }
 

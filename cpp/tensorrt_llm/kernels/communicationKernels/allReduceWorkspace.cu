@@ -28,7 +28,8 @@ __global__ void lamport_initialize_kernel(float* ptr, int size)
 
 void lamport_initialize(void* ptr, int bytes, cudaStream_t stream)
 {
-    lamport_initialize_kernel<<<bytes / 128, 128, 0, stream>>>(reinterpret_cast<float*>(ptr), bytes / sizeof(float));
+    int grid_size = (bytes + 127) / 128;
+    lamport_initialize_kernel<<<grid_size, 128, 0, stream>>>(reinterpret_cast<float*>(ptr), bytes / sizeof(float));
 }
 
 Workspace::Workspace(int rank, int tp_size, int max_token_num, int hidden_dim,

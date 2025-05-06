@@ -84,7 +84,7 @@ def test_llm_internlm2_7b_1node_1gpu(internlm2_example_root,
     print('Run internlm2-7b...')
     data_type = "fp16" if dtype == "float16" else "bf16"
     summary_cmd = [
-        f"{internlm2_example_root}/../summarize.py", "--test_trt_llm",
+        f"{internlm2_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", llm_internlm2_7b_model_root, "--engine_dir",
         engine_dir, "--data_type", data_type, "--check_accuracy",
         f"--num_beams={num_beams}", f"--dataset_dir={llm_datasets_root}",

@@ -306,6 +306,7 @@ def load_calib_dataset(dataset_name_or_dir: str,
     dataset = load_dataset(dataset_name_or_dir,
                            name=config_name,
                            split=split,
+                           trust_remote_code=trust_remote_code,
                            **kwargs)
     return dataset[key]
 
