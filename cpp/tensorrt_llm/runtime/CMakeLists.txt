@@ -48,8 +48,6 @@ set(SRCS
     runtimeBuffers.cpp
     runtimeKernels.cu
     rnnStateBuffers.cpp
-    statefulGptDecoder.cpp
-    statefulGptDecoderBatched.cpp
     tllmBuffers.cpp
     tllmRuntime.cpp
     tllmStreamReaders.cpp
