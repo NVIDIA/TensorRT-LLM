@@ -1771,7 +1771,8 @@ void TrtGptModelInflightBatching::setupDecoderStep(
         auto const logitsType = mRuntime->getEngine().getTensorDataType("logits");
 
         auto [batchSlots, decoderRequests, samplingConfigs] = (*mGenerateRequestOptions)(mModelConfig, mWorldConfig,
-            mDecodingConfig, contextRequests, mRuntime->getBufferManager(), logitsType, inputBuffers, buffers);
+            mDecodingConfig, contextRequests, mRuntime->getBufferManager(), logitsType, inputBuffers,
+            mDecoder->getDecoderState(), mOperatingBeamWidth, mRuntime->getStream(), buffers);
 
         if (!decoderRequests.empty())
         {
@@ -2014,8 +2015,7 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     auto& decodingInput = mDecodingInputs.at(mMicroBatchId);
     std::tie(decodingInput, mDecodingOutput) = (*mMakeDecodingBatchInputOutput)(scheduledRequests.contextRequests,
         scheduledRequests.generationRequests, *mDecoderBuffers, mDecoderInputBuffers.at(fusedBufferId),
-        mDecoder->getDecoderState(), mModelConfig, getMaxNumSequences(), mOperatingBeamWidth, isTrtOverlap(),
-        mRuntime->getBufferManager(), mRuntime->getStream(), *fusedRuntimeBuffers);
+        mDecoder->getDecoderState(), mModelConfig, getMaxNumSequences(), *fusedRuntimeBuffers);
 
     auto decoderFinishEvent = mDecoder->forwardAsync(*mDecodingOutput, *decodingInput);
 
