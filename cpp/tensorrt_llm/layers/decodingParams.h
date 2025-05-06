@@ -221,8 +221,8 @@ struct LookaheadSetupParams : public DecodingSetupParams
 {
     using TensorPtr = runtime::ITensor::SharedPtr;
 
-    std::vector<runtime::ITensor::SharedConstPtr> prompt;       // [batchSize][maxSeqLen], on cpu
-    std::vector<executor::LookaheadDecodingConfig> algoConfigs; // [1] or [batchSize]
+    std::vector<runtime::ITensor::SharedConstPtr> prompt;            // [batchSize][maxSeqLen], on cpu
+    std::vector<executor::LookaheadDecodingConfig> lookaheadConfigs; // [1] or [batchSize]
 
     //! see class LookaheadDecodingOutputs
     TensorPtr generationLengths;    // [maxBatchSize], on gpu

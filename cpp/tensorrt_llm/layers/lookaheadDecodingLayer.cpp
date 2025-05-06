@@ -15,24 +15,6 @@
  */
 
 #include "lookaheadDecodingLayer.h"
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/nvtxUtils.h"
-#include "tensorrt_llm/executor/executor.h"
-#include "tensorrt_llm/kernels/samplingTopKKernels.h"
-#include "tensorrt_llm/layers/decodingParams.h"
-#include "tensorrt_llm/layers/defaultDecodingParams.h"
-#include "tensorrt_llm/layers/lookaheadAlgorithm.h"
-#include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
-#include "tensorrt_llm/runtime/bufferManager.h"
-#include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/iBuffer.h"
-#include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/lookaheadModule.h"
-#include <cstddef>
-#include <memory>
-#include <tuple>
 
 namespace tensorrt_llm::layers
 {
@@ -53,7 +35,7 @@ LookaheadDecodingLayer<T>::CpuAlgorithmResources::CpuAlgorithmResources(DecoderD
     SizeType32 maxTokensPerStep, maxNumNewTokens, maxDraftLen, maxAcceptedDraftLen;
     std::tie(maxTokensPerStep, maxNumNewTokens, maxDraftLen, maxAcceptedDraftLen)
         = executor::LookaheadDecodingConfig(maxW, maxN, maxG).calculateSpeculativeResource();
-    TLLM_CHECK_WITH_INFO(beamWidth == 1, "Lookahead requires beam width = 1");
+    TLLM_CHECK_WITH_INFO(beamWidth == 1, "Beam width must be 1 in Lookahead decoding.");
     TLLM_CHECK_WITH_INFO(maxTokensPerStep == decodingTokens, "%d != %d", maxTokensPerStep, decodingTokens);
 
     for (SizeType32 id = 0; id < maxBatchSize; id++)
@@ -68,34 +50,33 @@ LookaheadDecodingLayer<T>::CpuAlgorithmResources::CpuAlgorithmResources(DecoderD
     }
 
     auto const maxBatchShape1D = ITensor::makeShape({maxBatchSize});
+    auto const maxBatchShape2D = ITensor::makeShape({maxBatchSize, maxTokensPerStep});
+
     mBatchSlots = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
-    mTargetTokens
-        = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxTokensPerStep}), nvinfer1::DataType::kINT32);
+    mTargetTokens = BufferManager::cpu(maxBatchShape2D, nvinfer1::DataType::kINT32);
     mTokensPerStep = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
     mEndIds = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
-
     mOutputIds = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxNumNewTokens}), nvinfer1::DataType::kINT32);
-    mNewTokens = BufferManager::cpu(
-        ITensor::makeShape({maxTokensPerStep, maxBatchSize, beamWidth}), nvinfer1::DataType::kINT32);
     mPathsOffsets
         = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxAcceptedDraftLen}), nvinfer1::DataType::kINT32);
     mPathsOffsetsBatch
         = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxAcceptedDraftLen}), nvinfer1::DataType::kINT32);
     mNumNewTokens = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
     mNumNewTokensCumSum = BufferManager::cpu(ITensor::makeShape({maxBatchSize + 1}), nvinfer1::DataType::kINT32);
+    mNewTokens = BufferManager::cpu(
+        ITensor::makeShape({maxTokensPerStep, maxBatchSize, beamWidth}), nvinfer1::DataType::kINT32);
     mNextDraftTokens = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxDraftLen}), nvinfer1::DataType::kINT32);
     mNextDraftPosIds = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxDraftLen}), nvinfer1::DataType::kINT32);
+    mNextDraftLengths = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
+    mSequenceLengths = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
     mGenerationLengths = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
-    mPositionOffsets
-        = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxTokensPerStep}), nvinfer1::DataType::kINT32);
-    mPositionIds = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxTokensPerStep}), nvinfer1::DataType::kINT32);
     mAttentionMask
         = BufferManager::cpu(ITensor::makeShape({maxTokensPerStep, maxTokensPerStep}), nvinfer1::DataType::kBOOL);
     mPackedMask = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxTokensPerStep,
                                          static_cast<ITensor::DimType64>(divUp(maxTokensPerStep, 32))}),
         nvinfer1::DataType::kINT32);
-    mNextDraftLengths = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
-    mSequenceLengths = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
+    mPositionOffsets = BufferManager::cpu(maxBatchShape2D, nvinfer1::DataType::kINT32);
+    mPositionIds = BufferManager::cpu(maxBatchShape2D, nvinfer1::DataType::kINT32);
 }
 
 template <typename T>
@@ -105,9 +86,6 @@ LookaheadDecodingLayer<T>::LookaheadDecodingLayer(
     , mCpuAlgo(std::make_optional<CpuAlgorithmResources>(decoderDomain))
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    auto lookaheadModule
-        = std::dynamic_pointer_cast<LookaheadModule const>(decoderDomain.getSpeculativeDecodingModule());
 
     auto const maxBatchSize = mDecoderDomain.getBatchSize();
     auto const maxTokensPerStep = mDecoderDomain.getMaxDecodingTokens();
@@ -132,83 +110,71 @@ void LookaheadDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth
     std::shared_ptr<BaseSetupParams> const& baseSetupParams,
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("================ %s start", __PRETTY_FUNCTION__);
+
+    TLLM_LOG_TRACE("Before LookaheadDecodingLayer<T>::setup");
+    printLookaheadDecodingLayer(__LINE__);
 
     auto setupParams = std::dynamic_pointer_cast<LookaheadSetupParams>(baseSetupParams);
 
-    if (mCpuAlgo)
+    TLLM_CHECK_WITH_INFO(mCpuAlgo, "CpuAlgorithmResources of the Lookahead decoding layer is empty.");
+
+    auto& lookaheadConfigs = setupParams->lookaheadConfigs;
+    TLLM_CHECK_WITH_INFO(lookaheadConfigs.size() == 1 || lookaheadConfigs.size() == static_cast<size_t>(batchSize),
+        "Lookahead runtime configuration size should be either 1 or batchSize");
+
+    auto const batchSlotsRange = BufferRange<SizeType32 const>(*batchSlots);
+
+    for (auto bi = 0; bi < batchSize; bi++)
     {
-        auto& algoConfigs = setupParams->algoConfigs;
-        TLLM_CHECK_WITH_INFO(algoConfigs.size() == 1 || algoConfigs.size() == static_cast<size_t>(batchSize),
-            "Lookahead runtime configuration size should be either 1 or batchSize");
+        auto const gbi{batchSlotsRange[bi]};
+        auto const prompt{setupParams->prompt[bi]}; // `bi` or `gbi`?
+        PRINT_SHAPE(prompt);
+        PRINT_TOKENS(prompt);
+        mCpuAlgo->mPrompts[bi]->reshape(prompt->getShape());                              // `bi` or `gbi`?
+        mBufferManager->copy(*prompt, *mCpuAlgo->mPrompts[bi]);                           // `bi` or `gbi`?
 
-        for (auto bi = 0; bi < batchSize; bi++)
+        auto [w, n, g] = lookaheadConfigs[(lookaheadConfigs.size() == 1) ? 0 : bi].get(); // `bi` or `gbi`?
+        SizeType32 runtimeTokensPerStep = 0;
+        std::tie(runtimeTokensPerStep, std::ignore, std::ignore, std::ignore)
+            = executor::LookaheadDecodingConfig(w, n, g).calculateSpeculativeResource();
+        TLLM_CHECK_WITH_INFO(runtimeTokensPerStep <= mDecoderDomain.getMaxDecodingTokens(),
+            "runtime w(%d) n(%d) g(%d) exceeds maxTokensPerStep(%d)", w, n, g, mDecoderDomain.getMaxDecodingTokens());
+        auto seed = DefaultDecodingParams::getSeed();
+        if (setupParams->randomSeed)
         {
-            PRINT_SHAPE(setupParams->prompt[bi]);
-            PRINT_TOKENS(setupParams->prompt[bi]);
-            mCpuAlgo->mPrompts[bi]->reshape(setupParams->prompt[bi]->getShape());
-            mBufferManager->copy(*setupParams->prompt[bi], *mCpuAlgo->mPrompts[bi]);
+            auto& seeds = setupParams->randomSeed.value();
+            seed = seeds.size() == 1 ? seeds[0] : seeds[bi];                // `bi` or `gbi`?
         }
+        mCpuAlgo->mAlgos[gbi].setup(mCpuAlgo->mPrompts[bi], w, n, g, seed); // `bi` or `gbi`?
 
-        mBufferManager->getStream().synchronize(); // sync prompt gpu to cpu
-
-        auto const batchSlotsRange = BufferRange<SizeType32 const>(*batchSlots);
-        for (SizeType32 bi = 0; bi < batchSize; bi++)
+        (BufferRange<SizeType32>(*mCpuAlgo->mGenerationLengths))[gbi] = 1;
+        (BufferRange<SizeType32>(*mCpuAlgo->mNextDraftLengths))[gbi] = 0;
+        BufferLocation<SizeType32>(*mCpuAlgo->mPositionOffsets).at(gbi, 0) = 0;
+        BufferRange<SizeType32> packedMaskRange(*ITensor::at(mCpuAlgo->mPackedMask, {gbi}));
+        for (auto& mask : packedMaskRange)
         {
-            auto const gbi = batchSlotsRange[bi];
-            SizeType32 bi1orN = (algoConfigs.size() == 1) ? 0 : bi;
-            TLLM_LOG_DEBUG("CPU ALGO [ %d ] setup prompt %s", gbi, D(mCpuAlgo->mPrompts[bi]).values().c_str());
-            auto [w, n, g] = algoConfigs[bi1orN].get();
-            SizeType32 runtimeTokensPerStep = 0;
-            std::tie(runtimeTokensPerStep, std::ignore, std::ignore, std::ignore)
-                = executor::LookaheadDecodingConfig(w, n, g).calculateSpeculativeResource();
-            TLLM_CHECK_WITH_INFO(runtimeTokensPerStep <= mDecoderDomain.getMaxDecodingTokens(),
-                "runtime w(%d) n(%d) g(%d) exceeds maxTokensPerStep(%d)", w, n, g,
-                mDecoderDomain.getMaxDecodingTokens());
-            PRINT_VALUES(mCpuAlgo->mPrompts[bi]);
-            auto seed = DefaultDecodingParams::getSeed();
-            if (setupParams->randomSeed)
-            {
-                auto& seeds = setupParams->randomSeed.value();
-                seed = seeds.size() == 1 ? seeds[0] : seeds[bi];
-            }
-            mCpuAlgo->mAlgos[gbi].setup(mCpuAlgo->mPrompts[bi], w, n, g, seed);
+            mask = 0;
         }
+        packedMaskRange[0] = 1;
 
-        for (runtime::SizeType32 bi = 0; bi < batchSize; bi++)
-        {
-            SizeType32 gbi = batchSlotsRange[bi];
-            (BufferRange<SizeType32>(*mCpuAlgo->mGenerationLengths))[gbi] = 1;
-            (BufferRange<SizeType32>(*mCpuAlgo->mNextDraftLengths))[gbi] = 0;
-            BufferLocation<SizeType32>(*mCpuAlgo->mPositionOffsets).at(gbi, 0) = 0;
-            BufferRange<SizeType32> packedMaskRange(*ITensor::at(mCpuAlgo->mPackedMask, {gbi}));
-            for (auto& mask : packedMaskRange)
-            {
-                mask = 0;
-            }
-            packedMaskRange[0] = 1;
-
-            PRINT_SHAPE(mCpuAlgo->mGenerationLengths);
-            PRINT_SHAPE(setupParams->generationLengths);
-            PRINT_SHAPE(mCpuAlgo->mPositionOffsets);
-            PRINT_SHAPE(setupParams->positionOffsets);
-            PRINT_SHAPE(mCpuAlgo->mPackedMask);
-            PRINT_SHAPE(setupParams->attentionPackedMasks);
-            mBufferManager->copy(
-                *ITensor::at(mCpuAlgo->mGenerationLengths, {gbi}), *ITensor::at(setupParams->generationLengths, {gbi}));
-            mBufferManager->copy(
-                *ITensor::at(mCpuAlgo->mPositionOffsets, {gbi}), *ITensor::at(setupParams->positionOffsets, {gbi}));
-            mBufferManager->copy(
-                *ITensor::at(mCpuAlgo->mPackedMask, {gbi}), *ITensor::at(setupParams->attentionPackedMasks, {gbi}));
-        }
-
-        mBufferManager->getStream().synchronize(); // sync outputs cpu to gpu
+        mBufferManager->copy(
+            *ITensor::at(mCpuAlgo->mGenerationLengths, {gbi}), *ITensor::at(setupParams->generationLengths, {gbi}));
+        mBufferManager->copy(
+            *ITensor::at(mCpuAlgo->mPositionOffsets, {gbi}), *ITensor::at(setupParams->positionOffsets, {gbi}));
+        mBufferManager->copy(
+            *ITensor::at(mCpuAlgo->mPackedMask, {gbi}), *ITensor::at(setupParams->attentionPackedMasks, {gbi}));
     }
+
+    mBufferManager->getStream().synchronize();
 
     workspace->initializeDeviceCurandStates(
         setupParams->randomSeed, batchSize, workspace->getDeviceBatchSlots(), mCurandStatesDevice);
 
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("After LookaheadDecodingLayer<T>::setup");
+    printLookaheadDecodingLayer(__LINE__);
+
+    TLLM_LOG_TRACE("================ %s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
@@ -216,7 +182,11 @@ void LookaheadDecodingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs
     std::shared_ptr<BaseDecodingInputs> const& inputParams,
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("================ %s start", __PRETTY_FUNCTION__);
+
+    TLLM_LOG_TRACE("Before LookaheadDecodingLayer<T>::forwardAsync");
+    printLookaheadDecodingLayer(__LINE__);
+
     NVTX3_SCOPED_RANGE(LookaheadDecodingLayer_forwardAsync);
 
     auto inputs = std::dynamic_pointer_cast<LookaheadDecodingInputs>(inputParams);
@@ -261,7 +231,10 @@ void LookaheadDecodingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs
         mGlobalSteps += 1;
     }
 
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    // TLLM_LOG_TRACE("After LookaheadDecodingLayer<T>::forwardAsync");
+    // printLookaheadDecodingLayer(__LINE__);
+
+    TLLM_LOG_TRACE("================ %s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
@@ -304,7 +277,11 @@ template <typename T>
 void LookaheadDecodingLayer<T>::forwardSyncCPU(
     std::shared_ptr<LookaheadDecodingOutputs> const& outputs, std::shared_ptr<LookaheadDecodingInputs> const& inputs)
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("================ %s start", __PRETTY_FUNCTION__);
+
+    TLLM_LOG_TRACE("Before LookaheadDecodingLayer<T>::forwardSyncCPU");
+    printLookaheadDecodingLayer(__LINE__);
+
     NVTX3_SCOPED_RANGE(LookaheadDecodingLayer_forwardSyncCPU);
 
     mCpuAlgo->mBatchSlots->reshape(inputs->batchSlots->getShape());
@@ -324,9 +301,6 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
 
     auto const batchSize = inputs->localBatchSize;
 
-    BufferRange<SizeType32 const> tokensPerStepRange(*mCpuAlgo->mTokensPerStep);
-    BufferRange<TokenIdType> endIdsRange(*mCpuAlgo->mEndIds);
-    BufferLocation<TokenIdType> newTokensLocation(*mCpuAlgo->mNewTokens);
     BufferRange<SizeType32> numNewTokensRange(*mCpuAlgo->mNumNewTokens);
     BufferRange<SizeType32> numNewTokensCumSumRange(*mCpuAlgo->mNumNewTokensCumSum);
     BufferRange<SizeType32> batchSlotsRange(*mCpuAlgo->mBatchSlots);
@@ -335,27 +309,33 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
     BufferRange<SizeType32> sequenceLengthsRange(*mCpuAlgo->mSequenceLengths);
     BufferLocation<SizeType32> pathsOffsetLocation(*mCpuAlgo->mPathsOffsets);
     BufferLocation<SizeType32> pathsOffsetBatchLocation(*mCpuAlgo->mPathsOffsetsBatch);
-    BufferLocation<TokenIdType> outputIdsLocation(*mCpuAlgo->mOutputIds);
 
     mBufferManager->setZero(*mCpuAlgo->mPathsOffsets);
     mBufferManager->setZero(*mCpuAlgo->mNumNewTokens);
     mBufferManager->setZero(*mCpuAlgo->mNumNewTokensCumSum);
     mBufferManager->setZero(*mCpuAlgo->mPackedMask);
 
-    for (SizeType32 bi = 0; bi < batchSize; bi++)
+    size_t pi = 0;
+    numNewTokensCumSumRange[0] = 0;
+
+    printLookaheadDecodingLayer(__LINE__);
+
+    for (auto bi = 0; bi < batchSize; bi++)
     {
-        SizeType32 gbi = batchSlotsRange[bi];
+        SizeType32 const gbi = batchSlotsRange[bi];
         LookaheadAlgorithm& theAlgo(mCpuAlgo->mAlgos[gbi]);
 
         SizeType32 const tokensPerStep = generationLengthsRange[gbi];
         TensorPtr sampledTokens = ITensor::slice(mCpuAlgo->mTargetTokens, {gbi, 0}, tokensPerStep);
 
+        PRINT_TOKENS(sampledTokens); // wili
+
         if (tokensPerStep == 1)
         {
-            // The first step in generation phase has no draft tokens.
+            // No draft tokens
             theAlgo.accept(sampledTokens);
-            mBufferManager->copy(*sampledTokens, *ITensor::slice(mCpuAlgo->mOutputIds, {gbi, 0}, tokensPerStep));
-            numNewTokensRange[gbi] = tokensPerStep;
+            mBufferManager->copy(*sampledTokens, *ITensor::slice(mCpuAlgo->mOutputIds, {gbi, 0}, 1));
+            numNewTokensRange[gbi] = 1;
             BufferLocation<SizeType32>(*mCpuAlgo->mNextDraftLengths).at(gbi) = 0;
         }
         else
@@ -368,7 +348,10 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
                 ITensor::at(mCpuAlgo->mEndIds, {gbi}));
         }
 
+        printLookaheadDecodingLayer(__LINE__);
+
         auto maxNumNewTokens = mCpuAlgo->mOutputIds->getShape().d[1];
+        TLLM_LOG_TRACE("L%d, maxNumNewTokens=%d", __LINE__, maxNumNewTokens);
 
         mBufferManager->copy(*ITensor::at(mCpuAlgo->mOutputIds, {gbi}),
             *ITensor::slice(outputs->outputIds, {gbi, 0, sequenceLengthsRange[gbi]}, maxNumNewTokens));
@@ -377,15 +360,20 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
 
         initAttentionMask(mCpuAlgo->mAttentionMask, mBufferManager);
 
+        printLookaheadDecodingLayer(__LINE__);
+
         theAlgo.prepare(                                     //
             ITensor::at(mCpuAlgo->mNextDraftTokens, {gbi}),  //
             ITensor::at(mCpuAlgo->mNextDraftPosIds, {gbi}),  //
             ITensor::at(mCpuAlgo->mNextDraftLengths, {gbi}), //
-            mCpuAlgo->mAttentionMask, 1,                     //
+            mCpuAlgo->mAttentionMask,                        //
+            1,                                               //
             ITensor::at(mCpuAlgo->mSequenceLengths, {gbi}),  //
             ITensor::at(mCpuAlgo->mOutputIds, {gbi, numNewTokensRange[gbi] - 1}));
 
         convertBoolToInt32(ITensor::at(mCpuAlgo->mPackedMask, {gbi}), mCpuAlgo->mAttentionMask);
+
+        printLookaheadDecodingLayer(__LINE__);
 
         BufferLocation<SizeType32> posIdsLocation(*ITensor::at(mCpuAlgo->mPositionIds, {gbi}));
         for (auto& posid : posIdsLocation)
@@ -401,24 +389,22 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
             offsetRange[i] = posIdsLocation[i] - posIdsLocation[0];
         }
 
+        printLookaheadDecodingLayer(__LINE__);
+
         TensorPtr accepted = ITensor::slice(mCpuAlgo->mOutputIds, {gbi, 0}, numNewTokensRange[gbi]);
         TensorPtr draft = ITensor::slice(mCpuAlgo->mNextDraftTokens, {gbi, 0}, nextDraftLengthsRange[gbi]);
         TLLM_LOG_DEBUG("CPU ALGO [ %d ] forward, %s", gbi, D(sampledTokens).values().c_str());
         TLLM_LOG_DEBUG("[%d][%d] CPU ALGO [ %d ] forward, %s, %s", mGlobalSteps, batchSize, gbi,
             D(accepted).values().c_str(), D(draft).values().c_str());
-    }
 
-    size_t pi = 0;
-    numNewTokensCumSumRange[0] = 0;
-    for (SizeType32 bi = 0; bi < batchSize; bi++)
-    {
-        SizeType32 gbi = batchSlotsRange[bi];
         SizeType32 acceptedDraftLen = numNewTokensRange[gbi] <= 1 ? 0 : (numNewTokensRange[gbi] - 1);
         numNewTokensCumSumRange[bi + 1] = numNewTokensCumSumRange[bi] + acceptedDraftLen;
         for (SizeType32 tj = 0; tj < acceptedDraftLen; tj++)
         {
             pathsOffsetBatchLocation[pi++] = pathsOffsetLocation.at(gbi, tj);
         }
+
+        printLookaheadDecodingLayer(__LINE__);
     }
 
     while (pi < pathsOffsetBatchLocation.size())
@@ -435,6 +421,8 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
     mBufferManager->copy(*mCpuAlgo->mPathsOffsetsBatch, *outputs->pathsOffsets);
     mBufferManager->copy(*mCpuAlgo->mNumNewTokensCumSum, *outputs->numNewTokensCumSum); //
     mBufferManager->copy(*mCpuAlgo->mNextDraftTokens, *outputs->nextDraftTokens);
+
+    printLookaheadDecodingLayer(__LINE__);
 
     for (SizeType32 bi = 0; bi < batchSize; bi++)
     {
@@ -455,8 +443,61 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
 
     mBufferManager->getStream().synchronize();
 
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    printLookaheadDecodingLayer(__LINE__);
+
+    TLLM_LOG_TRACE("================ %s stop", __PRETTY_FUNCTION__);
 }
+
+template <typename T>
+void LookaheadDecodingLayer<T>::printLookaheadDecodingLayer(int const lineNumber) const noexcept
+{
+    TLLM_LOG_TRACE("================ printLookaheadDecodingLayer @L%d start", lineNumber);
+    TLLM_LOG_TRACE("mWorkspaceSize=%d, ", mWorkspaceSize);
+    TLLM_LOG_TRACE("mSetupWorkspaceSize=%d, ", mSetupWorkspaceSize);
+    TLLM_LOG_TRACE("mGlobalSteps=%d, ", mGlobalSteps);
+    // PRINT_TOKENS(mCurandStatesDevice);
+    PRINT_TOKENS(mTargetTokensDevice);
+
+    if (mCpuAlgo.has_value())
+    {
+        auto const cpuAlgoValue = mCpuAlgo.value();
+        TLLM_LOG_TRACE("mPrompts:");
+        for (long unsigned int i = 0; i < cpuAlgoValue.mPrompts.size(); ++i)
+        {
+            TLLM_LOG_TRACE("i=%d", (int) i);
+            PRINT_TOKENS(cpuAlgoValue.mPrompts[i]);
+        }
+
+        PRINT_TOKENS(cpuAlgoValue.mBatchSlots);
+        PRINT_TOKENS(cpuAlgoValue.mTargetTokens);
+        PRINT_TOKENS(cpuAlgoValue.mTokensPerStep);
+        PRINT_TOKENS(cpuAlgoValue.mEndIds);
+        PRINT_TOKENS(cpuAlgoValue.mOutputIds);
+        PRINT_TOKENS(cpuAlgoValue.mPathsOffsets);
+        PRINT_TOKENS(cpuAlgoValue.mPathsOffsetsBatch);
+        PRINT_TOKENS(cpuAlgoValue.mNumNewTokens);
+        PRINT_TOKENS(cpuAlgoValue.mNumNewTokensCumSum);
+        PRINT_TOKENS(cpuAlgoValue.mNewTokens);
+        PRINT_TOKENS(cpuAlgoValue.mNextDraftTokens);
+        PRINT_TOKENS(cpuAlgoValue.mNextDraftPosIds);
+        PRINT_TOKENS(cpuAlgoValue.mNextDraftLengths);
+        PRINT_TOKENS(cpuAlgoValue.mSequenceLengths);
+        PRINT_TOKENS(cpuAlgoValue.mGenerationLengths);
+        PRINT_VALUES(cpuAlgoValue.mAttentionMask);
+        PRINT_TOKENS(cpuAlgoValue.mPackedMask);
+        PRINT_TOKENS(cpuAlgoValue.mPositionOffsets);
+        PRINT_TOKENS(cpuAlgoValue.mPositionIds);
+
+        for (long unsigned int i = 0; i < cpuAlgoValue.mAlgos.size(); ++i)
+        {
+            TLLM_LOG_TRACE("mAlgos[%d]:", (int) i);
+            cpuAlgoValue.mAlgos[i].printAlgorithm();
+        }
+    }
+
+    TLLM_LOG_TRACE("================ printLookaheadDecodingLayer @L%d end", lineNumber);
+}
+
 template class LookaheadDecodingLayer<float>;
 template class LookaheadDecodingLayer<half>;
 

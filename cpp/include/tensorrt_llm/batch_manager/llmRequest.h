@@ -1804,7 +1804,7 @@ protected:
     // List of tokens including input prompt and generated part.
     BeamTokens mTokens; // [beamSize, mPromptLen + getMaxNumGeneratedTokens()]
 
-                        // Length of input prompt tokens, never changes during generation process.
+    // Length of input prompt tokens, never changes during generation process.
     SizeType32 mOrigPromptLen;
 
     // List of numbers of pre-deocded tokens on the last PP rank when using pipeline parallelism.

@@ -15,16 +15,6 @@
  */
 
 #include "tensorrt_llm/layers/lookaheadAlgorithm.h"
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/executor/executor.h"
-#include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
-#include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/iTensor.h"
-
-#include <cstddef>
-#include <memory>
-#include <tuple>
 
 namespace tensorrt_llm::layers
 {
@@ -63,6 +53,7 @@ LookaheadAlgorithm::LookaheadAlgorithm(
 void LookaheadAlgorithm::setup(TensorConstPtr const& prompt, SizeType32 w, SizeType32 n, SizeType32 g, uint64_t seed)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     TLLM_CHECK_WITH_INFO(w <= mMaxW, "lookahead requires setup w (%d) <= max_w (%d)", w, mMaxW);
     TLLM_CHECK_WITH_INFO(n <= mMaxN, "lookahead requires setup n (%d) <= max_n (%d)", n, mMaxN);
     TLLM_CHECK_WITH_INFO(g <= mMaxG, "lookahead requires setup g (%d) <= max_g (%d)", g, mMaxG);
@@ -74,11 +65,13 @@ void LookaheadAlgorithm::setup(TensorConstPtr const& prompt, SizeType32 w, SizeT
 
     mPoolManager.setup(mG);
     mPoolManager.accept(prompt, mN);
-    mGoldenTokens = ITensor::slice(mGoldenTokensMax, 0, mN * 2 - 1);
-    mPrefills = ITensor::slice(mPrefillsMax, 0, mN <= 1 ? 0 : mN - 2);
-    mKeyTokens = ITensor::slice(mKeyTokensMax, 0, mW);
+
+    mPrefills = ITensor::slice(mPrefillsMax, 0, mN > 2 ? mN - 2 : 0);
     mPastTokens = ITensor::slice(mPastTokensMax, 0, mW * (mN - 1));
     mPastTokens->reshape(ITensor::makeShape({mW, mN - 1}));
+    mKeyTokens = ITensor::slice(mKeyTokensMax, 0, mW);
+    mGoldenTokens = ITensor::slice(mGoldenTokensMax, 0, mN * 2 - 1);
+    mGuessTokens = ITensor::slice(mGuessTokensMax, 0, 0);
 
     BufferRange<TokenIdType const> promptRange(*prompt);
     BufferRange<TokenIdType> prefillRange(*mPrefills);
@@ -86,7 +79,6 @@ void LookaheadAlgorithm::setup(TensorConstPtr const& prompt, SizeType32 w, SizeT
     BufferRange<TokenIdType> goldRange(*mGoldenTokens);
 
     srand(seed);
-
     auto randToken = [&promptRange](auto& item) { item = promptRange[rand() % promptRange.size()]; };
     std::for_each(prefillRange.begin(), prefillRange.end(), randToken);
     std::for_each(pastRange.begin(), pastRange.end(), [](auto& a) { a = -1; });
@@ -98,13 +90,16 @@ void LookaheadAlgorithm::setup(TensorConstPtr const& prompt, SizeType32 w, SizeT
         }
     }
     std::copy(std::prev(promptRange.end(), mN - 1), promptRange.end(), goldRange.begin());
-    mGuessTokens = ITensor::slice(mGuessTokensMax, 0, 0);
-    mFilling = (mN - 1) > 0 ? 1 : 0;
+
+    mFilling = mN > 1 ? 1 : 0;
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void LookaheadAlgorithm::accept(TensorConstPtr const& generatedTokens)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     TLLM_CHECK(ITensor::volume(generatedTokens->getShape()) <= mN);
     BufferRange<TokenIdType const> generatedRange(*generatedTokens);
     BufferRange<TokenIdType> goldRange(*mGoldenTokens);
@@ -112,8 +107,14 @@ void LookaheadAlgorithm::accept(TensorConstPtr const& generatedTokens)
     TLLM_CHECK(genLen <= mN);
     std::copy(generatedRange.begin(), generatedRange.end(), goldRange.begin() + mN - 1);
     TensorPtr newGold = ITensor::slice(mGoldenTokens, 0, mN - 1 + genLen);
+    TLLM_LOG_TRACE("genLen = %d, mN - 1 + genLen = %d", genLen, mN - 1 + genLen);
+    PRINT_TOKENS(newGold);
+
     mPoolManager.accept(newGold, mN);
+    // Remove the first `genLen` tokens in mGoldenTokens
     std::copy(goldRange.begin() + genLen, goldRange.begin() + genLen + mN - 1, goldRange.begin());
+
+    TLLM_LOG_TRACE("%s end", __PRETTY_FUNCTION__);
 }
 
 //! lookahead has two phase, prefill the past tokens matrix and maintain past tokens matrix.
@@ -180,7 +181,9 @@ runtime::SizeType32 LookaheadAlgorithm::lookahead(
 runtime::SizeType32 LookaheadAlgorithm::guess(TensorPtr const& guessTokens, TensorPtr const& guessIds,
     runtime::SizeType32 startPosId, runtime::TokenIdType lastToken)
 {
-    auto guesses = mPoolManager.guess(lastToken, mW);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto guesses = mPoolManager.guess(lastToken, mG); // mW or mG?
 
     SizeType32 len = 0;
     std::for_each(guesses.begin(), guesses.end(), [&len](auto& a) { len += ITensor::volume(a->getShape()); });
@@ -200,11 +203,15 @@ runtime::SizeType32 LookaheadAlgorithm::guess(TensorPtr const& guessTokens, Tens
         cur += ITensor::volume(guess->getShape());
     }
 
+    TLLM_LOG_TRACE("%s end", __PRETTY_FUNCTION__);
+
     return len;
 }
 
 void LookaheadAlgorithm::posIdsToMask(TensorPtr const& mask, TensorConstPtr const& posIds)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     auto len = ITensor::volume(posIds->getShape());
     TLLM_CHECK(mask->getDimension<0>() >= len);
     TLLM_CHECK(mask->getDimension<1>() >= len);
@@ -234,6 +241,8 @@ void LookaheadAlgorithm::posIdsToMask(TensorPtr const& mask, TensorConstPtr cons
             }
         }
     }
+
+    TLLM_LOG_TRACE("%s end", __PRETTY_FUNCTION__);
 }
 
 struct TreeValue;
@@ -267,6 +276,8 @@ void treeDFS(TreeNode& node, BF const& visitBefore, AF const& visitAfter)
 SizeType32 LookaheadAlgorithm::treeEncode(
     TensorPtr const& tokens, TensorPtr const& posIds, TensorPtr const& mask, TensorPtr const& encodeMap)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     TLLM_CHECK(ITensor::volume(tokens->getShape()) == ITensor::volume(posIds->getShape()));
     auto len = ITensor::volume(tokens->getShape());
 
@@ -349,6 +360,8 @@ SizeType32 LookaheadAlgorithm::treeEncode(
             maskLocation.at(i, j) = false;
         }
     }
+
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     return offset;
 }
@@ -578,6 +591,43 @@ void LookaheadAlgorithm::update(TensorPtr const& acceptedTokens, TensorPtr const
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void LookaheadAlgorithm::printAlgorithm() const noexcept
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    TLLM_LOG_TRACE("mMaxW=%d, ", mMaxW);
+    TLLM_LOG_TRACE("mMaxN=%d, ", mMaxN);
+    TLLM_LOG_TRACE("mMaxG=%d, ", mMaxG);
+    TLLM_LOG_TRACE("mW=%d, ", mW);
+    TLLM_LOG_TRACE("mN=%d, ", mN);
+    TLLM_LOG_TRACE("mG=%d, ", mG);
+    TLLM_LOG_TRACE("mRuntimeMaxDraftLen=%d, ", mRuntimeMaxDraftLen);
+    TLLM_LOG_TRACE("mRuntimeMaxDraftPathLen=%d, ", mRuntimeMaxDraftPathLen);
+    TLLM_LOG_TRACE("mFilling=%d, ", mFilling);
+
+    PRINT_TOKENS(mPrefillsMax);
+    PRINT_TOKENS(mPrefills);
+    PRINT_TOKENS(mPastTokensMax);
+    PRINT_TOKENS(mPastTokens);
+    PRINT_TOKENS(mKeyTokensMax);
+    PRINT_TOKENS(mKeyTokens);
+    PRINT_TOKENS(mGoldenTokensMax);
+    PRINT_TOKENS(mGoldenTokens);
+    PRINT_TOKENS(mGuessTokensMax);
+    PRINT_TOKENS(mGuessTokens);
+    PRINT_TOKENS(mDraftTokensMax);
+    PRINT_TOKENS(mDraftTokens);
+    PRINT_VALUES(mAttentionMask);
+    PRINT_TOKENS(mEncodeMapMax);
+    PRINT_TOKENS(mEncodeMap);
+    PRINT_TOKENS(mSampledTokensMax);
+    PRINT_TOKENS(mSampledTokens);
+
+    mPoolManager.printPoolManager();
+
+    TLLM_LOG_TRACE("%s end", __PRETTY_FUNCTION__);
 }
 
 } // namespace tensorrt_llm::layers
