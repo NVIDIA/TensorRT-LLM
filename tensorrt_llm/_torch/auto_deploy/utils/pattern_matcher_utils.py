@@ -9,7 +9,7 @@ import itertools
 import operator
 import re
 from collections.abc import Mapping, Sequence
-from typing import Any, Callable, List, NoReturn, Optional, Union
+from typing import Any, Callable, Iterable, List, NoReturn, Optional, Union
 
 import torch
 import torch.fx
@@ -55,9 +55,9 @@ def register_pattern(
     search_fn: Callable,
     replace_fn: Callable,
     patterns: PatternMatcherPass,
-    example_inputs: List[torch.Tensor],
     dummy_args: List[torch.Tensor],
     trace_fn: Callable[[Callable, Sequence[torch.Tensor]], GraphModule] = trace_to_gm,
+    example_inputs: Iterable[Any] = [None],
     exclusive_arg_names: Sequence[str] = (),
     scalar_workaround: Optional[Any] = None,
     op_ignore_types: Optional[Mapping[Callable[..., Any], Sequence[type[Any]]]] = None,

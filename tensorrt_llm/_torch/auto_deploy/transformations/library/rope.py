@@ -98,7 +98,6 @@ def match_explicit_rope_with_pm(gm: GraphModule) -> GraphModule:
         search_fn=_rope_pattern,
         replace_fn=_rope_repl,
         patterns=patterns,
-        example_inputs=[None],
         dummy_args=dummy,
         op_ignore_types={torch.ops.aten.slice.Tensor: (int,)},
         scalar_workaround={"unsqueeze_dim": 1},
