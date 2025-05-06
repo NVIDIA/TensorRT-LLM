@@ -131,20 +131,40 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
     copySequenceLengths(finishedContextRequests, inputBuffers, decoderState.getJointDecodingOutput().lengths, beamWidth,
         bufferManager, stream);
 
-    SizeType32 batchSize{0};
+    auto decoderRequests = createDecoderRequests(finishedContextRequests, inputBuffers.inputsIds, decodingConfig,
+        bufferManager, logitsType, modelConfig, worldConfig, buffers);
+
+    auto const batchSize = finishedContextRequests.size();
+
+    std::vector<SamplingConfig> samplingConfigs;
+    samplingConfigs.reserve(batchSize);
+    for (auto const& llmReq : finishedContextRequests)
+    {
+        samplingConfigs.push_back(llmReq->mSamplingConfig);
+    }
+
+    TensorPtr batchSlotsView = runtime::ITensor::slice(inputBuffers.setupBatchSlots, 0, batchSize);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    return {std::move(batchSlotsView), std::move(decoderRequests), std::move(samplingConfigs)};
+}
+
+[[nodiscard]] std::vector<runtime::decoder_batch::Request> GenerateRequestOptions::createDecoderRequests(
+    RequestVector const& finishedContextRequests, TensorPtr const& inputIds,
+    executor::DecodingConfig const& decodingConfig, BufferManager const& bufferManager, nvinfer1::DataType logitsType,
+    runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
+    OptionalRef<RuntimeBuffers const> buffers) const
+{
     unsigned decoderInputSize{0};
     for (auto const& llmReq : finishedContextRequests)
     {
         auto const& reqTokens = llmReq->getTokens(0);
         decoderInputSize += reqTokens.size();
-        ++batchSize;
     }
-    inputBuffers.inputsIds->resize(decoderInputSize);
+    inputIds->resize(decoderInputSize);
 
     std::vector<decoder_batch::Request> decoderRequests;
-    decoderRequests.reserve(batchSize);
-    std::vector<SamplingConfig> samplingConfigs;
-    samplingConfigs.reserve(batchSize);
+    decoderRequests.reserve(finishedContextRequests.size());
 
     SizeType32 inputOffset{0};
     for (auto const& llmReq : finishedContextRequests)
@@ -152,7 +172,7 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
         auto const promptLen = llmReq->getPromptLen();
         auto const& reqTokens = llmReq->getTokens(0);
         TLLM_CHECK(reqTokens.size() == static_cast<decltype(reqTokens.size())>(promptLen));
-        TensorPtr inputView = ITensor::slice(inputBuffers.inputsIds, inputOffset, promptLen);
+        TensorPtr inputView = ITensor::slice(inputIds, inputOffset, promptLen);
         bufferManager.copy(reqTokens.data(), *inputView);
 
         auto decoderRequest = decoder_batch::Request{inputView, promptLen, llmReq->mMaxNewTokens, llmReq->mEndId};
@@ -223,14 +243,11 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
             decoderRequest.stopWordsList->squeeze(0);
         }
         decoderRequests.push_back(decoderRequest);
-        samplingConfigs.push_back(llmReq->mSamplingConfig);
 
         inputOffset += promptLen;
     }
 
-    TensorPtr batchSlotsView = runtime::ITensor::slice(inputBuffers.setupBatchSlots, 0, batchSize);
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return {std::move(batchSlotsView), std::move(decoderRequests), std::move(samplingConfigs)};
+    return decoderRequests;
 }
 
 std::shared_ptr<runtime::ITensor> GenerateRequestOptions::retrieveDraftLogits(tr::ModelConfig const& modelConfig,

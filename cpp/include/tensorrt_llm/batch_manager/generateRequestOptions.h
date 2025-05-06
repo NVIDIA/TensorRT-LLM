@@ -64,6 +64,12 @@ public:
         OptionalRef<RuntimeBuffers const> buffers = std::nullopt) const;
 
 private:
+    [[nodiscard]] std::vector<runtime::decoder_batch::Request> createDecoderRequests(
+        RequestVector const& finishedContextRequests, TensorPtr const& inputIds,
+        executor::DecodingConfig const& decodingConfig, BufferManager const& bufferManager,
+        nvinfer1::DataType logitsType, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
+        OptionalRef<RuntimeBuffers const> buffers) const;
+
     [[nodiscard]] std::shared_ptr<runtime::ITensor> retrieveDraftLogits(runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, std::shared_ptr<runtime::ITensor> const& tensor,
         BufferManager const& bufferManager) const;
