@@ -9,7 +9,8 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist
-from ..speculative import Eagle3Config, NGramConfig, PLDPool, get_spec_resource_manager
+from ..speculative import (Eagle3Config, NGramConfig, PLDPool,
+                           get_spec_resource_manager)
 from ._util import (create_kv_cache_manager, create_py_executor_instance,
                     estimate_max_kv_cache_tokens, get_token_num_for_estimation,
                     instantiate_decoder, is_mla)
@@ -65,7 +66,8 @@ def create_py_executor(executor_config: ExecutorConfig,
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=executor_config.enable_chunked_context,
         cache_reuse=executor_config.kv_cache_config.enable_block_reuse,
-        has_speculative_draft_tokens=has_draft_model_engine or has_ngram_drafter,
+        has_speculative_draft_tokens=has_draft_model_engine
+        or has_ngram_drafter,
     )
 
     model_engine = PyTorchModelEngine(
@@ -109,10 +111,11 @@ def create_py_executor(executor_config: ExecutorConfig,
             input_batch_size=1,
             prompt_lookup_num_tokens=spec_config.prompt_lookup_num_tokens,
             max_matching_ngram_size=spec_config.max_matching_ngram_size,
-            max_seq_len=[131072], # TODO: Better way of setting this please (executor_config.max_seq_len is sometimes None)
+            max_seq_len=[
+                131072
+            ],  # TODO: Better way of setting this please (executor_config.max_seq_len is sometimes None)
             is_keep_all=spec_config.is_keep_all,
-            is_use_oldest=spec_config.is_use_oldest
-        )
+            is_use_oldest=spec_config.is_use_oldest)
     else:
         pld_pool = None
 
@@ -190,7 +193,8 @@ def create_py_executor(executor_config: ExecutorConfig,
                                               pytorch_backend_config,
                                               executor_config, ctx_chunk_config,
                                               model_engine, draft_model_engine,
-                                              pld_pool, False, decoder, lora_config)
+                                              pld_pool, False, decoder,
+                                              lora_config)
 
     if executor_config.pytorch_backend_config.use_kv_cache and 'cp_type' not in mapping.cp_config:
         kv_cache_max_tokens = estimate_max_kv_cache_tokens(

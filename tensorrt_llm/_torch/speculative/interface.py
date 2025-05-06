@@ -50,8 +50,9 @@ class SpeculativeDecodingMode(IntEnum):
         """
 
         # Fixme: only trtllm attention backend supports eagle3 generation-phase kernels on blackwell.
-        return (self.is_eagle3() and not (isinstance(
-            attention_backend, TrtllmAttention) and get_sm_version() == 100)) or self.is_ngram()
+        return (self.is_eagle3()
+                and not (isinstance(attention_backend, TrtllmAttention)
+                         and get_sm_version() == 100)) or self.is_ngram()
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":

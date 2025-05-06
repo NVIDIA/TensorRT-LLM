@@ -884,8 +884,8 @@ class LlmArgs(BaseModel):
     # Speculative decoding parameters
     speculative_config: Optional[Union[
         LookaheadDecodingConfig, MedusaDecodingConfig, EagleDecodingConfig,
-        MTPDecodingConfig, NGramDecodingConfig]] = Field(default=None,
-                                    description="Speculative decoding config.")
+        MTPDecodingConfig, NGramDecodingConfig]] = Field(
+            default=None, description="Speculative decoding config.")
 
     batching_type: Optional[BatchingType] = Field(default=None,
                                                   description="Batching type.")
@@ -1222,8 +1222,10 @@ class LlmArgs(BaseModel):
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 from tensorrt_llm._torch.speculative import NGramConfig
                 self.speculative_config = NGramConfig(
-                    prompt_lookup_num_tokens=self.speculative_config.prompt_lookup_num_tokens,
-                    max_matching_ngram_size=self.speculative_config.max_matching_ngram_size,
+                    prompt_lookup_num_tokens=self.speculative_config.
+                    prompt_lookup_num_tokens,
+                    max_matching_ngram_size=self.speculative_config.
+                    max_matching_ngram_size,
                     is_keep_all=self.speculative_config.is_keep_all,
                     is_use_oldest=self.speculative_config.is_use_oldest)
             elif isinstance(self.speculative_config, MTPDecodingConfig):

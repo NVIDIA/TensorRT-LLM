@@ -1,17 +1,8 @@
 from dataclasses import dataclass
-from typing import List, Optional
 
-import torch
-from torch import nn
 
-from tensorrt_llm.bindings.executor import FinishReason
 
-from ..attention_backend import AttentionMetadata
-from ..pyexecutor.decoder import DecoderState, TorchDecoder
-from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
-from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
+from .interface import SpecConfig, SpeculativeDecodingMode
 
 
 @dataclass

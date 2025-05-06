@@ -1,6 +1,7 @@
 import torch
 from ordered_set import OrderedSet
 
+
 class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
 
     def __init__(
@@ -36,7 +37,7 @@ class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
                 continue
 
             # Update pool
-            sequence = prefix[bi][self.start_index[gbi]:] #.tolist()
+            sequence = prefix[bi][self.start_index[gbi]:]  #.tolist()
             for size in range(min(self.mmns, prefix_len[bi] - 1), 0, -1):
                 # Find each possible key-value combination, and use tuple for hash
                 for l in range(len(sequence) - size):
@@ -71,4 +72,3 @@ class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
                 0, prefix_len[bi] - (self.plnt + self.mmns - 1))
 
         return draft_tokens, None
-
