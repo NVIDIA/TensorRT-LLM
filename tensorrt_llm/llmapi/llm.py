@@ -227,25 +227,22 @@ class LLM:
 
         inputs = [prompt_inputs(i) for i in inputs]
 
-        def _get_from_possible_batch(
-                i: int, possible_batch: Union[Any, Sequence[Any]]) -> Any:
-            if isinstance(possible_batch, list):
-                return possible_batch[i]
+        def _item_at(maybe_batched: Union[Any, Sequence[Any]], pos: int) -> Any:
+            if isinstance(maybe_batched, list):
+                return maybe_batched[pos]
             else:
-                return possible_batch
+                return maybe_batched
 
         futures = []
         for i, request_inputs in enumerate(inputs):
             future = self.generate_async(
                 request_inputs,
-                sampling_params=_get_from_possible_batch(i, sampling_params),
-                lora_request=_get_from_possible_batch(i, lora_request),
-                prompt_adapter_request=_get_from_possible_batch(
-                    i, prompt_adapter_request),
-                kv_cache_retention_config=_get_from_possible_batch(
-                    i, kv_cache_retention_config),
-                disaggregated_params=_get_from_possible_batch(
-                    i, disaggregated_params),
+                sampling_params=_item_at(sampling_params, i),
+                lora_request=_item_at(lora_request, i),
+                prompt_adapter_request=_item_at(prompt_adapter_request, i),
+                kv_cache_retention_config=_item_at(kv_cache_retention_config,
+                                                   i),
+                disaggregated_params=_item_at(disaggregated_params, i),
                 streaming=False)
             futures.append(future)
 
@@ -323,15 +320,10 @@ class LLM:
             prompt_token_ids, extra_processed_inputs = self.input_processor(
                 inputs, sampling_params)
             prompt = inputs['prompt']
-            if (extra_processed_inputs is not None
-                    and 'query_token_ids' in extra_processed_inputs):
+            if extra_processed_inputs is not None:
                 query_token_ids = extra_processed_inputs.get('query_token_ids')
-            if (extra_processed_inputs is not None
-                    and 'mm_embedding' in extra_processed_inputs):
                 multimodal_embedding = extra_processed_inputs.get(
                     'mm_embedding')
-            if (extra_processed_inputs is not None
-                    and 'mrope_config' in extra_processed_inputs):
                 mrope_config = extra_processed_inputs.get('mrope_config')
         else:
             raise TypeError(
