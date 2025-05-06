@@ -17,7 +17,8 @@ from tensorrt_llm.bench.benchmark.utils.general import (
     get_settings_from_engine, get_settings)
 # isort: on
 from tensorrt_llm._torch.llm import LLM as PyTorchLLM
-from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
+from tensorrt_llm.bench.benchmark.utils.general import (ALL_SUPPORTED_BACKENDS,
+                                                        generate_warmup_dataset)
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
@@ -42,7 +43,7 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path to a serialized TRT-LLM engine.",
 )
 @optgroup.option("--backend",
-                 type=click.Choice(["pytorch", "autodeploy"]),
+                 type=click.Choice(ALL_SUPPORTED_BACKENDS),
                  default=None,
                  help="Set to 'pytorch' for pytorch path. Default is cpp path.")
 @optgroup.option(
@@ -278,7 +279,8 @@ def throughput_command(
         logger.info(metadata.get_summary_for_print())
 
     # Engine configuration parsing
-    if backend and backend.lower() in ["pytorch", "autodeploy"]:
+    if backend and backend.lower() in ALL_SUPPORTED_BACKENDS and backend.lower(
+    ) != "cpp":
         exec_settings = get_settings(params, metadata, bench_env.model,
                                      bench_env.checkpoint_path)
         kwargs_max_sql = max_seq_len or metadata.max_sequence_length
