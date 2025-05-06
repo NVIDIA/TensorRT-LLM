@@ -601,8 +601,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-            # task = GSM8K(self.MODEL_NAME)
-            # task.evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
 class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
@@ -626,12 +624,10 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                   pytorch_backend_config=pytorch_config,
                   enable_attention_dp=attention_dp)
         with llm:
-            # task = CnnDailymail(self.MODEL_NAME)
-            # task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-            # task = GSM8K(self.MODEL_NAME)
-            # task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 class TestQwen3_32B(LlmapiAccuracyTestHarness):
@@ -659,5 +655,3 @@ class TestQwen3_32B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-            # task = GSM8K(self.MODEL_NAME)
-            # task.evaluate(llm)
