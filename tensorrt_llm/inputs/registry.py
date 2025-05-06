@@ -98,7 +98,7 @@ def create_input_processor(model_path_or_dir: str, tokenizer):
     except (ValueError, EnvironmentError):
         config = None
 
-    if model_config is not None and tokenizer is not None:
+    if model_config is not None:
         try:
             model_cls, _ = get_model_architecture(model_config)
             input_processor_cls = INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type \
