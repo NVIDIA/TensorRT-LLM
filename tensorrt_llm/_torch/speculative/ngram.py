@@ -1,7 +1,5 @@
 from dataclasses import dataclass
 
-
-
 from .interface import SpecConfig, SpeculativeDecodingMode
 
 
