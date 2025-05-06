@@ -281,8 +281,7 @@ class KVCacheManager(BaseResourceManager):
         requests = []
         for i, req_id in enumerate(request_ids):
             sampling_params = SamplingParams()
-            token_num = token_nums[
-                i] if token_nums is not None else 1 + max_num_draft_tokens
+            token_num = token_nums[i] if token_nums is not None else 1
             encoder_input_tokens = [
                 1
             ] * token_num if self.impl.cross_kv else None
@@ -297,12 +296,18 @@ class KVCacheManager(BaseResourceManager):
             req.paged_kv_block_ids = []
             if prepare_resource:
                 self.impl.add_sequence(req_id, token_num, beam_width, req)
+                for _ in range(self.num_extra_kv_tokens):
+                    self.impl.add_token(req_id)
             if is_gen:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
-                req.prompt_len = token_num - 1 + max_num_draft_tokens
+                req.prompt_len = token_num
                 req.py_prompt_len = req.prompt_len
+                req.add_new_token(1, 0)
+                self.impl.add_token(req_id)
                 if max_num_draft_tokens > 0:
-                    req.py_draft_tokens = [0] * max_num_draft_tokens
+                    req.py_draft_tokens = [1] * max_num_draft_tokens
+                    for _ in range(max_num_draft_tokens):
+                        self.impl.add_token(req_id)
             requests.append(req)
         return requests
 

@@ -445,21 +445,10 @@ class PyTorchModelEngine(ModelEngine):
                 )
                 available_blocks -= batch_size - 1
                 available_tokens = available_blocks * kv_cache_manager.tokens_per_block
-                # When we generate last token for the max_seq_len case,
-                # we only need to store (max_seq_len - 1 - max_num_draft_tokens) tokens in the KV cache.
-                # For the max_seq_len, some speculative decoding methods need extra kv tokens in kv cache
-                # manager to support different kv lengths for the draft/target layers. So, we also
-                # need to remove those extra tokens from the max_seq_len.
-                token_num = max(
-                    1,
-                    min(
-                        available_tokens, self.max_seq_len -
-                        kv_cache_manager.num_extra_kv_tokens - 1 -
-                        max_num_draft_tokens),
-                )
 
                 # Add one dummy request with the maximum possible sequence length.
                 # The sequence length is limited by both the max_seq_len and the number of available blocks.
+                token_num = max(1, min(available_tokens, self.max_seq_len - 1))
                 max_seq_len_request = kv_cache_manager.add_dummy_requests(
                     request_ids=[batch_size - 1],
                     token_nums=[token_num],
