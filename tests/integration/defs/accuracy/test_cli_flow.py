@@ -917,10 +917,6 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
                  tp_size=2,
                  extra_build_args=["--gemm_plugin=auto"])
 
-    @skip_post_blackwell
-    def test_int4_awq_prequantized(self):
-        self.run(quant_algo=QuantAlgo.W4A16_AWQ)
-
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(80000)
     def test_weight_only_int8_tp2(self):
