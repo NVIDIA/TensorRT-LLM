@@ -21,7 +21,6 @@ default_test_timeout = 3600
 include_test_map = {
     "gpt": ("Gpt[^j]", ),
     "gpt_executor": ("GptExecutor", ),
-    "gpt_session": ("GptSession", ),
     "gpt_tests": ("GptTests", ),
     "gptj": ("Gptj", ),
     "llama": ("Llama", ),
@@ -58,8 +57,6 @@ def generate_result_file_name(test_list: List[str],
 
 def generate_excluded_test_list(test_list):
     if "gpt" in test_list:
-        if "gpt_session" not in test_list:
-            yield "GptSession"
         if "gpt_executor" not in test_list:
             yield "GptExecutor"
         if "gpt_tests" not in test_list:
@@ -618,7 +615,7 @@ def prepare_model_tests(model_name: str,
         model_name = 'enc_dec'
 
     # share the same script for gpt related tests
-    if model_name == 'gpt_executor' or model_name == 'gpt_session' or model_name == 'gpt_tests':
+    if model_name == 'gpt_executor' or model_name == 'gpt_tests':
         model_name = 'gpt'
 
     build_engines = [

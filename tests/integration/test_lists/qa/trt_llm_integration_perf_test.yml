@@ -5,20 +5,16 @@ trt_llm_integration_perf_test:
       system_gpu_count:
         gte: 1
   tests:
-  # E2E gptSessionManager
-  - perf/test_perf.py::test_perf[gpt_350m_moe-cpp-ootb_except_mha-float16-maxbs:64-bs:64-input_output_len:128,8+512,32+200,200]
-
   # E2E BERT
   - perf/test_perf.py::test_perf[bert_large-cpp-plugin-float16-bs:32-input_len:128]
   - perf/test_perf.py::test_perf[bert_large-cpp-ootb_except_mha-float16-bs:32+64-input_len:128+512]
   - perf/test_perf.py::test_perf[roberta_base-cpp-plugin-float16-bs:32-input_len:128]
   - perf/test_perf.py::test_perf[roberta_base-cpp-ootb_except_mha-float16-bs:32+64-input_len:128+512]
 
-  # E2E gptManagerBenchmark V1
+  # E2E gptManagerBenchmark IFB
   - perf/test_perf.py::test_perf[gpt_next_2b-cppmanager-exe-plugin-float16-input_output_len:128,8]
   - perf/test_perf.py::test_perf[gpt_next_2b-cppmanager-ootb_except_mha-float16-input_output_len:128,128+512,32]
-
-  # E2E gptManagerBenchmark IFB
+  - perf/test_perf.py::test_perf[gpt_350m_moe-cppmanager-exe-ootb_except_mha-float16-maxbs:64-bs:64-input_output_len:128,8+512,32+200,200]
   - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-float16-maxbs:64-input_output_len:128,128+512,32]
   - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-streaming-plugin_ifb-float16-input_output_len:128,128+512,32]
   - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-static_batching-plugin_ifb-float16-bs:8-input_output_len:128,128+512,32]
