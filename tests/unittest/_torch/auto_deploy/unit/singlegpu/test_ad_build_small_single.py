@@ -40,9 +40,9 @@ from utils.llm_data import llm_models_root
                 "model_kwargs": {"num_hidden_layers": 2},
             },
         ),
-        # small Mixtral-8x7B model with world_size 0 (no processes are spawned)
+        # small Mixtral-8x7B model with world_size 1
         (
-            0,
+            1,
             {
                 "model": _hf_model_dir_or_hub_id(
                     f"{llm_models_root()}/Mixtral-8x7B-Instruct-v0.1",

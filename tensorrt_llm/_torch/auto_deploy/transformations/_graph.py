@@ -96,40 +96,44 @@ def named_graphmodules(gm: fx.GraphModule) -> Iterator[Tuple[str, fx.GraphModule
             yield name, m
 
 
-def move_to_device(gm: fx.GraphModule, device: DeviceLikeType) -> fx.GraphModule:
-    """Move the entire graph module and all sub-GraphModules to the specified device.
-
+def _move_single_gm_to_device(gm: GraphModule, device: torch.device) -> None:
+    """Move one GraphModule and its nodes to the specified device in-place.
     Partially inspired by https://github.com/pytorch/pytorch/blob/05cb98f91d49df9eadfcb3fc29bbd1b621d88860/torch/export/passes/__init__.py#L11
     """
+    # move state dict
+    gm.to(device)
+
+    for node in gm.graph.nodes:
+        # move all the nodes kwargs with burnt-in device
+        if "device" in node.kwargs:
+            kwargs = node.kwargs.copy()
+            kwargs["device"] = device
+            node.kwargs = kwargs
+
+        if node.op == "call_function" and node.target in (torch.ops.aten.to.device,):
+            args = list(node.args)
+            # aten.to.device(tensor, device)
+            args[1] = device
+            node.args = tuple(args)
+
+        # move all the tensor metadata
+        node.meta["val"] = pytree.tree_map(
+            lambda v: v.to(device) if isinstance(v, torch.Tensor) else v,
+            node.meta.get("val"),
+        )
+
+    # recompile graph to update self generated codes in subgraph
+    gm.graph.lint()
+    gm.recompile()
+
+
+def move_to_device(gm: fx.GraphModule, device: DeviceLikeType) -> fx.GraphModule:
+    """Move the entire graph module and all sub-GraphModules to the specified device."""
     # get device
     device = torch.device(device)
 
     for _, subgm in named_graphmodules(gm):
-        # move state dict
-        subgm.to(device)
-
-        for node in subgm.graph.nodes:
-            # move all the nodes kwargs with burnt-in device
-            if "device" in node.kwargs:
-                kwargs = node.kwargs.copy()
-                kwargs["device"] = device
-                node.kwargs = kwargs
-
-            if node.op == "call_function" and node.target in (torch.ops.aten.to.device,):
-                args = list(node.args)
-                # aten.to.device(tensor, device)
-                args[1] = device
-                node.args = tuple(args)
-
-            # move all the tensor metadata
-            node.meta["val"] = pytree.tree_map(
-                lambda v: v.to(device) if isinstance(v, torch.Tensor) else v,
-                node.meta.get("val"),
-            )
-
-        # recompile graph to update self generated codes in subgraph
-        subgm.graph.lint()
-        subgm.recompile()
+        _move_single_gm_to_device(subgm, device)
 
 
 def _is_impure_node(node: Node) -> bool:
@@ -145,6 +149,47 @@ def _is_impure_node(node: Node) -> bool:
         # restore RNG check
         if is_set_to_true:
             node.target._nondeterministic_seeded = True
+
+
+def _canonicalize_single_gm(
+    gm: GraphModule, shape_prop: bool = False, args_static: Optional[Tuple[Any, ...]] = None
+) -> GraphModule:
+    # clean up graph
+    gm.graph.eliminate_dead_code(is_impure_node=_is_impure_node)
+
+    # recompile to propagate all graph changes to the graph module
+    gm.recompile()
+
+    # clean up graph module
+    gm.delete_all_unused_submodules()
+    gm = legalize_graph(gm)
+
+    # NOTE: shape_prop can be a littly finicky & slow, so we only run it optionally...
+    if shape_prop:
+        fake_mode: Optional[FakeTensorMode] = _detect_fake_mode_from_gm(gm)
+
+        # get fake tensors from placeholder nodes
+        inps = [node.meta.get("val") for node in gm.graph.nodes if node.op == "placeholder"]
+
+        # check if we need to use args to create fake tensors
+        if any(inp is None for inp in inps):
+            if args_static is not None and fake_mode is not None and len(args_static) == len(inps):
+                inps = [
+                    fake_t if fake_t is not None else fake_mode.from_tensor(arg, static_shapes=True)
+                    for fake_t, arg in zip(inps, args_static)
+                ]
+
+        # run shape propagation if we have all the fake tensors
+        if all(inp is not None for inp in inps):
+            FakeTensorProp(gm, fake_mode).propagate(*inps)
+        else:
+            ad_logger.warning("No fake tensors and no args available for shape propagation")
+
+    # lint the graph
+    gm.graph.lint()
+
+    # lint the graph
+    gm.graph.lint()
 
 
 def canonicalize_graph(
@@ -168,39 +213,7 @@ def canonicalize_graph(
     ad_logger.debug(f"Before canonicalizing: {gm}")
 
     for _, subgm in named_graphmodules(gm):
-        # clean up graph
-        subgm.graph.eliminate_dead_code(is_impure_node=_is_impure_node)
-
-        # recompile to propagate all graph changes to the graph module
-        subgm.recompile()
-
-        # clean up graph module
-        subgm.delete_all_unused_submodules()
-        subgm = legalize_graph(subgm)
-
-        # NOTE: shape_prop can be a littly finicky & slow, so we only run it optionally...
-        if shape_prop:
-            fake_mode: Optional[FakeTensorMode] = _detect_fake_mode_from_gm(subgm)
-
-            # get fake tensors from placeholder nodes
-            inps = [node.meta.get("val") for node in subgm.graph.nodes if node.op == "placeholder"]
-
-            # check if we need to use args to create fake tensors
-            if any(inp is None for inp in inps):
-                if args_static is not None and fake_mode is not None and len(args_static) == len(inps):
-                    inps = [
-                        fake_t if fake_t is not None else fake_mode.from_tensor(arg, static_shapes=True)
-                        for fake_t, arg in zip(inps, args_static)
-                    ]
-
-            # run shape propagation if we have all the fake tensors
-            if all(inp is not None for inp in inps):
-                FakeTensorProp(subgm, fake_mode).propagate(*inps)
-            else:
-                ad_logger.warning("No fake tensors and no args available for shape propagation")
-
-        # lint the graph
-        subgm.graph.lint()
+        _canonicalize_single_gm(subgm, shape_prop=shape_prop, args_static=args_static)
 
     ad_logger.debug(f"After canonicalizing: {gm}")
 
