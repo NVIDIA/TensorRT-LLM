@@ -1662,18 +1662,9 @@ class PyExecutor:
         self, scheduled_requests: ScheduledRequests
     ) -> Tuple[ScheduledRequests, Dict[int, LlmRequest]]:
         """
-        Prepares a batch for the draft model engine. Draft tokens are only produced
-        for generation requests.
-
-        The requests are prepared as follows:
-        1. The first time the draft engine sees a request, it's a context request.
-        2. Otherwise, if draft tokens were accepted on the last target model decoding
-        step, it's a chunked context request (we process all the accepted tokens together).
-        3. Otherwise, it's a generation request.
+        Generate draft tokens for generation requests using ngram lookup table.
         """
         try:
-            req_id_to_num_rejected_tokens = {}
-
             for request in scheduled_requests.generation_requests:
                 if request.py_draft_pages_allocated == 0:
                     # No space for draft tokens.
@@ -1688,8 +1679,6 @@ class PyExecutor:
                                               "py_num_accepted_draft_tokens", 0)
                 num_rejected_tokens = num_draft_tokens - num_accepted_tokens
                 assert num_rejected_tokens >= 0
-                req_id_to_num_rejected_tokens[
-                    request.py_request_id] = num_rejected_tokens
 
                 spec_config = self.model_engine.spec_config
                 beam_idx = 0
@@ -1706,9 +1695,6 @@ class PyExecutor:
                     if num_draft_tokens < max_draft_tokens:
                         draft_tokens.extend(0 for _ in range(max_draft_tokens - num_draft_tokens))
                     request.py_draft_tokens = draft_tokens
-
-            return req_id_to_num_rejected_tokens
-
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
