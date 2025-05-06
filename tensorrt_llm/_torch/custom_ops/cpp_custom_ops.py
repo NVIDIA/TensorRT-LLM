@@ -192,43 +192,6 @@ def _register_fake():
     def _(input: torch.Tensor, scale: torch.Tensor):
         return torch.empty_like(input).to(torch.float8_e4m3fn), scale
 
-    @torch.library.register_fake("trtllm::deepseek_allreduce_fusion")
-    def _(
-        input,
-        workspace,
-        reduce_fusion_inputs,
-        rank,
-        nranks,
-        eps,
-        fusion_op,
-    ):
-        from tensorrt_llm.functional import AllReduceFusionOp
-        residual = reduce_fusion_inputs[0]
-        if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4 or fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
-            sf_vec_size = 16
-            quant_shape, scale_shape = fp4_utils.get_fp4_shape(
-                input.shape, sf_vec_size)
-            if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
-                return [
-                    input.new_empty(quant_shape, dtype=torch.uint8),
-                    input.new_empty(scale_shape, dtype=torch.uint8),
-                    torch.empty_like(residual)
-                ]
-            else:
-                return [
-                    torch.empty_like(input),
-                    input.new_empty(quant_shape, dtype=torch.uint8),
-                    input.new_empty(scale_shape, dtype=torch.uint8),
-                    torch.empty_like(residual)
-                ]
-
-        elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
-            return [torch.empty_like(input), torch.empty_like(residual)]
-        elif fusion_op == AllReduceFusionOp.MOE_ALLREDUCE_RESIDUAL_RMS_NORM:
-            return [torch.empty_like(residual), torch.empty_like(residual)]
-        else:
-            raise ValueError(f"Unsupported fusion op: {fusion_op}")
-
     @torch.library.register_fake("trtllm::logits_bitmask")
     def _(logits: List[torch.Tensor], bitmask: List[torch.Tensor]):
         pass
