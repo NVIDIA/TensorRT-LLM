@@ -186,8 +186,23 @@ def prepare_flashinfer_metadata(
 
     paged_kv_last_page_len = ((offsets + seq_len - 1) % page_size) + 1
 
+    # Compute batch_indices and positions so that they can be reused for kv cache appends
+    # for all the layers
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(paged_kv_indptr, paged_kv_last_page_len, page_size),
+        position_ids.numel(),
+    )
+
     # return metadata
-    return (qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len)
+    return (
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        batch_indices,
+        positions,
+    )
 
 
 @prepare_flashinfer_metadata.register_fake
@@ -195,11 +210,15 @@ def prepare_flashinfer_metadata_fake(
     input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
 ):
     qo_indptr = torch.empty(len(seq_len) + 1, dtype=seq_len.dtype, device=seq_len.device)
+    batch_indices = torch.empty_like(cache_loc)
+    positions = torch.empty_like(cache_loc)
     return (
         qo_indptr,  # qo_indptr
         torch.empty_like(qo_indptr),  # paged_kv_indptr
         torch.empty_like(cache_loc),  # paged_kv_indices
         torch.empty_like(seq_len),  # paged_kv_last_page_len
+        batch_indices,  # batch_indices
+        positions,  # positions
     )
 
 
@@ -214,6 +233,8 @@ def flashinfer_mha_with_cache(
     paged_kv_indptr: torch.Tensor,
     paged_kv_indices: torch.Tensor,
     paged_kv_last_page_len: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -254,13 +275,6 @@ def flashinfer_mha_with_cache(
         k = (k / k_scale).to(torch.float8_e4m3fn)
         v = (v / v_scale).to(torch.float8_e4m3fn)
 
-    # Append to kv cache
-    batch_indices, positions = flashinfer.get_batch_indices_positions(
-        qo_indptr,
-        flashinfer.get_seq_lens(paged_kv_indptr, paged_kv_last_page_len, pp.page_size),
-        q.shape[0],
-    )
-
     flashinfer.page.append_paged_kv_cache(
         k,
         v,
@@ -296,6 +310,8 @@ def flashinfer_mha_with_cache_fake(
     paged_kv_indptr: torch.Tensor,
     paged_kv_indices: torch.Tensor,
     paged_kv_last_page_len: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -341,7 +357,7 @@ class FlashInferAttention(AttentionDescriptor):
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        return torch.ops.attention.prepare_flashinfer_metadata, 4
+        return torch.ops.attention.prepare_flashinfer_metadata, 6
 
     @classmethod
     def get_cache_initializers(

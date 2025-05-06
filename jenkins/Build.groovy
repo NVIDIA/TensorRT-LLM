@@ -76,6 +76,18 @@ def BUILD_CONFIGS = [
   ],
 ]
 
+@Field
+def GITHUB_PR_API_URL = "github_pr_api_url"
+@Field
+def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
+@Field
+def ACTION_INFO = "action_info"
+def globalVars = [
+    (GITHUB_PR_API_URL): null,
+    (CACHED_CHANGED_FILE_LIST): null,
+    (ACTION_INFO): null,
+]
+
 // TODO: Move common variables to an unified location
 BUILD_CORES_REQUEST = "8"
 BUILD_CORES_LIMIT = "8"
@@ -585,7 +597,7 @@ def runLLMPackage(pipeline, archTriple, tarFileName, linuxPkgName)
     sh "cd ${llmPath} && ls -alh"
 }
 
-def launchStages(pipeline, cpu_arch, enableFailFast)
+def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
 {
     stage("Show Environment") {
         sh "env | sort"
@@ -594,6 +606,10 @@ def launchStages(pipeline, cpu_arch, enableFailFast)
         echo "gitlabCommit: ${env.gitlabCommit}"
         echo "alternativeTRT: ${env.alternativeTRT}"
         echo "Using GitLab repo: ${LLM_REPO}. Commit: ${env.gitlabCommit}"
+
+        echo "env.globalVars is: ${env.globalVars}"
+        globalVars = trtllm_utils.updateMapWithJson(pipeline, globalVars, env.globalVars, "globalVars")
+        globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(pipeline, globalVars[ACTION_INFO])
     }
 
     def wheelDockerImage = env.wheelDockerImage
@@ -710,7 +726,7 @@ pipeline {
     stages {
         stage("BuildJob") {
             steps {
-                launchStages(this, params.targetArch, params.enableFailFast)
+                launchStages(this, params.targetArch, params.enableFailFast, globalVars)
             }
         }
     } // stage
