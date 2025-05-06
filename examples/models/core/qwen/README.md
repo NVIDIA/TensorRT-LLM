@@ -587,21 +587,33 @@ TensorRT-LLM now supports Qwen3, the latest version of the Qwen model series. Ac
 
 To quickly run Qwen3, examples/pytorch/quickstart_advanced.py:
 
-python3 examples/pytorch/quickstart_advanced.py --model_dir /home/scratch.bhsueh_gpu/models/Qwen3-30B-A3B/ --kv_cache_fraction 0.6
-
-
-<!-- python3 examples/pytorch/quickstart_advanced.py --model_dir /home/scratch.bhsueh_gpu/models/Qwen3-235B-A22B-FP8 --kv_cache_fraction 0.6 --tp_size 8 -->
+python3 examples/pytorch/quickstart_advanced.py --model_dir Qwen3-30B-A3B/ --kv_cache_fraction 0.6
 
 ### Evaluation
 
 1. Evaluate accuracy on the MMLU dataset:
 
-python -m tensorrt_llm.commands.eval --model=/home/scratch.bhsueh_gpu/models/Qwen3-32B/ --tokenizer=/home/scratch.bhsueh_gpu/models/Qwen3-32B/ --backend=pytorch mmlu --dataset_path=/home/scratch.trt_llm_data/llm-models/datasets/mmlu/
+```bash
+python -m tensorrt_llm.commands.eval --model=Qwen3-32B/ --tokenizer=Qwen3-32B/ --backend=pytorch mmlu --dataset_path=./datasets/mmlu/
 [05/01/2025-13:56:15] [TRT-LLM] [I] MMLU weighted average accuracy: 79.09 (14042)
+```
 
-<!-- python -m tensorrt_llm.commands.eval --model=/home/scratch.bhsueh_gpu/models/Qwen3-30B-A3B/ --tokenizer=/home/scratch.bhsueh_gpu/models/Qwen3-30B-A3B/ --backend=pytorch mmlu --dataset_path=/home/scratch.trt_llm_data/llm-models/datasets/mmlu/
-[05/01/2025-14:03:05] [TRT-LLM] [I] MMLU weighted average accuracy: 48.10 (14042) -->
+```bash
+python -m tensorrt_llm.commands.eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ --backend=pytorch mmlu --dataset_path=./datasets/mmlu/
+[05/05/2025-11:33:02] [TRT-LLM] [I] MMLU weighted average accuracy: 79.44 (14042)
+```
 
+2. Evaluate accuracy on GSM8K dataset:
+
+```bash
+python -m tensorrt_llm.commands.eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ --backend=pytorch gsm8k --dataset_path=./datasets/openai/gsm8k/
+[05/05/2025-12:05:40] [TRT-LLM] [I] lm-eval gsm8k results (scores normalized to range 0~100):
+|Tasks|Version|     Filter     |n-shot|  Metric   |   | Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|------:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |84.3063|±  |1.0019|
+|     |       |strict-match    |     5|exact_match|↑  |88.6277|±  |0.8745|
+
+```
 
 ## Credits
 This Qwen model example exists thanks to Tlntin (TlntinDeng01@gmail.com) and zhaohb (zhaohbcloud@126.com).
