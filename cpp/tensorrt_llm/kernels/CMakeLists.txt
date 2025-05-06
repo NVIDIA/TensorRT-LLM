@@ -66,6 +66,11 @@ endif()
 add_library(kernels_src STATIC ${SRC_CPP} ${SRC_CU})
 set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+target_include_directories(
+  kernels_src
+  PUBLIC
+    $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
+)
 
 add_subdirectory(cutlass_kernels)
 add_subdirectory(flashMLA)
