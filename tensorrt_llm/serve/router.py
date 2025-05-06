@@ -65,9 +65,13 @@ class ServerState:
 
 class KvCacheAwareServerState(ServerState):
 
-    def __init__(self, server: str, use_tokens: bool = False):
+    def __init__(self,
+                 server: str,
+                 use_tokens: bool = False,
+                 tokens_per_block: int = 32):
         super().__init__(server, use_tokens)
         self._kv_cache_block_table: set[int] = set()
+        self._tokens_per_block = tokens_per_block
 
     def add_blocks(self, block_hashes: Iterable[int]):
         for hash in block_hashes:
