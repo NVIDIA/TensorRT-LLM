@@ -45,7 +45,7 @@ void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffe
     runtime::CudaStream const& stream)
 {
     auto const batchSize = contextRequests.size();
-    auto batchSlotsView = tr::ITensor::slice(inputBuffers.forwardBatchSlotsRequestOrder, 0, batchSize);
+    auto batchSlotsView = tr::ITensor::slice(inputBuffers.setupBatchSlots, 0, batchSize);
     auto fillValuesView = tr::ITensor::slice(inputBuffers.fillValues, 0, batchSize);
 
     auto batchSlotsRange = tr::BufferRange<SizeType32>(*batchSlotsView);
@@ -68,7 +68,7 @@ void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffe
 
     // copy sequence lengths
     {
-        auto batchSlotsDeviceView = tr::ITensor::slice(inputBuffers.forwardBatchSlotsRequestOrderDevice, 0, batchSize);
+        auto batchSlotsDeviceView = tr::ITensor::slice(inputBuffers.setupBatchSlotsDevice, 0, batchSize);
         auto fillValuesViewDevice = tr::ITensor::slice(inputBuffers.fillValuesDevice, 0, batchSize);
 
         manager.copy(*batchSlotsView, *batchSlotsDeviceView);
@@ -104,14 +104,11 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
     }
     inputBuffers.inputsIds->resize(decoderInputSize);
 
-    TensorPtr batchSlotsView = runtime::ITensor::slice(inputBuffers.setupBatchSlots, 0, batchSize);
-    auto batchSlotsRange = BufferRange<SizeType32>(*batchSlotsView);
     std::vector<decoder_batch::Request> decoderRequests;
     decoderRequests.reserve(batchSize);
     std::vector<SamplingConfig> samplingConfigs;
     samplingConfigs.reserve(batchSize);
 
-    SizeType32 batchIdx{0};
     SizeType32 inputOffset{0};
     for (auto const& llmReq : contextRequests)
     {
@@ -193,14 +190,13 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
                 = bufferManager.copyFrom(*llmReq->getStopWordsList().value(), MemoryType::kGPU);
             decoderRequest.stopWordsList->squeeze(0);
         }
-        batchSlotsRange[batchIdx] = llmReq->mSeqSlot.value();
         decoderRequests.push_back(decoderRequest);
         samplingConfigs.push_back(llmReq->mSamplingConfig);
 
         inputOffset += promptLen;
-        ++batchIdx;
     }
 
+    TensorPtr batchSlotsView = runtime::ITensor::slice(inputBuffers.setupBatchSlots, 0, batchSize);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return {std::move(batchSlotsView), std::move(decoderRequests), std::move(samplingConfigs)};
 }
