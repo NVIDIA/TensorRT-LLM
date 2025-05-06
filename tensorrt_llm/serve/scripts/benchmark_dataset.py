@@ -725,7 +725,6 @@ class AIMODataset(HuggingFaceDataset):
                     prompt=prompt,
                     prompt_len=prompt_len,
                     expected_output_len=output_len,
-                    multi_modal_data=None,
                 ))
         self.maybe_oversample_requests(sampled_requests, num_requests)
         return sampled_requests

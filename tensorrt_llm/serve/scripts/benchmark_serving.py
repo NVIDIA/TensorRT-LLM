@@ -258,16 +258,10 @@ async def benchmark(
         raise ValueError(f"Unknown backend: {backend}")
 
     print("Starting initial single prompt test run...")
-    test_prompt, test_prompt_len, test_output_len, test_mm_content = \
+    test_prompt, test_prompt_len, test_output_len = \
         input_requests[0].prompt, input_requests[0].prompt_len, \
-        input_requests[0].expected_output_len, \
-            input_requests[0].multi_modal_data
+        input_requests[0].expected_output_len
 
-    if backend != "openai-chat" and test_mm_content is not None:
-        # multi-modal benchmark is only available on OpenAI Chat backend.
-        raise ValueError(
-            "Multi-modal content is only supported on 'openai-chat' backend.")
-    assert test_mm_content is None or isinstance(test_mm_content, dict)
     test_input = RequestFuncInput(
         model=model_id,
         model_name=model_name,
@@ -276,7 +270,6 @@ async def benchmark(
         prompt_len=test_prompt_len,
         output_len=test_output_len,
         logprobs=logprobs,
-        multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
         extra_body=extra_body,
     )
@@ -304,7 +297,6 @@ async def benchmark(
                                          prompt_len=test_prompt_len,
                                          output_len=test_output_len,
                                          logprobs=logprobs,
-                                         multi_modal_content=test_mm_content,
                                          ignore_eos=ignore_eos,
                                          extra_body=extra_body)
         profile_output = await request_func(request_func_input=profile_input)
@@ -340,9 +332,9 @@ async def benchmark(
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate, burstiness):
-        prompt, prompt_len, output_len, mm_content = request.prompt, \
-            request.prompt_len, request.expected_output_len, \
-                request.multi_modal_data
+        prompt, prompt_len, output_len = request.prompt, \
+            request.prompt_len, request.expected_output_len
+
         req_model_id, req_model_name = model_id, model_name
         if lora_modules:
             req_lora_module = next(lora_modules)
@@ -355,7 +347,6 @@ async def benchmark(
                                               prompt_len=prompt_len,
                                               output_len=output_len,
                                               logprobs=logprobs,
-                                              multi_modal_content=mm_content,
                                               ignore_eos=ignore_eos,
                                               extra_body=extra_body)
         tasks.append(
