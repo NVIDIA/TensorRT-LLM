@@ -373,8 +373,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_fp8_block_scales_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                                     attention_dp, cuda_graph,
                                     overlap_scheduler):
-        if pp_size > 1:
-            pytest.skip("https://nvbugs/5241627")
         # OOM on H100 with default free_gpu_memory_fraction=0.9
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         pytorch_config = PyTorchConfig(
@@ -603,8 +601,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-            # task = GSM8K(self.MODEL_NAME)
-            # task.evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
 class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
@@ -628,12 +624,10 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                   pytorch_backend_config=pytorch_config,
                   enable_attention_dp=attention_dp)
         with llm:
-            # task = CnnDailymail(self.MODEL_NAME)
-            # task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-            # task = GSM8K(self.MODEL_NAME)
-            # task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 class TestQwen3_32B(LlmapiAccuracyTestHarness):
@@ -661,5 +655,3 @@ class TestQwen3_32B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-            # task = GSM8K(self.MODEL_NAME)
-            # task.evaluate(llm)

@@ -357,17 +357,11 @@ def create_py_executor_instance(dist,
                                 model_engine,
                                 draft_model_engine,
                                 start_worker,
+                                decoder,
                                 lora_config: LoraConfig = None):
     kv_cache_manager = resources.get(KV_CACHE_MANAGER_KEY, None)
 
-    # decoder for speculative decoding
     spec_config = model_engine.spec_config
-    if spec_config is not None:
-        spec_decoder = get_spec_decoder(max_seq_len=model_engine.max_seq_len,
-                                        spec_config=spec_config)
-    else:
-        spec_decoder = None
-
     if mapping.is_last_pp_rank(
     ) and executor_config.guided_decoding_config is not None:
         if spec_config is not None:
@@ -452,9 +446,6 @@ def create_py_executor_instance(dist,
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, kv_cache_manager, attention_type, cache_transceiver_config)
 
-    decoder = instantiate_decoder(model_engine, executor_config, spec_decoder,
-                                  pytorch_backend_config, mapping)
-
     return PyExecutor(resource_manager,
                       scheduler,
                       model_engine=model_engine,
@@ -470,14 +461,15 @@ def create_py_executor_instance(dist,
                       start_worker=start_worker)
 
 
-def instantiate_decoder(model_engine, executor_config, spec_decoder,
-                        pytorch_backend_config, mapping):
+def instantiate_decoder(model_engine, executor_config, pytorch_backend_config,
+                        mapping):
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         decoder = TorchStarAttentionDecoder(
             max_seq_len=model_engine.max_seq_len)
-    elif spec_decoder is not None:
-        decoder = spec_decoder
+    elif model_engine.spec_config is not None:
+        decoder = get_spec_decoder(max_seq_len=model_engine.max_seq_len,
+                                   spec_config=model_engine.spec_config)
     elif pytorch_backend_config.enable_trtllm_decoder:
         decoding_mode = executor_config.decoding_config.decoding_mode if executor_config.decoding_config and executor_config.decoding_config.decoding_mode else DecodingMode.TopK(
         )
