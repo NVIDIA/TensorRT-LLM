@@ -51,6 +51,10 @@ else()
   message(STATUS "NVTX is enabled")
 endif()
 
+# Add TensorRT-LLM Gen export interface and CUDA support
+add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
+add_compile_definitions("TLLM_ENABLE_CUDA")
+
 set(INTERNAL_CUTLASS_KERNELS_PATH
     ""
     CACHE
@@ -65,33 +69,6 @@ if(INTERNAL_CUTLASS_KERNELS_PATH)
 else()
   message(STATUS "Importing internal cutlass kernels")
 endif()
-
-# Add TensorRT-LLM Gen export interface and CUDA support
-add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
-add_compile_definitions("TLLM_ENABLE_CUDA")
-
-# if(EXISTS
-# "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/batch_manager/CMakeLists.txt")
-# set(BUILD_BATCH_MANAGER_DEFAULT ON) else() set(BUILD_BATCH_MANAGER_DEFAULT
-# OFF) endif()
-
-# option(BUILD_BATCH_MANAGER "Build batch manager from source"
-# ${BUILD_BATCH_MANAGER_DEFAULT})
-
-# if(BUILD_BATCH_MANAGER) message(STATUS "Building batch manager") else()
-# message(STATUS "Importing batch manager") endif()
-
-# if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/executor/CMakeLists.txt")
-# set(BUILD_EXECUTOR_DEFAULT ON) else() set(BUILD_EXECUTOR_DEFAULT OFF) endif()
-
-# option(BUILD_EXECUTOR "Build executor from source" ${BUILD_EXECUTOR_DEFAULT})
-
-# if(BUILD_EXECUTOR) message(STATUS "Building executor") else() message(STATUS
-# "Importing executor") endif()
-
-# if(EXISTS
-# "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/CMakeLists.txt"
-# )
 
 if(BUILD_PYT)
   message(STATUS "Building PyTorch")
