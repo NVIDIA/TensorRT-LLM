@@ -60,8 +60,7 @@ public:
     //! output @param attentionMask holds the draft tokens dependency mask, and attentionMaskOffset is the index offset
     //! in attentionMask.
     void prepare(TensorPtr const& draftTokens, TensorPtr const& positionIds, TensorPtr const& draftLengthPtr,
-        TensorPtr const& attentionMask, runtime::SizeType32 attentionMaskOffset,
-        TensorConstPtr const& lastPositionIdPtr, TensorConstPtr const& lastTokenPtr);
+        TensorPtr const& attentionMask, SizeType32 const offset, TokenIdType const lastToken);
 
     //! @brief update the internal states and generate accepted tokens from @param outputTokens.
     //! input @param sampledTokens is the all the tokens from the language model.

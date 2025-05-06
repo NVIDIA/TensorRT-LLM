@@ -41,6 +41,8 @@
 namespace tensorrt_llm::layers
 {
 
+using SizeType32 = tensorrt_llm::runtime::SizeType32;
+
 //! \brief LookaheadDecodingLayer
 template <typename T>
 class LookaheadDecodingLayer : public BaseLayer
@@ -51,7 +53,7 @@ public:
 
     LookaheadDecodingLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager);
 
-    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, TensorConstPtr batchSlots,
+    void setup(SizeType32 batchSize, SizeType32 beamWidth, TensorConstPtr batchSlots,
         std::shared_ptr<BaseSetupParams> const& baseSetupParams,
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
 
@@ -109,7 +111,37 @@ private:
 
     std::optional<CpuAlgorithmResources> mCpuAlgo;
 
-    runtime::SizeType32 mGlobalSteps{0};
+    SizeType32 mGlobalSteps{0};
 };
+
+inline void initAttentionMask(TensorPtr const& mask, std::shared_ptr<runtime::BufferManager>& bufferManager)
+{
+    bufferManager->setZero(*mask);
+    BufferLocation<bool> maskLocation(*mask);
+    auto maskShape = mask->getShape();
+    for (auto i = 0; i < maskShape.d[0]; i++)
+    {
+        maskLocation.at(i, 0) = true;
+    }
+}
+
+inline void convertBoolToInt32(TensorPtr const& dst, TensorConstPtr const& src)
+{
+    auto dstShape = dst->getShape();
+    auto srcShape = src->getShape();
+    TLLM_CHECK(dstShape.d[0] == srcShape.d[0]);
+    TLLM_CHECK(dstShape.d[1] * 32 >= srcShape.d[1]);
+    BufferLocation<SizeType32> dstLocation(*dst);
+    BufferLocation<bool const> srcLocation(*src);
+
+    auto setBit = [](SizeType32& x, SizeType32 idx, bool value) { x |= (value << idx); };
+    for (auto i = 0; i < srcShape.d[0]; i++)
+    {
+        for (auto j = 0; j < srcShape.d[1]; j++)
+        {
+            setBit(dstLocation.at(i, j / 32), j % 32, srcLocation.at(i, j));
+        }
+    }
+}
 
 } // namespace tensorrt_llm::layers

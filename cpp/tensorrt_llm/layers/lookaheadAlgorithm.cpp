@@ -84,7 +84,7 @@ void LookaheadAlgorithm::setup(TensorConstPtr const& prompt, SizeType32 w, SizeT
     std::for_each(pastRange.begin(), pastRange.end(), [](auto& a) { a = -1; });
     for (SizeType32 i = 0; i < mW; i++)
     {
-        if (mN - 1 > 0)
+        if (mN > 1)
         {
             randToken(pastRange[i * (mN - 1)]);
         }
@@ -367,10 +367,14 @@ SizeType32 LookaheadAlgorithm::treeEncode(
 }
 
 void LookaheadAlgorithm::prepare(TensorPtr const& draftTokens, TensorPtr const& positionIds,
-    TensorPtr const& draftLengthPtr, TensorPtr const& attentionMask, SizeType32 attentionMaskOffset,
-    TensorConstPtr const& lastPositionIdPtr, TensorConstPtr const& lastTokenPtr)
+    TensorPtr const& draftLengthPtr, TensorPtr const& attentionMask, SizeType32 const offset,
+    TokenIdType const lastToken)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    constexpr SizeType32 attentionMaskOffset = 1;
+    TLLM_LOG_TRACE("L%3d, offset=%d", __LINE__, offset);
+    TLLM_LOG_TRACE("L%3d, lastToken=%d", __LINE__, lastToken);
 
     if (mRuntimeMaxDraftLen == 0)
     {
@@ -380,11 +384,10 @@ void LookaheadAlgorithm::prepare(TensorPtr const& draftTokens, TensorPtr const& 
         return;
     }
 
-    auto lastToken = BufferRange<TokenIdType const>(*lastTokenPtr)[0];
-    auto offset = BufferRange<SizeType32 const>(*lastPositionIdPtr)[0];
-
     SizeType32 inputLen = ITensor::volume(draftTokens->getShape());
     TLLM_CHECK(inputLen >= mRuntimeMaxDraftLen);
+
+    TLLM_LOG_TRACE("L%3d, inputLen=%d", __LINE__, inputLen);
 
     BufferRange<TokenIdType> draftRange(*draftTokens);
     BufferRange<TokenIdType> positionRange(*positionIds);
@@ -394,10 +397,14 @@ void LookaheadAlgorithm::prepare(TensorPtr const& draftTokens, TensorPtr const& 
     filledLen += lookahead(ITensor::slice(draftTokens, filledLen, mRuntimeMaxDraftLen - filledLen),
         ITensor::slice(positionIds, filledLen, mRuntimeMaxDraftLen - filledLen), offset);
 
+    TLLM_LOG_TRACE("L%3d, filledLen=%d", __LINE__, filledLen);
+
     auto guessStart = filledLen;
     filledLen += guess(ITensor::slice(draftTokens, filledLen, mRuntimeMaxDraftLen - filledLen),
         ITensor::slice(positionIds, filledLen, mRuntimeMaxDraftLen - filledLen), offset, lastToken);
     auto guessEnd = filledLen;
+
+    TLLM_LOG_TRACE("L%3d, filledLen=%d", __LINE__, filledLen);
 
     std::copy(draftRange.begin() + guessStart, draftRange.begin() + guessEnd,
         BufferRange<TokenIdType>(*mGuessTokensMax).begin());
@@ -407,6 +414,8 @@ void LookaheadAlgorithm::prepare(TensorPtr const& draftTokens, TensorPtr const& 
 
     auto draftLen = treeEncode(ITensor::slice(draftTokens, 0, filledLen), ITensor::slice(positionIds, 0, filledLen),
         mAttentionMask, mEncodeMapMax);
+
+    TLLM_LOG_TRACE("L%3d, draftLen=%d", __LINE__, draftLen);
 
     for (SizeType32 i = 0; i < draftLen; i++)
     {
@@ -595,7 +604,7 @@ void LookaheadAlgorithm::update(TensorPtr const& acceptedTokens, TensorPtr const
 
 void LookaheadAlgorithm::printAlgorithm() const noexcept
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("======== printAlgorithm start");
 
     TLLM_LOG_TRACE("mMaxW=%d, ", mMaxW);
     TLLM_LOG_TRACE("mMaxN=%d, ", mMaxN);
@@ -627,7 +636,7 @@ void LookaheadAlgorithm::printAlgorithm() const noexcept
 
     mPoolManager.printPoolManager();
 
-    TLLM_LOG_TRACE("%s end", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("======== printAlgorithm stop");
 }
 
 } // namespace tensorrt_llm::layers

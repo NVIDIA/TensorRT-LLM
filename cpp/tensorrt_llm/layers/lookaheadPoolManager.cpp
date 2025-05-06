@@ -117,7 +117,7 @@ void LookaheadPoolManager::update(TensorConstPtr const& keyTokens, TensorConstPt
 
 void LookaheadPoolManager::printPoolManager() const noexcept
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("==== printPoolManager start");
 
     TLLM_LOG_TRACE("Pool size=%zu", mTokenMap.size());
     for (auto const& [key, list] : mTokenMap)
@@ -137,7 +137,7 @@ void LookaheadPoolManager::printPoolManager() const noexcept
         }
     }
 
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("==== printPoolManager stop");
 }
 
 } // namespace tensorrt_llm::layers

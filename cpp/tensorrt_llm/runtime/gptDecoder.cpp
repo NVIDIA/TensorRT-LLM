@@ -383,14 +383,12 @@ void prepareExplicitDraftTokensInput(DecodingInput const& inputs, std::shared_pt
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void prepareLookaheadInputs(
-    DecodingInput const& inputs, size_t maxBatchSize, std::shared_ptr<tl::DecodingInputs>& baseInputs)
+void prepareLookaheadInputs(DecodingInput const& inputs, std::shared_ptr<tl::DecodingInputs>& baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto inputParams = std::dynamic_pointer_cast<tl::LookaheadDecodingInputs>(baseInputs);
-    auto const& lookaheadInputs = inputs.lookaheadInputs.value();
-    inputParams->curTokensPerStep = lookaheadInputs.tokensPerStep;
+    auto lookaheadDecodingInputs = std::dynamic_pointer_cast<tl::LookaheadDecodingInputs>(baseInputs);
+    lookaheadDecodingInputs->curTokensPerStep = inputs.lookaheadInputs.value().tokensPerStep;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -527,7 +525,7 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
     }
     else if (decodingMode.isLookahead() && input.lookaheadInputs)
     {
-        prepareLookaheadInputs(input, maxBatchSize, forwardParams);
+        prepareLookaheadInputs(input, forwardParams);
         forwardParams->localBatchSize = input.batchSize;
     }
     else if (decodingMode.isExternalDraftTokens())
