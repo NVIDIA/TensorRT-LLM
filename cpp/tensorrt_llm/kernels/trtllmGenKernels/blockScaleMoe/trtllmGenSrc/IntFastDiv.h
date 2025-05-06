@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,130 +21,157 @@
 
 #include <cute/config.hpp>
 
+#include <stdexcept>
+
 namespace trtllm::dev
 {
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// *************************************************************************************************
+// IntFastDiv class.
+// *************************************************************************************************
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 class IntFastDiv
 {
 public:
-    // divisor != 0
-    CUTE_HOST_DEVICE
-    IntFastDiv(int divisor = 0)
-        : d(divisor)
+    // we allow a default constructor (and over-writing the divisor with assignment)
+    CUTE_HOST
+    IntFastDiv()
+        : mDivisor(1)
+        , mMagicM(0)
+        , mMagicS(-1)
+        , mAddSign(1)
     {
-        update_magic_numbers();
     }
 
-    CUTE_HOST_DEVICE
+    CUTE_HOST
+    IntFastDiv(int divisor)
+        : mDivisor(divisor)
+    {
+        if (mDivisor == 0)
+            throw std::runtime_error("IntFastDiv: cannot divide by 0");
+        updateMagicNumbers();
+    }
+
+    CUTE_HOST
     IntFastDiv& operator=(int divisor)
     {
-        this->d = divisor;
-        update_magic_numbers();
+        this->mDivisor = divisor;
+        if (this->mDivisor == 0)
+            throw std::runtime_error("IntFastDiv: cannot divide by 0");
+        updateMagicNumbers();
         return *this;
     }
 
     CUTE_HOST_DEVICE
     operator int() const
     {
-        return d;
+        return mDivisor;
     }
 
 private:
-    int d;
-    int M;
-    int s;
-    int n_add_sign;
+    int mDivisor;
+    int mMagicM;
+    int mMagicS;
+    int mAddSign;
 
-    // Hacker's Delight, Second Edition, Chapter 10, Integer Division By Constants
-    CUTE_HOST_DEVICE
-    void update_magic_numbers()
+    // Hacker'mMagicS Delight, Second Edition, Chapter 10, Integer Division By Constants
+    CUTE_HOST
+    void updateMagicNumbers()
     {
-        if (d == 1)
+        if (mDivisor == 1)
         {
-            M = 0;
-            s = -1;
-            n_add_sign = 1;
+            mMagicM = 0;
+            mMagicS = -1;
+            mAddSign = 1;
             return;
         }
-        else if (d == -1)
+        else if (mDivisor == -1)
         {
-            M = 0;
-            s = -1;
-            n_add_sign = -1;
+            mMagicM = 0;
+            mMagicS = -1;
+            mAddSign = -1;
             return;
         }
 
         int p;
-        unsigned int tmp_ad, tmp_anc, delta, q1, r1, q2, r2, t;
+        unsigned int tmpAd, tmpAnc, delta, q1, r1, q2, r2, t;
         unsigned const two31 = 0x80000000;
-        tmp_ad = (d == 0) ? 1 : abs(d);
-        t = two31 + ((unsigned int) d >> 31);
-        tmp_anc = t - 1 - t % tmp_ad;
+        tmpAd = abs(mDivisor);
+        t = two31 + ((unsigned int) mDivisor >> 31);
+        tmpAnc = t - 1 - t % tmpAd;
         p = 31;
-        q1 = two31 / tmp_anc;
-        r1 = two31 - q1 * tmp_anc;
-        q2 = two31 / tmp_ad;
-        r2 = two31 - q2 * tmp_ad;
+        q1 = two31 / tmpAnc;
+        r1 = two31 - q1 * tmpAnc;
+        q2 = two31 / tmpAd;
+        r2 = two31 - q2 * tmpAd;
         do
         {
             ++p;
             q1 = 2 * q1;
             r1 = 2 * r1;
-            if (r1 >= tmp_anc)
+            if (r1 >= tmpAnc)
             {
                 ++q1;
-                r1 -= tmp_anc;
+                r1 -= tmpAnc;
             }
             q2 = 2 * q2;
             r2 = 2 * r2;
-            if (r2 >= tmp_ad)
+            if (r2 >= tmpAd)
             {
                 ++q2;
-                r2 -= tmp_ad;
+                r2 -= tmpAd;
             }
-            delta = tmp_ad - r2;
+            delta = tmpAd - r2;
         } while (q1 < delta || (q1 == delta && r1 == 0));
-        this->M = q2 + 1;
-        if (d < 0)
-            this->M = -this->M;
-        this->s = p - 32;
+        this->mMagicM = q2 + 1;
+        if (mDivisor < 0)
+            this->mMagicM = -this->mMagicM;
+        this->mMagicS = p - 32;
 
-        if ((d > 0) && (M < 0))
-            n_add_sign = 1;
-        else if ((d < 0) && (M > 0))
-            n_add_sign = -1;
+        if ((mDivisor > 0) && (mMagicM < 0))
+            mAddSign = 1;
+        else if ((mDivisor < 0) && (mMagicM > 0))
+            mAddSign = -1;
         else
-            n_add_sign = 0;
+            mAddSign = 0;
     }
 
     CUTE_HOST_DEVICE
-    friend int operator/(int const divident, IntFastDiv const& divisor);
+    friend int operator/(int const dividend, IntFastDiv const& divisor);
 };
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 CUTE_HOST_DEVICE
-int operator/(int const n, IntFastDiv const& divisor)
+int operator/(int const dividend, IntFastDiv const& divisor)
 {
     int q;
 #ifdef __CUDA_ARCH__
-    asm("mul.hi.s32 %0, %1, %2;" : "=r"(q) : "r"(divisor.M), "r"(n));
+    asm("mul.hi.s32 %0, %1, %2;" : "=r"(q) : "r"(divisor.mMagicM), "r"(dividend));
 #else
-    q = (((unsigned long long) ((long long) divisor.M * (long long) n)) >> 32);
+    q = (((unsigned long long) ((long long) divisor.mMagicM * (long long) dividend)) >> 32);
 #endif
-    q += n * divisor.n_add_sign;
-    if (divisor.s >= 0)
+    q += dividend * divisor.mAddSign;
+    if (divisor.mMagicS >= 0)
     {
-        q >>= divisor.s; // we rely on this to be implemented as arithmetic shift
+        q >>= divisor.mMagicS; // we rely on this to be implemented as arithmetic shift
         q += (((unsigned int) q) >> 31);
     }
     return q;
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 CUTE_HOST_DEVICE
-int operator%(int const n, IntFastDiv const& divisor)
+int operator%(int const dividend, IntFastDiv const& divisor)
 {
-    int quotient = n / divisor;
-    int remainder = n - quotient * divisor;
+    int quotient = dividend / divisor;
+    int remainder = dividend - quotient * divisor;
     return remainder;
 }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace trtllm::dev
