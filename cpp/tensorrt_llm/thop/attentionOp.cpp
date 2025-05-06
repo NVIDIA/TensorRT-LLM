@@ -63,11 +63,11 @@ public:
     virtual int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
         int const num_gen_tokens) const
         = 0;
-    virtual void run(AttentionOp& op, bool const is_context, int32_t const seq_offset, int32_t const num_seqs,
-        int32_t const token_offset, int32_t const num_tokens, int32_t const predicted_tokens_per_seq,
-        torch::Tensor workspace, torch::Tensor output, torch::Tensor qkv, torch::Tensor sequence_length,
-        torch::Tensor host_past_key_value_lengths, torch::Tensor context_lengths, torch::Tensor host_context_lengths,
-        torch::optional<torch::Tensor> kv_cache_block_offsets,
+    virtual void run(AttentionOp& op, bool const is_context, bool skip_sdpa_for_context, int32_t const seq_offset,
+        int32_t const num_seqs, int32_t const token_offset, int32_t const num_tokens,
+        int32_t const predicted_tokens_per_seq, torch::Tensor workspace, torch::Tensor output, torch::Tensor qkv,
+        torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths, torch::Tensor context_lengths,
+        torch::Tensor host_context_lengths, torch::optional<torch::Tensor> kv_cache_block_offsets,
         torch::optional<torch::Tensor> host_kv_cache_block_offsets,
         torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
         torch::optional<torch::Tensor> host_kv_cache_pool_mapping, torch::optional<torch::Tensor> cache_indirection,
@@ -111,11 +111,11 @@ public:
         return std::max(context_workspace_size, generation_workspace_size);
     }
 
-    void run(AttentionOp& op, bool const is_context, int32_t const seq_offset, int32_t const num_seqs,
-        int32_t const token_offset, int32_t const num_tokens, int32_t const predicted_tokens_per_seq,
-        torch::Tensor workspace, torch::Tensor output, torch::Tensor qkv, torch::Tensor sequence_length,
-        torch::Tensor host_past_key_value_lengths, torch::Tensor context_lengths, torch::Tensor host_context_lengths,
-        torch::optional<torch::Tensor> kv_cache_block_offsets,
+    void run(AttentionOp& op, bool const is_context, bool skip_sdpa_for_context, int32_t const seq_offset,
+        int32_t const num_seqs, int32_t const token_offset, int32_t const num_tokens,
+        int32_t const predicted_tokens_per_seq, torch::Tensor workspace, torch::Tensor output, torch::Tensor qkv,
+        torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths, torch::Tensor context_lengths,
+        torch::Tensor host_context_lengths, torch::optional<torch::Tensor> kv_cache_block_offsets,
         torch::optional<torch::Tensor> host_kv_cache_block_offsets,
         torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
         torch::optional<torch::Tensor> host_kv_cache_pool_mapping, torch::optional<torch::Tensor> cache_indirection,
@@ -256,6 +256,7 @@ public:
             AttentionOp::EnqueueContextParams<T> enqueue_params{common_enqueue_params};
             enqueue_params.host_block_offsets = host_block_offsets;
             enqueue_params.batch_size = num_seqs;
+            enqueue_params.skip_sdpa = skip_sdpa_for_context;
             if (op.isMLAEnabled())
             {
                 mla_params.cache_seq_lens = sequence_lengths_ptr;
@@ -347,8 +348,8 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     torch::optional<torch::Tensor> out_scale, torch::optional<torch::Tensor> rotary_inv_freq,
     torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
     torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq, bool const is_fused_qkv,
-    bool const update_kv_cache, int64_t const predicted_tokens_per_seq, int64_t const layer_idx,
-    int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
+    bool const update_kv_cache, bool const skip_sdpa_for_context, int64_t const predicted_tokens_per_seq,
+    int64_t const layer_idx, int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
     std::optional<int64_t> const tokens_per_block, int64_t const max_num_requests, int64_t const max_context_length,
     int64_t const attention_window_size, int64_t const sink_token_length, int64_t const beam_width,
     int64_t const mask_type, int64_t const quant_mode, double const q_scaling, int64_t const position_embedding_type,
@@ -546,7 +547,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
         auto seq_offset = 0;
         auto token_offset = 0;
         runner->run(*op,
-            /*is_context=*/true, seq_offset,
+            /*is_context=*/true, skip_sdpa_for_context, seq_offset,
             /*num_seqs=*/num_contexts, token_offset,
             /*num_tokens=*/num_ctx_tokens, predicted_tokens_per_seq, workspace, output, qkv, sequence_length,
             host_past_key_value_lengths, context_lengths, host_context_lengths, kv_cache_block_offsets,
@@ -561,7 +562,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
         auto seq_offset = num_contexts;
         auto token_offset = is_gen_only ? 0 : num_ctx_tokens;
         runner->run(*op,
-            /*is_context=*/false, seq_offset,
+            /*is_context=*/false, skip_sdpa_for_context, seq_offset,
             /*num_seqs=*/num_generations, token_offset,
             /*num_tokens=*/num_gen_tokens, predicted_tokens_per_seq, workspace, output, qkv, sequence_length,
             host_past_key_value_lengths, context_lengths, host_context_lengths, kv_cache_block_offsets,
@@ -606,6 +607,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor? block_ids_per_seq"
         ", bool is_fused_qkv"
         ", bool update_kv_cache"
+        ", bool skip_sdpa_for_context"
         ", int predicted_tokens_per_seq"
         ", int layer_idx"
         ", int num_heads"

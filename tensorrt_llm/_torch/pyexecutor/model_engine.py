@@ -888,6 +888,7 @@ class PyTorchModelEngine(ModelEngine):
         draft_tokens = []
         draft_lens = []
         mrope_config = defaultdict(list)
+        num_context_logits = []
 
         batch_idx = 0
 
@@ -899,6 +900,8 @@ class PyTorchModelEngine(ModelEngine):
             begin_compute = request.context_current_position
             end_compute = begin_compute + request.context_chunk_size
             prompt_tokens = all_prompt_tokens[begin_compute:end_compute]
+            num_context_logits.append(
+                1 if request.is_last_context_chunk() else 0)
 
             position_ids.extend(
                 range(begin_compute, begin_compute + len(prompt_tokens)))
@@ -1141,6 +1144,10 @@ class PyTorchModelEngine(ModelEngine):
             self.spec_config.num_extra_kv_tokens)
         attn_metadata.kv_cache_manager = kv_cache_manager
 
+        # For simplicity, just return all logits if we have special gather_ids from speculative decoding.
+        attn_metadata.num_context_logits = [
+            -1
+        ] * attn_metadata.num_contexts if is_spec_decode else num_context_logits
         attn_metadata.prepare()
 
         inputs = {
@@ -1269,6 +1276,7 @@ class PyTorchModelEngine(ModelEngine):
             )
 
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
+        attn_metadata.num_context_logits = [-1] * attn_metadata.num_contexts
         if self.enable_attention_dp:
             all_rank_num_tokens = self.dist.allgather(attn_metadata.num_tokens)
             attn_metadata.all_rank_num_tokens = all_rank_num_tokens

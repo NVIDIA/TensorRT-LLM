@@ -196,7 +196,6 @@ class TorchDecoder(Decoder):
 
     def _meet_max_token_stop_criteria(self, request: LlmRequest,
                                       num_tokens: int):
-
         return (num_tokens - request.py_orig_prompt_len
                 >= request.py_max_new_tokens) or (num_tokens
                                                   >= self.max_seq_len)

@@ -280,6 +280,8 @@ class LlamaDecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = None,
+        # Whether to ignore attn_metadata.num_context_logits and always compute all context logits.
+        ignore_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -292,16 +294,22 @@ class LlamaDecoderLayer(DecoderLayer):
             0
         ) <= 128 and self.fusion_config.POST_MOE_FUSION and is_blackwell and self.is_quanted
 
+        skip_sdpa_for_context = not ignore_context_logits and all(
+            x == 0 for x in attn_metadata.num_context_logits)
+
         # Self Attention
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            skip_sdpa_for_context=skip_sdpa_for_context,
             all_reduce_params=AllReduceParams(enable_allreduce=not (
                 self.fusion_config.PRE_MOE_FUSION
                 or self.parallel_config.tensor_parallel_size == 1)),
             **kwargs,
         )
+
+        skip_post_attention_layernorm_and_mlp = skip_sdpa_for_context and attn_metadata.num_generations == 0
 
         if self.fusion_config.PRE_MOE_FUSION:
             hidden_states, residual = self.all_reduce(
@@ -313,23 +321,25 @@ class LlamaDecoderLayer(DecoderLayer):
                     eps=self.post_attention_layernorm.variance_epsilon,
                 ))
         else:
-            # Fully Connected
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual)
+            if not skip_post_attention_layernorm_and_mlp:
+                # Fully Connected
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual)
 
-        feed_forward = self.feed_forward if self.is_llama4 else self.mlp
-        hidden_states = feed_forward(
-            hidden_states,
-            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-            final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.POST_MOE_FUSION
-                or self.fusion_config.POST_MLP_FUSION
-                or self.parallel_config.tensor_parallel_size == 1)),
-            min_latency_mode=min_latency_mode,
-        )
-        if spec_metadata is not None:
-            spec_metadata.maybe_capture_hidden_states(self.layer_idx,
-                                                      hidden_states, residual)
+        if not skip_post_attention_layernorm_and_mlp:
+            feed_forward = self.feed_forward if self.is_llama4 else self.mlp
+            hidden_states = feed_forward(
+                hidden_states,
+                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                final_all_reduce_params=AllReduceParams(enable_allreduce=not (
+                    self.fusion_config.POST_MOE_FUSION
+                    or self.fusion_config.POST_MLP_FUSION
+                    or self.parallel_config.tensor_parallel_size == 1)),
+                min_latency_mode=min_latency_mode,
+            )
+            if spec_metadata is not None:
+                spec_metadata.maybe_capture_hidden_states(
+                    self.layer_idx, hidden_states, residual)
 
         if self.fusion_config.POST_MOE_FUSION or self.fusion_config.POST_MLP_FUSION:
             if min_latency_mode:
@@ -500,6 +510,7 @@ class LlamaModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
+        last_chunk_in_context: Optional[bool] = None,
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -517,12 +528,15 @@ class LlamaModel(DecoderModel):
 
         residual = hidden_states
         hidden_states = self.layers[0].input_layernorm(hidden_states)
-        for decoder_layer in self.layers:
-            hidden_states, residual = decoder_layer(position_ids=position_ids,
-                                                    hidden_states=hidden_states,
-                                                    attn_metadata=attn_metadata,
-                                                    residual=residual,
-                                                    spec_metadata=spec_metadata)
+        for i, decoder_layer in enumerate(self.layers):
+            ignore_context_logits = (i < len(self.layers) - 1)
+            hidden_states, residual = decoder_layer(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                residual=residual,
+                ignore_context_logits=ignore_context_logits,
+                spec_metadata=spec_metadata)
 
         return hidden_states
 

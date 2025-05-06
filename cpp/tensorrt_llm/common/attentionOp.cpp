@@ -1433,7 +1433,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         // do all-to-all for params.attention_input, need to split on kv head
         // [token_num // cp_size, kv_heads, head_size] -> [token_num, kv_heads // cp_size, head_size]
         T* attention_input = const_cast<T*>(params.attention_input);
-        if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
+        if (!params.skip_sdpa && mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
         {
             this->template ulyssesContextPreprocess<T>(
                 attention_input, gatherInBuffer, gatherOutBuffer, params, cu_q_seqlens, cu_cp_partial_seqlens, stream);
@@ -1541,69 +1541,72 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             mFMHAForceFP32Acc = mFMHAForceFP32Acc || enable_context_fmha_fp32_acc_val == 1;
         }
 
-        // Unified FMHA runner interface for both packed QKV FMHA, contiguous Q_KV and paged KV FMHA.
-        // Page KV input layout:
-        //    - q_ptr: [B, S, H, D], which supports variable sequence length
-        //    - paged_kv_cache: paged kv buffer
-        //    - cu_q_seqlens: the cumulative query sequence lengths, needed for variable sequence length.
-        //    - cu_kv_seqlens: the cumulative kv sequence lengths, needed for variable sequence length.
-        //
-        // Contiguous KV input layout:
-        //    - q_ptr: [B, S, H, D], which supports variable sequence length
-        //    - kv_ptr: [B, S, 2, H, D], which supports variable sequence length
-        //    - cu_q_seqlens: the cumulative query sequence lengths, needed for variable sequence length.
-        //    - cu_kv_seqlens: the cumulative kv sequence lengths, needed for variable sequence length.
-
-        // Construct the fmha params for running kernels.
-        MHARunnerParams fmhaParams{};
-        fmhaParams.b = params.batch_size;
-        fmhaParams.qSeqLen = params.input_seq_length;
-        fmhaParams.kvSeqLen = max_kv_seq_len;
-        // Disable sliding window attention when it is not needed.
-        fmhaParams.slidingWindowSize
-            = (mDenseContextFMHA || isCrossAttention()) ? max_kv_seq_len : params.cyclic_attention_window_size;
-        fmhaParams.totalQSeqLen = params.num_tokens;
-        // TODO: set it correctly for contiguous kv buffer (cross-attention).
-        fmhaParams.totalKvSeqLen = isCrossAttention() ? params.num_encoder_tokens : params.num_tokens;
-        // Device buffer pointers.
-        fmhaParams.qkvPtr = mFP8ContextFMHA ? reinterpret_cast<void const*>(fp8_qkv_buffer)
-                                            : reinterpret_cast<void const*>(attention_input);
-        fmhaParams.qPtr = reinterpret_cast<void const*>(q_buf_2_);
-        // TODO: add contiguous kv buffer (cross-attention).
-        fmhaParams.kvPtr = nullptr;
-        if (isCrossAttention() && !useKVCache())
+        if (!params.skip_sdpa)
         {
-            fmhaParams.kvPtr = params.cross_kv;
-        }
-        fmhaParams.outputPtr
-            = mCpSize > 1 ? gatherOutBuffer : params.context_buf; // only use [totalLength, h / cpSize, Dh]
-        fmhaParams.outputSfPtr = params.context_buf_sf;
-        fmhaParams.packedMaskPtr = params.attention_packed_mask;
-        if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
-        {
-            fmhaParams.pagedKvCache = kv_cache_buffer;
-        }
-        fmhaParams.cuQSeqLenPtr = cu_q_seqlens;
-        fmhaParams.kvSeqLenPtr = decoder_params.seqKVLengths;
-        fmhaParams.cuKvSeqLenPtr = cu_kv_seqlens;
-        fmhaParams.cuMaskRowsPtr = cu_mask_rows;
-        fmhaParams.tileCounterPtr = fmha_tile_counter_ptr;
-        fmhaParams.scaleBmm1Ptr = fmha_bmm1_scale_ptr;
-        fmhaParams.scaleBmm2Ptr = fmha_bmm2_scale_ptr;
-        fmhaParams.oSfScalePtr = params.attention_output_sf_scale;
-        fmhaParams.stream = stream;
-        fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
+            // Unified FMHA runner interface for both packed QKV FMHA, contiguous Q_KV and paged KV FMHA.
+            // Page KV input layout:
+            //    - q_ptr: [B, S, H, D], which supports variable sequence length
+            //    - paged_kv_cache: paged kv buffer
+            //    - cu_q_seqlens: the cumulative query sequence lengths, needed for variable sequence length.
+            //    - cu_kv_seqlens: the cumulative kv sequence lengths, needed for variable sequence length.
+            //
+            // Contiguous KV input layout:
+            //    - q_ptr: [B, S, H, D], which supports variable sequence length
+            //    - kv_ptr: [B, S, 2, H, D], which supports variable sequence length
+            //    - cu_q_seqlens: the cumulative query sequence lengths, needed for variable sequence length.
+            //    - cu_kv_seqlens: the cumulative kv sequence lengths, needed for variable sequence length.
 
-        // Run the fmha kernel.
-        mFmhaDispatcher->run(fmhaParams);
-        sync_check_cuda_error(stream);
+            // Construct the fmha params for running kernels.
+            MHARunnerParams fmhaParams{};
+            fmhaParams.b = params.batch_size;
+            fmhaParams.qSeqLen = params.input_seq_length;
+            fmhaParams.kvSeqLen = max_kv_seq_len;
+            // Disable sliding window attention when it is not needed.
+            fmhaParams.slidingWindowSize
+                = (mDenseContextFMHA || isCrossAttention()) ? max_kv_seq_len : params.cyclic_attention_window_size;
+            fmhaParams.totalQSeqLen = params.num_tokens;
+            // TODO: set it correctly for contiguous kv buffer (cross-attention).
+            fmhaParams.totalKvSeqLen = isCrossAttention() ? params.num_encoder_tokens : params.num_tokens;
+            // Device buffer pointers.
+            fmhaParams.qkvPtr = mFP8ContextFMHA ? reinterpret_cast<void const*>(fp8_qkv_buffer)
+                                                : reinterpret_cast<void const*>(attention_input);
+            fmhaParams.qPtr = reinterpret_cast<void const*>(q_buf_2_);
+            // TODO: add contiguous kv buffer (cross-attention).
+            fmhaParams.kvPtr = nullptr;
+            if (isCrossAttention() && !useKVCache())
+            {
+                fmhaParams.kvPtr = params.cross_kv;
+            }
+            fmhaParams.outputPtr
+                = mCpSize > 1 ? gatherOutBuffer : params.context_buf; // only use [totalLength, h / cpSize, Dh]
+            fmhaParams.outputSfPtr = params.context_buf_sf;
+            fmhaParams.packedMaskPtr = params.attention_packed_mask;
+            if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
+            {
+                fmhaParams.pagedKvCache = kv_cache_buffer;
+            }
+            fmhaParams.cuQSeqLenPtr = cu_q_seqlens;
+            fmhaParams.kvSeqLenPtr = decoder_params.seqKVLengths;
+            fmhaParams.cuKvSeqLenPtr = cu_kv_seqlens;
+            fmhaParams.cuMaskRowsPtr = cu_mask_rows;
+            fmhaParams.tileCounterPtr = fmha_tile_counter_ptr;
+            fmhaParams.scaleBmm1Ptr = fmha_bmm1_scale_ptr;
+            fmhaParams.scaleBmm2Ptr = fmha_bmm2_scale_ptr;
+            fmhaParams.oSfScalePtr = params.attention_output_sf_scale;
+            fmhaParams.stream = stream;
+            fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
+
+            // Run the fmha kernel.
+            mFmhaDispatcher->run(fmhaParams);
+            sync_check_cuda_error(stream);
+        }
 
         // The kv cache might need to be updated after FMHA (only when sliding window attention + chunked context is
         // used together). Reuse the preprocessingParams.
         invokeKvCachePostprocessing(preprocessingParams, stream);
         sync_check_cuda_error(stream);
 
-        if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
+        if (!params.skip_sdpa && mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
         {
             this->template ulyssesContextPostprocess<T>(gatherOutBuffer, reinterpret_cast<T*>(params.context_buf),
                 gatherInBuffer, params, cu_q_seqlens, cu_cp_partial_seqlens, stream);

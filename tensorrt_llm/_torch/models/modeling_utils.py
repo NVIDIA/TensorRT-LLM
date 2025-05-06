@@ -471,7 +471,6 @@ class DecoderModelForCausalLM(nn.Module,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         pipeline_interface: Optional[PipelineInterface] = None,
-        return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -497,12 +496,18 @@ class DecoderModelForCausalLM(nn.Module,
                 spec_metadata=spec_metadata,
             )
 
-        return self.logits_processor.forward(
-            output,
-            self.lm_head,
-            attn_metadata,
-            return_context_logits,
-        )
+        skip_logits_processing = attn_metadata.num_generations == 0 and all(
+            x == 0 for x in attn_metadata.num_context_logits)
+
+        if not skip_logits_processing:
+            return self.logits_processor.forward(
+                output,
+                self.lm_head,
+                attn_metadata,
+                return_context_logits=False,
+            )
+        else:
+            return output
 
     def load_weights(self, weights: Dict):
         tp_size = self.model_config.mapping.tp_size

@@ -167,6 +167,7 @@ class Attention(nn.Module):
         position_ids: Optional[torch.LongTensor],
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        skip_sdpa_for_context: bool = False,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
         mrope_config: Optional[dict] = None,
@@ -223,6 +224,7 @@ class Attention(nn.Module):
                                             None,
                                             None,
                                             attn_metadata,
+                                            skip_sdpa_for_context,
                                             out_scale=out_scale,
                                             attention_mask=attention_mask,
                                             mrope_config=mrope_config)
@@ -237,9 +239,11 @@ class Attention(nn.Module):
                                             k.contiguous(),
                                             v.contiguous(),
                                             attn_metadata,
+                                            skip_sdpa_for_context,
                                             attention_mask=attention_mask,
                                             mrope_config=mrope_config)
 
+        # TODO(minwei)
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
         if lora_params is not None:

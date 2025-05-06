@@ -108,6 +108,14 @@ class AttentionMetadata:
     # The shape is (batch_size) if provided.
     prompt_lens: Optional[List[int]] = None
 
+    # The number of required context logits for each sequence in the batch.
+    # The shape is (batch_size) if provided.
+    #
+    # This is used to skip certain computation in SDPA for context phase.
+    # If not provided, default to all context logits are required.
+    # -1 means all context logits are required.
+    num_context_logits: Optional[List[int]] = None
+
     # These fields indicate whether the runtime can use various features.
     # The kernels may or may not have different behaviors when these
     # are enabled.
