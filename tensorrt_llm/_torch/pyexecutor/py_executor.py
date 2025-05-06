@@ -26,7 +26,7 @@ from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
 from tensorrt_llm.logger import logger
 
 from ..distributed import Distributed
-from .decoder import Decoder, SamplerState
+from .decoder import Decoder, SamplerState, SamplerStateTensors
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
                           LlmRequestState, executor_request_to_llm_request)
@@ -889,6 +889,21 @@ class PyExecutor:
                     decoder_state = self._decode_async(scheduled_batch,
                                                        batch_outputs)
 
+                    def print_scheduled_requests(
+                            scheduled_requests: ScheduledRequests):
+                        print(f"{scheduled_requests.context_requests=}")
+                        print(f"{scheduled_requests.generation_requests=}")
+                        print(f"{scheduled_requests.batch_size=}")
+
+                    def print_state(state: SamplerState):
+                        print("--------------------")
+                        print_scheduled_requests(state.scheduled_requests)
+                        print(
+                            f"{state.new_tensors_device.new_tokens_device.tolist()}"
+                        )
+
+                    print_state(decoder_state)
+
                     self._update_request_states(scheduled_batch)
 
                     ctx_transmission_reqs = self._send_disagg_ctx_cache(
@@ -1108,7 +1123,7 @@ class PyExecutor:
                                       pin_memory=True)
         return SamplerState(
             scheduled_requests=scheduled_batch,
-            new_tensors_host={"new_tokens_host": new_tokens_host})
+            new_tensors_host=SamplerStateTensors(new_tokens=new_tokens_host))
 
     @nvtx_range("_forward_step_last_pp")
     def _forward_step_last_pp(self, scheduled_batch,
@@ -1131,11 +1146,11 @@ class PyExecutor:
     @nvtx_range("_handle_previous_batch_inter_pp")
     def _handle_previous_batch_inter_pp(
             self, previous_batch_state: BatchStatePP) -> None:
-        new_tokens_host = previous_batch_state.decoder_state.new_tensors_host
+        new_tensors_host = previous_batch_state.decoder_state.new_tensors_host
         prev_microbatch_id = previous_batch_state.microbatch_id
         # Receive tokens from prev pp rank w.r.t model forward direction
         self.dist.recv_tensor_list(
-            new_tokens_host.values(),
+            new_tensors_host.values(),
             src=self.dist.prev_pp_rank,
             tag=prev_microbatch_id  # not necessary and may discard
         )
@@ -1146,7 +1161,7 @@ class PyExecutor:
             if self.send_handles[prev_microbatch_id] is not None:
                 self.send_handles[prev_microbatch_id].Wait()
             self.send_handles[prev_microbatch_id] = self.dist.isend_tensor_list(
-                new_tokens_host.values(),
+                new_tensors_host.values(),
                 dest=self.dist.next_pp_rank,
                 tag=prev_microbatch_id)
 

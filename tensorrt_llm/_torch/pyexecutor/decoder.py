@@ -1,4 +1,3 @@
-import itertools
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -22,18 +21,18 @@ from tensorrt_llm.mapping import Mapping
 from .llm_request import LlmRequest, LlmRequestState, LogProbs
 from .scheduler import ScheduledRequests
 
-
-@dataclass(frozen=True, kw_only=True)
-class TensorsDevice:
-    new_tokens_device: torch.Tensor
+empty = torch.empty(0)
 
 
 @dataclass(frozen=True, kw_only=True)
-class TensorsHost:
-    new_tokens_host: torch.Tensor
-    finished_sum_host: torch.Tensor = None  # TODO: make this required
-    finish_reasons_host: torch.Tensor = None  # TODO: make this required
-    sequence_lengths_host: torch.Tensor = None  # TODO: make this required
+class SamplerStateTensors:
+    new_tokens: torch.Tensor
+    finished_sum: torch.Tensor = empty  # TODO: make this required
+    finish_reasons: torch.Tensor = empty  # TODO: make this required
+    sequence_lengths: torch.Tensor = empty  # TODO: make this required
+
+    def values(self):
+        return vars(self).values()
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -45,8 +44,8 @@ class SamplerState:
     # Set when decode_async() has evaluated these to avoid computing again in update_requests()
     log_probs: list[LogProbs] | None = None
 
-    new_tensors_device: TensorsDevice = None
-    new_tensors_host: TensorsHost = None
+    new_tensors_device: SamplerStateTensors = None
+    new_tensors_host: SamplerStateTensors = None
 
     decoder_event: torch.cuda.Event = None
 
@@ -181,12 +180,6 @@ def decode_single_request(request: LlmRequest, logits):
     return next_tokens, log_probs
 
 
-def chain_all_requests(
-        scheduled_requests: ScheduledRequests) -> itertools.chain[LlmRequest]:
-    return itertools.chain(scheduled_requests.context_requests,
-                           scheduled_requests.generation_requests)
-
-
 class TorchDecoder(Decoder):
 
     def __init__(self, *, max_seq_len: int, mixed_decoder: bool = False):
@@ -241,8 +234,7 @@ class TorchDecoder(Decoder):
     def update_requests(self, decoder_state: SamplerState) -> None:
         if decoder_state.decoder_event:
             decoder_state.decoder_event.synchronize()
-        new_tokens_list = decoder_state.new_tensors_host.new_tokens_host.tolist(
-        )
+        new_tokens_list = decoder_state.new_tensors_host.new_tokens.tolist()
         scheduled_requests = decoder_state.scheduled_requests
 
         request_idx = 0
@@ -372,9 +364,9 @@ class TorchDecoder(Decoder):
         return SamplerState(
             scheduled_requests=scheduled_requests,
             logits=logits,
-            new_tensors_device=TensorsDevice(
-                new_tokens_device=new_tokens_device),
-            new_tensors_host=TensorsHost(new_tokens_host=new_tokens_host),
+            new_tensors_device=SamplerStateTensors(
+                new_tokens=new_tokens_device),
+            new_tensors_host=SamplerStateTensors(new_tokens=new_tokens_host),
             decoder_event=decoder_event,
             log_probs=log_probs)
 
@@ -388,9 +380,9 @@ class TorchDecoder(Decoder):
         return SamplerState(
             scheduled_requests=scheduled_requests,
             logits=logits,
-            new_tensors_device=TensorsDevice(
-                new_tokens_device=new_tokens_device),
-            new_tensors_host=TensorsHost(new_tokens_host=new_tokens_host),
+            new_tensors_device=SamplerStateTensors(
+                new_tokens=new_tokens_device),
+            new_tensors_host=SamplerStateTensors(new_tokens=new_tokens_host),
             decoder_event=decoder_event)
 
     def decode_async(self, scheduled_requests: ScheduledRequests,
@@ -424,8 +416,7 @@ class TorchStarAttentionDecoder(TorchDecoder):
     def update_requests(self, decoder_state: SamplerState):
         if decoder_state.decoder_event:
             decoder_state.decoder_event.synchronize()
-        new_tokens_list = decoder_state.new_tensors_host.new_tokens_host.tolist(
-        )
+        new_tokens_list = decoder_state.new_tensors_host.new_tokens.tolist()
         logits = decoder_state.logits
 
         for request in decoder_state.scheduled_requests.context_requests:
@@ -629,23 +620,25 @@ class TRTLLMDecoder(Decoder):
             'cpu', non_blocking=True)
         finish_reasons = self.algs.decoder.decoder_state.finish_reasons.to(
             'cpu', non_blocking=True)
+        tensors_device = SamplerStateTensors(
+            new_tokens=new_tokens_device_tensor,
+            finished_sum=self.algs.decoder.decoder_state.finished_sum,
+            finish_reasons=self.algs.decoder.decoder_state.finish_reasons,
+            sequence_lengths=self.algs.decoder.decoder_state.sequence_lengths)
 
-        new_tensors_device = TensorsDevice(
-            new_tokens_device=new_tokens_device_tensor)
-
-        new_tensors_host = TensorsHost(
-            new_tokens_host=new_output_tokens,
-            finished_sum_host=finished_sum,
-            finish_reasons_host=finish_reasons,
-            sequence_lengths_host=self.store["sequence_lengths_host"])
+        tensors_host = SamplerStateTensors(
+            new_tokens=new_output_tokens,
+            finished_sum=finished_sum,
+            finish_reasons=finish_reasons,
+            sequence_lengths=self.store["sequence_lengths_host"])
 
         decoder_event = torch.cuda.Event()
         decoder_event.record()
 
         return SamplerState(scheduled_requests=scheduled_requests,
                             logits=logits,
-                            new_tensors_device=new_tensors_device,
-                            new_tensors_host=new_tensors_host,
+                            new_tensors_device=tensors_device,
+                            new_tensors_host=tensors_host,
                             decoder_event=decoder_event)
 
     def update_requests(self, decoder_state: SamplerState):
@@ -657,10 +650,10 @@ class TRTLLMDecoder(Decoder):
         if decoder_event:
             decoder_event.synchronize()
 
-        new_tokens_host = new_tensors_host.new_tokens_host
-        finished_sum_host = new_tensors_host.finished_sum_host
-        finish_reasons_host = new_tensors_host.finish_reasons_host
-        sequence_lengths_host_data = new_tensors_host.sequence_lengths_host
+        new_tokens_host = new_tensors_host.new_tokens
+        finished_sum_host = new_tensors_host.finished_sum
+        finish_reasons_host = new_tensors_host.finish_reasons
+        sequence_lengths_host_data = new_tensors_host.sequence_lengths
 
         for request in scheduled_requests.all_requests():
             if request.is_context_init_state:

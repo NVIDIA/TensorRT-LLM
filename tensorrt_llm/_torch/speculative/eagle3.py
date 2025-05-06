@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from ..pyexecutor.decoder import SamplerState, TorchDecoder
+from ..pyexecutor.decoder import SamplerState, SamplerStateTensors, TorchDecoder
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 
 
@@ -114,15 +114,15 @@ class Eagle3SpecMetadata(SpecMetadata):
 
 class Eagle3Decoder(TorchDecoder):
 
-    def _batch_decode(self, scheduled_requests, model_outputs):
+    def _batch_decode(self, scheduled_requests, model_outputs) -> SamplerState:
         logits = model_outputs["logits"]
         new_tokens_device = torch.argmax(logits, dim=-1)
         if "d2t" in model_outputs:
             d2t = model_outputs["d2t"]
             new_tokens_device = d2t[new_tokens_device] + new_tokens_device
-        new_tokens_host = new_tokens_device.to('cpu', non_blocking=True)
-        new_tensors_device = {"new_tokens_device": new_tokens_device}
-        new_tensors_host = {"new_tokens_host": new_tokens_host}
+        new_tensors_device = SamplerStateTensors(new_tokens=new_tokens_device)
+        new_tensors_host = SamplerStateTensors(
+            new_tokens=new_tokens_device.to('cpu', non_blocking=True))
         decoder_event = torch.cuda.Event()
         decoder_event.record()
         return SamplerState(scheduled_requests=scheduled_requests,
