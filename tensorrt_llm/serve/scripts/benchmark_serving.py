@@ -4,23 +4,17 @@
 r"""Benchmark online serving throughput.
 
 On the server side, run one of the following commands:
-    vLLM OpenAI API server
-    vllm serve <your_model> \
-        --swap-space 16 \
-        --disable-log-requests
+    TensorRT-LLM OpenAI API server
+    trtllm-serve <your_model>
 
 On the client side, run:
     python benchmarks/benchmark_serving.py \
-        --backend <backend> \
         --model <your_model> \
         --dataset-name sharegpt \
         --dataset-path <path to dataset> \
         --request-rate <request_rate> \ # By default <request_rate> is inf
         --num-prompts <num_prompts> # By default <num_prompts> is 1000
 
-    when using tgi backend, add
-        --endpoint /generate_stream
-    to the end of the command above.
 """
 import argparse
 import asyncio
@@ -30,6 +24,7 @@ import os
 import random
 import time
 import warnings
+from argparse import ArgumentParser as FlexibleArgumentParser
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -38,26 +33,15 @@ from typing import Any, Optional
 import numpy as np
 from backend_request_func import (ASYNC_REQUEST_FUNCS,
                                   OPENAI_COMPATIBLE_BACKENDS, RequestFuncInput,
-                                  RequestFuncOutput)
-from tqdm.asyncio import tqdm
-from transformers import PreTrainedTokenizerBase
-
-try:
-    from vllm.transformers_utils.tokenizer import get_tokenizer
-except ImportError:
-    from backend_request_func import get_tokenizer
-
-try:
-    from vllm.utils import FlexibleArgumentParser
-except ImportError:
-    from argparse import ArgumentParser as FlexibleArgumentParser
-
+                                  RequestFuncOutput, get_tokenizer)
 from benchmark_dataset import (AIMODataset, BurstGPTDataset,
                                ConversationDataset, HuggingFaceDataset,
                                InstructCoderDataset, RandomDataset,
                                SampleRequest, ShareGPTDataset, SonnetDataset,
                                VisionArenaDataset)
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
+from tqdm.asyncio import tqdm
+from transformers import PreTrainedTokenizerBase
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
@@ -773,7 +757,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--backend",
         type=str,
-        default="vllm",
+        default="openai",
         choices=list(ASYNC_REQUEST_FUNCS.keys()),
     )
     parser.add_argument(
