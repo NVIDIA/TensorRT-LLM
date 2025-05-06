@@ -466,7 +466,9 @@ class Llama4DecoderLayer(DecoderLayer):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
                                                       hidden_states, residual)
 
-        if (self.fusion_config.POST_MOE_FUSION or self.fusion_config.POST_MLP_FUSION) and self.next_layer_layernorm is not None:
+        if (self.fusion_config.POST_MOE_FUSION
+                or self.fusion_config.POST_MLP_FUSION
+            ) and self.next_layer_layernorm is not None:
             if min_latency_mode:
                 shared_output = hidden_states[0]
                 hidden_states_activated_experts = hidden_states[1]
@@ -962,14 +964,18 @@ class Llama4ForConditionalGeneration(Llama4ForCausalLM):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: Optional[bool] = False,
+        pipeline_interface: Optional[PipelineInterface] = None,
         **kwargs,
     ) -> torch.Tensor:
         mm_embed = kwargs.get("multi_modal_data", [])
-        pipeline_interface = kwargs.get("pipeline_interface", None)
         input_ids, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
                                                      input_ids, mm_embed)
-        logits = super().forward(attn_metadata=attn_metadata, input_ids=input_ids, position_ids=position_ids,
-                                 inputs_embeds=inputs_embeds, return_context_logits=return_context_logits, pipeline_interface=pipeline_interface)
+        logits = super().forward(attn_metadata=attn_metadata,
+                                 input_ids=input_ids,
+                                 position_ids=position_ids,
+                                 inputs_embeds=inputs_embeds,
+                                 return_context_logits=return_context_logits,
+                                 pipeline_interface=pipeline_interface)
         return logits
 
 
