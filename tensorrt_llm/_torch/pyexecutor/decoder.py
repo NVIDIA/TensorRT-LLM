@@ -182,7 +182,7 @@ def decode_single_request(request: LlmRequest, logits):
 
 class TorchDecoder(Decoder):
 
-    def __init__(self, *, max_seq_len: int, mixed_decoder: bool = False):
+    def __init__(self, max_seq_len: int, mixed_decoder: bool = False):
         self.max_seq_len = max_seq_len
         self.mixed_decoder = mixed_decoder
 
@@ -620,13 +620,13 @@ class TRTLLMDecoder(Decoder):
             'cpu', non_blocking=True)
         finish_reasons = self.algs.decoder.decoder_state.finish_reasons.to(
             'cpu', non_blocking=True)
-        tensors_device = SamplerStateTensors(
+        new_tensors_device = SamplerStateTensors(
             new_tokens=new_tokens_device_tensor,
             finished_sum=self.algs.decoder.decoder_state.finished_sum,
             finish_reasons=self.algs.decoder.decoder_state.finish_reasons,
             sequence_lengths=self.algs.decoder.decoder_state.sequence_lengths)
 
-        tensors_host = SamplerStateTensors(
+        new_tensors_host = SamplerStateTensors(
             new_tokens=new_output_tokens,
             finished_sum=finished_sum,
             finish_reasons=finish_reasons,
@@ -637,8 +637,8 @@ class TRTLLMDecoder(Decoder):
 
         return SamplerState(scheduled_requests=scheduled_requests,
                             logits=logits,
-                            new_tensors_device=tensors_device,
-                            new_tensors_host=tensors_host,
+                            new_tensors_device=new_tensors_device,
+                            new_tensors_host=new_tensors_host,
                             decoder_event=decoder_event)
 
     def update_requests(self, decoder_state: SamplerState):

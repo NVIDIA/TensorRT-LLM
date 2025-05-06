@@ -889,21 +889,6 @@ class PyExecutor:
                     decoder_state = self._decode_async(scheduled_batch,
                                                        batch_outputs)
 
-                    def print_scheduled_requests(
-                            scheduled_requests: ScheduledRequests):
-                        print(f"{scheduled_requests.context_requests=}")
-                        print(f"{scheduled_requests.generation_requests=}")
-                        print(f"{scheduled_requests.batch_size=}")
-
-                    def print_state(state: SamplerState):
-                        print("--------------------")
-                        print_scheduled_requests(state.scheduled_requests)
-                        print(
-                            f"{state.new_tensors_device.new_tokens_device.tolist()}"
-                        )
-
-                    print_state(decoder_state)
-
                     self._update_request_states(scheduled_batch)
 
                     ctx_transmission_reqs = self._send_disagg_ctx_cache(
