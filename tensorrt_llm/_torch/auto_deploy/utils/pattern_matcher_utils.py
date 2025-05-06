@@ -5,10 +5,26 @@ Work with `torch._inductor.pattern_matcher` in PyTorch ≥ 2.7.0.
 """
 
 import inspect
-from typing import Any, Callable, List, Optional, Sequence
+import itertools
+import operator
+import re
+from collections.abc import Mapping, Sequence
+from typing import Any, Callable, List, NoReturn, Optional, Union
 
 import torch
-from torch._inductor.pattern_matcher import PatternMatcherPass, fx_to_pattern, register_replacement
+import torch.fx
+import torch.utils._pytree as pytree
+from torch._inductor.pattern_matcher import (
+    CallFunction,
+    ExclusiveKeywordArg,
+    Ignored,
+    KeywordArg,
+    MultiOutputPattern,
+    PatternExpr,
+    PatternMatcherPass,
+    T,
+    register_replacement,
+)
 from torch.fx import GraphModule
 
 from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export_to_gm
@@ -44,29 +60,19 @@ def register_pattern(
     trace_fn: Callable[[Callable, Sequence[torch.Tensor]], GraphModule] = trace_to_gm,
     exclusive_arg_names: Sequence[str] = (),
     scalar_workaround: Optional[Any] = None,
+    op_ignore_types: Optional[Mapping[Callable[..., Any], Sequence[type[Any]]]] = None,
 ) -> None:
     """
     Tracing a Python-level pattern into a GraphModule and registering its replacement.
 
     The inductor matcher treats tensor-shaped arguments and numeric (literal) arguments differently:
 
-    1. Tensor inputs (both pattern inputs and aten-op arguments):
-       - Their shapes do not need to match the example_inputs exactly, except when a shape
-         dimension is materialized as a literal argument to an aten op (e.g., slicing or splitting);
-         in that case the corresponding dimension of your dummy_args must match the real runtime value
-         so the matcher recognizes it.
-       - Symbolic dimensions may be arbitrary (use small fake sizes).
-
-    2. Numeric (integer/float) args (e.g., `unsqueeze_dim=1`):
-       - These become hard-coded literals in the FX graph (e.g. `torch.ops.aten.unsqueeze.default(cos, 1)`).
-       - The matcher requires an exact match on these literals, so you must register one pattern
-         per distinct value.  (Torch ≥ 2.7.0 is required to handle multiple patterns that differ
-         only by numeric literals.)
-
     Note:
-      register_replacement can auto-generate `search_fn_pattern` if you omit it,
-      but that approach will fail when symbolic shapes are involved. Here
-      we explicitly trace & convert via `fx_to_pattern`.
+    1. Numeric (integer/float) args will be lifted as hard-coded literals in the FX graph,
+        utilize `scalar_workaround` to detect those literals and replace with args in the pattern
+    2. register_replacement can auto-generate `search_fn_pattern` if you omit it,
+        but that approach will fail when symbolic shapes are involved. Here
+        we explicitly trace & convert via `fx_to_pattern`.
 
     Args:
         search_fn:          Function defining the “before” pattern (traced for matching).
@@ -81,12 +87,14 @@ def register_pattern(
         exclusive_arg_names:
                             Parameter names to ignore when matching.
         scalar_workaround:  Optional dict or value to workaround FX scalar lifting bugs.
+        op_ignore_types:    Ignore certain types of arg for certain op type
     """
     argnames = list(inspect.signature(search_fn).parameters.keys())
     specific_gm = trace_fn(search_fn, dummy_args)
-    pattern = fx_to_pattern(
+    pattern = fx_to_pattern_with_op_ignore(
         specific_gm,
         argnames=argnames,
+        op_ignore_types=op_ignore_types,
         exclusive_arg_names=exclusive_arg_names,
         scalar_workaround=scalar_workaround,
     )
@@ -99,3 +107,116 @@ def register_pattern(
         pass_dicts=patterns,
         search_fn_pattern=pattern,
     )
+
+
+#   Copied from torch._inductor.pattern_matcher.fx_to_pattern
+#   with additional argument `op_ignore_types` that ignore certain types of arg for certain op type
+#   When a shape dimension is materialized as a literal argument to an aten op (e.g., slice or view);
+#   it's helpful to ignore matching args of these ops, so that the corresponding dimension of your dummy_args
+#   doesn't need to match the real runtime value
+def fx_to_pattern_with_op_ignore(
+    gm: Union[torch.fx.GraphModule, torch.fx.Graph],
+    ignore_types: Sequence[type[Any]] = (),
+    op_ignore_types: Optional[Mapping[Callable[..., Any], Sequence[type[Any]]]] = None,
+    argnames: Sequence[str] = (),
+    scalar_workaround: Union[dict[str, Union[float, int]], None] = None,
+    exclusive_arg_names: Sequence[str] = (),
+) -> PatternExpr:
+    """
+    Convert an FX graph into a PatternExpr.  This is useful for simple
+    patterns that can only match single functions and fixed-length lists.
+    """
+    # scalar_workaround is a hack to capture dropout_p
+    # see https://github.com/pytorch/pytorch/issues/97894
+    scalar_workaround = scalar_workaround or {}
+    inv_scalar_workaround = {v: k for k, v in scalar_workaround.items()}
+    assert len(inv_scalar_workaround) == len(scalar_workaround)
+
+    def process_arg(
+        x: T, ignore_types_override: Optional[Sequence[type[Any]]] = None
+    ) -> Union[T, KeywordArg, Ignored]:
+        current_ignore_types = (
+            ignore_types_override if ignore_types_override is not None else ignore_types
+        )
+        if isinstance(x, (float, int)) and x in inv_scalar_workaround:
+            return KeywordArg(inv_scalar_workaround[x])
+        if type(x) in current_ignore_types:
+            return Ignored()
+        if isinstance(x, list) and all(isinstance(y, Ignored) for y in x) and x:
+            return Ignored()
+        return x
+
+    argnum = itertools.count()
+
+    class Converter(torch.fx.Interpreter):
+        call_method = _not_implemented
+        call_module = _not_implemented
+        get_attr = _not_implemented
+
+        def placeholder(
+            self,
+            target: str,
+            args: Sequence[Any],
+            kwargs: Mapping[str, Any],  # type: ignore[override]
+        ) -> Union[ExclusiveKeywordArg, KeywordArg]:
+            n = next(argnum)
+            if n < len(argnames):
+                name = argnames[n]
+            elif argnames:
+                assert target.startswith("tangent")
+                name = target
+            else:
+                target = re.sub(r"_\d+$", "", target)  # de-mangle arg name
+                name = target
+            if name in exclusive_arg_names:
+                return ExclusiveKeywordArg(name)
+            else:
+                return KeywordArg(name)
+
+        def call_function(
+            self, target: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
+        ) -> PatternExpr:
+            # build a per-op ignore list if specified
+            if op_ignore_types and target in op_ignore_types:
+                combined_ignore = tuple(ignore_types) + tuple(op_ignore_types[target])
+            else:
+                combined_ignore = None
+
+            # by default use the global or per-op ignore set
+            def _make_arg_fn(ignore_override: Optional[Sequence[type[Any]]]):
+                return lambda x: process_arg(x, ignore_override)
+
+            # special-case getitem so ints still match as indices
+            if target == operator.getitem:
+                # drop all ignores except int
+                ints_only = tuple(t for t in (combined_ignore or ignore_types) if t is not int)
+                process_arg_fn = _make_arg_fn(ints_only)
+            else:
+                process_arg_fn = _make_arg_fn(combined_ignore)
+
+            args, kwargs = pytree.tree_map(process_arg_fn, (args, kwargs))
+            if list in ignore_types:
+                # handle burned-in tensor size lists of Ignored()
+                args = [process_arg_fn(a) for a in args]
+                kwargs = {k: process_arg_fn(v) for k, v in kwargs.items()}
+
+            return CallFunction(target, *args, **kwargs)
+
+        def run_node(self, n: torch.fx.Node) -> Any:
+            rv = super().run_node(n)
+            if n.op == "output" and isinstance(rv, tuple):
+                assert len(rv) == len(n.args[0])  # type: ignore[arg-type]
+                for r, arg in zip(rv, n.args[0]):  # type: ignore[arg-type]
+                    r.users = len(arg.users)
+            else:
+                rv.users = len(n.users)
+            return rv
+
+    pattern = Converter(gm).run()  # type: ignore[arg-type]
+    if not isinstance(pattern, PatternExpr):
+        return MultiOutputPattern(pytree.tree_leaves(pattern))
+    return pattern
+
+
+def _not_implemented(*args: Any, **kwargs: Any) -> NoReturn:
+    raise NotImplementedError

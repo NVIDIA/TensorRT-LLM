@@ -200,7 +200,7 @@ def test_rope_variants(
     rtol,
     target_layout,
 ):
-    hidden_size = 1024
+    hidden_size = 512
     model = RoPEModel(
         hidden_size,
         seq_len,
