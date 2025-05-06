@@ -872,7 +872,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             "LLM_MODELS_ROOT=${MODEL_CACHE_DIR}",
             extraInternalEnv,
             "pytest",
-            "-s",
             "-v",
             "--apply-test-list-correction",
             "--splitting-algorithm least_duration",
