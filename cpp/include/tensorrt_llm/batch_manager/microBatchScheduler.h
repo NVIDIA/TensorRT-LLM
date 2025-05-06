@@ -53,7 +53,7 @@ public:
     explicit MicroBatchScheduler(std::optional<batch_scheduler::ContextChunkingConfig> ctxChunkConfig = std::nullopt,
         std::optional<SizeType32> maxContextLength = std::nullopt,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
-        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
+        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_TO_COMPLETE);
 
     std::tuple<RequestVector, RequestVector> operator()(RequestVector& activeRequests, ReqIdsSet const& inflightReqIds,
         SizeType32 maxBatchSizeRuntime, std::optional<SizeType32> maxNumTokensRuntime) const;

@@ -780,7 +780,7 @@ def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
             # WAR: Currently importing the bindings here causes a segfault in pybind 11 during shutdown
             # As this just builds a path we hard-code for now to obviate the need for import of bindings
 
-            # model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
+            # model_spec_obj = ModelSpec(input_file, _tb.DataType.HALF)
             # model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
             # model_spec_obj.use_gpt_plugin()
             # model_engine_path = model_engine_dir / model_spec_obj.get_model_path(
@@ -827,7 +827,7 @@ def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
         # WAR: Currently importing the bindings here causes a segfault in pybind 11 during shutdown
         # As this just builds a path we hard-code for now to obviate the need for import of bindings
 
-        # model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
+        # model_spec_obj = ModelSpec(input_file, _tb.DataType.HALF)
         # model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
         # model_spec_obj.use_gpt_plugin()
         # model_spec_obj.use_packed_input()

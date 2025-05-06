@@ -211,16 +211,6 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("scalingVecPointer", &tr::LoraCache::TaskLayerModuleConfig::scalingVecPointer)
         .def(py::self == py::self);
 
-    py::classh<tr::CudaStream>(m, "CudaStream")
-        .def(py::init(
-                 [](py::object py_stream)
-                 {
-                     cudaStream_t stream = reinterpret_cast<cudaStream_t>(py_stream.cast<uintptr_t>());
-                     return tr::CudaStream{stream};
-                 }),
-            py::arg("stream_ptr"))
-        .def("get_device", &tr::CudaStream::getDevice);
-
     py::classh<tr::BufferManager>(m, "BufferManager")
         .def(py::init<tr::BufferManager::CudaStreamPtr, bool>(), py::arg("stream"), py::arg("trim_pool") = false)
         .def_property_readonly("stream", &tr::BufferManager::getStream);

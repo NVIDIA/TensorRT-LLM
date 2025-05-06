@@ -16,6 +16,7 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
        happens automatically via the checkpoint loading hook added in step 2c.
 """
 
+import operator
 from collections import defaultdict
 from functools import partial
 from typing import Callable, DefaultDict, Dict, List, Set
@@ -208,10 +209,9 @@ def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule
     # find boundary nodes of regions we want to shard
     boundary_nodes = identify_regions_between_residuals(gm)
 
-    # acceptable nodes between sharded GEMMs
-    # TODO: continue updating this list
-    shardable_nodes = {
-        torch.ops.attention.fused_mha,
+    # TODO: continue updating these lists
+    # pointwise ops that don't affect the sharder
+    pointwise_ops = {
         torch.ops.aten.gelu,
         torch.ops.aten.leaky_relu,
         torch.ops.aten.mul,
@@ -219,6 +219,25 @@ def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule
         torch.ops.aten.sigmoid,
         torch.ops.aten.silu,
         torch.ops.aten.tanh,
+        torch.ops.aten.contiguous,
+    }
+
+    # acceptable attention nodes between sharded GEMMs
+    shardable_attention_nodes = {
+        torch.ops.attention.scaled_dot_product_attention,
+        torch.ops.attention.grouped_sdpa,
+        torch.ops.attention.bsnd_grouped_sdpa,
+    }
+
+    # This is a heuristic. Basically, we assume those are okay to shard if we also encounter an
+    # attention node because we know that those ops must be compatible with the attention op. Now
+    # since the attention op is shardable, we will assume those are as well if used in conjunction
+    # with the attention op.
+    shardable_nodes_with_attention = {
+        torch.ops.aten.view,
+        torch.ops.aten.reshape,
+        torch.ops.rope.flashinfer,
+        operator.getitem,
     }
 
     # let's look at linear nodes we can identify between pairs of boundary nodes
@@ -234,12 +253,18 @@ def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule
         # we iterate through all nodes between the two boundary nodes and store linear nodes
         # sorted by their input activation node. We also store remaining nodes.
         nodes_linear: DefaultDict[Node, List[Node]] = defaultdict(list)
+        attention_nodes: Set[Node] = set()
+        attention_related_nodes: Set[Node] = set()
         unaccounted_nodes: Set[Node] = set()
         current_node = n_start
         while current_node != n_end:
             if is_linear_op(current_node, include_quantization=True):
                 nodes_linear[current_node.args[0]].append(current_node)
-            elif not is_op(current_node, shardable_nodes):
+            elif is_op(current_node, shardable_attention_nodes):
+                attention_nodes.add(current_node)
+            elif is_op(current_node, shardable_nodes_with_attention):
+                attention_related_nodes.add(current_node)
+            elif not is_op(current_node, pointwise_ops):
                 unaccounted_nodes.add(current_node)
             current_node = current_node.next
             assert current_node, "Could not identify next node"
@@ -268,11 +293,18 @@ def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule
             if len(lin_nodes_passed) == 0 or lin_nodes_passed == lin_nodes_flat:
                 # remove node from unaccounted nodes since we are outside and it doesn't matter
                 unaccounted_nodes.discard(current_node)
+                attention_related_nodes.discard(current_node)
+                attention_nodes.discard(current_node)
 
             current_node = current_node.next
 
+        # let's post-process the attention-related nodes
+        # we can disregard them if we also see attention nodes and we assume they are compatible
+        if len(attention_nodes) > 0:
+            attention_related_nodes.clear()
+
         # check if any unaccounted nodes are left. If so, do a simply shard
-        if unaccounted_nodes:
+        if unaccounted_nodes or attention_related_nodes:
             ad_logger.debug(f"Unaccounted nodes: {unaccounted_nodes}")
             _simple_shard(gm, nodes_linear, rank, world_size)
             continue

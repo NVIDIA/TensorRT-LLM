@@ -739,10 +739,8 @@ class PeftCacheManager(BaseResourceManager):
         world_config = _tb.WorldConfig()
 
         BufferManager = tensorrt_llm.bindings.internal.runtime.BufferManager
-        CudaStream = tensorrt_llm.bindings.internal.runtime.CudaStream
-        self._stream = torch.cuda.Stream().cuda_stream  # FIXME
-        cuda_stream = CudaStream(self._stream)
-        buffer_manager = BufferManager(cuda_stream, True)
+        buffer_manager = BufferManager(torch.cuda.current_stream().cuda_stream,
+                                       True)
         self.impl = PeftCacheManagerCpp(config=peft_cache_manager_config,
                                         model_config=model_config,
                                         world_config=world_config,

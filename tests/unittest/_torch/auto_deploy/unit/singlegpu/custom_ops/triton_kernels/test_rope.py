@@ -1,8 +1,24 @@
+from typing import Optional
+
 import pytest
 import torch
 from _custom_op_utils import torch_rope_reference
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.triton_attention import TritonWithFlattenedInputs
+
+def _precompute_freqs_cis(
+    seq_len: int, head_dim: int, rope_theta: Optional[float] = None
+) -> torch.Tensor:
+    if rope_theta is None:
+        rope_theta = 1e4
+    freqs = 1.0 / (
+        rope_theta ** (torch.arange(0, head_dim, 2)[: (head_dim // 2)].float() / head_dim)
+    )
+    t = torch.arange(seq_len)
+    freqs = torch.outer(t, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    # cos and sin (real and img) are packed
+    cache = torch.stack([freqs_cis.real, freqs_cis.imag], dim=-1)
+    return cache.to(dtype=torch.float16)
 
 
 @pytest.mark.parametrize("d_head", [16, 96])
@@ -11,7 +27,7 @@ def test_rope(d_head):
     N_ELEM = d_head
 
     input_position = torch.tensor([10], dtype=torch.int32, device="cuda")
-    freqs_cis = TritonWithFlattenedInputs._precompute_freqs_cis(1024, N_ELEM)
+    freqs_cis = _precompute_freqs_cis(1024, N_ELEM)
     print(freqs_cis.shape)
 
     x = torch.randn((1, SEQ_LEN, 8, N_ELEM), dtype=torch.float16)
@@ -30,7 +46,7 @@ def test_rope_flattened(d_head):
     SEQ_LENS = [4, 16, 28]
     N_ELEM = d_head
 
-    freqs_cis = TritonWithFlattenedInputs._precompute_freqs_cis(1024, N_ELEM).to("cuda")
+    freqs_cis = _precompute_freqs_cis(1024, N_ELEM).to("cuda")
 
     input_position = torch.tensor([0] * len(SEQ_LENS), device="cuda")
     x = []

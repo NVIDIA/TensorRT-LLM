@@ -47,7 +47,8 @@ def main(args):
 
     test_hf = args.test_hf and runtime_rank == 0  # only run hf on rank 0
     test_trt_llm = args.test_trt_llm
-    model_name, model_version = read_model_name(args.engine_dir)
+    model_name, model_version = read_model_name(
+        args.engine_dir if not test_hf else args.hf_model_dir, test_hf)
     if args.hf_model_dir is None:
         logger.warning(
             "hf_model_dir is not specified. Try to infer from model_name, but this may be incorrect."

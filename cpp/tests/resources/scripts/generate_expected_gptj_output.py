@@ -15,22 +15,20 @@
 # limitations under the License.
 
 import argparse as _arg
+import os
 from pathlib import Path
 
+# isort: off
 import run
-from build_engines_utils import init_model_spec_module
-
-init_model_spec_module()
-import os
-
-import model_spec
+# isort: on
 
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.bindings.internal.testing import ModelSpec
 
 
 def generate_output(engine: str,
                     num_beams: int,
-                    model_spec_obj: model_spec.ModelSpec,
+                    model_spec_obj: ModelSpec,
                     max_output_len: int = 4):
 
     tp_size = 1
@@ -70,7 +68,7 @@ def generate_output(engine: str,
 def generate_outputs(only_fp8, num_beams):
     input_file = 'input_tokens.npy'
     if only_fp8 and num_beams == 1:
-        model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.FP8)
+        model_spec_obj = ModelSpec(input_file, _tb.DataType.FP8)
         model_spec_obj.use_gpt_plugin()
         model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
         model_spec_obj.use_packed_input()
@@ -81,7 +79,7 @@ def generate_outputs(only_fp8, num_beams):
                         model_spec_obj=model_spec_obj)
     elif not only_fp8:
         print('Generating GPT-J FP16 outputs')
-        model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
+        model_spec_obj = ModelSpec(input_file, _tb.DataType.HALF)
         model_spec_obj.use_gpt_plugin()
         model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
         generate_output(engine=model_spec_obj.get_model_path(),
