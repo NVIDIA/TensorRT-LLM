@@ -378,7 +378,10 @@ class Linear(nn.Module):
                 output = F.linear(input, self.weight, bias)
 
         if self.lora is not None and bool(lora_params):
-            output = output + self.lora(input, lora_params, layer_idx)
+            lora_result = self.lora(input, lora_params, layer_idx)
+            if lora_result is not None:
+                output = output + lora_result
+
         return output
 
     def _maybe_fuse_bias_into_allreduce(
