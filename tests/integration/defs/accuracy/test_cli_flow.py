@@ -1083,7 +1083,6 @@ class TestGemma2_9BIt(CliFlowAccuracyTestHarness):
         self.run(quant_algo=quant_algo, extra_convert_args=["--ckpt-type=hf"])
 
     @skip_pre_hopper
-    @skip_post_blackwell
     def test_fp8(self):
         self.run(quant_algo=QuantAlgo.FP8,
                  kv_cache_quant_algo=QuantAlgo.FP8,
