@@ -50,7 +50,7 @@ Single tests can be executed from `CPP_BUILD_DIR/tests`, e.g.
 
 ### End-to-end tests
 
-`gptSessionTest`,`trtGptModelRealDecoderTest` and `executorTest` require pre-built TensorRT engines, which are loaded in the tests. They also require data files which are stored in [cpp/tests/resources/data](resources/data).
+`trtGptModelRealDecoderTest` and `executorTest` require pre-built TensorRT engines, which are loaded in the tests. They also require data files which are stored in [cpp/tests/resources/data](resources/data).
 
 #### Build engines
 
@@ -97,7 +97,7 @@ PYTHONPATH=examples mpirun -n 4 python3 cpp/tests/resources/scripts/generate_exp
 After building the engines and generating the expected output execute the tests
 
 ```bash
-./$CPP_BUILD_DIR/tests/gptSessionTest
+./$CPP_BUILD_DIR/tests/batch_manager/trtGptModelRealDecoderTest
 ```
 
 ### Run all tests with ctest
