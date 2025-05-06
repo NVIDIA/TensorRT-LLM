@@ -27,7 +27,7 @@ from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
 from tensorrt_llm.logger import logger
 
 from ..distributed import Distributed
-from .decoder import Decoder, DecoderState
+from .decoder import Decoder, SamplerState, SamplerStateTensors
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
                           LlmRequestState, executor_request_to_llm_request)
@@ -139,7 +139,7 @@ def _gc_nvtx_watcher():
 
 @dataclasses.dataclass
 class BatchState:
-    decoder_state: DecoderState
+    decoder_state: SamplerState
 
     iter_start_time: float = 0
     iter_stats: IterationStats = None
@@ -922,7 +922,7 @@ class PyExecutor:
                         'num_ctx_tokens']
                     self._process_iter_stats(
                         finished_requests,
-                        BatchState(decoder_state=DecoderState(
+                        BatchState(decoder_state=SamplerState(
                             scheduled_requests=scheduled_batch),
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
@@ -1102,7 +1102,7 @@ class PyExecutor:
             self._process_iter_stats(finished_requests, self.previous_batch)
 
     @nvtx_range("_forward_step_inter_pp")
-    def _forward_step_inter_pp(self, scheduled_batch) -> DecoderState:
+    def _forward_step_inter_pp(self, scheduled_batch) -> SamplerState:
         batch_outputs = self._forward_step(scheduled_batch)
         self._update_request_states(scheduled_batch)
         tokens_shape = batch_outputs["hidden_states"].shape[:-1]
@@ -1110,13 +1110,13 @@ class PyExecutor:
                                       dtype=torch.int64,
                                       device='cpu',
                                       pin_memory=True)
-        return DecoderState(
+        return SamplerState(
             scheduled_requests=scheduled_batch,
-            new_tensors_host={"new_tokens_host": new_tokens_host})
+            new_tensors_host=SamplerStateTensors(new_tokens=new_tokens_host))
 
     @nvtx_range("_forward_step_last_pp")
     def _forward_step_last_pp(self, scheduled_batch,
-                              microbatch_id) -> DecoderState:
+                              microbatch_id) -> SamplerState:
         batch_outputs = self._forward_step(scheduled_batch)
         decoder_state = self._decode_async(scheduled_batch, batch_outputs)
         self._update_request_states(scheduled_batch)
@@ -1135,11 +1135,11 @@ class PyExecutor:
     @nvtx_range("_handle_previous_batch_inter_pp")
     def _handle_previous_batch_inter_pp(
             self, previous_batch_state: BatchStatePP) -> None:
-        new_tokens_host = previous_batch_state.decoder_state.new_tensors_host
+        new_tensors_host = previous_batch_state.decoder_state.new_tensors_host
         prev_microbatch_id = previous_batch_state.microbatch_id
         # Receive tokens from prev pp rank w.r.t model forward direction
         self.dist.recv_tensor_list(
-            new_tokens_host.values(),
+            new_tensors_host.values(),
             src=self.dist.prev_pp_rank,
             tag=prev_microbatch_id  # not necessary and may discard
         )
@@ -1150,7 +1150,7 @@ class PyExecutor:
             if self.send_handles[prev_microbatch_id] is not None:
                 self.send_handles[prev_microbatch_id].Wait()
             self.send_handles[prev_microbatch_id] = self.dist.isend_tensor_list(
-                new_tokens_host.values(),
+                new_tensors_host.values(),
                 dest=self.dist.next_pp_rank,
                 tag=prev_microbatch_id)
 
@@ -1706,7 +1706,7 @@ class PyExecutor:
             self._update_request_states_tp(scheduled_requests)
 
     @nvtx_range("_decode_async")
-    def _decode_async(self, scheduled_batch, batch_outputs) -> DecoderState:
+    def _decode_async(self, scheduled_batch, batch_outputs) -> SamplerState:
         try:
             if batch_outputs is not None:
                 return self.decoder.decode_async(scheduled_batch, batch_outputs)
@@ -1727,7 +1727,7 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     @nvtx_range("_update_requests")
-    def _update_requests(self, decoder_state: DecoderState):
+    def _update_requests(self, decoder_state: SamplerState):
         try:
             self.decoder.update_requests(decoder_state)
         except Exception as e:
