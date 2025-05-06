@@ -1,13 +1,17 @@
 import argparse
 import json
-import torch.multiprocessing as mp
-import torch
 import os
 import random
-import numpy as np
-from tensorrt_llm.quantization.quantize_by_modelopt import get_model, get_model_type, quant_cfg_choices, get_calib_dataloader, quantize_model, get_tokenizer, KV_QUANT_CFG_CHOICES
-from tensorrt_llm._utils import release_gc, str_dtype_to_torch
+
 import modelopt.torch.speculative as mtsp
+import numpy as np
+import torch
+import torch.multiprocessing as mp
+
+from tensorrt_llm._utils import release_gc, str_dtype_to_torch
+from tensorrt_llm.quantization.quantize_by_modelopt import (
+    KV_QUANT_CFG_CHOICES, get_calib_dataloader, get_model, get_model_type,
+    get_tokenizer, quant_cfg_choices, quantize_model)
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
@@ -18,10 +22,11 @@ if __name__ == "__main__":
     parser.add_argument("--eagle_model_dir",
                         help="Specify where the EAGLE checkpoint is",
                         default=None)
-    parser.add_argument("--eagle_num_layers",
-                        help="Specify the number of layers in the EAGLE checkpoint",
-                        type=int,
-                        default=1)
+    parser.add_argument(
+        "--eagle_num_layers",
+        help="Specify the number of layers in the EAGLE checkpoint",
+        type=int,
+        default=1)
     parser.add_argument(
         '--device',
         help=
@@ -82,14 +87,11 @@ if __name__ == "__main__":
 
     if args.model_dir is None or args.eagle_model_dir is None:
         raise ValueError(
-            "One of source checkpoint (model_dir) must be specified"
-        )
+            "One of source checkpoint (model_dir) must be specified")
 
     import modelopt  # noqa
-
     import modelopt.torch.quantization as mtq
     from modelopt.torch.export import export_hf_checkpoint
-    from tensorrt_llm.models.convert_utils import infer_dtype
 
     if not torch.cuda.is_available():
         raise EnvironmentError("GPU is required for inference.")
@@ -102,12 +104,15 @@ if __name__ == "__main__":
     dtype = hf_config['torch_dtype']
     torch_dtype = str_dtype_to_torch(dtype)
 
-    model = get_model(args.model_dir, dtype, device=args.device, device_map=args.device_map)
+    model = get_model(args.model_dir,
+                      dtype,
+                      device=args.device,
+                      device_map=args.device_map)
     model_type = get_model_type(model)
 
     tokenizer = get_tokenizer(args.model_dir,
-                                max_seq_length=args.tokenizer_max_seq_length,
-                                model_type=model_type)
+                              max_seq_length=args.tokenizer_max_seq_length,
+                              model_type=model_type)
     quant_cfg = None
     if args.qformat in quant_cfg_choices():
         quant_cfg = quant_cfg_choices()[args.qformat]
@@ -133,7 +138,9 @@ if __name__ == "__main__":
 
     last_device = list({param.device for param in model.parameters()})[-1]
 
-    eagle_weights = torch.load(os.path.join(args.eagle_model_dir, "pytorch_model.bin"), map_location=last_device)
+    eagle_weights = torch.load(os.path.join(args.eagle_model_dir,
+                                            "pytorch_model.bin"),
+                               map_location=last_device)
     eagle_weights = {k: v.to(torch_dtype) for k, v in eagle_weights.items()}
     # Adjust the parameters depending on your eagle module weight
     eagle_config = {
@@ -145,22 +152,40 @@ if __name__ == "__main__":
 
     for i in range(args.eagle_num_layers):
         # Replace the eagle weight in modelopt eagle model
-        model.eagle_module.layers[i].self_attn.q_proj.weight = torch.nn.Parameter(eagle_weights[f"layers.{i}.self_attn.q_proj.weight"])
-        model.eagle_module.layers[i].self_attn.k_proj.weight = torch.nn.Parameter(eagle_weights[f"layers.{i}.self_attn.k_proj.weight"])
-        model.eagle_module.layers[i].self_attn.v_proj.weight = torch.nn.Parameter(eagle_weights[f"layers.{i}.self_attn.v_proj.weight"])
-        model.eagle_module.layers[i].self_attn.o_proj.weight = torch.nn.Parameter(eagle_weights[f"layers.{i}.self_attn.o_proj.weight"])
-        model.eagle_module.layers[i].mlp.gate_proj.weight = torch.nn.Parameter(eagle_weights[f"layers.{i}.mlp.gate_proj.weight"])
-        model.eagle_module.layers[i].mlp.up_proj.weight = torch.nn.Parameter(eagle_weights[f"layers.{i}.mlp.up_proj.weight"])
-        model.eagle_module.layers[i].mlp.down_proj.weight = torch.nn.Parameter(eagle_weights[f"layers.{i}.mlp.down_proj.weight"])
-        model.eagle_module.layers[i].post_attention_layernorm.weight = torch.nn.Parameter(eagle_weights[f"layers.{i}.post_attention_layernorm.weight"])
-    model.eagle_module.fc.weight = torch.nn.Parameter(eagle_weights[f"fc.weight"])
+        model.eagle_module.layers[
+            i].self_attn.q_proj.weight = torch.nn.Parameter(
+                eagle_weights[f"layers.{i}.self_attn.q_proj.weight"])
+        model.eagle_module.layers[
+            i].self_attn.k_proj.weight = torch.nn.Parameter(
+                eagle_weights[f"layers.{i}.self_attn.k_proj.weight"])
+        model.eagle_module.layers[
+            i].self_attn.v_proj.weight = torch.nn.Parameter(
+                eagle_weights[f"layers.{i}.self_attn.v_proj.weight"])
+        model.eagle_module.layers[
+            i].self_attn.o_proj.weight = torch.nn.Parameter(
+                eagle_weights[f"layers.{i}.self_attn.o_proj.weight"])
+        model.eagle_module.layers[i].mlp.gate_proj.weight = torch.nn.Parameter(
+            eagle_weights[f"layers.{i}.mlp.gate_proj.weight"])
+        model.eagle_module.layers[i].mlp.up_proj.weight = torch.nn.Parameter(
+            eagle_weights[f"layers.{i}.mlp.up_proj.weight"])
+        model.eagle_module.layers[i].mlp.down_proj.weight = torch.nn.Parameter(
+            eagle_weights[f"layers.{i}.mlp.down_proj.weight"])
+        model.eagle_module.layers[
+            i].post_attention_layernorm.weight = torch.nn.Parameter(
+                eagle_weights[f"layers.{i}.post_attention_layernorm.weight"])
+    model.eagle_module.fc.weight = torch.nn.Parameter(
+        eagle_weights[f"fc.weight"])
     if "fc.bias" in eagle_weights:
-        model.eagle_module.fc.bias = torch.nn.Parameter(eagle_weights[f"fc.bias"])
+        model.eagle_module.fc.bias = torch.nn.Parameter(
+            eagle_weights[f"fc.bias"])
     else:
-        model.eagle_module.fc.bias = torch.nn.Parameter(torch.zeros(eagle_weights[f"fc.weight"].shape[0], dtype=torch_dtype, device=last_device))
+        model.eagle_module.fc.bias = torch.nn.Parameter(
+            torch.zeros(eagle_weights[f"fc.weight"].shape[0],
+                        dtype=torch_dtype,
+                        device=last_device))
 
     model = quantize_model(model, quant_cfg, calib_dataloader, args.batch_size,
-                            args.qformat, None)
+                           args.qformat, None)
 
     with torch.inference_mode():
         export_hf_checkpoint(
