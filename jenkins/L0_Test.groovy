@@ -135,6 +135,18 @@ def testFilter = [
     (AUTO_TRIGGER_TAG_LIST): [],
 ]
 
+@Field
+def GITHUB_PR_API_URL = "github_pr_api_url"
+@Field
+def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
+@Field
+def ACTION_INFO = "action_info"
+def globalVars = [
+    (GITHUB_PR_API_URL): null,
+    (CACHED_CHANGED_FILE_LIST): null,
+    (ACTION_INFO): null,
+]
+
 String getShortenedJobName(String path)
 {
     static final nameMapping = [
@@ -1613,17 +1625,11 @@ pipeline {
                 script {
                     echo "enableFailFast is: ${params.enableFailFast}"
                     echo "env.testFilter is: ${env.testFilter}"
-                    if (env.testFilter)
-                    {
-                        def mp = readJSON text: env.testFilter, returnPojo: true
-                        mp.each {
-                            if (testFilter.containsKey(it.key)) {
-                                echo "setting ${it.key} = ${it.value}"
-                                testFilter[it.key] = it.value
-                            }
-                        }
-                    }
+                    testFilter = trtllm_utils.updateMapWithJson(this, testFilter, env.testFilter, "testFilter")
                     println testFilter
+                    echo "env.globalVars is: ${env.globalVars}"
+                    globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
+                    globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
                 }
             }
         }
