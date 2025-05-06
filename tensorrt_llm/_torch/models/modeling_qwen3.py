@@ -9,7 +9,7 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
+from ..modules.attention import Attention, QkNormType
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
@@ -52,7 +52,7 @@ class Qwen3Attention(Attention):
             dtype=config.torch_dtype,
             dense_bias=config.attention_bias,
             config=model_config,
-            use_qk_norm=True,
+            qk_norm_type=QkNormType.pre_rope,
         )
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
