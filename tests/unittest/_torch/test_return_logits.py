@@ -82,7 +82,7 @@ def test_generate_with_return_logits(gather_context_logits: bool,
         max_tokens=8,
         return_context_logits=gather_context_logits,
         return_generation_logits=gather_generation_logits,
-        return_log_probs=return_log_probs)
+        logprobs=return_log_probs)
 
     for output in llm.generate(prompts, sampling_params=sampling_params):
         if gather_context_logits:
@@ -135,7 +135,7 @@ def test_generate_async_with_return_logits(gather_context_logits: bool,
         max_tokens=8,
         return_context_logits=gather_context_logits,
         return_generation_logits=gather_generation_logits,
-        return_log_probs=return_log_probs)
+        logprobs=return_log_probs)
 
     for idx, output in enumerate(
             llm.generate_async(prompts[0],

@@ -79,6 +79,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
         self._await_response_helper = AwaitResponseHelper(
             self)  # TODO: make it weakref
         self._executor_config = executor_config
+        self._is_pytorch_backend = getattr(self._executor_config, "backend",
+                                           None) == "pytorch"
 
         if isinstance(engine, list):
             engine = engine[self.rank]
@@ -357,9 +359,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 context_phase_params = request.disaggregated_params.get_context_phase_params(
                 )
 
-        is_pytorch_backend = getattr(self._executor_config, "backend",
-                                     None) == "pytorch"
-        is_overlap_enabled = is_pytorch_backend and self._executor_config.pytorch_backend_config.enable_overlap_scheduler
+        is_overlap_enabled = self._is_pytorch_backend and self._executor_config.pytorch_backend_config.enable_overlap_scheduler
         if is_overlap_enabled:
             is_disaggregated = self.engine.kv_cache_transceiver is not None
             if is_disaggregated and (
@@ -380,7 +380,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 end_id=-1 if request.sampling_params.ignore_eos else
                 request.sampling_params.end_id,
                 pad_id=request.sampling_params.pad_id,
-                output_config=request.sampling_params._get_output_config(),
+                output_config=request.sampling_params._get_output_config(
+                    is_pytorch_backend=self._is_pytorch_backend),
                 # Beam search enforces return_all_generated_tokens=True regardless of the passed value
                 return_all_generated_tokens=False,
                 # convert python config into pybind config
@@ -399,13 +400,13 @@ class ExecutorBindingsWorker(GenerationExecutor):
                     tllm.Request.BATCHED_POST_PROCESSOR_NAME
                     if request.sampling_params.apply_batched_logits_processor
                     else None),
-                logits_post_processor=None if is_pytorch_backend else
+                logits_post_processor=None if self._is_pytorch_backend else
                 request.sampling_params.logits_processor,
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 type=request_type)
 
-            if is_pytorch_backend and request.sampling_params.logits_processor:
+            if self._is_pytorch_backend and request.sampling_params.logits_processor:
                 # For PyTorch backend, we attach logits processors as a dynamic Python attribute
                 # instead of using the C++ binding, since the latter will cause PyCapsule pickling issues.
                 lp = request.sampling_params.logits_processor
@@ -776,7 +777,8 @@ class AwaitResponseHelper:
             assert response is not None
             queue = self.worker.return_queue(response.client_id)
 
-            logprobs_result = _get_logprobs(self.worker, response)
+            logprobs_result = _get_logprobs(self.worker, response,
+                                            self.worker._is_pytorch_backend)
             if logprobs_result:
                 response = ResponseWrapper(response, logprobs_result)
 
@@ -817,7 +819,8 @@ class AwaitResponseHelper:
                                              response.error_msg,
                                              response.request_id)
                 else:
-                    logprobs_result = _get_logprobs(self.worker, response)
+                    logprobs_result = _get_logprobs(
+                        self.worker, response, self.worker._is_pytorch_backend)
                     if logprobs_result:
                         response = ResponseWrapper(response, logprobs_result)
 
@@ -843,7 +846,8 @@ class AwaitResponseHelper:
                 response = ErrorResponse(response.client_id, response.error_msg,
                                          response.request_id)
             else:
-                logprobs_result = _get_logprobs(self.worker, response)
+                logprobs_result = _get_logprobs(self.worker, response,
+                                                self.worker._is_pytorch_backend)
                 if logprobs_result:
                     response = ResponseWrapper(response, logprobs_result)
 
@@ -872,9 +876,16 @@ def _get_params_for_first_rsp(
     return None, None
 
 
-def _get_logprobs(worker, response: tllm.Response) -> Optional[LogProbsResult]:
+def _get_logprobs(worker,
+                  response: tllm.Response,
+                  is_pytorch_backend=False) -> Optional[LogProbsResult]:
     """Compute logprob and prompt logprob and clear out logits if applicable.
     """
+    if is_pytorch_backend:
+        # _get_logprobs() is a WAR for the TRT backend, where top-k logprobs are computed post runtime.
+        # In the PyTorch backend, logprobs are already computed during runtime if requested.
+        return None
+
     logprobs_result = None
     generation_result = worker._results.get(response.client_id, None)
 

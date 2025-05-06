@@ -462,13 +462,15 @@ class LLM:
                         "tokenizer is required to reset end_id if it is None, or you can explicitly specify the end_id for sampling_params"
                     )
                 sampling_params._setup(self.tokenizer)
-            # auto enabled context and/or generation logits flags, as they are required by logprob computation.
-            if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
-                sampling_params.return_context_logits = True
-                sampling_params._context_logits_auto_enabled = True
-            if sampling_params.logprobs and not sampling_params.return_generation_logits:
-                sampling_params.return_generation_logits = True
-                sampling_params._generation_logits_auto_enabled = True
+            # auto enabled context and/or generation logits flags, as they are required by logprob computation for TRT backend.
+            if self.args.backend not in ["pytorch", "autodeploy"]:
+                if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
+                    sampling_params.return_context_logits = True
+                    sampling_params._context_logits_auto_enabled = True
+                if sampling_params.logprobs and not sampling_params.return_generation_logits:
+                    sampling_params.return_generation_logits = True
+                    sampling_params._generation_logits_auto_enabled = True
+
             return sampling_params
         else:
             raise TypeError(
@@ -478,7 +480,19 @@ class LLM:
     def _check_arguments(self, prompt_len: int, query_len: int,
                          sampling_params: SamplingParams) -> None:
 
-        if self.args.backend in ['pytorch', 'autodeploy']:
+        if self.args.backend == "pytorch":
+            # TODO: remove these checks after PyTorch backend
+            # fully support TopK prompt and generation logprobs.
+            if sampling_params.prompt_logprobs:
+                raise ValueError(
+                    f"`prompt_logprobs` in sampling_params is not supported in the PyTorch backend yet. Received `prompt_logprobs={sampling_params.prompt_logprobs}`. Please unset this field."
+                )
+            if sampling_params.logprobs and sampling_params.logprobs > 1:
+                raise ValueError(
+                    f"PyTorch backend currently only supports `logprobs=1`. Received `logprobs={sampling_params.logprobs}` (Top{sampling_params.logprobs} logprobs). Please set `logprobs=1` in `sampling_params` instead."
+                )
+            return
+        elif self.args.backend == "autodeploy":
             return
 
         build_config = self.args.build_config

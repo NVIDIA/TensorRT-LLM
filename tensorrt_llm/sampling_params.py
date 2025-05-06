@@ -157,7 +157,6 @@ class SamplingParams:
         min_p (float, optional): scale the most likely token to determine the minimum token probability. None means using C++ runtime default 0.0. Defaults to None.
         beam_width_array (List[int], optional): The array of beam width using in Variable-Beam-Width-Search. Defaults to None.
 
-        return_log_probs (bool): Controls if Result should contain log probabilities. Defaults to False.
         logprobs (int, optional): Number of log probabilities to return per output token. Defaults to None.
         prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. Defaults to None.
         return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.
@@ -236,7 +235,6 @@ class SamplingParams:
     beam_width_array: Optional[List[int]] = None
 
     # Keep the below fields in sync with tllme.OutputConfig
-    return_log_probs: bool = False  # TODO: to be removed after PyTorch flow migrate to use `logprobs`
     logprobs: Optional[int] = None
     prompt_logprobs: Optional[int] = None
     return_context_logits: bool = False
@@ -250,6 +248,9 @@ class SamplingParams:
     # Can be deprecated after migration to PyTorch backend.
     _context_logits_auto_enabled: bool = False
     _generation_logits_auto_enabled: bool = False
+
+    # TODO: deprecate this after trtllm-serve migrate to use TopK logprobs
+    _return_log_probs: bool = False
 
     # Lookahead decoding config
     lookahead_config: Optional[tllme.LookaheadDecodingConfig] = None
@@ -448,13 +449,23 @@ class SamplingParams:
 
         return tllme.SamplingConfig(**llmapi_to_rt_param_map)
 
-    def _get_output_config(self) -> tllme.OutputConfig:
+    def _get_output_config(self,
+                           is_pytorch_backend: bool = False
+                           ) -> tllme.OutputConfig:
         sampling_param_fields = set(dir(SamplingParams))
         fields = [
             f for f in dir(tllme.OutputConfig)
             if not f.startswith('__') and f in sampling_param_fields
         ]
-        return tllme.OutputConfig(**{f: getattr(self, f) for f in fields})
+
+        config_kwargs = {f: getattr(self, f) for f in fields}
+
+        if is_pytorch_backend:
+            config_kwargs["return_log_probs"] = bool(self.logprobs)
+        else:
+            config_kwargs["return_log_probs"] = self._return_log_probs
+
+        return tllme.OutputConfig(**config_kwargs)
 
     def _get_guided_decoding_params(self) -> tllme.GuidedDecodingParams:
         if self.guided_decoding is None:
