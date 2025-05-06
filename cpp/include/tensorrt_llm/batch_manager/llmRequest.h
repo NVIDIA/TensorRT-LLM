@@ -1030,9 +1030,17 @@ public:
 
     void setPrepopulatedPromptLen(SizeType32 prepopulatedPromptLen, SizeType32 kvTokensPerBlock)
     {
-        TLLM_LOG_DEBUG("Setting pre-populated prompt length for request %lu to %i.", mRequestId, prepopulatedPromptLen);
+        // Add debug log for prepopulatedPromptLen
+        TLLM_LOG_DEBUG("Setting pre-populated prompt length for request %lu to %i (promptLen=%i).", mRequestId,
+            prepopulatedPromptLen, getPromptLen());
 
         auto const promptLen = getPromptLen();
+
+        // This check is make sure prepopulated prompt length (tokens already cached in KV cache) is less than prompt
+        // length (total tokens in the prompt)
+        TLLM_CHECK_WITH_INFO(prepopulatedPromptLen < promptLen,
+            "Invalid state: prepopulatedPromptLen (%d) >= promptLen (%d) for request %lu", prepopulatedPromptLen,
+            promptLen, mRequestId);
         TLLM_CHECK(prepopulatedPromptLen < promptLen);
         mPrepopulatedPromptLen = prepopulatedPromptLen;
 
