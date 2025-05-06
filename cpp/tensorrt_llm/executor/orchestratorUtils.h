@@ -19,18 +19,13 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/requestWithId.h"
 #include "tensorrt_llm/executor/types.h"
+
 #include <cstdint>
-#include <memory>
 #include <variant>
 #include <vector>
 
 namespace tensorrt_llm::executor
 {
-
-constexpr int32_t kMPI_ID_TAG{127};
-constexpr int32_t kMPI_STATS_ID_TAG{128};
-constexpr int32_t kMPI_DATA_TAG{1023};
-constexpr int32_t kMPI_STATS_DATA_TAG{1024};
 
 enum class MpiId : uint64_t
 {

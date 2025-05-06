@@ -51,7 +51,6 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
     BATCH_SIZE = batch_size
     N_HEADS = n_heads
     SEQ_LEN = seq_length
-    ROPE_THETA = 1e4
 
     # metadata
     seq_len_tensor = torch.tensor([SEQ_LEN] * BATCH_SIZE, dtype=torch.int32, device=device)
@@ -82,6 +81,13 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     _GlobalFlashInferPlanner.init_workspace(workspace)
 
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(
+            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+        ),
+        BATCH_SIZE * SEQ_LEN,
+    )
     flashinfer_output = torch.ops.attention.flashinfer_mha_with_cache(
         # Q, K, V
         q,
@@ -92,35 +98,23 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
-        offsets,
+        batch_indices,
+        positions,
         # CACHES
         k_cache,
         v_cache,
         # BUFFERS
         workspace,
         # CONSTANTS
-        False,
-        "rope",
-        ROPE_THETA,
-        1.0,
+        None,
         1.0,
         1.0,
     )
-    # Apply RoPE
-    q_rope, k_rope = flashinfer.apply_rope(
-        q.view(BATCH_SIZE * SEQ_LEN, N_HEADS, D_HEAD),
-        k.view(BATCH_SIZE * SEQ_LEN, N_HEADS, D_HEAD),
-        qo_indptr,
-        torch.tensor([0] * BATCH_SIZE, device=device, dtype=torch.int),
-        rope_theta=ROPE_THETA,
-    )
-    q_rope = q_rope.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
-    k_rope = k_rope.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
-    v = v.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
+
     ref = torch.nn.functional.scaled_dot_product_attention(
-        q_rope.transpose(1, 2),
-        k_rope.transpose(1, 2),
-        v.transpose(1, 2),
+        q.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD).transpose(1, 2),
+        k.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD).transpose(1, 2),
+        v.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD).transpose(1, 2),
         is_causal=True,
     )
     ref = ref.transpose(1, 2).contiguous()
@@ -151,7 +145,6 @@ def test_flashinfer_attention_op_decode(
     N_HEADS = n_heads
     SEQ_LEN = seq_length
     PREFILL_SEQ_LEN = prefill_seq_length
-    ROPE_THETA = 1e4
 
     seq_len_tensor = torch.tensor([SEQ_LEN] * BATCH_SIZE, dtype=torch.int32).to(device)
 
@@ -184,47 +177,12 @@ def test_flashinfer_attention_op_decode(
         BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD
     )
 
-    # Apply RoPE to kv cache
-    prefill_k, prefill_v = flashinfer.apply_rope(
-        k_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :].reshape(
-            BATCH_SIZE * PREFILL_SEQ_LEN, N_HEADS, D_HEAD
-        ),
-        v_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :].reshape(
-            BATCH_SIZE * PREFILL_SEQ_LEN, N_HEADS, D_HEAD
-        ),
-        torch.cat(
-            [
-                torch.tensor([0], device=device),
-                torch.cumsum(
-                    torch.tensor([PREFILL_SEQ_LEN] * BATCH_SIZE, dtype=torch.int32).to(device),
-                    0,
-                ),
-            ]
-        ),
-        torch.tensor([0] * BATCH_SIZE, device=device, dtype=torch.int),
-    )
-    k_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :] = prefill_k.reshape(
-        BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD
-    )
-    v_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :] = prefill_v.reshape(
-        BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD
-    )
-
     # Generate reference cache
     k_cache_ref = k_cache.clone()
     v_cache_ref = v_cache.clone()
 
-    # Apply RoPE
-    q_rope, k_rope = flashinfer.apply_rope(
-        q.reshape(BATCH_SIZE * SEQ_LEN, N_HEADS, D_HEAD),
-        k.reshape(BATCH_SIZE * SEQ_LEN, N_HEADS, D_HEAD),
-        qo_indptr,
-        offsets,
-        rope_theta=ROPE_THETA,
-    )
-
-    # Apply rope to k_cache
-    k_cache_ref[0:BATCH_SIZE, PREFILL_SEQ_LEN : PREFILL_SEQ_LEN + SEQ_LEN, :, :] = k_rope.view(
+    # Apply RoPE to k_cache
+    k_cache_ref[0:BATCH_SIZE, PREFILL_SEQ_LEN : PREFILL_SEQ_LEN + SEQ_LEN, :, :] = k.view(
         BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD
     )
     v_cache_ref[0:BATCH_SIZE, PREFILL_SEQ_LEN : PREFILL_SEQ_LEN + SEQ_LEN, :, :] = v.view(
@@ -248,6 +206,13 @@ def test_flashinfer_attention_op_decode(
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     _GlobalFlashInferPlanner.init_workspace(workspace)
 
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(
+            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+        ),
+        BATCH_SIZE * SEQ_LEN,
+    )
     flashinfer_output = torch.ops.attention.flashinfer_mha_with_cache(
         # Q, K, V
         q,
@@ -258,17 +223,15 @@ def test_flashinfer_attention_op_decode(
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
-        offsets,
+        batch_indices,
+        positions,
         # CACHES
         k_cache,
         v_cache,
         # BUFFERS
         workspace,
         # CONSTANTS
-        False,
-        "rope",
-        ROPE_THETA,
-        1.0,
+        None,
         1.0,
         1.0,
     )
@@ -287,11 +250,11 @@ def test_flashinfer_attention_op_decode(
     )
 
     # Generate reference outputs
-    q_rope = q_rope.view(BATCH_SIZE, -1, N_HEADS, D_HEAD)
+    q_ref = q.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
 
     k_ref = k_cache[:BATCH_SIZE, : PREFILL_SEQ_LEN + SEQ_LEN, :, :]
     v_ref = v_cache[:BATCH_SIZE, : PREFILL_SEQ_LEN + SEQ_LEN, :, :]
-    k_ref[:, PREFILL_SEQ_LEN : PREFILL_SEQ_LEN + SEQ_LEN, :, :] = k_rope.view(
+    k_ref[:, PREFILL_SEQ_LEN : PREFILL_SEQ_LEN + SEQ_LEN, :, :] = k.view(
         BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD
     )
     v_ref[:, PREFILL_SEQ_LEN : PREFILL_SEQ_LEN + SEQ_LEN, :, :] = v.view(
@@ -299,7 +262,7 @@ def test_flashinfer_attention_op_decode(
     )
 
     ref = torch.nn.functional.scaled_dot_product_attention(
-        q_rope.transpose(1, 2), k_ref.transpose(1, 2), v_ref.transpose(1, 2)
+        q_ref.transpose(1, 2), k_ref.transpose(1, 2), v_ref.transpose(1, 2)
     )
 
     ref = ref.transpose(1, 2).contiguous()
@@ -329,7 +292,6 @@ def test_flashinfer_attention_context_and_generate(
     BATCH_SIZE = batch_size
     N_HEADS = n_heads
     PREFILL_SEQ_LEN = prefill_seq_length
-    ROPE_THETA = 1e4
 
     # Prefill phase
     seq_len_tensor = torch.tensor([prefill_seq_length] * BATCH_SIZE, dtype=torch.int32).to(device)
@@ -360,7 +322,13 @@ def test_flashinfer_attention_context_and_generate(
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     _GlobalFlashInferPlanner.init_workspace(workspace)
 
-    # Generate output
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(
+            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+        ),
+        BATCH_SIZE * PREFILL_SEQ_LEN,
+    )
     flashinfer_output_1 = torch.ops.attention.flashinfer_mha_with_cache(
         # Q, K, V
         q_1,
@@ -371,17 +339,15 @@ def test_flashinfer_attention_context_and_generate(
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
-        offsets,
+        batch_indices,
+        positions,
         # CACHES
         k_cache,
         v_cache,
         # BUFFERS
         workspace,
         # CONSTANTS
-        False,
-        "rope",
-        ROPE_THETA,
-        1.0,
+        None,
         1.0,
         1.0,
     )
@@ -391,17 +357,8 @@ def test_flashinfer_attention_context_and_generate(
     k_ref = k_cache[:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :]
     v_ref = v_cache[:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :]
 
-    # Apply RoPE
-    q_rope, _ = flashinfer.apply_rope(
-        q_ref.reshape(BATCH_SIZE * (PREFILL_SEQ_LEN), N_HEADS, D_HEAD),
-        k_ref.reshape(BATCH_SIZE * (PREFILL_SEQ_LEN), N_HEADS, D_HEAD),
-        qo_indptr,
-        torch.tensor([0] * BATCH_SIZE, device=device, dtype=torch.int),
-        rope_theta=ROPE_THETA,
-    )
-    q_rope = q_rope.view(BATCH_SIZE, -1, N_HEADS, D_HEAD)
     ref = torch.nn.functional.scaled_dot_product_attention(
-        q_rope.transpose(1, 2),
+        q_ref.view(BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD).transpose(1, 2),
         k_ref.transpose(1, 2),
         v_ref.transpose(1, 2),
         is_causal=True,
@@ -440,6 +397,13 @@ def test_flashinfer_attention_context_and_generate(
     # Create FlashInferAttention class before calling the custom op
     _GlobalFlashInferPlanner.reset()
 
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(
+            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+        ),
+        BATCH_SIZE * 1,
+    )
     flashinfer_output_3 = torch.ops.attention.flashinfer_mha_with_cache(
         # Q, K, V
         q_3,
@@ -450,17 +414,15 @@ def test_flashinfer_attention_context_and_generate(
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
-        offsets,
+        batch_indices,
+        positions,
         # CACHES
         k_cache,
         v_cache,
         # BUFFERS
         workspace,
         # CONSTANTS
-        False,
-        "rope",
-        ROPE_THETA,
-        1.0,
+        None,
         1.0,
         1.0,
     )
@@ -470,18 +432,8 @@ def test_flashinfer_attention_context_and_generate(
     k_ref = k_cache[:BATCH_SIZE, PREFILL_SEQ_LEN : PREFILL_SEQ_LEN + 1, :, :]
     v_ref = v_cache[:BATCH_SIZE, PREFILL_SEQ_LEN : PREFILL_SEQ_LEN + 1, :, :]
 
-    # Apply RoPE
-    q_rope, _ = flashinfer.apply_rope(
-        q_3.reshape(BATCH_SIZE * 1, N_HEADS, D_HEAD),
-        k_ref.reshape(BATCH_SIZE * 1, N_HEADS, D_HEAD),
-        qo_indptr,
-        offsets,
-        rope_theta=ROPE_THETA,
-    )
-    q_rope = q_rope.view(BATCH_SIZE, -1, N_HEADS, D_HEAD)
-    # k_rope = k_rope.view(BATCH_SIZE, -1, N_HEADS, D_HEAD)
     ref = torch.nn.functional.scaled_dot_product_attention(
-        q_rope.transpose(1, 2),
+        q_3.view(BATCH_SIZE, 1, N_HEADS, D_HEAD).transpose(1, 2),
         k_ref.transpose(1, 2),
         v_ref.transpose(1, 2),
         is_causal=True,
@@ -499,7 +451,6 @@ def test_flashinfer_attention_context_and_generate(
     )
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5095416")
 @pytest.mark.parametrize(
     "seq",
     [
@@ -526,7 +477,6 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
     N_HEADS = n_heads
     SEQ_LEN = seq[0]
     PREFILL_SEQ_LEN = seq[1]
-    ROPE_THETA = 1e4
 
     seq_len_tensor = torch.tensor([SEQ_LEN] * BATCH_SIZE, dtype=torch.int32).to(device)
 
@@ -539,13 +489,6 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
     paged_kv_indices = torch.arange(BATCH_SIZE).int().to(device)
     paged_kv_last_page_len = offsets + seq_len_tensor
 
-    # Start index of each query in each batch/request
-    k_indptr = torch.cat(
-        [
-            torch.tensor([0], device=device),
-            torch.cumsum(seq_len_tensor + PREFILL_SEQ_LEN, 0),
-        ]
-    )
     # Q,K,V are computed using GEMM.
     q = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
     k = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
@@ -558,38 +501,18 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
     v_cache = torch.zeros(
         (MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD), dtype=DTYPE, device=device
     )
-    # Apply RoPE to prefilled sequence
-    prefill_k, prefill_v = flashinfer.apply_rope(
-        k_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :].reshape(
-            BATCH_SIZE * PREFILL_SEQ_LEN, N_HEADS, D_HEAD
-        ),
-        v_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :].reshape(
-            BATCH_SIZE * PREFILL_SEQ_LEN, N_HEADS, D_HEAD
-        ),
-        torch.cat(
-            [
-                torch.tensor([0], device=device),
-                torch.cumsum(
-                    torch.tensor([PREFILL_SEQ_LEN] * BATCH_SIZE, dtype=torch.int32).to(device),
-                    0,
-                ),
-            ]
-        ),
-        torch.tensor([0] * BATCH_SIZE, device=device, dtype=torch.int),
-        rope_theta=ROPE_THETA,
-    )
-    k_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :] = prefill_k.reshape(
-        BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD
-    )
-
-    v_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :] = prefill_v.reshape(
-        BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD
-    )
 
     # make sure planner is initialized
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     _GlobalFlashInferPlanner.init_workspace(workspace)
 
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(
+            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+        ),
+        BATCH_SIZE * SEQ_LEN,
+    )
     flashinfer_output = torch.ops.attention.flashinfer_mha_with_cache(
         # Q, K, V
         q,
@@ -600,17 +523,15 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
-        offsets,
+        batch_indices,
+        positions,
         # CACHES
         k_cache,
         v_cache,
         # BUFFERS
         workspace,
         # CONSTANTS
-        False,
-        "rope",
-        ROPE_THETA,
-        1.0,
+        None,
         1.0,
         1.0,
     )
@@ -619,24 +540,6 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
     q_ref = q.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
     k_ref = k_cache[0:BATCH_SIZE, 0 : PREFILL_SEQ_LEN + SEQ_LEN, :, :]
     v_ref = v_cache[0:BATCH_SIZE, 0 : PREFILL_SEQ_LEN + SEQ_LEN, :, :]
-
-    # Apply RoPE
-    _, _ = flashinfer.apply_rope(
-        k_ref.reshape(BATCH_SIZE * (PREFILL_SEQ_LEN + SEQ_LEN), N_HEADS, D_HEAD),
-        k_ref.reshape(BATCH_SIZE * (PREFILL_SEQ_LEN + SEQ_LEN), N_HEADS, D_HEAD),
-        k_indptr,
-        torch.tensor([0] * BATCH_SIZE, device=device, dtype=torch.int),
-        rope_theta=ROPE_THETA,
-    )
-
-    # # Apply RoPE
-    q_ref, _ = flashinfer.apply_rope(
-        q.view(BATCH_SIZE * (SEQ_LEN), N_HEADS, D_HEAD),
-        q.view(BATCH_SIZE * (SEQ_LEN), N_HEADS, D_HEAD),
-        qo_indptr,
-        offsets,
-        rope_theta=ROPE_THETA,
-    )
 
     q_ref = q_ref.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
     k_ref = k_ref.view(BATCH_SIZE, PREFILL_SEQ_LEN + SEQ_LEN, N_HEADS, D_HEAD)
@@ -691,7 +594,6 @@ def test_flashinfer_attention_with_fp8_cache(
     PREFILL_SEQ_LEN = seq_length[0]
     K_SCALE = kv_scales[0]
     V_SCALE = kv_scales[1]
-    ROPE_THETA = 1e4
 
     seq_len_tensor = torch.tensor([SEQ_LEN] * BATCH_SIZE, dtype=torch.int32).to(device)
 
@@ -724,31 +626,6 @@ def test_flashinfer_attention_with_fp8_cache(
         v_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :] = torch.randn(
             BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD
         )
-        # Apply RoPE to kv cache
-        prefill_k, prefill_v = flashinfer.apply_rope(
-            k_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :].reshape(
-                BATCH_SIZE * PREFILL_SEQ_LEN, N_HEADS, D_HEAD
-            ),
-            v_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :].reshape(
-                BATCH_SIZE * PREFILL_SEQ_LEN, N_HEADS, D_HEAD
-            ),
-            torch.cat(
-                [
-                    torch.tensor([0], device=device),
-                    torch.cumsum(
-                        torch.tensor([PREFILL_SEQ_LEN] * BATCH_SIZE, dtype=torch.int32).to(device),
-                        0,
-                    ),
-                ]
-            ),
-            torch.tensor([0] * BATCH_SIZE, device=device, dtype=torch.int),
-        )
-        k_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :] = prefill_k.reshape(
-            BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD
-        )
-        v_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :] = prefill_v.reshape(
-            BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD
-        )
 
         k_cache = k_cache / K_SCALE
         v_cache = v_cache / V_SCALE
@@ -776,16 +653,14 @@ def test_flashinfer_attention_with_fp8_cache(
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     _GlobalFlashInferPlanner.init_workspace(workspace)
 
-    # Apply RoPE
-    q_rope, _ = flashinfer.apply_rope(
-        q.view(BATCH_SIZE * SEQ_LEN, N_HEADS, D_HEAD),
-        k.view(BATCH_SIZE * SEQ_LEN, N_HEADS, D_HEAD),
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr,
-        offsets,
-        rope_theta=ROPE_THETA,
+        flashinfer.get_seq_lens(
+            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+        ),
+        BATCH_SIZE * SEQ_LEN,
     )
-
-    y = torch.ops.attention.flashinfer_mha_with_cache(
+    flashinfer_output = torch.ops.attention.flashinfer_mha_with_cache(
         # Q, K, V
         q,
         k,
@@ -795,23 +670,21 @@ def test_flashinfer_attention_with_fp8_cache(
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
-        offsets,
+        batch_indices,
+        positions,
         # CACHES
         k_cache,
         v_cache,
         # BUFFERS
         workspace,
         # CONSTANTS
-        False,
-        "rope",
-        ROPE_THETA,
-        1.0,
+        None,
         K_SCALE,
         V_SCALE,
     )
 
-    y = y.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
-    q = q_rope.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
+    y = flashinfer_output.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
+    q = q.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
 
     ref = _attention_with_fp8_kv_cache(
         q, k, v, k_cache, v_cache, K_SCALE, V_SCALE, PREFILL_SEQ_LEN, causal, mask
@@ -839,7 +712,6 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
     BATCH_SIZE = len(seq_lengths)
     N_HEADS = n_heads
     SEQ_LEN = sum(seq_lengths)
-    ROPE_THETA = 1e4
 
     MAX_NUM_PAGES = MAX_BATCH_SIZE * MAX_SEQ_LEN // PAGE_SIZE
     seq_len_tensor = torch.tensor(seq_lengths, dtype=torch.int32).to(device)
@@ -878,6 +750,13 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     _GlobalFlashInferPlanner.init_workspace(workspace)
 
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(
+            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+        ),
+        BATCH_SIZE * SEQ_LEN,
+    )
     flashinfer_output = torch.ops.attention.flashinfer_mha_with_cache(
         # Q, K, V
         q,
@@ -888,34 +767,24 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
-        offsets,
+        batch_indices,
+        positions,
         # CACHES
         k_cache,
         v_cache,
         # BUFFERS
         workspace,
         # CONSTANTS
-        False,
-        "rope",
-        ROPE_THETA,
+        None,
         1.0,
         1.0,
-        1.0,
-    )
-    # Apply RoPE
-    q_rope, k_rope = flashinfer.apply_rope(
-        q.view(SEQ_LEN, N_HEADS, D_HEAD),
-        k.view(SEQ_LEN, N_HEADS, D_HEAD),
-        qo_indptr,
-        offsets,
-        rope_theta=ROPE_THETA,
     )
 
     # Compute reference
     ref = []
     for i, s in enumerate(seq_lengths):
-        qq = q_rope[qo_indptr[i] : qo_indptr[i + 1], :, :].view(1, s, N_HEADS, D_HEAD)
-        kk = k_rope[qo_indptr[i] : qo_indptr[i + 1], :, :].view(1, s, N_HEADS, D_HEAD)
+        qq = q[0, qo_indptr[i] : qo_indptr[i + 1], :].view(1, s, N_HEADS, D_HEAD)
+        kk = k[0, qo_indptr[i] : qo_indptr[i + 1], :].view(1, s, N_HEADS, D_HEAD)
         vv = v[0, qo_indptr[i] : qo_indptr[i + 1], :].view(1, s, N_HEADS, D_HEAD)
         oo = torch.nn.functional.scaled_dot_product_attention(
             qq.transpose(1, 2), kk.transpose(1, 2), vv.transpose(1, 2), is_causal=True
@@ -964,6 +833,13 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
     # Create FlashInferAttention class before calling the custom op
     _GlobalFlashInferPlanner.reset()
 
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr2,
+        flashinfer.get_seq_lens(
+            paged_kv_indptr2, paged_kv_last_page_len2, page_size=k_cache.shape[1]
+        ),
+        BATCH_SIZE * 1,
+    )
     flashinfer_output_gen = torch.ops.attention.flashinfer_mha_with_cache(
         # Q, K, V
         q_gen,
@@ -974,38 +850,27 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         paged_kv_indptr2,
         paged_kv_indices2,
         paged_kv_last_page_len2,
-        offsets2,
+        batch_indices,
+        positions,
         # CACHES
         k_cache,
         v_cache,
         # BUFFERS
         workspace,
         # CONSTANTS
-        False,
-        "rope",
-        ROPE_THETA,
-        1.0,
+        None,
         1.0,
         1.0,
     )
 
     # Compute reference
-    # Apply RoPE
-    q_gen_rope, k_gen_rope = flashinfer.apply_rope(
-        q_gen.view(BATCH_SIZE, N_HEADS, D_HEAD),
-        k_gen.view(BATCH_SIZE, N_HEADS, D_HEAD),
-        qo_indptr2,
-        offsets2,
-        rope_theta=ROPE_THETA,
-    )
-
     # Here we compute the output for the new query using all the previous keys and values.
     ref = []
     for i, s in enumerate(seq_lengths):
-        qq = q_gen_rope[i : i + 1, :, :].view(1, 1, N_HEADS, D_HEAD)
+        qq = q_gen[i : i + 1, :, :].view(1, 1, N_HEADS, D_HEAD)
 
-        kk = k_rope[qo_indptr[i] : qo_indptr[i + 1], :, :].view(1, s, N_HEADS, D_HEAD)
-        kk = torch.cat([kk, k_gen_rope[i : i + 1, :, :].view(1, 1, N_HEADS, D_HEAD)], dim=1)
+        kk = k[0, qo_indptr[i] : qo_indptr[i + 1], :].view(1, s, N_HEADS, D_HEAD)
+        kk = torch.cat([kk, k_gen[i : i + 1, :, :].view(1, 1, N_HEADS, D_HEAD)], dim=1)
 
         vv = v[0, qo_indptr[i] : qo_indptr[i + 1], :].view(1, s, N_HEADS, D_HEAD)
         vv = torch.cat([vv, v_gen[i : i + 1, :, :].view(1, 1, N_HEADS, D_HEAD)], dim=1)

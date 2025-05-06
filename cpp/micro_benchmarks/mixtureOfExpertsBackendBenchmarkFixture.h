@@ -20,11 +20,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include "moe_kernels.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 

@@ -1971,22 +1971,6 @@ def get_device_memory():
     return memory
 
 
-#
-# When test parameters have an empty id, older versions of pytest ignored that parameter when generating the
-# test node's ID completely. This however was actually a bug, and not expected behavior that got fixed in newer
-# versions of pytest:https://github.com/pytest-dev/pytest/pull/6607. TRT test defs however rely on this behavior
-# for quite a few test names. This is a hacky WAR that restores the old behavior back so that the
-# test names do not change. Note: This might break in a future pytest version.
-#
-# TODO: Remove this hack once the test names are fixed.
-#
-
-from _pytest.python import CallSpec2
-
-CallSpec2.id = property(
-    lambda self: "-".join(map(str, filter(None, self._idlist))))
-
-
 def pytest_addoption(parser):
     parser.addoption(
         "--test-list",

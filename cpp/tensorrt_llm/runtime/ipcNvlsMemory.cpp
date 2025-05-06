@@ -71,21 +71,21 @@ void MPI_group_barrier(std::set<int> group)
         // Root receives messages from all other processes
         for (int i = 1; i < size; i++)
         {
-            COMM_SESSION.recv(&dummy, 1, MpiType::kINT32, ranks[i], 0);
+            COMM_SESSION.recv(&dummy, 1, MpiType::kINT32, ranks[i], MpiTag::kDefault);
         }
         // Root sends messages back to all other processes
         for (int i = 1; i < size; i++)
         {
-            COMM_SESSION.send(&dummy, 1, MpiType::kINT32, ranks[i], 0);
+            COMM_SESSION.send(&dummy, 1, MpiType::kINT32, ranks[i], MpiTag::kDefault);
         }
     }
     else
     {
         int dummy = 0;
         // Non-root processes send a message to root
-        COMM_SESSION.send(&dummy, 1, MpiType::kINT32, ranks[root], 0);
+        COMM_SESSION.send(&dummy, 1, MpiType::kINT32, ranks[root], MpiTag::kDefault);
         // Non-root processes receive a message from root
-        COMM_SESSION.recv(&dummy, 1, MpiType::kINT32, ranks[root], 0);
+        COMM_SESSION.recv(&dummy, 1, MpiType::kINT32, ranks[root], MpiTag::kDefault);
     }
 #else
     TLLM_THROW("MPI_group_barrier needs to be compiled with ENABLE_MULTI_DEVICE");
@@ -107,13 +107,13 @@ void MPI_group_bcast(std::set<int> group, void* buffer, int count, MpiType datat
         // Root sends message to all other processes
         for (size_t i = 1; i < ranks.size(); ++i)
         {
-            COMM_SESSION.send(buffer, count, datatype, ranks[i], 0);
+            COMM_SESSION.send(buffer, count, datatype, ranks[i], MpiTag::kDefault);
         }
     }
     else
     {
         // Non-root processes receive a message from root
-        COMM_SESSION.recv(buffer, count, datatype, ranks[root], 0);
+        COMM_SESSION.recv(buffer, count, datatype, ranks[root], MpiTag::kDefault);
     }
     MPI_group_barrier(group);
 #else

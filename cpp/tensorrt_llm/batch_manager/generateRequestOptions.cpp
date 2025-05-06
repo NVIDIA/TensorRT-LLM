@@ -24,17 +24,18 @@
 #include "tensorrt_llm/common/nvtxUtils.h"
 
 #include <NvInferRuntimeBase.h>
-#include <cstddef>
 
 using namespace tensorrt_llm::runtime;
+
+namespace te = tensorrt_llm::executor;
 
 namespace tensorrt_llm::batch_manager
 {
 
 std::tuple<ITensor::SharedPtr, std::vector<decoder_batch::Request>, std::vector<SamplingConfig>>
 GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
-    executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
-    BufferManager const& bufferManager, nvinfer1::DataType logitsType, DecoderInputBuffers const& inputBuffers,
+    te::DecodingConfig const& decodingConfig, RequestVector const& contextRequests, BufferManager const& bufferManager,
+    nvinfer1::DataType logitsType, DecoderInputBuffers const& inputBuffers,
     OptionalRef<RuntimeBuffers const> buffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -171,7 +172,7 @@ std::shared_ptr<runtime::ITensor> GenerateRequestOptions::retrieveDraftLogits(tr
 
     if (mIsLeaderInOrchMode)
     {
-        executor::SpeculativeDecodingFastLogitsInfo fastLogitsInfo;
+        te::SpeculativeDecodingFastLogitsInfo fastLogitsInfo;
         std::memcpy(&fastLogitsInfo, tensor->data(), sizeof(fastLogitsInfo));
         auto logits = utils::targetModelReceiveLogits(fastLogitsInfo, modelConfig).value();
 

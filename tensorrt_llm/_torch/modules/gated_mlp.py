@@ -7,7 +7,7 @@ from torch import nn
 
 from tensorrt_llm.mapping import Mapping
 
-from ..custom_ops import IS_FLASHINFER_AVAIABLE
+from ..custom_ops import IS_FLASHINFER_AVAILABLE
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
@@ -16,7 +16,7 @@ from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 
 
 def swiglu(x):
-    if IS_FLASHINFER_AVAIABLE:
+    if IS_FLASHINFER_AVAILABLE:
         # WAR for flashinfer activation since it does not support custom op properly
         from ..custom_ops import flashinfer_silu_and_mul
         return flashinfer_silu_and_mul(x)

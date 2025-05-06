@@ -187,7 +187,7 @@ class CompletionRequest(OpenAIBaseModel):
         sampling_params = SamplingParams(
             best_of=self.best_of,
             frequency_penalty=self.frequency_penalty,
-            return_log_probs=self.logprobs,
+            return_log_probs=self.logprobs,  # TODO: to be changed to `logprob`
             max_tokens=self.max_tokens,
             n=self.n,
             presence_penalty=self.presence_penalty,
@@ -293,6 +293,7 @@ class ToolCall(OpenAIBaseModel):
 class ChatMessage(OpenAIBaseModel):
     role: str
     content: str
+    reasoning_content: Optional[str] = None
     tool_calls: List[ToolCall] = Field(default_factory=list)
 
 
@@ -363,6 +364,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
 class DeltaMessage(OpenAIBaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
     tool_calls: List[ToolCall] = Field(default_factory=list)
 
 
@@ -502,7 +504,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
-            return_log_probs=self.logprobs,
+            return_log_probs=self.logprobs,  # TODO: to be changed to `logprob`
             max_tokens=self.max_completion_tokens,
             n=self.n,
             presence_penalty=self.presence_penalty,

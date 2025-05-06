@@ -14,14 +14,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #include "tensorrt_llm/common/opUtils.h"
+#include "tensorrt_llm/runtime/utils/mpiTags.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include "cuda.h"
-#include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -58,12 +60,12 @@ ncclUniqueId getUniqueId(std::set<int> const& group) noexcept
         NCCLCHECK(ncclGetUniqueId(&id));
         for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
         {
-            COMM_SESSION.sendValue(id, *it, 0);
+            COMM_SESSION.sendValue(id, *it, tensorrt_llm::mpi::MpiTag::kDefault);
         }
     }
     else
     {
-        COMM_SESSION.recvValue(id, *group.begin(), 0);
+        COMM_SESSION.recvValue(id, *group.begin(), tensorrt_llm::mpi::MpiTag::kDefault);
     }
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
     return id;

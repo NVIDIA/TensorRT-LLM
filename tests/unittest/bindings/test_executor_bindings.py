@@ -921,6 +921,64 @@ def test_prompt_tuning_config():
     assert (config.embedding_table == embedding_table).all()
 
 
+def test_multimodal_embedding():
+
+    def get_base_kwargs():
+        return {
+            "input_token_ids": [1, 2, 3],
+            "max_tokens":
+            1,
+            "streaming":
+            False,
+            "sampling_config":
+            trtllm.SamplingConfig(),
+            "output_config":
+            trtllm.OutputConfig(),
+            "end_id":
+            -1,
+            "pad_id":
+            -2,
+            "bad_words": [[4, 5, 6]],
+            "stop_words": [[7, 8, 9]],
+            "embedding_bias":
+            torch.ones(1),
+            "external_draft_tokens_config":
+            trtllm.ExternalDraftTokensConfig([1, 2, 3]),
+            "prompt_tuning_config":
+            trtllm.PromptTuningConfig(torch.ones(100, 64)),
+            "lora_config":
+            trtllm.LoraConfig(1),
+            "logits_post_processor_name":
+            "my_logits_pp",
+            "client_id":
+            1234,
+        }
+
+    # Test with ones
+    embedding = torch.ones(576, 1024)
+    kwargs = get_base_kwargs()
+    kwargs["multimodal_embedding"] = embedding
+    request = trtllm.Request(**kwargs)
+    assert torch.equal(request.multimodal_embedding,
+                       embedding), "Multimodal embedding with ones failed"
+
+    # Test with random values
+    random_embedding = torch.randn(576, 1024)
+    kwargs["multimodal_embedding"] = random_embedding
+    request = trtllm.Request(**kwargs)
+    assert torch.equal(
+        request.multimodal_embedding,
+        random_embedding), "Multimodal embedding with random values failed"
+
+    # Test with different shapes
+    small_embedding = torch.ones(10, 20)
+    kwargs["multimodal_embedding"] = small_embedding
+    request = trtllm.Request(**kwargs)
+    assert torch.equal(
+        request.multimodal_embedding,
+        small_embedding), "Multimodal embedding with different shape failed"
+
+
 def test_mrope_config():
     mrope_rotary_cos_sin = torch.ones(1, 4194304)
     mrope_position_deltas = torch.tensor([-50])
@@ -1021,6 +1079,7 @@ def test_request():
         "external_draft_tokens_config":
         trtllm.ExternalDraftTokensConfig([1, 2, 3]),
         "prompt_tuning_config": trtllm.PromptTuningConfig(torch.ones(100, 64)),
+        "multimodal_embedding": torch.ones(100, 64),
         "lora_config": trtllm.LoraConfig(1),
         "logits_post_processor_name": "my_logits_pp",
         "client_id": 1234,
@@ -1028,7 +1087,11 @@ def test_request():
     request = trtllm.Request(**kwargs)
     for k, v in kwargs.items():
         if "config" not in k:
-            assert getattr(request, k) == v
+            attr_value = getattr(request, k)
+            if isinstance(attr_value, torch.Tensor):
+                assert (attr_value == v).all()
+            else:
+                assert attr_value == v
     assert isinstance(request.sampling_config, trtllm.SamplingConfig)
     assert isinstance(request.output_config, trtllm.OutputConfig)
     assert isinstance(request.external_draft_tokens_config,

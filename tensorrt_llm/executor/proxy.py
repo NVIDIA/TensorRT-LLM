@@ -394,12 +394,14 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self._start_dispatch_threads()
 
         request.set_id(self._get_next_client_id())
+        logprob_params = self._get_logprob_params(request)
 
         result = GenerationResult(
             request,
             background_error_handler=self._handle_background_error,
             executor=self,
-            disaggregated_params=request.disaggregated_params)
+            disaggregated_params=request.disaggregated_params,
+            logprob_params=logprob_params)
         self._results[request.id] = result
 
         self.request_queue.put(request)

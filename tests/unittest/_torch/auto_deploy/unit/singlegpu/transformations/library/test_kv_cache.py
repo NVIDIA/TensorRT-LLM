@@ -10,31 +10,36 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.flashinfer_attention import Flas
 from tensorrt_llm._torch.auto_deploy.custom_ops.triton_attention import TritonWithFlattenedInputs
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export, torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transformations.library import (
-    check_in_out_nodes,
-    insert_mha_with_kv_cache,
-)
+from tensorrt_llm._torch.auto_deploy.transformations.library import check_in_out_nodes
+from tensorrt_llm._torch.auto_deploy.transformations.library.kvcache import insert_cached_attention
 
 
-# Class that inherits from GQA but uses fused_mha directly
-class GQAWithFusedMHA(GQA):
-    """GQA model that uses torch.ops.attention.fused_mha directly instead of SDPA."""
+# Class that uses SDPA directly instead of the regular attention mechanism
+class GQAWithSdpa(GQA):
+    """GQA model that uses SDPA directly instead of the regular attention."""
 
     def __init__(
         self,
         *args,
-        pos_embd_mode: Optional[str] = None,
-        rope_theta: float = 10000.0,
-        rope_scale: float = 1.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.pos_embd_mode = pos_embd_mode
-        self.rope_theta = rope_theta if pos_embd_mode == "rope" else None
-        self.rope_scale = rope_scale if pos_embd_mode == "rope" else None
+        # Store the head dimensions explicitly
+        self.num_heads = args[0]  # First argument is num_attention_heads
+        self.num_kv_heads = args[2]  # Third argument is num_key_value_heads
+        self.head_dim = args[1] // self.num_heads  # hidden_size / num_heads
+
+        if self.num_heads != self.num_kv_heads:
+            self.num_key_value_groups = self.num_heads // self.num_kv_heads
+        else:
+            self.num_key_value_groups = None
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, position_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Forward pass with input tokens and optional position ids.
+        position_ids parameter added to match expected interface in kvcache.py
+        """
         b, s, _ = x.shape
 
         # Project input to q, k, v representations
@@ -42,55 +47,57 @@ class GQAWithFusedMHA(GQA):
         k = self.k_proj(x)  # [b, s, n_kv*h_d]
         v = self.v_proj(x)  # [b, s, n_kv*h_d]
 
-        # Call fused_mha directly
-        y = torch.ops.attention.fused_mha(
-            q=q,
-            k=k,
-            v=v,
-            head_dim=self.head_dim,
-            pos_embd_mode=self.pos_embd_mode,
-            rope_theta=self.rope_theta,
-            rope_scale=self.rope_scale,
-        )
+        # Reshape to [b, s, n, h_d]
+        q = q.view(b, s, self.num_heads, self.head_dim)
+        k = k.view(b, s, self.num_kv_heads, self.head_dim)
+        v = v.view(b, s, self.num_kv_heads, self.head_dim)
+
+        # Use grouped SDPA in bsnd layout
+        attn_output = torch.ops.attention.bsnd_grouped_sdpa(q, k, v, None, 0.0, True, None)
+
+        # SDPA output is already in [b, s, n, h_d] format
+        # Reshape to [b, s, n*h_d]
+        attn_output = attn_output.reshape(b, s, -1)
 
         # Apply output projection
-        return self.o_proj(y)
+        return self.o_proj(attn_output)
 
 
-@pytest.mark.parametrize(
-    "use_rope,atol,rtol",
-    [
-        (True, 1e-2, 1e-2),  # Much more relaxed tolerance for RoPE due to float16 precision issues
-        (False, 1e-3, 1e-3),  # Default tolerance for non-RoPE cases
-    ],
-    ids=["with_rope", "without_rope"],
-)
 @pytest.mark.parametrize(
     "dtype",
     [torch.float16, torch.float32],
     ids=["float16", "float32"],
 )
 @pytest.mark.parametrize(
-    "attention_op",
-    [FlashInferAttention, TritonWithFlattenedInputs],
-    ids=["flashinfer", "triton"],
+    "attn_descriptor",
+    [TritonWithFlattenedInputs, FlashInferAttention],
+    ids=["triton", "flashinfer"],
+)
+@pytest.mark.parametrize(
+    "gqa_config",
+    [
+        (16, 1024, 16),  # Regular attention (num_heads = num_kv_heads)
+        (16, 1024, 4),  # GQA with 4 kv heads
+        (16, 1024, 1),  # MQA with 1 kv head
+    ],
+    ids=["regular", "gqa", "mqa"],
 )
 @torch.inference_mode()
-def test_model_with_kv_cache(use_rope, atol, rtol, dtype, attention_op):
-    # some config
-    batch_size, seq_len = 16, 64
-    num_reset_steps = 2
-    num_random_steps = 10
-    # Use 16 heads with 64 dimensions each to maintain hidden_size=1024
-    # This ensures compatibility with FlashInfer which requires head_dim=64
-    num_attention_heads = 16  # Changed from 32 to 16
-    hidden_size = 1024
-    num_key_value_heads = 16  # Changed from 32 to 16
-
+def test_sdpa_with_kv_cache(dtype, attn_descriptor, gqa_config):
+    """Test the SDPA transformation with KV cache."""
     # FlashInfer doesn't support float32 data type
-    if attention_op == FlashInferAttention and dtype == torch.float32:
+    if attn_descriptor == FlashInferAttention and dtype == torch.float32:
         pytest.skip("FlashInfer doesn't support float32 data type")
 
+    # Unpack the GQA configuration
+    num_attention_heads, hidden_size, num_key_value_heads = gqa_config
+
+    # some config
+    atol = 1e-3
+    rtol = 1e-3
+    batch_size, seq_len = 16, 64
+    num_reset_steps = 2
+    num_random_steps = 4
     max_position_embeddings = 128
 
     # set up sequence+cache objects
@@ -100,75 +107,84 @@ def test_model_with_kv_cache(use_rope, atol, rtol, dtype, attention_op):
     )
     cm = CachedSequenceInterface(sequence_info=ci, device="cuda")
 
-    # Use the model with fused MHA directly instead of regular GQA
-    model = GQAWithFusedMHA(
+    # Create the model with SDPA
+    model = GQAWithSdpa(
         num_attention_heads,
         hidden_size,
         num_key_value_heads,
-        pos_embd_mode="rope" if use_rope else None,
-        rope_theta=10000.0,
-        rope_scale=1.0,
     ).to(device="cuda", dtype=dtype)
 
+    # Create input tensor and position_ids
     x = torch.rand(batch_size, seq_len, hidden_size).to(device="cuda", dtype=dtype)
+    position_ids = torch.arange(0, seq_len).unsqueeze(0).repeat(batch_size, 1).to("cuda")
 
-    # get the model's regular output
-    y_model = model(x)  # b, s, d
+    # Get the model's regular output
+    y_model = model(x, position_ids)  # b, s, d
 
-    # export + check (we clone the state dict to have a bit more freedom in testing below)
+    # Export to graph module
     gm = torch_export_to_gm(
         model,
-        args=(x,),
+        args=(x, position_ids),
         clone=True,
-        dynamic_shapes=cm.dynamic_shapes[:1],
+        dynamic_shapes=cm.dynamic_shapes[:2],  # Include both inputs in dynamic shapes
     )
-    y_gm = gm(x)
+    y_gm = gm(x, position_ids)
     assert all_close(y_model, y_gm, atol=atol, rtol=rtol)
 
-    # Since we're already using fused_mha, we can skip the fusion step
-    # and directly insert KV cache
+    # Set up cache configuration
     cache_config = CacheConfig()
-    # get input node
-    input_node = check_in_out_nodes(gm)
-    gm_transformed = insert_mha_with_kv_cache(
-        gm, cm, attention_op=attention_op, cache_config=cache_config, input_node=input_node
+
+    # Get input node(s)
+    input_nodes = check_in_out_nodes(gm)
+
+    # Apply the transformation
+    gm_transformed = insert_cached_attention(
+        gm, cm, attn_descriptor=attn_descriptor, cache_config=cache_config, input_nodes=input_nodes
     )
     gm_transformed.to("cuda")
     cm.initialize_caches()
 
+    # Helper function to call the model with proper sequence nesting
     def _call_and_unnest(x):
+        # Use nest_sequences to properly set input_ids and automatically update position_ids
         cm.info.nest_sequences(x)
+
+        # Use the cm.args as is - it already contains the correct position_ids
         y = gm_transformed(*cm.args)
+
+        # Unnest the output sequences
         return torch.stack(cm.info.unnest_sequences(y))
 
-    # run regular inference
+    # Test 1: Regular inference (all tokens at once)
     cm.info.reset()
     y_no_cache = _call_and_unnest(x)
     assert all_close(y_model, y_no_cache, atol=atol, rtol=rtol)
 
-    # run inference with kv cache
+    # Test 2: Autoregressive inference with KV cache
     cm.info.reset()
     y_with_cache = torch.empty_like(y_model)
     for i in range(x.shape[1]):
+        # Just pass the current token
         y_with_cache[:, i : i + 1] = _call_and_unnest(x[:, i : i + 1])
-        cm.info.update_pos(1)
+        # Update position for next token
+        cm.info.update_pos(1)  # This automatically updates position_ids too
     assert all_close(y_model, y_with_cache, atol=atol, rtol=rtol)
 
-    # try running some garbage through the caches and then bring back input_pos to see
-    # if that works
-    cm.info.update_pos(-num_reset_steps)  # should be x.shape[1] - num_reset
+    # Test 3: Cache continuation after random tokens
+    cm.info.update_pos(-num_reset_steps)  # Rewind position
     for i in range(num_random_steps):
         _call_and_unnest(torch.rand_like(x[:, :1]))
         cm.info.update_pos(1)
 
-    # go back and run inference again
+    # Continue inference from previous context
     cm.info.reset()
     cm.info.update_pos(x.shape[1] - num_reset_steps)
-    for i in range(x.shape[1] - 2, x.shape[1]):
+    for i in range(x.shape[1] - num_reset_steps, x.shape[1]):
         y_with_cache[:, i : i + 1] = _call_and_unnest(x[:, i : i + 1])
         cm.info.update_pos(1)
     assert all_close(y_model, y_with_cache, atol=atol, rtol=rtol)
 
-    # check if we can still export the model as expected
+    # Test 4: Exportability of the transformed model
     torch_export(gm_transformed, args=cm.args)
-    torch_export_to_gm(gm_transformed, args=cm.args)
+    exported_gm = torch_export_to_gm(gm_transformed, args=cm.args)
+    assert exported_gm is not None

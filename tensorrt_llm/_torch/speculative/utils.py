@@ -24,7 +24,12 @@ def get_spec_metadata(spec_config,
 
 def get_spec_resource_manager(spec_config, model_config, max_num_requests):
     if spec_config.spec_dec_mode.is_mtp_eagle():
-        return None
+        if spec_config.use_relaxed_acceptance_for_thinking:
+            return MTPHiddenStatesManager(spec_config, model_config.torch_dtype,
+                                          model_config.hidden_size,
+                                          max_num_requests)
+        else:
+            return None
     elif spec_config.spec_dec_mode.is_mtp():
         return MTPHiddenStatesManager(spec_config, model_config.torch_dtype,
                                       model_config.hidden_size,

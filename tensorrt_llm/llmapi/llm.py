@@ -318,9 +318,14 @@ class LLM:
                 prompt=prompt,
                 multi_modal_data=inputs.get("multi_modal_data"),
                 mm_processor_kwargs=inputs.get("mm_processor_kwargs"))
+            if sampling_params.add_special_tokens:
+                logger.debug(
+                    "Setting add_special_tokens to False because prompt_token_ids were provided to generate. VLMs will re-encode the prompt."
+                )
+                sampling_params.add_special_tokens = False
 
         query_token_ids = None
-        prompt_tuning_config = None
+        multimodal_embedding = None
         mrope_config = None
         if "prompt_token_ids" in inputs:
             prompt_token_ids = inputs['prompt_token_ids']
@@ -335,9 +340,9 @@ class LLM:
                 query_token_ids, _ = self.input_processor(
                     queries, sampling_params)
             if (extra_processed_inputs is not None
-                    and 'prompt_tuning_config' in extra_processed_inputs):
-                prompt_tuning_config = extra_processed_inputs.get(
-                    'prompt_tuning_config')
+                    and 'mm_embedding' in extra_processed_inputs):
+                multimodal_embedding = extra_processed_inputs.get(
+                    'mm_embedding')
             if (extra_processed_inputs is not None
                     and 'mrope_config' in extra_processed_inputs):
                 mrope_config = extra_processed_inputs.get('mrope_config')
@@ -360,7 +365,7 @@ class LLM:
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
             streaming=streaming,
-            prompt_tuning_config=prompt_tuning_config,
+            multimodal_embedding=multimodal_embedding,
             mrope_config=mrope_config,
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
@@ -457,6 +462,13 @@ class LLM:
                         "tokenizer is required to reset end_id if it is None, or you can explicitly specify the end_id for sampling_params"
                     )
                 sampling_params._setup(self.tokenizer)
+            # auto enabled context and/or generation logits flags, as they are required by logprob computation.
+            if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
+                sampling_params.return_context_logits = True
+                sampling_params._context_logits_auto_enabled = True
+            if sampling_params.logprobs and not sampling_params.return_generation_logits:
+                sampling_params.return_generation_logits = True
+                sampling_params._generation_logits_auto_enabled = True
             return sampling_params
         else:
             raise TypeError(
@@ -489,6 +501,18 @@ class LLM:
             raise ValueError(
                 f"sampling_params's beam_width ({sampling_params.beam_width}) should not exceed max_beam_width ({build_config.max_beam_width})"
             )
+
+        if sampling_params.prompt_logprobs and not build_config.gather_context_logits:
+            raise ValueError(
+                f"`sampling_params's prompt_logprobs={sampling_params.prompt_logprobs}` requires `gather_context_logits=True` "
+                f"in the `BuildConfig` when constructing the LLM. "
+                f"Example: LLM(..., build_config=BuildConfig(gather_context_logits=True))."
+            )
+
+        if sampling_params.logprobs and not self.args.gather_generation_logits:
+            raise ValueError(
+                f"`sampling_params.logprobs={sampling_params.logprobs}` requires `gather_generation_logits=True` "
+                f"to be passed explicitly to the `LLM()` constructor.")
 
     def _build_model(self):
         model_loader = CachedModelLoader(self.args,

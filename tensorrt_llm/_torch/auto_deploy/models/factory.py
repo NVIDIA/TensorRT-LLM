@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from torch._prims_common import DeviceLikeType
 
-from ..custom_ops.attention_interface import CacheConfig, PositionalEmbeddingConfig
+from ..custom_ops.attention_interface import CacheConfig
 from ..utils.logger import ad_logger
 
 
@@ -19,29 +19,49 @@ class ModelFactory(ABC):
     """
 
     def __init__(self, model: Optional[str] = None, skip_loading_weights: bool = False, **kwargs):
-        self.model = model
-        self._ckpt_path = None if skip_loading_weights else model
+        self._model = model
+        self.skip_loading_weights = skip_loading_weights
         self._prefetched_path: Optional[str] = None
 
     @property
-    def ckpt_path(self):
-        return self._prefetched_path or self._ckpt_path
+    def model(self) -> Optional[str]:
+        """The model+checkpoint path."""
+        return self._prefetched_path or self._model
 
     @abstractmethod
     def build_model(self, device: str) -> nn.Module:
-        """Build the model on the desired device."""
+        """Build the model on the desired device.
+
+        Args:
+            device: The device to build the model on.
+
+        Returns:
+            The built model.
+
+
+        Note that we assume that the model's forward function has the following signature:
+
+        .. code-block:: python
+
+            def forward(
+                self, input_ids: torch.Tensor, position_ids: torch.Tensor
+            ) -> Sequence[torch.Tensor]: ...
+
+        ``logits`` are assumeg to be the first output of the model, i.e.,
+        ``model(input_ids, position_ids)[0]`` should return a ``logits`` tensor.
+
+        Moreover, we assume the following tensor shapes:
+
+        .. code-block:: python
+
+            input_ids.shape = (batch_size, seq_len)
+            position_ids.shape = (batch_size, seq_len)
+            logits.shape = (batch_size, seq_len, vocab_size)
+        """
 
     def get_quant_config(self) -> Dict:
         """Returns the quantization config for this model or None if not quantized."""
         return {}
-
-    def get_positional_embedding_config(self) -> PositionalEmbeddingConfig:
-        """Return the positional embedding configuration for the model.
-
-        Returns:
-            The positional embedding configuration for the model.
-        """
-        return PositionalEmbeddingConfig(mode=None)
 
     def get_cache_config(self) -> CacheConfig:
         """Return the cache configuration for the model.
@@ -74,10 +94,10 @@ class ModelFactory(ABC):
             **kwargs: Keyword arguments that will be passed to torch.load.
         """
         ad_logger.info("Loading and initializing weights.")
-        if self.ckpt_path:
-            self._load_checkpoint(model, **kwargs)
-        else:
+        if self.skip_loading_weights:
             self._load_random_init(model, **kwargs)
+        else:
+            self._load_checkpoint(model, **kwargs)
 
     @staticmethod
     def _to_maybe_empty(model: nn.Module, device: DeviceLikeType):

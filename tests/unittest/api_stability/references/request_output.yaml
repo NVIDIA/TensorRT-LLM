@@ -8,4 +8,7 @@ methods:
   aborted:
     parameters: {}
     return_annotation: bool
+  clear_logprob_params:
+    parameters: {}
+    return_annotation: None
 properties: {}

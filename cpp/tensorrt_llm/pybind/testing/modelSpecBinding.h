@@ -17,35 +17,14 @@
 
 #pragma once
 
-#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/pybind/common/customCasters.h"
-#include "tensorrt_llm/runtime/cudaStream.h"
 #include <pybind11/pybind11.h>
 
-namespace PYBIND11_NAMESPACE
+namespace py = pybind11;
+
+namespace tensorrt_llm::pybind::testing
 {
 
-namespace detail
-{
-template <>
-class type_caster<tensorrt_llm::executor::StreamPtr>
-{
-public:
-    PYBIND11_TYPE_CASTER(tensorrt_llm::executor::StreamPtr, _("int"));
+void initBindings(py::module_& m);
 
-    bool load([[maybe_unused]] handle src, bool)
-    {
-        // We don't need to convert in this direction.
-        return false;
-    }
-
-    static handle cast(
-        tensorrt_llm::executor::StreamPtr const& src, return_value_policy /* policy */, handle /* parent */)
-    {
-        // Return cudaStream_t as integer.
-        return PyLong_FromVoidPtr(src->get());
-    }
-};
-
-} // namespace detail
-} // namespace PYBIND11_NAMESPACE
+} // namespace tensorrt_llm::pybind::testing

@@ -22,7 +22,7 @@ l0_gh200:
   - unittest/bindings
   - test_cache.py::test_cache_sanity # 1 sec
   - unittest/llmapi/test_llm_quant.py
-  - test_e2e.py::test_llmapi_quickstart_atexit
+  - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
 - condition:
     ranges:
       system_gpu_count:

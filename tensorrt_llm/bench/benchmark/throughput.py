@@ -95,6 +95,14 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Pass in a dataset file for parsing instead of stdin.",
 )
 @optgroup.option(
+    "--eos_id",
+    type=int,
+    default=-1,
+    required=False,
+    help=
+    "Set the end-of-sequence token for the benchmark. Set to -1 to disable EOS.",
+)
+@optgroup.option(
     "--modality",
     type=click.Choice(["image", "video"]),
     default=None,
@@ -123,6 +131,22 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Number of requests warm up benchmark.",
 )
 @optgroup.option(
+    "--target_input_len",
+    default=None,
+    type=click.IntRange(min=1),
+    help="Target (average) input length for tuning heuristics.",
+)
+@optgroup.option(
+    "--target_output_len",
+    default=None,
+    type=click.IntRange(min=1),
+    help="Target (average) sequence length for tuning heuristics.",
+)
+@optgroup.group(
+    "World Configuration",
+    help="Options for configuring the backend multi-GPU world.",
+)
+@optgroup.option(
     "--tp",
     type=int,
     default=1,
@@ -145,18 +169,6 @@ from tensorrt_llm.sampling_params import SamplingParams
     type=int,
     default=None,
     help="expert cluster parallelism size",
-)
-@optgroup.option(
-    "--target_input_len",
-    default=None,
-    type=click.IntRange(min=1),
-    help="Target (average) input length for tuning heuristics.",
-)
-@optgroup.option(
-    "--target_output_len",
-    default=None,
-    type=click.IntRange(min=1),
-    help="Target (average) sequence length for tuning heuristics.",
 )
 @optgroup.group("Request Load Control Options",
                 cls=MutuallyExclusiveOptionGroup,
@@ -218,6 +230,7 @@ def throughput_command(
     # Parameters from CLI
     # Model, experiment, and engine params
     dataset_path: Path = params.pop("dataset")
+    eos_id: int = params.pop("eos_id")
     warmup: int = params.get("warmup")
     num_requests: int = params.pop("num_requests")
     max_seq_len: int = params.pop("max_seq_len")
@@ -329,8 +342,8 @@ def throughput_command(
         else:
             llm = LLM(**kwargs)
 
-        sampling_params = SamplingParams(end_id=-1,
-                                         pad_id=-1,
+        sampling_params = SamplingParams(end_id=eos_id,
+                                         pad_id=eos_id,
                                          beam_width=beam_width)
 
         # Perform warmup if requested.

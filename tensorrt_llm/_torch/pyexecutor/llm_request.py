@@ -221,6 +221,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             return_logits_device_memory: bool = True,
             stop_words_list: list[list[int]] | None = None,
             **kwargs):
+        self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
+                                                    None)
         super().__init__(
             *args,
             client_id=client_id,
@@ -335,6 +337,8 @@ def executor_request_to_llm_request(
         is None else executor_request.prompt_tuning_config.embedding_table,
         prompt_vocab_size=None if executor_request.prompt_tuning_config is None
         else executor_request.prompt_tuning_config.embedding_table.shape[0],
+        multimodal_embedding=None if executor_request.multimodal_embedding
+        is None else executor_request.multimodal_embedding,
         lora_task_id=executor_request.lora_config.task_id
         if executor_request.lora_config is not None else None,
         lora_weights=executor_request.lora_config.weights
@@ -358,6 +362,8 @@ def executor_request_to_llm_request(
         logits_post_processor=None,
         apply_logits_post_processor_batched=False,
         guided_decoding_params=executor_request.guided_decoding_params,
+        py_logits_post_processors=getattr(executor_request,
+                                          "py_logits_post_processors", None),
         encoder_input_tokens=None,
         return_encoder_output=False,
         client_id=executor_request.client_id
