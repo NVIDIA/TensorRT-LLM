@@ -750,8 +750,8 @@ def run_single_gpu_tests(build_dir: _pl.Path,
 
 def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
                    build_dir: _pl.Path, resources_dir: _pl.Path,
-                   model_cache: str, test_gpt_session_benchmark: bool,
-                   batching_types: list[str], api_types: list[str]):
+                   model_cache: str, batching_types: list[str],
+                   api_types: list[str]):
 
     benchmark_exe_dir = build_dir / "benchmarks"
     if model_name == "gpt":
@@ -772,33 +772,6 @@ def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
             f"run_benchmark test does not support {model_name}. Skipping benchmarks"
         )
         return NotImplementedError
-
-    if test_gpt_session_benchmark:
-        if model_name == "gpt":
-            pass
-
-            # WAR: Currently importing the bindings here causes a segfault in pybind 11 during shutdown
-            # As this just builds a path we hard-code for now to obviate the need for import of bindings
-
-            # model_spec_obj = ModelSpec(input_file, _tb.DataType.HALF)
-            # model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
-            # model_spec_obj.use_gpt_plugin()
-            # model_engine_path = model_engine_dir / model_spec_obj.get_model_path(
-            # ) / "tp1-pp1-cp1-gpu"
-
-            model_engine_path = model_engine_dir / "fp16_plugin_continuous" / "tp1-pp1-cp1-gpu"
-        else:
-            _logger.info(
-                f"gptSessionBenchmark test does not support {model_name}. Skipping benchmarks"
-            )
-            return NotImplementedError
-
-        benchmark = [
-            str(benchmark_exe_dir / "gptSessionBenchmark"), "--engine_dir",
-            str(model_engine_path), "--batch_size", "8", "--input_output_len",
-            "10,20", "--duration", "10"
-        ]
-        run_command(benchmark, cwd=root_dir, timeout=600)
 
     prompt_datasets_args = [{
         '--dataset-name': "cnn_dailymail",

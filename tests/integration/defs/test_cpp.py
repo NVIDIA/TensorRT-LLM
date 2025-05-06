@@ -268,7 +268,6 @@ def run_model_benchmarks(root_dir, build_dir, cpp_resources_dir, python_exe,
 
     def _run(
         model_name: str,
-        test_gpt_session_benchmark: bool,
         batching_types: List[str],
         api_types: List[str],
     ):
@@ -280,7 +279,6 @@ def run_model_benchmarks(root_dir, build_dir, cpp_resources_dir, python_exe,
             build_dir=build_dir,
             resources_dir=cpp_resources_dir,
             model_cache=model_cache,
-            test_gpt_session_benchmark=test_gpt_session_benchmark,
             batching_types=batching_types,
             api_types=api_types,
         )
@@ -356,13 +354,11 @@ def test_benchmarks(build_benchmarks, model, prepare_model,
 
     prepare_model(model)
 
-    test_gpt_session_benchmark = True if model == "gpt" else False
-    batching_types = ["IFB", "V1"] if model == "gpt" else ["IFB"]
+    batching_types = ["IFB"]
     api_types = ["executor"]
 
     run_model_benchmarks(
         model_name=model,
-        test_gpt_session_benchmark=test_gpt_session_benchmark,
         batching_types=batching_types,
         api_types=api_types,
     )

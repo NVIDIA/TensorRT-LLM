@@ -25,15 +25,14 @@ Toggling the CUDA profiler runtime API on and off:
 ```
 ### Inference Time Environment Variables
   * `TLLM_GPTM_PROFILE_START_STOP`, a csv of iterations to trigger start/stop for gptManagerBenchmark (corresponds to "Iteration Counter" in output above. Each value can be a range using the "-" separator e.g. 0-10. In the case of ranges all iterations in that range will be placed in the same nsys file.
-  * `TLLM_GPTS_PROFILE_START_STOP`, a csv of static batching iteration indexes to trigger start/stop for gptSessionBenchmark
 
 ## Coordinating with NVIDIA Nsight Systems Launch
 
 Consult the Nsight Systems User Guide for full overview of options.
 
-Say we want to profile the context phase and the first output token computation of a model with gptSessionBenchmark.
+Say we want to profile the context phase and the first output token computation of a model with gptManagerBenchmark.
 
-To profile just those iterations, in addition to setting `TLLM_GPTS_PROFILE_START_STOP="0,1"`:
+To profile just those iterations, in addition to setting `TLLM_GPTM_PROFILE_START_STOP="0,1"`:
   * We need to tell Nsight Systems to look for explicit API triggers to profile (`-c cudaProfilerApi`)
   * We need to tell Nsight Systems to keep profiling after seeing a profile stop API call (`--capture-range-end="repeat[]"`)
 
