@@ -635,9 +635,9 @@ public:
     /// @param skipCrossAttnBlocks Skip the cross attention transformer blocks or not.
     /// @param guidedDecodingParams The guided decoding parameters.
     /// @param languageAdapterUid Task Uid for language adapter.
-    /// @param allottedTimeMs The allotted time in milliseconds after which the request is finished with a timedOut
-    /// finish reason. The request always will exceed this time slightly, but at most with 1 forward pass. A request can
-    /// be timed-out before ever being scheduled.
+    /// @param allottedTimeMs The allotted time in milliseconds after which the request is cancelled with a timedOut
+    /// finish reason. The request may exceed this time slightly, but at most by 1 forward pass (in pipeline parallelism
+    /// that may involve multiple micro-batches). A request can be timed-out before ever being scheduled.
     // 34 parameters
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),

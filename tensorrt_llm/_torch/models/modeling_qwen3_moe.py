@@ -13,7 +13,7 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import DefaultMoeRoutingMethod, FusedMoE
+from ..modules.fused_moe import FusedMoE, RenormalizeMoeRoutingMethod
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
@@ -48,7 +48,7 @@ class Qwen3MoE(nn.Module):
 
         self.experts = FusedMoE(
             num_experts=self.num_experts,
-            routing_method=DefaultMoeRoutingMethod(top_k=self.top_k),
+            routing_method=RenormalizeMoeRoutingMethod(top_k=self.top_k),
             hidden_size=self.hidden_dim,
             intermediate_size=self.moe_intermediate_size,
             aux_stream=aux_stream,

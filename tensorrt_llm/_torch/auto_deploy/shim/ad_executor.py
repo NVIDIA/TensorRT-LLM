@@ -4,6 +4,8 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch._prims_common import DeviceLikeType
 
+from tensorrt_llm._utils import nvtx_range
+
 from ...._utils import mpi_rank, mpi_world_size
 from ....bindings.executor import ExecutorConfig
 from ....bindings.internal.batch_manager import CacheType
@@ -136,6 +138,7 @@ class ADEngine(ModelEngine):
         # start fresh with fixed seed
         torch.manual_seed(1234)
 
+    @nvtx_range("ad_prepare_inputs")
     def _prepare_inputs(
         self, scheduled_requests: ScheduledRequests, resource_manager: ResourceManager
     ) -> bool:

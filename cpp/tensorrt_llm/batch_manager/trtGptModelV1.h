@@ -64,6 +64,8 @@ public:
 
     // V1 model is stateless, so nothing to do here
     void terminateRequest(std::shared_ptr<LlmRequest> const& llmRequest, bool pause = false) override{};
+    void terminateRequestSync(
+        std::shared_ptr<LlmRequest> const& llmRequest, executor::FinishReason finishReason) override{};
 
     /// @brief This override is empty and solely exists to adhere to the interface
     void forwardSync() override;
