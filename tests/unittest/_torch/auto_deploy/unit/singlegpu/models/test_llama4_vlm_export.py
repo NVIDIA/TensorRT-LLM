@@ -161,10 +161,10 @@ def _forward_with_cond(
     )
 
 
-Llama4ForConditionalGeneration.forward = _forward_with_cond
-
-
 def test_build_run_llama4_vlm():
+    atol = 1e-3
+    rtol = 1e-3
+
     model_id = _hf_model_dir_or_hub_id(
         f"{llm_models_root()}/Llama-4-Scout-17B-16E-Instruct",
         "meta-llama/Llama-4-Scout-17B-16E-Instruct",
@@ -208,10 +208,17 @@ def test_build_run_llama4_vlm():
     )
 
     with torch.inference_mode():
+        # the original model queried with text-only
+        out_text_only = model(inputs["input_ids"], None, inputs["attention_mask"])
+
+    Llama4ForConditionalGeneration.forward = _forward_with_cond
+
+    with torch.inference_mode():
         out_real = model(inputs["input_ids"], inputs["pixel_values"], inputs["attention_mask"])
         out_dummy = model(
             inputs["input_ids"], torch.zeros_like(inputs["pixel_values"]), inputs["attention_mask"]
         )
+        torch.testing.assert_close(out_dummy.logits, out_text_only.logits, rtol=rtol, atol=atol)
 
     gm = torch_export_to_gm(
         model,
@@ -221,15 +228,13 @@ def test_build_run_llama4_vlm():
     move_to_device(gm, model.device)
 
     with torch.inference_mode():
-        atol = 1e-3
-        rtol = 1e-3
-
         out_real_gm = gm(inputs["input_ids"], inputs["pixel_values"], inputs["attention_mask"])
         torch.testing.assert_close(out_real.logits, out_real_gm.logits, rtol=rtol, atol=atol)
         out_dummy_gm = gm(
             inputs["input_ids"], torch.zeros_like(inputs["pixel_values"]), inputs["attention_mask"]
         )
         torch.testing.assert_close(out_dummy.logits, out_dummy_gm.logits, rtol=rtol, atol=atol)
+        torch.testing.assert_close(out_dummy_gm.logits, out_text_only.logits, rtol=rtol, atol=atol)
 
         assert not torch.allclose(out_real.logits, out_dummy.logits, rtol=rtol, atol=atol), (
             "Expected outputs to differ between text only input and text+image input"
