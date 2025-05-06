@@ -71,9 +71,6 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 set(XQA_SOURCES_H ${CMAKE_CURRENT_BINARY_DIR}/xqa_sources.h)
 
-# Ensure output directory exists
-file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
-
 # Generate the file during configuration
 message(STATUS "Generating xqa_sources.h for XQAJIT at config time...")
 execute_process(
@@ -85,11 +82,6 @@ execute_process(
 if(NOT GEN_RESULT EQUAL 0)
   message(FATAL_ERROR "Failed to generate xqa_sources.h header at config time")
 endif()
-
-# Create a dummy target for backward compatibility This doesn't regenerate the
-# file (already done at config time) but provides a target for other components
-# to depend on
-add_custom_target(xqa_sources_h)
 
 if(BUILD_XQA_TESTS)
   # GoogleTest Preparation - Code block copied from
@@ -129,10 +121,6 @@ if(BUILD_XQA_TESTS)
     include_directories(${PROJECT_BINARY_DIR})
     set(GENERATED_XQA_SOURCES
         "${CMAKE_CURRENT_BINARY_DIR}/generated/xqa_sources.h")
-
-    # Ensure generated directory exists
-    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated)
-
     add_custom_command(
       OUTPUT ${GENERATED_XQA_SOURCES}
       COMMAND
