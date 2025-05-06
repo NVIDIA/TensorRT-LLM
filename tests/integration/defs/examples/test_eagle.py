@@ -52,7 +52,7 @@ def test_llm_eagle_1gpu(batch_size, data_type, use_dynamic_tree,
         ]
         venv_check_call(llm_venv, quant_cmd)
         eagle_model_roots = merged_model_path
-        data_type = 'float16'
+        data_type = 'auto'
 
     model_dir = convert_weights(llm_venv=llm_venv,
                                 example_root=eagle_example_root,
@@ -65,8 +65,8 @@ def test_llm_eagle_1gpu(batch_size, data_type, use_dynamic_tree,
         "trtllm-build",
         f"--checkpoint_dir={model_dir}",
         f"--output_dir={engine_dir}",
-        f"--gpt_attention_plugin={data_type if data_type=='float16' else 'auto'}",
-        f"--gemm_plugin={data_type if data_type=='float16' else 'auto'}",
+        f"--gpt_attention_plugin={data_type}",
+        f"--gemm_plugin={data_type}",
         f"--max_beam_width=1",
         "--remove_input_padding=enable",
         "--context_fmha=enable",
