@@ -163,7 +163,7 @@ At the test method level, the test code should enable the tested features when c
 
 The last step is registering the accuracy reference. If the new test case shares the task, model, and accuracy specifications with existing cases, then the accuracy reference has already been registered, and this step can be skipped.
 
-Otherwise, run the new test case without reference by `TRTLLM_ACCURACY_NO_REFERENCE=1`. For example,
+Otherwise, run the new test case without reference by prepending `TRTLLM_ACCURACY_NO_REFERENCE=1`. For example,
 
 ```bash
 TRTLLM_ACCURACY_NO_REFERENCE=1 pytest -vs "test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM-torch_compile]"
