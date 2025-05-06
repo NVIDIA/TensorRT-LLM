@@ -455,12 +455,12 @@ void LookaheadDecodingLayerTest::newRequests(std::vector<SizeType32> requestIds)
     ////////////////////////////////
     auto setupParams = std::make_shared<LookaheadSetupParams>();
     setupParams->prompt.resize(0);
-    setupParams->algoConfigs.resize(0);
+    setupParams->lookaheadConfigs.resize(0);
     for (SizeType32 bi = 0; bi < requestSize; bi++)
     {
         SizeType32 gbi = requestIds[bi];
         setupParams->prompt.emplace_back(mPrompt[gbi]);
-        setupParams->algoConfigs.emplace_back(mTestParam.w, mTestParam.n, mTestParam.g);
+        setupParams->lookaheadConfigs.emplace_back(mTestParam.w, mTestParam.n, mTestParam.g);
         PRINT_TOKENS(setupParams->prompt[bi]);
         setupParams->generationLengths = mGenerationLengths;
         setupParams->positionOffsets = mPositionOffsets;

@@ -214,13 +214,13 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
         auto& requests = requestsOpt.value();
         lookaheadParams->prompt.resize(0);
         lookaheadParams->prompt.reserve(batchSize);
-        lookaheadParams->algoConfigs.resize(0);
-        lookaheadParams->algoConfigs.reserve(batchSize);
+        lookaheadParams->lookaheadConfigs.resize(0);
+        lookaheadParams->lookaheadConfigs.reserve(batchSize);
         for (size_t bi = 0; bi < batchSize; bi++)
         {
             lookaheadParams->prompt.emplace_back(ITensor::slice(requests[bi].ids, 0, requests[bi].inputLen));
             TLLM_CHECK(requests[bi].lookaheadRuntimeConfig);
-            lookaheadParams->algoConfigs.emplace_back(requests[bi].lookaheadRuntimeConfig.value());
+            lookaheadParams->lookaheadConfigs.emplace_back(requests[bi].lookaheadRuntimeConfig.value());
         }
         lookaheadParams->generationLengths = output->lookaheadOutputs->generationLengths;
         lookaheadParams->positionOffsets = output->lookaheadOutputs->positionOffsets;

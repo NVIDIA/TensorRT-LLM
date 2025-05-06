@@ -69,11 +69,11 @@ void initBindings(pybind11::module_& m)
                 if (p)
                     std::rethrow_exception(p);
             }
-            catch (const tb::PeftTaskNotCachedException& e)
+            catch (tb::PeftTaskNotCachedException const& e)
             {
                 PyErr_SetString(peft_exc, e.what());
             }
-            catch (const tr::LoraCacheFullException& e)
+            catch (tr::LoraCacheFullException const& e)
             {
                 PyErr_SetString(lora_exc, e.what());
             }

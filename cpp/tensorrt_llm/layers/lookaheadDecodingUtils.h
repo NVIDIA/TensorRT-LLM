@@ -136,6 +136,7 @@ public:
         std::shared_ptr<runtime::CudaStream> stream = nullptr)
         : DebugTensor(*tensor, name, bufferManager, stream)
     {
+        isNullptr = (tensor.get() == nullptr);
     }
 
     uint8_t const& u8(std::initializer_list<runtime::ITensor::DimType64> const& dims)
@@ -215,10 +216,13 @@ public:
     {
         using namespace tensorrt_llm::runtime;
         std::ostringstream buf;
+        if (isNullptr)
+        {
+            return mName + " is empty";
+        }
         auto shape = mTensor.getShape();
         runtime::BufferManager::ITensorPtr hostPtr = copyToHostOptional();
         runtime::BufferRange<runtime::TokenIdType const> tensorRange(hostPtr ? (*hostPtr) : mTensor);
-
         buf << mName << ": " << mTensor.getMemoryTypeName() << ',' << mTensor.getDataTypeName() << ',' << shape;
         auto line = [&buf](TokenIdType const* array, SizeType32 size)
         {
@@ -251,17 +255,26 @@ public:
         }
         else if (shape.nbDims == 2)
         {
-            buf << '[';
-            for (runtime::SizeType32 i = 0; i < shape.d[0]; i++)
+            for (auto i = 0; i < shape.d[0]; i++)
             {
-                buf << "\n " << i << ": ";
+                buf << "\n [" << i << "]: ";
                 line(tensorRange.begin() + i * shape.d[1], shape.d[1]);
             }
-            buf << ']';
+        }
+        else if (shape.nbDims == 3)
+        {
+            for (auto i = 0; i < shape.d[0]; i++)
+            {
+                for (auto j = 0; j < shape.d[1]; j++)
+                {
+                    buf << "\n [" << i << "," << j << "]: ";
+                    line(tensorRange.begin() + (i * shape.d[0] + j) * shape.d[1], shape.d[2]);
+                }
+            }
         }
         else
         {
-            buf << "Too Large to be printed";
+            buf << "More than 3 dimensions";
         }
         return buf.str();
     }
@@ -271,6 +284,10 @@ public:
     {
         using namespace tensorrt_llm::runtime;
         std::ostringstream buf;
+        if (isNullptr)
+        {
+            return mName + " is empty";
+        }
         auto shape = mTensor.getShape();
         runtime::BufferManager::ITensorPtr hostPtr = copyToHostOptional();
         runtime::BufferRange<T const> tensorRange(hostPtr ? (*hostPtr) : mTensor);
@@ -299,17 +316,26 @@ public:
         }
         else if (shape.nbDims == 2)
         {
-            buf << '[';
-            for (runtime::SizeType32 i = 0; i < shape.d[0]; i++)
+            for (auto i = 0; i < shape.d[0]; i++)
             {
-                buf << "\n " << i << ": ";
+                buf << "\n [" << i << "]: ";
                 line(tensorRange.begin() + i * shape.d[1], shape.d[1]);
             }
-            buf << ']';
+        }
+        else if (shape.nbDims == 3)
+        {
+            for (auto i = 0; i < shape.d[0]; i++)
+            {
+                for (auto j = 0; j < shape.d[1]; j++)
+                {
+                    buf << "\n [" << i << "," << j << "]: ";
+                    line(tensorRange.begin() + (i * shape.d[0] + j) * shape.d[1], shape.d[2]);
+                }
+            }
         }
         else
         {
-            buf << "Too Large to be printed";
+            buf << "More than 3 dimensions";
         }
         return buf.str();
     }
@@ -420,11 +446,13 @@ private:
     std::string mName;
     std::shared_ptr<runtime::BufferManager> mBufferManager;
     std::shared_ptr<runtime::CudaStream> mStream;
+    bool isNullptr{false};
 };
 
 #define D(x) tensorrt_llm::layers::DebugTensor(x, #x)
 #define Db(x, bufferManager) tensorrt_llm::layers::DebugTensor(x, #x, bufferManager, nullptr)
 #define Ds(x, stream) tensorrt_llm::layers::DebugTensor(x, #x, nullptr, stream)
+#define Dbs(x, bufferManager, stream) tensorrt_llm::layers::DebugTensor(x, #x, bufferManager, stream)
 #define PRINT_TOKENS(x) D(x).print_tokens()
 #define PRINT_VALUES(x) D(x).print_values()
 #define PRINT_SHAPE(x) D(x).print_shape()
