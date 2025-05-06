@@ -245,8 +245,8 @@ def run_model_benchmarks(root_dir, build_dir, cpp_resources_dir, python_exe,
                          indirect=True)
 @pytest.mark.parametrize("model", [
     "bart", "chatglm", "eagle", "encoder", "enc_dec_language_adapter", "gpt",
-    "gpt_executor", "gpt_session", "gpt_tests", "llama", "mamba", "medusa",
-    "recurrentgemma", "redrafter", "t5"
+    "gpt_executor", "gpt_tests", "llama", "mamba", "medusa", "recurrentgemma",
+    "redrafter", "t5"
 ])
 @pytest.mark.parametrize("run_fp8", [False, True], ids=["", "fp8"])
 def test_model(build_google_tests, model, prepare_model, run_model_tests,
@@ -270,7 +270,7 @@ def test_benchmarks(build_benchmarks, model, prepare_model,
 
     prepare_model(model)
 
-    batching_types = ["IFB", "V1"] if model == "gpt" else ["IFB"]
+    batching_types = ["IFB"]
     api_types = ["executor"]
 
     run_model_benchmarks(
