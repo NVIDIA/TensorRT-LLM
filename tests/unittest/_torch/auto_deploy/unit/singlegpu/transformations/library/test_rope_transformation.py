@@ -140,14 +140,16 @@ class RoPEModel(torch.nn.Module):
 
 
 @pytest.mark.parametrize(
-    "transformation,variant,layout,batch_size,seq_len,num_heads,num_kv_heads,atol,rtol",
+    "transformation,variant,layout,batch_size,seq_len,num_heads,num_kv_heads,atol,rtol, target_layout",
     [
-        ("match", "explicit", "BNSD", 8, 16, 8, 8, 1e-3, 1e-3),
-        ("match", "explicit", "BSND", 8, 16, 8, 4, 1e-2, 1e-2),
-        ("match", "complex", "BNSD", 8, 16, 8, 8, 1e-3, 1e-3),
-        ("match", "complex", "BSND", 8, 16, 8, 4, 1e-3, 1e-3),
-        ("match_layout", "explicit", "BNSD", 4, 12, 8, 8, 1e-3, 1e-3),
-        ("match_layout", "complex", "BNSD", 4, 12, 8, 8, 1e-3, 1e-3),
+        ("match", "explicit", "BNSD", 8, 16, 8, 8, 1e-3, 1e-3, None),
+        ("match", "explicit", "BSND", 8, 16, 8, 4, 1e-2, 1e-2, None),
+        ("match", "complex", "BNSD", 8, 16, 8, 8, 1e-3, 1e-3, None),
+        ("match", "complex", "BSND", 8, 16, 8, 4, 1e-3, 1e-3, None),
+        ("match_layout", "explicit", "BNSD", 4, 12, 8, 8, 1e-3, 1e-3, "BSND"),
+        ("match_layout", "explicit", "BNSD", 4, 12, 8, 8, 1e-3, 1e-3, "BNSD"),
+        ("match_layout", "complex", "BNSD", 4, 12, 8, 8, 1e-3, 1e-3, "BSND"),
+        ("match_layout", "complex", "BSND", 4, 12, 8, 8, 1e-3, 1e-3, "BSND"),
         pytest.param(
             "optimize",
             "explicit",
@@ -158,11 +160,12 @@ class RoPEModel(torch.nn.Module):
             8,
             1e-3,
             1e-3,
+            None,
             marks=pytest.mark.xfail(
                 reason="flashinfer op does not support BNSD layout", strict=True
             ),
         ),
-        ("optimize", "explicit", "BSND", 4, 12, 8, 4, 1e-3, 1e-3),
+        ("optimize", "explicit", "BSND", 4, 12, 8, 4, 1e-3, 1e-3, None),
         pytest.param(
             "optimize",
             "complex",
@@ -173,11 +176,12 @@ class RoPEModel(torch.nn.Module):
             8,
             1e-3,
             1e-3,
+            None,
             marks=pytest.mark.xfail(
                 reason="flashinfer op does not support BNSD layout", strict=True
             ),
         ),
-        ("optimize", "complex", "BSND", 4, 12, 8, 4, 1e-3, 1e-3),
+        ("optimize", "complex", "BSND", 4, 12, 8, 4, 1e-3, 1e-3, None),
     ],
 )
 @torch.inference_mode()
@@ -191,6 +195,7 @@ def test_rope_variants(
     num_kv_heads,
     atol,
     rtol,
+    target_layout,
 ):
     hidden_size = 512
     model = RoPEModel(
@@ -233,17 +238,18 @@ def test_rope_variants(
                         is_op(q_arg, torch.ops.aten.contiguous)
                         and is_op(k_arg, torch.ops.aten.contiguous)
                     ):
-                        return False
-                    # extract outputs and ensure each is transposed afterwards
+                        matched = False
+                        break
+
                     old_q, old_k = extract_output_tuple(n, 2)
                     if old_q is None or old_k is None:
-                        return False
-                    if not any(is_op(u, torch.ops.aten.transpose) for u in old_q.users):
-                        return False
-                    if not any(is_op(u, torch.ops.aten.transpose) for u in old_k.users):
-                        return False
-                    return True
-            return False
+                        matched = False
+                        break
+                    q_transposed = any(is_op(u, torch.ops.aten.transpose) for u in old_q.users)
+                    k_transposed = any(is_op(u, torch.ops.aten.transpose) for u in old_k.users)
+                    matched = q_transposed and k_transposed
+
+            return matched if layout != target_layout else not matched
 
     else:
         fn = optimize_rope
@@ -251,18 +257,33 @@ def test_rope_variants(
         def checker(gm):
             return any(is_op(n, torch.ops.rope.flashinfer) for n in gm.graph.nodes)
 
-    _ = run_test(
-        model,
-        x,
-        fn,
-        checker,
-        lambda n: n,
-        atol=atol,
-        rtol=rtol,
-        test_load_hook=True,
-        strict_loading=True,
-        dynamic_shapes=dyn,
-    )
+    if target_layout:
+        _ = run_test(
+            model,
+            x,
+            fn,
+            checker,
+            lambda n: n,
+            atol,  # atol
+            rtol,  # rtol
+            True,  # test_load_hook
+            True,  # strict_loading
+            dyn,  # dynamic_shapes
+            target_layout,
+        )
+    else:
+        _ = run_test(
+            model,
+            x,
+            fn,
+            checker,
+            lambda n: n,
+            atol,  # atol
+            rtol,  # rtol
+            True,  # test_load_hook
+            True,  # strict_loading
+            dyn,  # dynamic_shapes
+        )
 
 
 class DSRotaryEmbedding(torch.nn.Module):
@@ -327,16 +348,18 @@ class DSModel(torch.nn.Module):
 
 
 @pytest.mark.parametrize(
-    "layout,num_heads,num_kv_heads,mode",
+    "layout,num_heads,num_kv_heads,mode, target_layout",
     [
-        ("BNSD", 8, 8, "match"),
-        ("BSND", 8, 4, "match"),
-        ("BNSD", 8, 8, "optimize"),
-        ("BSND", 8, 4, "optimize"),
+        ("BNSD", 8, 8, "match", None),
+        ("BSND", 8, 4, "match", None),
+        ("BNSD", 8, 8, "match_layout", "BNSD"),
+        ("BSND", 8, 4, "match_layout", "BNSD"),
+        ("BSND", 8, 4, "match_layout", "BSND"),
+        ("BNSD", 8, 4, "match_layout", "BSND"),
     ],
 )
 @torch.inference_mode()
-def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode):
+def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode, target_layout):
     batch, seq, hid = 4, 12, 512
     model = DSModel(hid, 16, num_heads, num_kv_heads, layout=layout, mode=mode)
     model = model.to("cuda", torch.float16)
@@ -353,7 +376,7 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode):
                 for n in gm.graph.nodes
             )
 
-    else:  # mode == "optimize"
+    else:  # mode == "match_layout"
         transform = match_rope_layout
 
         def checker(gm):
@@ -375,18 +398,32 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode):
                     k_transposed = any(is_op(u, torch.ops.aten.transpose) for u in old_k.users)
                     matched = q_transposed and k_transposed
 
-                    # for BSND we expect that they were NOT transposed
-            return matched if layout == "BNSD" else not matched
+            return matched if layout != target_layout else not matched
 
-    _ = run_test(
-        model,
-        x,
-        transform,
-        checker,
-        lambda num_p: num_p,
-        atol=1e-3,
-        rtol=1e-3,
-        test_load_hook=True,
-        strict_loading=True,
-        dynamic_shapes=dynamic_shapes,
-    )
+    if target_layout:
+        _ = run_test(
+            model,
+            x,
+            transform,
+            checker,
+            lambda num_p: num_p,
+            1e-3,  # atol
+            1e-3,  # rtol
+            True,  # test_load_hook
+            True,  # strict_loading
+            dynamic_shapes,  # dynamic_shapes
+            target_layout,
+        )
+    else:
+        _ = run_test(
+            model,
+            x,
+            transform,
+            checker,
+            lambda num_p: num_p,
+            1e-3,  # atol
+            1e-3,  # rtol
+            True,  # test_load_hook
+            True,  # strict_loading
+            dynamic_shapes,  # dynamic_shapes
+        )
