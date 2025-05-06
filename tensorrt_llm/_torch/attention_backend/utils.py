@@ -79,8 +79,7 @@ def create_attention(
 def create_context_chunk_mask(
     total_prompt_len: int,
     context_len: int,
-    attention_chunk_size: int,
-    device: torch.device,
+    attention_chunk_size: int = 8192,
 ) -> torch.Tensor:
     """
     Creates a chunked causal attention mask specifically for a context chunk.
@@ -99,7 +98,7 @@ def create_context_chunk_mask(
         device: The torch device to create the mask on.
 
     Returns:
-        A boolean tensor of shape (context_len, seq_len_max_for_padding)
+        A boolean tensor of shape (context_len, total_prompt_len)
         where True indicates attention is allowed from the query token (row)
         to the key token (column).
     """
@@ -108,13 +107,16 @@ def create_context_chunk_mask(
     # These are the last `context_len` indices of the total length.
     start_of_chunk = total_prompt_len - context_len
     # Rows correspond to query tokens in the current chunk
-    q_indices = torch.arange(start_of_chunk, total_prompt_len,
-                             device=device)  # Shape: [context_len]
+    q_indices = torch.arange(start_of_chunk,
+                             total_prompt_len,
+                             device=torch.device("cuda"),
+                             dtype=torch.int32)  # Shape: [context_len]
 
     # 2. Define the indices for all key tokens (the entire sequence processed so far)
     # Columns correspond to key tokens
     k_indices = torch.arange(total_prompt_len,
-                             device=device)  # Shape: [total_prompt_len]
+                             device=torch.device("cuda"),
+                             dtype=torch.int32)  # Shape: [total_prompt_len]
 
     # 3. Expand indices to compute pairwise relationships
     q_indices_expanded = q_indices.unsqueeze(1)  # Shape: [context_len, 1]
