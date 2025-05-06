@@ -37,6 +37,8 @@ class LookaheadAlgorithm
 public:
     using TensorPtr = runtime::ITensor::SharedPtr;
     using TensorConstPtr = runtime::ITensor::SharedConstPtr;
+    using SizeType32 = runtime::SizeType32;
+    using TokenIdType = runtime::TokenIdType;
 
     //! @brief Currently the resource management is to be aligned with batch manager.
     //! @param w, n, g is the Jacobi window, n-gram level and guess set size respectively.
