@@ -22,6 +22,7 @@ For more info about EAGLE, refer to [speculative decoding documentation](https:/
   * Inflight-fused-batching
   * C++ runtime
   * Tensor Parallel
+  * FP8 quantization with ModelOpt
 
 This example is based on the Vicuna-7b v1.3 model, a fine-tuned Llama. With some modifications, you can add EAGLE to other base models as well. Some TensorRT-LLM models might not work with EAGLE due to the missing head size in the speculative decoding XQA attention kernels.
 
@@ -187,4 +188,34 @@ mpirun -np 1 --allow-run-as-root --oversubscribe \
                            --eagle_dynamic_tree_max_top_k 10 \
                            --batch_size 1
 
+```
+
+### FP8 Post-training Quantization
+To get fp8 quantized model with eagle head quantized, run the following command:
+```bash
+python quantize.py --model_dir ./vicuna-7b-v1.3 \
+                    --eagle_model_dir ./EAGLE-Vicuna-7B-v1.3 \
+                    --output_dir ./hf_eagle_fp8_merged \
+                    --qformat fp8 \
+                    --kv_cache_dtype fp8 \
+                    --calib_size 512
+```
+Then, feed the quantized checkpoint to `convert_checkpoint.py` *without --eagle_model_dir* to build the fp8 quantized engine. The convert_checkpoint.py will automatically get the checkpoint from the quantized checkpoint directory.
+```bash
+python convert_checkpoint.py --model_dir ./hf_eagle_fp8_merged \
+                            --output_dir ./tllm_checkpoint_1gpu_eagle_fp8_engine \
+                            --dtype float16 \
+                            --tp_size 1 \
+                            --pp_size 1 \
+                            --num_eagle_layers 4 \
+                            --max_draft_len 63 \
+                            --max_non_leaves_per_layer 10
+```
+Build the engine:
+```bash
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_eagle_fp8 \
+             --output_dir ./tllm_checkpoint_1gpu_eagle_fp8_engine \
+             --gemm_plugin auto \
+             --speculative_decoding_mode eagle \
+             --max_batch_size 4
 ```
