@@ -834,8 +834,8 @@ class PyTorchModelEngine(ModelEngine):
                 model = AutoModelForCausalLM.from_config(config)
 
             model.to("cuda")
-            print(
-                f"Rank {self.mapping.rank} uses {get_rank_model_storage(model) / (1024**3):.2f} GB"
+            logger.info(
+                f"Rank {self.mapping.rank} uses {get_rank_model_storage(model) / (1024**3):.2f} GB for model weights."
             )
 
             if load_format == LoadFormat.AUTO:

@@ -728,10 +728,6 @@ class FusedMoE(nn.Module):
                                                      token_final_scales)
 
         x_sf = None
-        # if self.mapping.tp_rank == 0:
-        #     import remote_pdb;
-        #     import random
-        #     remote_pdb.set_trace(port=random.randint(10000, 65535))
         if self.has_any_quant:
             if self.has_fp8_qdq:
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
@@ -760,15 +756,12 @@ class FusedMoE(nn.Module):
         if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
         ) and not self.enable_alltoall:
             # Fp4 gemm has extra scaling factor
-            if self.has_nvfp4:
-                x_sf, token_selected_experts, token_final_scales = self.all_gather(
-                    [x_sf, token_selected_experts, token_final_scales])
-                if x_sf is not None:
-                    x_sf = reswizzle_sf(x_sf, x_row, x_col,
-                                        self.scaling_vector_size)
-            else:
-                token_selected_experts, token_final_scales = self.all_gather(
-                    [token_selected_experts, token_final_scales])
+            x_sf, token_selected_experts, token_final_scales = self.all_gather(
+                [x_sf, token_selected_experts, token_final_scales])
+            x = allgather(x, self.mapping, gather_dim=0)
+            if x_sf is not None:
+                x_sf = reswizzle_sf(x_sf, x_row, x_col,
+                                    self.scaling_vector_size)
 
             # llama4 token final scales are already multiplied with input x
             if not self.apply_router_weight_on_input:
@@ -776,7 +769,6 @@ class FusedMoE(nn.Module):
                                                                 1).contiguous()
             token_selected_experts = token_selected_experts.flatten(
                 0, 1).contiguous()
-            x = allgather(x, self.mapping, gather_dim=0)
 
         if self.smart_router and not min_latency_mode:
             ep_size = self.cluster_size

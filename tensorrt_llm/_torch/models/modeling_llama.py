@@ -695,9 +695,9 @@ class Llama4Model(DecoderModel):
         self.aux_stream = torch.cuda.Stream()
 
         if self.model_config.mapping.enable_attention_dp:
-            self.embed_tokens = nn.Embedding(config.vocab_size,
-                                             config.hidden_size,
-                                             dtype=config.torch_dtype)
+            self.embed_tokens = Embedding(config.vocab_size,
+                                          config.hidden_size,
+                                          dtype=config.torch_dtype)
         else:
             self.embed_tokens = Embedding(
                 config.vocab_size,
