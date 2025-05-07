@@ -373,7 +373,7 @@ class ReportUtility:
                 "gen_tps_percentiles":
                 self.statistics.generation_tp_percentiles.model_dump(
                     exclude_none=True, by_alias=True, mode='json') | {
-                        k: self.convert_to_ms(v)
+                        k: self.convert_rate_to_s(v)
                         for k, v in self.statistics.generation_tp_percentiles.
                         model_dump().items()
                     },
