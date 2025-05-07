@@ -466,8 +466,9 @@ class Llama4DecoderLayer(DecoderLayer):
             hidden_states,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.POST_MOE_FUSION or self.fusion_config.
-                POST_MLP_FUSION or self.mapping.tp_size == 1 or self.enable_attention_dp)),
+                self.fusion_config.POST_MOE_FUSION
+                or self.fusion_config.POST_MLP_FUSION
+                or self.mapping.tp_size == 1 or self.enable_attention_dp)),
             cutlass_min_latency_mode=cutlass_min_latency_mode,
         )
         if spec_metadata is not None:
