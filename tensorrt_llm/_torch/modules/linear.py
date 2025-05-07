@@ -162,6 +162,7 @@ class Linear(nn.Module):
         use_custom_cublas_mm: bool = False,
         use_llama4_qkv: bool = False,
         use_llama4_fc_swiglu_kernel: bool = False,
+        use_llama4_trtllm_gen: bool = False,
         previous_gate_up_proj: nn.Module = None,
     ):
         from ..distributed import AllReduce
@@ -210,6 +211,9 @@ class Linear(nn.Module):
         # Llama4 FC13+SwiGLU kernel has hard requirement of hidden_size = 5120
         # and targets output_features = 2048 or 4096.
         self.use_llama4_fc_swiglu_kernel = use_llama4_fc_swiglu_kernel and self.in_features == 5120 and (self.out_features == 2048 or self.out_features == 4096)
+        # This knob is for Llama4 FC2.
+        # local_in_features for FC2 is 1024, while global is 8192 (TP8)
+        self.use_llama4_trtllm_gen = use_llama4_trtllm_gen and (self.in_features == 8192 or self.in_features == 1024) and self.out_features == 5120
 
         self.combined_scale = torch.randn(1, dtype=torch.float32, device='cuda')
         if not skip_create_weights:
@@ -387,6 +391,15 @@ class Linear(nn.Module):
                         low_latency_kernel=True,
                         gated_silu=True,
                     )
+                elif self.use_llama4_trtllm_gen and input.shape[0] <= 8:
+                    output = torch.ops.trtllm.fp8_per_tensor_scaling_tllmg_gemm(
+                        qinput,
+                        weight,
+                        global_scale=self.combined_scale,
+                        out_dtype=torch.bfloat16,
+                        low_latency_kernel=True,
+                        gated_silu=False,
+                    )
                 else:
                     # This op does not support bias now.
                     output = torch.ops.trtllm.cublas_scaled_mm(
@@ -479,13 +492,19 @@ class Linear(nn.Module):
                         bias = None
                 else:
                     assert all_reduce_params is None or all_reduce_params.enable_allreduce is False, "Cannot fuse norm/residual/bias ops into allreduce op since we do not call allreduce op when tp_size is 1."
-                output = self.apply_linear(input, self.weight, bias)
+                if self.use_llama4_trtllm_gen and input.shape[0] <= 8 and bias is None:
+                    output = self.apply_linear(input, self.trtllm_gen_weight, bias)
+                else:
+                    output = self.apply_linear(input, self.weight, bias)
                 output = self.all_reduce(
                     output,
                     all_reduce_params=all_reduce_params,
                 )
             else:
-                output = self.apply_linear(input, self.weight, bias)
+                if self.use_llama4_trtllm_gen and input.shape[0] <= 8 and bias is None:
+                    output = self.apply_linear(input, self.trtllm_gen_weight, bias)
+                else:
+                    output = self.apply_linear(input, self.weight, bias)
         elif self.tp_mode == TensorParallelMode.COLUMN:
             if self.use_llama4_qkv and position_ids is not None:
                 output = self.apply_linear(input,
@@ -538,6 +557,11 @@ class Linear(nn.Module):
             weight = load_weight_shard(weights[0]['weight'], self.tp_size,
                                        self.tp_rank, self.tp_mode, device)
             copy(self.weight, weight)
+            if self.use_llama4_trtllm_gen:
+                # Shuffling is needed for low latency mode. Assuming always low latency mode for now.
+                # epilogue_tile_m is hardcoded as 128 for now.
+                epilogue_tile_m = 128
+                self.trtllm_gen_weight = shuffle_matrix_a(weight.view(torch.uint8), epilogue_tile_m).view(torch.float8_e4m3fn)
 
             if self.bias is not None:
                 bias = load_weight_shard(weights[0]['bias'], self.tp_size,
