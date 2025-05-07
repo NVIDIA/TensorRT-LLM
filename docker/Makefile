@@ -107,7 +107,15 @@ endef
 
 DOCKER_RUN_OPTS   ?= --rm -it --ipc=host --ulimit memlock=-1 --ulimit stack=67108864
 DOCKER_RUN_ARGS   ?=
-GPU_OPTS          ?= --gpus=all
+# Check if NVIDIA_VISIBLE_DEVICES is set and not empty
+NVIDIA_VISIBLE_DEVICES_VAL = $(shell echo $$NVIDIA_VISIBLE_DEVICES)
+ifeq ($(NVIDIA_VISIBLE_DEVICES_VAL),)
+  # If empty or not set, use all GPUs
+  GPU_OPTS ?= --gpus=all
+else
+  # If set, use the specified devices
+  GPU_OPTS ?= --gpus='"device=$(NVIDIA_VISIBLE_DEVICES_VAL)"'
+endif
 SOURCE_DIR        ?= $(shell readlink -f ..)
 CODE_DIR          ?= /code/tensorrt_llm
 CCACHE_DIR        ?= ${CODE_DIR}/cpp/.ccache
