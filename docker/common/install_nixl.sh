@@ -12,15 +12,15 @@ if [ ! -d ${UCX_INSTALL_PATH} ]; then
   ./autogen.sh
   ./contrib/configure-release --prefix=${UCX_INSTALL_PATH}
   make install -j
+  cd ..
   echo "export LD_LIBRARY_PATH=${UCX_INSTALL_PATH}/lib:\$LD_LIBRARY_PATH" >> "${ENV}"
 fi
 
-NIXL_VERSION="0.1.0"
+NIXL_VERSION="0.2.0"
 NIXL_REPO="${GITHUB_URL}/ai-dynamo/nixl.git"
 
 ARCH_NAME="x86_64-linux-gnu"
 if [ "$(uname -m)" != "amd64" ] && [ "$(uname -m)" != "x86_64" ]; then
-  EXTRA_NIXL_ARGS="-Ddisable_gds_backend=true"
   ARCH_NAME="aarch64-linux-gnu"
 fi
 
