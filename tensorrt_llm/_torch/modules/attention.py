@@ -156,8 +156,9 @@ class Attention(nn.Module):
         # which could be modified after __init__
         self.attn.update_quant_config(self.quant_config)
 
-    def split_qkv(self, qkv):
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+    def split_qkv(self, q, k=None, v=None):
+        if k is None and v is None:
+            q, k, v = q.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         return q, k, v
 
     def convert_qkv(self, q, k, v):
@@ -195,10 +196,10 @@ class Attention(nn.Module):
 
         q, k, v = qkv, None, None
         if self.qk_norm_type == QkNormType.pre_rope:
-            q, k, v = self.split_qkv(qkv)
+            q, k, v = self.split_qkv(q, k, v)
             q, k = self.apply_qk_norm(q, k)
         if self.apply_rotary_emb and position_ids is not None:
-            q, k, v = self.split_qkv(qkv)
+            q, k, v = self.split_qkv(q, k, v)
             q, k = self.rotary_emb(position_ids, [q, k])
             if self.qk_norm_type == QkNormType.post_rope:
                 q, k = self.apply_qk_norm(q, k)
