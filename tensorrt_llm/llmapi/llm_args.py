@@ -19,6 +19,8 @@ from ..auto_parallel import AutoParallelConfig, infer_cluster_config
 # yapf: disable
 from ..bindings.executor import BatchingType as _BatchingType
 from ..bindings.executor import \
+    CacheTransceiverConfig as _CacheTransceiverConfig
+from ..bindings.executor import \
     CapacitySchedulerPolicy as _CapacitySchedulerPolicy
 from ..bindings.executor import ContextChunkingPolicy as _ContextChunkingPolicy
 from ..bindings.executor import DecodingConfig, DecodingMode
@@ -235,6 +237,9 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
 class MTPDecodingConfig(DecodingBaseConfig):
     num_nextn_predict_layers: Optional[int] = 1
+    use_relaxed_acceptance_for_thinking: Optional[bool] = False
+    relaxed_topk: Optional[int] = 1
+    relaxed_delta: Optional[float] = 0.
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -640,6 +645,19 @@ class ExtendedRuntimePerfKnobConfig(BaseModel, PybindMirror):
         return res
 
 
+@PybindMirror.mirror_pybind_fields(_CacheTransceiverConfig)
+class CacheTransceiverConfig(BaseModel, PybindMirror):
+    """
+    Configuration for the cache transceiver.
+    """
+    max_num_tokens: Optional[int] = Field(
+        default=None,
+        description="The max number of tokens the transfer buffer can fit.")
+
+    def _to_pybind(self):
+        return _CacheTransceiverConfig(max_num_tokens=self.max_num_tokens)
+
+
 @dataclass
 class _ModelWrapper:
     model: Union[str, Path]
@@ -846,6 +864,9 @@ class LlmArgs(BaseModel):
     scheduler_config: Optional[SchedulerConfig] = Field(
         default=None, description="Scheduler config.")
 
+    cache_transceiver_config: Optional[CacheTransceiverConfig] = Field(
+        default=None, description="Cache transceiver config.")
+
     # Speculative decoding parameters
     speculative_config: Optional[Union[
         LookaheadDecodingConfig, MedusaDecodingConfig, EagleDecodingConfig,
@@ -899,6 +920,11 @@ class LlmArgs(BaseModel):
         default=None,
         description="The postprocess tokenizer directory.",
         alias="_postprocess_tokenizer_dir")
+
+    reasoning_parser: Optional[str] = Field(
+        default=None,
+        description="The parser to separate reasoning content from output.",
+        alias="_reasoning_parser")
 
     # TODO[Superjomn]: To deprecate this config.
     decoding_config: Optional[object] = Field(
@@ -1181,7 +1207,11 @@ class LlmArgs(BaseModel):
                 self.speculative_config = MTPConfig(
                     num_nextn_predict_layers=self.speculative_config.
                     num_nextn_predict_layers,
-                    max_batch_size=self.build_config.max_batch_size)
+                    max_batch_size=self.build_config.max_batch_size,
+                    use_relaxed_acceptance_for_thinking=self.speculative_config.
+                    use_relaxed_acceptance_for_thinking,
+                    relaxed_topk=self.speculative_config.relaxed_topk,
+                    relaxed_delta=self.speculative_config.relaxed_delta)
             else:
                 raise ValueError(
                     f"Speculative config type not recognized: {self.speculative_config}"
@@ -1327,6 +1357,7 @@ def update_llm_args_with_extra_dict(
         "batching_type": BatchingType,
         "extended_runtime_perf_knob_config": ExtendedRuntimePerfKnobConfig,
         "pytorch_backend_config": PyTorchConfig,
+        "cache_transceiver_config": CacheTransceiverConfig,
     }
     for field, field_type in field_mapping.items():
         if field in llm_args_dict:

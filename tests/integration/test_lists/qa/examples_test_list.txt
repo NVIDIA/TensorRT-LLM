@@ -421,21 +421,21 @@ accuracy/test_llm_api.py::TestQwen2_5_7BInstruct::test_fp8
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4
+accuracy/test_llm_api_pytorch.py::TestMistral7B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_fp8_tp2
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_nvfp4_tp2
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[]
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[-]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[-]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[]
-accuracy/test_llm_api_pytorch.py::TestMistral7B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestMinitron4BBaseInstruct::test_fp8_prequantized
 accuracy/test_llm_api_pytorch.py::TestNemotronNas::test_auto_dtype_tp8
 accuracy/test_llm_api_pytorch.py::TestQwen2_7BInstruct::test_auto_dtype
-accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[tp8-cuda_graph-overlap_scheduler]
-accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[tp8-mtp_nextn=2-cuda_graph-overlap_scheduler]
-accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[tp8ep4-cuda_graph-overlap_scheduler]
-accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[tp8ep4-mtp_nextn=2-cuda_graph-overlap_scheduler]
-accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[tp8ep8-cuda_graph-overlap_scheduler]
-accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[tp8ep8-mtp_nextn=2-cuda_graph-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[tp8---cuda_graph-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[tp8-mtp_nextn=2--cuda_graph-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[tp8ep4---cuda_graph-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[tp8ep4-mtp_nextn=2--cuda_graph-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[tp8ep8---cuda_graph-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[tp8ep8-mtp_nextn=2--cuda_graph-overlap_scheduler]
 
 test_e2e.py::test_benchmark_sanity[bert_base] # 127.18s
 test_e2e.py::test_benchmark_sanity[gpt_350m] # 64.06s
@@ -445,17 +445,17 @@ test_e2e.py::test_benchmark_sanity[roberta_base]
 test_e2e.py::test_benchmark_sanity[t5_base]
 test_e2e.py::test_benchmark_sanity_enable_fp8[gpt_350m]
 test_e2e.py::test_benchmark_sanity_enable_fp8[llama_7b]
-test_e2e.py::test_llama_e2e[use_cpp_session-remove_input_padding]
-test_e2e.py::test_llama_e2e[use_py_session-remove_input_padding]
-test_e2e.py::test_llama_e2e[use_py_session]
-test_e2e.py::test_llmapi_load_engine_from_build_command[llama-codellama/CodeLlama-7b-Instruct-hf] # 5min
-test_e2e.py::test_llmapi_load_engine_from_build_command[llama-llama-models/llama-7b-hf] # 5min
-test_e2e.py::test_mistral_e2e[use_cpp_session-remove_input_padding]
-test_e2e.py::test_mistral_e2e[use_py_session-remove_input_padding]
-test_e2e.py::test_mistral_e2e[use_py_session]
+test_e2e.py::test_llama_e2e[use_cpp_session-remove_input_padding-]
+test_e2e.py::test_llama_e2e[use_py_session-remove_input_padding-]
+test_e2e.py::test_llama_e2e[use_py_session--]
+llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command[llama-codellama/CodeLlama-7b-Instruct-hf] # 5min
+llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command[llama-llama-models/llama-7b-hf] # 5min
+test_e2e.py::test_mistral_e2e[use_cpp_session-remove_input_padding--]
+test_e2e.py::test_mistral_e2e[use_py_session-remove_input_padding--]
+test_e2e.py::test_mistral_e2e[use_py_session---]
 test_e2e.py::test_openai_multi_chat_example
 test_e2e.py::test_openai_consistent_chat
-test_e2e.py::test_llmapi_server_example
+llmapi/test_llm_examples.py::test_llmapi_server_example
 # Pivot to Pytorch test cases.
 test_e2e.py::test_ptp_quickstart
 test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
@@ -470,6 +470,7 @@ test_e2e.py::test_ptp_quickstart_advanced_8gpus[Mixtral-8x7B-BF16-Mixtral-8x7B-v
 test_e2e.py::test_ptp_quickstart_advanced_8gpus[Mixtral-8x7B-NVFP4-nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1]
 test_e2e.py::test_ptp_quickstart_advanced_8gpus[Nemotron-Ultra-253B-nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1]
 test_e2e.py::test_ptp_quickstart_advanced_deepseek_r1_8gpus[DeepSeek-R1-DeepSeek-R1/DeepSeek-R1]
+test_e2e.py::test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus[DeepSeek-R1-DeepSeek-R1/DeepSeek-R1]
 test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-image]
 test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-video]
 test_e2e.py::test_ptp_quickstart_multimodal[llava-v1.6-mistral-7b-llava-v1.6-mistral-7b-hf-image]

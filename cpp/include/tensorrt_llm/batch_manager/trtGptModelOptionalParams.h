@@ -53,6 +53,7 @@ public:
         std::optional<executor::GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         bool isLeaderInOrchMode = false,
         std::optional<std::vector<executor::AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
+        std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
         bool gatherGenerationLogits = false, bool promptTableOffloading = false)
         : kvCacheConfig{std::move(kvCacheConfig)}
         , enableTrtOverlap{enableTrtOverlap}
@@ -74,6 +75,7 @@ public:
         , guidedDecodingConfig{std::move(guidedDecodingConfig)}
         , isLeaderInOrchMode{isLeaderInOrchMode}
         , additionalModelOutputs{std::move(additionalModelOutputs)}
+        , cacheTransceiverConfig{std::move(cacheTransceiverConfig)}
         , gatherGenerationLogits{gatherGenerationLogits}
         , promptTableOffloading{promptTableOffloading}
     {
@@ -84,7 +86,8 @@ public:
     }
 
     explicit TrtGptModelOptionalParams(executor::ExecutorConfig const& executorConfig, bool isLeaderInOrchMode)
-        : TrtGptModelOptionalParams(KvCacheConfig(executorConfig.getKvCacheConfig()), false,
+        : TrtGptModelOptionalParams(KvCacheConfig(executorConfig.getKvCacheConfig()),
+            executorConfig.getEnableTrtOverlap(),
             executorConfig.getParallelConfig().value_or(executor::ParallelConfig()).getDeviceIds(),
             executorConfig.getNormalizeLogProbs(), executorConfig.getEnableChunkedContext(),
             PeftCacheManagerConfig(executorConfig.getPeftCacheConfig().value_or(executor::PeftCacheConfig())),
@@ -94,7 +97,8 @@ public:
             executorConfig.getSchedulerConfig(), executorConfig.getExtendedRuntimePerfKnobConfig(),
             executorConfig.getDebugConfig(), executorConfig.getMaxSeqIdleMicroseconds(),
             executorConfig.getSpecDecConfig(), executorConfig.getGuidedDecodingConfig(), isLeaderInOrchMode,
-            executorConfig.getAdditionalModelOutputs(), executorConfig.getGatherGenerationLogits())
+            executorConfig.getAdditionalModelOutputs(), executorConfig.getCacheTransceiverConfig(),
+            executorConfig.getGatherGenerationLogits(), executorConfig.getPromptTableOffloading())
     {
     }
 
@@ -125,6 +129,7 @@ public:
     // This rank is the leader worker in orchestrator mode
     bool isLeaderInOrchMode;
     std::optional<std::vector<executor::AdditionalModelOutput>> additionalModelOutputs;
+    std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig;
     bool gatherGenerationLogits;
     // Whether to offload the prompt table to CPU and prefetching to GPU
     bool promptTableOffloading;

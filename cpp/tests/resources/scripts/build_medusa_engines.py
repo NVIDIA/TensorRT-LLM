@@ -19,12 +19,10 @@ import pathlib as _pl
 import platform as _pf
 import sys as _sys
 
-from build_engines_utils import init_model_spec_module, run_command, wincopy
-
-init_model_spec_module()
-import model_spec
+from build_engines_utils import run_command, wincopy
 
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.bindings.internal.testing import ModelSpec
 
 
 def build_engine(base_model_dir: _pl.Path, medusa_model_dir: _pl.Path,
@@ -94,7 +92,7 @@ def build_engines(model_cache: str):
 
     engine_dir = models_dir / 'rt_engine' / model_name
 
-    model_spec_obj = model_spec.ModelSpec('input_tokens.npy', _tb.DataType.HALF)
+    model_spec_obj = ModelSpec('input_tokens.npy', _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.use_packed_input()

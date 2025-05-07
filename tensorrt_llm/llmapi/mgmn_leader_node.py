@@ -22,7 +22,7 @@ def launch_server_main(sub_comm=None):
         f"MPI Comm Server started at {get_spawn_proxy_process_ipc_addr_env()}")
     server.serve()
 
-    print_colored_debug("MPI Comm Server stopped")
+    print_colored_debug("RemoteMpiCommSessionServer stopped\n", "yellow")
 
 
 if __name__ == '__main__':

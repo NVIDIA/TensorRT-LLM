@@ -200,6 +200,71 @@ std::tuple<th::Tensor, th::Tensor> mtp_update_hidden_states_op(th::Tensor& input
     return std::make_tuple(mtpPastHiddenStatesPtrs, mtpPastTokensPtrs);
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+std::tuple<th::Tensor, th::Tensor> mtp_relaxed_acceptance_op(th::Tensor& reqSlotIds, th::Tensor& topKValue,
+    th::Tensor& topKIndices, th::Tensor& draftTokens, th::Tensor& mtpRelaxedDelta, th::Tensor& numAcceptedTokens,
+    th::Tensor& acceptedTokens, int64_t const numMTPModules, int64_t const batchSize, int64_t const numContextRequest,
+    int64_t const relaxedTopK, double const relaxedDelta, int64_t const beginThinkingTokens,
+    int64_t const endThinkingTokens)
+{
+    auto dataType = topKValue.scalar_type();
+
+    // Check
+    auto numGenerationRequest = batchSize - numContextRequest;
+
+    auto topKValueSizes = topKValue.sizes();
+    TLLM_CHECK(topKValueSizes[0] == numGenerationRequest);
+    TLLM_CHECK(topKValueSizes[1] == numMTPModules + 1);
+    TLLM_CHECK(topKValueSizes[2] == relaxedTopK);
+
+    auto draftTokensSizes = draftTokens.sizes();
+    TLLM_CHECK(draftTokensSizes[0] == numGenerationRequest);
+
+    auto numAcceptedTokensSize = numAcceptedTokens.sizes();
+    TLLM_CHECK(numAcceptedTokensSize[0] == batchSize);
+
+    auto stream = at::cuda::getCurrentCUDAStream(numAcceptedTokens.get_device());
+
+    // Fill params
+    tk::MTPRelaxedAcceptanceParam params;
+    params.numMTPModules = numMTPModules;
+    params.batchSize = batchSize;
+    params.numContextRequest = numContextRequest;
+    params.relaxedTopK = relaxedTopK;
+    params.relaxedDelta = (float) relaxedDelta;
+    params.beginThinkingTokens = beginThinkingTokens;
+    params.endThinkingTokens = endThinkingTokens;
+    params.reqSlotIds = reinterpret_cast<int*>(reqSlotIds.data_ptr());
+    params.topKValue = reinterpret_cast<void*>(topKValue.data_ptr());
+    params.topKIndices = reinterpret_cast<int64_t*>(topKIndices.data_ptr());
+    params.draftTokens = reinterpret_cast<int*>(draftTokens.data_ptr());
+    params.mtpRelaxedDelta = reinterpret_cast<float*>(mtpRelaxedDelta.data_ptr());
+    params.numAcceptedTokens = reinterpret_cast<int*>(numAcceptedTokens.data_ptr());
+    params.acceptedTokens = reinterpret_cast<int*>(acceptedTokens.data_ptr());
+
+    switch (dataType)
+    {
+    case torch::kFloat16:
+        // Handle Float16
+        tk::invokeMTPRelaxedAcceptance<half>(params, stream);
+        break;
+    case torch::kFloat32:
+        // Handle Float32
+        tk::invokeMTPRelaxedAcceptance<float>(params, stream);
+        break;
+    case torch::kBFloat16:
+        // Handle BFloat16
+        tk::invokeMTPRelaxedAcceptance<__nv_bfloat16>(params, stream);
+        break;
+    default:
+        // Handle other data types
+        throw std::invalid_argument("Invalid dtype, only supports float16, float32, and bfloat16");
+        break;
+    }
+
+    return std::make_tuple(acceptedTokens, numAcceptedTokens);
+}
+
 } // end namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -245,4 +310,20 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("mtp_update_hidden_states_op", &torch_ext::mtp_update_hidden_states_op);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def(
+        "mtp_relaxed_acceptance_op(Tensor reqSlotIds, Tensor topKValue, Tensor topKIndices, Tensor draftTokens, "
+        "Tensor mtpRelaxedDelta, Tensor numAcceptedTokens, Tensor acceptedTokens, "
+        "int numMTPModules, int batchSize, int numContextRequest, int relaxedTopK, "
+        "float relaxedDelta, int beginThinkingTokens, int endThinkingTokens) -> (Tensor, Tensor)");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+{
+    m.impl("mtp_relaxed_acceptance_op", &torch_ext::mtp_relaxed_acceptance_op);
 }

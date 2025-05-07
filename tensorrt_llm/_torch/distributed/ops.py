@@ -14,12 +14,14 @@ _thread_local = threading.local()
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
     if not hasattr(_thread_local, 'allreduce_workspaces'):
-        _thread_local.allreduce_workspaces = {}
-    allreduce_workspaces = _thread_local.allreduce_workspaces
+        _thread_local.allreduce_workspaces = [{}
+                                              for _ in range(mapping.pp_size)]
+    allreduce_workspaces = _thread_local.allreduce_workspaces[mapping.pp_rank]
     if mapping not in allreduce_workspaces:
         ipc_buffers, workspace = CustomAllReduceHelper.allocate_allreduce_fusion_workspace(
             mapping,
-            CustomAllReduceHelper.max_workspace_size_auto(mapping.tp_size),
+            CustomAllReduceHelper.max_workspace_size_auto(
+                mapping.tp_size, support_deterministic=False),
         )
         allreduce_workspaces[mapping] = (ipc_buffers, workspace)
     return allreduce_workspaces[mapping][1]
@@ -131,15 +133,75 @@ class AllReduce(nn.Module):
                     - RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
 
                 - AUTO: AUTO chooses between NCCL and MIN_LATENCY mode based on a heuristic policy.
+
+        Note:
+            For the reference implementation for each pattern, please refer to the following unit test:
+            https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/unittest/_torch/multi_gpu/test_allreduce.py
         """
 
         self.mapping = mapping
         self.workspace = None
         self.strategy = strategy
+        self.max_workspace_size = CustomAllReduceHelper.max_workspace_size_auto(
+            self.mapping.tp_size, support_deterministic=False)
+
+        self.fallback_func_mapping = {
+            AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8:
+            self.fallback_residual_rms_norm_quant_fp8,
+            AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
+            self.fallback_residual_rms_norm_out_quant_fp8,
+            AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
+            self.fallback_residual_rms_norm_quant_nvfp4,
+            AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
+            self.fallback_residual_rms_norm_out_quant_nvfp4,
+        }
+
         if self.mapping.tp_size > 1:
             # When Strategy is UB, it is guaranteed that the workspace is not used.
             if self.strategy != AllReduceStrategy.UB:
                 self.workspace = get_allreduce_workspace(self.mapping)
+
+    @staticmethod
+    def fallback_residual_rms_norm_quant_fp8(
+        output: Tuple[torch.Tensor, ...],
+        all_reduce_params: AllReduceParams,
+    ):
+        norm_out, residual_out = output
+        quant_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+            norm_out, all_reduce_params.scale)
+        return quant_fp8, residual_out
+
+    @staticmethod
+    def fallback_residual_rms_norm_out_quant_fp8(
+        output: Tuple[torch.Tensor, ...],
+        all_reduce_params: AllReduceParams,
+    ):
+        norm_out, residual_out = output
+        quant_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+            norm_out, all_reduce_params.scale)
+        return norm_out, quant_fp8, residual_out
+
+    @staticmethod
+    def fallback_residual_rms_norm_quant_nvfp4(
+        output: Tuple[torch.Tensor, ...],
+        all_reduce_params: AllReduceParams,
+    ):
+        norm_out, residual_out = output
+        quant_fp4, scale_factor = torch.ops.trtllm.fp4_quantize(
+            norm_out, all_reduce_params.scale, 16, False)
+
+        return quant_fp4, scale_factor, residual_out
+
+    @staticmethod
+    def fallback_residual_rms_norm_out_quant_nvfp4(
+        output: Tuple[torch.Tensor, ...],
+        all_reduce_params: AllReduceParams,
+    ):
+        norm_out, residual_out = output
+        quant_fp4, scale_factor = torch.ops.trtllm.fp4_quantize(
+            norm_out, all_reduce_params.scale, 16, False)
+
+        return norm_out, quant_fp4, scale_factor, residual_out
 
     def forward(
         self,
@@ -179,6 +241,16 @@ class AllReduce(nn.Module):
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
+        strategy = self.strategy
+        fusion_op = all_reduce_params.fusion_op
+
+        # If the input size is larger than the max workspace size, fallback to NCCL strategy
+        if input.numel() > self.max_workspace_size \
+            and all_reduce_params.fusion_op != AllReduceFusionOp.NONE \
+            and all_reduce_params.fusion_op != AllReduceFusionOp.RESIDUAL_RMS_NORM:
+            strategy = AllReduceStrategy.NCCL
+            fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+
         output = torch.ops.trtllm.allreduce(
             input=input,
             residual=all_reduce_params.residual,
@@ -187,12 +259,79 @@ class AllReduce(nn.Module):
             bias=all_reduce_params.bias,
             workspace=self.workspace,
             group=self.mapping.tp_group,
-            strategy=self.strategy,
-            op=all_reduce_params.fusion_op,
+            strategy=strategy,
+            op=fusion_op,
             eps=all_reduce_params.eps,
         )
 
+        if input.numel() > self.max_workspace_size \
+            and all_reduce_params.fusion_op != AllReduceFusionOp.NONE \
+            and all_reduce_params.fusion_op != AllReduceFusionOp.RESIDUAL_RMS_NORM:
+            output = self.fallback_func_mapping[all_reduce_params.fusion_op](
+                output, all_reduce_params)
+
         return output if len(output) > 1 else output[0]
+
+
+class MoEAllReduce(nn.Module):
+
+    def __init__(self, mapping: Mapping):
+        """
+        MoEAllReduce is a module that performs a specific fused MoE reduction
+        followed by a regular AR + RMS norm.
+
+        Args:
+            mapping (Mapping):  The parallel mapping config.
+
+        Notes:
+            Support pattern: MoE Reduction + Add + AR + ADD_RMS, see this torch reference implementation:
+            expert_reduction = torch.sum(active_experts_token_input *
+                                        scale.unsqueeze(-1),
+                                        dim=0)
+            output_add = expert_reduction + shared_expert_output
+            output_residual = output_add + residual
+            output_hidden_states = rms_norm(output_residual, norm_weight, eps)
+        """
+        super().__init__()
+        self.mapping = mapping
+        self.workspace = get_allreduce_workspace(self.mapping)
+
+    def forward(
+        self,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        device_num_experts: torch.Tensor,
+        scale_input: torch.Tensor,
+        active_experts_token_input: torch.Tensor,
+        token_input: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        """
+        Args:
+            residual: residual tensor
+            norm_weight: RMS norm weight
+            device_num_experts: number of experts per device
+            scale_input: experts to token score
+            active_experts_token_input: per token per expert input
+            token_input: per token input, shared expert output
+            eps: epsilon for RMSNorm
+
+        Output:
+            hidden_states: hidden_states of the model
+            residual: residual tensor
+        """
+        return torch.ops.trtllm.moe_allreduce(
+            residual=residual,
+            norm_weight=norm_weight,
+            device_num_experts=device_num_experts,
+            scale_input=scale_input,
+            active_experts_token_input=active_experts_token_input,
+            token_input=token_input,
+            workspace=self.workspace,
+            rank=self.mapping.tp_rank,
+            nranks=self.mapping.tp_size,
+            eps=eps,
+        )
 
 
 class DeepseekAllReduce(nn.Module):

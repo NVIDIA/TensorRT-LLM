@@ -1,4 +1,5 @@
 import math
+import os
 import random
 from collections.abc import Iterable
 
@@ -6,20 +7,18 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._utils import (mpi_broadcast, str_dtype_to_binding,
-                                 torch_dtype_to_str)
+from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, load_torch_hf_lora
 from tensorrt_llm.mapping import Mapping
 
-from ..speculative import (get_num_spec_layers, get_spec_decoder,
-                           get_spec_resource_manager)
+from ..speculative import get_num_spec_layers, get_spec_decoder
 from .decoder import (EarlyStopDecoder, TorchDecoder, TorchStarAttentionDecoder,
                       TRTLLMDecoder)
-from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
-from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
-                           PyTorchModelEngine)
+from .kv_cache_transceiver import (AttentionTypeCpp, CacheTransBufferManager,
+                                   create_kv_cache_transceiver)
+from .model_engine import KV_CACHE_MANAGER_KEY, PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
                                PeftCacheManager, ResourceManager)
@@ -69,8 +68,11 @@ def get_cache_size_per_token(model_config, mapping):
         head_dim = config.kv_lora_rank + config.qk_rope_head_dim
         kv_factor = 1
     else:
-        head_dim = (config.hidden_size * num_key_value_heads /
-                    config.num_attention_heads / tp_size)
+        head_dim = getattr(
+            config,
+            "head_dim",
+            config.hidden_size // config.num_attention_heads,
+        ) * num_key_value_heads // tp_size
 
     num_hidden_layers = len(mapping.pp_layers(config.num_hidden_layers))
     mem_per_token *= num_hidden_layers * head_dim
@@ -147,6 +149,29 @@ def get_token_num_for_estimation(executor_config, model_config):
         return None
 
 
+def get_cache_transceiver_prealloc_size(executor_config: ExecutorConfig,
+                                        model_config: PyTorchModelEngine,
+                                        mapping: Mapping):
+    if (os.getenv("TRTLLM_USE_MPI_KVCACHE")
+            or os.getenv("TRTLLM_USE_UCX_KVCACHE")):
+        kv_size_per_token = int(get_cache_size_per_token(model_config, mapping))
+        logger.info(
+            f"get_cache_transceiver_prealloc_size kv_size_per_token: {kv_size_per_token} , executor_config.cache_transceiver_config: {executor_config.cache_transceiver_config}"
+        )
+        if executor_config.cache_transceiver_config is not None:
+            logger.info(
+                f"get_cache_transceiver_prealloc_size executor_config.cache_transceiver_config.max_num_tokens: {executor_config.cache_transceiver_config.max_num_tokens}"
+            )
+            return CacheTransBufferManager.pre_alloc_buffer_size(
+                executor_config.cache_transceiver_config.max_num_tokens,
+                kv_size_per_token)
+        else:
+            return CacheTransBufferManager.pre_alloc_buffer_size(
+                None, kv_size_per_token)
+    else:
+        return 0
+
+
 def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
                                  model_engine: PyTorchModelEngine,
                                  executor_config: ExecutorConfig,
@@ -180,10 +205,10 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
             py_executor.decoder) == TRTLLMDecoder else origin_seq_len
         req = create_dummy_context_requests(max_num_tokens, seq_len, vocab_size)
         req_ids = py_executor.enqueue_requests(req)
-    req_ids = mpi_broadcast(req_ids, root=0)
+    req_ids = py_executor.dist.broadcast(req_ids, root=0)
+    py_executor.is_warmup = True
     py_executor.start_worker()
     py_executor.await_responses(req_ids)
-    # TODO check why call mpi_barrier() here will hang-on, but call mpi_allgather(0) is fine.
 
     torch_peak_memory = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
 
@@ -194,7 +219,12 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     total_used_bytes = total_gpu_memory - end
     activation_bytes = torch_peak_memory - model_bytes
     extra_cost = max(total_used_bytes - torch_used_bytes, 0)
-    peak_memory = torch_peak_memory + extra_cost
+    kv_cache_transceiver_prealloc_size = get_cache_transceiver_prealloc_size(
+        executor_config, model_engine.model.model_config, mapping)
+    logger.info(
+        f"kv_cache_transceiver_prealloc_size: {kv_cache_transceiver_prealloc_size}"
+    )
+    peak_memory = torch_peak_memory + extra_cost + kv_cache_transceiver_prealloc_size
     logger.info(
         f"Memory dynamically allocated during inference (inside torch) in memory usage profiling: {activation_bytes / (GB):.2f} GiB"
     )
@@ -220,6 +250,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     py_executor.resource_manager.resource_managers.get(
         "kv_cache_manager").shutdown()
 
+    py_executor.is_warmup = False
     if py_executor.dist.mapping.rank == 0:
         py_executor.shutdown()
 
@@ -237,7 +268,8 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
         num_attention_heads = config.num_attention_heads
         num_key_value_heads = getattr(config, 'num_key_value_heads',
                                       num_attention_heads)
-        head_dim = hidden_size // num_attention_heads
+        head_dim = getattr(config, "head_dim",
+                           hidden_size // num_attention_heads)
 
         if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
         ):
@@ -317,8 +349,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
 
 
 def create_py_executor_instance(dist,
-                                kv_cache_manager,
-                                draft_kv_cache_manager,
+                                resources,
                                 mapping,
                                 pytorch_backend_config,
                                 executor_config,
@@ -326,33 +357,16 @@ def create_py_executor_instance(dist,
                                 model_engine,
                                 draft_model_engine,
                                 start_worker,
+                                decoder,
                                 lora_config: LoraConfig = None):
+    kv_cache_manager = resources.get(KV_CACHE_MANAGER_KEY, None)
+
     spec_config = model_engine.spec_config
-    resources = {
-        KV_CACHE_MANAGER_KEY: kv_cache_manager
-    } if kv_cache_manager is not None else {}
-
-    if draft_kv_cache_manager is not None:
-        resources[DRAFT_KV_CACHE_MANAGER_KEY] = draft_kv_cache_manager
-
-    if spec_config is not None:
-        spec_resource_manager = get_spec_resource_manager(
-            spec_config, model_engine.model.config, model_engine.batch_size * 2)
-        spec_decoder = get_spec_decoder(max_seq_len=model_engine.max_seq_len,
-                                        spec_config=spec_config)
-        if spec_resource_manager is not None:
-            resources["spec_resource_manager"] = spec_resource_manager
-    else:
-        spec_decoder = None
-
     if mapping.is_last_pp_rank(
     ) and executor_config.guided_decoding_config is not None:
         if spec_config is not None:
             raise ValueError(
                 "Guided decoding is not supported with speculative decoding.")
-
-    resources["seq_slot_manager"] = SeqSlotManager(
-        executor_config.max_batch_size)
 
     logger.info(
         f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}"
@@ -400,6 +414,13 @@ def create_py_executor_instance(dist,
             lora_config.lora_target_modules,
             lora_config.trtllm_modules_to_hf_modules)
 
+    num_micro_batches = 1
+    if mapping.has_pp:
+        num_micro_batches = mapping.pp_size + pytorch_backend_config.enable_overlap_scheduler
+
+    resources["seq_slot_manager"] = SeqSlotManager(
+        executor_config.max_batch_size * num_micro_batches)
+
     resource_manager = ResourceManager(resources)
 
     # Make sure the kv cache manager is always invoked last as it could
@@ -407,10 +428,6 @@ def create_py_executor_instance(dist,
     if kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end("kv_cache_manager",
                                                        last=True)
-
-    num_micro_batches = 1
-    if mapping.has_pp:
-        num_micro_batches = mapping.pp_size + pytorch_backend_config.enable_overlap_scheduler
 
     capacity_scheduler = BindCapacityScheduler(
         executor_config.max_batch_size,
@@ -425,12 +442,9 @@ def create_py_executor_instance(dist,
     config = model_engine.model.model_config.pretrained_config
     attention_type = AttentionTypeCpp.MLA if is_mla(
         config) else AttentionTypeCpp.DEFAULT
-    kv_cache_transceiver = create_kv_cache_transceiver(mapping,
-                                                       kv_cache_manager,
-                                                       attention_type)
-
-    decoder = instantiate_decoder(model_engine, executor_config, spec_decoder,
-                                  pytorch_backend_config, mapping)
+    cache_transceiver_config = executor_config.cache_transceiver_config
+    kv_cache_transceiver = create_kv_cache_transceiver(
+        mapping, kv_cache_manager, attention_type, cache_transceiver_config)
 
     return PyExecutor(resource_manager,
                       scheduler,
@@ -447,19 +461,20 @@ def create_py_executor_instance(dist,
                       start_worker=start_worker)
 
 
-def instantiate_decoder(model_engine, executor_config, spec_decoder,
-                        pytorch_backend_config, mapping):
+def instantiate_decoder(model_engine, executor_config, pytorch_backend_config,
+                        mapping):
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         decoder = TorchStarAttentionDecoder(
             max_seq_len=model_engine.max_seq_len)
-    elif spec_decoder is not None:
-        decoder = spec_decoder
+    elif model_engine.spec_config is not None:
+        decoder = get_spec_decoder(max_seq_len=model_engine.max_seq_len,
+                                   spec_config=model_engine.spec_config)
     elif pytorch_backend_config.enable_trtllm_decoder:
-        decoding_mode = executor_config.decoding_config.decoding_mode if executor_config.decoding_config and executor_config.decoding_config.decoding_mode else DecodingMode.TopK(
-        )
+        decoding_mode = get_decoding_mode(executor_config)
         decoder = TRTLLMDecoder(executor_config, model_engine.model,
-                                model_engine.dtype, mapping, decoding_mode)
+                                model_engine.dtype, mapping, decoding_mode,
+                                pytorch_backend_config.enable_overlap_scheduler)
     elif not model_engine.model.model_config.is_generation:
         # NOTE: choose decoder based on model type
         decoder = EarlyStopDecoder()
@@ -468,3 +483,110 @@ def instantiate_decoder(model_engine, executor_config, spec_decoder,
             max_seq_len=model_engine.max_seq_len,
             mixed_decoder=pytorch_backend_config.mixed_decoder)
     return decoder
+
+
+def get_decoding_mode(executor_config):
+    '''This implementation is based off trtGptModelInflightBatching.cpp getDecodingMode().'''
+
+    if executor_config.decoding_config and executor_config.decoding_config.decoding_mode and not executor_config.decoding_config.decoding_mode.isAuto(
+    ):
+        decoding_mode = executor_config.decoding_config.decoding_mode
+    elif executor_config.max_beam_width == 1:
+        decoding_mode = DecodingMode.TopKTopP()
+    else:
+        decoding_mode = DecodingMode.BeamSearch()
+
+    # Override decoding mode when beam width is one
+    if executor_config.max_beam_width == 1 and decoding_mode.isBeamSearch():
+        logger.warning(
+            "Beam width is set to 1, but decoding mode is BeamSearch. Overwriting decoding mode to TopKTopP."
+        )
+        decoding_mode = DecodingMode.TopKTopP()
+
+    # Override decoding mode when Medusa is used
+    if executor_config.speculative_config and executor_config.speculative_config.is_medusa and not decoding_mode.isMedusa(
+    ):
+        logger.warning(
+            "Model is Medusa, but decoding mode is not Medusa. Overwriting decoding mode to Medusa."
+        )
+        decoding_mode = DecodingMode.Medusa()
+
+    # Override decoding mode when Medusa is not used
+    if (not executor_config.speculative_config
+            or not executor_config.speculative_config.is_medusa
+        ) and decoding_mode.isMedusa():
+        logger.warning(
+            "Model is not Medusa, but decoding mode is Medusa. Overwriting decoding mode."
+        )
+        if executor_config.max_beam_width == 1:
+            decoding_mode = DecodingMode.TopKTopP()
+        else:
+            decoding_mode = DecodingMode.BeamSearch()
+
+    # Override decoding mode when lookahead decoding is used
+    if executor_config.speculative_config and executor_config.speculative_config.is_lookahead and not decoding_mode.isLookahead(
+    ):
+        logger.warning(
+            "Model is Lookahead, but decoding mode is not Lookahead. Overwriting decoding mode to Lookahead."
+        )
+        decoding_mode = DecodingMode.Lookahead()
+
+    # Override decoding mode when lookahead decoding is not used
+    if (not executor_config.speculative_config
+            or not executor_config.speculative_config.is_lookahead
+        ) and decoding_mode.isLookahead():
+        logger.warning(
+            "Model is not built with Lookahead decoding, but decoding mode is Lookahead. Overwriting decoding mode."
+        )
+        if executor_config.max_beam_width == 1:
+            decoding_mode = DecodingMode.TopKTopP()
+        else:
+            decoding_mode = DecodingMode.BeamSearch()
+
+    # Override decoding mode when 'explicit draft tokens' is used
+    if executor_config.speculative_config and executor_config.speculative_config.is_explicit_draft_tokens and not decoding_mode.isExplicitDraftTokens(
+    ):
+        logger.warning(
+            "Model is built with 'explicit draft tokens' decoding, but decoding mode is something else. Overwriting decoding mode."
+        )
+        decoding_mode = DecodingMode.ExplicitDraftTokens()
+
+    # Override decoding mode when 'explicit draft tokens' is not used
+    if (not executor_config.speculative_config
+            or not executor_config.speculative_config.is_explicit_draft_tokens
+        ) and decoding_mode.isExplicitDraftTokens():
+        logger.warning(
+            "Model is not built with 'explicit draft tokens' decoding, but decoding mode is set to it. Overwriting decoding mode to default."
+        )
+        if executor_config.max_beam_width == 1:
+            decoding_mode = DecodingMode.TopKTopP()
+        else:
+            decoding_mode = DecodingMode.BeamSearch()
+
+    # Override decoding mode when EAGLE is used
+    if executor_config.speculative_config and executor_config.speculative_config.is_eagle and not decoding_mode.isEagle(
+    ):
+        logger.warning(
+            "Model is Eagle, but decoding mode is not Eagle. Overwriting decoding mode to Eagle."
+        )
+        decoding_mode = DecodingMode.Eagle()
+
+    # Override decoding mode when Eagle is not used
+    if (not executor_config.speculative_config
+            or not executor_config.speculative_config.is_eagle
+        ) and decoding_mode.isEagle():
+        logger.warning(
+            "Model is not Eagle, but decoding mode is Eagle. Overwriting decoding mode."
+        )
+        if executor_config.max_beam_width == 1:
+            decoding_mode = DecodingMode.TopKTopP()
+        else:
+            decoding_mode = DecodingMode.BeamSearch()
+
+    # Override decoding mode when draft tokens are external
+    if executor_config.speculative_config and executor_config.speculative_config.is_draft_tokens_external:
+        logger.warning("Overwriting decoding mode to external draft token")
+        decoding_mode = DecodingMode.ExternalDraftTokens()
+
+    logger.debug(f"DecodingMode: {decoding_mode.name}")
+    return decoding_mode

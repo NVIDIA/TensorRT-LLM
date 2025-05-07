@@ -63,18 +63,18 @@ l0_l40s:
   - examples/test_phi.py::test_llm_phi_lora_1gpu[Phi-3-mini-4k-instruct-ru-lora-Phi-3-mini-4k-instruct-lora_fp16-base_fp16]
   - examples/test_nemotron_nas.py::test_nemotron_nas_summary_1gpu[DeciLM-7B]
   - examples/test_gpt.py::test_llm_gpt_starcoder_lora_1gpu[peft-lora-starcoder2-15b-unity-copilot-starcoder2-lora_fp16-base_fp16]
-  - test_e2e.py::test_llmapi_quickstart
-  - test_e2e.py::test_llmapi_example_inference
-  - test_e2e.py::test_llmapi_example_inference_async
-  - test_e2e.py::test_llmapi_example_inference_async_streaming
-  - test_e2e.py::test_llmapi_example_logits_processor
-  - test_e2e.py::test_llmapi_example_multilora
-  - test_e2e.py::test_llmapi_example_guided_decoding
-  - test_e2e.py::test_llmapi_example_customize
-  - test_e2e.py::test_llmapi_example_quantization
+  - llmapi/test_llm_examples.py::test_llmapi_quickstart
+  - llmapi/test_llm_examples.py::test_llmapi_example_inference
+  - llmapi/test_llm_examples.py::test_llmapi_example_inference_async
+  - llmapi/test_llm_examples.py::test_llmapi_example_inference_async_streaming
+  - llmapi/test_llm_examples.py::test_llmapi_example_logits_processor
+  - llmapi/test_llm_examples.py::test_llmapi_example_multilora
+  - llmapi/test_llm_examples.py::test_llmapi_example_guided_decoding
+  - llmapi/test_llm_examples.py::test_llmapi_example_customize
+  - llmapi/test_llm_examples.py::test_llmapi_example_quantization
   - examples/test_llm_api_with_mpi.py::test_llm_api_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
-  - test_e2e.py::test_llmapi_example_lookahead_decoding
-  - test_e2e.py::test_llmapi_example_medusa_decoding_use_modelopt
+  - llmapi/test_llm_examples.py::test_llmapi_example_lookahead_decoding
+  - llmapi/test_llm_examples.py::test_llmapi_example_medusa_decoding_use_modelopt
 - condition:
     ranges:
       system_gpu_count:
@@ -95,7 +95,7 @@ l0_l40s:
   - accuracy/test_cli_flow.py::TestQwen1_5MoeA2_7BChat::test_weight_only
   - examples/test_gpt.py::test_llm_gpt2_next_prompt_tuning[use_cpp_session-tp1] # 10 mins
   - examples/test_gpt.py::test_llm_gpt2_next_prompt_tuning[use_py_session-tp1]
-  # - examples/test_llama.py::test_llm_llama_1gpu_fp8_kv_cache[llama-v2-7b-hf-bfloat16] #4 mins
+  - examples/test_llama.py::test_llm_llama_1gpu_fp8_kv_cache[llama-v2-7b-hf-bfloat16] #4 mins
   - examples/test_multimodal.py::test_llm_multimodal_general[neva-22b-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[video-neva-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[kosmos-2-pp:1-tp:1-float16-bs:1-cpp_e2e:True-nb:1]

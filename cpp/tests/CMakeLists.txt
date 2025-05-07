@@ -76,7 +76,6 @@ add_gtest(mpiUtilsTest runtime/mpiUtilsTest.cpp)
 add_gtest(gptDecoderTest runtime/gptDecoderTest.cpp)
 add_gtest(gptDecoderBatchedTest runtime/gptDecoderBatchedTest.cpp)
 add_gtest(gptSessionTest runtime/gptSessionTest.cpp)
-target_link_libraries(gptSessionTest PRIVATE modelSpecStatic)
 add_gtest(medusaModuleTest runtime/medusaModuleTest.cpp)
 
 add_gtest(sanitizerTest runtime/sanitizerTest.cpp)

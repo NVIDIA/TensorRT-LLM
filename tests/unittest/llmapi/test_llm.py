@@ -99,6 +99,7 @@ def llm_test_harness(model_dir: str,
 
     tp_size = llm_kwargs.get('tensor_parallel_size', 1)
     pp_size = llm_kwargs.get('pipeline_parallel_size', 1)
+    backend = llm_kwargs.get('backend', None)
     world_size = tp_size * pp_size
     if world_size > torch.cuda.device_count():
         pytest.skip(
@@ -109,7 +110,11 @@ def llm_test_harness(model_dir: str,
     if tokenizer is None:
         tokenizer = model_dir
 
-    llm = LLM(model_dir, tokenizer=tokenizer, **llm_kwargs)
+    if backend == "pytorch":
+        from tensorrt_llm._torch import LLM as LLM_torch
+        llm = LLM_torch(model_dir, tokenizer=tokenizer, **llm_kwargs)
+    else:
+        llm = LLM(model_dir, tokenizer=tokenizer, **llm_kwargs)
     outputs = llm.generate(inputs, sampling_params=sampling_params)
     print(outputs)
     check_output(outputs, references, similar_threshold=similar_threshold)
@@ -626,7 +631,7 @@ def test_generate_with_seed(llm_for_sampling_params: LLM):
 def test_generate_with_beam_search(llm_for_sampling_params: LLM):
     llm = llm_for_sampling_params
     references = [["D E F G H I", "D E F G I J"]]
-    sampling_params = SamplingParams(max_tokens=6, beam_width=2)
+    sampling_params = SamplingParams(max_tokens=6, n=2, use_beam_search=True)
 
     # Non-streaming mode
     outputs = llm.generate(prompts, sampling_params)
@@ -681,11 +686,11 @@ def test_parallel_config():
 @force_ampere  # Save H100 resource
 @pytest.mark.parametrize("gather_context_logits", [True, False])
 @pytest.mark.parametrize("gather_generation_logits", [True, False])
-@pytest.mark.parametrize("return_log_probs", [True])  # prune space
 @pytest.mark.part0
-def test_generate_with_OutputConfig(gather_context_logits: bool,
-                                    gather_generation_logits: bool,
-                                    return_log_probs: bool):
+def test_generate_with_OutputConfig(
+    gather_context_logits: bool,
+    gather_generation_logits: bool,
+):
     if not (gather_context_logits or gather_generation_logits):  # prune space
         return
 
@@ -703,8 +708,7 @@ def test_generate_with_OutputConfig(gather_context_logits: bool,
     sampling_params = SamplingParams(
         max_tokens=8,
         return_context_logits=gather_context_logits,
-        return_generation_logits=gather_generation_logits,
-        return_log_probs=return_log_probs)
+        return_generation_logits=gather_generation_logits)
 
     for output in llm.generate(prompts, sampling_params=sampling_params):
         if gather_context_logits:
@@ -715,8 +719,6 @@ def test_generate_with_OutputConfig(gather_context_logits: bool,
             assert output.outputs[0].generation_logits is not None
             assert sampling_params.max_tokens == output.outputs[
                 0].generation_logits.shape[0]
-        if return_log_probs:
-            assert output.outputs[0].logprobs is not None
 
         print(output)
 
@@ -986,12 +988,14 @@ class MyLogitsProcessor(LogitsProcessor):
 
     def __call__(self, req_id: int, logits: torch.Tensor, ids: List[List[int]],
                  stream_ptr: int, client_id: Optional[int]):
-        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
+        stream = None if stream_ptr is None else torch.cuda.ExternalStream(
+            stream_ptr)
+        with torch.cuda.stream(stream):
             logits[:] = float("-inf")
             logits[..., self.biased_word_id] = 0
 
 
-def tinyllama_logits_processor_test_harness(**llm_kwargs):
+def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
     sampling_params = SamplingParams(
@@ -1002,6 +1006,7 @@ def tinyllama_logits_processor_test_harness(**llm_kwargs):
         prompts, ["Z Z Z Z Z Z"],
         sampling_params=sampling_params,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+        backend=backend,
         **llm_kwargs)
 
 
@@ -1607,6 +1612,104 @@ def test_llm_return_context_logits():
 
 def test_llm_return_generation_logits():
     check_llm_return_generation_logits(tp_size=1)
+
+
+def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
+                                     logprobs: Optional[int],
+                                     return_context_logits: bool,
+                                     return_generation_logits: bool,
+                                     tp_size=1,
+                                     streaming=False,
+                                     backend=None):
+    LLM_CLASS = LLM
+    if backend == "pytorch":
+        from tensorrt_llm._torch import LLM as LLM_torch
+        LLM_CLASS = LLM_torch
+
+    llm = LLM_CLASS(
+        llama_model_path,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+        build_config=BuildConfig(gather_context_logits=True),
+        tensor_parallel_size=tp_size,
+        gather_generation_logits=True,
+        fast_build=True,
+    )
+
+    prompts = ["A B C D E F G H I J K"]
+    sampling_params = SamplingParams(
+        logprobs=logprobs,
+        prompt_logprobs=prompt_logprobs,
+        return_context_logits=return_context_logits,
+        return_generation_logits=return_generation_logits)
+
+    for output in llm.generate(prompts, sampling_params):
+        context_logits = output.context_logits
+        generation_logits = output.outputs[0].generation_logits
+        logprobs_result = output.outputs[0].logprobs
+        prompt_logprobs_result = output.outputs[0].prompt_logprobs
+        token_ids = output.outputs[0].token_ids
+
+        # ensure logits are dropped unless users specify return_context_logits=True
+        if prompt_logprobs and not return_context_logits:
+            assert context_logits is None
+
+        if logprobs and not return_generation_logits:
+            assert generation_logits is None
+
+        if return_context_logits:
+            assert isinstance(context_logits, torch.Tensor)
+
+        if return_generation_logits:
+            assert isinstance(generation_logits, torch.Tensor)
+
+        if prompt_logprobs:
+            assert prompt_logprobs_result and len(
+                prompt_logprobs_result[0].keys()) == prompt_logprobs
+            print("prompt_logprobs[0]: ", prompt_logprobs_result[0])
+
+        if logprobs:
+            assert logprobs_result and len(
+                logprobs_result[0].keys()) in {logprobs, logprobs + 1}
+            # Most contain log prob of the sample token, even if it's not within K
+            assert token_ids[0] in logprobs_result[0].keys()
+            print("logprobs[0]: ", logprobs_result[0])
+
+    if streaming:
+
+        async def task(id: int, prompt: str):
+            logprobs_result_streaming = []
+            async for output in llm.generate_async(prompt,
+                                                   sampling_params,
+                                                   streaming=True):
+                logprobs_result_streaming += output.outputs[0].logprobs
+
+            # comparing streaming logprobs result to non-streaming
+            assert logprobs_result_streaming == logprobs_result
+            assert output.outputs[0].prompt_logprobs == prompt_logprobs_result
+
+        async def main():
+            tasks = [task(id, prompt) for id, prompt in enumerate(prompts)]
+            await asyncio.gather(*tasks)
+
+        asyncio.run(main())
+
+
+@force_ampere
+@pytest.mark.parametrize(
+    "prompt_logprobs, logprobs, return_context_logits, return_generation_logits",
+    [(2, None, True, False), (None, 2, False, False)])
+def test_llm_return_logprobs(prompt_logprobs: Optional[int],
+                             logprobs: Optional[int],
+                             return_context_logits: bool,
+                             return_generation_logits: bool):
+    llm_return_logprobs_test_harness(prompt_logprobs, logprobs,
+                                     return_context_logits,
+                                     return_generation_logits)
+
+
+@force_ampere
+def test_llm_return_logprobs_streaming():
+    llm_return_logprobs_test_harness(2, 2, False, True, streaming=True)
 
 
 class DummyExecutorWorker3(ExecutorBindingsWorker):

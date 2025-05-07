@@ -55,7 +55,7 @@ public:
     operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
         DecoderBuffers& decoderBuffers, DecoderInputBuffers const& inputBuffers,
         runtime::decoder::DecoderState& decoderState, runtime::ModelConfig const& modelConfig,
-        SizeType32 maxNumSequences, SizeType32 beamWidth, runtime::BufferManager const& manager,
+        SizeType32 maxNumSequences, SizeType32 beamWidth, bool isTrtOverlap, runtime::BufferManager const& manager,
         runtime::CudaStream const& stream, OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const;
 
     [[nodiscard]] static std::unique_ptr<runtime::decoder_batch::Input> createDecoderBatchInputs(

@@ -21,10 +21,10 @@ UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifac
 // Container configuration
 // available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
 // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
-LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.03-py3-x86_64-ubuntu24.04-trt10.9.0.34-skip-devel-202504101610-3421"
-LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.03-py3-aarch64-ubuntu24.04-trt10.9.0.34-skip-devel-202504101610-3421"
-LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py310-trt10.9.0.34-skip-devel-202504101610-3421"
-LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py312-trt10.9.0.34-skip-devel-202504101610-3421"
+LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.03-py3-x86_64-ubuntu24.04-trt10.9.0.34-skip-devel-202504250100-3759"
+LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.03-py3-aarch64-ubuntu24.04-trt10.9.0.34-skip-devel-202504250100-3759"
+LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py310-trt10.9.0.34-skip-devel-202504250100-3759"
+LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py312-trt10.9.0.34-skip-devel-202504250100-3759"
 
 LLM_ROCKYLINUX8_DOCKER_IMAGE = LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE
 
@@ -79,6 +79,8 @@ def TEST_STAGE_LIST = "stage_list"
 @Field
 def GPU_TYPE_LIST = "gpu_type"
 @Field
+def TEST_BACKEND = "test_backend"
+@Field
 def IS_POST_MERGE = "post_merge"
 @Field
 def ADD_MULTI_GPU_TEST = "add_multi_gpu_test"
@@ -104,6 +106,7 @@ def testFilter = [
     (ENABLE_SKIP_TEST): gitlabParamsFromBot.get((ENABLE_SKIP_TEST), false),
     (TEST_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get((TEST_STAGE_LIST), null)?.tokenize(',')),
     (GPU_TYPE_LIST): trimForStageList(gitlabParamsFromBot.get((GPU_TYPE_LIST), null)?.tokenize(',')),
+    (TEST_BACKEND): trimForStageList(gitlabParamsFromBot.get((TEST_BACKEND), null)?.tokenize(',')),
     (IS_POST_MERGE): (env.JOB_NAME ==~ /.*PostMerge.*/) || gitlabParamsFromBot.get((IS_POST_MERGE), false),
     (ADD_MULTI_GPU_TEST): gitlabParamsFromBot.get((ADD_MULTI_GPU_TEST), false),
     (ONLY_MULTI_GPU_TEST): gitlabParamsFromBot.get((ONLY_MULTI_GPU_TEST), false) || gitlabParamsFromBot.get((ENABLE_MULTI_GPU_TEST), false),
@@ -121,9 +124,12 @@ String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
 def GITHUB_PR_API_URL = "github_pr_api_url"
 @Field
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
+@Field
+def ACTION_INFO = "action_info"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
+    (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
@@ -131,7 +137,8 @@ boolean enableUpdateGitlabStatus =
     !testFilter[ENABLE_SKIP_TEST] &&
     !testFilter[ONLY_MULTI_GPU_TEST] &&
     testFilter[GPU_TYPE_LIST] == null &&
-    testFilter[TEST_STAGE_LIST] == null
+    testFilter[TEST_STAGE_LIST] == null &&
+    testFilter[TEST_BACKEND] == null
 
 String getShortenedJobName(String path)
 {
@@ -545,12 +552,13 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/compilation/patterns/ub_allreduce.py",
         "tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
+        "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/models/modeling_llama.py",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
-        "tests/unittest/llmapi/test_llm_pytorch.py",
+        "tests/unittest/llmapi/test_llm_multi_gpu.py",
         "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
         "jenkins/L0_Test.groovy",
     ]
@@ -592,12 +600,15 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
     }
     def pytorchOnlyList = [
         "tensorrt_llm/_torch/",
+        "tensorrt_llm/scaffolding/",
         "tests/unittest/_torch/",
+        "tests/unittest/scaffolding/",
         "tests/unittest/llmapi/test_llm_pytorch.py",
         "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
         "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
         "tests/integration/defs/disaggregated/",
         "examples/pytorch/",
+        "examples/scaffolding/",
         "docs/"
     ]
 
@@ -746,7 +757,7 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
     return status
 }
 
-def launchStages(pipeline, reuseBuild, testFilter, enableFailFast)
+def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
     stages = [
         "Release Check": {
@@ -758,10 +769,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast)
             script {
                 stage("Build") {
                     def parameters = getCommonParameters()
+                    String globalVarsJson = writeJSON returnText: true, json: globalVars
                     parameters += [
                         'enableFailFast': enableFailFast,
                         'dockerImage': LLM_DOCKER_IMAGE,
                         'wheelDockerImage': LLM_ROCKYLINUX8_DOCKER_IMAGE,
+                        'globalVars': globalVarsJson,
                     ]
 
                     if (env.alternativeTRT) {
@@ -795,10 +808,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast)
                         parameters = getCommonParameters()
 
                         String testFilterJson = writeJSON returnText: true, json: testFilter
+                        String globalVarsJson = writeJSON returnText: true, json: globalVars
                         parameters += [
                             'enableFailFast': enableFailFast,
                             'testFilter': testFilterJson,
                             'dockerImage': LLM_DOCKER_IMAGE,
+                            'globalVars': globalVarsJson,
                         ]
 
                         if (env.alternativeTRT) {
@@ -851,9 +866,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast)
                 def stageName = "Build"
                 stage(stageName) {
                     def parameters = getCommonParameters()
+                    String globalVarsJson = writeJSON returnText: true, json: globalVars
                     parameters += [
                         'enableFailFast': enableFailFast,
                         "dockerImage": LLM_SBSA_DOCKER_IMAGE,
+                        'globalVars': globalVarsJson,
                     ]
 
                     if (env.alternativeTrtSBSA) {
@@ -888,10 +905,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast)
                         def parameters = getCommonParameters()
 
                         String testFilterJson = writeJSON returnText: true, json: testFilter
+                        String globalVarsJson = writeJSON returnText: true, json: globalVars
                         parameters += [
                             'enableFailFast': enableFailFast,
                             'testFilter': testFilterJson,
                             "dockerImage": LLM_SBSA_DOCKER_IMAGE,
+                            'globalVars': globalVarsJson,
                         ]
 
                         if (env.alternativeTrtSBSA) {
@@ -986,6 +1005,8 @@ pipeline {
             {
                 script {
                     setupPipelineEnvironment(this, testFilter, globalVars)
+                    println globalVars
+                    globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
                     echo "enableFailFast is: ${enableFailFast}"
                     echo "env.gitlabTriggerPhrase is: ${env.gitlabTriggerPhrase}"
                     println testFilter
@@ -1003,7 +1024,7 @@ pipeline {
                             }
                         }
                     } else {
-                        launchStages(this, reuseBuild, testFilter, enableFailFast)
+                        launchStages(this, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
             }

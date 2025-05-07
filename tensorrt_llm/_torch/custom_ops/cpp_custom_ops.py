@@ -53,10 +53,10 @@ def _register_fake():
             return [torch.empty_like(input)]
 
     @torch.library.register_fake("trtllm::moe_allreduce")
-    def _(residual, norm_weight, moe_reduction_device_num_experts,
-          moe_reduction_scale_input, moe_reduction_active_experts_token_input,
-          moe_reduction_token_input, workspace, rank, nranks, eps):
-        norm_out = torch.empty_like(moe_reduction_token_input)
+    def _(residual, norm_weight, device_num_experts, scale_input,
+          active_experts_token_input, token_input, workspace, rank, nranks,
+          eps):
+        norm_out = torch.empty_like(token_input)
         residual_out = torch.empty_like(residual)
         return [norm_out, residual_out]
 
@@ -319,3 +319,45 @@ def _register_fake():
     @torch.library.register_fake("trtllm::set_moe_max_usable_sm_count")
     def _(max_sm_count: int):
         pass
+
+    @torch.library.custom_op("trtllm::group_rms_norm",
+                             mutates_args=("outputs", ))
+    def group_rms_norm(
+        inputs: List[torch.Tensor],
+        outputs: List[torch.Tensor],
+        weights: List[torch.Tensor],
+        eps: float,
+        weight_bias: float,
+    ) -> None:
+        pass
+
+    @group_rms_norm.register_fake
+    def _(
+        inputs: List[torch.Tensor],
+        outputs: List[torch.Tensor],
+        weights: List[torch.Tensor],
+        eps: float,
+        weight_bias: float,
+    ) -> List[torch.Tensor]:
+        return outputs
+
+    @torch.library.custom_op("trtllm::group_rms_norm_large_batch",
+                             mutates_args=("outputs", ))
+    def group_rms_norm_large_batch(
+        inputs: List[torch.Tensor],
+        outputs: List[torch.Tensor],
+        weights: List[torch.Tensor],
+        eps: float,
+        weight_bias: float,
+    ) -> None:
+        pass
+
+    @group_rms_norm_large_batch.register_fake
+    def _(
+        inputs: List[torch.Tensor],
+        outputs: List[torch.Tensor],
+        weights: List[torch.Tensor],
+        eps: float,
+        weight_bias: float,
+    ) -> List[torch.Tensor]:
+        return outputs

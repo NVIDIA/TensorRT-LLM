@@ -167,7 +167,7 @@ class AttentionMetadata:
                 # This copy is safe because the batch size is guaranteed to not
                 # change in the CUDA graph case. The seqlens can change if we
                 # are doing spec decode.
-                self._seq_lens_cuda.copy_(self._seq_lens)
+                self._seq_lens_cuda.copy_(self._seq_lens, non_blocking=True)
             else:
                 self._seq_lens_cuda = self._seq_lens.cuda(non_blocking=True)
 

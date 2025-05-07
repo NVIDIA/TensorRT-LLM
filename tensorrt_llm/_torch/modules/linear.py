@@ -210,9 +210,9 @@ class Linear(nn.Module):
         self.has_fp8_qdq = False
         self.has_fp8_block_scales = False
         self.has_nvfp4 = False
-        # only _create_weights, and load quantized weight directly.
+
         if self.quant_config and self.quant_config.layer_quant_mode.has_any_quant(
-        ):
+                exclude_kv_cache=True):
             self.has_any_quant = True
             qc = self.quant_config
             if qc.layer_quant_mode.has_fp8_qdq():
@@ -421,6 +421,9 @@ class Linear(nn.Module):
         assert self._weights_created
 
         def _copy(dst: Parameter, src: torch.Tensor):
+            # TODO check that is it a reasonable change or not
+            if dst.dtype != src.dtype:
+                src = src.to(dst.dtype)
             assert dst.dtype == src.dtype, f"Incompatible dtype. dst: {dst.dtype}, src: {src.dtype}"
             dst.data.copy_(src)
 

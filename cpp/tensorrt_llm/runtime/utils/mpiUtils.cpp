@@ -295,54 +295,65 @@ void MpiComm::bcast(runtime::IBuffer& buf, int root) const
     bcast(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, root);
 }
 
-std::shared_ptr<MpiRequest> MpiComm::sendAsync(void const* buffer, size_t size, MpiType dtype, int dest, int tag) const
+std::shared_ptr<MpiRequest> MpiComm::sendAsync(
+    void const* buffer, size_t size, MpiType dtype, int dest, MpiTag tag) const
 {
-    TLLM_LOG_DEBUG("start MPI_Isend with size %d", size);
+    TLLM_LOG_DEBUG("start MPI_Isend with dest %d, tag %d, size %d", dest, static_cast<int>(tag), size);
     std::shared_ptr<MpiRequest> r = std::make_shared<MpiRequest>();
 #if ENABLE_MULTI_DEVICE
-    invokeChunked(MPI_Isend, buffer, size, getMpiDtype(dtype), dest, tag, mComm, &r->mRequest);
+    invokeChunked(MPI_Isend, buffer, size, getMpiDtype(dtype), dest, static_cast<int>(tag), mComm, &r->mRequest);
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif
-    TLLM_LOG_DEBUG("end MPI_Isend with size %d", size);
+    TLLM_LOG_DEBUG("end MPI_Isend with dest %d, tag %d, size %d", dest, static_cast<int>(tag), size);
     return r;
 }
 
-std::shared_ptr<MpiRequest> MpiComm::sendAsync(runtime::IBuffer const& buf, int dest, int tag) const
+std::shared_ptr<MpiRequest> MpiComm::sendAsync(runtime::IBuffer const& buf, int dest, MpiTag tag) const
 {
     return sendAsync(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, dest, tag);
 }
 
-void MpiComm::send(void const* buffer, size_t size, MpiType dtype, int dest, int tag) const
+void MpiComm::sendRawTag(void const* buffer, size_t size, MpiType dtype, int dest, int tag) const
 {
-    TLLM_LOG_DEBUG("start MPI_Send with size %d", size);
+    TLLM_LOG_DEBUG("start MPI_Send with dest %d, tag %d, size %d", dest, tag, size);
 #if ENABLE_MULTI_DEVICE
     invokeChunked(MPI_Send, buffer, size, getMpiDtype(dtype), dest, tag, mComm);
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
-    TLLM_LOG_DEBUG("end MPI_Send with size %d", size);
+    TLLM_LOG_DEBUG("end MPI_Send with dest %d, tag %d, size %d", dest, tag, size);
 }
 
-void MpiComm::send(runtime::IBuffer const& buf, int dest, int tag) const
+void MpiComm::send(void const* buffer, size_t size, MpiType dtype, int dest, MpiTag tag) const
+{
+    sendRawTag(buffer, size, dtype, dest, static_cast<int>(tag));
+}
+
+void MpiComm::send(runtime::IBuffer const& buf, int dest, MpiTag tag) const
 {
     send(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, dest, tag);
 }
 
-MPI_Status MpiComm::recv(void* buffer, size_t size, MpiType dtype, int source, int tag) const
+MPI_Status MpiComm::recvRawTag(void* buffer, size_t size, MpiType dtype, int source, int tag) const
 {
-    TLLM_LOG_DEBUG("start MPI_Recv with size %d", size);
+    TLLM_LOG_DEBUG("start MPI_Recv with source %d, tag %d, size %d", source, tag, size);
     MPI_Status status{};
 #if ENABLE_MULTI_DEVICE
     invokeChunked(MPI_Recv, buffer, size, getMpiDtype(dtype), source, tag, mComm, &status);
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
-    TLLM_LOG_DEBUG("end MPI_Recv with size %d", size);
+    TLLM_LOG_DEBUG("end MPI_Recv with source %d, tag %d, size %d", source, tag, size);
     return status;
 }
 
-MPI_Status MpiComm::recv(runtime::IBuffer& buf, int source, int tag) const
+MPI_Status MpiComm::recv(void* buffer, size_t size, MpiType dtype, int source, MpiTag tag) const
+{
+    return recvRawTag(buffer, size, dtype, source, static_cast<int>(tag));
+}
+
+MPI_Status MpiComm::recv(runtime::IBuffer& buf, int source, MpiTag tag) const
 {
     return recv(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, source, tag);
 }
@@ -399,7 +410,7 @@ void MpiComm::allgatherv(void const* sendbuf, int sendcount, MpiType sendtype, v
 #endif // ENABLE_MULTI_DEVICE
 }
 
-void MpiComm::mprobe(int source, int tag, MPI_Message* msg, MPI_Status* status) const
+void MpiComm::mprobeRawTag(int source, int tag, MPI_Message* msg, MPI_Status* status) const
 {
 #if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Mprobe(source, tag, mComm, msg, status));
@@ -408,11 +419,16 @@ void MpiComm::mprobe(int source, int tag, MPI_Message* msg, MPI_Status* status) 
 #endif // ENABLE_MULTI_DEVICE
 }
 
-bool MpiComm::improbe(int source, int tag, MPI_Message* msg, MPI_Status* status) const
+void MpiComm::mprobe(int source, MpiTag tag, MPI_Message* msg, MPI_Status* status) const
+{
+    mprobeRawTag(source, static_cast<int>(tag), msg, status);
+}
+
+bool MpiComm::improbe(int source, MpiTag tag, MPI_Message* msg, MPI_Status* status) const
 {
 #if ENABLE_MULTI_DEVICE
     int flag{0};
-    MPICHECK(MPI_Improbe(source, tag, mComm, &flag, msg, status));
+    MPICHECK(MPI_Improbe(source, static_cast<int>(tag), mComm, &flag, msg, status));
     return flag != 0;
 #else
     TLLM_THROW("Multi device support is disabled.");
@@ -420,11 +436,11 @@ bool MpiComm::improbe(int source, int tag, MPI_Message* msg, MPI_Status* status)
 #endif
 }
 
-bool MpiComm::iprobe(int source, int tag, MPI_Status* status) const
+bool MpiComm::iprobe(int source, MpiTag tag, MPI_Status* status) const
 {
 #if ENABLE_MULTI_DEVICE
     int flag{0};
-    MPICHECK(MPI_Iprobe(source, tag, mComm, &flag, status));
+    MPICHECK(MPI_Iprobe(source, static_cast<int>(tag), mComm, &flag, status));
     return flag != 0;
 #else
     TLLM_THROW("Multi device support is disabled.");
@@ -432,7 +448,7 @@ bool MpiComm::iprobe(int source, int tag, MPI_Status* status) const
 #endif
 }
 
-void MpiComm::recvPoll(int source, int tag, int periodMs) const
+void MpiComm::recvPoll(int source, MpiTag tag, int periodMs) const
 {
     MPI_Status status;
     while (!iprobe(source, tag, &status))

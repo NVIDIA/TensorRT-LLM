@@ -15,13 +15,13 @@
  * limitations under the License.
  */
 
+#include "fp4_gemm.h"
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp4_gemm.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -139,7 +139,7 @@ public:
         allreduce_fusion_params.residual_in = reduce_fusion_inputs[0].data_ptr();
         allreduce_fusion_params.rms_gamma = reduce_fusion_inputs[1].data_ptr();
         allreduce_fusion_params.rms_eps = static_cast<float>(eps);
-        allreduce_fusion_params.use_oneshot = input.numel() <= tensorrt_llm::kernels::ar_fusion::kOneShotMaxToken;
+        allreduce_fusion_params.use_oneshot = input.size(0) <= tensorrt_llm::kernels::ar_fusion::kOneShotMaxToken;
 
         if (fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
             || fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)

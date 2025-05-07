@@ -7,7 +7,7 @@ from torch import nn
 
 from tensorrt_llm.mapping import Mapping
 
-from ..custom_ops import IS_FLASHINFER_AVAIABLE
+from ..custom_ops import IS_FLASHINFER_AVAILABLE
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
@@ -16,7 +16,7 @@ from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 
 
 def swiglu(x):
-    if IS_FLASHINFER_AVAIABLE:
+    if IS_FLASHINFER_AVAILABLE:
         # WAR for flashinfer activation since it does not support custom op properly
         from ..custom_ops import flashinfer_silu_and_mul
         return flashinfer_silu_and_mul(x)
@@ -104,13 +104,12 @@ class GatedMLP(nn.Module):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         all_rank_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
-        min_latency_mode: Optional[bool] = False,
         lora_params: Optional[dict] = None,
+        **kwargs,
     ) -> torch.Tensor:
         if lora_params is not None:
             return self.forward_lora(x, all_rank_num_tokens,
-                                     final_all_reduce_params, min_latency_mode,
-                                     lora_params)
+                                     final_all_reduce_params, lora_params)
 
         if self.activation == F.silu:
             h1 = self.gate_up_proj(x)
@@ -146,7 +145,6 @@ class GatedMLP(nn.Module):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         all_rank_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
-        min_latency_mode: Optional[bool] = False,
         lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         assert lora_params is not None
