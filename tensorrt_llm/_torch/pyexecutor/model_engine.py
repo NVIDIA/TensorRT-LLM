@@ -566,7 +566,7 @@ class PyTorchModelEngine(ModelEngine):
                         for num_tokens_per_request in [
                                 1,
                                 min(self.max_num_tokens // max(bs, 1),
-                                    kv_cache_manager.max_seq_len - 1)
+                                    self.max_seq_len - 1)
                         ]:
                             with release_batch(
                                     get_torch_compile_warmup_request(
