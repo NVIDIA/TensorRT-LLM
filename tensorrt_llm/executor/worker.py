@@ -374,7 +374,6 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 client_id=request.id,
                 input_token_ids=prompt_token_ids,
                 max_tokens=request.sampling_params.max_tokens,
-                max_new_tokens=request.sampling_params.max_new_tokens,
                 streaming=request.streaming,
                 sampling_config=request.sampling_params._get_sampling_config(),
                 end_id=-1 if request.sampling_params.ignore_eos else
@@ -422,7 +421,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 req_id = self.engine.enqueue_request(executor_request)
             return req_id
         except Exception as e:
-            raise RequestError(str(e))
+            raise RequestError(str(e)) from e
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """ Low-level API to the executor. Return a "future" GenerationResult which can be waited. """
