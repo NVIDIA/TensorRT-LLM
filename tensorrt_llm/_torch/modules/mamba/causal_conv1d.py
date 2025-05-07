@@ -3,6 +3,7 @@
 # causal_conv1d_varlen_states, adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_varlen.py
 
 from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -52,7 +53,8 @@ def causal_conv1d_fwd(xBC: torch.Tensor, conv1d_weight: torch.Tensor,
     return y_new
 
 
-PAD_SLOT_ID = -1000000      # TODO: check if this matters. resource_manager.py::add_dummy_requests uses similar value to pad requests to batch size.
+PAD_SLOT_ID = -1000000  # TODO: check if this matters. resource_manager.py::add_dummy_requests uses similar value to pad requests to batch size.
+
 
 def causal_conv1d_update(x: torch.Tensor,
                          conv_state: torch.Tensor,
@@ -69,18 +71,18 @@ def causal_conv1d_update(x: torch.Tensor,
     bias: (dim,)
     cache_seqlens: (batch,), dtype int32.
         If not None, the conv_state is treated as a circular buffer.
-        The conv_state will be updated by copying x to the conv_state 
+        The conv_state will be updated by copying x to the conv_state
         starting at the index
         @cache_seqlens % state_len.
     conv_state_indices: (batch,), dtype int32
-        If not None, the conv_state is a larger tensor along the batch dim, 
+        If not None, the conv_state is a larger tensor along the batch dim,
         and we are selecting the batch coords specified by conv_state_indices.
         Useful for a continuous batching scenario.
     pad_slot_id: int
-        if cache_indices is passed, lets the kernel identify padded 
-        entries that will not be processed, 
-        for example: cache_indices = [pad_slot_id, 1 ,20 ,pad_slot_id] 
-        in this case, the kernel will not process entries at 
+        if cache_indices is passed, lets the kernel identify padded
+        entries that will not be processed,
+        for example: cache_indices = [pad_slot_id, 1 ,20 ,pad_slot_id]
+        in this case, the kernel will not process entries at
         indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen)
     """
@@ -90,11 +92,13 @@ def causal_conv1d_update(x: torch.Tensor,
     unsqueeze = x.dim() == 2
     if unsqueeze:
         x = x.unsqueeze(-1)
-    torch.ops.trtllm.causal_conv1d_update(x, conv_state, weight, bias, activation_val,
-                             cache_seqlens, conv_state_indices, pad_slot_id)
+    torch.ops.trtllm.causal_conv1d_update(x, conv_state, weight, bias,
+                                          activation_val, cache_seqlens,
+                                          conv_state_indices, pad_slot_id)
     if unsqueeze:
         x = x.squeeze(-1)
     return x
+
 
 @triton.jit
 def _causal_conv1d_varlen_states(

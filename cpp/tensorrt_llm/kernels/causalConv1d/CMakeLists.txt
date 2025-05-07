@@ -22,7 +22,5 @@ add_library(causalConv1d_src OBJECT ${SRC_CPP} ${SRC_CU})
 target_compile_options(causalConv1d_src
                        PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-maxrregcount=32>)
 
-set_property(TARGET causalConv1d_src PROPERTY POSITION_INDEPENDENT_CODE
-                                                     ON)
-set_property(TARGET causalConv1d_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
-                                                     ON)
+set_property(TARGET causalConv1d_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET causalConv1d_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)

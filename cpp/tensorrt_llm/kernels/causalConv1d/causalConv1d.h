@@ -47,7 +47,7 @@ namespace tensorrt_llm::kernels::causal_conv1d
             return __VA_ARGS__();                                                    \
         }                                                                            \
     }()
-    
+
 struct ConvParamsBase {
     using index_t = uint32_t;
 
@@ -81,7 +81,7 @@ struct ConvParamsBase {
     void *__restrict__ cache_indices_ptr;
     int32_t *__restrict__ cache_seqlens;
 
-    // For the continuous batching case. Makes it so that the mamba state for 
+    // For the continuous batching case. Makes it so that the mamba state for
     // the current batch doesn't need to be a contiguous tensor.
     int32_t *__restrict__ conv_state_indices_ptr;
 
@@ -110,7 +110,7 @@ __device__ inline T shuffle_xor(T val, int offset) {
     return __shfl_xor_sync(uint32_t(-1), val, offset);
 }
 
-constexpr size_t custom_max(std::initializer_list<size_t> ilist) 
+constexpr size_t custom_max(std::initializer_list<size_t> ilist)
 {
     return std::max(ilist);
 }
