@@ -80,6 +80,16 @@ enum class SplitKStyle
     // SPLIT_K_PARALLEL // Not supported yet
 };
 
+constexpr int makeGemmTileShapeValue(int32_t m, int32_t n, int32_t k)
+{
+    return m * 1000000 + n * 1000 + k;
+}
+
+constexpr std::array<int32_t, 3> parseGemmTileShapeValue(int32_t config)
+{
+    return {config / 1000000, (config / 1000) % 1000, config % 1000};
+}
+
 enum class CutlassTileConfigSM90
 {
     // Signals that we should run heuristics do choose a config
@@ -89,21 +99,21 @@ enum class CutlassTileConfigSM90
     ChooseWithHeuristic,
 
     // CTA configs for M=64
-    CtaShape64x16x128B,
-    CtaShape64x32x128B,
-    CtaShape64x64x128B,
-    CtaShape64x128x128B,
-    CtaShape64x256x128B,
+    CtaShape64x16x128B = makeGemmTileShapeValue(64, 16, 128),
+    CtaShape64x32x128B = makeGemmTileShapeValue(64, 32, 128),
+    CtaShape64x64x128B = makeGemmTileShapeValue(64, 64, 128),
+    CtaShape64x128x128B = makeGemmTileShapeValue(64, 128, 128),
+    CtaShape64x256x128B = makeGemmTileShapeValue(64, 256, 128),
 
     // CTA configs for M=128
-    CtaShape128x16x128B,
-    CtaShape128x32x128B,
-    CtaShape128x64x128B,
-    CtaShape128x128x128B,
-    CtaShape128x256x128B,
+    CtaShape128x16x128B = makeGemmTileShapeValue(128, 16, 128),
+    CtaShape128x32x128B = makeGemmTileShapeValue(128, 32, 128),
+    CtaShape128x64x128B = makeGemmTileShapeValue(128, 64, 128),
+    CtaShape128x128x128B = makeGemmTileShapeValue(128, 128, 128),
+    CtaShape128x256x128B = makeGemmTileShapeValue(128, 256, 128),
 
-    // CTA configs for M=128
-    CtaShape256x128x128B,
+    // CTA configs for M=256
+    CtaShape256x128x128B = makeGemmTileShapeValue(256, 128, 128),
 };
 
 enum class CutlassTileConfigSM100
@@ -118,25 +128,25 @@ enum class CutlassTileConfigSM100
      * Grouped GEMM
      */
     // M=64
-    CtaShape64x32x128B,
-    CtaShape64x64x128B,
-    CtaShape64x128x128B,
-    CtaShape64x256x128B,
+    CtaShape64x32x128B = makeGemmTileShapeValue(64, 32, 128),
+    CtaShape64x64x128B = makeGemmTileShapeValue(64, 64, 128),
+    CtaShape64x128x128B = makeGemmTileShapeValue(64, 128, 128),
+    CtaShape64x256x128B = makeGemmTileShapeValue(64, 256, 128),
 
     // M=128
-    CtaShape128x8x256B,
-    CtaShape128x16x128B,
-    CtaShape128x32x128B,
-    CtaShape128x64x128B,
-    CtaShape128x128x128B,
-    CtaShape128x256x128B,
-    CtaShape128x128x256B,
-    CtaShape128x256x256B,
+    CtaShape128x8x256B = makeGemmTileShapeValue(128, 8, 256),
+    CtaShape128x16x128B = makeGemmTileShapeValue(128, 16, 128),
+    CtaShape128x32x128B = makeGemmTileShapeValue(128, 32, 128),
+    CtaShape128x64x128B = makeGemmTileShapeValue(128, 64, 128),
+    CtaShape128x128x128B = makeGemmTileShapeValue(128, 128, 128),
+    CtaShape128x256x128B = makeGemmTileShapeValue(128, 256, 128),
+    CtaShape128x128x256B = makeGemmTileShapeValue(128, 128, 256),
+    CtaShape128x256x256B = makeGemmTileShapeValue(128, 256, 256),
 
     // M=256
-    CtaShape256x64x128B,
-    CtaShape256x128x128B,
-    CtaShape256x256x128B,
+    CtaShape256x64x128B = makeGemmTileShapeValue(256, 64, 128),
+    CtaShape256x128x128B = makeGemmTileShapeValue(256, 128, 128),
+    CtaShape256x256x128B = makeGemmTileShapeValue(256, 256, 128),
 };
 
 enum class CutlassTileConfigSM120
@@ -147,12 +157,12 @@ enum class CutlassTileConfigSM120
     // Signals that we should run heuristics do choose a config
     ChooseWithHeuristic,
 
-    CtaShape128x128x128B,
-    CtaShape128x128x64B,
-    CtaShape256x128x64B,
-    CtaShape128x256x64B,
-    CtaShape128x128x256B,
-    CtaShape256x128x128B,
+    CtaShape128x128x128B = makeGemmTileShapeValue(128, 128, 128),
+    CtaShape128x128x64B = makeGemmTileShapeValue(128, 128, 64),
+    CtaShape256x128x64B = makeGemmTileShapeValue(256, 128, 64),
+    CtaShape128x256x64B = makeGemmTileShapeValue(128, 256, 64),
+    CtaShape128x128x256B = makeGemmTileShapeValue(128, 128, 256),
+    CtaShape256x128x128B = makeGemmTileShapeValue(256, 128, 128),
 };
 
 enum class MainloopScheduleType
@@ -308,16 +318,16 @@ static auto get_tile_shape_name(TileShape Shape_MNK)
 
 enum class ClusterShape
 {
-    ClusterShape_1x1x1,
-    ClusterShape_2x1x1,
-    ClusterShape_1x2x1,
-    ClusterShape_2x2x1,
-    ClusterShape_1x4x1,
-    ClusterShape_4x2x1,
-    ClusterShape_2x4x1,
-    ClusterShape_4x4x1,
-    ClusterShape_1x8x1,
-    ClusterShape_8x1x1
+    ClusterShape_1x1x1 = makeGemmTileShapeValue(1, 1, 1),
+    ClusterShape_2x1x1 = makeGemmTileShapeValue(2, 1, 1),
+    ClusterShape_1x2x1 = makeGemmTileShapeValue(1, 2, 1),
+    ClusterShape_2x2x1 = makeGemmTileShapeValue(2, 2, 1),
+    ClusterShape_1x4x1 = makeGemmTileShapeValue(1, 4, 1),
+    ClusterShape_4x2x1 = makeGemmTileShapeValue(4, 2, 1),
+    ClusterShape_2x4x1 = makeGemmTileShapeValue(2, 4, 1),
+    ClusterShape_4x4x1 = makeGemmTileShapeValue(4, 4, 1),
+    ClusterShape_1x8x1 = makeGemmTileShapeValue(1, 8, 1),
+    ClusterShape_8x1x1 = makeGemmTileShapeValue(8, 1, 1)
 };
 
 static auto get_cluster_shape_name(ClusterShape Shape_MNK)
