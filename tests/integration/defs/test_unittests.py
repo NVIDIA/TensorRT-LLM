@@ -16,6 +16,7 @@ import os
 import random
 from subprocess import CalledProcessError
 
+import pytest
 from defs.conftest import tests_path
 
 
