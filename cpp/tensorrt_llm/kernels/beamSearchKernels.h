@@ -99,6 +99,8 @@ struct BeamHypotheses
     int const* parentIdsUnfinish{nullptr};          // [BS, BM, MSL]   %% self.parent_ids
 
     // clang-format on
+
+    void print();
 };
 
 __inline__ int padToNextPowerOfTwo(int const n)
@@ -135,8 +137,6 @@ __global__ void addCumLogProbs(T* __restrict pStage1Probs, float const* __restri
 
 __global__ void gatherId(int const* __restrict pStage1Id, int* __restrict pStage2Id, size_t const nBS,
     size_t const nBMIn, size_t const nBMOut, size_t const nV);
-
-void printBH(BeamHypotheses const& bh);
 
 void printLogProbs(float const* x, int const nBS, int const nBMIn, int const nBM, int const nV);
 

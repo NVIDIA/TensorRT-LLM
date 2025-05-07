@@ -408,6 +408,8 @@ void BeamSearchLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const
     // a batch in one generation step) is supported in the future.
     op->variableBeamWidth = bh.nBeamWidthOutHost[0];
 
+    bh.print();
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
