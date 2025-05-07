@@ -1025,7 +1025,7 @@ pipeline {
                         }
                     } else {
                         // WAR for "Argument list too long" error
-                        globalVars[CACHED_CHANGED_FILE_LIST] = []
+                        globalVars[CACHED_CHANGED_FILE_LIST] = null
                         launchStages(this, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
