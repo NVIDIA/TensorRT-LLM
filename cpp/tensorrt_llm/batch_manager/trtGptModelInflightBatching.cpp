@@ -1801,7 +1801,7 @@ void TrtGptModelInflightBatching::postProcessRequest(
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const seqSlot = llmReq.mSeqSlot.value();
-    auto const reqBeamWidth = llmReq.getBeamWidthByIter();
+    auto const reqBeamWidth = llmReq.getBeamWidthByIter(true);
     auto const& bufferManager = getBufferManager();
 
     if (llmReq.getReturnGenerationLogits() && !llmReq.getGenerationLogitsFragments().empty())

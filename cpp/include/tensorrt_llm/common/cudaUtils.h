@@ -454,7 +454,7 @@ void printArrayInfo(T const* ptr, uint64_t nElement = 1, std::string name = "", 
     if (isDevicePtr)
     {
         tmpVec.resize(nElement);
-        tmp = tmpVec.data();
+        tmp = tmpVec.data(); // Note `data()` is not supported for vector<bool>
         check_cuda_error(cudaMemcpy(tmp, ptr, sizeInByte, cudaMemcpyDeviceToHost));
         cudaDeviceSynchronize();
     }
@@ -707,7 +707,7 @@ inline void printMatrix(T const* ptr, int nRow, int nCol, int nStride)
     {
         std::vector<T> tmpVec;
         tmpVec.resize(nRow * nStride);
-        T* tmp = tmpVec.data();
+        T* tmp = tmpVec.data(); // Note `data()` is not supported for vector<bool>
         check_cuda_error(cudaMemcpy(tmp, ptr, sizeInByte, cudaMemcpyDeviceToHost));
         cudaDeviceSynchronize();
         check_cuda_error(cudaGetLastError());
