@@ -146,7 +146,7 @@ def log_level(args):
 
 def sanity_check(hf_model_dir, engine):
     from transformers import AutoTokenizer
-    sampling = SamplingParams(max_new_tokens=5)
+    sampling = SamplingParams(max_tokens=5)
     input_str = "What should you say when someone gives you a gift? You should say:"
     executor = GenerationExecutor.create(engine)
 
