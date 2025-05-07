@@ -4,7 +4,7 @@ Modify directly if you want to change settings.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 
 @dataclass
@@ -21,7 +21,9 @@ class SimpleConfig:
     # If no `model` argument is provided, the checkpoint directory is used to infer the model
     # architecture.
     model: Optional[str] = None
-    model_factory: str = "hf"  # choose from 'hf' or 'llama4' (only 'hf' supported for "trtllm"!)
+    model_factory: Literal["AutoModelForCausalLM", "AutoModelForImageTextToText"] = (
+        "AutoModelForCausalLM"
+    )
     skip_loading_weights: bool = False  # only load the architecture, not the weights
     customize_tokenizer: bool = False  # True: tokenizer from the model factory, False: from LLM api
 
@@ -50,9 +52,9 @@ class SimpleConfig:
 
     ### CONFIGURE BACKEND, RUNTIME, AND WORLD SIZE ##################################
     world_size: int = 1  # choose from number of GPUs for TP (0--> no TP, no spawned processes)
-    runtime: str = "demollm"  # chose from "demollm" or "trtllm" (production-grade runtime)
-    compile_backend: str = "torch-opt"  # choose from "torch-simple", "torch-opt"
-    attn_backend: str = "TritonWithFlattenedInputs"  # "TritonWithFlattenedInputs" or "FlashInfer"
+    runtime: str = "trtllm"  # chose from "demollm" or "trtllm" (production-grade runtime)
+    compile_backend: str = "torch-simple"  # choose from "torch-simple", "torch-opt"
+    attn_backend: str = "FlashInfer"  # "TritonWithFlattenedInputs" or "FlashInfer"
     mla_backend: str = "MultiHeadLatentAttention"  # only option for now
     max_seq_len: int = 512  # max sequence length for inference/cache
     max_batch_size: int = 8  # max dimension for statically allocated kv cache

@@ -12,7 +12,12 @@ from accelerate import init_empty_weights
 from huggingface_hub import snapshot_download
 from huggingface_hub.utils import HFValidationError, validate_repo_id
 from torch._prims_common import DeviceLikeType
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoTokenizer,
+)
 from transformers.modeling_utils import load_sharded_checkpoint, load_state_dict
 
 from ..custom_ops.attention_interface import CacheConfig
@@ -59,8 +64,8 @@ def _to_maybe_empty(model: nn.Module, device: DeviceLikeType):
     )
 
 
-@ModelFactoryRegistry.register("hf")
-class HFFactory(ModelFactory):
+@ModelFactoryRegistry.register("AutoModelForCausalLM")
+class AutoModelForCausalLMFactory(ModelFactory):
     def __init__(
         self,
         model_kwargs: Optional[Dict[str, Any]] = None,
@@ -70,9 +75,11 @@ class HFFactory(ModelFactory):
         super().__init__(**kwargs)
 
         self.model_kwargs = model_kwargs or {}
-        self.model_kwargs["use_cache"] = False
         self.tokenizer_kwargs = tokenizer_kwargs or {}
         self._quant_config = None
+
+        # heuristic to disable use_cache
+        self.model_kwargs["use_cache"] = False
 
         # prefetch the model+checkpoint
         self.prefetch_checkpoint()
@@ -226,3 +233,21 @@ class HFFactory(ModelFactory):
                 # We do not quantize lm_head.
                 if "exclude_modules" not in self._quant_config:
                     self._quant_config["exclude_modules"] = ["lm_head"]
+
+
+@ModelFactoryRegistry.register("AutoModelForImageTextToText")
+class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # additional heuristic to disable use_cache
+        self.model_kwargs["text_config"] = self.model_kwargs.get("text_config", {})
+        self.model_kwargs["text_config"]["use_cache"] = False
+
+        self.model_kwargs["text_config"]["max_position_embeddings"] = self.model_kwargs[
+            "max_position_embeddings"
+        ]
+
+    @property
+    def automodel_from_config(self):
+        return AutoModelForImageTextToText.from_config
