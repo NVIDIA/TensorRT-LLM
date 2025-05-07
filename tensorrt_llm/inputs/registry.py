@@ -46,16 +46,23 @@ class DefaultInputProcessor(InputProcessor):
         """The default input processor handles only tokenization."""
         if self.tokenizer is None:
             raise ValueError("tokenizer is required to tokenize string prompt")
-        if sampling_params.truncate_prompt_tokens is None:
-            token_ids = self.tokenizer.encode(
-                inputs["prompt"],
-                add_special_tokens=sampling_params.add_special_tokens)
-        else:
-            token_ids = self.tokenizer.encode(
-                inputs["prompt"],
+        kwargs = {}
+        if sampling_params.truncate_prompt_tokens is not None:
+            kwargs = dict(truncation=True,
+                          max_length=sampling_params.truncate_prompt_tokens)
+
+        token_ids = self.tokenizer.encode(
+            inputs["prompt"],
+            add_special_tokens=sampling_params.add_special_tokens,
+            **kwargs)
+
+        if "query" in inputs:
+            query_token_ids = self.tokenizer.encode(
+                inputs["query"],
                 add_special_tokens=sampling_params.add_special_tokens,
-                truncation=True,
-                max_length=sampling_params.truncate_prompt_tokens)
+                **kwargs)
+            return token_ids, {"query_token_ids": query_token_ids}
+
         return token_ids, None
 
 
