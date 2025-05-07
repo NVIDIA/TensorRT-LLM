@@ -123,7 +123,7 @@ class Attention(nn.Module):
 
         attn_cls = get_attention_backend(self.attn_backend)
         self.enable_rope_fusion = attn_cls.support_fused_rope(
-        ) and qk_norm_type == QkNormType.none
+        ) and qk_norm_type != QkNormType.post_rope
         self.attn = create_attention(
             self.attn_backend,
             self.layer_idx,
@@ -156,9 +156,13 @@ class Attention(nn.Module):
         # which could be modified after __init__
         self.attn.update_quant_config(self.quant_config)
 
+    def split_qkv(self, qkv):
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        return q, k, v
+
     def convert_qkv(self, q, k, v):
         if k is None and v is None and not self.support_fused_qkv:
-            q, k, v = q.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k, v = self.split_qkv(q)
         elif k is not None and v is not None and self.support_fused_qkv:
             qkv = torch.concat([q, k, v], dim=-1)
             q, k, v = qkv, None, None
@@ -190,11 +194,11 @@ class Attention(nn.Module):
                 qkv = qkv + qkv_lora
 
         q, k, v = qkv, None, None
+        if self.qk_norm_type == QkNormType.pre_rope:
+            q, k, v = self.split_qkv(qkv)
+            q, k = self.apply_qk_norm(q, k)
         if self.apply_rotary_emb and position_ids is not None:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
-                                dim=-1)
-            if self.qk_norm_type == QkNormType.pre_rope:
-                q, k = self.apply_qk_norm(q, k)
+            q, k, v = self.split_qkv(qkv)
             q, k = self.rotary_emb(position_ids, [q, k])
             if self.qk_norm_type == QkNormType.post_rope:
                 q, k = self.apply_qk_norm(q, k)

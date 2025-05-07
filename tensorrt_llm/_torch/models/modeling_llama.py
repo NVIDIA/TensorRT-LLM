@@ -129,7 +129,7 @@ class Llama4Attention(Attention):
         all_reduce_params: Optional[AllReduceParams] = None,
     ):
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = self.split_qkv(qkv)
         if self.attn_temperature_tuning:
             q = self._attention_scaling(q, position_ids)
         out_scale = None
