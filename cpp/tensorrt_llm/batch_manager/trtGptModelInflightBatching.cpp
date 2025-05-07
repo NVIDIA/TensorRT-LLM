@@ -2160,13 +2160,13 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
         {
             continue;
         }
-        auto const reqBeamWidth = llmReq->getBeamWidthByIter();
+        auto const reqBeamWidth = llmReq->getBeamWidthByIter(true);
         auto const seqSlot = llmReq->mSeqSlot.value();
         auto const numGeneratedTokens = llmReq->getNumDraftTokens() + 1;
         auto const currentNumOfTokens = llmReq->getMaxBeamNumTokens();
 
         // Save the accepted token logits from target model
-        if (llmReq->getReturnGenerationLogits() && mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal()
+        if (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal() && llmReq->getReturnGenerationLogits()
             && llmReq->hasDraftTokens())
         {
             TLLM_CHECK_WITH_INFO(reqBeamWidth == 1, "Speculative decoding only works for beam width == 1");

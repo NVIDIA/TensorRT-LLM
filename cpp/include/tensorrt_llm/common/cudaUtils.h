@@ -626,6 +626,11 @@ __host__ __device__ inline void print_element_(__nv_fp8_e4m3 x)
 }
 #endif
 
+__host__ __device__ inline void print_element_(bool ui)
+{
+    printf("%7" PRIu32 " ", (unsigned int) ui);
+}
+
 __host__ __device__ inline void print_element_(uint8_t ui)
 {
     printf("%7" PRIu32 " ", (unsigned int) ui);

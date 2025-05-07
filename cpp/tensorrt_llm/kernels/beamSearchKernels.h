@@ -150,6 +150,7 @@ void printLogProbs(float const* x, int const nBS, int const nBMIn, int const nBM
     {                                                                                                                  \
         printf(#x "=");                                                                                                \
         print_element_(x);                                                                                             \
+        printf("\n");                                                                                                  \
     }
 
 // Host function
