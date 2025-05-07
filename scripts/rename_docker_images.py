@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse as _ap
 import datetime as _dt
+import os
 import pathlib as _pl
 import subprocess as _sp
 
@@ -42,6 +43,11 @@ def parse_arguments() -> _ap.Namespace:
         '--dry-run',
         action='store_true',
         help="Simulate the rename process without making any changes.")
+    parser.add_argument(
+        "--timestamp",
+        type=str,
+        required=False,
+        help="The timestamp to use for the destination image name.")
     return parser.parse_args()
 
 
@@ -97,22 +103,51 @@ def image_prefix(full_image_name: str) -> str:
     Returns:
         str: Image prefix.
     """
-    image_no_quotes = full_image_name.strip('"')
     dash = '-'
-    last_index = image_no_quotes.rfind(dash)  # Find the last occurrence
+    last_index = full_image_name.rfind(dash)  # Find the last occurrence
     if last_index == -1:
         raise ValueError("Invalid image name format")
-    second_last_index = image_no_quotes.rfind(
+    second_last_index = full_image_name.rfind(
         dash, 0, last_index)  # Look for the next occurrence before the last
     if second_last_index == -1:
         raise ValueError("Invalid image name format")
-    return image_no_quotes[:second_last_index]
+    return full_image_name[:second_last_index]
+
+
+def find_and_replace_in_files(directory, file_extension: str,
+                              search_string: str, replace_string: str,
+                              dry_run: bool) -> None:
+    """
+    Perform find-and-replace in all files within a directory tree matching a specific extension.
+
+    Args:
+        directory (str or PathLike): Root directory of the search.
+        file_extension (str): File extension to filter (e.g., ".txt").
+        search_string (str): String to search for.
+        replace_string (str): String to replace the search string with.
+        dry_run (bool): Whether to perform the find-and-replace operation or not.
+    """
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.endswith(file_extension):
+                file_path = os.path.join(root, file)
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+
+                # Replace strings in file content
+                updated_content = content.replace(search_string, replace_string)
+                if content != updated_content:
+                    print(f"Updating {file_path}")
+                    if not dry_run:
+                        with open(file_path, "w", encoding="utf-8") as f:
+                            f.write(updated_content)
 
 
 def rename_images(*,
                   src_branch: str,
                   src_build_id: int,
                   dst_mr: int,
+                  timestamp: str | None = None,
                   dry_run: bool = False) -> None:
     print(
         f"Renaming images for branch {src_branch} and build id {src_build_id} to {dst_mr}"
@@ -122,18 +157,24 @@ def rename_images(*,
     else:
         print("Renaming images...")
 
-    timestamp = get_current_timestamp()
+    timestamp = timestamp or get_current_timestamp()
     src_branch_sanitized = src_branch.replace("/", "_")
-    mr_groovy = find_script_directory(
-    ).parent / "jenkins" / MERGE_REQUEST_GROOVY
+    base_dir = find_script_directory().parent
+    mr_groovy = base_dir / "jenkins" / MERGE_REQUEST_GROOVY
 
     for dst_key, src_pattern in IMAGE_MAPPING.items():
+        print(f"Processing {dst_key} ...")
         src_image = f"{src_pattern}-{src_branch_sanitized}-{src_build_id}"
-        dst_pattern = image_prefix(
-            extract_line_after_prefix(mr_groovy, dst_key + " = "))
-        dst_image = f"{dst_pattern}-{timestamp}-{dst_mr}"
+        dst_image_old = extract_line_after_prefix(mr_groovy,
+                                                  dst_key + " = ").strip('"')
+        dst_image = f"{image_prefix(dst_image_old)}-{timestamp}-{dst_mr}"
+        run_shell_command(f"docker pull {src_image}", dry_run)
         run_shell_command(f"docker tag {src_image} {dst_image}", dry_run)
         run_shell_command(f"docker push {dst_image}", dry_run)
+        find_and_replace_in_files(base_dir / "jenkins", ".groovy",
+                                  dst_image_old, dst_image, dry_run)
+        find_and_replace_in_files(base_dir / ".devcontainer", ".yaml",
+                                  dst_image_old, dst_image, dry_run)
 
 
 def main() -> None:
