@@ -272,13 +272,13 @@ class KVCacheManager(BaseResourceManager):
     def add_dummy_requests(
         self,
         request_ids: List[int],
-        token_nums: Optional[List[int]] = None,
         # Note that token_nums should be past_kv_len + input_len (without
         # spec decoding). The draft tokens will be added in this function,
         # so we don't need to take care of it in the caller. When preparing
         # token_nums, we should not take the draft tokens into account, so
         # don't use the kv_cache_manager.max_seq_len, which includes both
         # extra tokens and draft tokens.
+        token_nums: Optional[List[int]] = None,
         is_gen: bool = False,
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
@@ -418,6 +418,10 @@ class KVCacheManager(BaseResourceManager):
 
     def get_num_kv_blocks(self, num_tokens: int) -> int:
         return (num_tokens + self.tokens_per_block - 1) // self.tokens_per_block
+
+    def get_num_available_tokens(self, max_num_draft_tokens: int = 0) -> int:
+        return (self.get_num_free_blocks() * self.tokens_per_block -
+                self.num_extra_kv_tokens - max_num_draft_tokens)
 
     def get_buffers(self, layer_idx: int) -> Optional[torch.Tensor]:
         result = self.impl.get_primary_pool_data(layer_idx)
