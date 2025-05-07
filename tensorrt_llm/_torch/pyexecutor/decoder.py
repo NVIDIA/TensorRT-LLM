@@ -546,7 +546,9 @@ class TRTLLMDecoder(Decoder):
         batch_slots, decoder_requests, sampling_configs = self.algs.generate_request_options(
             self.model_config, self.world_config, self.decoding_config,
             requests, self.store["buffer_manager"], self.logits_datatype,
-            self.store["decoder_input_buffers"])
+            self.store["decoder_input_buffers"],
+            self.algs.decoder.decoder_state, self.beam_width,
+            self.store["cuda_stream"])
 
         if len(decoder_requests):
             self.algs.create_new_decoder_requests(
@@ -593,8 +595,7 @@ class TRTLLMDecoder(Decoder):
             scheduled_requests.generation_requests,
             self.store["decoder_buffers"], self.store["decoder_input_buffers"],
             self.algs.decoder.decoder_state, self.model_config,
-            self.max_num_sequences, self.beam_width, self.is_trt_overlap,
-            self.store["buffer_manager"], self.store["cuda_stream"])
+            self.max_num_sequences)
 
         self.algs.decoder.forward_async(self.decoding_output, decoding_input)
 
