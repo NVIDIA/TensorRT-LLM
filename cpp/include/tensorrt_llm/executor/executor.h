@@ -206,6 +206,8 @@ class AdditionalModelOutput
 public:
     explicit AdditionalModelOutput(std::string name, bool gatherContext = false);
 
+    bool operator==(AdditionalModelOutput const& other) const;
+
     std::string name;
     bool gatherContext{false};
 };
@@ -1390,6 +1392,8 @@ class CacheTransceiverConfig
 public:
     explicit CacheTransceiverConfig(std::optional<size_t> maxNumTokens = std::nullopt);
 
+    bool operator==(CacheTransceiverConfig const& other) const;
+
     [[nodiscard]] std::optional<size_t> getMaxNumTokens() const;
     void setMaxNumTokens(size_t maxNumTokens);
 
@@ -1430,7 +1434,7 @@ public:
         std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
         std::optional<CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
         bool gatherGenerationLogits = false, bool useVariableBeamWidthSearch = false,
-        bool promptTableOffloading = false);
+        bool promptTableOffloading = false, bool enableTrtOverlap = false);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -1465,6 +1469,7 @@ public:
     [[nodiscard]] bool getUseVariableBeamWidthSearch() const;
     [[nodiscard]] bool getPromptTableOffloading() const;
     [[nodiscard]] std::optional<CacheTransceiverConfig> getCacheTransceiverConfig() const;
+    [[nodiscard]] bool getEnableTrtOverlap() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
@@ -1494,6 +1499,7 @@ public:
     void setUseVariableBeamWidthSearch(bool useVariableBeamWidthSearch);
     void setPromptTableOffloading(bool promptTableOffloading);
     void setCacheTransceiverConfig(CacheTransceiverConfig const& cacheTransceiverConfig);
+    void setEnableTrtOverlap(bool enableTrtOverlap);
 
 private:
     friend class Serialization;
@@ -1507,7 +1513,7 @@ private:
     /// @brief The KV cache configuration.
     KvCacheConfig mKvCacheConfig;
 
-    /// @brief The KV cache configuration.
+    /// @brief Controls whether context is allowed to be chunked.
     bool mEnableChunkedContext;
 
     /// @brief Controls if log probabilities should be normalized or not.
@@ -1580,6 +1586,9 @@ private:
 
     /// @brief Controls if prompt table offloading is enabled.
     bool mPromptTableOffloading{false};
+
+    /// @brief Controls whether preparation and TRT engine execution should be overlapped.
+    bool mEnableTrtOverlap{false};
 };
 
 struct KVCacheCreatedData

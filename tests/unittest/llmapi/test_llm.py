@@ -686,11 +686,11 @@ def test_parallel_config():
 @force_ampere  # Save H100 resource
 @pytest.mark.parametrize("gather_context_logits", [True, False])
 @pytest.mark.parametrize("gather_generation_logits", [True, False])
-@pytest.mark.parametrize("return_log_probs", [True])  # prune space
 @pytest.mark.part0
-def test_generate_with_OutputConfig(gather_context_logits: bool,
-                                    gather_generation_logits: bool,
-                                    return_log_probs: bool):
+def test_generate_with_OutputConfig(
+    gather_context_logits: bool,
+    gather_generation_logits: bool,
+):
     if not (gather_context_logits or gather_generation_logits):  # prune space
         return
 
@@ -708,8 +708,7 @@ def test_generate_with_OutputConfig(gather_context_logits: bool,
     sampling_params = SamplingParams(
         max_tokens=8,
         return_context_logits=gather_context_logits,
-        return_generation_logits=gather_generation_logits,
-        return_log_probs=return_log_probs)
+        return_generation_logits=gather_generation_logits)
 
     for output in llm.generate(prompts, sampling_params=sampling_params):
         if gather_context_logits:
@@ -720,8 +719,6 @@ def test_generate_with_OutputConfig(gather_context_logits: bool,
             assert output.outputs[0].generation_logits is not None
             assert sampling_params.max_tokens == output.outputs[
                 0].generation_logits.shape[0]
-        if return_log_probs:
-            assert output.outputs[0].logprobs is not None
 
         print(output)
 

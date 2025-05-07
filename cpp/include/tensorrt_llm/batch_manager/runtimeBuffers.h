@@ -19,6 +19,7 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
+#include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/eagleBuffers.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -76,6 +77,8 @@ public:
     using TensorPtr = runtime::ITensor::SharedPtr;
     using TensorMap = runtime::ITensor::TensorMap;
     using PeftTable = runtime::LoraManager::PeftTable;
+    template <typename T>
+    using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
 
     [[nodiscard]] SizeType32 constexpr getContextIndex() const noexcept
     {
@@ -275,7 +278,8 @@ public:
         DecoderBuffers& decoderBuffers, kv_cache_manager::BaseKVCacheManager* kvCacheManager,
         kv_cache_manager::BaseKVCacheManager* crossKvCacheManager, rnn_state_manager::RnnStateManager* rnnStateManager,
         PeftTable const& peftTable, runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
-        runtime::WorldConfig const& worldConfig, bool gatherGenerationLogits);
+        runtime::WorldConfig const& worldConfig, bool gatherGenerationLogits, bool trtOverlap,
+        OptionalRef<runtime::ITensor const> newOutputTokens = std::nullopt);
 
     void prepareBuffersForCudaGraph(SizeType32 maxSequenceLength);
 
@@ -309,7 +313,7 @@ private:
         kv_cache_manager::BaseKVCacheManager* crossKvCacheManagerPtr,
         rnn_state_manager::RnnStateManager* rnnStateManagerPtr, PeftTable const& peftTable,
         runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
-        runtime::WorldConfig const& worldConfig);
+        runtime::WorldConfig const& worldConfig, bool trtOverlap, OptionalRef<runtime::ITensor const> newOutputTokens);
 
     void fillIOMaps(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
 };
