@@ -87,7 +87,7 @@ class Llama4Attention(Attention):
         self.attn_scale = getattr(config, "attn_scale", 0.1)
 
     def apply_qk_norm(self, q, k):
-        # TODO: make this more efficient.
+
         def q_l2norm():
             return self.qk_norm(q.reshape(-1, self.head_dim)).reshape(
                 -1, self.q_size)
