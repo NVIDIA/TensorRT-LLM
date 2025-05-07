@@ -176,7 +176,7 @@ def create_request(payload_file, template_str, tokenizer):
 
     return trtllm.Request(
         input_token_ids=tokens[1:],
-        max_new_tokens=1024,
+        max_tokens=1024,
         sampling_config=sample_params,
         streaming=False,
         stop_words=None,

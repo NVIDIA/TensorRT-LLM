@@ -490,9 +490,9 @@ class LLM:
                 f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and query length ({query_len}) max_tokens ({sampling_params.max_tokens}) should not exceed "
                 f"max_seq_len ({build_config.max_seq_len})")
 
-        if sampling_params.beam_width > build_config.max_beam_width:
+        if sampling_params.use_beam_search and sampling_params.n > build_config.max_beam_width:
             raise ValueError(
-                f"sampling_params's beam_width ({sampling_params.beam_width}) should not exceed max_beam_width ({build_config.max_beam_width})"
+                f"sampling_params's n ({sampling_params.n}) should not exceed max_beam_width ({build_config.max_beam_width}) when use_beam_search is True"
             )
 
         if sampling_params.prompt_logprobs and not build_config.gather_context_logits:

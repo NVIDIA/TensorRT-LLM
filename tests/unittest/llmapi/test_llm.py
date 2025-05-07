@@ -631,7 +631,7 @@ def test_generate_with_seed(llm_for_sampling_params: LLM):
 def test_generate_with_beam_search(llm_for_sampling_params: LLM):
     llm = llm_for_sampling_params
     references = [["D E F G H I", "D E F G I J"]]
-    sampling_params = SamplingParams(max_tokens=6, beam_width=2)
+    sampling_params = SamplingParams(max_tokens=6, n=2, use_beam_search=True)
 
     # Non-streaming mode
     outputs = llm.generate(prompts, sampling_params)
