@@ -489,10 +489,10 @@ __global__ void routingMainKernel(KernelParams params)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename KernelParams>
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(NumThreads)
     routingIndicesClusterKernel(KernelParams params)
 {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // number of experts is bounded by number of threads
     __shared__ int32_t __attribute((aligned(128))) smemExpertCount[NumThreads];
     __shared__ int32_t __attribute((aligned(128))) smemExpertOffset[NumThreads];
@@ -695,13 +695,11 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
             params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;
         }
     }
-}
 #else
-__global__ void routingIndicesClusterKernel(KernelParams params)
-{
     assert(false && "routingIndicesClusterKernel is only supported on SM90+ architectures");
-}
 #endif
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename KernelParams>
@@ -1603,6 +1601,7 @@ __host__ __device__ constexpr void setBits(int32_t& value, int32_t newBits, int 
 template <typename KernelParams>
 __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParams params)
 {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // types used in this kernel
     using TypeExpW = typename KernelParams::TypeExpW;
     using TypePacked = PackedScoreIdx<TypeExpW>;
@@ -1828,15 +1827,18 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
             }
         }
     }
+#else
+    assert(false && "routingIndicesWarpKernel is only supported on SM90+ architectures");
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename KernelParams>
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(NumThreads)
     routingIndicesClusterKernel(KernelParams params)
 {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // number of experts is bounded by number of threads
     __shared__ int32_t __attribute((aligned(128))) smemExpertCount[NumThreads];
     __shared__ int32_t __attribute((aligned(128))) smemExpertOffset[NumThreads];
@@ -2081,13 +2083,10 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
             params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;
         }
     }
-}
 #else
-__global__ void routingIndicesClusterKernel(KernelParams params)
-{
     assert(false && "routingIndicesClusterKernel is only supported on SM90+ architectures");
-}
 #endif
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -2095,6 +2094,7 @@ __global__ void routingIndicesClusterKernel(KernelParams params)
 template <typename KernelParams>
 __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresKernel(KernelParams params)
 {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     using TypeExpW = typename KernelParams::TypeExpW;
     using TypeExpWVec = std::conditional_t<sizeof(TypeExpW) == 2, float2, float4>;
     using TypePacked = PackedScoreIdx<TypeExpW>;
@@ -2147,6 +2147,9 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
             params.mPtrExpertIdx[tokenIdx] = packedScore;
         }
     }
+#else
+    assert(false && "routingIndicesHistogramScoresKernel is only supported on SM90+ architectures");
+#endif
 }
 
 // Two-step approach (if number of tokens exceed limits of what cluster / cooperative launch
@@ -2160,6 +2163,7 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
 template <typename KernelParams>
 __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramKernel(KernelParams params)
 {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     using TypeExpW = typename KernelParams::TypeExpW;
     using TypePacked = PackedScoreIdx<TypeExpW>;
     // number of experts is bounded by number of threads
@@ -2242,6 +2246,9 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramKernel(
         int32_t const localExpertCount = smemExpertCount[threadIdx.x];
         atomicAdd(&params.mPtrExpertCounts[threadIdx.x], localExpertCount);
     }
+#else
+    assert(false && "routingIndicesHistogramKernel is only supported on SM90+ architectures");
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2249,6 +2256,7 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramKernel(
 template <typename KernelParams>
 __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(KernelParams params)
 {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     using TypeExpW = typename KernelParams::TypeExpW;
     using TypePacked = PackedScoreIdx<TypeExpW>;
     // number of experts is bounded by number of threads
@@ -2494,6 +2502,10 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
     {
         cudaTriggerProgrammaticLaunchCompletion();
     }
+#endif
+
+#else
+    assert(false && "routingIndicesOffsetsKernel is only supported on SM90+ architectures");
 #endif
 }
 
