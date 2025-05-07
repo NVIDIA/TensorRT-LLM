@@ -64,8 +64,6 @@ private:
 
     executor::DecodingMode mDecodingMode;
     size_t mWorkspaceSize{0};
-
-    runtime::SizeType32 mVariableBeamWidth; // For Variable-Beam-Width-Search
 };
 
 } // namespace tensorrt_llm::layers
