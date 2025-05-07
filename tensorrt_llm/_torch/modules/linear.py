@@ -211,9 +211,9 @@ class Linear(nn.Module):
         # Llama4 FC13+SwiGLU kernel has hard requirement of hidden_size = 5120
         # and targets output_features = 2048 or 4096.
         self.use_llama4_fc_swiglu_kernel = use_llama4_fc_swiglu_kernel and self.in_features == 5120 and (self.out_features == 2048 or self.out_features == 4096)
-        # This knob is for Llama4 FC2.
+        # This knob is for Llama4 FC2 (down_proj in gated_mlp)
         # local_in_features for FC2 is 1024, while global is 8192 (TP8)
-        self.use_llama4_trtllm_gen = use_llama4_trtllm_gen and (self.in_features == 8192 or self.in_features == 1024) and self.out_features == 5120
+        self.use_llama4_trtllm_gen = use_llama4_trtllm_gen and (self.in_features % 512 == 0) and self.out_features == 5120
 
         self.combined_scale = torch.randn(1, dtype=torch.float32, device='cuda')
         if not skip_create_weights:
