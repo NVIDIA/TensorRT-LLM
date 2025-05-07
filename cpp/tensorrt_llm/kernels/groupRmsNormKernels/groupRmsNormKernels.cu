@@ -43,7 +43,8 @@ __global__ void GroupRMSNormKernel(GroupRMSParams<n> params, int rounds)
     if (warp_idx == 0)
     {
         smem_rsqrts[lane_idx] = 0.0f;
-        smem_input_mask[lane_idx] = 0;
+        // Initialize input mask to 33 to indicate no input
+        smem_input_mask[lane_idx] = 33;
         smem_warp_sum_sqs[lane_idx] = 0.0f;
     }
     float warp_acc = 0.0f;
@@ -111,8 +112,20 @@ __global__ void GroupRMSNormKernel(GroupRMSParams<n> params, int rounds)
             }
         }
     }
-    smem_input_mask[warp_idx] = input_idx;
-    smem_warp_sum_sqs[warp_idx] = tensorrt_llm::common::warpReduceSum(warp_acc);
+    float warp_sum = tensorrt_llm::common::warpReduceSum(warp_acc);
+    if (lane_idx == 0)
+    {
+        smem_warp_sum_sqs[warp_idx] = warp_sum;
+    }
+
+// Extra _syncwarp for sm < 900, needed to avoid race condition on smem_input_mask write.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 900)
+    __syncwarp();
+#endif
+    if (lane_idx == 0)
+    {
+        smem_input_mask[warp_idx] = input_idx;
+    }
 
     __syncthreads();
 
@@ -125,8 +138,11 @@ __global__ void GroupRMSNormKernel(GroupRMSParams<n> params, int rounds)
         {
             warp_acc = smem_warp_sum_sqs[lane_idx];
         }
-        smem_rsqrts[warp_idx]
-            = rsqrtf(tensorrt_llm::common::warpReduceSum(warp_acc) / params.input_last_dims[warp_idx] + params.eps);
+        float sum_sq = tensorrt_llm::common::warpReduceSum(warp_acc);
+        if (lane_idx == 0)
+        {
+            smem_rsqrts[warp_idx] = rsqrtf(sum_sq / params.input_last_dims[warp_idx] + params.eps);
+        }
     }
 
     __syncthreads();
@@ -302,9 +318,14 @@ __global__ void GroupRMSNormKernelLargeBatch(
             }
         }
     }
+
     if (process_input_0)
     {
-        smem_rsqrts[0][warp_idx] = tensorrt_llm::common::warpReduceSum(sum_sq_0);
+        float warp_sum = tensorrt_llm::common::warpReduceSum(sum_sq_0);
+        if (lane_idx == 0)
+        {
+            smem_rsqrts[0][warp_idx] = warp_sum;
+        }
     }
 
     // Process round0
@@ -341,7 +362,11 @@ __global__ void GroupRMSNormKernelLargeBatch(
     // Store warp reduction to shared memory
     if (process_input_1)
     {
-        smem_rsqrts[1][warp_idx] = tensorrt_llm::common::warpReduceSum(sum_sq_1);
+        float warp_sum = tensorrt_llm::common::warpReduceSum(sum_sq_1);
+        if (lane_idx == 0)
+        {
+            smem_rsqrts[1][warp_idx] = warp_sum;
+        }
     }
 
     __syncthreads();
@@ -350,21 +375,21 @@ __global__ void GroupRMSNormKernelLargeBatch(
     if (warp_idx == 0)
     {
         // Final reduction across warps
-        smem_rsqrts[0][0] = tensorrt_llm::common::warpReduceSum(smem_rsqrts[0][lane_idx]);
+        float block_sum = tensorrt_llm::common::warpReduceSum(smem_rsqrts[0][lane_idx]);
 
         // Compute rsqrt
         if (lane_idx == 0)
         {
-            smem_rsqrts[0][0] = rsqrtf(smem_rsqrts[0][0] / input_dim_0 + params.eps);
+            smem_rsqrts[0][0] = rsqrtf(block_sum / input_dim_0 + params.eps);
         }
     }
     else if (warp_idx == 1)
     {
-        smem_rsqrts[1][0] = tensorrt_llm::common::warpReduceSum(smem_rsqrts[1][lane_idx]);
+        float block_sum = tensorrt_llm::common::warpReduceSum(smem_rsqrts[1][lane_idx]);
         // Compute rsqrt
         if (lane_idx == 0)
         {
-            smem_rsqrts[1][0] = rsqrtf(smem_rsqrts[1][0] / input_dim_1 + params.eps);
+            smem_rsqrts[1][0] = rsqrtf(block_sum / input_dim_1 + params.eps);
         }
     }
 
