@@ -64,6 +64,8 @@ def retrieve_multimodal_placeholder(
     if modality == "image":
         if model_type in ("qwen2_vl", "qwen2_5_vl"):
             return "<|vision_start|><|image_pad|><|vision_end|>"
+        elif model_type in ("mllama", "llama4"):
+            return "<|image|>"
         raise TypeError(f"Unknown {modality} model type: {model_type}")
     elif modality == "video":
         if model_type in ("qwen2_vl", "qwen2_5_vl"):
