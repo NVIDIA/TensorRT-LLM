@@ -11,7 +11,6 @@ All published functionality in the Release Notes has been fully tested and verif
   - **The C++ runtime is now open sourced.**
   - **PyTorch workflow**
     - Added DeepSeek V3/R1 support. Refer to `examples/deepseek_v3/README.md`, also to the blog `docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md`.
-    - Added Llama 4 support.
     - Added Llava-Next support.
     - Added BERT support.
     - Added a C++ based decoder, which added support for:
