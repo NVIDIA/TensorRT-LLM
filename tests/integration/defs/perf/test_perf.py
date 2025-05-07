@@ -54,7 +54,8 @@ MODEL_PATH_DICT = {
     "llama_v3.2_1b": "llama-3.2-models/Llama-3.2-1B",
     "llama_v3.3_nemotron_49b": "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1/",
     "llama_v3.1_nemotron_nano_8b": "Llama-3.1-Nemotron-Nano-8B-v1",
-    "llama_v3.3_nemotron_super_49b":"nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
+    "llama_v3.3_nemotron_super_49b":
+    "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
     # "llama_30b": "llama-models/llama-30b-hf",
     "mixtral_8x7b_v0.1": "Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct": "Mixtral-8x7B-Instruct-v0.1",
@@ -100,7 +101,8 @@ HF_MODEL_PATH = {
     "llama_v3.1_70b_hf": "meta-llama/Llama-3.1-70B",
     "llama_v3.1_405b_hf": "meta-llama/Llama-3.1-405B",
     "llama_v3.1_nemotron_nano_8b_hf": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
-    "llama_v3.3_nemotron_super_49b_hf": "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
+    "llama_v3.3_nemotron_super_49b_hf":
+    "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
     "mixtral_8x7b_v0.1_hf": "mistralai/Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct_hf": "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "mistral_7b_v0.1_hf": "mistralai/Mistral-7B-v0.1",
@@ -114,7 +116,7 @@ LORA_MODEL_PATH = {
 
 TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
 
-TRUST_REMOTE_CODE_MODELS = { # these models require explicit trust_remote_code=True
+TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
     "llama_v3.3_nemotron_super_49b"
 }
 
