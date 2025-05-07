@@ -546,7 +546,7 @@ class LLM:
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
-        self.input_processor = create_input_processor(self.args.model,
+        self.input_processor = create_input_processor(self._hf_model_dir,
                                                       self.tokenizer)
         self.tokenizer = self.input_processor.tokenizer
 
