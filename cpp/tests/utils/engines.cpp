@@ -25,6 +25,22 @@ nvinfer1::ITensor& tensorrt_llm::testing::utils::engines::details::addInputIds(
     return *input_ids;
 }
 
+nvinfer1::ITensor* tensorrt_llm::testing::utils::engines::details::addLastTokenIds(
+    EngineBuildState& buildState, runtime::SizeType32 maxBatchSize, runtime::SizeType32 maxBeamWidth)
+{
+    auto* last_token_ids
+        = buildState.networkDefinition->addInput(batch_manager::RuntimeBuffers::kLastTokenIdsTensorName,
+            nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({-1}));
+    buildState.tensors.push_back(last_token_ids);
+    buildState.profile->setDimensions(batch_manager::RuntimeBuffers::kLastTokenIdsTensorName,
+        nvinfer1::OptProfileSelector::kMAX, runtime::ITensor::makeShape({maxBatchSize * maxBeamWidth}));
+    buildState.profile->setDimensions(batch_manager::RuntimeBuffers::kLastTokenIdsTensorName,
+        nvinfer1::OptProfileSelector::kOPT, runtime::ITensor::makeShape({maxBatchSize * maxBeamWidth / 2}));
+    buildState.profile->setDimensions(batch_manager::RuntimeBuffers::kLastTokenIdsTensorName,
+        nvinfer1::OptProfileSelector::kMIN, runtime::ITensor::makeShape({1}));
+    return last_token_ids;
+}
+
 nvinfer1::ITensor& tensorrt_llm::testing::utils::engines::details::addKvCacheOffsets(EngineBuildState& buildState,
     runtime::SizeType32 numPools, runtime::SizeType32 tokensPerBlock, runtime::SizeType32 maxBatchSize,
     runtime::SizeType32 maxNumTokens, runtime::SizeType32 maxBeamWidth)

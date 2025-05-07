@@ -265,6 +265,20 @@ class PerfBenchScriptTestCmds(NamedTuple):
                 benchmark_cmd = mpi_cmd + command
                 output += subprocess.check_output(benchmark_cmd,
                                                   env=envs).decode()
+                # write config.json to output log
+                match = re.search(r'--engine_dir=([^\s]+)', current_cmd_str)
+                if match:
+                    engine_dir = match.group(1)
+                    print_info(
+                        f'writing config.json in {engine_dir} to output log')
+                    with open(os.path.join(engine_dir, "config.json"),
+                              "r") as f:
+                        config_content = f.read()
+                        output += "\n" + "=" * 50 + "\n"
+                        output += "ENGINE CONFIG:\n"
+                        output += "=" * 50 + "\n"
+                        output += config_content
+                        output += "\n" + "=" * 50 + "\n"
         return output
 
     def get_cmd_str(self, cmd_idx) -> List[str]:
@@ -411,7 +425,9 @@ class AbstractPerfScriptTestClass(abc.ABC):
                             print(collect_and_clean_myelin_time(output))
 
                     # Print the output log to stdout and cache it.
-                    print(buf.getvalue())
+                    # skip the output log for prepare dataset command
+                    if 'prepare_dataset' not in commands.get_cmd_str(cmd_idx):
+                        print(buf.getvalue())
                     outputs[cmd_idx] = buf.getvalue()
             else:
                 print_info(f"Reusing cached logs for command index {cmd_idx}.")

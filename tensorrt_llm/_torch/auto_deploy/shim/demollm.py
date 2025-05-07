@@ -36,16 +36,26 @@ class DemoEngine(ADEngine):
     """
 
     @torch.inference_mode()
+    def __init__(
+        self,
+        get_inference_model,
+        seq_info,
+        device,
+    ) -> None:
+        super().__init__(get_inference_model, seq_info, device)
+        self.queue = mp.Queue()
+
+    @torch.inference_mode()
     def __call__(self, requests: GenerationRequest) -> mp.Queue:
         """Generate tokens and put the results in a queue and return the queue."""
         output = self.generate_tokens_batched([requests])[0]
-        queue = mp.Queue()
-        queue.put(output)
-        return queue
+        self.queue.put(output)
+        return self.queue
 
     def stop(self):
         """Stop the engine."""
-        pass
+        self.queue.close()
+        self.queue.join_thread()
 
     def _assign_pages(self) -> List[List[int]]:
         """A simple heuristic to assign pages based on current sequence info.

@@ -45,23 +45,16 @@ TrtEncoderModel::TrtEncoderModel(runtime::ModelConfig const& modelConfig, WorldC
     , mWorldConfig{worldConfig}
     , mDevice{runtime::utils::initDevice(worldConfig)}
     , mLogger{logger ? std::move(logger) : std::make_shared<TllmLogger>()}
-    , mRuntime{std::make_shared<TllmRuntime>(rawEngine, mLogger.get(), optionalParams.gpuWeightsPercent)}
-    , mMicroBatchId(0)
+    , mRuntime{std::make_shared<TllmRuntime>(
+          rawEngine, mLogger.get(), optionalParams.useGpuDirectStorage, optionalParams.gpuWeightsPercent)}
+    , mNumMicroBatches{1}
+    , mNumBuffers{mNumMicroBatches}
     , mCopyBufferManager{std::make_shared<CudaStream>()}
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    if (mWorldConfig.isPipelineParallel())
-    {
-        TLLM_THROW("Pipeline parallelism is currently not supported for encoder models.");
-        mNumMicroBatches = mWorldConfig.getPipelineParallelism();
-    }
-    else
-    {
-        mNumMicroBatches = isTrtOverlap() ? 2 : 1;
-    }
-
-    mNumBuffers = mNumMicroBatches;
+    TLLM_CHECK_WITH_INFO(
+        !mWorldConfig.isPipelineParallel(), "Pipeline parallelism is currently not supported for encoder models.");
 
     createRuntimeContexts();
 
@@ -104,6 +97,18 @@ BufferManager const& TrtEncoderModel::getBufferManager() const
 BufferManager::CudaStreamPtr TrtEncoderModel::getRuntimeStreamPtr() const
 {
     return mRuntime->getStreamPtr();
+}
+
+nvinfer1::DataType TrtEncoderModel::getTensorDataType(std::string const& name) const
+{
+    auto const& engine = mRuntime->getEngine();
+    return engine.getTensorDataType(name.c_str());
+}
+
+nvinfer1::Dims TrtEncoderModel::getTensorShape(std::string const& name) const
+{
+    auto const& engine = mRuntime->getEngine();
+    return engine.getTensorShape(name.c_str());
 }
 
 void TrtEncoderModel::getCurrentIterationStats(executor::IterationStats& stats) const
@@ -387,6 +392,14 @@ void TrtEncoderModel::terminateRequest(std::shared_ptr<LlmRequest> const& llmReq
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void TrtEncoderModel::terminateRequestSync(
+    std::shared_ptr<LlmRequest> const& llmReq, executor::FinishReason finishReason)
+{
+    terminateRequest(llmReq, false);
+    llmReq->finishByReason(finishReason);
+    llmReq->clearGeneratedTokens();
 }
 
 void TrtEncoderModel::fillEncoderOutputSync(RequestVector const& requestList, TensorMap outputTensors)

@@ -52,6 +52,9 @@ public:
     ~TrtEncoderModel() override;
 
     void terminateRequest(std::shared_ptr<LlmRequest> const& llmRequest, bool pause = false) override;
+    void terminateRequestSync(
+        std::shared_ptr<LlmRequest> const& llmRequest, executor::FinishReason finishReason) override;
+
     void forward(RequestVector& activeRequests);
 
     void forwardSync() override;
@@ -96,17 +99,8 @@ public:
         return getModelConfig().getDataType();
     }
 
-    nvinfer1::DataType getTensorDataType(std::string const& name) const override
-    {
-        auto const& engine = mRuntime->getEngine();
-        return engine.getTensorDataType(name.c_str());
-    }
-
-    nvinfer1::Dims getTensorShape(std::string const& name) const override
-    {
-        auto const& engine = mRuntime->getEngine();
-        return engine.getTensorShape(name.c_str());
-    }
+    nvinfer1::DataType getTensorDataType(std::string const& name) const override;
+    nvinfer1::Dims getTensorShape(std::string const& name) const override;
 
     [[nodiscard]] TrtGptModelType getModelType() const override
     {
@@ -185,7 +179,7 @@ private:
     std::shared_ptr<nvinfer1::ILogger> mLogger;
     std::shared_ptr<runtime::TllmRuntime> mRuntime;
 
-    SizeType32 mMicroBatchId;
+    SizeType32 mMicroBatchId{0};
 
     // TODO: Add runtime buffers for async PP
     std::vector<std::shared_ptr<EncoderBuffers>> mBuffers;

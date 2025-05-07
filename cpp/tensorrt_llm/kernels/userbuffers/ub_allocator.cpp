@@ -49,13 +49,13 @@ UBBuffer UserBufferAllocator::register_ub_buffer(size_t bytes)
     return {addr, handle, bytes};
 }
 
-void* UserBufferAllocator::allocate(int idx, size_t bytes)
+UBBuffer UserBufferAllocator::allocate(size_t bytes)
 {
-    TLLM_CHECK(is_initialized() && idx < buffers_.size() && buffers_[idx].invalid());
+    TLLM_CHECK(is_initialized());
     auto ub_buffer = register_ub_buffer(bytes);
     TLLM_CHECK(!ub_buffer.invalid());
-    buffers_[idx] = ub_buffer;
-    return ub_buffer.addr;
+    buffers_.push_back(ub_buffer);
+    return ub_buffer;
 }
 
 void UserBufferAllocator::deallocate(void* addr) {}

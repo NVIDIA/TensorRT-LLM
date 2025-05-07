@@ -56,9 +56,9 @@ public:
     [[nodiscard]] static size_t serializedSize(OutputConfig const& config);
 
     // OutputConfig::AdditionalModelOutput
-    [[nodiscard]] static OutputConfig::AdditionalModelOutput deserializeAdditionalModelOutput(std::istream& is);
-    static void serialize(OutputConfig::AdditionalModelOutput const& additionalModelOutput, std::ostream& os);
-    [[nodiscard]] static size_t serializedSize(OutputConfig::AdditionalModelOutput const& additionalModelOutput);
+    [[nodiscard]] static AdditionalModelOutput deserializeAdditionalModelOutput(std::istream& is);
+    static void serialize(AdditionalModelOutput const& additionalModelOutput, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(AdditionalModelOutput const& additionalModelOutput);
 
     // ExternalDraftTokensConfig
     [[nodiscard]] static ExternalDraftTokensConfig deserializeExternalDraftTokensConfig(std::istream& is);
@@ -226,6 +226,11 @@ public:
     static DebugConfig deserializeDebugConfig(std::istream& is);
     static void serialize(DebugConfig const& debugConfig, std::ostream& os);
     static size_t serializedSize(DebugConfig const& debugConfig);
+
+    // CacheTransceiverConfig
+    static CacheTransceiverConfig deserializeCacheTransceiverConfig(std::istream& is);
+    static void serialize(CacheTransceiverConfig const& cacheTransceiverConfig, std::ostream& os);
+    static size_t serializedSize(CacheTransceiverConfig const& cacheTransceiverConfig);
 
     // ExecutorConfig
     static ExecutorConfig deserializeExecutorConfig(std::istream& is);

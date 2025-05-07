@@ -91,7 +91,7 @@ protected:
 TEST_F(TllmRuntimeTest, SinglePass)
 {
     EXPECT_TRUE(mSerializedEngine);
-    TllmRuntime rt{RawEngine(mSerializedEngine.get()), &mLogger, 1.0F};
+    TllmRuntime rt{RawEngine(mSerializedEngine.get()), &mLogger, false, 1.0F};
     auto& engine = rt.getEngine();
     EXPECT_FALSE(engine.hasImplicitBatchDimension());
     EXPECT_EQ(rt.getNbProfiles(), engine.getNbOptimizationProfiles());

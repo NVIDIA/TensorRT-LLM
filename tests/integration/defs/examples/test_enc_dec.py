@@ -16,7 +16,7 @@
 import pytest
 from defs.common import (convert_weights, quantize_data, venv_check_call,
                          venv_mpi_check_call)
-from defs.conftest import (get_device_count, llm_models_root, skip_fp8_pre_ada,
+from defs.conftest import (get_device_count, skip_fp8_pre_ada,
                            skip_post_blackwell)
 from defs.trt_test_alternative import check_call
 
@@ -77,12 +77,6 @@ def test_llm_enc_dec_general(llm_venv, cmodel_dir, engine_dir, data_type,
 
     if use_fp8:
         assert use_paged_kv_cache and use_attention_plugin
-        # a workaround to install pre-built whl before modelopt release new version
-        models_root = llm_models_root()  # /scratch.trt_llm_data/llm-models
-        llm_venv.run_cmd([
-            "-m", "pip", "install",
-            f"{models_root}/wheels/nvidia_modelopt-0.22.1.dev96+g22762793-py3-none-any.whl"
-        ])
         # a known apex huggingface bug for t5 only
         # t5 only takes float32 in quantization loop
         # https://github.com/huggingface/transformers/issues/34264
@@ -170,7 +164,7 @@ def test_llm_enc_dec_general(llm_venv, cmodel_dir, engine_dir, data_type,
     if use_paged_kv_cache and pp_size == 1:
         # use paged engines to cover ModelRunnerCpp tests
         run_cmd = [
-            f"{enc_dec_example_root}/../run.py",
+            f"{enc_dec_example_root}/../../../run.py",
             f"--engine_dir={enc_dec_engine_dir}",
             f"--tokenizer_dir={model_ckpt_path}",
             "--max_output_len=24",
@@ -236,12 +230,6 @@ def test_llm_enc_dec_mmlu(llm_venv, cmodel_dir, engine_dir, data_type,
         model_type = "nmt"
 
     if use_fp8:
-        # a workaround to install pre-built whl before modelopt release new version
-        models_root = llm_models_root()  # /scratch.trt_llm_data/llm-models
-        llm_venv.run_cmd([
-            "-m", "pip", "install",
-            f"{models_root}/wheels/nvidia_modelopt-0.22.1.dev96+g22762793-py3-none-any.whl"
-        ])
         # a known apex huggingface bug for t5 only
         # t5 only takes float32 in quantization loop
         # https://github.com/huggingface/transformers/issues/34264
@@ -329,7 +317,7 @@ def test_llm_enc_dec_mmlu(llm_venv, cmodel_dir, engine_dir, data_type,
     accuracy_threshold = accuracy_threshold_map[tllm_model_name][precision]
 
     mmlu_cmd = [
-        f"{enc_dec_example_root}/../mmlu.py",
+        f"{enc_dec_example_root}/../../../mmlu.py",
         f"--data_dir={mmlu_dataset_root}",
         f"--hf_model_dir={model_ckpt_path}",
         "--test_trt_llm",

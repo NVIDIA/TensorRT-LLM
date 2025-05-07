@@ -209,7 +209,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
         xqaParams.kv_cache_data_type = xqaParams.data_type;
     }
     if (xqaParams.kv_cache_data_type == DATA_TYPE_INT8
-        || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && mSM < kSM_90))
+        || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && (mSM < kSM_90 || mSM >= kSM_120)))
     {
         xqaParams.multi_block_mode = false;
     }
@@ -749,7 +749,7 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
     if (mIsMLAEnabled)
     {
         size_t flash_mla_workspace_size = 0;
-        if (mUseFlashMLA)
+        if (mUseGenFlashMLA)
         {
             int const FLASH_MLA_NUM_BUFFERS = 5;
             size_t flash_mla_workspaces[FLASH_MLA_NUM_BUFFERS];
@@ -915,7 +915,8 @@ int AttentionOp::mlaGeneration(
     params.quant_scale_kv = generation_params.kv_scale_orig_quant;
     params.dequant_scale_q = generation_params.kv_scale_quant_orig;
     params.dequant_scale_kv = generation_params.kv_scale_quant_orig;
-    params.host_bmm1_scale = 1 / (sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
+    params.host_bmm1_scale
+        = 1 / (mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
 
     invokeMLARopeGeneration<T>(params, kv_cache_buffer, stream);
     sync_check_cuda_error(stream);
@@ -935,6 +936,7 @@ int AttentionOp::mlaGeneration(
 
     if (mUseTllmGen)
     {
+        TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
         TllmGenFmhaRunnerParams tllmRunnerParams;
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
 
@@ -990,10 +992,9 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mScaleQ = mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim))
             / sqrtf((float) (mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim));
 
-        auto const [freeMemory, totalMemory] = tensorrt_llm::common::getDeviceMemoryInfo(false);
         // The kv cache should be based on the maximum headDim of K and V due to paddings.
         int maxHeadDimKv = std::max(tllmRunnerParams.mHeadDimQk, tllmRunnerParams.mHeadDimV);
-        tllmRunnerParams.mNumPagesInMemPool = totalMemory
+        tllmRunnerParams.mNumPagesInMemPool = mTllmGenFMHARunner->getTotalDeviceMemory()
             / (tllmRunnerParams.mNumHeadsKv * tllmRunnerParams.mNumTokensPerPage * maxHeadDimKv * elemSize);
 
         tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
@@ -1001,15 +1002,18 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mSfStartTokenIdx = generation_params.start_token_idx_sf;
 
         // Scales for quantization
-        static constexpr int bmm1_scale_offset = 1;
-        tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(params.bmm2_scale);
-        tllmRunnerParams.scaleSoftmaxLog2Ptr = reinterpret_cast<float const*>(params.bmm1_scale) + bmm1_scale_offset;
+        if (mFP8GenerationMLA)
+        {
+            static constexpr int bmm1_scale_offset = 1;
+            tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(params.bmm2_scale);
+            tllmRunnerParams.scaleSoftmaxLog2Ptr
+                = reinterpret_cast<float const*>(params.bmm1_scale) + bmm1_scale_offset;
+        }
 
-        TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
         mTllmGenFMHARunner->run(tllmRunnerParams);
         sync_check_cuda_error(stream);
     }
-    else if (mUseFlashMLA)
+    else if (mUseGenFlashMLA)
     {
         static constexpr int block_size_n = 64;
         static constexpr int fixed_overhead_num_blocks = 5;
@@ -2276,29 +2280,29 @@ int AttentionOp::initialize() noexcept
     if (mFP8ContextFMHA)
     {
         TLLM_CHECK_WITH_INFO(mEnableContextFMHA, "FP8 FMHA cannot be enabled because Context FMHA is not supported.");
-        TLLM_CHECK_WITH_INFO(
-            mSM == 89 || mSM == 90 || mSM == 100, "FP8 FMHA can only be enabled on sm_89, sm_90 or sm_100.");
+        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 120,
+            "FP8 FMHA can only be enabled on sm_89, sm_90, sm_100 or sm_120.");
     }
 
     // Pre-Check of FP8 Generation MLA.
     if (mFP8GenerationMLA)
     {
         TLLM_CHECK_WITH_INFO(mIsMLAEnabled, "FP8 Generation MLA cannot be enabled because MLA is not supported.");
-        TLLM_CHECK_WITH_INFO(
-            mSM == 90 || mSM == 100, "FP8 Generation MLA is supported on Hopper or Blackwell architecture.");
+        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 120,
+            "FP8 Generation MLA is supported on Ada, Hopper or Blackwell architecture.");
     }
 
     // Check requirements for FP4 output.
     TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || mEnableContextFMHA, "Context FMHA must enable if fuse_fp4_quant is enabled");
-    TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || (mSM >= 100), "fuse_fp4_quant only supports SM100 and later devices.");
+    TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || mSM == 100, "fuse_fp4_quant only supports SM100 devices.");
 
     TLLM_CHECK(isRoPE() == (mRotaryEmbeddingDim != 0));
     TLLM_CHECK_WITH_INFO((mSM >= 80) || (mType != nvinfer1::DataType::kBF16),
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
 
     // Pre-check whether the head size is supported by MMHA.
-    // Support head size == 72 only for fmha kernels (in Cross Attention), so skip pre-check here.
-    if (getHeadSize() == 72 && mCrossAttention)
+    // Support head size == 72 only for fmha kernels, so skip pre-check here.
+    if (getHeadSize() == 72)
     {
         ;
     }
@@ -2412,7 +2416,7 @@ int AttentionOp::initialize() noexcept
         fmhaParams.numTokensPerBlock = mTokensPerBlock;
         fmhaParams.headSize = mHeadSize;
         fmhaParams.headSizeV = mHeadSize;
-        if (mIsMLAEnabled)
+        if (mIsMLAEnabled && !mIsGenerationMLA)
         {
             // Context attention of MLA is different
             fmhaParams.numKvHeads = mNumHeads;
@@ -2472,10 +2476,9 @@ int AttentionOp::initialize() noexcept
                 // Instantiate the mTllmGenFMHARunner used for MLA
                 mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(qDataType, kvDataType, outputDataType));
             }
-            else
+            else if (mIsGenerationMLA && !mUseGenFlashMLA)
             {
-                // Construct the fmha runner.
-                // FP8 Generation MLA also uses context FMHA.
+                // Construct the fmha runner for generation.
                 if (mFP8GenerationMLA)
                 {
                     data_type = DATA_TYPE_E4M3;
@@ -2513,17 +2516,24 @@ int AttentionOp::initialize() noexcept
                 fmhaParams.tpRank = mTpRank;
                 mDecoderFMHARunner.reset(new FusedMHARunnerV2(fmhaParams));
 
-                // Only deepseek must using fmha.
-                TLLM_CHECK_WITH_INFO(
-                    mDecoderFMHARunner->isFmhaSupported(), "Deepseek should be supported by fmha in generation part.");
+                // Only deepseek must using fmha in the generation phase when flash mla is not enabled.
+                if (!mUseGenFlashMLA)
+                {
+                    TLLM_CHECK_WITH_INFO(mDecoderFMHARunner->isFmhaSupported(),
+                        "Deepseek should be supported by fmha in generation part.");
+                }
             }
-
-            TLLM_CHECK_WITH_INFO(
-                mFmhaDispatcher->isSupported(), "Deepseek should be supported by fmha in context part.");
+            if (!mIsGenerationMLA)
+            {
+                TLLM_CHECK_WITH_INFO(
+                    mFmhaDispatcher->isSupported(), "Deepseek should be supported by fmha in context part.");
+            }
         }
 
         // Fall back to unfused MHA kernels if not supported.
-        mEnableContextFMHA = mFmhaDispatcher->isSupported();
+        // Generation MLA reuses the context FMHA code path so set mEnableContextFMHA to true.
+        // However, do not check mFmhaDispatcher which is not used for generation MLA.
+        mEnableContextFMHA = mIsGenerationMLA || mFmhaDispatcher->isSupported();
 
         // Only FMHA supports custom mask currently.
         TLLM_CHECK_WITH_INFO(
@@ -2640,6 +2650,12 @@ void AttentionOp::debugCheckSemaphores(cudaStream_t stream)
 #ifdef NDEBUG
     TLLM_CHECK_WITH_INFO(false, "debugCheckSemaphores should not be called in release build");
 #endif
+
+    if (isCapturing(stream))
+    {
+        // The sync for the d2h copy below won't work when we're capturing CUDA graphs.
+        return;
+    }
     if (mNbMultiBlockSemaphores == 0)
     {
         return;
@@ -2690,7 +2706,8 @@ std::string AttentionOp::toString() const
     ss << "mFMHAForceFP32Acc: " << std::boolalpha << mFMHAForceFP32Acc << std::endl;
     ss << "mSM: " << mSM << std::endl;
     ss << "mUseTllmGen: " << mUseTllmGen << std::endl;
-    ss << "mUseFlashMLA: " << mUseFlashMLA << std::endl;
+    ss << "mIsGenerationMLA: " << std::boolalpha << mIsGenerationMLA << std::endl;
+    ss << "mUseGenFlashMLA: " << mUseGenFlashMLA << std::endl;
     ss << "mMultiProcessorCount: " << mMultiProcessorCount << std::endl;
     ss << "mMaxSharedMemoryPerBlockOptin: " << mMaxSharedMemoryPerBlockOptin << std::endl;
     ss << "mMultiBlockMode: " << std::boolalpha << mMultiBlockMode << std::endl;

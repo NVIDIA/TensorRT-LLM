@@ -51,64 +51,67 @@ public:
         TLLM_CHECK_WITH_INFO(static_cast<bool>(this->endIds), "Invalid endIds tensor");
     }
 
-    // mandatory parameters
+    //! Mandatory parameters
+    //! The index of the decoding step we are on. Only used in Python runtime
+    SizeType32 step;
+    //! The maximum number of tokens to decode
+    SizeType32 maxLength;
+    //! The maximum length of the attention window to consider while decoding
+    SizeType32 maxAttentionWindow;
+    //! The number of tokens to use as attention sinks, https://arxiv.org/html/2309.17453v3
+    SizeType32 sinkTokenLength;
+    //! The number of samples in the batch
+    SizeType32 batchSize;
+    //! The beam widths of each request, [batchSize]
+    std::vector<SizeType32> beamWidths;
 
-    SizeType32 step;                    //!< The index of the decoding step we are on. Only used in Python runtime.
+    //! The maximum value in the `stopWordsLens` tensor
+    SizeType32 maxStopWordsLen;
+    //! The maximum value in the `badWordsLens` tensor
+    SizeType32 maxBadWordsLen;
+    //! The output of the model forward computation, a probability distribution over the vocabulary
+    //! [batchSize, beamWidth, vocabSizePadded] on gpu
+    TensorConstPtr logits;
+    //! Another view on the logits, [batchSize][beamWidth, vocabSizePadded] on gpu
+    std::optional<std::vector<TensorConstPtr>> logitsVec;
+    //! The end ids, [batchSize * beamWidth] on gpu
+    TensorConstPtr endIds;
+    //! Address map of the linear batch id to to the seq slots, [batchSize] on pinned, int32_t
+    TensorConstPtr batchSlots;
 
-    SizeType32 maxLength;               //!< The maximum number of tokens to decode.
+    //! Optional parameters
+    //! Finished states at current iteration (skip decoding step of a request if true), [batchSize, beamWidth] on gpu
+    TensorConstPtr finishReasons;
+    //! The maximum sequence length for each sequence in the batch, [batchSize] on gpu
+    TensorConstPtr sequenceLimitLength;
+    TensorConstPtr embeddingBias;          // [batchSize, vocabSizePadded] on gpu
+    TensorConstPtr lengths;                // [batchSize, beamWidth] on gpu
+    std::vector<TensorPtr> badWordsLists;  // [batchSize][2, badWordsLength] on gpu
+    TensorConstPtr badWordsPtrs;           // [batchSize][2, badWordsLength] on pinned
+    TensorConstPtr badWordsLens;           // [batchSize] on gpu
+    std::vector<TensorPtr> stopWordsLists; // [batchSize][2, stopWordsLength] on gpu
+    TensorConstPtr stopWordsPtrs;          // [batchSize][2, stopWordsLength] on pinned
+    TensorConstPtr stopWordsLens;          // [batchSize] on pinned
+    TensorConstPtr noRepeatNgramSize;      // [batchSize] on gpu
 
-    SizeType32 maxAttentionWindow;      //!< The maximum length of the attention window to consider while decoding.
-
-    SizeType32 sinkTokenLength;         //!< the number of tokens to use as attention sinks, as described there: @link
-                                        //!< https://arxiv.org/html/2309.17453v3
-
-    SizeType32 batchSize;               //!< The number of requests in the batch.
-
-    std::vector<SizeType32> beamWidths; //!<  [batchSize], the beam widths of each request.
-
-    SizeType32 maxStopWordsLen;         //!<  The maximum value in the `stopWordsLens` tensor.
-
-    SizeType32 maxBadWordsLen;          //!<  The maximum value in the `badWordsLens` tensor.
-
-    TensorConstPtr logits; //!<  [batchSize, beamWidth, vocabSizePadded], on gpu. Logits are are a probability
-                           //!<  distribution over the vocabulary, the output of the model.
-    std::optional<std::vector<TensorConstPtr>>
-        logitsVec; //!< Vector of size [batchSize] contains logits of size [beamWidth, vocabSizePadded], on gpu. This is
-                   //!< another view on the @property logits
-
-    TensorConstPtr endIds; //!<  [batchSize * beamWidth], on gpu
-
-    TensorConstPtr
-        batchSlots; //!<  [batchSize], address map of the linear batch id to to the seq slots, int32_t, pinned
-
-    // optional parameters
-    TensorConstPtr finishReasons; //!<  [batchSize, beamWidth], finished states at current iteration.
-                                  //!<  If true for some request, the decoding step of it is skipped, on gpu
-    TensorConstPtr
-        sequenceLimitLength;      //!<  [batchSize], on gpu. The maximum sequence length for each sequence in the batch.
-    TensorConstPtr embeddingBias; //!<  [batchSize, vocabSizePadded], on gpu
-    TensorConstPtr lengths;       //!<  [batchSize, beamWidth], on gpu
-    std::vector<TensorPtr> badWordsLists;  // vector with batchSize elements of size [2, badWordsLength], on gpu
-    TensorConstPtr badWordsPtrs;           //!<  [batchSize][2, badWordsLength], on gpu
-    TensorConstPtr badWordsLens;           //!<  [batchSize], on gpu
-    std::vector<TensorPtr> stopWordsLists; // vector with batchSize elements of size [2, stopWordsLength], on gpu
-    TensorConstPtr stopWordsPtrs;          //!<  [batchSize][2, stopWordsLength], pinned
-    TensorConstPtr stopWordsLens;          //!<  [batchSize], pinned
-    TensorConstPtr noRepeatNgramSize;      //!<  [batchSize], on gpu
-
-    // parameters for beam search
-    TensorPtr cacheIndirection; //!<  [batchSize, beamWidth, maxSeqLen] - the k/v cache index for beam search, on gpu
+    //! Parameters for beam search
+    //! KV cache index for beam search, [batchSize, beamWidth, maxSeqLen] on gpu
+    TensorPtr cacheIndirection;
 
     // Medusa
     class MedusaInputs
     {
     public:
-        TensorConstPtr medusaPaths;   //!<  [batchSize, maxTokensPerStep, maxMedusaHeads + 1], on gpu
-        TensorConstPtr medusaTreeIds; //!<  [batchSize, maxTokensPerStep], on gpu
-        std::vector<std::vector<TensorPtr>>
-            medusaLogits; //!<  [batchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded], on gpu
-        TensorPtr medusaCurTokensPerStep;         //!<  [batchSize], on gpu
-        TensorConstPtr medusaTargetTokensPerStep; //!<  [batchSize], on gpu
+        //! [batchSize, maxTokensPerStep, maxMedusaHeads + 1], on gpu
+        TensorConstPtr medusaPaths;
+        //! [batchSize, maxTokensPerStep], on gpu
+        TensorConstPtr medusaTreeIds;
+        //! [batchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded], on gpu
+        std::vector<std::vector<TensorPtr>> medusaLogits;
+        //! [batchSize], on gpu
+        TensorPtr medusaCurTokensPerStep;
+        //! [batchSize], on gpu
+        TensorConstPtr medusaTargetTokensPerStep;
     };
 
     class ExternalDraftTokensInputs
@@ -131,21 +134,21 @@ public:
     class ExplicitDraftTokensInputs
     {
     public:
-        TensorConstPtr nextDraftTokens;       //!<  [batchSize, maxNumPaths, maxPathLen]
-        TensorConstPtr nextFlatTokens;        //!<  [batchSize * maxDecodingTokens]
-        TensorConstPtr nextDraftIndices;      //!<  [batchSize, maxNumPaths, maxPathLen]
-        TensorConstPtr nextDraftProbs;        //!<  [batchSize, maxNumPaths, maxDraftPathLen, vocabSize]
-        TensorConstPtr lastDraftTokens;       //!<  [batchSize, maxNumPaths, maxPathLen]
-        TensorConstPtr lastDraftIndices;      //!<  [batchSize, maxNumPaths, maxPathLen]
-        TensorConstPtr masks;                 //!<  [batchSize, maxDecodingTokens, maxDecodingTokens], bool
-        TensorConstPtr packedPositionIds;     //!<  [batchSize * maxDecodingTokens]
-        TensorConstPtr bestPathLengths;       //!<  [batchSize]
-        TensorConstPtr bestPathIndices;       //!<  [batchSize]
-        TensorConstPtr nextGenerationLengths; //!<  [batchSize]
-        TensorConstPtr lastPositionIdsBase;   //!<  [batchSize]
-        TensorConstPtr lastGenerationLengths; //!<  [batchSize]
-        TensorConstPtr maxGenLengthDevice;    //!<  [1]
-        TensorConstPtr seqSlots;              //!<  [batchSize]
+        TensorConstPtr nextDraftTokens;       // [batchSize, maxNumPaths, maxPathLen]
+        TensorConstPtr nextFlatTokens;        // [batchSize * maxDecodingTokens]
+        TensorConstPtr nextDraftIndices;      // [batchSize, maxNumPaths, maxPathLen]
+        TensorConstPtr nextDraftProbs;        // [batchSize, maxNumPaths, maxDraftPathLen, vocabSize]
+        TensorConstPtr lastDraftTokens;       // [batchSize, maxNumPaths, maxPathLen]
+        TensorConstPtr lastDraftIndices;      // [batchSize, maxNumPaths, maxPathLen]
+        TensorConstPtr masks;                 // [batchSize, maxDecodingTokens, maxDecodingTokens], bool
+        TensorConstPtr packedPositionIds;     // [batchSize * maxDecodingTokens]
+        TensorConstPtr bestPathLengths;       // [batchSize]
+        TensorConstPtr bestPathIndices;       // [batchSize]
+        TensorConstPtr nextGenerationLengths; // [batchSize]
+        TensorConstPtr lastPositionIdsBase;   // [batchSize]
+        TensorConstPtr lastGenerationLengths; // [batchSize]
+        TensorConstPtr maxGenLengthDevice;    // [1]
+        TensorConstPtr seqSlots;              // [batchSize]
     };
 
     struct LookaheadInputs
@@ -173,18 +176,17 @@ public:
         {
         }
 
-        TensorConstPtr nextDraftTokens;          //!< [batchSize, maxDecodingDraftTokens]
-        TensorConstPtr nextDraftLens;            //!< [batchSize]
-        TensorConstPtr nextDraftPaths;           //!< [batchSize, maxDecodingTokens, maxPathLen]
-        TensorConstPtr lastDraftTokens;          //!< [batchSize, maxNumPaths, maxPathLen]
-        TensorConstPtr lastDraftLens;            //!< [batchSize]
-        TensorConstPtr lastDraftPaths;           //!< [batchSize, maxDecodingTokens, maxPathLen]
-
-        TensorConstPtr acceptedTokens;           //!< [batchSize, maxPathLen]
-        TensorConstPtr acceptedLens;             //!< [batchSize]
-        TensorConstPtr acceptedPathIds;          //!< [batchSize]
-        TensorConstPtr chunkedContextNextTokens; //!< [batchSize]
-        TensorConstPtr seqSlots;                 //!< [batchSize]
+        TensorConstPtr nextDraftTokens;          // [batchSize, maxDecodingDraftTokens]
+        TensorConstPtr nextDraftLens;            // [batchSize]
+        TensorConstPtr nextDraftPaths;           // [batchSize, maxDecodingTokens, maxPathLen]
+        TensorConstPtr lastDraftTokens;          // [batchSize, maxNumPaths, maxPathLen]
+        TensorConstPtr lastDraftLens;            // [batchSize]
+        TensorConstPtr lastDraftPaths;           // [batchSize, maxDecodingTokens, maxPathLen]
+        TensorConstPtr acceptedTokens;           // [batchSize, maxPathLen]
+        TensorConstPtr acceptedLens;             // [batchSize]
+        TensorConstPtr acceptedPathIds;          // [batchSize]
+        TensorConstPtr chunkedContextNextTokens; // [batchSize]
+        TensorConstPtr seqSlots;                 // [batchSize]
     };
 
     std::optional<MedusaInputs> medusaInputs;

@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ast
 import json
 import os
 import subprocess
@@ -81,12 +82,30 @@ def read_decoder_start_token_id(engine_dir):
     return config['pretrained_config']['decoder_start_token_id']
 
 
-def read_model_name(engine_dir: str):
-    engine_version = get_engine_version(engine_dir)
+def read_is_enc_dec(engine_dir: str, is_hf: bool = False):
+    if is_hf:
+        with open(Path(engine_dir) / "config.json", 'r') as f:
+            config = json.load(f)
+        is_enc_dec = config.get('is_encoder_decoder', False)
+    else:
+        is_enc_dec = {'encoder', 'decoder'}.issubset({
+            name
+            for name in os.listdir(engine_dir)
+            if os.path.isdir(os.path.join(engine_dir, name))
+        })
+    return is_enc_dec
 
+
+def read_model_name(engine_dir: str, is_hf: bool = False):
     with open(Path(engine_dir) / "config.json", 'r') as f:
         config = json.load(f)
 
+    if is_hf:
+        model_arch = config['architectures'][0]
+        model_version = config.get('model_type', None)
+        return model_arch, model_version
+
+    engine_version = get_engine_version(engine_dir)
     if engine_version is None:
         return config['builder_config']['name'], None
 
@@ -198,7 +217,7 @@ def prepare_enc_dec_inputs(batch_input_ids: List[torch.Tensor], model_name: str,
     encoder_input_ids = None
     if 'whisper' in model_name.lower():
         # cannot directly import whisper due to name collision
-        sys.path.append(f"{os.path.dirname(__file__)}/whisper")
+        sys.path.append(f"{os.path.dirname(__file__)}/models/core/whisper")
         from whisper_utils import log_mel_spectrogram
 
         config_path = os.path.join(engine_dir, 'encoder', 'config.json')
@@ -234,6 +253,40 @@ def prepare_enc_dec_inputs(batch_input_ids: List[torch.Tensor], model_name: str,
     return encoder_input_ids, encoder_input_features, encoder_output_lengths, decoder_input_ids
 
 
+def get_beam_width_array(bwa: str = None):
+    bwa = ast.literal_eval(bwa)  # Short for "beam_width_array"
+    if isinstance(bwa, str):
+        bwa = ast.literal_eval(bwa)  # parse again for string
+
+    def parse_one_bwa(row):
+        assert isinstance(row, list), f"Beam width array must be a list."
+        assert len(
+            row
+        ) <= 8, "Length of beam width array must not be greater than 8 now."
+        assert all([isinstance(beam, int) for beam in row
+                    ]), "Numbers in beam width array must be integer."
+        bwa_tensor = torch.zeros([8], dtype=torch.int32)
+        for j in range(len(row)):
+            bwa_tensor[j] = row[j]
+        bwa_tensor[len(row):] = row[-1]
+        return bwa_tensor, max(row)
+
+    if isinstance(bwa, list):  # Only one BWA
+        bwa_tensor, max_beam_width = parse_one_bwa(bwa)
+    elif isinstance(bwa, tuple):  # BWA for respective requests
+        bwa_tensor_list = []
+        max_beam_width = 0
+        for row in bwa:
+            bwa_tensor, beam_width = parse_one_bwa(row)
+            bwa_tensor_list.append(bwa_tensor)
+            max_beam_width = max(max_beam_width, beam_width)
+        bwa_tensor = torch.stack(bwa_tensor_list, dim=0)
+    else:
+        raise ValueError(f"Invalid beam width array: {bwa}")
+
+    return bwa_tensor.tolist(), max_beam_width
+
+
 def add_common_args(parser):
     # sampling arguments
     parser.add_argument('--num_beams',
@@ -260,6 +313,13 @@ def add_common_args(parser):
                         '1 for early-stopping, 0 for non-early-stopping'
                         'other values for stopping by length',
                         default=1)
+    parser.add_argument(
+        '--beam_width_array',
+        type=str,
+        default=None,
+        help=
+        'Beam width array for each step. E.g.: --beam_width_array="[2,4,6,8]"',
+    )
     parser.add_argument(
         '--end_id',
         default=None,

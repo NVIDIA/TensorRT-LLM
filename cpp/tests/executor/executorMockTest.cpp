@@ -12,11 +12,11 @@
 
 #include "executorTest.h"
 
-#include "modelSpec.h"
 #include "tensorrt_llm/batch_manager/trtGptModel.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/testing/modelSpec.h"
 #include "tests/utils/common.h"
 
 #include <gmock/gmock.h>
@@ -51,6 +51,8 @@ public:
     MOCK_METHOD(void, forwardSync, (), ());
     MOCK_METHOD(void, forwardAsync, (RequestList const&), ());
     MOCK_METHOD(void, terminateRequest, (std::shared_ptr<tb::LlmRequest> const& llmRequest, bool pause), ());
+    MOCK_METHOD(
+        void, terminateRequestSync, (std::shared_ptr<tb::LlmRequest> const& llmRequest, FinishReason finishReason), ());
     MOCK_METHOD(SizeType32, getMaxNumSequences, (), (const));
     MOCK_METHOD(SizeType32, getMaxInputLen, (), (const));
     MOCK_METHOD(SizeType32, getHiddenSize, (), (const));
@@ -195,6 +197,7 @@ TEST_F(GptExecutorTest, MockedModelMaxQueueSize)
     auto model = std::make_shared<MockedModel>();
 
     EXPECT_CALL(*model, terminateRequest(_, _)).Times(0);
+    EXPECT_CALL(*model, terminateRequestSync(_, _)).Times(0);
     EXPECT_CALL(*model, getVocabSizePadded()).Times(0);
     EXPECT_CALL(*model, getLogitDataType()).Times(0);
 
@@ -747,7 +750,12 @@ TEST_F(GptExecutorTest, MockedModelCancelRequest)
     constexpr bool streaming = true;
     auto model = std::make_shared<MockedModel>();
 
+    std::unordered_map<IdType, tensorrt_llm::executor::FinishReason> reqIdsToTerminate;
     // Two requests with one child request (3 in total) should be terminated
+    EXPECT_CALL(*model, terminateRequestSync(_, _))
+        .Times(3)
+        .WillRepeatedly(Invoke([&](LlmRequestPtr const& llmRequest, FinishReason finishReason)
+            { reqIdsToTerminate.try_emplace(llmRequest->mRequestId, finishReason); }));
     EXPECT_CALL(*model, terminateRequest(_, _)).Times(3);
     EXPECT_CALL(*model, getVocabSizePadded()).Times(0);
     EXPECT_CALL(*model, getLogitDataType()).Times(0);
@@ -789,6 +797,17 @@ TEST_F(GptExecutorTest, MockedModelCancelRequest)
                     else
                     {
                         callCountPerSeq[llmReq->mRequestId] = 1;
+                    }
+
+                    if (reqIdsToTerminate.count(llmReq->mRequestId) != 0U)
+                    {
+                        if (!llmReq->isGenerationToCompleteState())
+                        {
+                            model->terminateRequest(llmReq, false);
+                            llmReq->finishByReason(reqIdsToTerminate[llmReq->mRequestId]);
+                            llmReq->clearGeneratedTokens();
+                        }
+                        reqIdsToTerminate.erase(llmReq->mRequestId);
                     }
                 }
                 callCount++;

@@ -66,7 +66,7 @@ def test_llm_bert_general(bert_example_root, llm_venv, model, dtype, pp_size,
     if not use_attention_plugin:
         remove_padding = False
     else:
-        if get_sm_version() >= 100:
+        if get_sm_version() >= 100 and get_sm_version() < 120:
             pytest.skip("Attention plugin is not supported on SM100")
 
     # Convert checkpoints

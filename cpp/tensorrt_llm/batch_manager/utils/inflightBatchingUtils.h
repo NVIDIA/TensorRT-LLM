@@ -37,6 +37,13 @@ TensorPtr collectRequestIds(RequestVector const& contextRequests, RequestVector 
 
 void sortByLoraId(ScheduledRequests& scheduledRequests);
 
+//! @brief Move finished context requests to generation requests.
+//! @details This function assumes that the context requests are sorted so that requests with isLastContextChunk() are
+//!          at the end of the context requests vector. These requests are moved to the beginning of the generation
+//!          requests vector. This means that the order of the requests in context+generation requests is not changed.
+//! @param scheduledRequests The scheduled context and generation requests.
+void moveFinishedContextRequestsToGeneration(ScheduledRequests& scheduledRequests);
+
 //! @param beforeDecoder    Whether the function is called before the decoder. If it is true, correct the output offset.
 //! @param numDroppedTokens The number of dropped tokens for each beam (e.g. when the requests finished early).
 //!                         Generation logits for dropped tokens are ignored.
@@ -44,7 +51,8 @@ void copyGenerationLogits(RuntimeBuffers::GenerationLogitsCache& generationLogit
     runtime::BufferManager const& bufferManager, LlmRequest& llmReq, bool beforeDecoder,
     std::vector<SizeType32> const& numDroppedTokens = {});
 
-void copyAdditionalOutputs(RequestVector const& contextRequests, RequestVector const& generationRequests,
+void copyAdditionalOutputs(std::vector<executor::AdditionalModelOutput> const& additionalModelOutputs,
+    RequestVector const& contextRequests, RequestVector const& generationRequests,
     RuntimeBuffers::TensorMap const& outputMap, runtime::BufferManager const& manager);
 
 void terminateRequest(SequenceSlotManager& seqSlotManager, LlmRequest& llmRequest, SizeType32 maxInputLen,

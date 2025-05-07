@@ -174,20 +174,6 @@ void setRawPointers(ITensor& pointers, ITensor::SharedPtr const& input)
     }
 }
 
-void scatterBufferReplace(ITensor::SharedPtr& tensor, SizeType32 beamWidth, BufferManager& manager)
-{
-    if (tensor)
-    {
-        auto& stream = manager.getStream();
-        auto shape = tensor->getShape();
-        shape.d[0] *= beamWidth;
-        auto tiledTensor = std::shared_ptr(manager.gpu(shape, tensor->getDataType()));
-        kernels::scatterTensor(*tiledTensor, *tensor, beamWidth, stream);
-        stream.synchronize();
-        tensor = tiledTensor;
-    }
-}
-
 void tileBufferReplace(ITensor::SharedPtr& tensor, SizeType32 beamWidth, BufferManager& manager)
 {
     if (tensor)

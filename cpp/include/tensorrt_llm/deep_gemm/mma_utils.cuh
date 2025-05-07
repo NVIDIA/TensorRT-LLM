@@ -26,7 +26,9 @@
 
 #pragma once
 
+#ifndef NVRTC_JIT_COMPILATION
 #include <cuda.h>
+#endif
 
 #include "utils.cuh"
 

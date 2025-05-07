@@ -29,11 +29,11 @@ linuxPkgName = ( env.targetArch == AARCH64_TRIPLE ? "tensorrt-llm-sbsa-release-s
 // available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
 // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
 LLM_DOCKER_IMAGE = env.dockerImage
-LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.0-devel-rocky8-x86_64-rocky8-py310-trt10.8.0.43-skip-devel-202503131720-8877"
-LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.0-devel-rocky8-x86_64-rocky8-py312-trt10.8.0.43-skip-devel-202503131720-8877"
+LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py310-trt10.9.0.34-skip-devel-202504250100-3759"
+LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py312-trt10.9.0.34-skip-devel-202504250100-3759"
 
 // DLFW torch image
-DLFW_IMAGE = "nvcr.io/nvidia/pytorch:25.01-py3"
+DLFW_IMAGE = "nvcr.io/nvidia/pytorch:25.03-py3"
 
 //Ubuntu base image
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
@@ -101,6 +101,8 @@ def TEST_STAGE_LIST = "stage_list"
 @Field
 def GPU_TYPE_LIST = "gpu_type"
 @Field
+def TEST_BACKEND = "test_backend"
+@Field
 def IS_POST_MERGE = "post_merge"
 @Field
 def ADD_MULTI_GPU_TEST = "add_multi_gpu_test"
@@ -115,6 +117,8 @@ def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
 @Field
 def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
 @Field
+def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
+@Field
 def DEBUG_MODE = "debug"
 @Field
 def testFilter = [
@@ -122,6 +126,7 @@ def testFilter = [
     (ENABLE_SKIP_TEST): false,
     (TEST_STAGE_LIST): null,
     (GPU_TYPE_LIST): null,
+    (TEST_BACKEND): null,
     (IS_POST_MERGE): false,
     (ADD_MULTI_GPU_TEST): false,
     (ONLY_MULTI_GPU_TEST): false,
@@ -130,6 +135,19 @@ def testFilter = [
     (MULTI_GPU_FILE_CHANGED): false,
     (ONLY_PYTORCH_FILE_CHANGED): false,
     (DEBUG_MODE): false,
+    (AUTO_TRIGGER_TAG_LIST): [],
+]
+
+@Field
+def GITHUB_PR_API_URL = "github_pr_api_url"
+@Field
+def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
+@Field
+def ACTION_INFO = "action_info"
+def globalVars = [
+    (GITHUB_PR_API_URL): null,
+    (CACHED_CHANGED_FILE_LIST): null,
+    (ACTION_INFO): null,
 ]
 
 String getShortenedJobName(String path)
@@ -264,8 +282,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         def driverVersion = Constants.DEFAULT_NVIDIA_DRIVER_VERSION
         def cpuCount = "${TESTER_CORES}"
 
-        // Multi-GPU only supports DGX-H100 due to the hardware stability.
-        if (type.contains("dgx-h100") && hasMultipleGPUs)
+        // Multi-GPU only supports DGX-H100 and DGX-H200 due to the hardware stability.
+        if ((type.contains("dgx-h100") || type.contains("dgx-h200")) && hasMultipleGPUs)
         {
             // Not a hard requirement, but based on empirical values.
             memorySize = "${gpuCount * 150}" + "Gi"
@@ -279,7 +297,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         targetCould = "kubernetes"
 
         // The following GPU types doesn't support dynamic driver flashing.
-        if (type == "b100-ts2" || type.contains("dgx-h100") || type == "gh200" ) {
+        if (type.contains("dgx-h100") || type.contains("dgx-h200") || type in ["b100-ts2", "gh200", "rtx-5080", "rtx-5090"]) {
             selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
@@ -458,7 +476,9 @@ def runLLMDocBuild(pipeline, config)
                 pip3 install -r requirements.txt && \
                 pip3 install git+https://github.com/sphinx-doc/sphinx.git@v7.4.7 && \
                 doxygen Doxygen && \
-                make html
+                make html && \
+                cd build/html && \
+                touch .nojekyll
             """
         )
     }
@@ -469,6 +489,32 @@ def runLLMDocBuild(pipeline, config)
         "doc-html-preview.tar.gz",
         "${UPLOAD_PATH}/test-results/"
     )
+}
+
+def launchTestListCheck(pipeline)
+{
+    stageName = "Test List Check"
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10"), "trt-llm", {
+        try {
+            echoNodeAndGpuInfo(pipeline, stageName)
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
+            libffi-dev \
+            -y""")
+            sh "nvidia-smi -q"
+            // download TRT-LLM tarfile
+            def tarName = BUILD_CONFIGS[VANILLA_CONFIG][TARNAME]
+            def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pwd && wget -nv ${llmTarfile} && ls -alh")
+            sh "tar -zxf ${tarName}"
+            def llmPath = sh (script: "realpath .", returnStdout: true).trim()
+            def llmSrc = "${llmPath}/TensorRT-LLM/src"
+            sh "python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa"
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            throw e
+        }
+    })
 }
 
 def generateStageFailTestResultXml(stageName, subName, failureLog, resultPath) {
@@ -586,6 +632,12 @@ def renderTestDB(testContext, llmSrc, stageName) {
         // At this point, all tests will be run
         // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
     }
+    if (stageName.contains("-DeepSeek-")) {
+        makoArgs += ["auto_trigger=deepseek"]
+    } else {
+        makoArgs += ["auto_trigger=others"]
+    }
+
     def makoOpts = getMakoOpts(scriptPath, makoArgs)
 
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
@@ -929,6 +981,13 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
                 error("Error in post-debug session: ${e.message}")
             }
         }
+        // If the execution test list is null, remove the test result xml
+        sh """
+            ls -all ${stageName}/
+            if ! grep -q '<testcase' ${stageName}/results.xml; then
+                rm ${stageName}/results.xml
+            fi
+        """
         def llmPath = sh (script: "realpath .", returnStdout: true).trim()
         def llmSrc = "${llmPath}/${LLM_ROOT}${config}/TensorRT-LLM/src"
         // CPP tests will generate test result in ${llmSrc}/cpp/build_backup/, move these files to job result folder
@@ -938,7 +997,6 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
         sh "cd ${llmSrc}/cpp/build_backup/ && sed -i 's/\" classname=\"/\" classname=\"${stageName}./g' *.xml || true"
         sh "cd ${llmSrc}/cpp/build_backup/ && sed -i 's/testsuite name=\"[^\"]*\"/testsuite name=\"${stageName}\"/g' *.xml || true"
         // Sed for Pytest result
-        sh "ls ${stageName}/ -all"
         sh "cd ${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
         // Copy CPP test result
         sh "cp ${llmSrc}/cpp/build_backup/*.xml ${stageName} || true"
@@ -985,7 +1043,6 @@ def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, whe
         # Folders and their allowed files
         declare -A ALLOWED=(
             ["./tensorrt_llm/cpp/tensorrt_llm/kernels/internal_cutlass_kernels/src"]=""
-            ["./tensorrt_llm/cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/src"]=""
         )
 
         for DIR in "${!ALLOWED[@]}"; do
@@ -1030,7 +1087,9 @@ def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, whe
     } else if  (reinstall_dependencies == true) {
         buildArgs = "-a '80-real;86-real;89-real;90-real'"
     }
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${buildArgs}")
+    withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${buildArgs}")
+    }
     if (env.alternativeTRT) {
         sh "bash -c 'pip3 show tensorrt || true'"
     }
@@ -1100,9 +1159,9 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cp
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${pkgUrl}")
     sh "tar -zvxf ${linuxPkgName}"
 
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/gpt && python3 ../generate_checkpoint_config.py --architecture GPTForCausalLM --dtype float16'")
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/gpt && trtllm-build --model_config config.json --log_level verbose'")
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/gpt && python3 ../run.py --max_output_len 4 --end_id -1'")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/models/core/gpt && python3 ../../../generate_checkpoint_config.py --architecture GPTForCausalLM --dtype float16'")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/models/core//gpt && trtllm-build --model_config config.json --log_level verbose'")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/models/core/gpt && python3 ../../../run.py --max_output_len 4 --end_id -1'")
 }
 
 def checkStageNameSet(stageNames, jobKeys, paramName) {
@@ -1150,8 +1209,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 {
     def dockerArgs = "-v /mnt/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
     turtleConfigs = [
-        "DGX_H100-4_GPUs-PyTorch-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
-        "DGX_H100-4_GPUs-PyTorch-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
+        "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_H100-4_GPUs-PyTorch-Others-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-TensorRT-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
         "DGX_H100-4_GPUs-TensorRT-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
@@ -1171,6 +1230,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A30-TensorRT-2": ["a30", "l0_a30", 2, 4],
         "A30-TensorRT-3": ["a30", "l0_a30", 3, 4],
         "A30-TensorRT-4": ["a30", "l0_a30", 4, 4],
+        "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
         "A100X-TensorRT-1": ["a100x", "l0_a100", 1, 4],
         "A100X-TensorRT-2": ["a100x", "l0_a100", 2, 4],
         "A100X-TensorRT-3": ["a100x", "l0_a100", 3, 4],
@@ -1179,8 +1239,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "L40S-TensorRT-1": ["l40s", "l0_l40s", 1, 3],
         "L40S-TensorRT-2": ["l40s", "l0_l40s", 2, 3],
         "L40S-TensorRT-3": ["l40s", "l0_l40s", 3, 3],
-        "H100_PCIe-PyTorch-1": ["h100-cr", "l0_h100", 1, 2],
-        "H100_PCIe-PyTorch-2": ["h100-cr", "l0_h100", 2, 2],
+        "H100_PCIe-PyTorch-1": ["h100-cr", "l0_h100", 1, 3],
+        "H100_PCIe-PyTorch-2": ["h100-cr", "l0_h100", 2, 3],
+        "H100_PCIe-PyTorch-3": ["h100-cr", "l0_h100", 3, 3],
         "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 5],
         "H100_PCIe-TensorRT-2": ["h100-cr", "l0_h100", 2, 5],
@@ -1191,16 +1252,21 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 2],
         "B200_PCIe-TensorRT-1": ["b100-ts2", "l0_b200", 1, 2],
         "B200_PCIe-TensorRT-2": ["b100-ts2", "l0_b200", 2, 2],
+        "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
+        "RTX5080-TensorRT-1": ["rtx-5080", "l0_gb203", 1, 2],
+        "RTX5080-TensorRT-2": ["rtx-5080", "l0_gb203", 2, 2],
         // Currently post-merge test stages only run tests with "stage: post_merge" mako
         // in the test-db. This behavior may change in the future.
         "A10-TensorRT-[Post-Merge]-1": ["a10", "l0_a10", 1, 2],
         "A10-TensorRT-[Post-Merge]-2": ["a10", "l0_a10", 2, 2],
         "A30-TensorRT-[Post-Merge]-1": ["a30", "l0_a30", 1, 2],
         "A30-TensorRT-[Post-Merge]-2": ["a30", "l0_a30", 2, 2],
+        "A30-CPP-[Post-Merge]-1": ["a30", "l0_a30", 1, 1],
         "A100X-TensorRT-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
         "A100X-TensorRT-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
         "L40S-TensorRT-[Post-Merge]-1": ["l40s", "l0_l40s", 1, 2],
         "L40S-TensorRT-[Post-Merge]-2": ["l40s", "l0_l40s", 2, 2],
+        "H100_PCIe-PyTorch-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-TensorRT-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 2],
         "H100_PCIe-TensorRT-[Post-Merge]-2": ["h100-cr", "l0_h100", 2, 2],
@@ -1208,6 +1274,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "DGX_H100-4_GPUs-TensorRT-[Post-Merge]": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A100_80GB_PCIE-TensorRT-Perf": ["a100-80gb-pcie", "l0_perf", 1, 1],
         "H100_PCIe-TensorRT-Perf": ["h100-cr", "l0_perf", 1, 1],
+        "DGX_H200-8_GPUs-PyTorch-[Post-Merge]": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
     ]
 
     parallelJobs = turtleConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
@@ -1410,7 +1477,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         }, {}, true)
     }]}
 
-    multiGpuJobs = parallelJobs.findAll{it.key.contains("4_GPUs") && !it.key.contains("Post-Merge")}
+    multiGpuJobs = parallelJobs.findAll{(it.key.contains("4_GPUs") || it.key.contains("8_GPUs")) && !it.key.contains("Post-Merge")}
     println multiGpuJobs.keySet()
 
     parallelJobs += docBuildJobs
@@ -1424,6 +1491,19 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     // Check if the multi GPU related file has changed or not. If changed, add multi GPU test stages.
     if (testFilter[(MULTI_GPU_FILE_CHANGED)]) {
         parallelJobsFiltered += multiGpuJobs
+    }
+
+    if (testFilter[(AUTO_TRIGGER_TAG_LIST)] != null) {
+        echo "AUTO_TRIGGER_TAG_LIST mode is true. Auto trigger tags: ${testFilter[(AUTO_TRIGGER_TAG_LIST)].join(', ')}."
+        def autoTriggerTagStages = [:]
+        for (tag in testFilter[(AUTO_TRIGGER_TAG_LIST)]) {
+            autoTriggerTagStages += parallelJobs.findAll { it.key.contains(tag) }
+        }
+        parallelJobsFiltered += autoTriggerTagStages
+        if (autoTriggerTagStages.size() > 0) {
+            echo "Auto trigger will force run stages: ${autoTriggerTagStages.keySet().join(', ')}."
+        }
+        println parallelJobsFiltered.keySet()
     }
 
     // Check --post-merge, post-merge or TRT dependency testing pipelines.
@@ -1456,27 +1536,52 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     // Check --gpu-type, filter test stages.
     if (testFilter[(GPU_TYPE_LIST)] != null) {
-        echo "Use GPU_TYPE_LIST for filtering."
+        echo "Use GPU_TYPE_LIST for filtering. GPU types: ${testFilter[(GPU_TYPE_LIST)]}."
         parallelJobsFiltered = parallelJobsFiltered.findAll {it.key.tokenize('-')[0] in testFilter[(GPU_TYPE_LIST)]}
         println parallelJobsFiltered.keySet()
     }
 
-    if (testFilter[(ONLY_PYTORCH_FILE_CHANGED)]) {
-        echo "ONLY_PYTORCH_FILE_CHANGED mode is true."
-        parallelJobsFiltered = parallelJobsFiltered.findAll { !it.key.contains("-CPP-") && !it.key.contains("-TensorRT-") }
+    // Check --backend-mode, filter test stages.
+    if (testFilter[(TEST_BACKEND)] != null) {
+        echo "Use TEST_BACKEND for filtering. Backend mode: ${testFilter[(TEST_BACKEND)]}."
+        def backendMode = testFilter[(TEST_BACKEND)].collect { it.toLowerCase() }
+        def changeMap = [
+            "pytorch": "-PyTorch-",
+            "tensorrt": "-TensorRT-",
+            "cpp": "-CPP-",
+        ]
+        def backendModeList = backendMode.collect { changeMap.get(it) }.flatten()
+        def parallelJobsNoBackend = parallelJobsFiltered.findAll { key, _ ->
+            !changeMap.values().any { backend -> key.contains(backend) }
+        }
+        def parallelJobsBackendMode = parallelJobsFiltered.findAll { key, _ ->
+            backendModeList.any { backend -> key.contains(backend) }
+        }
+        parallelJobsFiltered = parallelJobsNoBackend + parallelJobsBackendMode
+        echo "parallelJobsBackendMode: ${parallelJobsBackendMode.keySet()}"
         println parallelJobsFiltered.keySet()
+    }
+
+    if (testFilter[(ONLY_PYTORCH_FILE_CHANGED)]) {
+        if (testFilter[(TEST_BACKEND)] != null) {
+            echo "Force disable ONLY_PYTORCH_FILE_CHANGED mode. Backend mode set by flag: ${testFilter[(TEST_BACKEND)]}."
+        } else {
+            echo "ONLY_PYTORCH_FILE_CHANGED mode is true."
+            parallelJobsFiltered = parallelJobsFiltered.findAll { !it.key.contains("-CPP-") && !it.key.contains("-TensorRT-") }
+            println parallelJobsFiltered.keySet()
+        }
     }
 
     // Check --stage-list, only run the stages in stage-list.
     if (testFilter[TEST_STAGE_LIST] != null) {
-        echo "Use TEST_STAGE_LIST for filtering."
+        echo "Use TEST_STAGE_LIST for filtering. Stages: ${testFilter[(TEST_STAGE_LIST)]}."
         parallelJobsFiltered = parallelJobs.findAll {it.key in testFilter[(TEST_STAGE_LIST)]}
         println parallelJobsFiltered.keySet()
     }
 
     // Check --extra-stage, add the stages in extra-stage.
     if (testFilter[EXTRA_STAGE_LIST] != null) {
-        echo "Use EXTRA_STAGE_LIST for filtering."
+        echo "Use EXTRA_STAGE_LIST for filtering. Stages: ${testFilter[(EXTRA_STAGE_LIST)]}."
         parallelJobsFiltered += parallelJobs.findAll {it.key in testFilter[(EXTRA_STAGE_LIST)]}
         println parallelJobsFiltered.keySet()
     }
@@ -1548,17 +1653,25 @@ pipeline {
                 script {
                     echo "enableFailFast is: ${params.enableFailFast}"
                     echo "env.testFilter is: ${env.testFilter}"
-                    if (env.testFilter)
-                    {
-                        def mp = readJSON text: env.testFilter, returnPojo: true
-                        mp.each {
-                            if (testFilter.containsKey(it.key)) {
-                                echo "setting ${it.key} = ${it.value}"
-                                testFilter[it.key] = it.value
-                            }
-                        }
-                    }
+                    testFilter = trtllm_utils.updateMapWithJson(this, testFilter, env.testFilter, "testFilter")
                     println testFilter
+                    echo "env.globalVars is: ${env.globalVars}"
+                    globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
+                    globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
+                }
+            }
+        }
+        stage("Check Test Lists")
+        {
+            when {
+                expression {
+                    env.targetArch == X86_64_TRIPLE  // Only execute the check if running on x86
+                }
+            }
+            steps
+            {
+                script {
+                    launchTestListCheck(this)
                 }
             }
         }
@@ -1572,9 +1685,9 @@ pipeline {
 
                     def testPhase2StageName = env.testPhase2StageName
                     if (testPhase2StageName) {
-                        def dgxSign = "DGX_H100"
-                        singleGpuJobs = parallelJobs.findAll{!it.key.contains(dgxSign)}
-                        dgxJobs = parallelJobs.findAll{it.key.contains(dgxSign)}
+                        def dgxSigns = ["DGX_H100", "DGX_H200"]
+                        singleGpuJobs = parallelJobs.findAll{!dgxSigns.any{sign -> it.key.contains(sign)}}
+                        dgxJobs = parallelJobs.findAll{dgxSigns.any{sign -> it.key.contains(sign)}}
                     }
 
                     if (singleGpuJobs.size() > 0) {

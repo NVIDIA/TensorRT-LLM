@@ -14,15 +14,15 @@ l0_sanity_check:
           - '*a10*'
         linux_distribution_name: ubuntu*
     tests:
-      - test_e2e.py::test_llmapi_quickstart
-      - test_e2e.py::test_llmapi_example_inference
-      - test_e2e.py::test_llmapi_example_inference_async
-      - test_e2e.py::test_llmapi_example_inference_async_streaming
-      - test_e2e.py::test_llmapi_example_logits_processor
-      - test_e2e.py::test_llmapi_example_multilora
-      - test_e2e.py::test_llmapi_example_guided_decoding
-      - test_e2e.py::test_llmapi_example_customize
-      - test_e2e.py::test_llmapi_example_quantization
+      - llmapi/test_llm_examples.py::test_llmapi_quickstart
+      - llmapi/test_llm_examples.py::test_llmapi_example_inference
+      - llmapi/test_llm_examples.py::test_llmapi_example_inference_async
+      - llmapi/test_llm_examples.py::test_llmapi_example_inference_async_streaming
+      - llmapi/test_llm_examples.py::test_llmapi_example_logits_processor
+      - llmapi/test_llm_examples.py::test_llmapi_example_multilora
+      - llmapi/test_llm_examples.py::test_llmapi_example_guided_decoding
+      - llmapi/test_llm_examples.py::test_llmapi_example_customize
+      - llmapi/test_llm_examples.py::test_llmapi_example_quantization
       - examples/test_llm_api_with_mpi.py::test_llm_api_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
   - condition:
       ranges:
@@ -38,7 +38,7 @@ l0_sanity_check:
           - '*a10*'
         linux_distribution_name: ubuntu*
     tests:
-      - test_e2e.py::test_llmapi_example_lookahead_decoding
+      - llmapi/test_llm_examples.py::test_llmapi_example_lookahead_decoding
   - condition:
       ranges:
         system_gpu_count:
@@ -53,4 +53,4 @@ l0_sanity_check:
           - '*l40s*'
         linux_distribution_name: ubuntu*
     tests:
-      - test_e2e.py::test_llmapi_example_medusa_decoding_use_modelopt
+      - llmapi/test_llm_examples.py::test_llmapi_example_medusa_decoding_use_modelopt

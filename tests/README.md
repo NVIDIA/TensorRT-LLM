@@ -109,7 +109,7 @@ Details on usage of the resources scripts can be found in the [C++ Test document
 
 ## 5. Performance regression test
 
-Porformance in QA tests and CI are still using TURTLE, see [legacy turtle perf test readme](./integration/README.md)
+For performance regression testing in QA and CI, see the [performance test guide](./integration/README.md).
 
 # How to add test to CI
 

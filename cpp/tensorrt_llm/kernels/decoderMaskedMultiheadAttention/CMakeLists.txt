@@ -20,8 +20,12 @@ file(GLOB_RECURSE SRC_CPP *.cpp)
 set(SRC_CU)
 set(SRC_CU_EXTRA)
 
-# Exclude files in nvrtcWrapper folder.
-list(FILTER SRC_CPP EXCLUDE REGEX ".*nvrtcWrapper/src.*")
+# Exclude files in nvrtcWrapper folder; add it as a subdirectory instead.
+#
+# nvrtcWrapper directory will produce nvrtc_wrapper_src, which is linked to
+# decoder_attention_src.
+list(FILTER SRC_CPP EXCLUDE REGEX ".*nvrtcWrapper/.*")
+add_subdirectory(decoderXQAImplJIT/nvrtcWrapper)
 
 filter_cuda_archs("80" SRC_CPP)
 filter_cuda_archs("86" SRC_CPP)
@@ -77,6 +81,7 @@ else()
   add_library(decoder_attention_src OBJECT ${SRC_CPP} ${SRC_CU} ${SRC_CU_EXTRA})
 endif()
 
+target_link_libraries(decoder_attention_src PUBLIC nvrtc_wrapper_src)
 set_property(TARGET decoder_attention_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET decoder_attention_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
                                                    ON)

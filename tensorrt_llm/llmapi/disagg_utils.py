@@ -29,6 +29,8 @@ class DisaggServerConfig():
     server_configs: List[CtxGenServerConfig]
     hostname: str = "localhost"
     port: int = 8000
+    ctx_router_type: str = "round_robin"
+    gen_router_type: str = "round_robin"
 
 
 def parse_disagg_config_file(yaml_config_file: str):
@@ -68,7 +70,11 @@ def extract_disagg_cfg(hostname: str = 'localhost',
         type="ctx", **context_servers) + extract_ctx_gen_cfgs(
             type="gen", **generation_servers)
 
-    return DisaggServerConfig(server_configs, hostname, port)
+    ctx_router_type = context_servers.get("router_type", "round_robin")
+    gen_router_type = generation_servers.get("router_type", "round_robin")
+
+    return DisaggServerConfig(server_configs, hostname, port, ctx_router_type,
+                              gen_router_type)
 
 
 def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],

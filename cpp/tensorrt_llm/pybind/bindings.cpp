@@ -35,8 +35,10 @@
 #include "tensorrt_llm/pybind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/pybind/executor/bindings.h"
 #include "tensorrt_llm/pybind/runtime/bindings.h"
+#include "tensorrt_llm/pybind/testing/modelSpecBinding.h"
 #include "tensorrt_llm/pybind/userbuffers/bindings.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
@@ -101,6 +103,16 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
                 auto& world = tensorrt_llm::mpi::MpiComm::world();
                 tensorrt_llm::mpi::MpiComm::setSession(world.split(color, rank));
             });
+
+    py::classh<tr::CudaStream>(m, "CudaStream")
+        .def(py::init(
+                 [](py::object py_stream)
+                 {
+                     cudaStream_t stream = reinterpret_cast<cudaStream_t>(py_stream.cast<uintptr_t>());
+                     return tr::CudaStream{stream};
+                 }),
+            py::arg("stream_ptr"))
+        .def("get_device", &tr::CudaStream::getDevice);
 
     // Create submodule for executor bindings.
     py::module_ executor_submodule = m.def_submodule("executor", "Executor bindings");
@@ -251,7 +263,12 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("in_dim_first", &tr::LoraModule::inDimFirst)
         .def_property_readonly("out_dim_first", &tr::LoraModule::outDimFirst)
         .def_property_readonly("in_tp_split_dim", &tr::LoraModule::inTpSplitDim)
-        .def_property_readonly("out_tp_split_dim", &tr::LoraModule::outTpSplitDim);
+        .def_property_readonly("out_tp_split_dim", &tr::LoraModule::outTpSplitDim)
+        .def_static("create_lora_modules", &tr::LoraModule::createLoraModules, py::arg("lora_module_names"),
+            py::arg("hidden_size"), py::arg("mlp_hidden_size"), py::arg("num_attention_heads"),
+            py::arg("num_kv_attention_heads"), py::arg("attention_head_size"), py::arg("tp_size") = 1,
+            py::arg("num_experts") = 0);
+
     py::class_<tc::QuantMode>(m, "QuantMode")
         .def_static("none", &tc::QuantMode::none)
         .def_static("int4_weights", &tc::QuantMode::int4Weights)
@@ -346,7 +363,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property(
             "use_cross_attention", &tr::ModelConfig::useCrossAttention, &tr::ModelConfig::setUseCrossAttention)
         .def_property("lora_modules", &tr::ModelConfig::getLoraModules, &tr::ModelConfig::setLoraModules)
-        .def_property("max_lora_rank", &tr::ModelConfig::getMaxLoraRank, &tr::ModelConfig::setMaxLoraRank);
+        .def_property("max_lora_rank", &tr::ModelConfig::getMaxLoraRank, &tr::ModelConfig::setMaxLoraRank)
+        .def_property("mlp_hidden_size", &tr::ModelConfig::getMlpHiddenSize, &tr::ModelConfig::setMlpHiddenSize)
+        .def_property("size_per_head", &tr::ModelConfig::getSizePerHead, &tr::ModelConfig::setSizePerHead);
 
     py::class_<tr::WorldConfig>(m, "WorldConfig")
         .def(py::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
@@ -520,11 +539,12 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("enable_chunked_context", &tb::TrtGptModelOptionalParams::enableChunkedContext)
         .def_readwrite("normalize_log_probs", &tb::TrtGptModelOptionalParams::normalizeLogProbs)
         .def_readwrite("decoding_config", &tb::TrtGptModelOptionalParams::decodingConfig)
+        .def_readwrite("use_gpu_direct_storage", &tb::TrtGptModelOptionalParams::useGpuDirectStorage)
         .def_readwrite("gpu_weights_percent", &tb::TrtGptModelOptionalParams::gpuWeightsPercent)
         .def_readwrite("max_beam_width", &tb::TrtGptModelOptionalParams::maxBeamWidth)
         .def_readwrite("scheduler_config", &tb::TrtGptModelOptionalParams::schedulerConfig)
-        .def(py::pickle(gptModelParamsGetState, gptModelParamsSetState))
-        .def("__eq__", &tb::TrtGptModelOptionalParams::operator==);
+        .def_readwrite("cache_transceiver_config", &tb::TrtGptModelOptionalParams::cacheTransceiverConfig)
+        .def(py::pickle(gptModelParamsGetState, gptModelParamsSetState));
 
     py::class_<tr::MemoryCounters>(m, "MemoryCounters")
         .def_static("instance", &tr::MemoryCounters::getInstance, py::return_value_policy::reference)
@@ -537,6 +557,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 
     auto mInternalRuntime = mInternal.def_submodule("runtime", "Runtime internal bindings");
     tensorrt_llm::pybind::runtime::initBindings(mInternalRuntime);
+
+    auto mInternalTesting = mInternal.def_submodule("testing", "Testing internal bindings");
+    tensorrt_llm::pybind::testing::initBindings(mInternalTesting);
 
     auto mInternalBatchManager = mInternal.def_submodule("batch_manager", "Batch manager internal bindings");
     tpb::initBindings(mInternalBatchManager);
@@ -560,7 +583,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def("get_ipc_ptrs",
             [](tr::IpcNvlsHandle& self) { return reinterpret_cast<uintptr_t>(self.ipc_uc_ptrs.data()); });
 
-    m.def("ipc_nvls_allocate", &tr::ipcNvlsAllocate);
+    m.def("ipc_nvls_allocate", &tr::ipcNvlsAllocate, py::return_value_policy::reference);
     m.def("ipc_nvls_free", &tr::ipcNvlsFree);
     m.def("ipc_nvls_supported", &tr::ipcNvlsSupported);
 }

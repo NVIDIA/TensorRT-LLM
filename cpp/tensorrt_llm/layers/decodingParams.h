@@ -34,6 +34,8 @@ using TensorPtr = runtime::ITensor::SharedPtr;
 using TensorConstPtr = runtime::ITensor::SharedConstPtr;
 using BufferPtr = runtime::IBuffer::SharedPtr;
 using BufferConstPtr = runtime::IBuffer::SharedConstPtr;
+template <typename T>
+using OptVec = std::optional<std::vector<T>>;
 
 //!
 //! \brief In a DecodingLayer's life cycle, it is constructed once;
@@ -129,18 +131,18 @@ public:
 class PenaltySetupParams : public BaseSetupParams
 {
 public:
-    std::optional<std::vector<float>> temperature;             // [1] or [setupBatchSize] on cpu
-    std::optional<std::vector<runtime::SizeType32>> minLength; // [1] or [setupBatchSize] on cpu
-    std::optional<std::vector<float>> repetitionPenalty;       // [1] or [setupBatchSize] on cpu
-    std::optional<std::vector<float>> presencePenalty;         // [1] or [setupBatchSize] on cpu
-    std::optional<std::vector<float>> frequencyPenalty;        // [1] or [setupBatchSize] on cpu
+    OptVec<float> temperature;             // [1] or [setupBatchSize]
+    OptVec<runtime::SizeType32> minLength; // [1] or [setupBatchSize]
+    OptVec<float> repetitionPenalty;       // [1] or [setupBatchSize]
+    OptVec<float> presencePenalty;         // [1] or [setupBatchSize]
+    OptVec<float> frequencyPenalty;        // [1] or [setupBatchSize]
 };
 
 // Ban words layer
 class BanWordsSetupParams : public BaseSetupParams
 {
 public:
-    std::optional<std::vector<runtime::SizeType32>> noRepeatNgramSize; // [1] or [setupBatchSize] on cpu
+    OptVec<runtime::SizeType32> noRepeatNgramSize; // [1] or [setupBatchSize]
 };
 
 class DecodingSetupParams : public BaseSetupParams
@@ -148,23 +150,23 @@ class DecodingSetupParams : public BaseSetupParams
 public:
     virtual ~DecodingSetupParams() = default;
 
-    std::optional<std::vector<uint64_t>> randomSeed; // [1] or [setupBatchSize] on cpu
-    std::optional<std::vector<bool>> outputLogProbs; // [setupBatchSize]
-    std::optional<std::vector<bool>> cumLogProbs;    // [setupBatchSize]
+    OptVec<uint64_t> randomSeed; // [1] or [setupBatchSize]
+    OptVec<bool> outputLogProbs; // [setupBatchSize]
+    OptVec<bool> cumLogProbs;    // [setupBatchSize]
 };
 
 class SamplingSetupParams : public DecodingSetupParams
 {
 public:
     // baseSamplingLayer
-    std::optional<std::vector<runtime::SizeType32>> runtimeTopK; // [1] or [setupBatchSize] on cpu
-    std::optional<std::vector<float>> runtimeTopP;               // [1] or [setupBatchSize] on cpu
-    std::optional<std::vector<float>> runtimeMinP;               // [1] or [setupBatchSize] on cpu
+    OptVec<runtime::SizeType32> runtimeTopK; // [1] or [setupBatchSize]
+    OptVec<float> runtimeTopP;               // [1] or [setupBatchSize]
+    OptVec<float> runtimeMinP;               // [1] or [setupBatchSize]
 
     // topPSamplingLayer
-    std::optional<std::vector<float>> topPDecay;                   // [setupBatchSize], must between [0, 1]
-    std::optional<std::vector<float>> topPMin;                     // [setupBatchSize], must between [0, 1]
-    std::optional<std::vector<runtime::TokenIdType>> topPResetIds; // [setupBatchSize]
+    OptVec<float> topPDecay;                   // [setupBatchSize], between [0, 1]
+    OptVec<float> topPMin;                     // [setupBatchSize], between [0, 1]
+    OptVec<runtime::TokenIdType> topPResetIds; // [setupBatchSize]
     std::optional<bool> normalizeLogProbs;
 };
 
@@ -172,11 +174,10 @@ class BeamSearchSetupParams : public DecodingSetupParams
 {
 public:
     // BeamSearchLayer
-    std::optional<std::vector<float>> beamSearchDiversityRate; // [setupBatchSize] on cpu
-    std::optional<std::vector<float>> lengthPenalty;           // [setupBatchSize] on cpu
-    std::optional<std::vector<int>> earlyStopping;             // [setupBatchSize] on cpu
-    std::optional<std::vector<std::vector<runtime::SizeType32>>>
-        beamWidthArray;                                        // [setupBatchSize, nMaxBeamWidthArray] on cpu
+    OptVec<float> beamSearchDiversityRate;                   // [setupBatchSize]
+    OptVec<float> lengthPenalty;                             // [setupBatchSize]
+    OptVec<int> earlyStopping;                               // [setupBatchSize]
+    OptVec<std::vector<runtime::SizeType32>> beamWidthArray; // [setupBatchSize, nMaxBeamWidthArray]
     bool hasDiffRuntimeArgs{false};
 };
 
@@ -184,37 +185,35 @@ class MedusaSetupParams : public DecodingSetupParams
 {
 public:
     // Medusa params
-    std::optional<std::vector<runtime::SizeType32>> runtimeTopK;                   // [setupBatchSize] on cpu
-    std::optional<std::vector<std::vector<runtime::SizeType32>>> runtimeHeadsTopK; // [setupBatchSize, maxMedusaHeads]
+    OptVec<runtime::SizeType32> runtimeTopK;                   // [setupBatchSize]
+    OptVec<std::vector<runtime::SizeType32>> runtimeHeadsTopK; // [setupBatchSize, maxMedusaHeads]
 };
 
 class ExplicitDraftTokensSetupParams : public DecodingSetupParams
 {
 public:
-    std::optional<std::vector<float>> temperature; // [setupBatchSize] on cpu
+    OptVec<float> temperature; // [setupBatchSize]
     // Hack to init some data for the context phase in the setup.
     TensorPtr randomDataSample; // [maxBatchSize], on gpu
     TensorPtr temperatures;     // [maxBatchSize], on gpu
-    nvinfer1::DataType dtype;   // [1], on cpu
+    nvinfer1::DataType dtype;   // [1]
 };
 
 class EagleSetupParams : public DecodingSetupParams
 {
 public:
-    std::optional<std::vector<float>> temperature; // [setupBatchSize] on cpu
+    OptVec<float> temperature; // [setupBatchSize]
     // Hack to init some data for the context phase in the setup.
     TensorPtr randomDataSample; // [maxBatchSize], on gpu
     TensorPtr temperatures;     // [maxBatchSize], on gpu
-    nvinfer1::DataType dtype;   // [1], on cpu
+    nvinfer1::DataType dtype;   // [1]
 };
 
 class DynamicDecodeSetupParams : public BaseSetupParams
 {
 public:
     std::shared_ptr<PenaltySetupParams> penaltyParams;
-
     std::shared_ptr<BanWordsSetupParams> banWordsParams;
-
     std::shared_ptr<DecodingSetupParams> decodingParams;
 };
 
@@ -222,22 +221,20 @@ struct LookaheadSetupParams : public DecodingSetupParams
 {
     using TensorPtr = runtime::ITensor::SharedPtr;
 
-    std::vector<runtime::ITensor::SharedConstPtr> prompt;       // [batchSize][maxSeqLen] on cpu
-    std::vector<executor::LookaheadDecodingConfig> algoConfigs; // [1 or batchSize] on cpu
+    std::vector<runtime::ITensor::SharedConstPtr> prompt;       // [batchSize][maxSeqLen], on cpu
+    std::vector<executor::LookaheadDecodingConfig> algoConfigs; // [1] or [batchSize]
 
-    //! see LookaheadDecodingOutputs::generationLengths
-    TensorPtr generationLengths;
-    //! see LookaheadDecodingOutputs::positionOffsets
-    TensorPtr positionOffsets;
-    //! see LookaheadDecodingOutputs::attentionPackedMasks
-    TensorPtr attentionPackedMasks;
+    //! see class LookaheadDecodingOutputs
+    TensorPtr generationLengths;    // [maxBatchSize], on gpu
+    TensorPtr positionOffsets;      // [maxBatchSize, maxDecodingTokens], on gpu
+    TensorPtr attentionPackedMasks; // [maxBatchSize, maxDecodingTokens], on gpu
 };
 
 class ExternalDraftTokensSetupParams : public DecodingSetupParams
 {
 public:
-    std::optional<std::vector<runtime::SizeType32>> runtimeTopK; // [1] or [setupBatchSize] on cpu
-    std::optional<std::vector<float>> runtimeTopP;               // [1] or [setupBatchSize] on cpu
+    OptVec<runtime::SizeType32> runtimeTopK; // [1] or [setupBatchSize]
+    OptVec<float> runtimeTopP;               // [1] or [setupBatchSize]
 };
 
 class BaseDecodingInputs
@@ -263,10 +260,8 @@ public:
     }
 
     runtime::SizeType32 maxBadWordsLen{0};
-    //! [maxBatchSize][2, bad_words_length], on gpu
-    std::optional<TensorConstPtr> badWordsPtr;
-    //! [maxBatchSize], on gpu
-    std::optional<TensorConstPtr> badWordsLengths;
+    std::optional<TensorConstPtr> badWordsPtr;     // [maxBatchSize][2, bad_words_length], on gpu
+    std::optional<TensorConstPtr> badWordsLengths; // [maxBatchSize], on gpu
 };
 
 // Stop criteria inputs
@@ -279,12 +274,9 @@ public:
     }
 
     runtime::SizeType32 maxStopWordsLen{0};
-    //! [maxBatchSize], on gpu
-    std::optional<TensorConstPtr> sequenceLimitLength;
-    //! [maxBatchSize][2, stop_words_length], pinned
-    std::optional<TensorConstPtr> stopWordsPtr;
-    //! [maxBatchSize], pinned
-    std::optional<TensorConstPtr> stopWordsLengths;
+    std::optional<TensorConstPtr> sequenceLimitLength; // [maxBatchSize], on gpu
+    std::optional<TensorConstPtr> stopWordsPtr;        // [maxBatchSize][2, stop_words_length], on pinned
+    std::optional<TensorConstPtr> stopWordsLengths;    // [maxBatchSize], on pinned
 };
 
 class DecodingInputs : public BaseDecodingInputs
@@ -303,8 +295,7 @@ public:
     {
     }
 
-    //! [maxBatchSize]
-    TensorConstPtr endIds;
+    TensorConstPtr endIds; // [maxBatchSize]
 
     // used only for python runtime
     runtime::SizeType32 step;
@@ -314,35 +305,23 @@ public:
     runtime::SizeType32 maxAttentionWindow;
     runtime::SizeType32 sinkTokenLength;
 
-    //! One of these two fields has to be set
+    //! One of `logits` and `logitsVec` has to be set
     //! DynamicDecodeLayer::forward checks for it
     //! Need both of these fields to support legacy code during transition period to the batched decoder
-    //! [forwardBatchSize, beamWidth, vocabSizePadded]
-    std::optional<TensorConstPtr> logits;
-    //! [forwardBatchSize][beamWidth, vocabSizePadded], on gpu
-    std::optional<std::vector<TensorConstPtr>> logitsVec;
-    //! [forwardBatchSize], on pinned memory
-    TensorConstPtr batchSlots;
+    std::optional<TensorConstPtr> logits; // [forwardBatchSize, beamWidth, vocabSizePadded], on gpu
+    OptVec<TensorConstPtr> logitsVec;     // [forwardBatchSize][beamWidth, vocabSizePadded], on gpu
+    TensorConstPtr batchSlots;            // [forwardBatchSize], on pinned
 
     // optional parameters
-    //! the indices of the selected beams, mandatory for beam search, on gpu
-    //! [forwardBatchSize, maxBeamWidth, maxSeqLen]
-    std::optional<TensorPtr> srcCacheIndirection;
-    //! [vocabSizePadded], on gpu
-    std::optional<TensorConstPtr> embeddingBias;
-    //! [maxBatchSize, maxBeamWidth], on gpu
-    std::optional<TensorConstPtr> inputLengths;
-    //! [maxBatchSize, maxBeamWidth]
-    std::optional<TensorConstPtr> finished;
-    //! [maxBatchSize], on gpu
-    std::optional<TensorPtr> curTokensPerStep;
-
+    std::optional<TensorPtr>
+        srcCacheIndirection;                     // [forwardBatchSize, maxBeamWidth, maxSeqLen], on gpu, for Beam Search
+    std::optional<TensorConstPtr> embeddingBias; // [vocabSizePadded], on gpu
+    std::optional<TensorConstPtr> inputLengths;  // [maxBatchSize, maxBeamWidth], on gpu
+    std::optional<TensorConstPtr> finished;      // [maxBatchSize, maxBeamWidth]
+    std::optional<TensorPtr> curTokensPerStep;   // [maxBatchSize], on gpu
     std::shared_ptr<BanWordsDecodingInputs> banWordsInputs;
-
     std::shared_ptr<StopCriteriaDecodingInputs> stopCriteriaInputs;
-
-    //! Step of each request, for Variable-Beam-Width-Search
-    std::optional<std::vector<runtime::SizeType32>> beamSearchSteps; // [batchSize]
+    OptVec<runtime::SizeType32> beamSearchSteps; // [forwardBatchSize], for Variable-Beam-Width-Search
 };
 
 class SamplingInputs : public DecodingInputs
@@ -355,8 +334,7 @@ public:
     }
 
     //! optional parameters
-    //! [localBatchSize]
-    curandState_t* curandStates{};
+    curandState_t* curandStates{}; // [localBatchSize]
 
     //! Flag to mark that logits tensor contains probabilities
     bool probsComputed{};
@@ -385,8 +363,7 @@ public:
     bool useRandomAcceptanceThreshold{};
 
     //! optional parameters
-    //! [localBatchSize]
-    curandState_t* curandStates{};
+    curandState_t* curandStates{}; // [localBatchSize]
 
     //! Flag to mark that logits tensor contains probabilities
     bool probsComputed{};
@@ -401,13 +378,11 @@ public:
     {
     }
 
-    //! [maxBatchSize], on gpu
-    TensorConstPtr targetTokensPerStep;
-    //! [maxBatchSize, maxPathLen, maxPathLen], on gpu
-    TensorConstPtr paths;
-    //! [maxBatchSize, maxDecodingTokens], on gpu
-    TensorConstPtr treeIds;
-    //! [maxBatchSize][maxDraftPathLen][maxDecodingTokens, vocabSizePadded], on gpu
+    TensorConstPtr targetTokensPerStep; // [maxBatchSize], on gpu
+    TensorConstPtr paths;               // [maxBatchSize, maxPathLen, maxPathLen], on gpu
+    TensorConstPtr treeIds;             // [maxBatchSize, maxDecodingTokens], on gpu
+
+    // [maxBatchSize][maxDraftPathLen][maxDecodingTokens, vocabSizePadded], on gpu
     std::vector<std::vector<TensorPtr>> medusaLogits;
 };
 
@@ -505,7 +480,6 @@ public:
     TensorConstPtr lastDraftLens; // [forwardBatchSize], gpu
     //! Same as `nextDraftPaths`, but for current iteration.
     TensorConstPtr lastDraftPaths; // [forwardBatchSize, maxDecodingTokens, maxPathLen], gpu
-
     //! Lastly accepted tokens (including golden token).
     TensorConstPtr acceptedTokens; // [forwardBatchSize, maxPathLen]
     //! Number of accepted tokens (at least 1).
@@ -514,8 +488,8 @@ public:
     TensorConstPtr acceptedPathIds; // [forwardBatchSize]
     //! Indicator whether the context request last chunk or not.
     TensorConstPtr chunkedContextNextTokens; // [forwardBatchSize]
-
-    TensorConstPtr seqSlots;                 // [forwardBatchSize], on gpu
+    //!
+    TensorConstPtr seqSlots; // [forwardBatchSize], on gpu
 };
 
 class BaseDecodingOutputs
@@ -528,38 +502,26 @@ public:
 
     virtual ~BaseDecodingOutputs() = default;
 
-    // mandatory parameters
+    //! Mandatory parameters
     TensorPtr outputIds; // [maxBatchSize, maxSeqLen]
 
-    // optional parameters
-    //! [maxBatchSize * maxBeamWidth], optional
-    std::optional<TensorPtr> finished;
-    //! [maxBatchSize * maxBeamWidth], optional
-    std::optional<TensorPtr> sequenceLength;
-    //! [maxBatchSize * maxBeamWidth], necessary in beam search
-    std::optional<TensorPtr> cumLogProbs;
-    //! [maxBatchSize, maxBeamWidth, maxSeqLen], must be float*, optional
-    std::optional<TensorPtr> outputLogProbs;
-    //! [maxBatchSize, maxBeamWidth, maxSeqLen], necessary in beam search
-    std::optional<TensorPtr> parentIds;
+    //! Optional parameters
+    std::optional<TensorPtr> finished;       // [maxBatchSize * maxBeamWidth], on pinned
+    std::optional<TensorPtr> sequenceLength; // [maxBatchSize * maxBeamWidth], on gpu
+    std::optional<TensorPtr> cumLogProbs;    // [maxBatchSize * maxBeamWidth], on gpu, for Beam Search
+    std::optional<TensorPtr> outputLogProbs; // [maxBatchSize, maxBeamWidth, maxSeqLen], on gpu
+    std::optional<TensorPtr> parentIds;      // [maxBatchSize, maxBeamWidth, maxSeqLen], on gpu, for Beam Search
 
-    //! [maxBatchSize] int* (2-d array), each int* has [maxBeamWidth, maxSeqLen]
-    TensorPtr outputIdsPtr;
-    TensorPtr outputIdsPtrHost;
-    //! [maxBatchSize] int* (2-d array), each int* has [maxBeamWidth, maxSeqLen]
-    TensorPtr parentIdsPtr;
+    TensorPtr outputIdsPtr;     // [maxBatchSize][maxBeamWidth, maxSeqLen], on gpu and outputIdsPtr[i], on gpu
+    TensorPtr outputIdsPtrHost; // [maxBatchSize][maxBeamWidth, maxSeqLen], on cpu but outputIdsPtrHost[i], on gpu
+    TensorPtr parentIdsPtr;     // [maxBatchSize][maxBeamWidth, maxSeqLen], on cpu but parentIdsPtr[i], on gpu
 
-    // Tokens predicted at current iteration.
-    TensorPtr newTokens; // [maxBatchSize, maxBeamWidth]
+    TensorPtr newTokens;        // [maxBatchSize, maxBeamWidth], on gpu, tokens predicted at current iteration.
 
     // optional parameters
-    //! Number of tokens predicted at current iteration.
-    //! [maxBatchSize]
-    std::optional<TensorPtr> numNewTokens;
-    //! [1] in pinned host memory
-    std::optional<TensorPtr> finishedSum;
-    //! [maxSeqLen, maxBatchSize, maxBeamWidth], must be float*
-    std::optional<TensorPtr> outputLogProbsTiled;
+    std::optional<TensorPtr> numNewTokens; // [maxBatchSize], on pinned, number of tokens predicted at current iteration
+    std::optional<TensorPtr> finishedSum;  // [1], on pinned
+    std::optional<TensorPtr> outputLogProbsTiled; // [maxSeqLen, maxBatchSize, maxBeamWidth], on gpu
 };
 
 class BeamSearchOutputs : public BaseDecodingOutputs
@@ -570,11 +532,9 @@ public:
     {
     }
 
-    //! the k/v cache index for beam search
-    //! [forwardBatchSize, maxBeamWidth, maxSeqLen]
-    TensorPtr tgtCacheIndirection;
-    //! structure maintains some pointers of beam search
-    std::unique_ptr<kernels::BeamHypotheses> beamHypotheses;
+    TensorPtr tgtCacheIndirection; //[forwardBatchSize, maxBeamWidth, maxSeqLen], on gpu, the k/v cache index
+
+    std::unique_ptr<kernels::BeamHypotheses> beamHypotheses; // Structure maintains variables of Beam Search
 };
 
 //!
@@ -617,24 +577,17 @@ public:
     }
 
     //! Draft tokens for the next step
-    // [maxBatchSize, maxDecodingDraftTokens]
-    TensorPtr nextDraftTokens;
+    TensorPtr nextDraftTokens; // [maxBatchSize, maxDecodingDraftTokens]
     //! Draft token position IDs
-    //! [maxBatchSize, maxDecodingDraftTokens]
-    TensorPtr nextDraftPosIds;
+    TensorPtr nextDraftPosIds; // [maxBatchSize, maxDecodingDraftTokens]
     //! Prev step draft tokens lengths, should be filled only for variable draft length speculative decoding mode
-    //! [maxBatchSize]
-    TensorPtr prevDraftLengths;
+    TensorPtr prevDraftLengths; // [maxBatchSize]
     //! Next step draft tokens lengths, should be filled only for variable draft length speculative decoding mode
-    //! [maxBatchSize]
-    TensorPtr nextDraftLengths;
+    TensorPtr nextDraftLengths; // [maxBatchSize]
     //! Accumulative sum along batchSlots.
-    //! [maxBatchSize + 1]
-    TensorPtr numNewTokensCumSum;
-    //! [maxBatchSize * maxPathLen]
-    TensorPtr pathsOffsets;
-    //! [maxBatchSize, maxDecodingTokens, divUp(maxDecodingTokens, 32)]
-    TensorPtr packedMasks;
+    TensorPtr numNewTokensCumSum; // [maxBatchSize + 1]
+    TensorPtr pathsOffsets;       // [maxBatchSize * maxPathLen]
+    TensorPtr packedMasks;        // [maxBatchSize, maxDecodingTokens, divUp(maxDecodingTokens, 32)]
 };
 
 class LookaheadDecodingOutputs : public SpeculativeDecodingOutputs
@@ -649,17 +602,14 @@ public:
 
     //! for TLLM engine input "spec_decoding_generation_lengths", indicating how many tokens to be generated.
     //! currently, the 1st step of generation is 1, set at `setup`, others are maxDecodingTokens, set at `forward`.
-    //! [maxBatchSize]
-    TensorPtr generationLengths;
+    TensorPtr generationLengths; //  [maxBatchSize]
     //! for TLLM engine input "spec_decoding_position_offsets",
     //! indicating each token position offset base on the last golden token = 0.
     //! ABC<D>efgxyz--- // sequence tokens, ABCD: golden; efg, xyz: draft; ---: padding.
     //! ***<0>123123--- // positionOffsets.
     //! 012<3>456456--- // positionIds.
-    //! [maxBatchSize, maxDecodingTokens]
-    TensorPtr positionOffsets;
-    //! [maxBatchSize, maxDecodingTokens]
-    TensorPtr positionIds;
+    TensorPtr positionOffsets; // [maxBatchSize, maxDecodingTokens]
+    TensorPtr positionIds;     // [maxBatchSize, maxDecodingTokens]
 };
 
 class ExplicitDraftTokensOutputs : public SpeculativeDecodingOutputs
@@ -672,26 +622,26 @@ public:
 
     //! Draft tokens for the next iteration. The first token in each path is the last accepted token at current
     //! iteration. E.g. if batchSize == 1, maxNumPaths == 2, maxPathLen== 3, [[[0, 1, 2], [0, 1, 10]]]
-    TensorPtr unpackedNextDraftTokens; // [maxBatchSize, maxNumPaths, maxPathLen] on gpu
+    TensorPtr unpackedNextDraftTokens; // [maxBatchSize, maxNumPaths, maxPathLen], on gpu
     //! Indices of draft tokens in the compressed `nextFlatTokens` for the next iteration.
     //! Using example above, [[[0, 1, 2], [0, 1, 3]]]
-    TensorPtr unpackedNextDraftIndices; // [maxBatchSize, maxNumPaths, maxPathLen] on gpu
+    TensorPtr unpackedNextDraftIndices; // [maxBatchSize, maxNumPaths, maxPathLen], on gpu
     //! Probabilities of the next draft tokens.
-    TensorPtr nextDraftProbs; // [maxBatchSize, maxNumPaths, maxPathDraftLen, vocabSize] on gpu
+    TensorPtr nextDraftProbs; // [maxBatchSize, maxNumPaths, maxPathDraftLen, vocabSize], on gpu
     //! Baseline for the position ids.
-    TensorPtr positionIdsBase; // [maxBatchSize] on gpu
+    TensorPtr positionIdsBase; // [maxBatchSize], on gpu
     //! Randomly sampled data (between 0.f and 1.f)
-    TensorPtr randomDataSample; // [maxBatchSize] on gpu
+    TensorPtr randomDataSample; // [maxBatchSize], on gpu
     //! Randomly sampled data (between 0.f and 1.f)
-    TensorPtr randomDataValidation; // [maxBatchSize, maxNumPaths, maxDraftPathLen] on gpu
+    TensorPtr randomDataValidation; // [maxBatchSize, maxNumPaths, maxDraftPathLen], on gpu
     //! Sampling temperature.
-    TensorPtr temperatures; // [maxBatchSize] on gpu
+    TensorPtr temperatures; // [maxBatchSize], on gpu
     //! Next generation lengths.
-    TensorPtr generationLengths; // [maxBatchSize] on gpu
+    TensorPtr generationLengths; // [maxBatchSize], on gpu
     //! Next generation lengths on host.
-    TensorPtr generationLengthsHost; // [maxBatchSize] on pinned
+    TensorPtr generationLengthsHost; // [maxBatchSize], on pinned
     //! Maximum number of generated tokens for the next step across whole batch
-    TensorPtr maxGenLengthHost; // [1] on pinned
+    TensorPtr maxGenLengthHost; // [1], on pinned
 };
 
 class EagleOutputs : public SpeculativeDecodingOutputs
@@ -703,32 +653,31 @@ public:
     }
 
     //! Unpacked draft tokens
-    TensorPtr unpackedNextDraftTokens; // [maxBatchSize, maxDecodingDraftTokens] on gpu
+    TensorPtr unpackedNextDraftTokens; // [maxBatchSize, maxDecodingDraftTokens], on gpu
     //! Draft paths for the next iteration.
-    TensorPtr nextDraftPaths; // [maxBatchSize, maxDecodingTokens, maxPathLen] on gpu
+    TensorPtr nextDraftPaths; // [maxBatchSize, maxDecodingTokens, maxPathLen], on gpu
     //! Randomly sampled data (between 0.f and 1.f)
-    TensorPtr randomDataSample; // [maxBatchSize] on gpu
+    TensorPtr randomDataSample; // [maxBatchSize], on gpu
     //! Randomly sampled data (between 0.f and 1.f)
-    TensorPtr randomDataValidation; // [maxBatchSize] on gpu
+    TensorPtr randomDataValidation; // [maxBatchSize], on gpu
     //! Sampling temperature.
-    TensorPtr temperatures; // [maxBatchSize] on gpu
+    TensorPtr temperatures; // [maxBatchSize], on gpu
     //! Next generation lengths.
-    TensorPtr generationLengths; // [maxBatchSize] on gpu
+    TensorPtr generationLengths; // [maxBatchSize], on gpu
     //! Next generation lengths.
-    TensorPtr generationLengthsHost; // [maxBatchSize] on pinned
-
+    TensorPtr generationLengthsHost; // [maxBatchSize], on pinned
     //! Request types for ctx stage of the EagleNet0 (filled with 0s).
-    TensorPtr eagleNetCtxRequestTypesHost; //! [maxBatchSize] on pinned
+    TensorPtr eagleNetCtxRequestTypesHost; // [maxBatchSize], on pinned
     //! Context lengths of the context EagleNet0.
-    TensorPtr eagleNetCtxContextLengthsHost; //! [maxBatchSize] on pinned
+    TensorPtr eagleNetCtxContextLengthsHost; // [maxBatchSize], on pinned
     //! Past kv lengths of the context EagleNet0.
-    TensorPtr eagleNetCtxPastKeyValueLengthsHost; //! [maxBatchSize] on pinned
+    TensorPtr eagleNetCtxPastKeyValueLengthsHost; // [maxBatchSize], on pinned
     //! Request types for ctx stage of the EagleNetX (filled with 1s).
-    TensorPtr eagleNetGenRequestTypesHost; //! [maxBatchSize] on pinned
+    TensorPtr eagleNetGenRequestTypesHost; // [maxBatchSize], on pinned
     //! Context lengths of the generation EagleNetX.
-    TensorPtr eagleNetGenContextLengthsHost; //! [maxBatchSize] on pinned
+    TensorPtr eagleNetGenContextLengthsHost; // [maxBatchSize], on pinned
     //! Past kv lengths of the generation EagleNetX.
-    TensorPtr eagleNetGenPastKeyValueLengthsHost; //! [maxBatchSize] on pinned
+    TensorPtr eagleNetGenPastKeyValueLengthsHost; // [maxBatchSize], on pinned
 };
 
 } // namespace tensorrt_llm::layers

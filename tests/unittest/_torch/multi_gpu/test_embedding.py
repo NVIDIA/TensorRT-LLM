@@ -10,8 +10,9 @@ from mpi4py.futures import MPIPoolExecutor
 from torch import nn
 
 import tensorrt_llm
-from tensorrt_llm._torch.distributed import ParallelConfig, TensorParallelMode
 from tensorrt_llm._torch.modules.embedding import Embedding, LMHead
+from tensorrt_llm._torch.modules.linear import TensorParallelMode
+from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -44,10 +45,12 @@ def column_embedding_forward(x, vocab_size, hidden_size, dtype,
         num_embeddings=vocab_size,
         embedding_dim=hidden_size,
         dtype=dtype,
-        parallel_config=ParallelConfig(
-            tensor_parallel_size=tensor_parallel_size,
-            tensor_parallel_rank=tensor_parallel_rank,
-            tensor_parallel_mode=TensorParallelMode.COLUMN),
+        mapping=Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=tensor_parallel_rank,
+        ),
+        tensor_parallel_mode=TensorParallelMode.COLUMN,
     )
     embedding.load_weights([dict(weight=weight)])
     embedding.cuda()
@@ -79,11 +82,13 @@ def row_embedding_forward(x, vocab_size, hidden_size, dtype,
         num_embeddings=vocab_size,
         embedding_dim=hidden_size,
         dtype=dtype,
-        parallel_config=ParallelConfig(
-            tensor_parallel_size=tensor_parallel_size,
-            tensor_parallel_rank=tensor_parallel_rank,
-            tensor_parallel_mode=TensorParallelMode.ROW,
-            gather_output=True),
+        mapping=Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=tensor_parallel_rank,
+        ),
+        tensor_parallel_mode=TensorParallelMode.ROW,
+        gather_output=True,
     )
     embedding.load_weights([dict(weight=weight)])
     embedding.cuda()
@@ -115,11 +120,13 @@ def column_lm_head_forward(x, vocab_size, hidden_size, dtype,
         num_embeddings=vocab_size,
         embedding_dim=hidden_size,
         dtype=dtype,
-        parallel_config=ParallelConfig(
-            tensor_parallel_size=tensor_parallel_size,
-            tensor_parallel_rank=tensor_parallel_rank,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            gather_output=True),
+        mapping=Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=tensor_parallel_rank,
+        ),
+        tensor_parallel_mode=TensorParallelMode.COLUMN,
+        gather_output=True,
     )
     lm_head.load_weights([dict(weight=weight)])
     lm_head.cuda()
@@ -152,10 +159,12 @@ def row_lm_head_forward(x, vocab_size, hidden_size, dtype, tensor_parallel_size,
         num_embeddings=vocab_size,
         embedding_dim=hidden_size,
         dtype=dtype,
-        parallel_config=ParallelConfig(
-            tensor_parallel_size=tensor_parallel_size,
-            tensor_parallel_rank=tensor_parallel_rank,
-            tensor_parallel_mode=TensorParallelMode.ROW),
+        mapping=Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=tensor_parallel_rank,
+        ),
+        tensor_parallel_mode=TensorParallelMode.ROW,
     )
     lm_head.load_weights([dict(weight=weight)])
     lm_head.cuda()

@@ -66,4 +66,8 @@ private:
     std::optional<Config> mBestConfig;
 };
 
+// Change to following declarations must sync with moe_kernels.h in internal kernel repo
+int Lora_run(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* input, int32_t const* loraRanks,
+    void const* const* loraWeightsPtr, int weightIndex, void* const* outputs, void* workspace, cudaStream_t stream);
+
 } // namespace tensorrt_llm::kernels

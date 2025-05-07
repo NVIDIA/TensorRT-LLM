@@ -61,11 +61,11 @@ bool getEnvDisaggLayerwise();
 
 bool getEnvParallelCacheSend();
 
-bool getEnvRequestKVCacheSerial();
+bool getEnvRequestKVCacheConcurrent();
 
 bool getEnvDisableKVCacheTransferOverlap();
 
-bool getEnvDisableReceiveKVCacheParallel();
+bool getEnvEnableReceiveKVCacheParallel();
 
 std::string getEnvKVCacheTransferOutputPath();
 
@@ -86,6 +86,8 @@ bool getEnvForceDeterministicAllReduce();
 // Return the workspace size for custom all reduce kernels.
 // This only works when force deterministic is enabled.
 size_t getEnvAllReduceWorkspaceSize();
+
+size_t getEnvKVCacheRecvBufferCount();
 
 bool getEnvKVCacheTransferUseAsyncBuffer();
 

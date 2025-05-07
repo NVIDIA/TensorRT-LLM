@@ -28,9 +28,9 @@ from torch import nn
 
 import tensorrt_llm
 from tensorrt_llm._torch.compilation.backend import Backend
-from tensorrt_llm._torch.distributed import ParallelConfig, TensorParallelMode
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -77,11 +77,10 @@ def row_linear_residual_norm_fusion_forward(
         out_features=hidden_size,
         bias=False,
         dtype=dtype,
-        parallel_config=ParallelConfig(
-            tensor_parallel_size=tensor_parallel_size,
-            tensor_parallel_rank=tensor_parallel_rank,
-            tensor_parallel_mode=TensorParallelMode.ROW,
-        ),
+        tensor_parallel_mode=TensorParallelMode.ROW,
+        mapping=Mapping(world_size=tensor_parallel_size,
+                        tp_size=tensor_parallel_size,
+                        rank=tensor_parallel_rank),
     ).cuda()
     norm = RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype).cuda()
 

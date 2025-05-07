@@ -508,7 +508,7 @@ size_t CutlassFp8RowwiseGemmRunner<T>::dispatchToArch(void* D, void const* A, vo
         return dispatchGemmToCutlassSm90<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, gemmConfig,
             workspace, workspaceBytes, stream, occupancy);
     }
-    else if (mSm == 89)
+    else if (mSm == 89 || mSm >= 120)
     {
         return dispatchGemmToCutlassSm89<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, gemmConfig,
             workspace, workspaceBytes, stream, occupancy);
@@ -574,7 +574,7 @@ std::vector<tkc::CutlassGemmConfig> CutlassFp8RowwiseGemmRunner<T>::getConfigs()
             }
         }
     }
-    else if (mSm == 89)
+    else if (mSm == 89 || mSm >= 120)
     {
         tkc::CutlassGemmConfig::CandidateConfigTypeParam config_type_param
             = tkc::CutlassGemmConfig::CandidateConfigTypeParam::FP8_ONLY;

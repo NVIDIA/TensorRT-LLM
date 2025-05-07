@@ -11,8 +11,8 @@
 
 add_gtest(executorMockTest executorMockTest.cpp)
 add_gtest(executorTest executorTest.cpp)
-target_link_libraries(executorTest PRIVATE modelSpecStatic testingUtils)
+target_link_libraries(executorTest PRIVATE testingUtils)
 add_gtest(encDecTest encDecTest.cpp)
-target_link_libraries(encDecTest PRIVATE modelSpecStatic testingUtils)
+target_link_libraries(encDecTest PRIVATE testingUtils)
 add_gtest(disaggExecutorTest disaggExecutorTest.cpp)
-target_link_libraries(disaggExecutorTest PRIVATE modelSpecStatic testingUtils)
+target_link_libraries(disaggExecutorTest PRIVATE testingUtils)

@@ -16,7 +16,6 @@
  */
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
-#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 namespace tensorrt_llm::batch_manager
 {
@@ -182,8 +181,7 @@ std::optional<executor::Response> LlmRequest::createResponse(bool useFastLogits,
 }
 
 void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
-    SizeType32 vocabSizePadded, std::optional<SizeType32> maxEncoderInputLen, bool enableKVCacheReuse,
-    bool gatherContextOutputs)
+    SizeType32 vocabSizePadded, std::optional<SizeType32> maxEncoderInputLen, bool enableKVCacheReuse)
 {
     if (mEndId.has_value())
     {
@@ -253,14 +251,6 @@ void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, Siz
         TLLM_CHECK_WITH_INFO(mInputTokenExtraIds.value()->size() == static_cast<size_t>(mOrigPromptLen),
             "inputTokenExtraIds vector size (%lu) must be the same as input token vector size (%lu).",
             mInputTokenExtraIds.value()->size(), static_cast<size_t>(mOrigPromptLen));
-    }
-
-    if (!gatherContextOutputs && !mAdditionalContextOutputTensors.empty())
-    {
-        TLLM_LOG_WARNING(
-            "Requested additional outputs for context tokens, but engine does not gather context outputs. "
-            "To enable context outputs build the engine with gather_context_logits.");
-        mAdditionalContextOutputTensors.clear();
     }
 }
 

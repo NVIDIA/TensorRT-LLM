@@ -23,14 +23,10 @@ import typing
 from pathlib import Path
 from typing import Optional
 
-from build_engines_utils import init_model_spec_module, run_command, wincopy
-
-init_model_spec_module()
-import shutil
-
-import model_spec
+from build_engines_utils import run_command, wincopy
 
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.bindings.internal.testing import ModelSpec
 
 resources_dir = Path(__file__).parent.resolve().parent
 model_dir = resources_dir / "models"
@@ -150,8 +146,7 @@ def build_engines(model_cache: typing.Optional[str] = None,
 
         convert_ckpt(hf_dir, ckpt_dir, world_size)
 
-        model_spec_obj = model_spec.ModelSpec('input_tokens.npy',
-                                              _tb.DataType.HALF)
+        model_spec_obj = ModelSpec('input_tokens.npy', _tb.DataType.HALF)
         model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
         model_spec_obj.use_gpt_plugin()
         engine_dir = Path(

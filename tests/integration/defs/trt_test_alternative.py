@@ -160,7 +160,14 @@ def call(*popenargs,
             if retcode and start_new_session:
                 cleanup_process_tree(p, True)
             return retcode
-        except:
+        except Exception as e:
+            if isinstance(e, subprocess.TimeoutExpired):
+                print("Process timed out.")
+                stdout, stderr = p.communicate()
+                if stdout:
+                    print("STDOUT:", stdout.decode('utf-8', errors='replace'))
+                if stderr:
+                    print("STDERR:", stderr.decode('utf-8', errors='replace'))
             cleanup_process_tree(p, start_new_session)
             raise
 

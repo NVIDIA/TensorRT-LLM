@@ -55,9 +55,9 @@ class PyKvCacheManager : public tbk::BaseKVCacheManager
 {
 public:
     // using BaseKVCacheManager::BaseKVCacheManager; // Inherit constructors
-    void allocatePools(nvinfer1::DataType dtype, bool useUvm = false) override
+    void allocatePools(bool useUvm = false) override
     {
-        PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, allocatePools, dtype, useUvm);
+        PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, allocatePools, useUvm);
     }
 
     void releasePools() override
@@ -88,21 +88,6 @@ public:
     tbk::KvCacheStats getKvCacheStats() const override
     {
         PYBIND11_OVERLOAD_PURE(tbk::KvCacheStats, tbk::BaseKVCacheManager, getKvCacheStats);
-    }
-
-    SizeType32 getMaxBlocksPerSeq() const override
-    {
-        PYBIND11_OVERLOAD_PURE(SizeType32, tbk::BaseKVCacheManager, getMaxBlocksPerSeq);
-    }
-
-    SizeType32 getNeededBlocksOneStep(tb::LlmRequest const& req, bool twoStepsLookAhead) const override
-    {
-        PYBIND11_OVERLOAD_PURE(SizeType32, tbk::BaseKVCacheManager, getNeededBlocksOneStep, req, twoStepsLookAhead);
-    }
-
-    SizeType32 getRemainingBlocksToCompletion(tb::LlmRequest const& req) const override
-    {
-        PYBIND11_OVERLOAD_PURE(SizeType32, tbk::BaseKVCacheManager, getRemainingBlocksToCompletion, req);
     }
 
     void addToken(tb::LlmRequest::RequestIdType requestId) override
@@ -164,11 +149,6 @@ public:
         PYBIND11_OVERLOAD_PURE(bool, tbk::BaseKVCacheManager, isEnableBlockReuse);
     }
 
-    bool isUseOneMoreBlock() const override
-    {
-        PYBIND11_OVERLOAD_PURE(bool, tbk::BaseKVCacheManager, isUseOneMoreBlock);
-    }
-
     void rewindKVCache(tb::LlmRequest::RequestIdType requestId, SizeType32 rewindLengths) override
     {
         PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, rewindKVCache, requestId, rewindLengths);
@@ -191,27 +171,25 @@ public:
         PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, storeContextBlocks, llmRequest);
     }
 
-    bool schedulingHasFreeBlocks(SizeType32 numRequired = 1) const override
+    std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
+        tb::LlmRequest::RequestIdType requestId, SizeType32 windowSize) const override
     {
-        PYBIND11_OVERLOAD_PURE(bool, tbk::BaseKVCacheManager, schedulingHasFreeBlocks, numRequired);
-    }
-
-    std::vector<std::vector<SizeType32>> const& getCacheBlockIds(tb::LlmRequest::RequestIdType requestId) const override
-    {
-        PYBIND11_OVERLOAD_PURE(
-            std::vector<std::vector<SizeType32>> const&, tbk::BaseKVCacheManager, getCacheBlockIds, requestId);
+        PYBIND11_OVERLOAD_PURE(std::vector<std::vector<SizeType32>> const&, tbk::BaseKVCacheManager, getCacheBlockIds,
+            requestId, windowSize);
     }
 
     std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
-        std::vector<tb::LlmRequest::RequestIdType> const& requestIds) const override
+        std::vector<tb::LlmRequest::RequestIdType> const& requestIds, SizeType32 windowSize) const override
     {
         PYBIND11_OVERLOAD_PURE(std::vector<std::vector<std::vector<SizeType32>>>, tbk::BaseKVCacheManager,
-            getBatchCacheBlockIds, requestIds);
+            getBatchCacheBlockIds, requestIds, windowSize);
     }
 
-    std::vector<SizeType32> getNewlyAllocatedBlockIds(tb::LlmRequest::RequestIdType requestId) const override
+    std::vector<SizeType32> getNewlyAllocatedBlockIds(
+        tb::LlmRequest::RequestIdType requestId, SizeType32 windowSize) const override
     {
-        PYBIND11_OVERLOAD_PURE(std::vector<SizeType32>, tbk::BaseKVCacheManager, getNewlyAllocatedBlockIds, requestId);
+        PYBIND11_OVERLOAD_PURE(
+            std::vector<SizeType32>, tbk::BaseKVCacheManager, getNewlyAllocatedBlockIds, requestId, windowSize);
     }
 
     SizeType32 getUsedNumBlocks() const override
@@ -322,13 +300,32 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def_readwrite("missed_blocks", &tbk::KvCacheStats::missedBlocks)
         .def_readwrite("cache_hit_rate", &tbk::KvCacheStats::cacheHitRate);
 
+    py::class_<tbk::TempAttentionWindowInputs>(m, "TempAttentionWindowInputs")
+        .def(py::init<>())
+        .def_readwrite("paged_context_fmha", &tbk::TempAttentionWindowInputs::pagedContextFMHA)
+        .def_readwrite("max_input_len", &tbk::TempAttentionWindowInputs::maxInputLen)
+        .def_readwrite("max_num_tokens", &tbk::TempAttentionWindowInputs::maxNumTokens);
+
+    py::class_<tbk::BlockKey>(m, "BlockKey")
+        .def(py::init<>())
+        .def(py::init<VecTokens const&, std::optional<tr::LoraTaskIdType>>(), py::arg("tokens"),
+            py::arg("lora_task_id") = std::nullopt)
+        .def(py::init<bool, std::optional<tr::LoraTaskIdType>, VecUniqueTokens const&>(), py::arg("uses_extra_ids"),
+            py::arg("lora_task_id"), py::arg("unique_tokens"))
+        .def_readonly("uses_extra_ids", &tbk::BlockKey::usesExtraIds)
+        .def_readonly("lora_task_id", &tbk::BlockKey::loraTaskId)
+        .def_readonly("unique_tokens", &tbk::BlockKey::uniqueTokens);
+
+    py::class_<tbk::BlockKeyHasher>(m, "BlockKeyHasher")
+        .def_static("hash", &tbk::BlockKeyHasher::hash, py::arg("block_key"), py::arg("parent_hash") = 0);
+
     py::class_<tbk::KVCacheEventManager, std::shared_ptr<tbk::KVCacheEventManager>>(m, "KVCacheEventManager")
         .def(py::init<size_t>(), py::arg("max_kv_event_entries"));
 
     py::classh<tbk::BaseKVCacheManager, PyKvCacheManager>(m, "BaseKVCacheManager")
         .def_static("calculate_max_num_blocks", &tbk::BaseKVCacheManager::calculateMaxNumBlocks, py::arg("config"),
             py::arg("dtype"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"),
-            py::arg("kvFactor"))
+            py::arg("kvFactor"), py::arg("extra_cost_memory") = 0)
         .def("allocate_pools", &BaseKVCacheManager::allocatePools)
         .def("release_pools", &BaseKVCacheManager::releasePools)
         .def("start_scheduling", &BaseKVCacheManager::startScheduling)
@@ -336,7 +333,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def_property_readonly("max_num_blocks", &BaseKVCacheManager::getMaxNumBlocks)
         .def_property_readonly("num_pools", &BaseKVCacheManager::getNumPools)
         .def("get_kv_cache_stats", &BaseKVCacheManager::getKvCacheStats)
-        .def_property_readonly("max_blocks_per_seq", &BaseKVCacheManager::getMaxBlocksPerSeq)
+        .def_property_readonly("max_blocks_per_seq",
+            [](tbk::BaseKVCacheManager& self) { return self.getOffsetTableDimensions().maxBlocksPerSeq; })
         .def("get_needed_blocks_one_step", &BaseKVCacheManager::getNeededBlocksOneStep)
         .def("get_remaining_blocks_to_completion", &BaseKVCacheManager::getRemainingBlocksToCompletion)
         .def("add_token", &BaseKVCacheManager::addToken)
@@ -414,11 +412,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             },
             py::arg("timeout_ms") = std::nullopt)
         .def_property_readonly("enable_block_reuse", &BaseKVCacheManager::isEnableBlockReuse)
-        .def_property_readonly("use_one_more_block", &BaseKVCacheManager::isUseOneMoreBlock)
         .def("rewind_kv_cache", &BaseKVCacheManager::rewindKVCache)
         .def_property_readonly("cross_kv", &BaseKVCacheManager::isCrossKv)
         .def("store_context_blocks", &BaseKVCacheManager::storeContextBlocks)
-        .def("scheduling_has_free_blocks", &BaseKVCacheManager::schedulingHasFreeBlocks)
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds)
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds)
         .def("get_newly_allocated_block_ids", &BaseKVCacheManager::getNewlyAllocatedBlockIds)
@@ -431,13 +427,14 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
 
     py::classh<tbk::KVCacheManager, tbk::BaseKVCacheManager>(m, "KVCacheManager")
         .def(py::init<std::vector<SizeType32> const&, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
-                 SizeType32, std::vector<SizeType32> const&, SizeType32, SizeType32, bool, int64_t, bool, bool,
-                 tbk::CacheType, std::optional<tensorrt_llm::executor::RetentionPriority>,
-                 std::shared_ptr<tbk::KVCacheEventManager>, bool, bool>(),
+                 SizeType32, std::vector<SizeType32> const&, std::optional<tbk::TempAttentionWindowInputs> const&,
+                 nvinfer1::DataType, SizeType32, bool, int64_t, bool, bool, tbk::CacheType,
+                 std::optional<tensorrt_llm::executor::RetentionPriority>, std::shared_ptr<tbk::KVCacheEventManager>,
+                 bool, bool>(),
             py::arg("num_kv_heads_per_layer"), py::arg("size_per_head"), py::arg("tokens_per_block"),
             py::arg("blocks_in_primary_pool"), py::arg("blocks_in_secondary_pool"), py::arg("max_num_sequences"),
-            py::arg("max_beam_width"), py::arg("max_attention_window_vec"), py::arg("temporary_attention_window"),
-            py::arg("sink_token_length"), py::arg("stream"), py::arg("max_sequence_length"),
+            py::arg("max_beam_width"), py::arg("max_attention_window_vec"), py::arg("temp_attention_window_inputs"),
+            py::arg("dtype"), py::arg("sink_token_length"), py::arg("stream"), py::arg("max_sequence_length"),
             py::arg("enable_block_reuse") = false, py::arg("onboard_blocks") = true,
             py::arg_v("cache_type", tbk::CacheType::kSELF, "bindings.internal.batch_manager.CacheType.SELF"),
             py::arg("secondary_offload_min_priority") = std::nullopt, py::arg("event_manager") = nullptr,

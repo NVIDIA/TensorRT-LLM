@@ -113,18 +113,17 @@ Assuming the TensorRT engine you are planning to use has a tensor named `TopKLog
 ```cpp
 auto const executorConfig = ExecutorConfig{};
 
+std::vector<executor::AdditionalModelOutput> additionalOutputs{
+    executor::AdditionalModelOutput{"TopKLogits", /*whether or not to get the output for the context too */ true}};
+executorConfig.setAdditionalModelOutputs(additionalOutputs);
+
 // ... set more configuration options if needed
-
-executorConfig.setAdditionalOutputNames(std::vector<std::string>{"TopKLogits"});
-
 // ... create the `Executor` instance
 ```
 
 ### Request Additional Output
 Construct a request to enqueue in the executor to query this tensor output:
 ```cpp
-std::vector<executor::OutputConfig::AdditionalModelOutput> additionalOutputs{
-    executor::OutputConfig::AdditionalModelOutput{"TopKLogits", /*whether or not to get the output for the context too */ true}};
 executor::Request request{requestTokens, parameters.maxOutputLength, true, executor::SamplingConfig{},
     executor::OutputConfig{false, false, false, true, false, false, additionalOutputs}};
 executor.enqueueRequest(request);
@@ -134,7 +133,7 @@ The output can be found at the `additionalOutputs` property of each response.
 
 #### Note on context outputs
 
-Note that context outputs require to build the engine with `--gather_context_logits`. If KV cache reuse is enabled, context outputs will not contain outputs for the part of the context that has been reused. This part of the outputs can only be obtained from the prior request with the same prefix that generated this part of the KV cache.
+If KV cache reuse is enabled, context outputs will not contain outputs for the part of the context that has been reused. This part of the outputs can only be obtained from the prior request with the same prefix that generated this part of the KV cache.
 
 ## C++ Executor API Example
 

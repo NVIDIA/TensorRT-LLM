@@ -58,7 +58,8 @@ std::mutex CacheTransceiver::mDllMutex;
 
 std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransceiver(
     kv_cache_manager::BaseKVCacheManager* cacheManager, runtime::ModelConfig const& modelConfig,
-    runtime::WorldConfig const& worldConfig, executor::kv_cache::CacheState::AttentionType attentionType)
+    runtime::WorldConfig const& worldConfig, executor::kv_cache::CacheState::AttentionType attentionType,
+    std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig)
 {
 
     std::optional<CacheTransceiver::CommType> commType;
@@ -77,17 +78,19 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
         executor::kv_cache::CacheState::ModelConfig cacheStateCfg{
             modelConfig.getNumKvHeadsPerLayer(), modelConfig.getSizePerHead(), modelConfig.getTokensPerBlock()};
 
-        return std::make_unique<CacheTransceiver>(
-            cacheManager, commType.value(), cacheStateCfg, worldConfig, modelConfig.getKvDataType(), attentionType);
+        return std::make_unique<CacheTransceiver>(cacheManager, commType.value(), cacheStateCfg, worldConfig,
+            modelConfig.getKvDataType(), attentionType, cacheTransceiverConfig);
     }
     return nullptr;
 }
 
 CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, CommType commType,
     executor::kv_cache::CacheState::ModelConfig const& cacheStateModelCfg, runtime::WorldConfig const& worldConfig,
-    nvinfer1::DataType dataType, executor::kv_cache::CacheState::AttentionType attentionType)
+    nvinfer1::DataType dataType, executor::kv_cache::CacheState::AttentionType attentionType,
+    std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig)
     : mCommType{commType}
     , mMpiGroupComm(std::addressof(tensorrt_llm::mpi::MpiComm::session()))
+    , mCacheTransceiverConfig{cacheTransceiverConfig}
 {
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
     if (worldConfig.isPipelineParallel())
@@ -108,7 +111,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     mCacheState = std::make_unique<executor::kv_cache::CacheState>(
         cacheStateModelCfg, worldConfig, dataType, attentionType, kvFactor);
 
-    if (mCacheState->getParallelConfig().mEnableAttenionDP)
+    if (mCacheState->getParallelConfig().mEnableAttentionDP)
     {
         int TPSizeInDPGroup
             = mCacheState->getParallelConfig().mTensorParallelism / mCacheState->getParallelConfig().mDPsize;
@@ -154,12 +157,21 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
             mManager = std::make_unique<executor::kv_cache::MpiConnectionManager>(mMpiWorldComm);
             TLLM_LOG_INFO("MPI Connection Manager created");
         }
+        std::optional<size_t> maxNumTokens = std::nullopt;
+        if (mCacheTransceiverConfig.has_value())
+        {
+            maxNumTokens = mCacheTransceiverConfig.value().getMaxNumTokens();
+        }
+        mCacheTransBufferManager
+            = std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens);
 
         using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;
-        auto makeFormatter = [cacheManager, isMLA]() -> std::unique_ptr<IOFormatter>
+        auto makeFormatter = [cacheManager, isMLA, this]() -> std::unique_ptr<IOFormatter>
         {
-            return isMLA ? std::unique_ptr<IOFormatter>(std::make_unique<MLACacheFormatter>(cacheManager))
-                         : std::unique_ptr<IOFormatter>(std::make_unique<CacheFormatter>(cacheManager));
+            return isMLA ? std::unique_ptr<IOFormatter>(
+                       std::make_unique<MLACacheFormatter>(cacheManager, this->mCacheTransBufferManager.get()))
+                         : std::unique_ptr<IOFormatter>(
+                             std::make_unique<CacheFormatter>(cacheManager, this->mCacheTransBufferManager.get()));
         };
 
         mDataResponder = std::make_unique<DataResponder>(
@@ -210,7 +222,9 @@ void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isContextOnlyRequest());
     llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS);
-    if (mResponderFutures.find(llmRequest) != mResponderFutures.end())
+    // If context phase params is already set, it means that the KV cache
+    // transfer is already in progress.
+    if (llmRequest->getContextPhaseParams().has_value())
     {
         if (llmRequest->getContextProgress() == nullptr)
         {
@@ -220,7 +234,7 @@ void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
     }
     setContextState(llmRequest);
     auto future = mDataResponder->respondAndSendAsync(*llmRequest);
-    mResponderFutures.insert({llmRequest, std::move(future)});
+    mResponderFutures.emplace_back(llmRequest, std::move(future));
 }
 
 void CacheTransceiver::respondAndSendLayerWise(
@@ -229,14 +243,14 @@ void CacheTransceiver::respondAndSendLayerWise(
     for (auto const& llmRequest : requests)
     {
         TLLM_CHECK(llmRequest && llmRequest->isContextOnlyRequest());
-        TLLM_CHECK(mResponderFutures.find(llmRequest.get()) == mResponderFutures.end());
+        TLLM_CHECK(!llmRequest->getContextPhaseParams().has_value());
         llmRequest->setContextProgress(progress);
         TLLM_LOG_DEBUG("Request %ld is being sent layer-wise.", llmRequest->mRequestId);
 
         llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
         setContextState(llmRequest.get());
         auto future = mDataResponder->respondAndSendAsync(*llmRequest);
-        mResponderFutures.emplace(llmRequest.get(), std::move(future));
+        mResponderFutures.emplace_back(llmRequest.get(), std::move(future));
     }
 }
 
@@ -337,9 +351,10 @@ void updateKVCacheTransferBW(mpi::MpiComm const& mpiComm, LlmRequest* request)
     }
 }
 
-void CacheTransceiver::checkContextTransferStatus(bool blocking)
+void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLeastRequestNum)
 {
-    auto syncComm = mCacheState->getParallelConfig().mEnableAttenionDP ? mMpiGroupTPInDPComm : mMpiGroupTensorParaComm;
+    bool blockAll = !atLeastRequestNum.has_value();
+    auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mMpiGroupTPInDPComm : mMpiGroupTensorParaComm;
     std::vector<LlmRequest::RequestIdType> contextCompleteRequestIds;
     for (auto&& [request, future] : mResponderFutures)
     {
@@ -352,7 +367,6 @@ void CacheTransceiver::checkContextTransferStatus(bool blocking)
     std::unordered_map<LlmRequest::RequestIdType, int> frequencyMap;
     if ((syncComm) && syncComm->getSize() > 1)
     {
-
         auto gatherRequestIdVec = gatherRequestIds(*syncComm, contextCompleteRequestIds);
         for (auto&& requestId : gatherRequestIdVec)
         {
@@ -379,12 +393,25 @@ void CacheTransceiver::checkContextTransferStatus(bool blocking)
             toCompleteIdSet.insert(requestId);
         }
     }
+
+    // Make sure there are at least atLeastRequestNum requests in toCompleteIdSet.
+    // This will preserve the order of insertion for KVCache transfer requests.
+    for (auto it = mResponderFutures.begin();
+         atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()) && it != mResponderFutures.end();
+         ++it)
+    {
+        auto& [request, future] = *it;
+        toCompleteIdSet.insert(request->mRequestId);
+    }
+
+    // Complete all the requests in toCompleteIdSet
     for (auto it = mResponderFutures.begin(); it != mResponderFutures.end();)
     {
-        if (blocking || (toCompleteIdSet.find(it->first->mRequestId) != toCompleteIdSet.end()))
+        auto& [request, future] = *it;
+        if (blockAll || (toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end()))
         {
-            it->second.get();
-            it->first->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+            future.get();
+            request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
             it = mResponderFutures.erase(it);
         }
         else
@@ -394,10 +421,9 @@ void CacheTransceiver::checkContextTransferStatus(bool blocking)
     }
 }
 
-void CacheTransceiver::checkGenTransferStatus(int atLeastRequestNum)
+void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)
 {
-
-    bool blockAll = atLeastRequestNum < 0;
+    bool blockAll = !atLeastRequestNum.has_value();
     std::vector<LlmRequest::RequestIdType> genTransferReadyRequestIds;
     for (auto&& [request, future] : mRequesterFutures)
     {
@@ -409,7 +435,7 @@ void CacheTransceiver::checkGenTransferStatus(int atLeastRequestNum)
     std::unordered_map<LlmRequest::RequestIdType, int> frequencyMap;
 
     std::vector<LlmRequest::RequestIdType> toBlockRequestIds;
-    auto syncComm = mCacheState->getParallelConfig().mEnableAttenionDP ? mMpiGroupDataComm.get() : mMpiGroupComm;
+    auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mMpiGroupDataComm.get() : mMpiGroupComm;
     if ((syncComm) && syncComm->getSize() > 1)
     {
         auto gatherRequestIdVec = gatherRequestIds(*syncComm, genTransferReadyRequestIds);
@@ -433,7 +459,7 @@ void CacheTransceiver::checkGenTransferStatus(int atLeastRequestNum)
             std::pair<LlmRequest::RequestIdType, int> const& right) { return left.second > right.second; });
     std::unordered_set<LlmRequest::RequestIdType> toCompleteIdSet;
     size_t idx = 0;
-    while (atLeastRequestNum > static_cast<int>(toCompleteIdSet.size()))
+    while (atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()))
     {
         if (idx >= freqVec.size())
         {
@@ -447,7 +473,7 @@ void CacheTransceiver::checkGenTransferStatus(int atLeastRequestNum)
     idx = 0;
 
     // insert order
-    while (atLeastRequestNum > static_cast<int>(toCompleteIdSet.size()))
+    while (atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()))
     {
         if (idx >= mRequesterFutures.size())
         {
@@ -458,7 +484,7 @@ void CacheTransceiver::checkGenTransferStatus(int atLeastRequestNum)
             toCompleteIdSet.insert(mRequesterFutures.at(idx).first->mRequestId);
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
                 " checkGenTransferStatus at least from RequesterFuture requestId: %zu atLeastRequestNum:%d",
-                mRequesterFutures.at(idx).first->mRequestId, atLeastRequestNum);
+                mRequesterFutures.at(idx).first->mRequestId, atLeastRequestNum.value_or(0));
         }
         idx++;
     }
@@ -473,7 +499,7 @@ void CacheTransceiver::checkGenTransferStatus(int atLeastRequestNum)
     }
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
-        atLeastRequestNum);
+        atLeastRequestNum.value_or(0));
     for (auto it = mRequesterFutures.begin(); it != mRequesterFutures.end();)
     {
         if (blockAll || toCompleteIdSet.find(it->first->mRequestId) != toCompleteIdSet.end())

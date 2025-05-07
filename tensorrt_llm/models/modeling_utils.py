@@ -1,11 +1,11 @@
 import argparse
 import copy
 import dataclasses
+import fnmatch
 import json
 import os
 import re
 from enum import IntFlag, auto
-from fnmatch import fnmatch
 from functools import cached_property
 from pathlib import Path
 from typing import (TYPE_CHECKING, Callable, Dict, Generator, List, Optional,
@@ -63,12 +63,25 @@ class Gemma2ConfigGroup:
         return {f.name for f in dataclasses.fields(cls)}
 
 
+@dataclasses.dataclass(kw_only=True, frozen=True)
+class Gemma3ConfigGroup:
+    query_pre_attn_scalar: float
+    final_logit_softcapping: Optional[float]
+    sliding_window_pattern: int
+    rope_local_base_freq: int
+    sliding_window: int
+
+    @classmethod
+    def keys(cls):
+        return {f.name for f in dataclasses.fields(cls)}
+
+
 if TYPE_CHECKING:
     from typing import Type, TypeVar
 
     from typing_extensions import Self
 
-    ConfigGroups = Union[Gemma2ConfigGroup]
+    ConfigGroups = Union[Gemma2ConfigGroup, Gemma3ConfigGroup]
     """Groupings of config where, if one of said properties exists, we assume all of the properties exist (even if they are `None`)"""
     CG = TypeVar("CG", bound=ConfigGroups)
 
@@ -207,6 +220,21 @@ class QuantConfig:
         else:
             return None
 
+    def is_module_excluded_from_quantization(self, name: str) -> bool:
+        """Check if the module is excluded from quantization.
+
+        Args:
+            name (str): The name of the module.
+
+        Returns:
+            bool: True if the module is excluded from quantization, False otherwise.
+        """
+        if self.exclude_modules is not None:
+            for exclude_module in self.exclude_modules:
+                if fnmatch.fnmatchcase(name, exclude_module):
+                    return True
+        return False
+
     @classmethod
     def from_dict(cls, config: dict) -> 'QuantConfig':
         """Create a QuantConfig instance from a dict.
@@ -267,7 +295,7 @@ class LayerQuantConfig(QuantConfig):
     def layer_quant_mode(self, layer_name) -> QuantMode:
 
         for name, quant_mode in self.auto_quant_mode.items():
-            if fnmatch(layer_name, name):
+            if fnmatch.fnmatch(layer_name, name):
                 return quant_mode
 
         return QuantMode(0)
@@ -296,7 +324,7 @@ class LayerQuantConfig(QuantConfig):
         quant_res = QuantConfig()
 
         for name, quant_cfg in self.quantized_layers.items():
-            if fnmatch(module_name, name):
+            if fnmatch.fnmatch(module_name, name):
                 quant_res = quant_cfg
                 break
         return quant_res
@@ -1027,6 +1055,9 @@ class DecoderModelForCausalLM(PretrainedModel):
             else:
                 assert False, "Context parallelism with non-remove-padding is not supported yet."
 
+        is_gemma_2_cg = self.config.has_config_group(Gemma2ConfigGroup)
+        is_gemma_3_cg = self.config.has_config_group(Gemma3ConfigGroup)
+
         kwargs = {
             'input_ids': input_ids,
             'position_ids': position_ids,
@@ -1080,9 +1111,10 @@ class DecoderModelForCausalLM(PretrainedModel):
                 lm_logits *= getattr(self.config, 'output_multiplier_scale', 1)
             if self.mup_width_multiplier is not None:
                 lm_logits = lm_logits / self.mup_width_multiplier
-            if self.config.has_config_group(Gemma2ConfigGroup):
+            if is_gemma_2_cg or is_gemma_3_cg:
                 softcap = self.config.get_config_group(
-                    Gemma2ConfigGroup).final_logit_softcapping
+                    Gemma2ConfigGroup if not is_gemma_3_cg else
+                    Gemma3ConfigGroup).final_logit_softcapping
                 if softcap:
                     lm_logits = lm_logits * float(1 / softcap)
                     lm_logits = tanh(lm_logits) * float(softcap)

@@ -41,7 +41,8 @@ def llama_7b_path(engine_path: Path) -> Path:
     if not path.exists():
         model_dir = str(llm_models_root() / "llama-models/llama-7b-hf")
         llm = LLM(model_dir)
-        llm.save(str(path))
+        with llm:
+            llm.save(str(path))
 
     return path
 
@@ -56,7 +57,8 @@ def llama_7b_bs2_path(engine_path: Path) -> Path:
         build_config.max_beam_width = 2
         # TODO[chunweiy]: switch to executor backend
         llm = LLM(model_dir, build_config=build_config)
-        llm.save(str(path))
+        with llm:
+            llm.save(str(path))
 
     return path
 
@@ -68,7 +70,8 @@ def llama_7b_tp2_path(engine_path: Path) -> Path:
     if not path.exists():
         model_dir = str(llm_models_root() / "llama-models/llama-7b-hf")
         llm = LLM(model_dir, tensor_parallel_size=2)
-        llm.save(str(path))
+        with llm:
+            llm.save(str(path))
 
     return path
 
@@ -85,7 +88,9 @@ def test_generation_bs2(llama_7b_bs2_path: Path):
             executor_config=tllm.ExecutorConfig(max_beam_width=2)) as executor:
         result = executor.generate(prompt_token_ids,
                                    sampling_params=SamplingParams(
-                                       max_tokens=max_tokens, beam_width=2))
+                                       max_tokens=max_tokens,
+                                       n=2,
+                                       use_beam_search=True))
         assert similar(tokenizer.decode(result.outputs[0].token_ids),
                        'E F G H I J K L')
         assert similar(tokenizer.decode(result.outputs[1].token_ids),
@@ -160,7 +165,7 @@ def test_invalid_sampling_params():
     with pytest.raises(ValueError):
         # n > beam_width is not possible because n exceeds the number of beam
         # search results
-        SamplingParams(max_tokens=4, n=4, beam_width=3)
+        SamplingParams(max_tokens=4, n=4, best_of=3, use_beam_search=True)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2 or WORLD_SIZE != 2,
@@ -347,6 +352,8 @@ def test_ZeroMqQueue_sync_async():
         push_pipe.put(i)
 
     assert res.result() == 45
+    pool.shutdown()
+    push_pipe.close()
 
 
 Input = PostprocWorker.Input
@@ -413,6 +420,10 @@ def test_ResponsePostprocessWorker():
 
     input_pipe.put(None)  # tell worker to shutdown
     fut.result()
+
+    pool.shutdown()
+    input_pipe.close()
+    out_pipe.close()
 
 
 if __name__ == '__main__':

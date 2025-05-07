@@ -76,7 +76,7 @@ Here is an example to print the values of the MLP output tensor in the GPT model
 Enable the `--enable_debug_output` option when building engines with `trtllm-build`
 
 ```bash
-cd examples/gpt
+cd examples/models/core/gpt
 
 # Download hf gpt2 model
 rm -rf gpt2 && git clone https://huggingface.co/gpt2-medium gpt2
@@ -190,9 +190,12 @@ unexpected shape for input 'XXX' for model 'YYY'. Expected [-1,-1,-1], got [8,16
 RuntimeError: Sizes of tensors must match except in dimension 0. Expected size 8192 but got size 1024 for tensor number 1 in the list.
 ```
 
-By setting environment variable `export TLLM_LOG_LEVEL=TRACE`, we can get more information about the TensorRT engine at runtime, which contains the shapes of each input / output tensors, and all allowed ranges of every input shapes.
+By setting environment variable `export TLLM_LOG_LEVEL=TRACE`, we can get more information about the TensorRT engine and context at runtime.
+
+Before the first forward computation, the shapes of all input / output tensors and their corresponding allowed ranges are provided in a table like:
 
 ```txt
+[TensorRT-LLM][TRACE] Information of engine input / output.
 [TensorRT-LLM][TRACE] =====================================================================
 [TensorRT-LLM][TRACE]              Name              |I/O|Location|DataType|    Shape     |
 [TensorRT-LLM][TRACE] ---------------------------------------------------------------------
@@ -237,6 +240,35 @@ By setting environment variable `export TLLM_LOG_LEVEL=TRACE`, we can get more i
 [TensorRT-LLM][TRACE] cache_indirection              |  (1, 1, 1)   | (4, 1, 1024) | (8, 1, 2048) |
 [TensorRT-LLM][TRACE] logits                         |  (1, 65024)  |  (4, 65024)  |  (8, 65024)  |
 [TensorRT-LLM][TRACE] =============================================================================
+```
+
+Before each forward computation, the real shapes of all input / output tensors for TRT engine are provided by a table like:
+
+```txt
+[TensorRT-LLM][TRACE] Information of context input / output.
+[TensorRT-LLM][TRACE] Using Optimization Profile: 0
+[TensorRT-LLM][TRACE] =================================================
+[TensorRT-LLM][TRACE]              Name              |I/O|   Shape    |
+[TensorRT-LLM][TRACE] -------------------------------------------------
+[TensorRT-LLM][TRACE] input_ids                      | I |    (33)    |
+[TensorRT-LLM][TRACE] position_ids                   | I |    (33)    |
+[TensorRT-LLM][TRACE] last_token_ids                 | I |    (3)     |
+[TensorRT-LLM][TRACE] kv_cache_block_offsets         | I |(1, 3, 2, 4)|
+[TensorRT-LLM][TRACE] host_kv_cache_block_offsets    | I |(1, 3, 2, 4)|
+[TensorRT-LLM][TRACE] host_kv_cache_pool_pointers    | I |   (1, 2)   |
+[TensorRT-LLM][TRACE] host_kv_cache_pool_mapping     | I |    (28)    |
+[TensorRT-LLM][TRACE] sequence_length                | I |    (3)     |
+[TensorRT-LLM][TRACE] host_request_types             | I |    (3)     |
+[TensorRT-LLM][TRACE] host_past_key_value_lengths    | I |    (3)     |
+[TensorRT-LLM][TRACE] context_lengths                | I |    (3)     |
+[TensorRT-LLM][TRACE] host_runtime_perf_knobs        | I |    (16)    |
+[TensorRT-LLM][TRACE] host_context_progress          | I |    (1)     |
+[TensorRT-LLM][TRACE] host_context_lengths           | I |    (3)     |
+[TensorRT-LLM][TRACE] host_max_attention_window_sizes| I |    (28)    |
+[TensorRT-LLM][TRACE] host_sink_token_length         | I |    (1)     |
+[TensorRT-LLM][TRACE] cache_indirection              | I |(3, 2, 256) |
+[TensorRT-LLM][TRACE] logits                         | O | (3, 65024) |
+[TensorRT-LLM][TRACE] =================================================
 ```
 
 ## Tips
@@ -291,6 +323,6 @@ As a rule of thumb, if you are running TensorRT-LLM interactively on a Slurm
 node, prefix your commands with `mpirun -n 1` to run TensorRT-LLM in a
 dedicated MPI environment, not the one provided by your Slurm allocation.
 
-For example: `mpirun -n 1 python3 examples/gpt/build.py ...`
+For example: `mpirun -n 1 python3 examples/models/core/gpt/build.py ...`
 
 It's critical that it's always `-n 1` regardless of how many GPUs are being used. If you'd use `-n 2` for a 2 GPU program it will not work. `mpirun` here isn't being used to orchestrate multiple processes, but to invoke the right environment on SLURM. The internal MPI implementation deals with spawning the additional processes.

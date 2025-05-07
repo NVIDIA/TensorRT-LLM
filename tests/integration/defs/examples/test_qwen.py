@@ -94,7 +94,7 @@ def test_llm_qwen_single_gpu_summary(
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     summary_cmd = [
-        f"{qwen_example_root}/../summarize.py", "--test_trt_llm",
+        f"{qwen_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", f"{llm_qwen_model_root}", "--data_type", "fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}",
         f"--tensorrt_llm_rouge1_threshold=22",
@@ -171,7 +171,7 @@ def test_llm_qwen_moe_single_gpu_summary(
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     summary_cmd = [
-        f"{qwen_example_root}/../summarize.py", "--test_trt_llm",
+        f"{qwen_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", f"{llm_qwen_model_root}", "--data_type", "fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}",
         f"--tensorrt_llm_rouge1_threshold=22",
@@ -320,7 +320,7 @@ def test_llm_qwen1_5_7b_single_gpu_lora(
     input_text = "What is your name?"
     print("Run inference with lora id 0...")
     venv_check_call(llm_venv, [
-        f"{qwen_example_root}/../run.py",
+        f"{qwen_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--input_text={input_text}",
         "--lora_task_uids=0",
@@ -338,7 +338,7 @@ def test_llm_qwen1_5_7b_single_gpu_lora(
 
     print("Run inference with lora id -1...")
     venv_check_call(llm_venv, [
-        f"{qwen_example_root}/../run.py",
+        f"{qwen_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--input_text={input_text}",
         "--lora_task_uids=-1",
@@ -408,7 +408,7 @@ def test_llm_qwen1_5_moe_single_gpu_lora(
     input_text = "What is your name?"
     print("Run inference with lora id 0...")
     venv_check_call(llm_venv, [
-        f"{qwen_example_root}/../run.py",
+        f"{qwen_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--input_text={input_text}",
         "--lora_task_uids=0",
@@ -426,7 +426,7 @@ def test_llm_qwen1_5_moe_single_gpu_lora(
 
     print("Run inference with lora id -1...")
     venv_check_call(llm_venv, [
-        f"{qwen_example_root}/../run.py",
+        f"{qwen_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--input_text={input_text}",
         "--lora_task_uids=-1",
@@ -496,7 +496,7 @@ def test_llm_qwen1_5_moe_plugin_single_gpu_lora(
     input_text = "What is your name?"
     print("Run inference with lora id 0...")
     venv_check_call(llm_venv, [
-        f"{qwen_example_root}/../run.py",
+        f"{qwen_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--input_text={input_text}",
         "--lora_task_uids=0",
@@ -514,7 +514,7 @@ def test_llm_qwen1_5_moe_plugin_single_gpu_lora(
 
     print("Run inference with lora id -1...")
     venv_check_call(llm_venv, [
-        f"{qwen_example_root}/../run.py",
+        f"{qwen_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--input_text={input_text}",
         "--lora_task_uids=-1",
@@ -575,7 +575,7 @@ def test_llm_qwen_7b_int8_kv_1node_1gpus(qwen_example_root, llm_qwen_model_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     summary_cmd = [
-        f"{qwen_example_root}/../summarize.py", "--test_trt_llm",
+        f"{qwen_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", f"{llm_qwen_model_root}", "--data_type", "fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}",
         "--tensorrt_llm_rouge1_threshold=22",
@@ -647,7 +647,7 @@ def test_llm_qwen_7b_multi_gpus_summary(qwen_example_root, llm_qwen_model_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     summary_cmd = [
-        f"{qwen_example_root}/../summarize.py", "--test_trt_llm",
+        f"{qwen_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", f"{llm_qwen_model_root}", "--data_type", "fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}",
         f"--num_beams={num_beams}", "--tensorrt_llm_rouge1_threshold=24",
@@ -711,7 +711,7 @@ def test_llm_qwen_smooth_quant_single_gpu_summary(qwen_example_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     summary_cmd = [
-        f"{qwen_example_root}/../summarize.py", "--test_trt_llm",
+        f"{qwen_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", f"{llm_qwen_model_root}", "--data_type", "fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}",
         f"--num_beams={num_beams}", "--tensorrt_llm_rouge1_threshold=24",
@@ -760,7 +760,7 @@ def test_llm_qwen_int4_single_gpu_summary(qwen_example_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     summary_cmd = [
-        f"{qwen_example_root}/../summarize.py", "--test_trt_llm",
+        f"{qwen_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", f"{llm_qwen_model_root}", "--data_type", "fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}",
         f"--num_beams={num_beams}", "--tensorrt_llm_rouge1_threshold=24",
@@ -787,7 +787,7 @@ def test_llm_qwen_awq_single_gpu_summary(qwen_example_root, llm_qwen_model_root,
     dtype = 'float16'
     output_dir = f"{qcache_dir}/quantized_int4-awq"
     quantize_cmd = [
-        f"{qwen_example_root}/../quantization/quantize.py",
+        f"{qwen_example_root}/../../../quantization/quantize.py",
         f"--model_dir={llm_qwen_model_root}",
         f"--calib_dataset={llm_datasets_root}/cnn_dailymail",
         f"--output_dir={output_dir}",
@@ -814,7 +814,7 @@ def test_llm_qwen_awq_single_gpu_summary(qwen_example_root, llm_qwen_model_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     summary_cmd = [
-        f"{qwen_example_root}/../summarize.py", "--test_trt_llm",
+        f"{qwen_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", f"{llm_qwen_model_root}", "--data_type", "fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}",
         f"--num_beams={num_beams}", "--tensorrt_llm_rouge1_threshold=22.8",
@@ -874,7 +874,7 @@ def test_llm_qwen_1node_8gpus_summary(qwen_example_root, llm_qwen_model_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     summary_cmd = [
-        f"{qwen_example_root}/../summarize.py", "--test_trt_llm",
+        f"{qwen_example_root}/../../../summarize.py", "--test_trt_llm",
         f"--hf_model_dir={llm_qwen_model_root}", "--data_type=fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}", "--num_beams=4",
         "--tensorrt_llm_rouge1_threshold=22", "--max_input_length=2048",
@@ -936,7 +936,7 @@ def test_llm_qwen_moe_multi_gpu_summary(qwen_example_root, llm_qwen_model_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     summary_cmd = [
-        f"{qwen_example_root}/../summarize.py", "--test_trt_llm",
+        f"{qwen_example_root}/../../../summarize.py", "--test_trt_llm",
         f"--hf_model_dir={llm_qwen_model_root}", "--data_type=fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}",
         "--tensorrt_llm_rouge1_threshold=20", "--max_input_length=2048",
@@ -966,7 +966,7 @@ def test_llm_hf_qwen_quantization_1gpu(dtype, llm_qwen_model_root, llm_venv,
     "Run qwen quantization tests"
     print("Convert checkpoint by modelopt...")
     convert_cmd = [
-        f"{qwen_example_root}/../quantization/quantize.py",
+        f"{qwen_example_root}/../../../quantization/quantize.py",
         f"--model_dir={llm_qwen_model_root}",
         f"--calib_dataset={llm_datasets_root}/cnn_dailymail",
         f"--dtype={dtype}",
@@ -1000,17 +1000,17 @@ def test_llm_hf_qwen_quantization_1gpu(dtype, llm_qwen_model_root, llm_venv,
     llm_venv.run_cmd(['-m', 'pip', 'install', 'jinja2==3.1.0'])
     # Run MMLU for Qwen 2.5 models.
     if '2.5' in llm_qwen_model_root:
-        summary_cmd = [
-            f"{qwen_example_root}/../mmlu_llmapi.py",
-            f"--hf_model_dir={llm_qwen_model_root}",
-            f"--engine_dir={engine_dir}",
-            f"--data_dir={llm_datasets_root}/mmlu",
-            "--check_accuracy",
-            f"--accuracy_threshold={mmlu_score}",
+        mmlu_cmd = [
+            "trtllm-eval", f"--model={engine_dir}",
+            f"--tokenizer={llm_qwen_model_root}", "--backend=tensorrt", "mmlu",
+            f"--dataset_path={llm_datasets_root}/mmlu", "--check_accuracy",
+            f"--accuracy_threshold={mmlu_score}"
         ]
+        check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
+
     else:
         summary_cmd = [
-            f"{qwen_example_root}/../summarize.py",
+            f"{qwen_example_root}/../../../summarize.py",
             "--test_trt_llm",
             f"--hf_model_dir={llm_qwen_model_root}",
             f"--engine_dir={engine_dir}",
@@ -1019,7 +1019,7 @@ def test_llm_hf_qwen_quantization_1gpu(dtype, llm_qwen_model_root, llm_venv,
             f"--dataset_dir={llm_datasets_root}",
             f"--rouge_dir={llm_rouge_root}",
         ]
-    venv_check_call(llm_venv, summary_cmd)
+        venv_check_call(llm_venv, summary_cmd)
 
 
 @skip_pre_ada
@@ -1039,7 +1039,7 @@ def test_llm_hf_qwen_multi_lora_1gpu(llm_qwen_model_root,
 
     print("Convert checkpoint by modelopt...")
     convert_cmd = [
-        f"{qwen_example_root}/../quantization/quantize.py",
+        f"{qwen_example_root}/../../../quantization/quantize.py",
         f"--model_dir={llm_qwen_model_root}",
         f"--calib_dataset={llm_datasets_root}/cnn_dailymail",
         f"--dtype={dtype}",

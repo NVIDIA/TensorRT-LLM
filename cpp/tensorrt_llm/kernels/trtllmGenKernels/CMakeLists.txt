@@ -15,6 +15,8 @@
 # the License.
 #
 
-add_subdirectory(fmha)
 add_subdirectory(blockscaleGemm)
-add_subdirectory(fp8BlockScaleMoe)
+add_subdirectory(fmha)
+add_subdirectory(gemm)
+add_subdirectory(batchedGemm)
+add_subdirectory(blockScaleMoe)

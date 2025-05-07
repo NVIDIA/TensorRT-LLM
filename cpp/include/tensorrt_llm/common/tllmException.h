@@ -22,7 +22,7 @@
 #include <string>
 
 #define NEW_TLLM_EXCEPTION(...)                                                                                        \
-    tensorrt_llm::common::TllmException(__FILE__, __LINE__, tensorrt_llm::common::fmtstr(__VA_ARGS__))
+    tensorrt_llm::common::TllmException(__FILE__, __LINE__, tensorrt_llm::common::fmtstr(__VA_ARGS__).c_str())
 
 namespace tensorrt_llm::common
 {
@@ -32,7 +32,7 @@ class TllmException : public std::runtime_error
 public:
     static auto constexpr MAX_FRAMES = 128;
 
-    explicit TllmException(char const* file, std::size_t line, std::string const& msg);
+    explicit TllmException(char const* file, std::size_t line, char const* msg);
 
     ~TllmException() noexcept override;
 

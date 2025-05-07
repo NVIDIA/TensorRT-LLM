@@ -8,12 +8,11 @@ import asyncio
 import os
 import sys
 
-import openai
 import pytest
 from llmapi.apps.openai_server import RemoteOpenAIServer
 
-from tensorrt_llm.scaffolding.task import GenerationTask, TaskStatus
-from tensorrt_llm.scaffolding.worker import TRTLLMWorker, TRTOpenaiWorker
+from tensorrt_llm.scaffolding import (GenerationTask, TaskStatus, TRTLLMWorker,
+                                      TRTOpenaiWorker)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from llmapi.test_llm import get_model_path
@@ -52,67 +51,33 @@ def server(model_name: str, backend: str, num_postprocess_workers: int):
 
     args = ["--backend", f"{backend}"]
     args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
-    with RemoteOpenAIServer(model_path, args) as remote_server:
-        yield remote_server
-
-
-@pytest.fixture(scope="module")
-def async_client(server: RemoteOpenAIServer):
-    return server.get_async_client()
-
-
-@pytest.mark.asyncio(loop_scope="module")
-async def test_single_completion(async_client: openai.OpenAI, model_name):
-    completion = await async_client.completions.create(
-        model=model_name,
-        prompt="Hello, my name is",
-        max_tokens=5,
-        temperature=0.0,
-    )
-
-    choice = completion.choices[0]
-    assert len(choice.text) >= 5
-    assert choice.finish_reason == "length"
-    assert completion.id is not None
-    assert completion.choices is not None and len(completion.choices) == 1
-    completion_tokens = 5
-    prompt_tokens = 6
-    assert completion.usage == openai.types.CompletionUsage(
-        completion_tokens=completion_tokens,
-        prompt_tokens=prompt_tokens,
-        total_tokens=prompt_tokens + completion_tokens)
-
-    # test using token IDs
-    completion = await async_client.completions.create(
-        model=model_name,
-        prompt=[0, 0, 0, 0, 0],
-        max_tokens=5,
-        temperature=0.0,
-    )
-    assert len(completion.choices[0].text) >= 1
+    remote_server = RemoteOpenAIServer(model_path, args)
+    return remote_server
 
 
 def create_trtoai_worker(model_name, async_client):
     return TRTOpenaiWorker(
         async_client=async_client,
         model=model_name,
+        max_tokens=5,
     )
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_trtoai_worker_generation(default_prompt, model_name,
-                                        async_client):
-    worker = create_trtoai_worker(model_name, async_client)
+def test_trtoai_worker_generation(default_prompt, model_name, server):
+    worker = create_trtoai_worker(model_name, server.get_async_client())
     task = GenerationTask.create_from_prompt(default_prompt)
-    status = await worker.run_task(task)
+    status = asyncio.run(worker.run_task(task))
     assert status == TaskStatus.SUCCESS, "Generation Task is not successful with TRTOpenaiWorker"
+    server.__exit__(None, None, None)
+    worker.shutdown()
 
 
 def create_trtllm_worker(model_path):
     return TRTLLMWorker.init_with_new_llm(str(model_path),
                                           backend="pytorch",
-                                          max_batch_size=32,
-                                          max_num_tokens=4096,
+                                          max_batch_size=1,
+                                          max_tokens=5,
                                           temperature=0.9)
 
 
@@ -121,3 +86,4 @@ def test_trtllm_worker_generation(default_prompt, deepseek_distill_7b_path):
     task = GenerationTask.create_from_prompt(default_prompt)
     status = asyncio.run(worker.run_task(task))
     assert status == TaskStatus.SUCCESS, "Generation Task is not successful with TRTLLMWorker"
+    worker.shutdown()
