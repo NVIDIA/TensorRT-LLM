@@ -174,3 +174,48 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                                     self.MODEL_PATH)
         task = MMLU(self.MODEL_NAME)
         task.evaluate(client)
+
+
+class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/fp8"
+
+    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.skip_device_not_contain(["H100"])
+    @pytest.mark.parametrize("overlap_scheduler", [False, True])
+    def test_auto_dtype(self, overlap_scheduler):
+        ctx_server_config = {
+            "pytorch_backend_config": {
+                "enable_overlap_scheduler": False
+            },
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.2
+            }
+        }
+        gen_server_config = {
+            "pytorch_backend_config": {
+                "enable_overlap_scheduler": overlap_scheduler
+            },
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.2
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        client = OpenAIServerClient(disaggregated_server_config,
+                                    ctx_server_config, gen_server_config,
+                                    self.MODEL_PATH)
+        task = MMLU(self.MODEL_NAME)
+        task.evaluate(client)
+        del client
