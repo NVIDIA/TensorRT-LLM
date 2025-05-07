@@ -91,7 +91,6 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
             inputIdsFlatView = ITensor::view(inputIdsFlatView, ITensor::makeShape({numVocabs, numTokens}));
         }
 
-        // TODO: not sure about promptLen here, it 
         auto const promptLen = llmReq->getPromptLen();
         auto const& reqTokens = llmReq->getTokens(0);
         TLLM_CHECK(reqTokens.size() == static_cast<decltype(reqTokens.size())>(promptLen * numVocabs));

@@ -80,6 +80,13 @@ void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector co
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(HandleGenerationLogits);
 
+    // compute where logits start for the given `vocabId`
+    auto vocabSizes = modelConfig.getVocabSizes();
+    SizeType32 vocabOffset = 0;
+    for (SizeType32 i = 0; i < vocabId; ++i) {
+        vocabOffset += vocabSizes[i];
+    }
+
     for (auto const& llmReq : generationRequests)
     {
         auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
@@ -112,12 +119,7 @@ void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector co
             auto curVocablogitsView = logitsView;
             if (logitsViewShape.d[0] == 1) // if current nTok is 1, could have multiple vocabs
             {
-                auto vocabSizes = modelConfig.getVocabSizes();
-                SizeType32 offset = 0;
-                for (SizeType32 i = 0; i < vocabId; ++i) {
-                    offset += vocabSizes[i];
-                }
-                curVocablogitsView = ITensor::slice(logitsView, {0, offset}, vocabSizes[vocabId]); // [vocabSize,]
+                curVocablogitsView = ITensor::slice(logitsView, {0, vocabOffset}, vocabSizes[vocabId]); // [vocabSize,]
                 curVocablogitsView = ITensor::view(curVocablogitsView, ITensor::makeShape({1, vocabSizes[vocabId]})); // [numLogits == 1, vocabSize]
             }
             const auto updateLogitsViewShape = curVocablogitsView->getShape();

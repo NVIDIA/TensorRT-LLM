@@ -651,10 +651,9 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
                 if (llmReq->getNumVocabs() > 1)
                 {
                     auto const& beamTokens = llmReq->getTokens(beam);
-                    // TODO: disable for now
-                    // TLLM_CHECK_WITH_INFO(
-                    //     beamTokens.size() % llmReq->getNumVocabs() == 0, "Number of tokens needs to be a multiple of
-                    //     number of vocabs!");
+                     TLLM_CHECK_WITH_INFO(
+                         beamTokens.size() % llmReq->getNumVocabs() == 0, "Number of tokens needs to be a multiple of
+                         number of vocabs!");
                     inputHost.insert(inputHost.end(), beamTokens.cend() - llmReq->getNumVocabs(), beamTokens.cend());
                 }
                 else
