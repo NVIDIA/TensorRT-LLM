@@ -468,8 +468,11 @@ class MLA(nn.Module):
         self.mha.update_quant_config(self.quant_config)
         self.mqa.update_quant_config(self.quant_config)
 
-        has_fp8_block_scales = self.quant_config and self.quant_config.quant_mode.has_fp8_block_scales(
-        )
+        # k_b_proj_trans's dtype must be consistent with self.kv_b_proj,
+        # which can be modified after __init__
+        has_fp8_block_scales = (
+            self.kv_b_proj.quant_config
+            and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales())
 
         mla_weight_dtype = torch.float8_e4m3fn if has_fp8_block_scales else self.dtype
         self.k_b_proj_trans = nn.Parameter(
@@ -693,6 +696,7 @@ class MLA(nn.Module):
             dtype=q.dtype,
             device=q.device,
         )
+
         if self.k_b_proj_trans.dtype == torch.bfloat16:
             # [num_heads, num_tokens, self.qk_nope_head_dim]
             q_nope_t = q_nope.transpose(0, 1)

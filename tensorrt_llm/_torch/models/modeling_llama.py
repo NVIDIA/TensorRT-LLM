@@ -295,10 +295,10 @@ class Llama4MoE(nn.Module):
         self.aux_stream = aux_stream
 
     def compute_routed_output(self, hidden_states, all_rank_num_tokens,
-                              min_latency_mode):
+                              cutlass_min_latency_mode):
         router_logits = self.router(hidden_states)
         routed_output = self.experts(hidden_states, router_logits,
-                                     min_latency_mode)
+                                     cutlass_min_latency_mode)
         return routed_output
 
     def forward(
@@ -306,16 +306,16 @@ class Llama4MoE(nn.Module):
         hidden_states: torch.Tensor,
         all_rank_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
-        min_latency_mode: Optional[bool] = False,
+        cutlass_min_latency_mode: Optional[bool] = False,
     ) -> torch.Tensor:
         # Only enable multi-stream for cuda graph since switch stream has extra host overhead
         # This design is mainly for low latency use case. Need to improve for max throughput use case.
         fn0 = lambda: self.shared_expert(hidden_states)
         fn1 = lambda: self.compute_routed_output(
-            hidden_states, all_rank_num_tokens, min_latency_mode)
+            hidden_states, all_rank_num_tokens, cutlass_min_latency_mode)
         shared_output, routed_output = maybe_execute_in_parallel(
             fn0, fn1, self.moe_event[0], self.moe_event[1], self.aux_stream)
-        if min_latency_mode:
+        if cutlass_min_latency_mode:
             return [shared_output, *routed_output]
 
         assert shared_output.size() == routed_output.size(
@@ -414,12 +414,12 @@ class Llama4DecoderLayer(DecoderLayer):
         # TODO: Remove it after we fix crash on Hopper
         # major, minor = torch.cuda.get_device_capability()
         # is_blackwell = (major * 10 + minor) >= 100
-        # min_latency_mode = hidden_states.size(
+        # cutlass_min_latency_mode = hidden_states.size(
         #     0
         # ) <= 128 and self.fusion_config.POST_MOE_FUSION and is_blackwell and self.is_quanted
 
         # Temporarily disable min-latency mode for Llama4
-        min_latency_mode = False
+        cutlass_min_latency_mode = False
 
         if residual is None:
             residual = hidden_states
@@ -456,7 +456,7 @@ class Llama4DecoderLayer(DecoderLayer):
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
                 self.fusion_config.POST_MOE_FUSION or self.fusion_config.
                 POST_MLP_FUSION or self.mapping.tp_size == 1)),
-            min_latency_mode=min_latency_mode,
+            cutlass_min_latency_mode=cutlass_min_latency_mode,
         )
         if spec_metadata is not None:
             # We save the hidden states in the spec metadata here. In _prepare_draft_tokens,
@@ -467,7 +467,7 @@ class Llama4DecoderLayer(DecoderLayer):
                                                       hidden_states, residual)
 
         if self.fusion_config.POST_MOE_FUSION or self.fusion_config.POST_MLP_FUSION:
-            if min_latency_mode:
+            if cutlass_min_latency_mode:
                 shared_output = hidden_states[0]
                 hidden_states_activated_experts = hidden_states[1]
                 num_activated_experts_per_node = hidden_states[2]
