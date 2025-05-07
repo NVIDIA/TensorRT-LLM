@@ -304,8 +304,9 @@ class KVCacheManager(BaseResourceManager):
                 req.py_prompt_len = req.prompt_len
                 if max_num_draft_tokens > 0:
                     req.py_draft_tokens = [1] * max_num_draft_tokens
-                    for _ in range(max_num_draft_tokens):
-                        self.impl.add_token(req_id)
+                    if prepare_resource:
+                        for _ in range(max_num_draft_tokens):
+                            self.impl.add_token(req_id)
             requests.append(req)
         return requests
 
