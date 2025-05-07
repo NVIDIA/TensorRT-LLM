@@ -136,7 +136,7 @@ public:
         std::shared_ptr<runtime::CudaStream> stream = nullptr)
         : DebugTensor(*tensor, name, bufferManager, stream)
     {
-        isNullptr = (tensor.get() == nullptr);
+        isEmpty = (tensor.get() == nullptr);
     }
 
     uint8_t const& u8(std::initializer_list<runtime::ITensor::DimType64> const& dims)
@@ -212,82 +212,11 @@ public:
         return result;
     }
 
-    std::string tokens(void)
+    template <typename T, bool IsTokens = false>
+    std::string value()
     {
         using namespace tensorrt_llm::runtime;
         std::ostringstream buf;
-        if (isNullptr)
-        {
-            return mName + " is empty";
-        }
-        auto shape = mTensor.getShape();
-        runtime::BufferManager::ITensorPtr hostPtr = copyToHostOptional();
-        runtime::BufferRange<runtime::TokenIdType const> tensorRange(hostPtr ? (*hostPtr) : mTensor);
-        buf << mName << ": " << mTensor.getMemoryTypeName() << ',' << mTensor.getDataTypeName() << ',' << shape;
-        auto line = [&buf](TokenIdType const* array, SizeType32 size)
-        {
-            buf << '[';
-            for (SizeType32 i = 0; i < size; i++)
-            {
-                auto token = array[i];
-                if (token >= ' ' && token <= '~')
-                {
-                    buf << '\'' << static_cast<char>(token) << '\'';
-                }
-                else
-                {
-                    buf << token;
-                }
-                if (i != size - 1)
-                {
-                    buf << ',';
-                }
-            }
-            buf << ']';
-        };
-        if (shape.nbDims == 0)
-        {
-            buf << "[]";
-        }
-        else if (shape.nbDims == 1)
-        {
-            line(tensorRange.begin(), shape.d[0]);
-        }
-        else if (shape.nbDims == 2)
-        {
-            for (auto i = 0; i < shape.d[0]; i++)
-            {
-                buf << "\n [" << std::setw(3) << i << "]: ";
-                line(tensorRange.begin() + i * shape.d[1], shape.d[1]);
-            }
-        }
-        else if (shape.nbDims == 3)
-        {
-            for (auto i = 0; i < shape.d[0]; i++)
-            {
-                for (auto j = 0; j < shape.d[1]; j++)
-                {
-                    buf << "\n [" << std::setw(3) << i << "," << std::setw(3) << j << "]: ";
-                    line(tensorRange.begin() + (i * shape.d[0] + j) * shape.d[1], shape.d[2]);
-                }
-            }
-        }
-        else
-        {
-            buf << "More than 3 dimensions";
-        }
-        return buf.str();
-    }
-
-    template <typename T>
-    std::string values(void)
-    {
-        using namespace tensorrt_llm::runtime;
-        std::ostringstream buf;
-        if (isNullptr)
-        {
-            return mName + " is empty";
-        }
         auto shape = mTensor.getShape();
         runtime::BufferManager::ITensorPtr hostPtr = copyToHostOptional();
         runtime::BufferRange<T const> tensorRange(hostPtr ? (*hostPtr) : mTensor);
@@ -298,7 +227,22 @@ public:
             buf << '[';
             for (SizeType32 i = 0; i < size; i++)
             {
-                buf << static_cast<unsigned long long>(array[i]);
+                if constexpr (std::is_same_v<T, runtime::TokenIdType> && IsTokens)
+                {
+                    auto token = array[i];
+                    if (token >= ' ' && token <= '~')
+                    {
+                        buf << '\'' << static_cast<char>(token) << '\'';
+                    }
+                    else
+                    {
+                        buf << token;
+                    }
+                }
+                else
+                {
+                    buf << static_cast<unsigned long long>(array[i]);
+                }
                 if (i != size - 1)
                 {
                     buf << ',';
@@ -306,23 +250,20 @@ public:
             }
             buf << ']';
         };
-        if (shape.nbDims == 0)
+        switch (shape.nbDims)
         {
-            buf << "[]";
-        }
-        else if (shape.nbDims == 1)
-        {
-            line(tensorRange.begin(), shape.d[0]);
-        }
-        else if (shape.nbDims == 2)
+        case 0: buf << "[]"; break;
+        case 1: line(tensorRange.begin(), shape.d[0]); break;
+        case 2:
         {
             for (auto i = 0; i < shape.d[0]; i++)
             {
                 buf << "\n [" << std::setw(3) << i << "]: ";
                 line(tensorRange.begin() + i * shape.d[1], shape.d[1]);
             }
+            break;
         }
-        else if (shape.nbDims == 3)
+        case 3:
         {
             for (auto i = 0; i < shape.d[0]; i++)
             {
@@ -332,44 +273,51 @@ public:
                     line(tensorRange.begin() + (i * shape.d[0] + j) * shape.d[1], shape.d[2]);
                 }
             }
+            break;
         }
-        else
-        {
-            buf << "More than 3 dimensions";
+        default: buf << "More than 3 dimensions";
         }
         return buf.str();
     }
 
-    std::string values(void)
+    std::string value(bool const isTokens = false)
     {
+        if (isEmpty)
+        {
+            return mName + " is empty";
+        }
         switch (mTensor.getDataType())
         {
-        case nvinfer1::DataType::kBOOL: return values<bool>();
-        case nvinfer1::DataType::kFLOAT: return values<float>();
-        case nvinfer1::DataType::kINT8: return values<std::int8_t>();
-        case nvinfer1::DataType::kINT32: return values<std::int32_t>();
-        case nvinfer1::DataType::kINT64: return values<std::int64_t>();
-        case nvinfer1::DataType::kUINT8: return values<std::uint8_t>();
+        case nvinfer1::DataType::kFLOAT: return value<float>();
+        case nvinfer1::DataType::kHALF: return value<half>();
+        case nvinfer1::DataType::kINT8: return value<std::int8_t>();
+        case nvinfer1::DataType::kINT32: return isTokens ? value<std::int32_t, true>() : value<std::int32_t, false>();
+        case nvinfer1::DataType::kBOOL: return value<bool>();
+        case nvinfer1::DataType::kUINT8: return value<std::uint8_t>();
+        // FP8 is not supported
+        // BF16 is not supported
+        case nvinfer1::DataType::kINT64: return value<std::int64_t>();
+        // INT4 is not supported
+        // FP4 is not supported
         default: return std::string(mName + ": Unsupported data type");
         }
     }
 
     std::string shape(void)
     {
+        if (isEmpty)
+        {
+            return mName + " is empty";
+        }
         using namespace tensorrt_llm::runtime;
         std::ostringstream buf;
         buf << mName << ": " << mTensor.getShape();
         return buf.str();
     }
 
-    void print_tokens(void)
+    void print_value(bool const isTokens)
     {
-        TLLM_LOG_DEBUG(tokens());
-    }
-
-    void print_values(void)
-    {
-        TLLM_LOG_DEBUG(values());
+        TLLM_LOG_DEBUG(value(isTokens));
     }
 
     void print_shape(void)
@@ -383,7 +331,7 @@ public:
         runtime::BufferRange<T> tensorRange(const_cast<runtime::ITensor&>(mTensor));
         for (auto& item : tensorRange)
         {
-            item = vtype == 0 ? 0 : vtype == 1 ? 1 : rand();
+            item = (vtype == 0 ? 0 : (vtype == 1 ? 1 : rand()));
         }
     }
 
@@ -446,15 +394,15 @@ private:
     std::string mName;
     std::shared_ptr<runtime::BufferManager> mBufferManager;
     std::shared_ptr<runtime::CudaStream> mStream;
-    bool isNullptr{false};
+    bool isEmpty{false};
 };
 
 #define D(x) tensorrt_llm::layers::DebugTensor(x, #x)
 #define Db(x, bufferManager) tensorrt_llm::layers::DebugTensor(x, #x, bufferManager, nullptr)
 #define Ds(x, stream) tensorrt_llm::layers::DebugTensor(x, #x, nullptr, stream)
 #define Dbs(x, bufferManager, stream) tensorrt_llm::layers::DebugTensor(x, #x, bufferManager, stream)
-#define PRINT_TOKENS(x) D(x).print_tokens()
-#define PRINT_VALUES(x) D(x).print_values()
+#define PRINT_TOKEN(x) D(x).print_value(true)
+#define PRINT_VALUE(x) D(x).print_value(false)
 #define PRINT_SHAPE(x) D(x).print_shape()
 
 } // namespace tensorrt_llm::layers

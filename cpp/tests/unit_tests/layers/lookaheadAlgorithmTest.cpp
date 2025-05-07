@@ -113,7 +113,7 @@ TEST_P(LookaheadAlgorithmTest, predict)
     sequenceRange[sequenceLength] = oracle[promptLen]; // from context phase.
     sequenceLength += 1;
 
-    PRINT_TOKENS(sequence);
+    PRINT_TOKEN(sequence);
 
     tensorrt_llm::layers::LookaheadAlgorithm algo(W, N, G);
     algo.setup(ITensor::slice(sequence, 0, sequenceLength), w, n, g, 42);
@@ -151,13 +151,13 @@ TEST_P(LookaheadAlgorithmTest, predict)
         TensorPtr posid = ITensor::slice(posidMax, 0, inputLength + 1);
         TensorPtr amask = ITensor::slice(attentionMaskMax, 0, inputLength + 1);
 
-        PRINT_TOKENS(input);
-        PRINT_VALUES(posid);
-        PRINT_VALUES(amask);
+        PRINT_TOKEN(input);
+        PRINT_VALUE(posid);
+        PRINT_VALUE(amask);
 
         TensorPtr output = ITensor::slice(outputMax, 0, inputLength + 1);
         llm.foretell(output, input, posid, amask);
-        PRINT_TOKENS(output);
+        PRINT_TOKEN(output);
 
         // algo.update(acceptedMax, acceptedOffsetsMax, acceptedLengthPtr, output, endIdPtr);
         algo.update(
@@ -168,8 +168,8 @@ TEST_P(LookaheadAlgorithmTest, predict)
 
         TLLM_CHECK(acceptedLength <= N);
         histogram[acceptedLength] += 1;
-        PRINT_TOKENS(accepted);
-        PRINT_VALUES(acceptedOffsets);
+        PRINT_TOKEN(accepted);
+        PRINT_VALUE(acceptedOffsets);
 
         EXPECT_TRUE(verifyAcceptOffsets(output, accepted, acceptedOffsets));
         EXPECT_TRUE(llm.verify(sequenceLength, accepted));
@@ -181,7 +181,7 @@ TEST_P(LookaheadAlgorithmTest, predict)
     EXPECT_EQ(sequenceLength, seqLen);
 
     TensorPtr hist = ITensor::wrap(histogram, ITensor::makeShape({N + 1}));
-    TLLM_LOG_DEBUG("Lookahead acceptance histogram: %s", D(hist).values<SizeType32>().c_str());
+    TLLM_LOG_DEBUG("Lookahead acceptance histogram: %s", D(hist).value<SizeType32>().c_str());
 }
 
 INSTANTIATE_TEST_CASE_P(CombineLookaheadAlgorithmTest, LookaheadAlgorithmTest,

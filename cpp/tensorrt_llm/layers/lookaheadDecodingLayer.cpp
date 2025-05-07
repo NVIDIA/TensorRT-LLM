@@ -130,7 +130,7 @@ void LookaheadDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth
         auto const gbi{batchSlotsRange[bi]};
         auto const prompt{setupParams->prompt[bi]}; // `bi` or `gbi`?
         PRINT_SHAPE(prompt);
-        PRINT_TOKENS(prompt);
+        PRINT_TOKEN(prompt);
         mCpuAlgo->mPrompts[bi]->reshape(prompt->getShape());                              // `bi` or `gbi`?
         mBufferManager->copy(*prompt, *mCpuAlgo->mPrompts[bi]);                           // `bi` or `gbi`?
 
@@ -252,20 +252,20 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
     TLLM_LOG_TRACE("Before LookaheadDecodingLayer<T>::forwardSyncCPU");
     printLookaheadDecodingLayer(__LINE__);
 
-    PRINT_TOKENS(outputs->generationLengths); // wili, debug
-    PRINT_TOKENS(outputs->positionOffsets);
-    PRINT_TOKENS(outputs->positionIds);
+    PRINT_TOKEN(outputs->generationLengths); // wili, debug
+    PRINT_TOKEN(outputs->positionOffsets);
+    PRINT_TOKEN(outputs->positionIds);
 
-    PRINT_TOKENS(outputs->nextDraftTokens);
-    PRINT_TOKENS(outputs->nextDraftPosIds);
-    PRINT_TOKENS(outputs->prevDraftLengths);
-    PRINT_TOKENS(outputs->nextDraftLengths);
+    PRINT_TOKEN(outputs->nextDraftTokens);
+    PRINT_TOKEN(outputs->nextDraftPosIds);
+    PRINT_TOKEN(outputs->prevDraftLengths);
+    PRINT_TOKEN(outputs->nextDraftLengths);
 
-    PRINT_TOKENS(outputs->numNewTokensCumSum);
-    PRINT_TOKENS(outputs->pathsOffsets);
-    PRINT_TOKENS(outputs->packedMasks);
+    PRINT_TOKEN(outputs->numNewTokensCumSum);
+    PRINT_TOKEN(outputs->pathsOffsets);
+    PRINT_TOKEN(outputs->packedMasks);
 
-    PRINT_TOKENS(outputs->outputIds);
+    PRINT_TOKEN(outputs->outputIds);
 
     NVTX3_SCOPED_RANGE(LookaheadDecodingLayer_forwardSyncCPU);
 
@@ -313,7 +313,7 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
         SizeType32 const tokensPerStep = generationLengthsRange[gbi];
         TensorPtr sampledTokens = ITensor::slice(mCpuAlgo->mTargetTokens, {gbi, 0}, tokensPerStep);
 
-        PRINT_TOKENS(sampledTokens); // wili
+        PRINT_TOKEN(sampledTokens); // wili
 
         if (tokensPerStep == 1)
         {
@@ -375,9 +375,9 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
 
         TensorPtr accepted = ITensor::slice(mCpuAlgo->mOutputIds, {gbi, 0}, numNewTokensRange[gbi]);
         TensorPtr draft = ITensor::slice(mCpuAlgo->mNextDraftTokens, {gbi, 0}, nextDraftLengthsRange[gbi]);
-        TLLM_LOG_DEBUG("CPU ALGO [ %d ] forward, %s", gbi, D(sampledTokens).values().c_str());
+        TLLM_LOG_DEBUG("CPU ALGO [ %d ] forward, %s", gbi, D(sampledTokens).value().c_str());
         TLLM_LOG_DEBUG("[%d][%d] CPU ALGO [ %d ] forward, %s, %s", mGlobalSteps, batchSize, gbi,
-            D(accepted).values().c_str(), D(draft).values().c_str());
+            D(accepted).value().c_str(), D(draft).value().c_str());
 
         SizeType32 acceptedDraftLen = numNewTokensRange[gbi] <= 1 ? 0 : (numNewTokensRange[gbi] - 1);
         numNewTokensCumSumRange[bi + 1] = numNewTokensCumSumRange[bi] + acceptedDraftLen;
@@ -437,42 +437,42 @@ void LookaheadDecodingLayer<T>::printLookaheadDecodingLayer(int const lineNumber
     TLLM_LOG_TRACE("mWorkspaceSize=%d, ", mWorkspaceSize);
     TLLM_LOG_TRACE("mSetupWorkspaceSize=%d, ", mSetupWorkspaceSize);
     TLLM_LOG_TRACE("mGlobalSteps=%d, ", mGlobalSteps);
-    // PRINT_TOKENS(mCurandStatesDevice);
-    PRINT_TOKENS(mTargetTokensDevice);
+    // PRINT_TOKEN(mCurandStatesDevice);
+    PRINT_TOKEN(mTargetTokensDevice);
 
-    if (!mCpuAlgo.has_value())
+    auto const cpuAlgoValue = mCpuAlgo.value();
+    if (!cpuAlgoValue)
     {
         TLLM_LOG_TRACE("================ printLookaheadDecodingLayer @L%d end without mCpuAlgo", lineNumber);
         return;
     }
 
-    auto const cpuAlgoValue = mCpuAlgo.value();
     TLLM_LOG_TRACE("mPrompts:");
     for (long unsigned int i = 0; i < cpuAlgoValue.mPrompts.size(); ++i)
     {
         TLLM_LOG_TRACE("i=%d", (int) i);
-        PRINT_TOKENS(cpuAlgoValue.mPrompts[i]);
+        PRINT_TOKEN(cpuAlgoValue.mPrompts[i]);
     }
 
-    PRINT_TOKENS(cpuAlgoValue.mBatchSlots);
-    PRINT_TOKENS(cpuAlgoValue.mTargetTokens);
-    PRINT_TOKENS(cpuAlgoValue.mTokensPerStep);
-    PRINT_TOKENS(cpuAlgoValue.mEndIds);
-    PRINT_TOKENS(cpuAlgoValue.mOutputIds);
-    PRINT_TOKENS(cpuAlgoValue.mPathsOffsets);
-    PRINT_TOKENS(cpuAlgoValue.mPathsOffsetsBatch);
-    PRINT_TOKENS(cpuAlgoValue.mNumNewTokens);
-    PRINT_TOKENS(cpuAlgoValue.mNumNewTokensCumSum);
-    PRINT_TOKENS(cpuAlgoValue.mNewTokens);
-    PRINT_TOKENS(cpuAlgoValue.mNextDraftTokens);
-    PRINT_TOKENS(cpuAlgoValue.mNextDraftPosIds);
-    PRINT_TOKENS(cpuAlgoValue.mNextDraftLengths);
-    PRINT_TOKENS(cpuAlgoValue.mSequenceLengths);
-    PRINT_TOKENS(cpuAlgoValue.mGenerationLengths);
-    PRINT_VALUES(cpuAlgoValue.mAttentionMask);
-    PRINT_TOKENS(cpuAlgoValue.mPackedMask);
-    PRINT_TOKENS(cpuAlgoValue.mPositionOffsets);
-    PRINT_TOKENS(cpuAlgoValue.mPositionIds);
+    PRINT_TOKEN(cpuAlgoValue.mBatchSlots);
+    PRINT_TOKEN(cpuAlgoValue.mTargetTokens);
+    PRINT_TOKEN(cpuAlgoValue.mTokensPerStep);
+    PRINT_TOKEN(cpuAlgoValue.mEndIds);
+    PRINT_TOKEN(cpuAlgoValue.mOutputIds);
+    PRINT_TOKEN(cpuAlgoValue.mPathsOffsets);
+    PRINT_TOKEN(cpuAlgoValue.mPathsOffsetsBatch);
+    PRINT_TOKEN(cpuAlgoValue.mNumNewTokens);
+    PRINT_TOKEN(cpuAlgoValue.mNumNewTokensCumSum);
+    PRINT_TOKEN(cpuAlgoValue.mNewTokens);
+    PRINT_TOKEN(cpuAlgoValue.mNextDraftTokens);
+    PRINT_TOKEN(cpuAlgoValue.mNextDraftPosIds);
+    PRINT_TOKEN(cpuAlgoValue.mNextDraftLengths);
+    PRINT_TOKEN(cpuAlgoValue.mSequenceLengths);
+    PRINT_TOKEN(cpuAlgoValue.mGenerationLengths);
+    PRINT_VALUE(cpuAlgoValue.mAttentionMask);
+    PRINT_TOKEN(cpuAlgoValue.mPackedMask);
+    PRINT_TOKEN(cpuAlgoValue.mPositionOffsets);
+    PRINT_TOKEN(cpuAlgoValue.mPositionIds);
 
     for (long unsigned int i = 0; i < cpuAlgoValue.mAlgos.size(); ++i)
     {

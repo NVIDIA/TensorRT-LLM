@@ -108,7 +108,7 @@ void LookaheadAlgorithm::accept(TensorConstPtr const& generatedTokens)
     std::copy(generatedRange.begin(), generatedRange.end(), goldRange.begin() + mN - 1);
     TensorPtr newGold = ITensor::slice(mGoldenTokens, 0, mN - 1 + genLen);
     TLLM_LOG_TRACE("genLen = %d, mN - 1 + genLen = %d", genLen, mN - 1 + genLen);
-    PRINT_TOKENS(newGold);
+    PRINT_TOKEN(newGold);
 
     mPoolManager.accept(newGold, mN);
     // Remove the first `genLen` tokens in mGoldenTokens
@@ -130,7 +130,7 @@ runtime::SizeType32 LookaheadAlgorithm::lookahead(
     BufferRange<TokenIdType> prefillRange(*mPrefills);
     BufferRange<TokenIdType> pastRange(*mPastTokens);
     BufferRange<TokenIdType> draftRange(*draftTokens);
-    PRINT_TOKENS(mPrefills);
+    PRINT_TOKEN(mPrefills);
 
     if (mFilling < mN - 1)
     { // prefilling
@@ -172,7 +172,7 @@ runtime::SizeType32 LookaheadAlgorithm::lookahead(
             fillPosition(startPosId - 1 + wj, mFilling);
         }
     }
-    PRINT_VALUES(positionIds);
+    PRINT_VALUE(positionIds);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return len;
@@ -373,6 +373,11 @@ void LookaheadAlgorithm::prepare(TensorPtr const& draftTokens, TensorPtr const& 
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     constexpr SizeType32 attentionMaskOffset = 1;
+
+    PRINT_TOKEN(draftTokens);
+    PRINT_TOKEN(positionIds);
+    PRINT_TOKEN(draftLengthPtr);
+    PRINT_VALUE(attentionMask);
     TLLM_LOG_TRACE("L%3d, offset=%d", __LINE__, offset);
     TLLM_LOG_TRACE("L%3d, lastToken=%d", __LINE__, lastToken);
 
@@ -616,23 +621,23 @@ void LookaheadAlgorithm::printAlgorithm() const noexcept
     TLLM_LOG_TRACE("mRuntimeMaxDraftPathLen=%d, ", mRuntimeMaxDraftPathLen);
     TLLM_LOG_TRACE("mFilling=%d, ", mFilling);
 
-    PRINT_TOKENS(mPrefillsMax);
-    PRINT_TOKENS(mPrefills);
-    PRINT_TOKENS(mPastTokensMax);
-    PRINT_TOKENS(mPastTokens);
-    PRINT_TOKENS(mKeyTokensMax);
-    PRINT_TOKENS(mKeyTokens);
-    PRINT_TOKENS(mGoldenTokensMax);
-    PRINT_TOKENS(mGoldenTokens);
-    PRINT_TOKENS(mGuessTokensMax);
-    PRINT_TOKENS(mGuessTokens);
-    PRINT_TOKENS(mDraftTokensMax);
-    PRINT_TOKENS(mDraftTokens);
-    PRINT_VALUES(mAttentionMask);
-    PRINT_TOKENS(mEncodeMapMax);
-    PRINT_TOKENS(mEncodeMap);
-    PRINT_TOKENS(mSampledTokensMax);
-    PRINT_TOKENS(mSampledTokens);
+    PRINT_TOKEN(mPrefillsMax);
+    PRINT_TOKEN(mPrefills);
+    PRINT_TOKEN(mPastTokensMax);
+    PRINT_TOKEN(mPastTokens);
+    PRINT_TOKEN(mKeyTokensMax);
+    PRINT_TOKEN(mKeyTokens);
+    PRINT_TOKEN(mGoldenTokensMax);
+    PRINT_TOKEN(mGoldenTokens);
+    PRINT_TOKEN(mGuessTokensMax);
+    PRINT_TOKEN(mGuessTokens);
+    PRINT_TOKEN(mDraftTokensMax);
+    PRINT_TOKEN(mDraftTokens);
+    PRINT_VALUE(mAttentionMask);
+    PRINT_TOKEN(mEncodeMapMax);
+    PRINT_TOKEN(mEncodeMap);
+    PRINT_TOKEN(mSampledTokensMax);
+    PRINT_TOKEN(mSampledTokens);
 
     mPoolManager.printPoolManager();
 
