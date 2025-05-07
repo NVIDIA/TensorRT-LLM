@@ -46,9 +46,7 @@ def create_py_executor(executor_config: ExecutorConfig,
             )
             executor_config.kv_cache_config.enable_block_reuse = False
 
-    if pytorch_backend_config.attn_backend in [
-            "FLASHINFER", "FLASHINFER_STAR_ATTENTION"
-    ] and executor_config.enable_chunked_context:
+    if pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION" and executor_config.enable_chunked_context:
         logger.warning(
             f"Disabling chunked context for {pytorch_backend_config.attn_backend} backend"
         )
