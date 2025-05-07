@@ -874,7 +874,24 @@ def rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout) {
     rerunTestList = "${WORKSPACE}/${stageName}/rerun_0.txt"
     if (fileExists(rerunTestList)) {
         sh "cat ${rerunTestList}"
-        error "There are some failed tests that cannot be rerun, skip the rerun step"
+        error "There are some failed tests that cannot be rerun, skip the rerun step."
+    }
+
+    // If the stage has more than 5 failed tests, skip the rerun step
+    def validLineCount = 0
+    for (times in [1, 2]) {
+        rerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
+        if (fileExists(rerunTestList)) {
+            count = sh(
+                script: "grep -v '^[[:space:]]*\$' ${rerunTestList} | wc -l",
+                returnStdout: true
+            ).trim().toInteger()
+            echo "Found ${count} tests to rerun ${times} time(s)"
+            validLineCount += count
+        }
+    }
+    if (validLineCount > 5) {
+        error "There are more than 5 failed tests, skip the rerun step."
     }
 
     // Rerun tests
@@ -1174,32 +1191,19 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
             ]) {
                 sh "env | sort"
-                if (env.alternativeTRT || testFilter[(IS_POST_MERGE)]) {
-                    trtllm_utils.llmExecStepWithRetry(
-                        pipeline,
-                        numRetries: 1,
-                        script: """
-                            rm -rf ${stageName}/ && \
-                            cd ${llmSrc}/tests/integration/defs && \
-                            ${testCmdLine.join(" ")}
-                        """,
-                        retryLog: "stageName = ${stageName}, HOST_NODE_NAME = ${env.HOST_NODE_NAME}"
-                    )
-                } else {
-                    try {
-                        sh """
-                            rm -rf ${stageName}/ && \
-                            cd ${llmSrc}/tests/integration/defs && \
-                            ${testCmdLine.join(" ")}
-                        """
-                    } catch (InterruptedException e) {
+                try {
+                    sh """
+                        rm -rf ${stageName}/ && \
+                        cd ${llmSrc}/tests/integration/defs && \
+                        ${testCmdLine.join(" ")}
+                    """
+                } catch (InterruptedException e) {
+                    throw e
+                } catch (Exception e) {
+                    isRerunFailed = rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout)
+                    if (isRerunFailed) {
+                        echo "The tests still failed after rerun attempt."
                         throw e
-                    } catch (Exception e) {
-                        isRerunFailed = rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout)
-                        if (isRerunFailed) {
-                            echo "The tests still failed after rerun attempt."
-                            throw e
-                        }
                     }
                 }
             }

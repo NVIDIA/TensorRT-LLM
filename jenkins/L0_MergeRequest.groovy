@@ -714,36 +714,41 @@ def collectTestResults(pipeline, testFilter)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
-        if (!(env.alternativeTRT || testFilter[(IS_POST_MERGE)])) {
-            stage("Rerun report") {
-                sh "rm -rf rerun && mkdir -p rerun"
-                sh "find . -type f -wholename '*/rerun_results.xml' -exec sh -c 'mv \"{}\" \"rerun/\$(basename \$(dirname \"{}\"))_rerun_results.xml\"' \\; || true"
-                sh "find rerun -type f"
-                def rerunFileCount = sh(returnStdout: true, script: 'find rerun -type f | wc -l').replaceAll("\\s","").toInteger()
-                if (rerunFileCount == 0) {
-                    echo "Rerun report is skipped because there is no rerun test data file."
-                    return
+        stage("Rerun report") {
+            sh "rm -rf rerun && mkdir -p rerun"
+            sh "find . -type f -wholename '*/rerun_results.xml' -exec sh -c 'mv \"{}\" \"rerun/\$(basename \$(dirname \"{}\"))_rerun_results.xml\"' \\; || true"
+            sh "find rerun -type f"
+            def rerunFileCount = sh(returnStdout: true, script: 'find rerun -type f | wc -l').replaceAll("\\s","").toInteger()
+            if (rerunFileCount == 0) {
+                echo "Rerun report is skipped because there is no rerun test data file."
+                return
+            }
+            def xmlFiles = findFiles(glob: 'rerun/**/*.xml')
+            def xmlFileList = xmlFiles.collect { it.path }
+            def inputfiles = xmlFileList.join(',')
+            echo "inputfiles: ${inputfiles}"
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
+            sh """
+                python3 llm/tests/integration/defs/test_rerun.py \
+                generate_rerun_report \
+                --output-file=rerun/rerun_report.xml \
+                --input-files=${inputfiles}
+            """
+            trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
+            echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
+            if (env.alternativeTRT || testFilter[(IS_POST_MERGE)]) {
+                catchError(
+                    buildResult: 'FAILURE',
+                    stageResult: 'FAILURE') {
+                    error "Some failed tests were reruned, please check the rerun report."
                 }
-                def xmlFiles = findFiles(glob: 'rerun/**/*.xml')
-                def xmlFileList = xmlFiles.collect { it.path }
-                def inputfiles = xmlFileList.join(',')
-                echo "inputfiles: ${inputfiles}"
-                trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
-                sh """
-                    python3 llm/tests/integration/defs/test_rerun.py \
-                    generate_rerun_report \
-                    --output-file=rerun/rerun_report.xml \
-                    --input-files=${inputfiles}
-                """
-                trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
-                echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
+            } else {
                 catchError(
                     buildResult: 'SUCCESS',
                     stageResult: 'UNSTABLE') {
-                    error "Some failed tests were reruned."
+                    error "Some failed tests were reruned, please check the rerun report."
                 }
             }
         } // Rerun report stage
