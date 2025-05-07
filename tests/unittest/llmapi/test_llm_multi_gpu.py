@@ -341,7 +341,7 @@ def test_executor_results_cleanup():
     llm = LLM(model=llama_model_path,
               kv_cache_config=global_kv_cache_config,
               tensor_parallel_size=2)
-    sampling_params = SamplingParams(max_new_tokens=6)
+    sampling_params = SamplingParams(max_tokens=6)
     for i in range(20):
         llm.generate(prompts, sampling_params=sampling_params)
 

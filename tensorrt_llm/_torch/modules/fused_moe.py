@@ -821,10 +821,7 @@ class FusedMoE(nn.Module):
             final_hidden_states = final_hidden_states[0]
 
         if not self.enable_alltoall:
-            if self.reduce_results and self.parallel_size > 1:
-                return self.all_reduce(final_hidden_states)
-            else:
-                return final_hidden_states
+            return final_hidden_states
         else:
             return self.alltoall_combine(final_hidden_states, alltoall_info,
                                          token_count)
