@@ -234,9 +234,8 @@ class CompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
-        if ("top_logprobs" in data and data.get("top_logprobs")) or \
-            ("logprobs" in data and data.get("logprobs")):
-            raise ValueError("returning log probs is not supported")
+        if data.get("logprobs"):
+            raise ValueError("logprobs is not supported")
         return data
 
     @model_validator(mode="before")
@@ -268,15 +267,6 @@ class CompletionRequest(OpenAIBaseModel):
     def check_suffix(cls, data):
         if data.get("suffix"):
             raise ValueError("suffix is not supported")
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def check_special_tokens(cls, data):
-        if data.get("skip_special_tokens") or data.get("add_special_tokens") or \
-            data.get("spaces_between_special_tokens"):
-            raise ValueError(
-                "special_tokens related settings are not supported")
         return data
 
 
@@ -425,7 +415,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
-    temperature: Optional[float] = 0.7
+    temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none"],
@@ -604,15 +594,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
     def check_suffix(cls, data):
         if data.get("suffix"):
             raise ValueError("suffix is not supported")
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def check_special_tokens(cls, data):
-        if data.get("skip_special_tokens") or data.get("add_special_tokens") or \
-            data.get("spaces_between_special_tokens"):
-            raise ValueError(
-                "special_tokens related settings are not supported")
         return data
 
 
