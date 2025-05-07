@@ -39,6 +39,7 @@ add_library(
   allgatherOp.cpp
   allreduceOp.cpp
   attentionOp.cpp
+  causalConv1dOp.cpp
   convertSpecDecodingMaskToPackedMaskOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
