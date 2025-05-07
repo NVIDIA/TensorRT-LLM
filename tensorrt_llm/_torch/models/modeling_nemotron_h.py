@@ -114,7 +114,7 @@ class NemotronHLayer(nn.Module):
         assert RMSNorm is not None, "RMSNorm from transformer_engine is not installed, install it with `pip3 install transformer_engine[pytorch]`"
 
         self.norm = RMSNorm(
-            hidden_size=config.hidden_size,
+            normalized_shape=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype,
         )
@@ -191,7 +191,7 @@ class NemotronHModel(DecoderModel):
 
         # final norm
         self.norm_f = RMSNorm(
-            hidden_size=config.hidden_size,
+            normalized_shape=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype,
         )
