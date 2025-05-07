@@ -181,6 +181,13 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
 class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct"
+
+    @pytest.mark.skip_less_device(8)
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH, tensor_parallel_size=8) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["H100", "B200"])

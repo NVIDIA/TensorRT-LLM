@@ -1481,6 +1481,8 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
 @pytest.mark.parametrize("model_name,model_path", [
     ("Llama3.1-70B-BF16", "llama-3.1-model/Meta-Llama-3.1-70B"),
     ("Mixtral-8x7B-BF16", "Mixtral-8x7B-v0.1"),
+    ("Nemotron-H-47B", "Nemotron-H-47B-Base-8K"),
+    ("Nemotron-H-56B", "Nemotron-H-56B-Base-8K"),
     pytest.param('Llama3.1-70B-FP8',
                  'llama-3.1-model/Llama-3.1-70B-Instruct-FP8',
                  marks=skip_pre_hopper),
