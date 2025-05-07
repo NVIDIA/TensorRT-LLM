@@ -44,16 +44,22 @@ MODEL_PATH_DICT = {
     "llama_v2_70b": "llama-models-v2/llama-v2-70b-hf",  # not safetensors repo
     "llama_v3.1_8b": "llama-3.1-model/Meta-Llama-3.1-8B",
     "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
+    "llama_v3.1_8b_instruct_fp8": "llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
     "llama_v3.1_70b": "llama-3.1-model/Meta-Llama-3.1-70B",
+    "llama_v3.3_70b_instruct_fp8":
+    "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8",
+    "llama_v3.1_405b_instruct_fp4":
+    "llm-models/modelopt-hf-model-hub/Llama-3.1-405B-Instruct-fp4",
     "llama_v3.1_70b_instruct": "llama-3.1-model/Meta-Llama-3.1-70B-Instruct",
     "llama_v3.2_11b": "llama-3.2-models/Llama-3.2-11B-Vision",
+    "llama_v3.3_nemotron_49b": "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1/",
     "llama_v3.1_nemotron_nano_8b": "Llama-3.1-Nemotron-Nano-8B-v1",
     # "llama_30b": "llama-models/llama-30b-hf",
     "mixtral_8x7b_v0.1": "Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct": "Mixtral-8x7B-Instruct-v0.1",
     "mixtral_8x22b_v0.1": "Mixtral-8x22B-v0.1",
     "mistral_7b_v0.1": "mistral-7b-v0.1",
-    "deepseek_r1": "DeepSeek-R1/DeepSeek-R1",
+    "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
     "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
     "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
     "deepseek_v3_lite_nvfp4": "DeepSeek-V3-Lite/nvfp4_moe_only",
@@ -596,7 +602,7 @@ class PerfTestConfig:
         assert self.mode in VALID_MODES, f"Invalid mode {self.mode}!"
 
         # Validate dtype.
-        VALID_DTYPES = ["float32", "float16", "bfloat16"]
+        VALID_DTYPES = ["float32", "float16", "bfloat16", "float8", "float4"]
         assert self.data_type in VALID_DTYPES, f"Invalid data_type {self.data_type}!"
 
         # Validate quantization mode.
@@ -978,8 +984,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             nloras = self._config.num_loras
             lora_data = os.path.join(engine_dir,
                                      f"token-norm-dist-lora-{nloras}.json")
-            with open(lora_data, 'w') as file:
-                pass
+            # with open(lora_data, 'w') as file:
+            #     pass
             data_cmd += [
                 "python3", prepare_data_script, f"--output={lora_data}",
                 f"--rand-task-id 0 {nloras-1}", f"--tokenizer={tokenizer_dir}",
