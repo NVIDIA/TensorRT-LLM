@@ -20,21 +20,31 @@ from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.llmapi import LLM
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.chat_utils import (ConversationMessage,
-                                           apply_chat_template,
-                                           parse_chat_message_content)
-from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
-                                                ChatCompletionResponse,
-                                                CompletionRequest,
-                                                CompletionResponse,
-                                                CompletionResponseChoice,
-                                                ErrorResponse, ModelCard,
-                                                ModelList, UsageInfo,
-                                                to_llm_disaggregated_params)
+from tensorrt_llm.serve.chat_utils import (
+    ConversationMessage,
+    apply_chat_template,
+    parse_chat_message_content,
+)
+from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    CompletionRequest,
+    CompletionResponse,
+    CompletionResponseChoice,
+    ErrorResponse,
+    ModelCard,
+    ModelList,
+    UsageInfo,
+    to_llm_disaggregated_params,
+)
 from tensorrt_llm.serve.postprocess_handlers import (
-    ChatPostprocArgs, CompletionPostprocArgs, chat_response_post_processor,
-    chat_stream_post_processor, completion_response_post_processor,
-    completion_stream_post_processor)
+    ChatPostprocArgs,
+    CompletionPostprocArgs,
+    chat_response_post_processor,
+    chat_stream_post_processor,
+    completion_response_post_processor,
+    completion_stream_post_processor,
+)
 from tensorrt_llm.version import __version__ as VERSION
 
 from .._utils import nvtx_mark
@@ -144,7 +154,7 @@ class OpenAIServer:
             # queue is empty, no more events
             pass
         return JSONResponse(content=events)
-    
+
     async def health_generate(self) -> Response:
         """Health check that performs a minimal generation."""
         try:
@@ -156,12 +166,16 @@ class OpenAIServer:
                 stream=False,
                 temperature=0.0 # Deterministic output
             )
-            # Create a dummy Request object as openai_chat expects it
-            # Passing None to avoid dependency on actual request details for health check
-            dummy_raw_request = None
+
+            # Create a mock request object using a dictionary, we need this so that we can call
+            # asyncio.create_task(self.await_disconnected(raw_request, promise))
+            mock_request = {
+                '_disconnected': False,
+                'is_disconnected': lambda: mock_request['_disconnected']
+            }
 
             # Call the chat completion logic
-            response = await self.openai_chat(health_request, dummy_raw_request)
+            response = await self.openai_chat(health_request, mock_request)
 
             # Check if the response indicates success (status code 200)
             if response.status_code == 200:
@@ -197,7 +211,7 @@ class OpenAIServer:
                 pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
                 for pp_res in pp_results:
                     yield pp_res
-            yield f"data: [DONE]\n\n"
+            yield "data: [DONE]\n\n"
             nvtx_mark("generation ends")
 
         async def create_chat_response(
@@ -316,7 +330,7 @@ class OpenAIServer:
                     pp_result = request_output.outputs[0]._postprocess_result
                 for pp_res in pp_result:
                     yield pp_res
-            yield f"data: [DONE]\n\n"
+            yield "data: [DONE]\n\n"
 
         async def create_completion_response(
                 generator: AsyncIterator[Tuple[RequestOutput, Optional[PostprocParams]]]) -> CompletionResponse:
