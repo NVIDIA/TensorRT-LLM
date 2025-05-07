@@ -1833,6 +1833,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename KernelParams>
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(NumThreads)
     routingIndicesClusterKernel(KernelParams params)
 {
@@ -2081,6 +2082,12 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
         }
     }
 }
+#else
+__global__ void routingIndicesClusterKernel(KernelParams params)
+{
+    assert(false && "routingIndicesClusterKernel is only supported on SM90+ architectures");
+}
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
