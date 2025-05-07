@@ -112,8 +112,8 @@ def create_py_executor(executor_config: ExecutorConfig,
             prompt_lookup_num_tokens=spec_config.prompt_lookup_num_tokens,
             max_matching_ngram_size=spec_config.max_matching_ngram_size,
             max_seq_len=[
-                131072
-            ],  # TODO: Better way of setting this please (executor_config.max_seq_len is sometimes None)
+                model_engine.max_seq_len
+            ],
             is_keep_all=spec_config.is_keep_all,
             is_use_oldest=spec_config.is_use_oldest)
     else:
