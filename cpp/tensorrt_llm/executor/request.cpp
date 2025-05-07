@@ -82,12 +82,6 @@ SizeType32 Request::getMaxTokens() const
     return mImpl->getMaxNewTokens();
 }
 
-SizeType32 Request::getMaxNewTokens() const
-{
-    TLLM_LOG_WARNING("getMaxNewTokens is being deprecated; please use getMaxTokens instead.");
-    return mImpl->getMaxNewTokens();
-}
-
 bool Request::getStreaming() const
 {
     return mImpl->getStreaming();
@@ -228,14 +222,6 @@ std::optional<Tensor> Request::getCrossAttentionMask() const
     return mImpl->getCrossAttentionMask();
 }
 
-SizeType32 Request::getNumReturnSequences() const
-{
-    TLLM_LOG_WARNING(
-        "'Request.getNumReturnSequences' will be deprecated. Please directly use "
-        "'SamplingConfig.getNumReturnSequences' instead.");
-    return mImpl->getNumReturnSequences().value_or(1);
-}
-
 std::optional<EagleConfig> Request::getEagleConfig() const
 {
     return mImpl->getEagleConfig();
@@ -258,57 +244,57 @@ std::optional<SizeType32> Request::getLanguageAdapterUid() const
 
 void Request::setStreaming(bool streaming)
 {
-    return mImpl->setStreaming(streaming);
+    mImpl->setStreaming(streaming);
 }
 
 void Request::setSamplingConfig(SamplingConfig const& config)
 {
-    return mImpl->setSamplingConfig(config);
+    mImpl->setSamplingConfig(config);
 }
 
 void Request::setOutputConfig(OutputConfig const& outputConfig)
 {
-    return mImpl->setOutputConfig(outputConfig);
+    mImpl->setOutputConfig(outputConfig);
 }
 
 void Request::setEndId(SizeType32 endId)
 {
-    return mImpl->setEndId(endId);
+    mImpl->setEndId(endId);
 }
 
 void Request::setPadId(SizeType32 padId)
 {
-    return mImpl->setPadId(padId);
+    mImpl->setPadId(padId);
 }
 
 void Request::setPositionIds(std::vector<SizeType32> const& positionIds)
 {
-    return mImpl->setPositionIds(positionIds);
+    mImpl->setPositionIds(positionIds);
 }
 
 void Request::setBadWords(std::list<VecTokens> const& badWords)
 {
-    return mImpl->setBadWords(badWords);
+    mImpl->setBadWords(badWords);
 }
 
 void Request::setStopWords(std::list<VecTokens> const& stopWords)
 {
-    return mImpl->setStopWords(stopWords);
+    mImpl->setStopWords(stopWords);
 }
 
 void Request::setEmbeddingBias(Tensor const& embeddingBias)
 {
-    return mImpl->setEmbeddingBias(embeddingBias);
+    mImpl->setEmbeddingBias(embeddingBias);
 }
 
 void Request::setExternalDraftTokensConfig(ExternalDraftTokensConfig const& specDecodingConfig)
 {
-    return mImpl->setExternalDraftTokensConfig(specDecodingConfig);
+    mImpl->setExternalDraftTokensConfig(specDecodingConfig);
 }
 
 void Request::setPromptTuningConfig(PromptTuningConfig const& pTuningConfig)
 {
-    return mImpl->setPromptTuningConfig(pTuningConfig);
+    mImpl->setPromptTuningConfig(pTuningConfig);
 }
 
 void Request::setMultimodalEmbedding(Tensor const& multimodalEmbedding)
@@ -318,52 +304,52 @@ void Request::setMultimodalEmbedding(Tensor const& multimodalEmbedding)
 
 void Request::setMropeConfig(MropeConfig const& mRopeConfig)
 {
-    return mImpl->setMropeConfig(mRopeConfig);
+    mImpl->setMropeConfig(mRopeConfig);
 }
 
 void Request::setLoraConfig(LoraConfig const& loraConfig)
 {
-    return mImpl->setLoraConfig(loraConfig);
+    mImpl->setLoraConfig(loraConfig);
 }
 
 void Request::setLookaheadConfig(LookaheadDecodingConfig const& lookaheadConfig)
 {
-    return mImpl->setLookaheadConfig(lookaheadConfig);
+    mImpl->setLookaheadConfig(lookaheadConfig);
 }
 
 void Request::setKvCacheRetentionConfig(KvCacheRetentionConfig const& kvCacheRetentionConfig)
 {
-    return mImpl->setKvCacheRetentionConfig(kvCacheRetentionConfig);
+    mImpl->setKvCacheRetentionConfig(kvCacheRetentionConfig);
 }
 
 void Request::setLogitsPostProcessorName(std::string const& logitsPostProcessorName)
 {
-    return mImpl->setLogitsPostProcessorName(logitsPostProcessorName);
+    mImpl->setLogitsPostProcessorName(logitsPostProcessorName);
 }
 
 void Request::setLogitsPostProcessor(std::optional<LogitsPostProcessor> const& logitsPostProcessor)
 {
-    return mImpl->setLogitsPostProcessor(logitsPostProcessor);
+    mImpl->setLogitsPostProcessor(logitsPostProcessor);
 }
 
 void Request::setEncoderInputTokenIds(VecTokens const& encoderInputTokenIds)
 {
-    return mImpl->setEncoderInputTokenIds(encoderInputTokenIds);
+    mImpl->setEncoderInputTokenIds(encoderInputTokenIds);
 }
 
 void Request::setClientId(IdType clientId)
 {
-    return mImpl->setClientId(clientId);
+    mImpl->setClientId(clientId);
 }
 
 void Request::setPriority(PriorityType priority)
 {
-    return mImpl->setPriority(priority);
+    mImpl->setPriority(priority);
 }
 
 void Request::setReturnAllGeneratedTokens(bool returnAllGeneratedTokens)
 {
-    return mImpl->setReturnAllGeneratedTokens(returnAllGeneratedTokens);
+    mImpl->setReturnAllGeneratedTokens(returnAllGeneratedTokens);
 }
 
 void Request::setRequestType(RequestType const& requestType)
@@ -378,25 +364,17 @@ void Request::setContextPhaseParams(ContextPhaseParams contextPhaseParams)
 
 void Request::setEncoderInputFeatures(Tensor encoderInputFeatures)
 {
-    return mImpl->setEncoderInputFeatures(encoderInputFeatures);
+    mImpl->setEncoderInputFeatures(encoderInputFeatures);
 }
 
 void Request::setEncoderOutputLength(SizeType32 encoderOutputLength)
 {
-    return mImpl->setEncoderOutputLength(encoderOutputLength);
+    mImpl->setEncoderOutputLength(encoderOutputLength);
 }
 
 void Request::setCrossAttentionMask(Tensor crossAttentionMask)
 {
-    return mImpl->setCrossAttentionMask(crossAttentionMask);
-}
-
-void Request::setNumReturnSequences(SizeType32 numReturnSequences)
-{
-    TLLM_LOG_WARNING(
-        "'Request.setNumReturnSequences' will be deprecated. Please directly use "
-        "'SamplingConfig.setNumReturnSequences' instead.");
-    mImpl->setNumReturnSequences(numReturnSequences);
+    mImpl->setCrossAttentionMask(crossAttentionMask);
 }
 
 void Request::setEagleConfig(std::optional<EagleConfig> const& eagleConfig)

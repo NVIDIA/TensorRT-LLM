@@ -26,6 +26,11 @@ CacheTransceiverConfig::CacheTransceiverConfig(std::optional<size_t> maxNumToken
 {
 }
 
+bool CacheTransceiverConfig::operator==(CacheTransceiverConfig const& other) const
+{
+    return mMaxNumTokens == other.mMaxNumTokens;
+}
+
 std::optional<size_t> CacheTransceiverConfig::getMaxNumTokens() const
 {
     return mMaxNumTokens;
