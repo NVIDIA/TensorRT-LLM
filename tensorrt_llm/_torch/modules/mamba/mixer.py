@@ -264,9 +264,10 @@ class MambaMixer(nn.Module):
                 xbc = causal_conv1d_update(
                     xbc,
                     conv_states_in,
-                    self.conv1d.weight.permute(0, 1).contiguous(),
+                    self.conv1d.weight.permute(0, 1).contiguous(),  # TODO: just permute and contigous when loading weights
                     self.conv1d.bias,
                     "silu",
+                    conv_state_indices=torch.tensor(range(len(indices)), dtype=torch.int32, device=conv_states_in.device)
                 )
 
                 # copy new conv states

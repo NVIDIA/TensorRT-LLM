@@ -2,8 +2,8 @@
 # causal_conv1d_update, adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 # causal_conv1d_varlen_states, adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_varlen.py
 
+from typing import Optional
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -52,7 +52,16 @@ def causal_conv1d_fwd(xBC: torch.Tensor, conv1d_weight: torch.Tensor,
     return y_new
 
 
-def causal_conv1d_update(x, conv_state, weight, bias=None, activation=None):
+PAD_SLOT_ID = -1000000      # TODO: check if this matters. resource_manager.py::add_dummy_requests uses similar value to pad requests to batch size.
+
+def causal_conv1d_update(x: torch.Tensor,
+                         conv_state: torch.Tensor,
+                         weight: torch.Tensor,
+                         bias: Optional[torch.Tensor] = None,
+                         activation: Optional[str] = None,
+                         cache_seqlens: Optional[torch.Tensor] = None,
+                         conv_state_indices: Optional[torch.Tensor] = None,
+                         pad_slot_id: int = PAD_SLOT_ID):
     """
     x: (batch, dim) or (batch, dim, seqlen)
     conv_state: (batch, dim, state_len), where state_len >= width - 1
@@ -60,34 +69,32 @@ def causal_conv1d_update(x, conv_state, weight, bias=None, activation=None):
     bias: (dim,)
     cache_seqlens: (batch,), dtype int32.
         If not None, the conv_state is treated as a circular buffer.
-        The conv_state will be updated by copying x to the conv_state starting at the index
-        @cache_seqlens % state_len before performing the convolution.
-
+        The conv_state will be updated by copying x to the conv_state 
+        starting at the index
+        @cache_seqlens % state_len.
+    conv_state_indices: (batch,), dtype int32
+        If not None, the conv_state is a larger tensor along the batch dim, 
+        and we are selecting the batch coords specified by conv_state_indices.
+        Useful for a continuous batching scenario.
+    pad_slot_id: int
+        if cache_indices is passed, lets the kernel identify padded 
+        entries that will not be processed, 
+        for example: cache_indices = [pad_slot_id, 1 ,20 ,pad_slot_id] 
+        in this case, the kernel will not process entries at 
+        indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen)
     """
     if activation not in [None, "silu", "swish"]:
         raise NotImplementedError("activation must be None, silu, or swish")
-    dtype_in = x.dtype
+    activation_val = activation in ["silu", "swish"]
     unsqueeze = x.dim() == 2
     if unsqueeze:
         x = x.unsqueeze(-1)
-    batch, dim, seqlen = x.shape
-    width = weight.shape[1]
-    state_len = conv_state.shape[-1]
-
-    assert conv_state.shape == (batch, dim, state_len)
-    assert weight.shape == (dim, width)
-
-    x_new = torch.cat([conv_state, x], dim=-1).to(
-        weight.dtype)  # (batch, dim, state_len + seqlen)
-    conv_state.copy_(x_new[:, :, -state_len:])
-
-    out = F.conv1d(x_new, weight.unsqueeze(1), bias, padding=0,
-                   groups=dim)[:, :, -seqlen:]
+    torch.ops.trtllm.causal_conv1d_update(x, conv_state, weight, bias, activation_val,
+                             cache_seqlens, conv_state_indices, pad_slot_id)
     if unsqueeze:
-        out = out.squeeze(-1)
-    return (out if activation is None else F.silu(out)).to(dtype=dtype_in)
-
+        x = x.squeeze(-1)
+    return x
 
 @triton.jit
 def _causal_conv1d_varlen_states(
