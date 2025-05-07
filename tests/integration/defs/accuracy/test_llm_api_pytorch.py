@@ -186,7 +186,9 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     def test_auto_dtype(self):
         with LLM(self.MODEL_PATH, tensor_parallel_size=8) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
@@ -683,6 +685,20 @@ class TestMinitron4BBaseInstruct(LlmapiAccuracyTestHarness):
     def test_fp8_prequantized(self):
         with LLM(self.MODEL_PATH) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestMinitronH(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nemotron-H-47B-Base-8K"
+    MODEL_PATH = f"{llm_models_root()}/Nemotron-H-47B-Base-8K"
+
+    @skip_pre_ada
+    def test_auto_dtype_tp8(self):
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=8,
+                 kv_cache_config=kv_cache_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
