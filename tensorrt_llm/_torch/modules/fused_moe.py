@@ -265,7 +265,7 @@ class FusedMoE(nn.Module):
                 equals to: dynamic quant + routing(topK, etc.) [+ fp4_allgather] + scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute [no allreduce] + reducescatter
 
         trtllm_gen backend (moe_backend="TRTLLM"):
-            min-latency mode (min_latency_mode flag of forward has no effect when trtllm_gen is used):
+            min-latency mode (cutlass_min_latency_mode flag of forward has no effect when trtllm_gen is used):
                 dynamic quant + FusedMoe Op
                 equals to: dynamic quant + routing(topK, etc.) + scatter + gemm1 + swiglu + gemm2 + finalize MoeRoute
 
@@ -689,7 +689,7 @@ class FusedMoE(nn.Module):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        min_latency_mode: bool = False,
+        cutlass_min_latency_mode: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens=None,
     ) -> torch.Tensor:
@@ -766,7 +766,7 @@ class FusedMoE(nn.Module):
                 x_sf = reswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
 
-        if self.smart_router and not min_latency_mode:
+        if self.smart_router and not cutlass_min_latency_mode:
             ep_size = self.cluster_size
             ep_rank = self.cluster_rank
             expert_start = ep_rank * self.num_experts // ep_size
@@ -808,15 +808,15 @@ class FusedMoE(nn.Module):
             cluster_size=cluster_size,
             cluster_rank=cluster_rank,
             use_fp8_block_scaling=use_fp8_block_scaling,
-            min_latency_mode=min_latency_mode,
+            min_latency_mode=cutlass_min_latency_mode,
         )
 
-        if min_latency_mode:
+        if cutlass_min_latency_mode:
             assert not self.reduce_results
             return final_hidden_states
         else:
             # Custom op requires all inputs are in the same type.
-            # Only in min_latency_mode, the output is a list of tensors.
+            # Only in cutlass_min_latency_mode, the output is a list of tensors.
             # Otherwise, the output should be unpacked as a single tensor.
             final_hidden_states = final_hidden_states[0]
 
@@ -830,16 +830,17 @@ class FusedMoE(nn.Module):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        min_latency_mode: bool = False,
+        cutlass_min_latency_mode: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """
-        min_latency_mode has no effect when trtllm_gen backend is enabled.
+        cutlass_min_latency_mode has no effect when trtllm_gen backend is enabled.
         """
         if self.is_cutlass():
-            return self.forward_cutlass(x, router_logits, min_latency_mode,
-                                        output_dtype, all_rank_num_tokens)
+            return self.forward_cutlass(x, router_logits,
+                                        cutlass_min_latency_mode, output_dtype,
+                                        all_rank_num_tokens)
         elif self.is_trtllm():
             return self.forward_trtllmgen(x, router_logits)
         else:
@@ -851,7 +852,7 @@ class FusedMoE(nn.Module):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        min_latency_mode: bool = False,
+        cutlass_min_latency_mode: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
@@ -866,16 +867,16 @@ class FusedMoE(nn.Module):
         num_rows = x.shape[0]
         num_chunks = (num_rows + max_chunk_size - 1) // max_chunk_size
 
-        if min_latency_mode:
+        if cutlass_min_latency_mode:
             assert num_chunks == 1 and (
                 not self.reduce_results
-            ), "min_latency_mode must be used with a single chunk and reduce_results must be False"
+            ), "cutlass_min_latency_mode must be used with a single chunk and reduce_results must be False"
 
         if num_chunks == 1:
             outputs = self.forward_chunk(
                 x,
                 router_logits,
-                min_latency_mode,
+                cutlass_min_latency_mode,
                 output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens)
             outputs = self.reducescatter_or_allreduce(outputs)
