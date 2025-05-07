@@ -1611,9 +1611,9 @@ public:
     /// ---> [Forward, step == 3] ---> logits[1, 4, vocabSize] ---> [BeamSearchDecoder] ---> tokens[1, 4]
     ///     Generation phase, getBeamWidthByIter() returns 4 for computing tensor shapes
     ///     Decoder uses beamWidthIn=4, beamWidthOut=4 to get top 4 tokens
-    /// ---> ...
-    ///     The same as normal Beam Search of `beamWidth==4`
-    [[nodiscard]] SizeType32 getBeamWidthByIter();
+    ///     i.e. the same as normal Beam Search of `beamWidth==4`
+    /// @param: forNextIteration: get beam width for next step rather than current beam width.
+    [[nodiscard]] SizeType32 getBeamWidthByIter(bool forNextIteration = false);
 
     [[nodiscard]] bool isFinished() const noexcept
     {

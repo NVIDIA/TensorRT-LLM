@@ -79,6 +79,11 @@ public:
         return mBeamWidth;
     }
 
+    void setBeamWidth(runtime::SizeType32 beamWidth)
+    {
+        mBeamWidth = beamWidth;
+    }
+
     [[nodiscard]] runtime::SizeType32 getVocabSize() const
     {
         return mVocabSize;
@@ -514,6 +519,8 @@ public:
     std::optional<TensorPtr> numNewTokens; // [maxBatchSize], on pinned, number of tokens predicted at current iteration
     std::optional<TensorPtr> finishedSum;  // [1], on pinned
     std::optional<TensorPtr> outputLogProbsTiled; // [maxSeqLen, maxBatchSize, maxBeamWidth], on gpu
+
+    runtime::SizeType32 variableBeamWidth{1};     // For Variable-Beam-Width-Search
 };
 
 class BeamSearchOutputs : public BaseDecodingOutputs

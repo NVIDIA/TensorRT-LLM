@@ -400,6 +400,14 @@ void BeamSearchLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const
     int* srcCI = bufferCast<int>(*ip->srcCacheIndirection.value());
     invokeUpdateCacheIndirection(tgtCI, srcCI, bh, ip->maxAttentionWindow, ip->sinkTokenLength, getStream());
 
+    // Beam width might have been changed in Variable-Beam-Width-Search mode.
+    // So the new beam width is stored in output for the later layers.
+    // At present, all requests of a batch must have the same beam width in one generation step (or they will not
+    // be batched together). So, the beam width of the first request is taken here to reshape the buffer.
+    // Corresponding changes must be done if Diverse-Beam-Width-Search (DBWS, requests with diverse beam width in
+    // a batch in one generation step) is supported in the future.
+    op->variableBeamWidth = bh.nBeamWidthOutHost[0];
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
