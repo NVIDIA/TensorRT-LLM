@@ -755,16 +755,20 @@ class FusedMoE(nn.Module):
 
         if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
         ) and not self.enable_alltoall:
+            # Fp4 gemm has extra scaling factor
             x_sf, token_selected_experts, token_final_scales = self.all_gather(
                 [x_sf, token_selected_experts, token_final_scales])
             x = allgather(x, self.mapping, gather_dim=0)
-            token_selected_experts = token_selected_experts.flatten(
-                0, 1).contiguous()
-            token_final_scales = token_final_scales.flatten(0, 1).contiguous()
-
             if x_sf is not None:
                 x_sf = reswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
+
+            # llama4 token final scales are already multiplied with input x
+            if not self.apply_router_weight_on_input:
+                token_final_scales = token_final_scales.flatten(0,
+                                                                1).contiguous()
+            token_selected_experts = token_selected_experts.flatten(
+                0, 1).contiguous()
 
         if self.smart_router and not cutlass_min_latency_mode:
             ep_size = self.cluster_size
@@ -865,6 +869,7 @@ class FusedMoE(nn.Module):
                 max_chunk_size //= len(all_rank_num_tokens)
 
         num_rows = x.shape[0]
+        # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
         num_chunks = (num_rows + max_chunk_size - 1) // max_chunk_size
 
         if cutlass_min_latency_mode:
