@@ -111,7 +111,8 @@ void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 max
     mDecoderStream = std::make_shared<CudaStream>();
     TLLM_CHECK(mDecoderStream->getDevice() == device);
 
-    if (vocabSize == 0) {
+    if (vocabSize == 0)
+    {
         vocabSize = modelConfig.getVocabSize();
     }
     auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize(), vocabSize);

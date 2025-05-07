@@ -810,9 +810,9 @@ private:
 namespace
 {
 
-texec::Request makeExecutorRequest(texec::VecTokens &inputTokenIds, int32_t outputLen, SizeType32 const& beamWidth,
-    std::optional<SizeType32> const& eosId, std::optional<SizeType32> const& padId, SizeType32 num_vocabs = 1, bool streaming = false,
-    bool const& returnContextLogits = false, bool const& returnGenerationLogits = false,
+texec::Request makeExecutorRequest(texec::VecTokens& inputTokenIds, int32_t outputLen, SizeType32 const& beamWidth,
+    std::optional<SizeType32> const& eosId, std::optional<SizeType32> const& padId, SizeType32 num_vocabs = 1,
+    bool streaming = false, bool const& returnContextLogits = false, bool const& returnGenerationLogits = false,
     std::optional<texec::LoraConfig> const& loraConfig = std::nullopt,
     std::optional<texec::LookaheadDecodingConfig> const& lookaheadConfig = std::nullopt,
     std::optional<texec::VecTokens> encoderInputTokenIds = std::nullopt,
@@ -835,7 +835,8 @@ texec::Request makeExecutorRequest(texec::VecTokens &inputTokenIds, int32_t outp
         std::nullopt,    // logitsPostProcessorName
         std::nullopt,    // logitsPostProcessor
         encoderInputTokenIds.has_value() ? encoderInputTokenIds : std::nullopt);
-    if (num_vocabs > 1) {
+    if (num_vocabs > 1)
+    {
         request.setNumVocabs(num_vocabs);
     }
     return request;
@@ -928,20 +929,13 @@ void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngine
                 if (executorModelType == texec::ModelType::kENCODER_DECODER)
                 {
                     std::vector<int32_t> contextIds{decoderStartTokenId};
-                    requests.emplace_back(makeExecutorRequest(
-                        contextIds, 1,
-                        beamWidth, eosId, padId, num_vocabs, false, false, false,
-                        loraConfig, std::nullopt, inputIds)
-                    );
+                    requests.emplace_back(makeExecutorRequest(contextIds, 1, beamWidth, eosId, padId, num_vocabs, false,
+                        false, false, loraConfig, std::nullopt, inputIds));
                 }
                 else
                 {
-                    requests.emplace_back(
-                        makeExecutorRequest(
-                            inputIds, 1, beamWidth,
-                            eosId, padId, num_vocabs, false, false, false, loraConfig, std::nullopt
-                        )
-                    );
+                    requests.emplace_back(makeExecutorRequest(inputIds, 1, beamWidth, eosId, padId, num_vocabs, false,
+                        false, false, loraConfig, std::nullopt));
                 }
             }
             executorServer->enqueue(std::move(requests), true);
@@ -957,18 +951,21 @@ void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngine
             {
                 if (executorModelType == texec::ModelType::kENCODER_DECODER)
                 {
-                    if (samples[0].contextIds.empty()) {
+                    if (samples[0].contextIds.empty())
+                    {
                         samples[0].contextIds.push_back(decoderStartTokenId);
                     }
-                    requests.emplace_back(makeExecutorRequest(samples[0].contextIds, samples[0].outputLen, beamWidth, eosId, padId, num_vocabs,
-                        benchmarkParams.streaming, returnContextLogits, returnGenerationLogits, std::nullopt,
-                        benchmarkParams.requestLookaheadConfig, samples[0].inputIds));
+                    requests.emplace_back(
+                        makeExecutorRequest(samples[0].contextIds, samples[0].outputLen, beamWidth, eosId, padId,
+                            num_vocabs, benchmarkParams.streaming, returnContextLogits, returnGenerationLogits,
+                            std::nullopt, benchmarkParams.requestLookaheadConfig, samples[0].inputIds));
                 }
                 else
                 {
-                    requests.emplace_back(makeExecutorRequest(samples[0].inputIds, samples[0].outputLen, beamWidth, eosId, padId, num_vocabs,
-                        benchmarkParams.streaming, returnContextLogits, returnGenerationLogits, std::nullopt,
-                        benchmarkParams.requestLookaheadConfig, std::nullopt, benchmarkParams.temperature));
+                    requests.emplace_back(makeExecutorRequest(samples[0].inputIds, samples[0].outputLen, beamWidth,
+                        eosId, padId, num_vocabs, benchmarkParams.streaming, returnContextLogits,
+                        returnGenerationLogits, std::nullopt, benchmarkParams.requestLookaheadConfig, std::nullopt,
+                        benchmarkParams.temperature));
                 }
             }
             executorServer->enqueue(std::move(requests), true);
@@ -992,18 +989,21 @@ void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngine
                 }
                 if (executorModelType == texec::ModelType::kENCODER_DECODER)
                 {
-                    if (samples[i].contextIds.empty()) {
+                    if (samples[i].contextIds.empty())
+                    {
                         samples[i].contextIds.push_back(decoderStartTokenId);
                     }
-                    requests.emplace_back(makeExecutorRequest(samples[i].contextIds, samples[i].outputLen, beamWidth, eosId, padId, num_vocabs,
-                        benchmarkParams.streaming, returnContextLogits, returnGenerationLogits, loraConfig,
-                        benchmarkParams.requestLookaheadConfig, samples[i].inputIds));
+                    requests.emplace_back(
+                        makeExecutorRequest(samples[i].contextIds, samples[i].outputLen, beamWidth, eosId, padId,
+                            num_vocabs, benchmarkParams.streaming, returnContextLogits, returnGenerationLogits,
+                            loraConfig, benchmarkParams.requestLookaheadConfig, samples[i].inputIds));
                 }
                 else
                 {
-                    requests.emplace_back(makeExecutorRequest(samples[i].inputIds, samples[i].outputLen, beamWidth, eosId, padId, num_vocabs,
-                        benchmarkParams.streaming, returnContextLogits, returnGenerationLogits, loraConfig,
-                        benchmarkParams.requestLookaheadConfig, std::nullopt, benchmarkParams.temperature));
+                    requests.emplace_back(makeExecutorRequest(samples[i].inputIds, samples[i].outputLen, beamWidth,
+                        eosId, padId, num_vocabs, benchmarkParams.streaming, returnContextLogits,
+                        returnGenerationLogits, loraConfig, benchmarkParams.requestLookaheadConfig, std::nullopt,
+                        benchmarkParams.temperature));
                 }
             }
 

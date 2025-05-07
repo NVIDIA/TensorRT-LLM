@@ -81,13 +81,16 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
         TensorPtr inputIdsFlatView = ITensor::view(inputBuffers.inputsIds);
         auto const numTokens = inputIdsFlatView->getShape().d[0] / numVocabs;
         TLLM_CHECK(inputIdsFlatView->getShape().d[0] % numVocabs == 0);
-        if (numVocabs > 1) {
+        if (numVocabs > 1)
+        {
             inputIdsFlatView = ITensor::view(inputIds, ITensor::makeShape({numTokens, numVocabs}));
             auto inputIdsTransposed
                 = bufferManager.gpu(ITensor::makeShape({numVocabs, numTokens}), inputBuffers.inputsIds->getDataType());
             runtime::kernels::invokeTranspose(*inputIdsTransposed, *inputIdsFlatView, bufferManager.getStream());
             inputIdsFlatView = std::move(inputIdsTransposed);
-        } else {
+        }
+        else
+        {
             inputIdsFlatView = ITensor::view(inputIdsFlatView, ITensor::makeShape({numVocabs, numTokens}));
         }
 
@@ -95,9 +98,11 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
         auto const& reqTokens = llmReq->getTokens(0);
         TLLM_CHECK(reqTokens.size() == static_cast<decltype(reqTokens.size())>(promptLen * numVocabs));
         TensorPtr inputView = ITensor::slice(inputIdsFlatView, ITensor::makeShape({vocabId, inputOffset}), promptLen);
-        if (numVocabs > 1) {
+        if (numVocabs > 1)
+        {
             TokenIdType vocabShift = 0;
-            for (SizeType32 i = 0; i < vocabId; i++) {
+            for (SizeType32 i = 0; i < vocabId; i++)
+            {
                 vocabShift -= modelConfig.getVocabSizes()[i];
             }
             runtime::kernels::invokeAdd<TokenIdType>(

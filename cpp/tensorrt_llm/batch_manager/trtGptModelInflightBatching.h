@@ -285,7 +285,8 @@ private:
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> decoderSync(
         ScheduledRequests const& scheduledRequests, std::optional<runtime::CudaEvent> const& decoderFinishEvent);
 
-    runtime::CudaEvent updateDecoderBuffers(bool returnLogProbs, runtime::CudaEvent decoderFinishEvent, SizeType32 vocabId = 0);
+    runtime::CudaEvent updateDecoderBuffers(
+        bool returnLogProbs, runtime::CudaEvent decoderFinishEvent, SizeType32 vocabId = 0);
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> communicateDecoderBuffers(bool returnLogProbs);
     void updateRequests(ScheduledRequests const& scheduledRequests);
 
@@ -302,7 +303,8 @@ private:
     /// @brief Copies the content of the cache indirection outputs to the cache indirection inputs.
     /// @param[in] scheduledRequests The requests to copy the cache indirections for.
     /// @param[in] genBufferId The id of the generation buffers for those requests.
-    void copyCacheIndirectionFromOutputsToInputs(ScheduledRequests const& scheduledRequests, SizeType32 genBufferId, SizeType32 vocabId);
+    void copyCacheIndirectionFromOutputsToInputs(
+        ScheduledRequests const& scheduledRequests, SizeType32 genBufferId, SizeType32 vocabId);
 
     [[nodiscard]] bool getGatherGenerationLogits() const override
     {

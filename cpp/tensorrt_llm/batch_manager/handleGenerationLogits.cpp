@@ -83,7 +83,8 @@ void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector co
     // compute where logits start for the given `vocabId`
     auto vocabSizes = modelConfig.getVocabSizes();
     SizeType32 vocabOffset = 0;
-    for (SizeType32 i = 0; i < vocabId; ++i) {
+    for (SizeType32 i = 0; i < vocabId; ++i)
+    {
         vocabOffset += vocabSizes[i];
     }
 
@@ -120,9 +121,10 @@ void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector co
             if (logitsViewShape.d[0] == 1) // if current nTok is 1, could have multiple vocabs
             {
                 curVocablogitsView = ITensor::slice(logitsView, {0, vocabOffset}, vocabSizes[vocabId]); // [vocabSize,]
-                curVocablogitsView = ITensor::view(curVocablogitsView, ITensor::makeShape({1, vocabSizes[vocabId]})); // [numLogits == 1, vocabSize]
+                curVocablogitsView = ITensor::view(
+                    curVocablogitsView, ITensor::makeShape({1, vocabSizes[vocabId]})); // [numLogits == 1, vocabSize]
             }
-            const auto updateLogitsViewShape = curVocablogitsView->getShape();
+            auto const updateLogitsViewShape = curVocablogitsView->getShape();
             decoderLogits = ITensor::view(
                 curVocablogitsView, ITensor::makeShape({updateLogitsViewShape.d[0], 1, updateLogitsViewShape.d[1]}));
         }

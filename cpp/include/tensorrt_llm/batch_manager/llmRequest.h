@@ -127,8 +127,7 @@ public:
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
-        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-	    SizeType32 numVocabs = 1)
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt, SizeType32 numVocabs = 1)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size() / numVocabs)
         , mMaxNewTokens(maxNewTokens)
@@ -181,7 +180,7 @@ public:
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
-	    , mNumVocabs{numVocabs}
+        , mNumVocabs{numVocabs}
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {

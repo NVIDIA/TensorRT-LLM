@@ -564,8 +564,7 @@ void initRequestBindings(pybind11::module_& m)
                      std::optional<tle::EagleConfig> const& eagleConfig,
                      std::optional<tle::Tensor> const& skipCrossAttnBlocks,
                      std::optional<tle::GuidedDecodingParams> const& guidedDecodingParams,
-                     std::optional<tle::SizeType32> const& languageAdapterUid,
-                     tle::SizeType32 numVocabs)
+                     std::optional<tle::SizeType32> const& languageAdapterUid, tle::SizeType32 numVocabs)
                  {
                      if (maxNewTokens.has_value())
                      {
@@ -601,7 +600,8 @@ void initRequestBindings(pybind11::module_& m)
             py::arg("context_phase_params") = py::none(), py::arg("encoder_input_features") = py::none(),
             py::arg("encoder_output_length") = py::none(), py::arg("cross_attention_mask") = py::none(),
             py::arg("eagle_config") = py::none(), py::arg("skip_cross_attn_blocks") = py::none(),
-            py::arg("guided_decoding_params") = py::none(), py::arg("language_adapter_uid") = py::none(), py::arg("num_vocabs") = 1)
+            py::arg("guided_decoding_params") = py::none(), py::arg("language_adapter_uid") = py::none(),
+            py::arg("num_vocabs") = 1)
         .def_property_readonly("input_token_ids", &tle::Request::getInputTokenIds)
         .def_property_readonly("max_tokens", &tle::Request::getMaxTokens)
         .def_property_readonly("max_new_tokens", &tle::Request::getMaxNewTokens)

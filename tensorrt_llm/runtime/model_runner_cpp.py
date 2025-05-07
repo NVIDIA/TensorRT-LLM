@@ -461,7 +461,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                     f"Decoder prefix tokens ({decoder_max_length}) + maximum new tokens ({max_new_tokens}) exceeds the engine or specified limit ({self.max_seq_len})"
                 )
         else:
-            if max_length + max_new_tokens > self.max_seq_len * len(self.model_config.vocab_sizes):
+            if max_length + max_new_tokens > self.max_seq_len * len(
+                    self.model_config.vocab_sizes):
                 raise RuntimeError(
                     f"Maximum input length ({max_length}) + maximum new tokens ({max_new_tokens}) exceeds the engine or specified limit ({self.max_seq_len})"
                 )
@@ -1056,7 +1057,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
             input_lengths = torch.tensor([x.size(0) for x in batch_input_ids],
                                          dtype=torch.int32,
-                                         device=cuda_device) // len(self.model_config.vocab_sizes)
+                                         device=cuda_device) // len(
+                                             self.model_config.vocab_sizes)
 
             if output_sequence_lengths:
                 outputs['sequence_lengths'] = torch.tensor(sequence_lengths,

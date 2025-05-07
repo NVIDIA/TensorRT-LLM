@@ -47,7 +47,8 @@ public:
         std::optional<Tensor> encoderInputFeatures, std::optional<SizeType32> encoderOutputLength,
         std::optional<Tensor> crossAttentionMask, SizeType32 numReturnSequences, std::optional<EagleConfig> eagleConfig,
         std::optional<Tensor> skipCrossAttnBlocks, std::optional<GuidedDecodingParams> guidedDecodingParams,
-        std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs, SizeType32 numVocabs = 1)
+        std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs,
+        SizeType32 numVocabs = 1)
         : mInputTokenIds(std::move(inputTokenIds))
         , mMaxNewTokens(maxNewTokens)
         , mStreaming(streaming)

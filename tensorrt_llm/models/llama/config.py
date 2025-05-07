@@ -16,7 +16,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Optional, Union, List
+from typing import List, Optional, Union
 
 from ...layers import MoeConfig
 from ...mapping import Mapping

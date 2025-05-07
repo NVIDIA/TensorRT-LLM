@@ -1618,9 +1618,9 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
                 weights[target.replace("weight", "bias")] = bias
 
     if mapping.is_first_pp_rank():
-        v = load(
-            param_name_map["vocab_embedding"], config.embedding_sharding_dim
-            if config.use_parallel_embedding else -1)  # vocab_embedding
+        v = load(param_name_map["vocab_embedding"],
+                 config.embedding_sharding_dim
+                 if config.use_parallel_embedding else -1)  # vocab_embedding
         weights['transformer.vocab_embedding.weight'] = v
 
     if mapping.is_last_pp_rank():

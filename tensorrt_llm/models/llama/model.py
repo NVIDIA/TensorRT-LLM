@@ -21,7 +21,7 @@ from ..._common import default_net
 from ..._utils import pad_vocab_size
 from ...functional import (AllReduceFusionOp, AllReduceParams, Tensor,
                            allgather, concat, constant, div, non_gated_version,
-                           recv, send, unsqueeze, shape, sum, view, select)
+                           recv, select, send, shape, unsqueeze, view)
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, FusedGatedMLP, GatedMLP,
                        PositionEmbeddingType, RmsNorm)
@@ -338,37 +338,40 @@ class LLaMAModel(Module):
                                     eps=config.norm_epsilon,
                                     dtype=config.dtype)
 
-    def forward(self,
-                input_ids,  # seqlen x num_vocabs
-                position_ids=None,
-                use_cache=False,
-                attention_mask=None,
-                spec_decoding_params=None,
-                kv_cache_params=None,
-                attention_params=None,
-                hidden_states=None,
-                hidden_states_for_embed=None,
-                prompt_embedding_table: Optional[Tensor] = None,
-                prompt_tasks: Optional[Tensor] = None,
-                prompt_vocab_size: Optional[Tensor] = None,
-                lora_params=None):
+    def forward(
+            self,
+            input_ids,  # seqlen x num_vocabs
+            position_ids=None,
+            use_cache=False,
+            attention_mask=None,
+            spec_decoding_params=None,
+            kv_cache_params=None,
+            attention_params=None,
+            hidden_states=None,
+            hidden_states_for_embed=None,
+            prompt_embedding_table: Optional[Tensor] = None,
+            prompt_tasks: Optional[Tensor] = None,
+            prompt_vocab_size: Optional[Tensor] = None,
+            lora_params=None):
 
         ptuning_args = [
             prompt_embedding_table, prompt_tasks, prompt_vocab_size
         ] if prompt_embedding_table is not None else []
 
         if self.mapping.is_first_pp_rank():
-            hidden_states = self.vocab_embedding(input_ids, *ptuning_args)  # seqlen x num_vocabs x hidden_size
-            hidden_states = view(
-                hidden_states,
-                concat([shape(hidden_states, 0) / self.num_vocabs, self.num_vocabs, -1])
-            )  # shape [totalSeqLen, nVocab, embDim]
+            hidden_states = self.vocab_embedding(
+                input_ids, *ptuning_args)  # seqlen x num_vocabs x hidden_size
+            hidden_states = view(hidden_states,
+                                 concat([
+                                     shape(hidden_states, 0) / self.num_vocabs,
+                                     self.num_vocabs, -1
+                                 ]))  # shape [totalSeqLen, nVocab, embDim]
             # TODO: for debug pick the very first sampled token, ignore rest
             # in the future:
             # hidden_states = sum(hidden_states, 1, keepdim=False)
             # shape [totalSeqLen, embDim]
             # hidden_states[:, 0, :]
-            hidden_states = select(hidden_states, 1, 0) 
+            hidden_states = select(hidden_states, 1, 0)
             hidden_states *= self.embedding_multiplier
         else:
             # TODO: not supported for multi-vocab yet

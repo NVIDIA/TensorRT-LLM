@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import types
-import torch
 from ast import literal_eval
 from collections import defaultdict
 from datetime import datetime

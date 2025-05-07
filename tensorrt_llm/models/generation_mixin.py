@@ -80,19 +80,18 @@ class GenerationMixin:
         return num_tokens_ranges
 
     @staticmethod
-    def get_profiles_ranges(
-            *,
-            max_batch_size,
-            max_beam_width,
-            max_input_len,
-            max_num_tokens,
-            max_draft_len,
-            opt_batch_size,
-            opt_num_tokens,
-            enable_ctx_gen_opt_profiles,
-            multiple_profiles,
-            kv_cache_type: KVCacheType = KVCacheType.CONTINUOUS,
-            num_vocabs: int = 1):
+    def get_profiles_ranges(*,
+                            max_batch_size,
+                            max_beam_width,
+                            max_input_len,
+                            max_num_tokens,
+                            max_draft_len,
+                            opt_batch_size,
+                            opt_num_tokens,
+                            enable_ctx_gen_opt_profiles,
+                            multiple_profiles,
+                            kv_cache_type: KVCacheType = KVCacheType.CONTINUOUS,
+                            num_vocabs: int = 1):
         default_range = GenerationMixin.default_range
         if opt_batch_size:
             bb_range_cxt = [1, opt_batch_size, max_batch_size]
@@ -168,7 +167,6 @@ class GenerationMixin:
                     lambda x:
                     [math.ceil(x[0] / (max_draft_len + 1)), x[1], x[2]],
                     num_tokens_range))
-
 
         num_tokens_range = [[rr * num_vocabs for rr in r]
                             for r in num_tokens_range]

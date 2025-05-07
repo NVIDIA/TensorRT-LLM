@@ -23,9 +23,10 @@ from tensorrt_llm._common import default_net
 from tensorrt_llm._utils import numpy_to_torch, str_dtype_to_torch
 from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      MLPType, PositionEmbeddingType, Tensor,
-                                     assertion, cast, gather_last_token_logits,
-                                     gelu, maximum, minimum, recv, send, shape,
-                                     transpose, unsqueeze, shape, view, select, concat)
+                                     assertion, cast, concat,
+                                     gather_last_token_logits, gelu, maximum,
+                                     minimum, recv, select, send, shape,
+                                     transpose, unsqueeze, view)
 # yapf: disable
 from tensorrt_llm.layers import (MLP, Attention, AttentionMaskParams,
                                  AttentionMaskType, AttentionParams,
@@ -167,15 +168,18 @@ class EncDecTransformer(Module):
         self.register_network_output('word_embeddings', x)
 
         if self.num_vocabs > 1:
-            x = view(
-                x,
-                concat([shape(x, 0) / self.num_vocabs, self.num_vocabs, -1])
-            )  # shape [totalSeqLen, nVocab, embDim]
+            x = view(x,
+                     concat(
+                         [shape(x, 0) / self.num_vocabs, self.num_vocabs,
+                          -1]))  # shape [totalSeqLen, nVocab, embDim]
             # TODO: selecting just embedding from first vocab for e2e test
             x = select(x, 1, 0)
 
-        if self.num_vocabs > 1 and (self.position_embedding or self.token_type_embedding):
-            raise RuntimeError("For multi-vocab enc-dec, position ids and token type ids have to be repeated")
+        if self.num_vocabs > 1 and (self.position_embedding
+                                    or self.token_type_embedding):
+            raise RuntimeError(
+                "For multi-vocab enc-dec, position ids and token type ids have to be repeated"
+            )
 
         if self.position_embedding:
             pos_emb = self.position_embedding(position_ids)
@@ -1408,7 +1412,9 @@ class DecoderModel(PretrainedModel):
             max(max_decoder_input_len * max_batch_size,
                 max_beam_width * max_batch_size),
         ]
-        io_decoder_num_tokens_range = [x * num_vocabs for x in decoder_num_tokens_range]
+        io_decoder_num_tokens_range = [
+            x * num_vocabs for x in decoder_num_tokens_range
+        ]
 
         # No enable_two_optimization_profiles support yet
 
@@ -1470,7 +1476,8 @@ class DecoderModel(PretrainedModel):
                         dtype=trt.int32,
                         shape=[-1],
                         dim_range=OrderedDict([('decoder_num_tokens',
-                                                [io_decoder_num_tokens_range])]),
+                                                [io_decoder_num_tokens_range])
+                                               ]),
                     )
             else:
                 hidden_states = Tensor(name='hidden_states_input',
@@ -1497,16 +1504,18 @@ class DecoderModel(PretrainedModel):
                                           dim_range=OrderedDict([
                                               ('batch_size_beam_width',
                                                [bb_range]),
-                                              ('input_len', [decoder_inlen_range]),
+                                              ('input_len',
+                                               [decoder_inlen_range]),
                                           ]))
                 if self.has_token_type_embedding:
                     token_type_ids = Tensor(
                         name='token_type_ids',
                         dtype=trt.int32,
                         shape=[-1, -1],
-                        dim_range=OrderedDict([('batch_size_beam_width',
-                                                [bb_range]),
-                                               ('input_len', [decoder_inlen_range])]),
+                        dim_range=OrderedDict([
+                            ('batch_size_beam_width', [bb_range]),
+                            ('input_len', [decoder_inlen_range])
+                        ]),
                     )
             else:
                 hidden_states = Tensor(name='hidden_states_input',

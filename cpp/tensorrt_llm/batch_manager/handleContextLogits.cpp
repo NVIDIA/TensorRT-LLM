@@ -151,22 +151,21 @@ SizeType32 HandleContextLogits::operator()(RequestVector const& contextRequests,
         else
         {
             auto curVocablogitsView = logitsView;
-            const auto logitsViewShape = logitsView->getShape();
+            auto const logitsViewShape = logitsView->getShape();
             if (logitsViewShape.d[0] == 1) // if current nTok is 1, could have multiple vocabs
             {
                 SizeType32 offset = 0;
                 auto vocabSizes = modelConfig.getVocabSizes();
-                for (SizeType32 i = 0; i < vocabId; ++i) {
+                for (SizeType32 i = 0; i < vocabId; ++i)
+                {
                     offset += vocabSizes[i];
                 }
                 curVocablogitsView = ITensor::slice(logitsView, {0, offset}, vocabSizes[vocabId]); // [vocabSize,]
                 curVocablogitsView = ITensor::view(curVocablogitsView, ITensor::makeShape({1, vocabSizes[vocabId]}));
             }
-            const auto updateLogitsViewShape = curVocablogitsView->getShape();
-            decoderLogits
-                = ITensor::view(curVocablogitsView, ITensor::makeShape(
-                    {updateLogitsViewShape.d[0], 1, updateLogitsViewShape.d[1]}
-                ));
+            auto const updateLogitsViewShape = curVocablogitsView->getShape();
+            decoderLogits = ITensor::view(
+                curVocablogitsView, ITensor::makeShape({updateLogitsViewShape.d[0], 1, updateLogitsViewShape.d[1]}));
         }
         ++batchIndex;
     }

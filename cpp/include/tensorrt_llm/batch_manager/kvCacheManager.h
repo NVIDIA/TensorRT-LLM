@@ -1006,7 +1006,8 @@ public:
         SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
         SizeType32 temporaryAttentionWindow, SizeType32 sinkTokenLength, int64_t stream,
         std::optional<SizeType32> maxSequenceLength, bool enableBlockReuse = false, bool onboardBlocks = true,
-        CacheType cacheType = CacheType::kSELF, bool enablePartialReuse = true, bool copyOnpartialReuse = true, SizeType32 numVocabs = 1);
+        CacheType cacheType = CacheType::kSELF, bool enablePartialReuse = true, bool copyOnpartialReuse = true,
+        SizeType32 numVocabs = 1);
 
     ~KVCacheManager() override = default;
 

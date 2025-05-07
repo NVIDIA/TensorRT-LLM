@@ -524,11 +524,8 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
             auto const contextChunkSize = llmReq->getContextChunkSize();
             auto const beginCompute = llmReq->getContextCurrentPosition();
             auto const endCompute = beginCompute + contextChunkSize;
-            inputHost.insert(
-                inputHost.end(),
-                reqTokens.begin() + beginCompute,
-                reqTokens.begin() + beginCompute + contextChunkSize * llmReq->getNumVocabs()
-            );
+            inputHost.insert(inputHost.end(), reqTokens.begin() + beginCompute,
+                reqTokens.begin() + beginCompute + contextChunkSize * llmReq->getNumVocabs());
 
             logitsIdsHostPtr[totalNumLogits++] = contextChunkSize;
             numContextLogits.at(batchIdx) = modelConfig.computeContextLogits() ? contextChunkSize : 1;
@@ -658,59 +655,58 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
                 }
                 else
                 {
-                    inputHost.push_back(lastToken);
+                     inputHost.push_back(lastToken);
                 }
-
 
                 // If model updates generation position ids do not append them here.
                 if (!modelConfig.getSpeculativeDecodingMode().updatesPositionIds())
                 {
-                    if (positionIds.has_value())
-                    {
-                        TLLM_CHECK_WITH_INFO(
-                            !(isChatGlm || isGlm), "ChatGLM-6B and Glm only use the default initialization");
-                        auto last_context_position_id = positionIds.value()->back();
-                        positionIdsHost.push_back(
-                            static_cast<SizeType32>(last_context_position_id + sequenceLen - promptLen));
-                    }
-                    else
-                    {
-                        if (isChatGlm) // ChatGLM-6B
-                        {
-                            positionIdsHost.push_back(static_cast<SizeType32>(promptLen - 2));
-                            positionIdsHostRow2.push_back(static_cast<SizeType32>(sequenceLen - promptLen + 1));
-                        }
-                        else if (isGlm)
-                        {
-                            positionIdsHost.push_back(llmReq->mMaskPosition);
-                            positionIdsHostRow2.push_back(static_cast<SizeType32>(sequenceLen - promptLen + 1));
-                        }
-                        else // GPT / ChatGLM2-6B / ChatGLM3-6B / BART
-                        {
-                            // positionIds is just the size of tokens -1
-                            positionIdsHost.push_back(numTokens - 1);
-                        }
-                    }
+                     if (positionIds.has_value())
+                     {
+                         TLLM_CHECK_WITH_INFO(
+                             !(isChatGlm || isGlm), "ChatGLM-6B and Glm only use the default initialization");
+                         auto last_context_position_id = positionIds.value()->back();
+                         positionIdsHost.push_back(
+                             static_cast<SizeType32>(last_context_position_id + sequenceLen - promptLen));
+                     }
+                     else
+                     {
+                         if (isChatGlm) // ChatGLM-6B
+                         {
+                             positionIdsHost.push_back(static_cast<SizeType32>(promptLen - 2));
+                             positionIdsHostRow2.push_back(static_cast<SizeType32>(sequenceLen - promptLen + 1));
+                         }
+                         else if (isGlm)
+                         {
+                             positionIdsHost.push_back(llmReq->mMaskPosition);
+                             positionIdsHostRow2.push_back(static_cast<SizeType32>(sequenceLen - promptLen + 1));
+                         }
+                         else // GPT / ChatGLM2-6B / ChatGLM3-6B / BART
+                         {
+                             // positionIds is just the size of tokens -1
+                             positionIdsHost.push_back(numTokens - 1);
+                         }
+                     }
                 }
 
                 if (draftLength > 0)
                 {
-                    inputHost.insert(inputHost.end(), draftTokens->begin(), draftTokens->end());
+                     inputHost.insert(inputHost.end(), draftTokens->begin(), draftTokens->end());
                 }
 
                 if (modelConfig.useMrope())
                 {
-                    auto optMropePositionDeltas = llmReq->getMropePositionDeltas().value();
-                    mropePositionDeltasHost.push_back(optMropePositionDeltas);
+                     auto optMropePositionDeltas = llmReq->getMropePositionDeltas().value();
+                     mropePositionDeltasHost.push_back(optMropePositionDeltas);
                 }
 
                 if (modelConfig.useLanguageAdapter())
                 {
-                    // Generation requests only have one token per sequence
-                    auto const languageAdapterRouting
-                        = llmReq->getLanguageAdapterRouting(modelConfig.getNumLanguages().value(), 1);
-                    languageAdapterRoutingsHost.insert(languageAdapterRoutingsHost.end(),
-                        std::begin(languageAdapterRouting), std::end(languageAdapterRouting));
+                     // Generation requests only have one token per sequence
+                     auto const languageAdapterRouting
+                         = llmReq->getLanguageAdapterRouting(modelConfig.getNumLanguages().value(), 1);
+                     languageAdapterRoutingsHost.insert(languageAdapterRoutingsHost.end(),
+                         std::begin(languageAdapterRouting), std::end(languageAdapterRouting));
                 }
             }
 
@@ -786,7 +782,7 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
                 bool tmpValue = false;
                 if (llmReq->getSkipCrossAttnBlocks() != nullptr)
                 {
-                    manager.copy(*llmReq->getSkipCrossAttnBlocks(), &tmpValue);
+                     manager.copy(*llmReq->getSkipCrossAttnBlocks(), &tmpValue);
                 }
                 isSkipCrossAttn &= tmpValue;
             }

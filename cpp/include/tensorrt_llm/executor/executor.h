@@ -745,6 +745,7 @@ public:
     void setLanguageAdapterUid(SizeType32 languageAdapterUid);
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
     void setNumVocabs(SizeType32 numVocabs);
+
 private:
     friend class Serialization;
     class Impl;

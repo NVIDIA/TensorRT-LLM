@@ -142,7 +142,7 @@ public:
         , mManageWeightsType(ManageWeightsType::kDisabled)
         , mSkipCrossAttnBlocks(false)
         , mNumLanguages(0)
-	    , mVocabSizes{vocabSizes}
+        , mVocabSizes{vocabSizes}
     {
         TLLM_CHECK_WITH_INFO(mNbLayers >= mNbAttentionLayers + mNbRnnLayers,
             "Number of layers (%d) expected to be >= number of attention (%d) + number of rnn layers (%d)", mNbLayers,
@@ -152,7 +152,7 @@ public:
             SizeType32 const sizesSum = std::accumulate(mVocabSizes.value().cbegin(), mVocabSizes.value().cend(), 0);
             TLLM_CHECK_WITH_INFO(
                 sizesSum == vocabSize, "Sum of all vocab sizes (%d) must equal to vocabSize (%d)", sizesSum, vocabSize);
-        }  
+        }
         setNbKvHeads(mNbHeads);
     }
 
@@ -178,7 +178,8 @@ public:
 
     [[nodiscard]] SizeType32 constexpr getVocabSizePadded(SizeType32 worldSize, SizeType32 vocabSize = 0) const noexcept
     {
-        if (vocabSize == 0) {
+        if (vocabSize == 0)
+        {
             vocabSize = mVocabSize;
         }
         return (vocabSize + worldSize - 1) / worldSize * worldSize;
