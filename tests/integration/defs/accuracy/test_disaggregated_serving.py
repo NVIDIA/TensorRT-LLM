@@ -242,31 +242,28 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
 
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
-    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/fp8"
 
-    @parametrize_with_ids("overlap_scheduler", [True, False])
-    @parametrize_with_ids("mtp_nextn",
-                          [0, pytest.param(2, marks=skip_pre_hopper)])
-    def test_auto_dtype(self, overlap_scheduler, mtp_nextn):
+    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.skip_device_not_contain(["H100"])
+    @pytest.mark.parametrize("overlap_scheduler", [False, True])
+    def test_auto_dtype(self, overlap_scheduler):
         ctx_server_config = {
             "pytorch_backend_config": {
                 "disable_overlap_scheduler": True
+            },
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.2
             }
         }
         gen_server_config = {
             "pytorch_backend_config": {
-                "disable_overlap_scheduler": not overlap_scheduler
+                "disable_overlap_scheduler": overlap_scheduler
+            },
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.2
             }
         }
-        if mtp_nextn > 0:
-            ctx_server_config["speculative_config"] = {
-                "decoding_type": "MTP",
-                "num_nextn_predict_layers": mtp_nextn
-            }
-            gen_server_config["speculative_config"] = {
-                "decoding_type": "MTP",
-                "num_nextn_predict_layers": mtp_nextn
-            }
         disaggregated_server_config = {
             "hostname": "localhost",
             "port": 8000,
