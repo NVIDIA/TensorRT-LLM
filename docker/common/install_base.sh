@@ -108,7 +108,6 @@ install_pyp_rockylinux() {
 
 install_gcctoolset_rockylinux() {
   dnf install -y gcc gcc-c++ file libtool make wget bzip2 bison flex
-  DEVTOOLSET_ENV_FILE="/tmp/gcctoolset_env"
   # https://catalog.ngc.nvidia.com/orgs/nvidia/containers/cuda
   echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
   dnf install \
@@ -123,8 +122,7 @@ install_gcctoolset_rockylinux() {
 	  openmpi-devel \
 	  pigz \
 	  -y
-  echo "source scl_source enable gcc-toolset-13" >> "${DEVTOOLSET_ENV_FILE}"
-  echo "source ${DEVTOOLSET_ENV_FILE}" >> "${ENV}"
+  echo "source scl_source enable gcc-toolset-13" >> "${ENV}"
   echo 'export PATH=/usr/lib64/openmpi/bin:$PATH' >> "${ENV}"
 }
 
