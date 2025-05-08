@@ -63,7 +63,6 @@ class TrtllmAttentionWrapper:
 
     def __init__(
         self,
-        layer_idx: int,
         num_heads: int,
         head_size: int,
         num_kv_heads: Optional[int] = None,
@@ -75,7 +74,6 @@ class TrtllmAttentionWrapper:
         """
         Initialize the attention wrapper.
         Args:
-            layer_idx (int): The index of the attention layer in the model.
             num_heads (int): The number of query heads.
             head_dim (int): The size of each attention head (hidden_size // num_heads).
             num_kv_heads (int): The number of kv heads. Defaults to num_heads if None.
@@ -108,7 +106,6 @@ class TrtllmAttentionWrapper:
         self.rotary_inv_freq, self.rotary_cos_sin = rope_params.create_rope_const_params(
         )
 
-        self.layer_idx = layer_idx
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads or num_heads
         self.head_size = head_size
@@ -132,6 +129,7 @@ class TrtllmAttentionWrapper:
     def plan(
         self,
         *,
+        layer_idx: int,
         tokens_per_block: Optional[int] = None,
         max_num_requests: int,
         max_sequence_length: int,
@@ -164,6 +162,7 @@ class TrtllmAttentionWrapper:
         """
         Plan the attention operation.
         Args:
+            layer_idx (int): The index of the attention layer in the model.
             tokens_per_block (int): Token number per KV cache block.
             max_num_requests (int): Max request number per batch.
             max_sequence_length (int): Max sequence length.
@@ -188,6 +187,7 @@ class TrtllmAttentionWrapper:
             use_paged_context_fmha (bool): Sets the mPagedContextFMHA attribute in the op runner.
             mrope_config (dict): The dictionary containing the mRope configuration.
         """
+        self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
         self.max_num_requests = max_num_requests
         self.max_context_length = max_context_length
@@ -597,7 +597,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                          **kwargs)
 
         self.wrapper = TrtllmAttentionWrapper(
-            layer_idx,
             num_heads,
             head_dim,
             num_kv_heads,
@@ -664,6 +663,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         num_seqs = metadata.num_seqs
         self.wrapper.plan(
+            layer_idx=metadata.kv_cache_manager.layer_offsets[self.layer_idx]
+            if metadata.kv_cache_manager is not None else self.layer_idx,
             tokens_per_block=metadata.tokens_per_block,
             max_num_requests=metadata.max_num_requests,
             max_sequence_length=metadata.max_seq_len,

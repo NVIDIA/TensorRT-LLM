@@ -57,6 +57,16 @@ class RMSNorm(nn.Module):
         else:
             return hidden_states, residual
 
+    def skip_forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor] = ...,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is ...:
+            return hidden_states
+        else:
+            return hidden_states, residual
+
 
 def group_rms_norm(
         inputs: list[torch.Tensor],

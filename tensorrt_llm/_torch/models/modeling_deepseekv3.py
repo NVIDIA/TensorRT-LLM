@@ -47,7 +47,7 @@ from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, allgather)
 from ..model_config import ModelConfig
-from ..models.modeling_utils import MissingLayer, ModelConfig, support_pp
+from ..models.modeling_utils import MissingLayer, ModelConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.fused_moe import BaseMoeRoutingMethod, FusedMoE
@@ -55,7 +55,6 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..pipeline_interface import PipelineInterface
 from ..speculative import MTPEagleWorker, MTPSpecMetadata, MTPWorker
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
                      disable_fp4_allgather)
@@ -548,9 +547,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
         self.mlp_tp_size = mapping.tp_size
 
-        pp_layer_offset = mapping.pp_layers(config.num_hidden_layers)[0]
-        global_layer_idx = pp_layer_offset + layer_idx
-
         self.fusion_config = EagerFusionConfig()
         self.enable_fusion = os.environ.get(
             "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
@@ -559,14 +555,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         # FIXME: incompatible with mixed quantization mode (including excluding modules from quantization)
         self.is_nvfp4 = model_config.quant_config.layer_quant_mode.has_nvfp4()
         has_tp = mapping.has_tp()
-        has_pp = mapping.has_pp()
 
         if (config.n_routed_experts is not None
-                and global_layer_idx >= config.first_k_dense_replace
-                and global_layer_idx % config.moe_layer_freq == 0):
+                and layer_idx >= config.first_k_dense_replace
+                and layer_idx % config.moe_layer_freq == 0):
 
             self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
-            self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION and not has_pp
+            self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION
 
             self.mlp = Deepseekv3MoE(
                 num_experts=self.num_experts,
@@ -587,7 +582,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
             has_mlp_tp = self.mlp_tp_size > 1
             self.fusion_config.PRE_MLP_FUSION = self.enable_fusion and has_mlp_tp and self.is_nvfp4
-            self.fusion_config.POST_MLP_FUSION = self.enable_fusion and has_mlp_tp and not has_pp
+            self.fusion_config.POST_MLP_FUSION = self.enable_fusion and has_mlp_tp
 
             self.mlp = GatedMLP(hidden_size=config.hidden_size,
                                 intermediate_size=config.intermediate_size,
@@ -924,7 +919,6 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         return hidden_states, logits
 
 
-@support_pp
 class DeepseekV3Model(DecoderModel):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
@@ -960,28 +954,19 @@ class DeepseekV3Model(DecoderModel):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        pipeline_interface: Optional[PipelineInterface] = None,
     ) -> torch.Tensor:
-        if self.model_config.mapping.is_first_pp_rank():
-            if (input_ids is None) ^ (inputs_embeds is not None):
-                raise ValueError(
-                    "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
-                )
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+            )
 
-            if inputs_embeds is None:
-                inputs_embeds = self.embed_tokens(input_ids)
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
 
-            hidden_states = inputs_embeds
-            residual = None
-        else:
-            if pipeline_interface is None:
-                raise ValueError(
-                    "pipeline_interface is required for non-first pp rank.")
-            hidden_states, residual = pipeline_interface
-            hidden_states, residual = self.local_layers()[0].input_layernorm(
-                hidden_states, residual)
+        hidden_states = inputs_embeds
+        residual = None
 
-        for decoder_layer in self.local_layers():
+        for decoder_layer in self.layers[:self.num_hidden_layers]:
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
@@ -989,10 +974,7 @@ class DeepseekV3Model(DecoderModel):
                 residual=residual,
             )
 
-        if self.model_config.mapping.is_last_pp_rank():
-            return hidden_states
-        else:
-            return PipelineInterface(hidden_states, residual)
+        return hidden_states
 
 
 @register_auto_model("DeepseekV3ForCausalLM")
@@ -1007,9 +989,6 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
 
         self.model_nextn = 0
         if model_config.spec_config is not None:
-            assert not model_config.mapping.has_pp(
-            ), "PP + MTP combination is not supported"
-
             model_nextn = model_config.spec_config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
@@ -1055,32 +1034,16 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[MTPSpecMetadata] = None,
-        pipeline_interface: Optional[PipelineInterface] = None,
         return_context_logits: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         attn_metadata.num_generations_per_batch = self.model_nextn + 1
-        if self._supports_pp and self.pp_size > 1:
-            output = self.model(
-                input_ids=input_ids,
-                attn_metadata=attn_metadata,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                pipeline_interface=pipeline_interface,
-            )
-
-            # No need to compute logits for non-last PP ranks
-            if self.pp_rank < self.pp_size - 1:
-                return output
-            else:
-                hidden_states = output
-        else:
-            hidden_states = self.model(
-                input_ids=input_ids,
-                attn_metadata=attn_metadata,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-            )
+        hidden_states = self.model(
+            input_ids=input_ids,
+            attn_metadata=attn_metadata,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+        )
 
         if spec_metadata and spec_metadata.spec_dec_mode.is_mtp():
             # get logits
