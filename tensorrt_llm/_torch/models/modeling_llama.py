@@ -35,8 +35,7 @@ from ..modules.rotary_embedding import RotaryEmbedding
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             EagerFusionConfig, MissingLayer,
-                             register_auto_model, unpack_hidden_states)
+                             EagerFusionConfig, register_auto_model)
 
 
 class Llama4Attention(Attention):
@@ -458,8 +457,8 @@ class Llama4DecoderLayer(DecoderLayer):
                 ))
         else:
             # Fully Connected
-            hidden_states, residual = unpack_hidden_states(
-                self.post_attention_layernorm(hidden_states, residual))
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
 
         hidden_states = self.feed_forward(
             hidden_states,
@@ -506,8 +505,8 @@ class Llama4DecoderLayer(DecoderLayer):
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
         elif self.next_layer_layernorm:
-            hidden_states, residual = unpack_hidden_states(
-                self.next_layer_layernorm(hidden_states, residual))
+            hidden_states, residual = self.next_layer_layernorm(
+                hidden_states, residual)
 
         return hidden_states, residual
 
@@ -890,7 +889,7 @@ class Llama4ForCausalLM(DecoderModelForCausalLM[Llama4Model, Llama4Config]):
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
-            elif not isinstance(self.model.layers[idx + 1], MissingLayer):
+            else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
 

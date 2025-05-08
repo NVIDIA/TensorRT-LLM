@@ -1104,15 +1104,10 @@ class PyExecutor:
     @nvtx_range("_forward_step_inter_pp")
     def _forward_step_inter_pp(self, scheduled_batch) -> DecoderState:
         batch_outputs = self._forward_step(scheduled_batch)
+        decoder_state = self._decode_async(scheduled_batch, batch_outputs)
         self._update_request_states(scheduled_batch)
-        tokens_shape = batch_outputs["logits"].shape[:-1]
-        new_tokens_host = torch.empty(tokens_shape,
-                                      dtype=torch.int64,
-                                      device='cpu',
-                                      pin_memory=True)
-        return DecoderState(
-            scheduled_requests=scheduled_batch,
-            new_tensors_host={"new_tokens_host": new_tokens_host})
+        decoder_state.decoder_event.synchronize()
+        return decoder_state
 
     @nvtx_range("_forward_step_last_pp")
     def _forward_step_last_pp(self, scheduled_batch,
@@ -1125,6 +1120,7 @@ class PyExecutor:
             self.send_handles[microbatch_id].Wait()
         decoder_state.decoder_event.synchronize()
 
+        # print(f"decoder_state.new_tensors_host: {decoder_state.new_tensors_host['new_tokens_host'].shape}")
         self.send_handles[microbatch_id] = self.dist.isend_tensor_list(
             decoder_state.new_tensors_host.values(),
             dest=self.dist.next_pp_rank,

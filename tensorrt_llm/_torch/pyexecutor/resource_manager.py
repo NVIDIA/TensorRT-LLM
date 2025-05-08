@@ -1,7 +1,7 @@
 import math
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from typing import Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -20,6 +20,9 @@ if ENABLE_MULTI_DEVICE:
     from mpi4py import MPI
 
     from tensorrt_llm._utils import mpi_comm
+
+if TYPE_CHECKING:
+    from ..speculative.interface import SpecConfig
 
 KVCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
 KvCacheConfigCpp = tensorrt_llm.bindings.KvCacheConfig
@@ -60,6 +63,25 @@ class BaseResourceManager(ABC):
         pass
 
 
+def get_pp_layers(
+    num_layers: int,
+    mapping: Mapping,
+    spec_config: Optional["SpecConfig"] = None,
+) -> Tuple[List[int], int]:
+    from ..speculative.utils import get_num_spec_layers
+
+    pp_layers = mapping.pp_layers(num_layers)
+    if spec_config is not None:
+        num_spec_layers = get_num_spec_layers(spec_config)
+        num_layers += num_spec_layers
+        if mapping.is_last_pp_rank():
+            pp_layers.extend(range(num_layers - num_spec_layers, num_layers))
+    if len(pp_layers) == 0:
+        # Don't support empty KV cache for now, provide at least 1 layer
+        pp_layers.append(0)
+    return pp_layers, num_layers
+
+
 class KVCacheManager(BaseResourceManager):
 
     def __init__(
@@ -77,15 +99,13 @@ class KVCacheManager(BaseResourceManager):
         max_batch_size: int,
         mapping: Mapping,
         dtype: DataType = DataType.HALF,
-        # Some speculative decoding methods need to use different kv lengths for the
-        # draft/target layers. Add extra tokens to haddle this issue.
-        num_extra_kv_tokens: int = 0,
+        spec_config: Optional["SpecConfig"] = None,
     ) -> None:
-        self.num_layers = num_layers
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
-        self.pp_layers = mapping.pp_layers(num_layers)
+        self.pp_layers, self.num_layers = get_pp_layers(num_layers, mapping,
+                                                        spec_config)
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {
             idx: offset
@@ -122,7 +142,9 @@ class KVCacheManager(BaseResourceManager):
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
-        self.num_extra_kv_tokens = num_extra_kv_tokens
+        # Some speculative decoding methods need to use different kv lengths for the
+        # draft/target layers. Add extra tokens to haddle this issue.
+        self.num_extra_kv_tokens = 0 if spec_config is None else spec_config.num_extra_kv_tokens
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
 
         if kv_cache_config.max_attention_window is None:
@@ -473,10 +495,17 @@ class MambaCacheManager(BaseResourceManager):
         # conv and ssm states device
         device = torch.device("cuda")
 
+        pp_layers, num_layers = get_pp_layers(num_layers, mapping)
+        num_local_layers = len(pp_layers)
+        self.mamba_layer_offsets = {
+            idx: offset
+            for offset, idx in enumerate(pp_layers)
+        }
+
         # mamba conv states
         self.conv_states = torch.empty(
             size=[
-                num_layers,
+                num_local_layers,
                 max_batch_size,
                 conv_dim,
                 d_conv,
@@ -488,7 +517,7 @@ class MambaCacheManager(BaseResourceManager):
         # mamba ssm states
         self.ssm_states = torch.empty(
             size=[
-                num_layers,
+                num_local_layers,
                 max_batch_size,
                 nheads,
                 d_state,
@@ -544,10 +573,12 @@ class MambaCacheManager(BaseResourceManager):
         return self.state_indices
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
-        return self.conv_states[layer_idx]
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.conv_states[layer_offset]
 
     def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
-        return self.ssm_states[layer_idx]
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.ssm_states[layer_offset]
 
 
 class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
@@ -577,9 +608,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         max_batch_size: int,
         mapping: Mapping,
         dtype: DataType = DataType.HALF,
-        # Some speculative decoding methods need to use different kv lengths for the
-        # draft/target layers. Add extra tokens to haddle this issue.
-        num_extra_kv_tokens: int = 0
+        spec_config: Optional["SpecConfig"] = None,
     ) -> None:
 
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
@@ -604,7 +633,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
                                 max_batch_size=max_batch_size,
                                 mapping=mapping,
                                 dtype=dtype,
-                                num_extra_kv_tokens=num_extra_kv_tokens)
+                                spec_config=spec_config)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         self.prepare_mamba_resources(scheduled_batch)
