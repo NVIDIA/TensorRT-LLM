@@ -115,7 +115,7 @@ void LookaheadPoolManager::update(TensorConstPtr const& keyTokens, TensorConstPt
     }
 }
 
-void LookaheadPoolManager::printPoolManager() const noexcept
+void LookaheadPoolManager::print() const noexcept
 {
     TLLM_LOG_TRACE("==== printPoolManager start");
 

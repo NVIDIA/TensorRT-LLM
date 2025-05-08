@@ -64,7 +64,7 @@ public:
     }
 
     //! @brief print content of the pool
-    void printPoolManager() const noexcept;
+    void print() const noexcept;
 
 private:
     void insertOne(Key key, TensorConstPtr const& ngram);

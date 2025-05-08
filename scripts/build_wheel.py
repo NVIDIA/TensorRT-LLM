@@ -105,7 +105,7 @@ def setup_venv(project_dir: Path, requirements_file: Path):
     print(
         f"-- Installing requirements from {requirements_file} into {venv_dir}..."
     )
-    build_run(f'"{venv_python}" -m pip install -r "{requirements_file}"')
+    #build_run(f'"{venv_python}" -m pip install -r "{requirements_file}"')
 
     venv_conan = setup_conan(scripts_dir, venv_python)
 
