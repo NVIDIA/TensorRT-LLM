@@ -1445,6 +1445,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "DGX_H100-4_GPUs-PyTorch-[Post-Merge]": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-TensorRT-[Post-Merge]": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "H100_PCIe-TensorRT-Perf": ["h100-cr", "l0_perf", 1, 1],
+        "H100_PCIe-PyTorch-Perf": ["h100-cr", "l0_perf", 1, 1],
         "DGX_H200-8_GPUs-PyTorch-[Post-Merge]": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
     ]
 
