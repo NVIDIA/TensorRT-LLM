@@ -54,6 +54,7 @@ run_llm_path = os.path.join(os.path.dirname(__file__), "_run_llmapi_llm.py")
 ])
 def test_llmapi_load_engine_from_build_command_with_lora(
         llm_root, llm_venv, engine_dir, model_name, model_path):
+    pytest.fail("Test failed")
     llama_example_root = os.path.join(llm_root, "examples", "models", "core",
                                       model_name)
     dtype = 'bfloat16'
