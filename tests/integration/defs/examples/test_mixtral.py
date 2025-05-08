@@ -21,7 +21,8 @@ import pytest
 from defs.common import (convert_weights, generate_summary_cmd, quantize_data,
                          venv_check_call, venv_mpi_check_call)
 from defs.conftest import (evaltool_mmlu_post_process,
-                           evaltool_wikilingua_post_process, skip_pre_ada)
+                           evaltool_wikilingua_post_process, llm_models_root,
+                           skip_post_blackwell, skip_pre_ada)
 from defs.trt_test_alternative import check_call
 from evaltool.constants import (EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT,
                                 EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT,
@@ -134,6 +135,47 @@ def test_mixtal_evaltool(llama_example_root, evaltool_root,
         check_call(" ".join(end_inference_server),
                    shell=True,
                    env=llm_venv._new_env)
+
+
+@skip_post_blackwell
+@pytest.mark.parametrize("model_name", ['mixtral-8x7b-v0.1-AWQ'])
+def test_llm_mixtral_int4_awq_1gpu_summary(llama_example_root,
+                                           llm_datasets_root, model_name,
+                                           llm_rouge_root, llm_venv, cmodel_dir,
+                                           engine_dir,
+                                           qcache_dir_without_install_package):
+    models_root = llm_models_root()
+    model_dir = os.path.join(models_root, model_name)
+    ckpt_dir = os.path.join(cmodel_dir, model_name)
+
+    print("Convert checkpoint...")
+    convert_cmd = [
+        f"{llama_example_root}/convert_checkpoint.py",
+        "--model_dir",
+        model_dir,
+        "--output_dir",
+        ckpt_dir,
+    ]
+    venv_check_call(llm_venv, convert_cmd)
+
+    print("Build engines...")
+    build_cmd = [
+        "trtllm-build",
+        f"--checkpoint_dir={ckpt_dir}",
+        f"--output_dir={engine_dir}",
+    ]
+    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+
+    print("Run inference")
+    summary_cmd = generate_summary_cmd(llama_example_root,
+                                       hf_model_dir=model_dir,
+                                       data_type="fp16",
+                                       tensorrt_llm_rouge1_threshold=19.5,
+                                       engine_dir=engine_dir,
+                                       dataset_dir=llm_datasets_root,
+                                       rouge_dir=llm_rouge_root)
+
+    venv_check_call(llm_venv, summary_cmd)
 
 
 @pytest.mark.skip_less_device(8)
