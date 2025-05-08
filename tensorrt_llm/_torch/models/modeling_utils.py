@@ -630,7 +630,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
         weights = rename_weights_with_regex(params_map, weights)
         logger.info(f"Renamed weights with params_map: {params_map}")
 
-    tp_size = model.model_config.mapping.tp_size
+    tp_size = 1 if model.model_config.mapping.enable_attention_dp else model.model_config.mapping.tp_size
     head_dim = getattr(
         model.config, "head_dim",
         model.config.hidden_size // model.config.num_attention_heads)
