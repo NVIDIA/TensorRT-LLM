@@ -32,7 +32,6 @@
 #include <memory>
 #include <optional>
 #include <utility>
-#include <valarray>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager
@@ -501,16 +500,6 @@ public:
         return mTokens.at(beam).size() - mNumPreDecodedTokens[beam];
     }
 
-    /// @brief Get number of return sequences for this req.
-    /// @return  The number of sequences to return.
-    [[nodiscard]] SizeType32 getNumReturnSequences() const
-    {
-        TLLM_LOG_WARNING(
-            "mNumReturnSequences in the LlmRequest class is deprecated. Please use numReturnSequences in "
-            "SamplingConfig directly.");
-        return mNumReturnSequences;
-    }
-
     /// @brief Get the number of subrequests, the expected number of responses under non-streaming mode. In sampling
     /// mode, it will be equal to mSamplingConfig.numReturnSequences, while it will be equal to 1 in beam search.
     /// @return  The number of subrequests in total  request size.
@@ -665,6 +654,12 @@ public:
     [[nodiscard]] SizeType32 getMaxNumGeneratedTokens() const
     {
         return getMaxBeamNumTokens() - mPromptLen;
+    }
+
+    /// @brief Returns true if request reaches max number of tokens in the next iteration.
+    [[nodiscard]] bool willCompleteNextIteration() const
+    {
+        return getMaxNumGeneratedTokens() + mNumTokensPerIteration >= mMaxNewTokens;
     }
 
     [[nodiscard]] LlmRequestType getLlmRequestType() const
@@ -1030,9 +1025,17 @@ public:
 
     void setPrepopulatedPromptLen(SizeType32 prepopulatedPromptLen, SizeType32 kvTokensPerBlock)
     {
-        TLLM_LOG_DEBUG("Setting pre-populated prompt length for request %lu to %i.", mRequestId, prepopulatedPromptLen);
+        // Add debug log for prepopulatedPromptLen
+        TLLM_LOG_DEBUG("Setting pre-populated prompt length for request %lu to %i (promptLen=%i).", mRequestId,
+            prepopulatedPromptLen, getPromptLen());
 
         auto const promptLen = getPromptLen();
+
+        // This check is make sure prepopulated prompt length (tokens already cached in KV cache) is less than prompt
+        // length (total tokens in the prompt)
+        TLLM_CHECK_WITH_INFO(prepopulatedPromptLen < promptLen,
+            "Invalid state: prepopulatedPromptLen (%d) >= promptLen (%d) for request %lu", prepopulatedPromptLen,
+            promptLen, mRequestId);
         TLLM_CHECK(prepopulatedPromptLen < promptLen);
         mPrepopulatedPromptLen = prepopulatedPromptLen;
 
@@ -1535,7 +1538,7 @@ public:
     }
 
     /// Determines whether the current position is only one chunk away from the end of the context.
-    [[nodiscard]] bool isLastContextChunk() const noexcept
+    [[nodiscard]] bool isLastContextChunk() const
     {
         return isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete()
             || getContextCurrentPosition() + getContextChunkSize() == mPromptLen;

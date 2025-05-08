@@ -179,7 +179,7 @@ private:
     std::shared_ptr<nvinfer1::ILogger> mLogger;
     std::shared_ptr<runtime::TllmRuntime> mRuntime;
 
-    SizeType32 mMicroBatchId;
+    SizeType32 mMicroBatchId{0};
 
     // TODO: Add runtime buffers for async PP
     std::vector<std::shared_ptr<EncoderBuffers>> mBuffers;

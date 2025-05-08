@@ -438,6 +438,7 @@ class TRTLLMDecoder(Decoder):
         model_dtype,
         mapping: Mapping,
         decoding_mode: DecodingMode,
+        enable_overlap_scheduler: bool,
     ):
 
         vocab_size = model.config.vocab_size
@@ -456,6 +457,7 @@ class TRTLLMDecoder(Decoder):
         self.max_num_sequences = mapping.pp_size * self.executor_config.max_batch_size
         self.max_seq_idle_microseconds = 180 * 1000 * 1000
         self.max_decoding_tokens = 1  # It must be 1 when not in speculative decoding
+        self.is_trt_overlap = enable_overlap_scheduler
 
         self.world_config = WorldConfig.mpi(mapping.gpus_per_node,
                                             mapping.tp_size, mapping.pp_size)
@@ -580,7 +582,7 @@ class TRTLLMDecoder(Decoder):
             scheduled_requests.generation_requests,
             self.store["decoder_buffers"], self.store["decoder_input_buffers"],
             self.algs.decoder.decoder_state, self.model_config,
-            self.max_num_sequences, self.beam_width,
+            self.max_num_sequences, self.beam_width, self.is_trt_overlap,
             self.store["buffer_manager"], self.store["cuda_stream"])
 
         self.algs.decoder.forward_async(self.decoding_output, decoding_input)
@@ -601,20 +603,13 @@ class TRTLLMDecoder(Decoder):
             non_blocking=True)
         new_tokens_device_tensor = new_tokens_device_tensor.view(-1)
 
-        # NOTE: If we overwrite seq lens on every iteration then overlap scheduling seemingly works.
-        #       This could be a race condition.
-        self.store["sequence_lengths_host"].copy_(
-            self.algs.decoder.decoder_state.sequence_lengths, non_blocking=True)
-
-        # TODO: We should instead copy on every iteration, however this doesn't work for overlap scheduling atm.
-        #       It's still not understood why.
-        # sequence_lengths = self.store["decoder_buffers"].sequence_lengths.to('cpu', non_blocking=True)
-
         new_output_tokens = self.algs.decoder.decoder_state.all_new_tokens.to(
             'cpu', non_blocking=True)
         finished_sum = self.algs.decoder.decoder_state.finished_sum.to(
             'cpu', non_blocking=True)
         finish_reasons = self.algs.decoder.decoder_state.finish_reasons.to(
+            'cpu', non_blocking=True)
+        sequence_lengths = self.algs.decoder.decoder_state.sequence_lengths.to(
             'cpu', non_blocking=True)
 
         new_tensors_device = {"new_tokens_device": new_tokens_device_tensor}
@@ -623,7 +618,7 @@ class TRTLLMDecoder(Decoder):
             "new_tokens_host": new_output_tokens,
             "finished_sum_host": finished_sum,
             "finish_reasons_host": finish_reasons,
-            "sequence_lengths_host": self.store["sequence_lengths_host"]
+            "sequence_lengths_host": sequence_lengths
         }
 
         decoder_event = torch.cuda.Event()

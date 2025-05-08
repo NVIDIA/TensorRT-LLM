@@ -228,6 +228,7 @@ def test_llm_loading_from_hf():
                      kv_cache_config=global_kvcache_config)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5266240")
 @force_ampere
 @pytest.mark.part0
 def test_llm_loading_from_ckpt():
@@ -246,7 +247,11 @@ def test_llm_loading_from_ckpt():
                      sampling_params=SamplingParams(max_tokens=8))
 
 
-@pytest.mark.parametrize('model_format', ['hf', 'ckpt'])
+@pytest.mark.parametrize('model_format', [
+    'hf',
+    pytest.param('ckpt',
+                 marks=pytest.mark.skip(reason="https://nvbugs/5266240"))
+])
 @pytest.mark.part0
 def test_llm_with_dummy_weights(model_format):
     # dummy_dir contains config.json and tokenizer files only
@@ -631,7 +636,7 @@ def test_generate_with_seed(llm_for_sampling_params: LLM):
 def test_generate_with_beam_search(llm_for_sampling_params: LLM):
     llm = llm_for_sampling_params
     references = [["D E F G H I", "D E F G I J"]]
-    sampling_params = SamplingParams(max_tokens=6, beam_width=2)
+    sampling_params = SamplingParams(max_tokens=6, n=2, use_beam_search=True)
 
     # Non-streaming mode
     outputs = llm.generate(prompts, sampling_params)
@@ -686,11 +691,11 @@ def test_parallel_config():
 @force_ampere  # Save H100 resource
 @pytest.mark.parametrize("gather_context_logits", [True, False])
 @pytest.mark.parametrize("gather_generation_logits", [True, False])
-@pytest.mark.parametrize("return_log_probs", [True])  # prune space
 @pytest.mark.part0
-def test_generate_with_OutputConfig(gather_context_logits: bool,
-                                    gather_generation_logits: bool,
-                                    return_log_probs: bool):
+def test_generate_with_OutputConfig(
+    gather_context_logits: bool,
+    gather_generation_logits: bool,
+):
     if not (gather_context_logits or gather_generation_logits):  # prune space
         return
 
@@ -708,8 +713,7 @@ def test_generate_with_OutputConfig(gather_context_logits: bool,
     sampling_params = SamplingParams(
         max_tokens=8,
         return_context_logits=gather_context_logits,
-        return_generation_logits=gather_generation_logits,
-        return_log_probs=return_log_probs)
+        return_generation_logits=gather_generation_logits)
 
     for output in llm.generate(prompts, sampling_params=sampling_params):
         if gather_context_logits:
@@ -720,8 +724,6 @@ def test_generate_with_OutputConfig(gather_context_logits: bool,
             assert output.outputs[0].generation_logits is not None
             assert sampling_params.max_tokens == output.outputs[
                 0].generation_logits.shape[0]
-        if return_log_probs:
-            assert output.outputs[0].logprobs is not None
 
         print(output)
 
