@@ -639,6 +639,7 @@ public:
             benchmarkParams.cudaGraphCacheSize);
         texec::ExecutorConfig executorConfig(
             maxBeamWidth, schedulerConfig, kvCacheConfig, benchmarkParams.enableChunkedContext, true);
+        executorConfig.setEnableTrtOverlap(benchmarkParams.enableTrtOverlap);
         executorConfig.setGpuWeightsPercent(benchmarkParams.gpuWeightsPercent);
         executorConfig.setPeftCacheConfig(peftCacheConfig);
         executorConfig.setBatchingType(batchingType);
@@ -1161,6 +1162,7 @@ int main(int argc, char* argv[])
         "Specify how many cuda graphs are cached in the runtime. Larger cache gives better perf, but consumes more GPU "
         "memory.",
         cxxopts::value<SizeType32>()->default_value("0"));
+    options.add_options()("enable_trt_overlap", "Enable TRT Overlap", cxxopts::value<bool>()->default_value("false"));
 
     options.add_options()("enable_context_fmha_fp32_acc", "Enable FMHA runner FP32 accumulation",
         cxxopts::value<bool>()->default_value("false"));
@@ -1413,6 +1415,9 @@ int main(int argc, char* argv[])
 
     // Argument: cuda_graph_cache_size
     benchmarkParams.cudaGraphCacheSize = result["cuda_graph_cache_size"].as<SizeType32>();
+
+    // Argument: enable_trt_overlap
+    benchmarkParams.enableTrtOverlap = result["enable_trt_overlap"].as<bool>();
 
     std::optional<TokenIdType> padId;
     // Argument: Padding token id
