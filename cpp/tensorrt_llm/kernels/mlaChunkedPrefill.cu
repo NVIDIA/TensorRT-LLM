@@ -1,6 +1,5 @@
 #include "mlaChunkedPrefill.cuh"
 #include "tensorrt_llm/common/assert.h"
-#include <__clang_cuda_builtin_vars.h>
 #include <cutlass/array.h>
 #include <cutlass/half.h>
 
@@ -22,10 +21,9 @@ struct MergeSoftmaxTraits
     };
 };
 
-template <typename ABC>
+template <typename T>
 struct PrepareMLAContigousKVTraits
 {
-    using T = half;
     using VecT = uint4;
     static constexpr int kQKNopeSize = 128;
     static constexpr int kRopeSize = 64;
@@ -42,18 +40,16 @@ struct PrepareMLAContigousKVTraits
     static constexpr int kBlockSize = kThreadPerHead * kCpTokenPerBlock;
 };
 
-template <typename ABC>
-__global__ void mergeAttnWithSoftmaxKernel(ABC* merged_attn, float* merged_softmax_sum, ABC* const pre_attn,
-    float* const pre_softmax_sum, ABC* const curr_attn, float* const curr_softmax_sum, int const batch_size,
+template <typename T>
+__global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float* merged_softmax_sum, T* const pre_attn,
+    float* const pre_softmax_sum, T* const curr_attn, float* const curr_softmax_sum, int const batch_size,
     int const chunked_token_size, int const num_heads, int const head_size)
 {
-    using T = half;
     using KT = MergeSoftmaxTraits<T>;
-
     int const batch_idx = blockIdx.x;
     int const token_idx = blockIdx.y;
-    static int const kNumHeadsPerBlock = KT::kElemPerThread * KT::kNumThreads / head_size;
-    static int const kNumThreadsPerHead = head_size / KT::kElemPerThread;
+    int const kNumHeadsPerBlock = KT::kElemPerThread * KT::kNumThreads / head_size;
+    int const kNumThreadsPerHead = head_size / KT::kElemPerThread;
     int const head_idx = (blockIdx.z * kNumHeadsPerBlock) + (threadIdx.x / kNumThreadsPerHead);
     int const dim_idx = (threadIdx.x % kNumThreadsPerHead) * KT::kElemPerThread;
 
@@ -82,9 +78,9 @@ __global__ void mergeAttnWithSoftmaxKernel(ABC* merged_attn, float* merged_softm
     float merged_softmax_sum_val = (pre_softmax_sum_val * pre_shift) + (curr_softmax_sum_val * curr_shift);
 
     // merge softmax
-    KT::VecReader pre_attn_reader{};
-    KT::VecReader curr_attn_reader{};
-    KT::VecReader merged_attn_reader{};
+    typename KT::VecReader pre_attn_reader{};
+    typename KT::VecReader curr_attn_reader{};
+    typename KT::VecReader merged_attn_reader{};
 
     pre_attn_reader.reader = *reinterpret_cast<decltype(pre_attn_reader.reader)*>(pre_attn_ptr + dim_idx);
     curr_attn_reader.reader = *reinterpret_cast<decltype(curr_attn_reader.reader)*>(curr_attn_ptr + dim_idx);
@@ -201,3 +197,15 @@ void invokePrepareMLAContigousKV(T* output_kv, T* const k, T* const v, T* const 
     PrepareMLAContigousKV<T><<<grid, KT::kBlockSize, 0, stream>>>(
         output_kv, k, v, k_pe, chunked_token_size, num_heads, uncompressed_head_size, rope_size, cu_seq_lens);
 }
+
+#define INSTANTIATE_MLA_CHUNKED_PREFILL_KERNEL(T)                                                                      \
+    template void invokeMergeAttnWithSoftmax<T>(T * merged_attn, float* merged_softmax_sum, T* const pre_attn,         \
+        float* const pre_softmax_sum, T* const curr_attn, float* const curr_softmax_sum, int const batch_size,         \
+        int const chunked_token_size, int const num_heads, int const head_size, cudaStream_t stream);                  \
+    template void invokePrepareMLAContigousKV<T>(T * output_kv, T* const k, T* const v, T* const k_pe,                 \
+        int const batch_size, int const chunked_token_size, int const num_heads, int uncompressed_head_size,           \
+        int rope_size, int64_t* const cu_seq_lens, cudaStream_t stream);
+
+INSTANTIATE_MLA_CHUNKED_PREFILL_KERNEL(half);
+INSTANTIATE_MLA_CHUNKED_PREFILL_KERNEL(float);
+INSTANTIATE_MLA_CHUNKED_PREFILL_KERNEL(__nv_bfloat16);

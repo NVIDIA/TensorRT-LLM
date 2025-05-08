@@ -51,8 +51,8 @@ void selfAttentionRef(T* output, T* const Q, T* const KV, int batch_size, int nu
                     P[s_q * seq_len_kv + s_kv] = 0;
                     for (int d = 0; d < head_size; d++)
                     {
-                        P[s_q * seq_len_kv + s_kv]
-                            += q_ptr[s_q * num_heads * head_size + h * head_size + d] * k_ptr[s_kv * head_size + d];
+                        P[s_q * seq_len_kv + s_kv] += static_cast<float>(
+                            q_ptr[s_q * num_heads * head_size + h * head_size + d] * k_ptr[s_kv * head_size + d]);
                     }
                     if (softmax_max < P[s_q * seq_len_kv + s_kv])
                     {
@@ -100,8 +100,8 @@ void selfAttentionRef(T* output, T* const Q, T* const KV, int batch_size, int nu
                     output_ptr[s_q * num_heads * head_size + h * head_size + d] = 0;
                     for (int s_kv = 0; s_kv < seq_len_kv; s_kv++)
                     {
-                        output_ptr[s_q * num_heads * head_size + h * head_size + d]
-                            += P[s_q * seq_len_kv + s_kv] * v_ptr[s_kv * head_size + d];
+                        output_ptr[s_q * num_heads * head_size + h * head_size + d] += static_cast<T>(
+                            P[s_q * seq_len_kv + s_kv] * static_cast<float>(v_ptr[s_kv * head_size + d]));
                     }
                 }
             }
@@ -188,6 +188,7 @@ protected:
             GTEST_SKIP() << "Skipping mla chunked prefill test";
         }
         mStream = std::make_shared<tensorrt_llm::runtime::CudaStream>();
+        gen.seed(42U);
     }
 
     static bool shouldSkip()
@@ -209,6 +210,17 @@ protected:
     {
         void* ptr = tensor->data();
         std::memset(ptr, 0, tensor->getSizeInBytes());
+    }
+
+    template <typename T>
+    void showHostTensor(tensorrt_llm::runtime::BufferManager::ITensorPtr& tensor)
+    {
+        auto* const ptr = reinterpret_cast<T*>(tensor->data());
+        for (int _ = 0; _ < tensor->getSize(); _++)
+        {
+            std::cout << static_cast<float>(ptr[_]) << " ";
+        }
+        std::cout << std::endl;
     }
 
     float generateRandomFloat(float min, float max)
@@ -281,12 +293,8 @@ protected:
             = tensorrt_llm::runtime::BufferManager::gpuSync(this->h_output_tensor_accum_ref->getShape(), dtype);
 
         {
-            auto q_ptr = bufferCast<DataType>(this->h_q_tensor);
-            auto kv_ptr = bufferCast<DataType>(this->h_kv_tensor);
-            auto chunked_kv_ptr = bufferCast<DataType>(this->h_chunked_kv_tensor);
-            auto output_ptr = bufferCast<DataType>(this->h_output_tensor);
-            auto softmax_sum_ptr = bufferCast<float>(this->h_softmax_sum_tensor);
-            auto output_ref_ptr = bufferCast<DataType>(this->h_output_tensor_ref);
+            auto* q_ptr = bufferCast<DataType>(*(this->h_q_tensor));
+            auto* kv_ptr = bufferCast<DataType>(*(this->h_kv_tensor));
 
             generateRandomData(q_ptr, h_q_tensor->getSize());
             generateRandomData(kv_ptr, h_kv_tensor->getSize());
@@ -316,15 +324,16 @@ protected:
                 h_output_tensor_accum_ref->getSizeInBytes(), cudaMemcpyHostToDevice, mStream->get());
             cudaStreamSynchronize(mStream->get());
         }
+        return true;
     }
 
     void PerformNormalAttention()
     {
         using tensorrt_llm::runtime::bufferCast;
 
-        auto q_ptr = bufferCast<DataType>(this->h_q_tensor);
-        auto kv_ptr = bufferCast<DataType>(this->h_kv_tensor);
-        auto output_ptr = bufferCast<DataType>(this->h_output_tensor);
+        auto* q_ptr = bufferCast<DataType>(*(this->h_q_tensor));
+        auto* kv_ptr = bufferCast<DataType>(*(this->h_kv_tensor));
+        auto* output_ptr = bufferCast<DataType>(*(this->h_output_tensor));
         selfAttentionRef(output_ptr, q_ptr, kv_ptr, this->mBatchSize, this->mNumHeads, this->mChunkSize, this->mSeqLen,
             this->mHeadSize, false, nullptr, this->mIsCausalMask);
     }
@@ -333,19 +342,19 @@ protected:
     {
         using tensorrt_llm::runtime::bufferCast;
 
-        auto h_q_ptr = bufferCast<DataType>(this->h_q_tensor);
-        auto h_kv_ptr = bufferCast<DataType>(this->h_kv_tensor);
-        auto h_chunked_kv_ptr = bufferCast<DataType>(this->h_chunked_kv_tensor);
-        auto h_output_ptr = bufferCast<DataType>(this->h_output_tensor_ref);
-        auto h_output_accum_ptr = bufferCast<DataType>(this->h_output_tensor_accum_ref);
-        auto h_softmax_sum_ptr = bufferCast<float>(this->h_softmax_sum_tensor);
-        auto h_softmax_sum_accum_ptr = bufferCast<float>(this->h_softmax_sum_accum_tensor);
-        auto d_kv_ptr = bufferCast<DataType>(this->d_kv_tensor);
-        auto d_chunked_kv_ptr = bufferCast<DataType>(this->d_chunked_kv_tensor);
-        auto d_softmax_sum_ptr = bufferCast<float>(this->d_softmax_sum_tensor);
-        auto d_softmax_sum_accum_ptr = bufferCast<float>(this->d_softmax_sum_accum_tensor);
-        auto d_output_ptr = bufferCast<DataType>(this->d_output_tensor_ref);
-        auto d_output_accum_ptr = bufferCast<DataType>(this->d_output_tensor_accum_ref);
+        auto* h_q_ptr = bufferCast<DataType>(*(this->h_q_tensor));
+        auto* h_kv_ptr = bufferCast<DataType>(*(this->h_kv_tensor));
+        auto* h_chunked_kv_ptr = bufferCast<DataType>(*(this->h_chunked_kv_tensor));
+        auto* h_output_ptr = bufferCast<DataType>(*(this->h_output_tensor_ref));
+        auto* h_output_accum_ptr = bufferCast<DataType>(*(this->h_output_tensor_accum_ref));
+        auto* h_softmax_sum_ptr = bufferCast<float>(*(this->h_softmax_sum_tensor));
+        auto* h_softmax_sum_accum_ptr = bufferCast<float>(*(this->h_softmax_sum_accum_tensor));
+        auto* d_kv_ptr = bufferCast<DataType>(*(this->d_kv_tensor));
+        auto* d_chunked_kv_ptr = bufferCast<DataType>(*(this->d_chunked_kv_tensor));
+        auto* d_softmax_sum_ptr = bufferCast<float>(*(this->d_softmax_sum_tensor));
+        auto* d_softmax_sum_accum_ptr = bufferCast<float>(*(this->d_softmax_sum_accum_tensor));
+        auto* d_output_ptr = bufferCast<DataType>(*(this->d_output_tensor_ref));
+        auto* d_output_accum_ptr = bufferCast<DataType>(*(this->d_output_tensor_accum_ref));
 
         int const loop_count = this->mSeqLen / this->mChunkSize;
         for (int _ = 0; _ < loop_count; _++)
@@ -354,7 +363,7 @@ protected:
             copyRelatedChunkedKV(h_chunked_kv_ptr, h_kv_ptr, _, this->mBatchSize, this->mNumHeads, this->mChunkSize,
                 this->mSeqLen, this->mHeadSize);
             // attention
-            selfAttentionRef(h_output_tensor_ref, h_q_ptr, h_chunked_kv_ptr, this->mBatchSize, this->mNumHeads,
+            selfAttentionRef(h_output_ptr, h_q_ptr, h_chunked_kv_ptr, this->mBatchSize, this->mNumHeads,
                 this->mChunkSize, this->mChunkSize, this->mHeadSize, true, h_softmax_sum_ptr,
                 this->mIsCausalMask && (_ == loop_count - 1));
             // merge attention
@@ -366,15 +375,19 @@ protected:
             else
             {
                 // copy curr_attn and softmax_sum to device
-                cudaMemcpyAsync(d_softmax_sum_ptr->data(), h_softmax_sum_ptr,
-                    this->h_softmax_sum_tensor->getSizeInBytes(), cudaMemcpyHostToDevice, mStream->get());
-                cudaMemcpyAsync(d_output_ptr->data(), h_output_ptr, this->h_output_tensor->getSizeInBytes(),
+                cudaMemcpyAsync(d_softmax_sum_accum_ptr, h_softmax_sum_accum_ptr,
+                    this->h_softmax_sum_accum_tensor->getSizeInBytes(), cudaMemcpyHostToDevice, mStream->get());
+                cudaMemcpyAsync(d_softmax_sum_ptr, h_softmax_sum_ptr, this->h_softmax_sum_tensor->getSizeInBytes(),
+                    cudaMemcpyHostToDevice, mStream->get());
+                cudaMemcpyAsync(d_output_accum_ptr, h_output_accum_ptr,
+                    this->h_output_tensor_accum_ref->getSizeInBytes(), cudaMemcpyHostToDevice, mStream->get());
+                cudaMemcpyAsync(d_output_ptr, h_output_ptr, this->h_output_tensor->getSizeInBytes(),
                     cudaMemcpyHostToDevice, mStream->get());
                 sync_check_cuda_error(mStream->get());
                 // merge softmax
-                invokeMergeAttnWithSoftmax(d_output_accum_ptr, d_softmax_sum_accum_ptr, d_output_accum_ptr,
-                    d_softmax_sum_accum_ptr, d_output_tensor_ref, d_softmax_sum_tensor, this->mBatchSize,
-                    this->mChunkSize, this->mNumHeads, this->mHeadSize, mStream->get());
+                invokeMergeAttnWithSoftmax<DataType>(d_output_accum_ptr, d_softmax_sum_accum_ptr, d_output_accum_ptr,
+                    d_softmax_sum_accum_ptr, d_output_ptr, d_softmax_sum_ptr, this->mBatchSize, this->mChunkSize,
+                    this->mNumHeads, this->mHeadSize, mStream->get());
                 sync_check_cuda_error(mStream->get());
                 // copy merged softmax sum back to host
                 cudaMemcpyAsync(h_softmax_sum_accum_ptr, d_softmax_sum_accum_ptr,
@@ -407,18 +420,21 @@ TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedPrefillDefault)
     sync_check_cuda_error(this->mStream->get());
 
     // check result
+    auto* output_ptr = bufferCast<DataType>(*(this->h_output_tensor));
+    auto* output_ref_ptr = bufferCast<DataType>(*(this->h_output_tensor_accum_ref));
     for (int i = 0; i < this->h_output_tensor->getSize(); i++)
     {
-        auto output_ptr = bufferCast<DataType>(this->h_output_tensor);
-        auto output_ref_ptr = bufferCast<DataType>(this->h_output_tensor_accum_ref);
-        if (std::abs(output_ptr[i] - output_ref_ptr[i]) > getTolerance<DataType>(output_ptr[i]))
+        if (std::abs(static_cast<float>(output_ptr[i]) - static_cast<float>(output_ref_ptr[i]))
+            > getTolerance<DataType>(output_ptr[i]))
         {
             std::cout << "Output mismatch at index " << i << ": "
-                      << "expected " << output_ref_ptr[i] << ", got " << output_ptr[i] << std::endl;
+                      << "expected " << static_cast<float>(output_ref_ptr[i]) << ", got "
+                      << static_cast<float>(output_ptr[i]) << std::endl;
             allEqual = false;
             break;
         }
     }
+    ASSERT_TRUE(allEqual);
 }
 
 TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedPrefillCausalMask)
@@ -439,16 +455,21 @@ TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedPrefillCausalMask)
     sync_check_cuda_error(this->mStream->get());
 
     // check result
+    auto* output_ptr = bufferCast<DataType>(*(this->h_output_tensor));
+    auto* output_ref_ptr = bufferCast<DataType>(*(this->h_output_tensor_accum_ref));
     for (int i = 0; i < this->h_output_tensor->getSize(); i++)
     {
-        auto output_ptr = bufferCast<DataType>(this->h_output_tensor);
-        auto output_ref_ptr = bufferCast<DataType>(this->h_output_tensor_accum_ref);
-        if (std::abs(output_ptr[i] - output_ref_ptr[i]) > getTolerance<DataType>(output_ptr[i]))
+        std::cout << "diff: " << std::abs(static_cast<float>(output_ptr[i]) - static_cast<float>(output_ref_ptr[i]))
+                  << std::endl;
+        if (std::abs(static_cast<float>(output_ptr[i]) - static_cast<float>(output_ref_ptr[i]))
+            > getTolerance<DataType>(output_ptr[i]))
         {
             std::cout << "Output mismatch at index " << i << ": "
-                      << "expected " << output_ref_ptr[i] << ", got " << output_ptr[i] << std::endl;
+                      << "expected " << static_cast<float>(output_ref_ptr[i]) << ", got "
+                      << static_cast<float>(output_ptr[i]) << std::endl;
             allEqual = false;
             break;
         }
     }
+    ASSERT_TRUE(allEqual);
 }
