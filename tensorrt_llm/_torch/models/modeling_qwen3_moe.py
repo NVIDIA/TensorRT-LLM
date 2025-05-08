@@ -73,8 +73,10 @@ class Qwen3MoE(nn.Module):
                 hidden_states,
                 (0, 0, 0, max_num_token - hidden_states.shape[0]))
         router_logits = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states, router_logits,
-                                           all_rank_num_tokens=all_rank_num_tokens)
+        final_hidden_states = self.experts(
+            hidden_states,
+            router_logits,
+            all_rank_num_tokens=all_rank_num_tokens)
 
         return final_hidden_states.view(orig_shape)
 
@@ -185,11 +187,12 @@ class Qwen3MoEModel(DecoderModel):
 
         if model_config.mapping.enable_attention_dp:
             # When attention_dp is enabled, we cannot do all_reduce since
-            # the problem size of different ranks are different. 
+            # the problem size of different ranks are different.
             # So, we don't do parallelism here.
-            self.embed_tokens = nn.Embedding(config.pretrained_config.vocab_size,
-                                             config.pretrained_config.hidden_size,
-                                             dtype=config.pretrained_config.torch_dtype)
+            self.embed_tokens = nn.Embedding(
+                config.pretrained_config.vocab_size,
+                config.pretrained_config.hidden_size,
+                dtype=config.pretrained_config.torch_dtype)
         else:
             self.embed_tokens = Embedding(
                 config.pretrained_config.vocab_size,
