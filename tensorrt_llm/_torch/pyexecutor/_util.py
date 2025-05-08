@@ -389,6 +389,9 @@ def create_py_executor_instance(dist,
         if spec_config is not None:
             raise ValueError(
                 "Guided decoding is not supported with speculative decoding.")
+        if pytorch_backend_config.enable_overlap_scheduler:
+            raise ValueError(
+                "Guided decoding is not supported with overlap scheduler.")
 
     resources["seq_slot_manager"] = SeqSlotManager(
         executor_config.max_batch_size)
