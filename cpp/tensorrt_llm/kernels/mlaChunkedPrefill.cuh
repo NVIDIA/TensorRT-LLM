@@ -1,7 +1,7 @@
 
 
 // merged_softmax_sum {2, B, S=chunked_token_size, H} (float), the first part is the softmax sum, the second part is the
-// max value for each row of P = QK^T we just ignore the second part.
+// max value for each row of P = QK^T
 template <typename T>
 void invokeMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_sum, T* const pre_attn,
     float* const pre_softmax_sum, T* const curr_attn, float* const curr_softmax_sum, int const batch_size,

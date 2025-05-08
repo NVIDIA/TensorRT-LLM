@@ -44,8 +44,8 @@ struct PrepareMLAContigousKVTraits
 
 template <typename ABC>
 __global__ void mergeAttnWithSoftmaxKernel(ABC* merged_attn, float* merged_softmax_sum, ABC* const pre_attn,
-    float* const pre_softmax_sum, ABC* const curr_attn, float* const curr_softmax_sum, int const chunked_token_size,
-    int const num_heads, int const head_size)
+    float* const pre_softmax_sum, ABC* const curr_attn, float* const curr_softmax_sum, int const batch_size,
+    int const chunked_token_size, int const num_heads, int const head_size)
 {
     using T = half;
     using KT = MergeSoftmaxTraits<T>;
@@ -60,16 +60,26 @@ __global__ void mergeAttnWithSoftmaxKernel(ABC* merged_attn, float* merged_softm
     int const global_attn_offset = batch_idx * chunked_token_size * num_heads * head_size
         + token_idx * num_heads * head_size + head_idx * head_size;
     int const global_softmax_sum_offset = batch_idx * chunked_token_size * num_heads + token_idx * num_heads + head_idx;
+    int const global_softmax_max_offset = global_softmax_sum_offset + batch_size * chunked_token_size * num_heads;
     auto* merged_attn_ptr = merged_attn + global_attn_offset;
     auto* merged_softmax_sum_ptr = merged_softmax_sum + global_softmax_sum_offset;
+    auto* merged_softmax_max_ptr = merged_softmax_sum + global_softmax_max_offset;
     auto* pre_attn_ptr = pre_attn + global_attn_offset;
     auto* pre_softmax_sum_ptr = pre_softmax_sum + global_softmax_sum_offset;
+    auto* pre_softmax_max_ptr = pre_softmax_sum + global_softmax_max_offset;
     auto* curr_attn_ptr = curr_attn + global_attn_offset;
     auto* curr_softmax_sum_ptr = curr_softmax_sum + global_softmax_sum_offset;
+    auto* curr_softmax_max_ptr = curr_softmax_sum + global_softmax_max_offset;
 
     float pre_softmax_sum_val = *pre_softmax_sum_ptr;
     float curr_softmax_sum_val = *curr_softmax_sum_ptr;
-    float merged_softmax_sum_val = pre_softmax_sum_val + curr_softmax_sum_val;
+    float pre_softmax_max_val = *pre_softmax_max_ptr;
+    float curr_softmax_max_val = *curr_softmax_max_ptr;
+    // merge softmax sum
+    float merged_softmax_max_val = fmaxf(pre_softmax_max_val, curr_softmax_max_val);
+    float pre_shift = std::exp(pre_softmax_max_val - merged_softmax_max_val);
+    float curr_shift = std::exp(curr_softmax_max_val - merged_softmax_max_val);
+    float merged_softmax_sum_val = (pre_softmax_sum_val * pre_shift) + (curr_softmax_sum_val * curr_shift);
 
     // merge softmax
     KT::VecReader pre_attn_reader{};
@@ -81,17 +91,19 @@ __global__ void mergeAttnWithSoftmaxKernel(ABC* merged_attn, float* merged_softm
 
     for (int i = 0; i < KT::kElemPerThread; ++i)
     {
-        merged_attn_reader.data[i] = (static_cast<float>(pre_attn_reader.data[i]) * pre_softmax_sum_val
-                                         + static_cast<float>(curr_attn_reader.data[i]) * curr_softmax_sum_val)
+        merged_attn_reader.data[i]
+            = (static_cast<float>(pre_attn_reader.data[i]) * pre_softmax_sum_val * pre_shift
+                  + static_cast<float>(curr_attn_reader.data[i]) * curr_softmax_sum_val * curr_shift)
             / merged_softmax_sum_val;
     }
     // write merged attn back to global memory
     *reinterpret_cast<decltype(merged_attn_reader.reader)*>(merged_attn_ptr + dim_idx) = merged_attn_reader.reader;
 
-    // write merged softmax sum back to global memory
+    // write merged softmax sum and max back to global memory
     if (threadIdx.x % kNumThreadsPerHead == 0)
     {
         *merged_softmax_sum_ptr = merged_softmax_sum_val;
+        *merged_softmax_max_ptr = merged_softmax_max_val;
     }
 }
 
@@ -168,7 +180,7 @@ void invokeMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_sum, T* co
     dim3 block(KT::kNumThreads);
 
     mergeAttnWithSoftmaxKernel<T><<<grid, block, 0, stream>>>(merged_attn, merged_softmax_sum, pre_attn,
-        pre_softmax_sum, curr_attn, curr_softmax_sum, chunked_token_size, num_heads, head_size);
+        pre_softmax_sum, curr_attn, curr_softmax_sum, batch_size, chunked_token_size, num_heads, head_size);
 }
 
 // output_kv {B, 2, H, S=chunked_token_size, D=uncompressed_h+rope_h}, padding with zero
