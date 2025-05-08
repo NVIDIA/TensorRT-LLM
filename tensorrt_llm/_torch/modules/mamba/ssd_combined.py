@@ -1,10 +1,9 @@
-# Copyright (c) 2024, Tri Dao, Albert Gu.
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/ssd_combined.py
 
 import torch
 from einops import rearrange
 
-from .causal_conv1d import causal_conv1d_fwd
+from .causal_conv1d import causal_conv1d_fn, causal_conv1d_fwd
 from .ssd_bmm import _bmm_chunk_fwd
 from .ssd_chunk_scan import _chunk_scan_fwd
 from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
@@ -166,14 +165,12 @@ def mamba_split_conv1d_scan_combined(
     zx0, z, xBC, dt = torch.split(
         zxbcdt, [2 * d_nonssm, dim, dim + ngroups * dstate * 2, nheads], dim=-1)
 
-    xBC_conv = rearrange(
-        causal_conv1d_fwd(
-            rearrange_and_update_stride(xBC, "b s d -> b d s"),
-            conv1d_weight,
-            conv1d_bias,
-        ),
-        "b d s -> b s d",
-    )
+    xBC_conv = rearrange(causal_conv1d_fn(rearrange(xBC, "b s d -> b d s"),
+                                           conv1d_weight,
+                                        conv1d_bias,
+                                               activation=activation),
+                        "b d s -> b s d")
+
     x, B, C = torch.split(xBC_conv, [dim, ngroups * dstate, ngroups * dstate],
                           dim=-1)
     x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
