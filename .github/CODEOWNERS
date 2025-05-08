@@ -10,6 +10,5 @@
 # of the NVIDIA/trt-llm-committed-api-review-committee or NVIDIA/trt-llm-noncommitted-api-review-committee team.
 # This approval is mandatory regardless of other approvals the PR may have received. Without approval
 # from a member of this team, PRs affecting public APIs cannot be merged to main or release branches.
-/tests/unittest/api_stability/ @NVIDIA/trt-llm-committed-api-review-committee
+/tests/unittest/api_stability/ @NVIDIA/trt-llm-noncommitted-api-review-committee
 /tests/unittest/api_stability/references_committed/ @NVIDIA/trt-llm-committed-api-review-committee
-/tests/unittest/api_stability/references/ @NVIDIA/trt-llm-noncommitted-api-review-committee
