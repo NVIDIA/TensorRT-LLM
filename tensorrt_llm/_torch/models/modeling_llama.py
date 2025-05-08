@@ -13,6 +13,7 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, DeepseekAllReduce)
 from tensorrt_llm._torch.pipeline_interface import PipelineInterface
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
                        register_input_processor)
@@ -773,13 +774,14 @@ class LlamaModel(DecoderModel):
         self.padding_idx = config.pad_token_id
 
         vocab_size = config.vocab_size
-        # TODO smor- hack
-        if hasattr(model_config,
-                   'lora_config') and model_config.lora_config is not None:
+        # TODO smor- we load manually only if there is a single lora dir, need to come up with a better solution
+        if hasattr(
+                model_config,
+                'lora_config') and model_config.lora_config is not None and len(
+                    model_config.lora_config.lora_dir) == 1:
             from tensorrt_llm.lora_manager import HfLoraLoader
             lora_loader = HfLoraLoader(model_config.lora_config.lora_dir)
             weight = lora_loader.embed_tokens
-            # TODO smor - need to split tp matrix here
             vocab_size = lora_loader.vocab_size
 
         self.embed_tokens = Embedding(
@@ -791,9 +793,17 @@ class LlamaModel(DecoderModel):
             gather_output=True,
         )
 
-        if hasattr(model_config,
-                   'lora_config') and model_config.lora_config is not None:
+        if hasattr(
+                model_config,
+                'lora_config') and model_config.lora_config is not None and len(
+                    model_config.lora_config.lora_dir) == 1:
             with torch.no_grad():
+                if model_config.mapping.tp_size > 1:
+                    weight = split_matrix_tp(
+                        weight,
+                        model_config.mapping.tp_size,
+                        model_config.mapping.tp_rank,
+                        dim=0)  # split by vocabulary dimension
                 x = weight.to(self.embed_tokens.dtype)
                 self.embed_tokens.weight.data.copy_(x)
 
