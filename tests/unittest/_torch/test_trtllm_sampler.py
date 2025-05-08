@@ -26,7 +26,7 @@ def model_path():
 def create_llm(model_dir):
     """Create LLM with specific overlap scheduler setting"""
     pytorch_config = PyTorchConfig(use_cuda_graph=True,
-                                   enable_trtllm_decoder=True)
+                                   enable_trtllm_sampler=True)
 
     trt_kv_cache_config = TRT_KvCacheConfig(enable_block_reuse=False)
 
@@ -42,7 +42,7 @@ def create_llm(model_dir):
     )
 
 
-def test_trtllm_decoder(model_path, test_case):
+def test_trtllm_sampler(model_path, test_case):
     prompts = [
         "Magellan and Elcano lead the first",
         "The capital of France is",

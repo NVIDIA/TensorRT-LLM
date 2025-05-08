@@ -12,7 +12,7 @@ from ..distributed import MPIDist
 from ..speculative import Eagle3Config, get_spec_resource_manager
 from ._util import (create_kv_cache_manager, create_py_executor_instance,
                     estimate_max_kv_cache_tokens, get_token_num_for_estimation,
-                    instantiate_decoder, is_mla)
+                    instantiate_sampler, is_mla)
 from .config import PyTorchConfig
 from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
                            PyTorchModelEngine)
@@ -143,7 +143,7 @@ def create_py_executor(executor_config: ExecutorConfig,
         executor_config.kv_cache_config.enable_block_reuse = False
         executor_config.enable_chunked_context = False
 
-    decoder = instantiate_decoder(model_engine, executor_config,
+    sampler = instantiate_sampler(model_engine, executor_config,
                                   pytorch_backend_config, mapping)
 
     kv_cache_manager = None
@@ -177,7 +177,7 @@ def create_py_executor(executor_config: ExecutorConfig,
                                               pytorch_backend_config,
                                               executor_config, ctx_chunk_config,
                                               model_engine, draft_model_engine,
-                                              False, decoder, lora_config)
+                                              False, sampler, lora_config)
 
     if executor_config.pytorch_backend_config.use_kv_cache and 'cp_type' not in mapping.cp_config:
         kv_cache_max_tokens = estimate_max_kv_cache_tokens(
@@ -210,7 +210,7 @@ def create_py_executor(executor_config: ExecutorConfig,
             py_executor = create_py_executor_instance(
                 dist, resources, mapping, pytorch_backend_config,
                 executor_config, ctx_chunk_config, model_engine,
-                draft_model_engine, False, decoder, lora_config)
+                draft_model_engine, False, sampler, lora_config)
 
     py_executor.start_worker()
     return py_executor

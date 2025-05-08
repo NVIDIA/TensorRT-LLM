@@ -29,9 +29,6 @@ class SpeculativeDecodingMode(IntEnum):
     def is_none(self):
         return self == SpeculativeDecodingMode.NONE
 
-    def without_logits(self):
-        return self.is_mtp()
-
     def needs_kv_cache_rewind(self):
         return self.is_mtp()
 
