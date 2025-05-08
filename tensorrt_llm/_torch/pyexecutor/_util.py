@@ -505,6 +505,7 @@ def instantiate_sampler(model_engine: PyTorchModelEngine,
     else:
         sampler = TorchSampler(
             max_seq_len=model_engine.max_seq_len,
+            executor_config=executor_config,
             mixed_sampler=pytorch_backend_config.mixed_sampler)
     return sampler
 

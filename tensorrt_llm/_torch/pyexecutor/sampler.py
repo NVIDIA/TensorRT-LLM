@@ -179,7 +179,11 @@ def decode_single_request(request: LlmRequest, logits):
 
 class TorchSampler(Sampler):
 
-    def __init__(self, max_seq_len: int, mixed_sampler: bool = False):
+    def __init__(self,
+                 *,
+                 max_seq_len: int,
+                 executor_config: ExecutorConfig,
+                 mixed_sampler: bool = False):
         self.max_seq_len = max_seq_len
         self.mixed_sampler = mixed_sampler
 
@@ -189,7 +193,8 @@ class TorchSampler(Sampler):
                 >= request.py_max_new_tokens) or (num_tokens
                                                   >= self.max_seq_len)
 
-    def _meet_stop_token_criteria(self, request: LlmRequest):
+    @staticmethod
+    def _meet_stop_token_criteria(request: LlmRequest):
         if request.py_stop_words_list:
             assert isinstance(
                 request.py_stop_words_list,
