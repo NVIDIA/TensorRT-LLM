@@ -51,6 +51,7 @@ class Llama4Attention(Attention):
         nope_layer: bool = False,
         attn_temperature_tuning: bool = True,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        attention_chunk_size: Optional[int] = None,
     ):
         config = model_config.pretrained_config
         self.aux_stream = aux_stream
@@ -98,6 +99,7 @@ class Llama4Attention(Attention):
         self.attn_temperature_tuning = attn_temperature_tuning and nope_layer
         self.floor_scale = getattr(config, "floor_scale", 8192.0)
         self.attn_scale = getattr(config, "attn_scale", 0.1)
+        self.attention_chunk_size = attention_chunk_size
 
     def _attn_qkv(
             self,
@@ -114,13 +116,15 @@ class Llama4Attention(Attention):
             out_scale = self.o_proj.inv_input_scale
 
         q, k, v = self.convert_qkv(q, k, v)
-        attn_output = self.attn.forward(q,
-                                        k,
-                                        v,
-                                        attn_metadata,
-                                        out_scale=out_scale,
-                                        attention_mask=attention_mask,
-                                        mrope_config=mrope_config)
+        attn_output = self.attn.forward(
+            q,
+            k,
+            v,
+            attn_metadata,
+            out_scale=out_scale,
+            attention_mask=attention_mask,
+            mrope_config=mrope_config,
+            attention_chunk_size=self.attention_chunk_size)
 
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
@@ -360,7 +364,8 @@ class Llama4DecoderLayer(DecoderLayer):
         # TODO: re-enable these fusions
         self.fusion_config.PRE_MOE_FUSION = False
         self.fusion_config.POST_MLP_FUSION = False
-
+        self.attention_chunk_size = getattr(config, "attention_chunk_size",
+                                            None)
         self.self_attn = Llama4Attention(
             model_config,
             layer_idx=layer_idx,
@@ -368,6 +373,9 @@ class Llama4DecoderLayer(DecoderLayer):
             nope_layer=config.no_rope_layers[layer_idx] == 0,
             attn_temperature_tuning=config.attn_temperature_tuning > 0,
             aux_stream=aux_stream,
+            attention_chunk_size=self.attention_chunk_size
+            if config.no_rope_layers[layer_idx] != 0 else
+            None,  # apply attention chunking only on RoPE layers
         )
 
         is_mlp_layer = (layer_idx + 1) % config.interleave_moe_layer_step != 0
@@ -890,14 +898,14 @@ class Llama4ForCausalLM(DecoderModelForCausalLM[Llama4Model, Llama4Config]):
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
 
-    def infer_max_seq_len(self):
-        # TODO: increase to support 10M context length. There are two blockers
-        # right now:
-        # 1. We need to implement chunked attention.
-        # 2. CUDA graph warmup will crash when the cached context is that long.
-        # This only affects the TRTLLM backend; flashinfer is fine. It is
-        # most likely an issue with the kernel.
-        return 8192
+    # def infer_max_seq_len(self):
+    #     # TODO: increase to support 10M context length. There are two blockers
+    #     # right now:
+    #     # 1. We need to implement chunked attention.
+    #     # 2. CUDA graph warmup will crash when the cached context is that long.
+    #     # This only affects the TRTLLM backend; flashinfer is fine. It is
+    #     # most likely an issue with the kernel.
+    #     return 8192
 
     def load_weights(self, weights: Dict):
         new_weights = {}

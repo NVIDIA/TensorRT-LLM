@@ -46,13 +46,13 @@ def create_py_executor(executor_config: ExecutorConfig,
             )
             executor_config.kv_cache_config.enable_block_reuse = False
 
-    if pytorch_backend_config.attn_backend in [
-            "FLASHINFER", "FLASHINFER_STAR_ATTENTION"
-    ] and executor_config.enable_chunked_context:
-        logger.warning(
-            f"Disabling chunked context for {pytorch_backend_config.attn_backend} backend"
-        )
-        executor_config.enable_chunked_context = False
+    # if pytorch_backend_config.attn_backend in [
+    #         "FLASHINFER", "FLASHINFER_STAR_ATTENTION"
+    # ] and executor_config.enable_chunked_context:
+    #     logger.warning(
+    #         f"Disabling chunked context for {pytorch_backend_config.attn_backend} backend"
+    #     )
+    #     executor_config.enable_chunked_context = False
 
     if executor_config.max_num_tokens is None:
         executor_config.max_num_tokens = 8192
