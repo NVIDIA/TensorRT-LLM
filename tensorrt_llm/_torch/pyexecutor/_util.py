@@ -440,6 +440,24 @@ def create_py_executor_instance(dist,
                       start_worker=start_worker)
 
 
+def instantiate_torch_sampler(engine: PyTorchModelEngine,
+                              executor_config: ExecutorConfig,
+                              pytorch_backend_config: PyTorchConfig):
+    pretrained_config = engine.model.model_config.pretrained_config
+    vocab_size = pretrained_config.vocab_size
+    assert vocab_size is not None
+    max_draft_tokens = (0 if executor_config.speculative_config is None else
+                        executor_config.speculative_config.max_draft_tokens)
+    return TorchSampler(
+        max_seq_len=engine.max_seq_len,
+        max_draft_tokens=max_draft_tokens,
+        max_batch_size=executor_config.max_batch_size,
+        max_beam_width=executor_config.max_beam_width,
+        vocab_size=vocab_size,
+        mixed_sampler=pytorch_backend_config.mixed_sampler,
+    )
+
+
 def instantiate_sampler(model_engine: PyTorchModelEngine,
                         executor_config: ExecutorConfig,
                         pytorch_backend_config: PyTorchConfig,
@@ -460,9 +478,8 @@ def instantiate_sampler(model_engine: PyTorchModelEngine,
         # NOTE: choose sampler based on model type
         sampler = EarlyStopSampler()
     else:
-        sampler = TorchSampler(
-            max_seq_len=model_engine.max_seq_len,
-            mixed_sampler=pytorch_backend_config.mixed_sampler)
+        sampler = instantiate_torch_sampler(model_engine, executor_config,
+                                            pytorch_backend_config)
     return sampler
 
 
