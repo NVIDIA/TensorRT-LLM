@@ -583,6 +583,7 @@ def parse_and_validate_test_list(
     config,
     items,
     check_for_corrections,
+    is_waive=False,
 ):
     test_prefix = config.getoption("--test-prefix")
     apply_test_list_correction = config.getoption(
@@ -671,6 +672,7 @@ def apply_waives(waives_file, items, config):
         config,
         items,
         check_for_corrections=False,
+        is_waive=True,
     )
     if not ret:
         return
