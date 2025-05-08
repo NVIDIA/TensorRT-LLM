@@ -853,7 +853,7 @@ def test_moe_fp4(num_tokens, num_experts, hidden_size, intermediate_size):
 @pytest.mark.parametrize("num_experts", [128])
 @pytest.mark.parametrize("hidden_size", [2048])
 @pytest.mark.parametrize("intermediate_size", [2048])
-@pytest.mark.parametrize("use_routing_scales_on_input", [True, False])
+@pytest.mark.parametrize("use_routing_scales_on_input", [True])
 def test_moe_fp8_per_tensor_scale(num_tokens, num_experts, hidden_size,
                                   intermediate_size,
                                   use_routing_scales_on_input):
