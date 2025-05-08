@@ -361,7 +361,11 @@ class Linear(nn.Module):
                 raise ValueError(f'unsupported quant mode: {qc.quant_mode}')
         else:
             # TODO: remove custom cublas_mm when default heuristics is good enough
-            if self.use_custom_cublas_mm:
+            if input.shape[0] >= 1 and input.shape[0] <= 16 and input.shape[
+                    1] == 7168 and weight.shape[0] == 2112:
+                output = torch.ops.trtllm.fuse_a_gemm_op(
+                    input, self.weight.t(), bias, None)
+            elif self.use_custom_cublas_mm:
                 output = torch.ops.trtllm.cublas_mm(input,
                                                     self.weight.t(),
                                                     bias,

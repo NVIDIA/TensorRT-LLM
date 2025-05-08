@@ -57,7 +57,8 @@ public:
     ~DeepseekAllreduceOp() = default;
 
     std::vector<torch::Tensor> run(torch::Tensor input, torch::optional<torch::Tensor> workspace,
-        torch::TensorList reduce_fusion_inputs, int64_t rank, int64_t nranks, double eps, int64_t fusion_op) noexcept
+        torch::TensorList reduce_fusion_inputs, int64_t rank, int64_t nranks, double eps, int64_t fusion_op,
+        bool trigger_completion_at_end) noexcept
     {
         auto const fusion_op_type = static_cast<AllReduceFusionOp>(int8_t(fusion_op));
 
@@ -72,6 +73,7 @@ public:
         allreduce_fusion_params.scale_out = nullptr;
         allreduce_fusion_params.residual_out = nullptr;
         allreduce_fusion_params.norm_out = nullptr;
+        allreduce_fusion_params.trigger_completion_at_end = trigger_completion_at_end;
 
         if (fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
             || fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
@@ -234,7 +236,7 @@ public:
 
 std::vector<torch::Tensor> deepseekAllreduceFusion(torch::Tensor input, torch::optional<torch::Tensor> workspace,
     torch::TensorList reduce_fusion_inputs, int64_t const rank, int64_t const nranks, double const eps,
-    int64_t const fusion_op)
+    int64_t const fusion_op, bool const trigger_completion_at_end)
 {
 #if ENABLE_MULTI_DEVICE
     DeepseekAllreduceOp op;
@@ -245,7 +247,7 @@ std::vector<torch::Tensor> deepseekAllreduceFusion(torch::Tensor input, torch::o
     }
     else
     {
-        return op.run(input, workspace, reduce_fusion_inputs, rank, nranks, eps, fusion_op);
+        return op.run(input, workspace, reduce_fusion_inputs, rank, nranks, eps, fusion_op, trigger_completion_at_end);
     }
 #else
     return std::vector<torch::Tensor>();
@@ -262,7 +264,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     // 2. scale_factor: only when fusion_op == RESIDUAL_RMS_NORM_QUANT_NVFP4
     m.def(
         "deepseek_allreduce_fusion(Tensor input, Tensor? workspace, Tensor[] reduce_fusion_inputs, "
-        "int rank, int nranks, float eps, int fusion_op) -> Tensor[]");
+        "int rank, int nranks, float eps, int fusion_op, bool trigger_completion_at_end) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
