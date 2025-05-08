@@ -70,7 +70,6 @@ def get_llm_args(model: str,
         "tensor_parallel_size": tensor_parallel_size,
         "pipeline_parallel_size": pipeline_parallel_size,
         "moe_expert_parallel_size": moe_expert_parallel_size,
-        "moe_cluster_parallel_size":
         "gpus_per_node": gpus_per_node,
         "trust_remote_code": trust_remote_code,
         "build_config": build_config,
@@ -202,14 +201,16 @@ def launch_server(host: str, port: int, llm_args: dict,
     default=None,
     help="Server role. Specify this value only if running in disaggregated mode."
 )
-def serve(
-        model: str, tokenizer: Optional[str], host: str, port: int,
-        log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
-        max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
-        ep_size: Optional[int], gpus_per_node: Optional[int],
-        kv_cache_free_gpu_memory_fraction: float, num_postprocess_workers: int,
-        trust_remote_code: bool, extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
-        metadata_server_config_file: Optional[str], server_role: Optional[str]):
+def serve(model: str, tokenizer: Optional[str], host: str, port: int,
+          log_level: str, backend: str, max_beam_width: int,
+          max_batch_size: int, max_num_tokens: int, max_seq_len: int,
+          tp_size: int, pp_size: int, ep_size: Optional[int],
+          cluster_size: Optional[int], gpus_per_node: Optional[int],
+          kv_cache_free_gpu_memory_fraction: float,
+          num_postprocess_workers: int, trust_remote_code: bool,
+          extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
+          metadata_server_config_file: Optional[str],
+          server_role: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -245,7 +246,7 @@ def serve(
 
     if metadata_server_cfg is not None:
         try:
-            server_role = ServerRole(server_role)
+            server_role = ServerRole[server_role.upper()]
         except ValueError:
             raise ValueError(f"Invalid server role: {server_role}. " \
                              f"Must be one of: {', '.join([role.name for role in ServerRole])}")
@@ -286,10 +287,18 @@ def get_ctx_gen_server_urls(
               type=int,
               default=180,
               help="Request timeout")
+@click.option("-l",
+              '--log_level',
+              type=click.Choice(severity_map.keys()),
+              default='info',
+              help="The logging level.")
 def disaggregated(config_file: Optional[str],
                   metadata_server_config_file: Optional[str],
-                  server_start_timeout: int, request_timeout: int):
+                  server_start_timeout: int, request_timeout: int,
+                  log_level: str):
     """Running server in disaggregated mode"""
+
+    logger.set_level(log_level)
 
     disagg_cfg = parse_disagg_config_file(config_file)
 
