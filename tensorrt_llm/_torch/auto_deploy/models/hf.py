@@ -17,6 +17,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoTokenizer,
+    PretrainedConfig,
 )
 from transformers.modeling_utils import load_sharded_checkpoint, load_state_dict
 
@@ -107,15 +108,46 @@ class AutoModelForCausalLMFactory(ModelFactory):
         """
         return type(model).forward(model, input_ids=input_ids, position_ids=position_ids)
 
+    def _recursive_update_config(self, config: PretrainedConfig, update_dict: Dict[str, Any]):
+        """
+        Recursively update a PretrainedConfig object with values from update_dict.
+
+        Args:
+            config: PretrainedConfig object to update
+            update_dict: Dictionary with values to update in the config
+
+        Returns:
+            The updated PretrainedConfig object
+        """
+        for key, value_new in update_dict.items():
+            # Check if the key exists in config
+            if not hasattr(config, key):
+                continue
+
+            target_value = getattr(config, key)
+
+            # Handle nested PretrainedConfig objects...
+            if isinstance(value_new, dict) and isinstance(target_value, PretrainedConfig):
+                # Recursively update nested configs
+                updated_value = self._recursive_update_config(target_value, value_new)
+                setattr(config, key, updated_value)
+            else:
+                # Direct update for simple values
+                setattr(config, key, value_new)
+
+        return config
+
     def build_model(self, device: DeviceLikeType) -> nn.Module:
         """Build the model on the desired device."""
         # We only support fp16 to fp4 conversion.
         if self._quant_config and self._quant_config.get("quant_algo", None) == "NVFP4":
             self.model_kwargs["torch_dtype"] = torch.half
 
-        model_config = self.autoconfig_from_pretrained(
-            self.model, trust_remote_code=True, **self.model_kwargs
-        )
+        # NOTE (lucaslie): HF doesn't recursively update nested PreTrainedConfig objects. Instead,
+        # the entire subconfig will be overwritten.
+        # we want to recursively update model_config from model_kwargs here.
+        model_config = self.autoconfig_from_pretrained(self.model, trust_remote_code=True)
+        model_config = self._recursive_update_config(model_config, self.model_kwargs)
 
         with (init_empty_weights if device == "meta" else nullcontext)():
             default_dtype = torch.get_default_dtype()
