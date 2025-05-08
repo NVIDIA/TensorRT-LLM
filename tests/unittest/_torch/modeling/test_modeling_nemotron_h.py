@@ -1,5 +1,4 @@
 import unittest
-from copy import deepcopy
 
 import torch
 
@@ -15,57 +14,13 @@ from tensorrt_llm._torch.models.modeling_nemotron_h import (NemotronHConfig,
 # isort: on
 from transformers import AutoTokenizer
 from utils.llm_data import llm_models_root
+from utils.util import skip_gpu_memory_less_than
 
 from tensorrt_llm._torch.pyexecutor.model_engine import load_weights
 from tensorrt_llm._torch.pyexecutor.resource_manager import \
     MambaHybridCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-
-NEMOTRON_H_CONFIG = {
-    "architectures": ["NemotronHForCausalLM"],
-    "attention_bias": False,
-    "attention_dropout": 0.0,
-    "attention_head_dim": 128,
-    "bos_token_id": 1,
-    "chunk_size": 256,
-    "conv_kernel": 4,
-    "eos_token_id": 2,
-    "expand": 2,
-    "hidden_dropout": 0.0,
-    "hidden_size": 4096,
-    "hybrid_override_pattern":
-    "M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-",
-    "initializer_range": 0.02,
-    "intermediate_size": 21504,
-    "layer_norm_epsilon": 1e-05,
-    "mamba_head_dim": 64,
-    "mamba_hidden_act": "silu",
-    "mamba_num_heads": 128,
-    "mamba_proj_bias": False,
-    "max_position_embeddings": 8192,
-    "mlp_bias": False,
-    "mlp_hidden_act": "relu2",
-    "model_type": "nemotron_h",
-    "n_groups": 8,
-    "num_attention_heads": 32,
-    "num_hidden_layers": 52,
-    "num_key_value_heads": 8,
-    "num_logits_to_keep": 1,
-    "pad_token_id": 0,
-    "rescale_prenorm_residual": True,
-    "residual_in_fp32": False,
-    "rms_norm_eps": 1e-05,
-    "sliding_window": None,
-    "ssm_state_size": 128,
-    "tie_word_embeddings": False,
-    "torch_dtype": "bfloat16",
-    "use_bias": False,
-    "use_cache": True,
-    "use_conv_bias": True,
-    "use_mamba_kernels": True,
-    "vocab_size": 131072
-}
 
 
 def get_logprobs(token_ids: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
@@ -77,16 +32,18 @@ def get_logprobs(token_ids: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
 
 class TestNemotronH(unittest.TestCase):
 
+    @skip_gpu_memory_less_than(
+        (2 * 8 + 1) * 2**30)  # 8B, bf16, plus 1 GB for good measure
     def test_nemotron_correctness(self):
-        config_dict = deepcopy(NEMOTRON_H_CONFIG)
-        nemotron_h_config = NemotronHConfig.from_dict(config_dict)
-
         model_dir = f"{llm_models_root(check=True)}/Nemotron-H-8B-Base-8K"
+        nemotron_h_config = NemotronHConfig.from_pretrained(model_dir)
 
         tokenizer = AutoTokenizer.from_pretrained(model_dir)
 
         dtype = nemotron_h_config.torch_dtype
         device = torch.device('cuda')
+        assert dtype == torch.bfloat16
+        kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
 
         model_config = ModelConfig(pretrained_config=nemotron_h_config)
         nemotron_h = NemotronHForCausalLM(model_config).to(device)
@@ -112,11 +69,6 @@ class TestNemotronH(unittest.TestCase):
         num_kv_heads = nemotron_h.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
         max_batch_size = 1
-
-        if dtype == torch.bfloat16:
-            kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
-        else:
-            raise ValueError("Invalid dtype")
 
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
