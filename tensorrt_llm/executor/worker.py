@@ -272,9 +272,34 @@ class ExecutorBindingsWorker(GenerationExecutor):
         return True  # success
 
     def dispatch_stats_task(self) -> bool:
-        return self._iteration_result_task(
-            self.stats_queues, self.engine.get_latest_iteration_stats,
-            self._iter_stats_result, lambda x: x.to_json_str())
+
+        # Define a Callable to join iteration and request stats
+        def stats_serializer(
+                stats: Tuple[tllm.IterationStats, tllm.RequestStats]) -> str:
+            iteration_stats, req_stats = stats
+            stats_dict = json.loads(iteration_stats.to_json_str())
+
+            if req_stats is not None and len(req_stats) > 0:
+                stats_dict["requestStats"] = []
+                for req_stat in req_stats:
+                    stats_dict["requestStats"].append(
+                        json.loads(req_stat.to_json_str()))
+
+            # Convert back to JSON string
+            return json.dumps(stats_dict)
+
+        def get_stats():
+            if isinstance(self.engine, tllm.Executor):
+                iter_stats = self.engine.get_latest_iteration_stats()
+                #TODO: Support req stats with TRT engine
+                #      This would require ensuring iter and req stats have same size
+                return [(iter_stat, None) for iter_stat in iter_stats]
+            else:
+                return self.engine.get_latest_iteration_stats()
+
+        return self._iteration_result_task(self.stats_queues, get_stats,
+                                           self._iter_stats_result,
+                                           stats_serializer)
 
     def dispatch_kv_cache_events_task(self) -> bool:
         if isinstance(self.engine, tllm.Executor):
