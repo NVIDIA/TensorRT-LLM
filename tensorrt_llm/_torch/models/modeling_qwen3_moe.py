@@ -261,6 +261,8 @@ class Qwen3MoeForCausalLM(DecoderModelForCausalLM[Qwen3MoEModel,
 
     def load_weights(self, weights: Dict):
         tp_size = self.model_config.mapping.tp_size
+        enable_attention_dp = self.model_config.mapping.enable_attention_dp
+
         head_dim = getattr(
             self.config, "head_dim",
             self.config.hidden_size // self.config.num_attention_heads)
@@ -299,7 +301,8 @@ class Qwen3MoeForCausalLM(DecoderModelForCausalLM[Qwen3MoEModel,
                                 k: (duplicate_kv_weight(
                                     weight=v[:],
                                     head_dim=head_dim,
-                                    tensor_parallel_size=tp_size)
+                                    tensor_parallel_size=tp_size
+                                    if not enable_attention_dp else 1)
                                     if k in tensors_need_duplication else v)
                                 for k, v in fw.items()
                             }
