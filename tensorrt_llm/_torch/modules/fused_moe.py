@@ -1,7 +1,7 @@
 import math
 import os
-from enum import Enum
 import threading
+from enum import Enum
 from typing import Dict, List, NamedTuple, Optional, Union
 
 import torch
