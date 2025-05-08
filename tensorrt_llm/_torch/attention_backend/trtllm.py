@@ -1,3 +1,4 @@
+import weakref
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -7,6 +8,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..utils import get_global_attrs, get_model_extra_attrs
 from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
                         AttentionMetadata, KVCacheParams, MLAParams,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
@@ -531,7 +533,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 )
 
     def prepare(self) -> None:
-
+        extra_attrs = get_model_extra_attrs()
+        # If model extra attrs is set, attention_metadata is setup in executor.
+        if extra_attrs is None:
+            get_global_attrs().attention_metadata = weakref.ref(self)
         if self.kv_cache_manager is None:
             # Convert the attention metadata to a TRT-LLM no cache attention metadata.
             assert self.kv_cache_manager is None, "no cache attention should not have KV cache manager"
@@ -725,7 +730,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.has_fp8_qdq = self.quant_config.layer_quant_mode.has_fp8_qdq()
             self.has_fp8_block_wise = self.quant_config.layer_quant_mode.has_fp8_block_scales(
             )
-            self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
             self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
 
     def get_local_layer_idx(self, metadata: TrtllmAttentionMetadata) -> int:

@@ -8,6 +8,7 @@ import math
 import multiprocessing
 import os
 import traceback
+import weakref
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -44,7 +45,8 @@ from ..models import AutoModelForCausalLM
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      timing)
 from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
-from ..utils import set_torch_compiling, with_model_extra_attrs
+from ..utils import (get_model_extra_attrs, set_torch_compiling,
+                     with_model_extra_attrs)
 from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
 from .cuda_graph_runner import DecodingCUDAGraphRunner
@@ -586,6 +588,8 @@ class PyTorchModelEngine(ModelEngine):
 
                 # Disable cuda graph capture here so that we can properly capture it later
                 with no_cuda_graph():
+                    available_tokens = kv_cache_manager.get_num_available_tokens(
+                        self.max_draft_len)
                     warmup_batch_size = [1, self.batch_size // 2]
                     if self.batch_size < 2:
                         warmup_batch_size = [1]
@@ -593,7 +597,7 @@ class PyTorchModelEngine(ModelEngine):
                         for num_tokens_per_request in [
                                 1,
                                 min(self.max_num_tokens // max(bs, 1),
-                                    self.max_seq_len - 1)
+                                    min(available_tokens, self.max_seq_len - 1))
                         ]:
                             with release_batch(
                                     get_torch_compile_warmup_request(
@@ -614,8 +618,11 @@ class PyTorchModelEngine(ModelEngine):
 
             if self.pytorch_backend_config.autotuner_enabled:
                 with no_cuda_graph(), autotune():
-                    num_tokens_per_request = min(self.max_seq_len - 1,
-                                                 self.max_num_tokens)
+                    available_tokens = kv_cache_manager.get_num_available_tokens(
+                        self.max_draft_len)
+                    num_tokens_per_request = min(
+                        min(available_tokens, self.max_seq_len - 1),
+                        self.max_num_tokens)
                     with release_batch(
                             get_torch_compile_warmup_request(
                                 1, num_tokens_per_request)) as batch:
@@ -1909,6 +1916,11 @@ class PyTorchModelEngine(ModelEngine):
             return outputs
 
     def model_forward(self, **kwargs):
+        attrs = get_model_extra_attrs()
+        assert attrs is not None, "Model extra attrs is not set"
+        attrs["attention_metadata"] = weakref.ref(kwargs['attn_metadata'])
+        attrs.update(self.model.model_config.extra_attrs)
+
         if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
             return trace_func(self.model.forward)(**kwargs)
         else:
