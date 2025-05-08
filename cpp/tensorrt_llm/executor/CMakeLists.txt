@@ -40,6 +40,7 @@ set(SRCS
     peftCacheConfig.cpp
     promptTuningConfig.cpp
     mropeConfig.cpp
+    multimodalInput.cpp
     request.cpp
     requestUtils.cpp
     requestWithId.cpp
