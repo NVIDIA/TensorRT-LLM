@@ -202,6 +202,48 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
+class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-4-Maverick-17B-128E-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Maverick-17B-128E-Instruct"
+
+    @pytest.mark.skip_less_device(8)
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
+                                                         (8, 1, 8)],
+                             ids=["tp8", "tp8ep4", "tp8ep8"])
+    def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 use_cuda_graph=cuda_graph) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct"
+
+    @pytest.mark.skip_less_device(8)
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
+                                                         (8, 1, 8)],
+                             ids=["tp8", "tp8ep4", "tp8ep8"])
+    def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 use_cuda_graph=cuda_graph) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestMistral7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-7B-v0.1"
     MODEL_PATH = f"{llm_models_root()}/mistral-7b-v0.1"
@@ -557,6 +599,50 @@ class TestNemotronNas(LlmapiAccuracyTestHarness):
                  pytorch_backend_config=pytorch_config) as llm:
 
             task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestNemotronSuper(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Llama-3_3-Nemotron-Super-49B-v1"
+    MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1"
+
+    @pytest.mark.skip_less_device(2)
+    def test_auto_dtype_tp2(self):
+        with LLM(self.MODEL_PATH, tensor_parallel_size=2) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+
+
+class TestNemotronNano(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Llama-3.1-Nemotron-Nano-8B-v1"
+    MODEL_PATH = f"{llm_models_root()}/Llama-3.1-Nemotron-Nano-8B-v1"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestNemotronH(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nemotron-H-8B-Base-8K"
+    MODEL_PATH = f"{llm_models_root()}/Nemotron-H-8B-Base-8K"
+
+    @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5264431")
+    def test_auto_dtype(self):
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
 
