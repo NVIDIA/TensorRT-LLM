@@ -634,7 +634,24 @@ class LLM:
         if hasattr(
                 self.args, "backend"
         ) and self.args.backend == "pytorch" and self.args.lora_config is not None:
-            tokenizer_path = self.args.lora_config.lora_dir[0]
+            num_lora_dirs = len(self.args.lora_config.lora_dir)
+            if num_lora_dirs == 1:
+                tokenizer_path = self.args.lora_config.lora_dir[0]
+                try:
+                    tokenizer = ModelLoader.load_hf_tokenizer(
+                        tokenizer_path,
+                        trust_remote_code=self.args.trust_remote_code,
+                        use_fast=self.args.tokenizer_mode != 'slow')
+                    return tokenizer
+                except Exception:
+                    tokenizer_path = self.args.model
+            elif num_lora_dirs > 1:
+                # TODO smor- currently not supported, need to determine which tokenizer to use, if possible
+                raise ValueError(
+                    f"Expecting only a single lora dir, but got {num_lora_dirs}"
+                )
+            else:
+                tokenizer_path = self.args.model
         else:
             tokenizer_path = self.args.model
         return ModelLoader.load_hf_tokenizer(
