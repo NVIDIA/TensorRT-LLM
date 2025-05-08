@@ -1024,6 +1024,9 @@ pipeline {
                             }
                         }
                     } else {
+                        // globalVars[CACHED_CHANGED_FILE_LIST] is only used in setupPipelineEnvironment
+                        // Reset it to null to workaround the "Argument list too long" error
+                        globalVars[CACHED_CHANGED_FILE_LIST] = null
                         launchStages(this, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
