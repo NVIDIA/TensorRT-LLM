@@ -10,6 +10,7 @@ from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse, PyResult
 from tensorrt_llm.bindings.executor import Response, Result
+from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.llm_utils import BuildConfig, KvCacheConfig
 
 prompts = ["A B C"]
@@ -30,7 +31,7 @@ def test_LlmResponse_pickle():
                          return_generation_logits=True)
     context_logits = torch.randn([1, 1, 128], device='cuda')
     generation_logits = torch.randn([1, 1, 128], device='cuda')
-    logprobs = [[0.8]]
+    logprobs = [[{1: Logprob(0.8, 1)}]]
     py_result.append_context_logits(context_logits)
     py_result.append_generation_logits(generation_logits)
     py_result.append_log_probs(logprobs)
@@ -68,7 +69,6 @@ def test_generate_with_return_logits(gather_context_logits: bool,
         pytest.skip("gather_context_logits unimplemented yet")
 
     build_config = BuildConfig()
-    build_config.max_batch_size = 128  # reduce buffer sizes, specially for generation logits
     build_config.gather_context_logits = gather_context_logits
 
     llm = LLM(
@@ -77,6 +77,8 @@ def test_generate_with_return_logits(gather_context_logits: bool,
         kv_cache_config=global_kvcache_config,
         build_config=build_config,
         gather_generation_logits=gather_generation_logits,
+        max_batch_size=
+        128,  # reduce buffer sizes, specially for generation logits
     )
     sampling_params = SamplingParams(
         max_tokens=8,
@@ -121,7 +123,6 @@ def test_generate_async_with_return_logits(gather_context_logits: bool,
         pytest.skip("gather_context_logits unimplemented yet")
 
     build_config = BuildConfig()
-    build_config.max_batch_size = 128  # reduce buffer sizes, specially for generation logits
     build_config.gather_context_logits = gather_context_logits
 
     llm = LLM(
@@ -130,6 +131,8 @@ def test_generate_async_with_return_logits(gather_context_logits: bool,
         kv_cache_config=global_kvcache_config,
         build_config=build_config,
         gather_generation_logits=gather_generation_logits,
+        max_batch_size=
+        128,  # reduce buffer sizes, specially for generation logits
     )
     sampling_params = SamplingParams(
         max_tokens=8,

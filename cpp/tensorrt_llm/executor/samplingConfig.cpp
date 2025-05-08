@@ -113,12 +113,6 @@ std::optional<RandomSeedType> SamplingConfig::getSeed() const
     return mSeed;
 }
 
-std::optional<RandomSeedType> SamplingConfig::getRandomSeed() const
-{
-    TLLM_LOG_WARNING("getRandomSeed is being deprecated; please use getSeed instead.");
-    return mSeed;
-}
-
 OptFloat SamplingConfig::getTemperature() const
 {
     return mTemperature;
@@ -126,12 +120,6 @@ OptFloat SamplingConfig::getTemperature() const
 
 OptSize32 SamplingConfig::getMinTokens() const
 {
-    return mMinTokens;
-}
-
-OptSize32 SamplingConfig::getMinLength() const
-{
-    TLLM_LOG_WARNING("getMinLength is being deprecated; please use getMinTokens instead.");
     return mMinTokens;
 }
 
@@ -222,12 +210,6 @@ void SamplingConfig::setSeed(std::optional<RandomSeedType> const& seed)
     mSeed = seed;
 }
 
-void SamplingConfig::setRandomSeed(std::optional<RandomSeedType> const& randomSeed)
-{
-    TLLM_LOG_WARNING("setRandomSeed is being deprecated; please use setSeed instead.");
-    mSeed = randomSeed;
-}
-
 void SamplingConfig::setTemperature(OptFloat const& temperature)
 {
     mTemperature = checkTemperature(temperature);
@@ -236,12 +218,6 @@ void SamplingConfig::setTemperature(OptFloat const& temperature)
 void SamplingConfig::setMinTokens(OptSize32 const& minTokens)
 {
     mMinTokens = checkMinTokens(minTokens);
-}
-
-void SamplingConfig::setMinLength(OptSize32 const& minLength)
-{
-    TLLM_LOG_WARNING("setMinLength is being deprecated; please use setMinTokens instead.");
-    mMinTokens = checkMinTokens(minLength);
 }
 
 void SamplingConfig::setBeamSearchDiversityRate(OptFloat const& beamSearchDiversityRate)
