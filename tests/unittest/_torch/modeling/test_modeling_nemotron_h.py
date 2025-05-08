@@ -13,6 +13,10 @@ from tensorrt_llm._torch.models.modeling_nemotron_h import (NemotronHConfig,
                                                             NemotronHForCausalLM
                                                             )
 # isort: on
+from transformers import AutoTokenizer
+from utils.llm_data import llm_models_root
+
+from tensorrt_llm._torch.pyexecutor.model_engine import load_weights
 from tensorrt_llm._torch.pyexecutor.resource_manager import \
     MambaHybridCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -64,11 +68,22 @@ NEMOTRON_H_CONFIG = {
 }
 
 
+def get_logprobs(token_ids: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+    raw_probs = torch.softmax(logits, dim=-1)
+    index = token_ids.unsqueeze(1).cuda()
+    token_probs = torch.gather(raw_probs, dim=1, index=index).squeeze(-1)
+    return torch.log(token_probs)
+
+
 class TestNemotronH(unittest.TestCase):
 
-    def test_nemotron_h_sanity(self):
+    def test_nemotron_correctness(self):
         config_dict = deepcopy(NEMOTRON_H_CONFIG)
         nemotron_h_config = NemotronHConfig.from_dict(config_dict)
+
+        model_dir = f"{llm_models_root(check=True)}/Nemotron-H-8B-Base-8K"
+
+        tokenizer = AutoTokenizer.from_pretrained(model_dir)
 
         dtype = nemotron_h_config.torch_dtype
         device = torch.device('cuda')
@@ -76,17 +91,18 @@ class TestNemotronH(unittest.TestCase):
         model_config = ModelConfig(pretrained_config=nemotron_h_config)
         nemotron_h = NemotronHForCausalLM(model_config).to(device)
 
-        input_ids = torch.tensor([100, 200, 300, 100, 200, 100, 400, 500],
-                                 dtype=torch.int,
+        weights = load_weights(model_dir)
+        nemotron_h.load_weights(weights)
+
+        # These tokens are from the sentence: The future of AI is
+        input_ids = torch.tensor([1784, 7147, 1307, 26554, 1395],
+                                 dtype=torch.int64,
                                  device=device)
 
-        context_sequence_lengths = [3, 2, 1]
-        sequence_lengths = context_sequence_lengths + [1, 1]
-        past_seen_tokens = [0, 0, 0, 62, 75]
-        request_ids = list(range(len(sequence_lengths)))
-        token_nums = (torch.tensor(past_seen_tokens) +
-                      torch.tensor(sequence_lengths)).tolist()
-        prompt_lens = token_nums[:3] + past_seen_tokens[3:]
+        num_cached_tokens_per_seq = [0]
+        request_ids = [1]
+        token_nums = [input_ids.size(-1)]
+        prompt_lens = [input_ids.size(-1)]
 
         num_blocks = 100
         tokens_per_block = 128
@@ -95,7 +111,7 @@ class TestNemotronH(unittest.TestCase):
         mamba_num_layers = nemotron_h.config.hybrid_override_pattern.count("M")
         num_kv_heads = nemotron_h.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
-        batch_size = len(context_sequence_lengths) + 2
+        max_batch_size = 1
 
         if dtype == torch.bfloat16:
             kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
@@ -124,7 +140,7 @@ class TestNemotronH(unittest.TestCase):
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
-            max_batch_size=batch_size,
+            max_batch_size=max_batch_size,
             mapping=mapping,
             dtype=kv_cache_dtype,
             num_extra_kv_tokens=0,
@@ -134,44 +150,196 @@ class TestNemotronH(unittest.TestCase):
 
         metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
         attn_metadata = metadata_cls(
-            seq_lens=torch.tensor(sequence_lengths, dtype=torch.int),
-            num_contexts=len(context_sequence_lengths),
+            seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
+            num_contexts=1,
             kv_cache_params=KVCacheParams(
                 use_cache=True,
-                num_cached_tokens_per_seq=past_seen_tokens,
+                num_cached_tokens_per_seq=num_cached_tokens_per_seq,
             ),
+            max_num_requests=1,
+            max_num_tokens=8192,
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
             prompt_lens=prompt_lens,
-            max_num_requests=len(context_sequence_lengths) + 2,
-            max_num_tokens=8192,
         )
 
-        position_ids = []
-        for i, tokens in enumerate(past_seen_tokens):
-            seq_len = context_sequence_lengths[i] if i < len(
-                context_sequence_lengths) else 1
-            position_id = torch.arange(tokens,
-                                       tokens + seq_len,
-                                       device=input_ids.device)
-            position_ids.append(position_id)
-
-        position_ids = torch.cat(position_ids).unsqueeze(0)
-
-        with torch.inference_mode():
-            attn_metadata.prepare()
-            logits = nemotron_h.forward(input_ids=input_ids,
-                                        position_ids=position_ids,
-                                        attn_metadata=attn_metadata)
-
-        self.assertEqual(len(past_seen_tokens), logits.shape[0])
-
+        # prefill
+        position_ids = [torch.arange(0, input_ids.size(-1))]
+        position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
         with torch.inference_mode():
             attn_metadata.prepare()
             logits = nemotron_h.forward(input_ids=input_ids,
                                         position_ids=position_ids,
                                         attn_metadata=attn_metadata,
                                         return_context_logits=True)
-        self.assertEqual(input_ids.shape, logits.shape[:-1])
+
+        # compute logprobs from logits
+        prefill_logprobs = get_logprobs(input_ids[1:], logits)
+
+        # reference logprobs from mcore
+        prefill_logprobs_ref = torch.tensor([
+            -7.415980815887451, -0.36192911863327026, -2.8658294677734375,
+            -2.316344738006592
+        ],
+                                            device=device)
+
+        # reference logprobs from initial implementation
+        prefill_logprobs_ref_initial = torch.tensor([
+            -7.4359540939331055, -0.37661877274513245, -2.8925108909606934,
+            -2.268364906311035
+        ],
+                                                    device=device)
+
+        # compare logprobs with mcore logprobs, check that the max error is less than 0.3
+        torch.testing.assert_close(prefill_logprobs,
+                                   prefill_logprobs_ref,
+                                   atol=0.3,
+                                   rtol=0.0)
+
+        # compare logprobs with initial implementation, check that the max error is less than 0.1
+        torch.testing.assert_close(prefill_logprobs,
+                                   prefill_logprobs_ref_initial,
+                                   atol=0.1,
+                                   rtol=0.0)
+
+        print("#" * 40 + " prefill logprobs error " + "#" * 40)
+        print("            prefill_logprobs:", prefill_logprobs.cpu().numpy())
+        print("        prefill_logprobs_ref:",
+              prefill_logprobs_ref.cpu().numpy())
+        print("prefill_logprobs_ref_initial:",
+              prefill_logprobs_ref_initial.cpu().numpy())
+        print(
+            f"  max error mcore: {torch.max(torch.abs(prefill_logprobs - prefill_logprobs_ref)).item():.5f}"
+        )
+        print(
+            f"max error initial: {torch.max(torch.abs(prefill_logprobs - prefill_logprobs_ref_initial)).item():.5f}"
+        )
+        print()
+
+        # output tokens
+        output = []
+        decode_logprobs = []
+
+        # sample token greedily
+        sampled_tokens = torch.argmax(logits[-1]).unsqueeze(0)
+        output.append(sampled_tokens)
+
+        decode_logprobs.append(get_logprobs(sampled_tokens, logits[-1:]))
+
+        # generate 8 more tokens
+        max_tokens = 8
+        for i in range(max_tokens):
+
+            num_cached_tokens_per_seq = input_ids.shape[0] + i + 1
+
+            attn_metadata = metadata_cls(
+                seq_lens=torch.tensor([1], dtype=torch.int),
+                num_contexts=0,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True,
+                    num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+                ),
+                max_num_requests=1,
+                max_num_tokens=8192,
+                kv_cache_manager=kv_cache_manager,
+                request_ids=request_ids,
+                prompt_lens=prompt_lens,
+            )
+
+            with torch.inference_mode():
+                attn_metadata.prepare()
+                logits = nemotron_h.forward(input_ids=sampled_tokens,
+                                            position_ids=position_ids,
+                                            attn_metadata=attn_metadata)
+
+            sampled_tokens = torch.argmax(logits).unsqueeze(0)
+            output.append(sampled_tokens)
+
+            decode_logprobs.append(get_logprobs(sampled_tokens, logits))
+
+        output = torch.cat(output)
+        decode_logprobs = torch.cat(decode_logprobs)
+        completion = tokenizer.decode(output)
+
+        decode_logprobs_ref_initial = torch.tensor([
+            -2.2722280025482178, -0.5235245823860168, -0.8821321725845337,
+            -1.9436249732971191, -0.07366813719272614, -0.4224405586719513,
+            -0.3872227966785431, -0.0612114779651165, -1.0475994348526
+        ],
+                                                   device=device)
+
+        self.assertEqual(
+            output.tolist(),
+            [18168, 1044, 1454, 58096, 32975, 1394, 32492, 1321, 6762])
+        self.assertEqual(
+            completion,
+            " bright, with endless possibilities for innovation and growth")
+
+        # compare logprobs with initial implementation, check that the max error is less than 0.1
+        torch.testing.assert_close(decode_logprobs,
+                                   decode_logprobs_ref_initial,
+                                   atol=0.1,
+                                   rtol=0.0)
+
+        print("#" * 40 + " completion " + "#" * 40)
+        print("completion ids:", output.tolist())
+        print("sequence:", f"The future of AI is{completion}")
+        print("            decode_logprobs:", decode_logprobs.cpu().numpy())
+        print("decode_logprobs_ref_initial:",
+              decode_logprobs_ref_initial.cpu().numpy())
+        print(
+            f"max decode error initial: {torch.max(torch.abs(decode_logprobs - decode_logprobs_ref_initial)).item():.5f}"
+        )
+        print()
+
+        # now let's test that decodes match prefill logprobs
+
+        input_ids = torch.cat([input_ids, output])
+        prefill_decode_logprobs = torch.cat([prefill_logprobs, decode_logprobs])
+        num_cached_tokens_per_seq = [0]
+        request_ids = [1]
+        prompt_lens = [input_ids.size(-1)]
+
+        attn_metadata = metadata_cls(
+            seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
+            num_contexts=1,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+            ),
+            max_num_requests=1,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=prompt_lens,
+        )
+
+        # prefill
+        position_ids = [torch.arange(0, input_ids.size(-1))]
+        position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
+        with torch.inference_mode():
+            attn_metadata.prepare()
+            logits = nemotron_h.forward(input_ids=input_ids,
+                                        position_ids=position_ids,
+                                        attn_metadata=attn_metadata,
+                                        return_context_logits=True)
+
+        # compute logprobs from logits
+        full_sequence_prefill_logprobs = get_logprobs(input_ids[1:], logits)
+
+        # compare full sequence prefill logprobs with prefill + decode logprobs, check that the max error is less than 0.3
+        torch.testing.assert_close(full_sequence_prefill_logprobs,
+                                   prefill_decode_logprobs,
+                                   atol=0.3,
+                                   rtol=0.0)
+
+        print("#" * 40 + " prefill vs decode logprobs " + "#" * 40)
+        print("full_sequence_prefill_logprobs:",
+              full_sequence_prefill_logprobs.cpu().numpy())
+        print("       prefill_decode_logprobs:",
+              prefill_decode_logprobs.cpu().numpy())
+        print(
+            f"max error: {torch.max(torch.abs(full_sequence_prefill_logprobs - prefill_decode_logprobs)).item():.5f}"
+        )
 
         kv_cache_manager.shutdown()
