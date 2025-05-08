@@ -64,7 +64,7 @@ public:
     //! @returns workspace needed for this layer in bytes
     [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
 
-    void print(int const lineNumber) const noexcept;
+    void print(char const* functionName, int const lineNumber) const noexcept;
 
 private:
     void forwardSyncCPU(std::shared_ptr<LookaheadDecodingOutputs> const& outputs,

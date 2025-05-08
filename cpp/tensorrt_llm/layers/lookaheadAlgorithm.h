@@ -80,7 +80,7 @@ public:
         TensorPtr const& tokens, TensorPtr const& posIds, TensorPtr const& masks, TensorPtr const& encodeMap);
 
     //! @brief print content of the LookaheadAlgorithm
-    void print() const noexcept;
+    void print(char const* functionName, int const lineNumber) const noexcept;
 
 private:
     //! @brief generate lookahead branch information.
