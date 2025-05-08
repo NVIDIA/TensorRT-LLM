@@ -755,16 +755,20 @@ class FusedMoE(nn.Module):
 
         if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
         ) and not self.enable_alltoall:
+            # Fp4 gemm has extra scaling factor
             x_sf, token_selected_experts, token_final_scales = self.all_gather(
                 [x_sf, token_selected_experts, token_final_scales])
             x = allgather(x, self.mapping, gather_dim=0)
-            token_selected_experts = token_selected_experts.flatten(
-                0, 1).contiguous()
-            token_final_scales = token_final_scales.flatten(0, 1).contiguous()
-
             if x_sf is not None:
                 x_sf = reswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
+
+            # llama4 token final scales are already multiplied with input x
+            if not self.apply_router_weight_on_input:
+                token_final_scales = token_final_scales.flatten(0,
+                                                                1).contiguous()
+            token_selected_experts = token_selected_experts.flatten(
+                0, 1).contiguous()
 
         if self.smart_router and not cutlass_min_latency_mode:
             ep_size = self.cluster_size
@@ -865,6 +869,7 @@ class FusedMoE(nn.Module):
                 max_chunk_size //= len(all_rank_num_tokens)
 
         num_rows = x.shape[0]
+        # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
         num_chunks = (num_rows + max_chunk_size - 1) // max_chunk_size
 
         if cutlass_min_latency_mode:
@@ -1174,19 +1179,15 @@ class FusedMoE(nn.Module):
                 w1_w3_weight = weights["gate_up_proj"][expert_id].transpose(
                     0, 1)
                 w1_weight, w3_weight = w1_w3_weight.chunk(2, dim=0)
-                w2_weight = weights["down_proj"][expert_id].transpose(0, 1)
+                w2_weight = weights["down_proj"][expert_id].transpose(
+                    0, 1).contiguous()
             else:
                 raise NotImplementedError(
                     f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
                 )
 
-            # TODO: remove w1, w3 swap when kernel is ready
-            if self.is_trtllm() and self.quant_config.quant_mode.has_nvfp4():
-                is_trtllm_nvfp4 = True
-                w1_weight, w3_weight = w3_weight, w1_weight
-            else:
-                is_trtllm_nvfp4 = False
-
+            is_trtllm_nvfp4 = self.is_trtllm(
+            ) and self.quant_config.quant_mode.has_nvfp4()
             load_expert_w3_w1_weight(w1_weight, w3_weight,
                                      self.w3_w1_weight.data[expert_idx],
                                      is_trtllm_nvfp4)
@@ -1489,18 +1490,29 @@ class FusedMoE(nn.Module):
                                (final_fc2_input_scale * w2_weight_scale_2))
 
         for expert_id in range(self.expert_start, self.expert_end):
-            w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
-            w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
-            w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
-            w1_weight_scale_2 = weights[f"{expert_id}.w1.weight_scale_2"]
-            w3_weight_scale_2 = weights[f"{expert_id}.w3.weight_scale_2"]
-            w2_weight_scale_2 = weights[f"{expert_id}.w2.weight_scale_2"]
+            if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
+                w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
+                w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
+                w1_weight_scale_2 = weights[f"{expert_id}.w1.weight_scale_2"]
+                w3_weight_scale_2 = weights[f"{expert_id}.w3.weight_scale_2"]
+                w2_weight_scale_2 = weights[f"{expert_id}.w2.weight_scale_2"]
+            elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                w1_w3_weight_scale = weights["gate_up_proj_weight_scale"][
+                    expert_id].transpose(0, 1).contiguous()
+                w1_weight_scale, w3_weight_scale = w1_w3_weight_scale.chunk(
+                    2, dim=0)
+                w2_weight_scale = weights["down_proj_weight_scale"][
+                    expert_id].transpose(0, 1).contiguous()
+                w1_weight_scale_2 = weights["gate_up_proj_weight_scale_2"]
+                w3_weight_scale_2 = weights["gate_up_proj_weight_scale_2"]
+                w2_weight_scale_2 = weights["down_proj_weight_scale_2"]
+            else:
+                raise NotImplementedError(
+                    f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
+                )
 
             expert_idx = expert_id - self.expert_start
-
-            # TODO: remove w1, w3 swap
-            if self.is_trtllm():
-                w1_weight_scale, w3_weight_scale = w3_weight_scale, w1_weight_scale
 
             load_expert_w3_w1_weight_scale_nvfp4(
                 w1_weight_scale, w3_weight_scale,
