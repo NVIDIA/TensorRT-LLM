@@ -54,7 +54,7 @@ from ..modules.fused_moe import BaseMoeRoutingMethod, FusedMoE
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
-from ..modules.rms_norm import RMSNorm
+from ..modules.rms_norm import GroupRMSNorm
 from ..pipeline_interface import PipelineInterface
 from ..speculative import MTPEagleWorker, MTPSpecMetadata, MTPWorker
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
@@ -126,9 +126,9 @@ class DeepseekV3MTPHead(nn.Module):
         super().__init__()
         config = model_config.pretrained_config
 
-        self.norm = RMSNorm(hidden_size=config.hidden_size,
-                            eps=config.rms_norm_eps,
-                            dtype=config.torch_dtype)
+        self.norm = GroupRMSNorm(hidden_size=config.hidden_size,
+                                 eps=config.rms_norm_eps,
+                                 dtype=config.torch_dtype)
 
     def forward(self, hidden_states: torch.Tensor, lm_head: Linear,
                 attn_metadata: AttentionMetadata) -> torch.Tensor:
@@ -597,22 +597,23 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                 overridden_tp_size=self.mlp_tp_size,
                                 reduce_output=True)
 
-        self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
-                                       eps=config.rms_norm_eps,
-                                       dtype=config.torch_dtype)
+        self.input_layernorm = GroupRMSNorm(hidden_size=config.hidden_size,
+                                            eps=config.rms_norm_eps,
+                                            dtype=config.torch_dtype)
 
         self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
                                        or self.fusion_config.PRE_MLP_FUSION
                                        or self.mapping.tp_size == 1
                                        or self.enable_attention_dp)
 
-        self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
-                                                eps=config.rms_norm_eps,
-                                                dtype=config.torch_dtype)
+        self.post_attention_layernorm = GroupRMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype)
         self.layer_idx = layer_idx
         self.allreduce = AllReduce(self.mapping)
         self.moe_allreduce = MoEAllReduce(self.mapping)
-        self.next_layer_layernorm: RMSNorm = None
+        self.next_layer_layernorm: GroupRMSNorm = None
 
     def _compute_mlp_tp_size(self, intermediate_size: int,
                              block_size: int) -> int:
@@ -833,13 +834,13 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         self.num_shared_experts = config.n_shared_experts
         self.top_k = config.num_experts_per_tok
 
-        self.enorm = RMSNorm(hidden_size=config.hidden_size,
-                             eps=config.rms_norm_eps,
-                             dtype=config.torch_dtype)
+        self.enorm = GroupRMSNorm(hidden_size=config.hidden_size,
+                                  eps=config.rms_norm_eps,
+                                  dtype=config.torch_dtype)
 
-        self.hnorm = RMSNorm(hidden_size=config.hidden_size,
-                             eps=config.rms_norm_eps,
-                             dtype=config.torch_dtype)
+        self.hnorm = GroupRMSNorm(hidden_size=config.hidden_size,
+                                  eps=config.rms_norm_eps,
+                                  dtype=config.torch_dtype)
 
         self.eh_proj = Linear(
             config.hidden_size * 2,
@@ -950,9 +951,9 @@ class DeepseekV3Model(DecoderModel):
                                    self.aux_stream_dict)
             for layer_idx in range(config.num_hidden_layers)
         ])
-        self.norm = RMSNorm(hidden_size=config.hidden_size,
-                            eps=config.rms_norm_eps,
-                            dtype=config.torch_dtype)
+        self.norm = GroupRMSNorm(hidden_size=config.hidden_size,
+                                 eps=config.rms_norm_eps,
+                                 dtype=config.torch_dtype)
 
     def forward(
         self,

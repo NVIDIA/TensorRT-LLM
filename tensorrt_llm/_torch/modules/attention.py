@@ -15,7 +15,7 @@ from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
-from .rms_norm import RMSNorm
+from .rms_norm import group_rms_norm
 from .rotary_embedding import RotaryEmbedding
 
 
@@ -312,7 +312,7 @@ class MLA(nn.Module):
         self.num_key_value_heads = (self.num_key_value_heads + tp_size -
                                     1) // tp_size
 
-        rms_norm_eps = config.pretrained_config.rms_norm_eps
+        self.rms_norm_eps = config.pretrained_config.rms_norm_eps
         quant_config = config.get_quant_config()
         self.quant_config = quant_config
 
@@ -325,10 +325,6 @@ class MLA(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 use_custom_cublas_mm=True)
-
-            self.q_a_layernorm = RMSNorm(hidden_size=self.q_lora_rank,
-                                         eps=rms_norm_eps,
-                                         dtype=dtype)
 
             self.q_b_proj = Linear(
                 self.q_lora_rank,
@@ -360,10 +356,6 @@ class MLA(nn.Module):
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
             )
             self.q_b_proj = self.q_proj
-
-        self.kv_a_layernorm = RMSNorm(hidden_size=kv_lora_rank,
-                                      dtype=dtype,
-                                      eps=rms_norm_eps)
 
         self.kv_b_proj = Linear(
             self.kv_lora_rank,
@@ -536,20 +528,16 @@ class MLA(nn.Module):
         if self.is_lite:
             compressed_kv, k_pe = self.fused_a(hidden_states).split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], -1)
-            compressed_kv = self.kv_a_layernorm(compressed_kv)
+            compressed_kv = group_rms_norm([compressed_kv],
+                                           eps=self.rms_norm_eps)[0]
             q = hidden_states
         else:
             q, compressed_kv, k_pe = self.fused_a(hidden_states).split(
                 [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
                 -1)
 
-            q, compressed_kv = maybe_execute_in_parallel(
-                lambda: self.q_a_layernorm(q),
-                lambda: self.kv_a_layernorm(compressed_kv),
-                self.ln_events[0],
-                self.ln_events[1],
-                self.aux_stream,
-            )
+            q, compressed_kv = group_rms_norm([q, compressed_kv],
+                                              eps=self.rms_norm_eps)
 
         q, latent_cache = maybe_execute_in_parallel(
             lambda: self.q_b_proj(q),
