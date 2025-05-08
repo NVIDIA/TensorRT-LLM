@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 import aiohttp
 import pytest
 import yaml
+from defs.conftest import skip_no_hopper
 from transformers import AutoTokenizer
 
 from tensorrt_llm import logger
@@ -17,8 +18,6 @@ from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
 from tensorrt_llm.serve.router import (KvCacheAwareRouter,
                                        KvCacheAwareServerState,
                                        block_key_hasher)
-
-MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
 
 def get_ctx_gen_server_urls_from_cfg(config_file: str):
@@ -184,15 +183,17 @@ class ConditionalWorkerTester(BasicWorkerTester):
                  ctx_servers: List[str],
                  gen_servers: List[str],
                  req_timeout_secs: int = 180,
-                 server_start_timeout_secs: int = 180):
+                 server_start_timeout_secs: int = 180,
+                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs)
+        self.model_name = model_name
 
     async def multi_round_request(self, session: aiohttp.ClientSession,
                                   init_prompt: str, max_rounds: int,
                                   threshold: float):
         request = {
-            "model": MODEL_NAME,
+            "model": self.model_name,
             "prompt": init_prompt,
             "max_tokens": 10,
             "temperature": 0.0,
@@ -234,10 +235,15 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
                  ctx_servers: List[str],
                  gen_servers: List[str],
                  req_timeout_secs: int = 180,
-                 server_start_timeout_secs: int = 180):
+                 server_start_timeout_secs: int = 180,
+                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                 model_path: Optional[str] = None):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs)
-        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        if model_path is None:
+            model_path = model_path(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.model_name = model_name
         self.kv_cache_block_maps: dict[str, KvCacheAwareServerState] = {}
         self.kv_cache_event_maps: dict[str, list[dict]] = {}
         for ctx_server in ctx_servers:
@@ -265,7 +271,7 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
                                   max_rounds: int,
                                   check_match_count: bool = True):
         request = {
-            "model": MODEL_NAME,
+            "model": self.model_name,
             "prompt": init_prompt,
             "max_tokens": 64,
             "temperature": 0.0,
@@ -345,11 +351,13 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
                  ctx_servers: List[str],
                  gen_servers: List[str],
                  req_timeout_secs: int = 180,
-                 server_start_timeout_secs: int = 180):
+                 server_start_timeout_secs: int = 180,
+                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs)
         self.ctx_router = KvCacheAwareRouter(ctx_servers)
         self.gen_router = KvCacheAwareRouter(gen_servers)
+        self.model_name = model_name
 
     async def multi_round_request(self,
                                   session: aiohttp.ClientSession,
@@ -357,7 +365,7 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
                                   max_rounds: int = 8,
                                   check_server_match: bool = True):
         request = {
-            "model": MODEL_NAME,
+            "model": self.model_name,
             "prompt": init_prompt,
             "max_tokens": 64,
             "temperature": 0.0,
@@ -368,7 +376,7 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
         gen_match = 0
         for i in range(max_rounds):
             openai_request = CompletionRequest(
-                model=MODEL_NAME,
+                model=self.model_name,
                 prompt=request["prompt"],
                 disaggregated_params=DisaggregatedParams(
                     request_type="context_only"))
@@ -420,7 +428,7 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
         async with await self.new_session() as session:
             # send a dummy request for initialization
             dummy_request = {
-                "model": MODEL_NAME,
+                "model": self.model_name,
                 "prompt": [3] * 100,
                 "max_tokens": 1,
                 "temperature": 0.0,
@@ -441,7 +449,7 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             logger.info(f"Block pool size: {block_pool_size}")
 
             # the dummy request can be reused
-            openai_request = CompletionRequest(model=MODEL_NAME,
+            openai_request = CompletionRequest(model=self.model_name,
                                                prompt=dummy_request["prompt"])
             server, info = await self.gen_router.get_next_server(openai_request)
             first_match = info["matches"][0]
@@ -559,6 +567,34 @@ def test_workers_kv_cache_aware_router(disaggregated_test_root,
         tester = KvCacheAwareRouterTester(ctx_servers, gen_servers)
         prompts = load_default_prompts(disaggregated_example_root)
         asyncio.run(tester.test_multi_round_request(prompts, 6, 4))
+
+
+@skip_no_hopper
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_workers_kv_cache_aware_router_deepseek_v3_lite_fp8(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    config_file = os.path.join(
+        disaggregated_test_root,
+        'test_configs/disagg_config_cache_aware_balance_deepseek_v3.yaml')
+    model_root = f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8"
+    src_dst_dict = {
+        deepseek_v3_model_root: model_root,
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    with background_workers(llm_venv, config_file,
+                            4) as (ctx_servers, gen_servers):
+        os.chdir(llm_venv.get_working_directory())
+        tester = KvCacheAwareRouterTester(ctx_servers,
+                                          gen_servers,
+                                          model_name="DeepSeek-V3-Lite/fp8")
+        prompts = load_default_prompts(disaggregated_example_root)
+        asyncio.run(tester.test_multi_round_request(prompts, 4, 4))
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
