@@ -1,17 +1,15 @@
 import asyncio
 import heapq
-import logging
 from abc import ABC, abstractmethod
 from typing import Dict, List, Union
 
 import aiohttp
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
+from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest)
-
-logger = logging.getLogger(__name__)
 
 
 def get_request_num_tokens(
@@ -129,7 +127,6 @@ class Router(ABC):
         await self.close_session()
 
     async def close_session(self):
-        """Close the HTTP session used for health checks"""
         if self._session:
             try:
                 await self._session.close()
@@ -140,7 +137,6 @@ class Router(ABC):
                 self._session = None
 
     async def _monitor_servers(self, poll_interval: int = 10):
-        """Monitor servers update from metadata service"""
         while True:
             try:
                 if self._metadata_server:
@@ -167,8 +163,7 @@ class Router(ABC):
                             logger.info(
                                 f"Updated {self._server_role} server list: {old_count} -> {new_count} servers"
                             )
-                            if logger.isEnabledFor(
-                                    logging.DEBUG) and self._servers:
+                            if logger.level == "debug" and self._servers:
                                 for server in self._servers:
                                     logger.debug(f"  - {server}")
                         else:
@@ -218,15 +213,6 @@ class Router(ABC):
         if not self._metadata_server:
             # Only use static servers if no metadata server
             return {server: "" for server in self._servers}
-
-        # Get ETCD server details if available
-        etcd_host = "unknown"
-        etcd_port = "unknown"
-        if hasattr(self._metadata_server, '_etcd_client'):
-            etcd_host = getattr(self._metadata_server._etcd_client, 'host',
-                                'unknown')
-            etcd_port = getattr(self._metadata_server._etcd_client, 'port',
-                                'unknown')
 
         # If metadata server is available, ignore static server list entirely
         server_key_map = {}

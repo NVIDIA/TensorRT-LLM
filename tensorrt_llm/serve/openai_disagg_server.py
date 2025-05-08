@@ -49,8 +49,8 @@ class OpenAIDisaggServer:
         self.ctx_server_idx = 0
         self.gen_server_idx = 0
         self.metadata_server = create_metadata_server(metadata_server_cfg)
-        self.ctx_router = create_router(ServerRole.CONTEXT, ctx_router_type, ctx_servers, self.metadata_server)
-        self.gen_router = create_router(ServerRole.GENERATION, gen_router_type, gen_servers, self.metadata_server)
+        self.ctx_router = create_router(ctx_router_type, ServerRole.CONTEXT, ctx_servers, self.metadata_server)
+        self.gen_router = create_router(gen_router_type, ServerRole.GENERATION, gen_servers, self.metadata_server)
 
 
         if (len(self.gen_servers) == 0):
