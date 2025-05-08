@@ -29,14 +29,15 @@ import tensorrt as trt
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
-from utils import (N_SAMPLES, MelFilterBankFeats, pad_or_trim, store_transcripts,
-                   write_error_stats)
+from utils import (N_SAMPLES, MelFilterBankFeats, pad_or_trim,
+                   store_transcripts, write_error_stats)
 
 import tensorrt_llm
 import tensorrt_llm.logger as logger
-from tensorrt_llm._utils import (str_dtype_to_torch, trt_dtype_to_torch)
+from tensorrt_llm._utils import str_dtype_to_torch, trt_dtype_to_torch
 from tensorrt_llm.bindings import KVCacheType
-from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelConfig, SamplingConfig
+from tensorrt_llm.runtime import (PYTHON_BINDINGS, ModelConfig, ModelRunnerCpp,
+                                  SamplingConfig)
 from tensorrt_llm.runtime.session import Session, TensorInfo
 
 if PYTHON_BINDINGS:
@@ -107,6 +108,13 @@ def remove_tensor_padding(input_tensor,
         # Concatenate all valid sequences along the batch dimension
         output_tensor = torch.cat(valid_sequences, dim=0)
     return output_tensor
+
+
+def unpack_tensors(input_tensors, input_tensor_lengths):
+    output_tensors = []
+    for i in range(len(input_tensors)):
+        output_tensors.append(input_tensors[i, :input_tensor_lengths[i]])
+    return output_tensors
 
 
 def read_config(component, engine_dir):
@@ -465,17 +473,20 @@ class CanaryDecoding:
                  runtime_mapping,
                  tokenizer,
                  debug_mode=False,
-                 device="cuda:0"):
+                 device="cuda:0",
+                 use_py_session=False):
         self.tokenizer = tokenizer
         self.decoder_config = read_config('decoder', engine_dir)
         self.prompt_format = self.decoder_config['prompt_format']
         self.tokenizer.set_prompt_format(self.prompt_format)
-        self.decoder_generation_session = self.get_session(
-            engine_dir, runtime_mapping, debug_mode)
         self.dtype = str_dtype_to_torch(self.decoder_config['dtype'])
         self.max_seq_len = self.decoder_config['max_seq_len']
         self.max_input_len = self.decoder_config['max_input_len']
         self.device = device
+        self.use_py_session = use_py_session
+
+        self.decoder_generation_session = self.get_session(
+            engine_dir, runtime_mapping, debug_mode, use_py_session)
 
     @staticmethod
     def get_x_attention_mask(lens, max_length):
@@ -485,7 +496,7 @@ class CanaryDecoding:
                                                                          None]
         return mask
 
-    def get_session(self, engine_dir, runtime_mapping, debug_mode=False):
+    def get_py_session(self, engine_dir, runtime_mapping, debug_mode=False):
         serialize_path = engine_dir / 'decoder' / 'rank0.engine'
         with open(serialize_path, "rb") as f:
             decoder_engine_buffer = f.read()
@@ -516,8 +527,31 @@ class CanaryDecoding:
             decoder_engine_buffer,
             runtime_mapping,
             debug_mode=debug_mode)
-
         return decoder_generation_session
+
+    def get_cpp_session(self, engine_dir, runtime_mapping, debug_mode=False):
+        runner_kwargs = dict(
+            engine_dir=os.path.join(engine_dir, 'decoder'),
+            is_enc_dec=False,
+            max_batch_size=self.decoder_config['max_batch_size'],
+            max_input_len=self.max_input_len,
+            max_output_len=self.max_seq_len - self.max_input_len,
+            max_beam_width=self.decoder_config['max_beam_width'],
+            debug_mode=debug_mode,
+            kv_cache_free_gpu_memory_fraction=0.9,
+            cross_kv_cache_fraction=0.5)
+        model_runner_cpp = ModelRunnerCpp.from_dir(**runner_kwargs)
+        return model_runner_cpp
+
+    def get_session(self,
+                    engine_dir,
+                    runtime_mapping,
+                    debug_mode=False,
+                    use_py_session=False):
+        if use_py_session:
+            return self.get_py_session(engine_dir, runtime_mapping, debug_mode)
+        else:
+            return self.get_cpp_session(engine_dir, runtime_mapping, debug_mode)
 
     def generate(self,
                  decoder_input_ids,
@@ -546,48 +580,74 @@ class CanaryDecoding:
                 f"max_new_tokens {max_new_tokens} is greater than max_seq_len {self.max_seq_len}, setting max_new_tokens to max_seq_len"
             )
             max_new_tokens = self.max_seq_len
-
-        cross_attention_mask = torch.ones([
-            batch_size, decoder_max_input_length + max_new_tokens,
-            encoder_max_input_length
-        ]).int().cuda()
-
-        # generation config
-        sampling_config = SamplingConfig(end_id=self.tokenizer.eos_id,
-                                         pad_id=self.tokenizer.pad_id,
-                                         num_beams=num_beams)
-        self.decoder_generation_session.setup(
-            decoder_input_lengths.size(0),
-            decoder_max_input_length,
-            max_new_tokens=max_new_tokens,
-            beam_width=num_beams,
-            encoder_max_input_length=encoder_max_input_length,
-        )
-
-        torch.cuda.synchronize()
+        max_new_tokens -= self.max_input_len
 
         decoder_input_ids = decoder_input_ids.type(torch.int32).cuda()
-        if self.decoder_config['plugin_config']['remove_input_padding']:
-            decoder_input_ids = remove_tensor_padding(
-                decoder_input_ids, pad_value=self.tokenizer.pad_id)
-            if encoder_outputs.dim() == 3:
-                encoder_input_lengths = torch.full((encoder_outputs.shape[0], ),
-                                                   encoder_max_input_length,
-                                                   dtype=torch.int32,
-                                                   device='cuda')
 
-                encoder_outputs = remove_tensor_padding(encoder_outputs,
-                                                        encoder_input_lengths)
+        if self.use_py_session:
+            cross_attention_mask = torch.ones([
+                batch_size, decoder_max_input_length + max_new_tokens,
+                encoder_max_input_length
+            ]).int().cuda()
+            if self.decoder_config['plugin_config']['remove_input_padding']:
+                decoder_input_ids = remove_tensor_padding(
+                    decoder_input_ids, pad_value=self.tokenizer.pad_id)
+                if encoder_outputs.dim() == 3:
+                    encoder_input_lengths = torch.full(
+                        (encoder_outputs.shape[0], ),
+                        encoder_max_input_length,
+                        dtype=torch.int32,
+                        device='cuda')
+                    encoder_outputs = remove_tensor_padding(
+                        encoder_outputs, encoder_input_lengths)
 
-        output_ids = self.decoder_generation_session.decode(
-            decoder_input_ids,
-            decoder_input_lengths,
-            sampling_config,
-            encoder_output=encoder_outputs,
-            encoder_input_lengths=encoder_input_lengths,
-            cross_attention_mask=cross_attention_mask,
-        )
-        torch.cuda.synchronize()
+            # generation config
+            sampling_config = SamplingConfig(end_id=self.tokenizer.eos_id,
+                                             pad_id=self.tokenizer.pad_id,
+                                             num_beams=num_beams)
+            self.decoder_generation_session.setup(
+                decoder_input_lengths.size(0),
+                decoder_max_input_length,
+                max_new_tokens=max_new_tokens,
+                beam_width=num_beams,
+                encoder_max_input_length=encoder_max_input_length,
+            )
+            torch.cuda.synchronize()
+            output_ids = self.decoder_generation_session.decode(
+                decoder_input_ids,
+                decoder_input_lengths,
+                sampling_config,
+                encoder_output=encoder_outputs,
+                encoder_input_lengths=encoder_input_lengths,
+                cross_attention_mask=cross_attention_mask,
+            )
+            torch.cuda.synchronize()
+        else:
+            cross_attention_masks = [
+                torch.ones([
+                    decoder_input_lengths[i] + max_new_tokens,
+                    encoder_input_lengths[i]
+                ],
+                           dtype=torch.bool,
+                           device='cuda') for i in range(batch_size)
+            ]
+            decoder_input_ids = unpack_tensors(decoder_input_ids,
+                                               decoder_input_lengths)
+            encoder_outputs = unpack_tensors(encoder_outputs,
+                                             encoder_input_lengths)
+            out = self.decoder_generation_session.generate(
+                batch_input_ids=decoder_input_ids,
+                encoder_input_features=encoder_outputs,
+                encoder_output_lengths=encoder_input_lengths,
+                cross_attention_masks=cross_attention_masks,
+                max_new_tokens=max_new_tokens,
+                end_id=self.tokenizer.eos_id,
+                pad_id=self.tokenizer.pad_id,
+                num_beams=num_beams,
+                output_sequence_lengths=True,
+                return_dict=True)
+            output_ids = out['output_ids']
+            out['sequence_lengths']
 
         # get the list of int from output_ids tensor
         output_ids = output_ids.cpu().numpy().tolist()
@@ -639,19 +699,13 @@ class CanaryTRTLLM(object):
                                                fs=sample_rate,
                                                preemp=preemp)
         self.tokenizer = CanaryTokenizer(engine_dir)
-
-        if not use_py_session:
-            print(
-                "Only Python session is supported for now. Setting use_py_session to True"
-            )
-            use_py_session = True
-        if use_py_session:
-            self.encoder = CanaryEncoder(engine_dir)
-            self.decoder = CanaryDecoding(engine_dir,
-                                          runtime_mapping,
-                                          tokenizer=self.tokenizer,
-                                          debug_mode=debug_mode,
-                                          device=self.device)
+        self.encoder = CanaryEncoder(engine_dir)
+        self.decoder = CanaryDecoding(engine_dir,
+                                      runtime_mapping,
+                                      tokenizer=self.tokenizer,
+                                      debug_mode=debug_mode,
+                                      device=self.device,
+                                      use_py_session=use_py_session)
 
         self.use_py_session = use_py_session
 
@@ -690,14 +744,13 @@ class CanaryTRTLLM(object):
         mel, mel_input_lengths = self.preprocessor.get_feats(
             audio, audio_input_lengths)
 
-        if self.use_py_session:
-            encoder_output, encoder_output_lengths = self.encoder.infer(
-                mel, mel_input_lengths, stream)
-            output_ids = self.decoder.generate(decoder_input_ids,
-                                               encoder_output,
-                                               encoder_output_lengths,
-                                               max_new_tokens=max_new_tokens,
-                                               num_beams=num_beams)
+        encoder_output, encoder_output_lengths = self.encoder.infer(
+            mel, mel_input_lengths, stream)
+        output_ids = self.decoder.generate(decoder_input_ids,
+                                           encoder_output,
+                                           encoder_output_lengths,
+                                           max_new_tokens=max_new_tokens,
+                                           num_beams=num_beams)
 
         texts = []
         for i in range(len(output_ids)):
@@ -896,8 +949,6 @@ def decode_dataset(model,
 
 if __name__ == '__main__':
     args = parse_arguments()
-
-    args.use_py_session = True
 
     tensorrt_llm.logger.set_level(args.log_level)
     model = CanaryTRTLLM(args.engine_dir,
