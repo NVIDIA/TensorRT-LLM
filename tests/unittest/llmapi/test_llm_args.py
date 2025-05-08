@@ -4,7 +4,6 @@ import yaml
 
 import tensorrt_llm.bindings.executor as tle
 from tensorrt_llm.llmapi.llm_args import *
-from tensorrt_llm.llmapi.llm_utils import *
 
 from .test_llm import llama_model_path
 
@@ -34,29 +33,6 @@ def test_LookaheadDecodingConfig():
     assert pybind_config.max_window_size == 4
     assert pybind_config.max_ngram_size == 3
     assert pybind_config.max_verification_set_size == 4
-
-
-def test_update_llm_args_with_extra_dict_with_speculative_config():
-    yaml_content = """
-speculative_config:
-  decoding_type: Lookahead
-  max_window_size: 4
-  max_ngram_size: 3
-  verification_set_size: 4
-"""
-    with tempfile.NamedTemporaryFile(delete=False) as f:
-        f.write(yaml_content.encode('utf-8'))
-        f.flush()
-        f.seek(0)
-        dict_content = yaml.safe_load(f)
-
-    llm_args = LlmArgs(llama_model_path)
-    llm_args_dict = update_llm_args_with_extra_dict(llm_args.to_dict(),
-                                                    dict_content)
-    llm_args = LlmArgs(**llm_args_dict)
-    assert llm_args.speculative_config.max_window_size == 4
-    assert llm_args.speculative_config.max_ngram_size == 3
-    assert llm_args.speculative_config.max_verification_set_size == 4
 
 
 def check_defaults(py_config_cls, pybind_config_cls):
@@ -173,3 +149,93 @@ def test_PeftCacheConfig_declaration():
     assert pybind_config.device_cache_percent == 0.5
     assert pybind_config.host_cache_size == 1024
     assert pybind_config.lora_prefetch_dir == "."
+
+
+class TestLlmArgs:
+
+    def test_update_with_speculative_config(self):
+        yaml_content = """speculative_config:
+    decoding_type: Lookahead
+    max_window_size: 4
+    max_ngram_size: 3
+    verification_set_size: 4
+    """
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(yaml_content.encode('utf-8'))
+            f.flush()
+            f.seek(0)
+            dict_content = yaml.safe_load(f)
+
+        llm_args = LlmArgs(model=llama_model_path)
+        llm_args.update(**dict_content)
+        print(f"llm_args: {llm_args.scheduler_config}")
+        assert llm_args.speculative_config.max_window_size == 4
+        assert llm_args.speculative_config.max_ngram_size == 3
+        assert llm_args.speculative_config.max_verification_set_size == 4
+
+    def test_yaml_loading(self):
+        yaml_content = """
+trust_remote_code: true
+kv_cache_config:
+  enable_block_reuse: true
+  max_tokens: 1024
+  max_attention_window: [1024, 1024, 1024]
+  sink_token_length: 32
+  free_gpu_memory_fraction: 0.5
+  host_cache_size: 1024
+
+speculative_config:
+  decoding_type: Lookahead
+  max_window_size: 4
+  max_ngram_size: 3
+  max_verification_set_size: 4
+"""
+        with tempfile.NamedTemporaryFile() as f:
+            f.write(yaml_content.encode('utf-8'))
+            f.flush()
+            f.seek(0)
+            dict_content = yaml.safe_load(f)
+            print(dict_content)
+
+            llm_args = TrtLlmArgs(model=llama_model_path, **dict_content)
+
+            assert llm_args.trust_remote_code == True
+            for key, value in dict_content.items():
+                if key in ("kv_cache_config", "speculative_config"):
+                    for k, v in value.items():
+                        assert getattr(getattr(llm_args, key), k) == v
+
+    def test_yaml_roundtrip(self):
+        llm_args = TrtLlmArgs(model=llama_model_path,
+                              trust_remote_code=True,
+                              tensor_parallel_size=1,
+                              dtype="float16",
+                              context_parallel_size=1,
+                              pipeline_parallel_size=1,
+                              gpus_per_node=1,
+                              moe_cluster_parallel_size=1,
+                              moe_tensor_parallel_size=1,
+                              speculative_config=LookaheadDecodingConfig(
+                                  max_window_size=4,
+                                  max_ngram_size=3,
+                                  max_verification_set_size=4),
+                              kv_cache_config=KvCacheConfig(
+                                  enable_block_reuse=True,
+                                  max_tokens=1024,
+                                  max_attention_window=[1024, 1024, 1024],
+                                  sink_token_length=32,
+                                  free_gpu_memory_fraction=0.5,
+                                  host_cache_size=1024))
+        dict_to_dump = llm_args.to_dict()
+        print('dict_to_dump: ', dict_to_dump)
+
+        with tempfile.NamedTemporaryFile(mode='w+') as f:
+            yaml.dump(dict_to_dump, f)
+            f.flush()
+            f.seek(0)
+            dict_content = yaml.safe_load(f)
+            print(dict_content)
+
+            new_llm_args = TrtLlmArgs(**dict_content)
+
+            assert llm_args == new_llm_args

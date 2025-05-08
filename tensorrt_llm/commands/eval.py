@@ -23,7 +23,7 @@ from .._torch.pyexecutor.config import PyTorchConfig
 from ..evaluate import (GSM8K, MMLU, CnnDailymail, GPQADiamond, GPQAExtended,
                         GPQAMain)
 from ..llmapi import LLM, BuildConfig, KvCacheConfig
-from ..llmapi.llm_utils import update_llm_args_with_extra_options
+from ..llmapi.llm_args import LlmArgs, update_llm_args_with_extra_options
 from ..logger import logger, severity_map
 
 
@@ -117,19 +117,19 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
     if backend == "pytorch":
         pytorch_backend_config = PyTorchConfig(enable_overlap_scheduler=True)
 
-    llm_args = {
-        "model": model,
-        "tokenizer": tokenizer,
-        "tensor_parallel_size": tp_size,
-        "pipeline_parallel_size": pp_size,
-        "moe_expert_parallel_size": ep_size,
-        "gpus_per_node": gpus_per_node,
-        "trust_remote_code": trust_remote_code,
-        "build_config": build_config,
-        "kv_cache_config": kv_cache_config,
-        "backend": backend,
-        "pytorch_backend_config": pytorch_backend_config,
-    }
+    llm_args = LlmArgs(
+        model=model,
+        tokenizer=tokenizer,
+        tensor_parallel_size=tp_size,
+        pipeline_parallel_size=pp_size,
+        moe_expert_parallel_size=ep_size,
+        gpus_per_node=gpus_per_node,
+        trust_remote_code=trust_remote_code,
+        build_config=build_config,
+        kv_cache_config=kv_cache_config,
+        backend=backend,
+        pytorch_backend_config=pytorch_backend_config,
+    )
 
     if extra_llm_api_options is not None:
         llm_args = update_llm_args_with_extra_options(llm_args,

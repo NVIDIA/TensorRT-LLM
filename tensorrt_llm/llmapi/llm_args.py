@@ -1,7 +1,7 @@
 import json
 import math
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
@@ -904,6 +904,36 @@ class BaseLlmArgs(BaseModel):
         exclude=True,  # exclude from serialization
         alias="_mpi_session")
 
+    # private fields
+    _parallel_config: Optional[_ParallelConfig] = PrivateAttr(default=None)
+
+    def update(self, **kwargs: Dict[str, Any]):
+        '''
+        Update the LlmArgs instance inplace with the given kwargs.
+
+        Usage:
+        >>> llm_args = LlmArgs(model="meta-llama/Meta-Llama-3-8B-Instruct")
+        >>> llm_args.update(max_input_len=1024, max_seq_len=2048)
+        '''
+        for key, value in kwargs.items():
+            logger.warning(
+                f"Updating {key} from {getattr(self, key)} to {value}")
+            if key in self.model_fields:
+                if key == "speculative_config":
+                    value = DecodingBaseConfig.from_dict(value)
+                setattr(self, key, value)
+        return self
+
+    def copy(self, **kwargs: Dict[str, Any]):
+        '''
+        Create a new LlmArgs instance with the given kwargs overriding the current instance.
+
+        Usage:
+        >>> llm_args = LlmArgs(model="meta-llama/Meta-Llama-3-8B-Instruct")
+        >>> llm_args_copy = llm_args.copy(max_input_len=1024, max_seq_len=2048)
+        '''
+        return self.model_copy(update=kwargs)
+
     @print_traceback_on_error
     def model_post_init(self, __context: Any):
 
@@ -936,7 +966,7 @@ class BaseLlmArgs(BaseModel):
         if self.moe_expert_parallel_size is None:
             self.moe_expert_parallel_size = -1
 
-        self.parallel_config = _ParallelConfig(
+        self._parallel_config = _ParallelConfig(
             tp_size=self.tensor_parallel_size,
             pp_size=self.pipeline_parallel_size,
             cp_size=self.context_parallel_size,
@@ -954,7 +984,7 @@ class BaseLlmArgs(BaseModel):
 
         self.scheduler_config = self.scheduler_config or SchedulerConfig()
 
-        # This is used to hold th options for convert_checkpoint
+        # This is used to hold the options for convert_checkpoint
         self._convert_checkpoint_options = {}
 
     @classmethod
@@ -972,14 +1002,17 @@ class BaseLlmArgs(BaseModel):
         ret._setup()
         return ret
 
-    def to_dict(self) -> dict:
+    def to_dict(self, ignore_unset: bool = True) -> dict:
         """Dump `LlmArgs` instance to a dict.
 
         Returns:
             dict: The dict that contains all fields of the `LlmArgs` instance.
         """
-        return dict(
-            (field.name, getattr(self, field.name)) for field in fields(self))
+        return self.model_dump(exclude_unset=ignore_unset)
+
+    @property
+    def parallel_config(self) -> _ParallelConfig:
+        return self._parallel_config
 
     @staticmethod
     def _maybe_update_config_for_consistency(
@@ -1138,7 +1171,7 @@ class BaseLlmArgs(BaseModel):
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
 
                 if self.backend != 'pytorch':
-                    eagle_config = EagleConfig(
+                    eagle_config = _EagleConfig(
                         self.speculative_config.eagle_choices,
                         self.speculative_config.greedy_sampling,
                         self.speculative_config.posterior_threshold,
@@ -1202,7 +1235,7 @@ class BaseLlmArgs(BaseModel):
             raise ValueError(
                 f"cp_size {self.parallel_config.cp_size} is not consistent with the engine's cp_size {mapping.cp_size}"
             )
-        self.parallel_config = _ParallelConfig(
+        self._parallel_config = _ParallelConfig(
             tp_size=mapping.tp_size,
             pp_size=mapping.pp_size,
             cp_size=mapping.cp_size,
@@ -1241,7 +1274,7 @@ class BaseLlmArgs(BaseModel):
                 f"auto parallel with world_size {self.parallel_config.world_size} does not support checkpoint with "
                 "world_size {world_size} > 1")
         if not self.parallel_config.auto_parallel:
-            self.parallel_config = _ParallelConfig(
+            self._parallel_config = _ParallelConfig(
                 tp_size=tp_size,
                 pp_size=pp_size,
                 cp_size=cp_size,
@@ -1310,13 +1343,13 @@ class TrtLlmArgs(BaseLlmArgs):
     fast_build: bool = Field(default=False, description="Enable fast build.")
 
     # Private attributes
-    auto_parallel_config: Optional[AutoParallelConfig] = PrivateAttr(
+    _auto_parallel_config: Optional[AutoParallelConfig] = PrivateAttr(
         default=None)
 
     def model_post_init(self, __context):
         super().model_post_init(__context)
 
-        self.auto_parallel_config = AutoParallelConfig(
+        self._auto_parallel_config = AutoParallelConfig(
             sharded_io_allowlist=[
                 "past_key_value_\\d+",
                 "present_key_value_\\d*",
@@ -1326,6 +1359,10 @@ class TrtLlmArgs(BaseLlmArgs):
             },
             **infer_cluster_config(),
         )
+
+    @property
+    def auto_parallel_config(self) -> AutoParallelConfig:
+        return self._auto_parallel_config
 
 
 LlmArgs = TrtLlmArgs
@@ -1340,48 +1377,22 @@ class TorchLlmArgs(BaseLlmArgs):
         super().model_post_init(__context)
 
 
-def update_llm_args_with_extra_dict(
-        llm_args: Dict,
-        llm_args_dict: Dict,
-        extra_llm_api_options: Optional[str] = None) -> Dict:
+def update_llm_args_with_extra_options(
+        llm_args: LlmArgs, extra_llm_api_options_yaml: str) -> LlmArgs:
+    '''
+    Update the LlmArgs instance with the given extra options from a yaml file.
 
-    from .._torch.pyexecutor.config import PyTorchConfig
-    field_mapping = {
-        "quant_config": QuantConfig,
-        "calib_config": CalibConfig,
-        "build_config": BuildConfig,
-        "kv_cache_config": KvCacheConfig,
-        "decoding_config": DecodingConfig,
-        "enable_build_cache": BuildCacheConfig,
-        "peft_cache_config": PeftCacheConfig,
-        "scheduler_config": SchedulerConfig,
-        "speculative_config": DecodingBaseConfig,
-        "batching_type": BatchingType,
-        "extended_runtime_perf_knob_config": ExtendedRuntimePerfKnobConfig,
-        "pytorch_backend_config": PyTorchConfig,
-        "cache_transceiver_config": CacheTransceiverConfig,
-    }
-    for field, field_type in field_mapping.items():
-        if field in llm_args_dict:
-            if field == "speculative_config":
-                llm_args_dict[field] = field_type.from_dict(
-                    llm_args_dict[field])
-            else:
-                llm_args_dict[field] = field_type(**llm_args_dict[field])
-            extra_llm_str = f"because it's specified in {extra_llm_api_options}" if extra_llm_api_options else ""
-            logger.warning(f"Overriding {field} {extra_llm_str}")
+    Args:
+        llm_args: The LlmArgs instance to update.
+        extra_llm_api_options_yaml: The path to the yaml file containing the extra options.
 
-    llm_args = llm_args | llm_args_dict
-    return llm_args
-
-
-def update_llm_args_with_extra_options(llm_args: Dict,
-                                       extra_llm_api_options: str) -> Dict:
-    if extra_llm_api_options is not None:
-        with open(extra_llm_api_options, 'r') as f:
+    Returns:
+        The updated LlmArgs instance.
+    '''
+    if extra_llm_api_options_yaml is not None:
+        with open(extra_llm_api_options_yaml, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
-            llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_dict,
-                                                       extra_llm_api_options)
+            llm_args = llm_args.copy(**llm_args_dict)
     return llm_args
 
 
