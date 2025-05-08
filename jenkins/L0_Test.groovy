@@ -1434,7 +1434,6 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     turtleSlurmConfigs = [
         "RTXPro6000-PyTorch-[Post-Merge]-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
-        "H100_PCIe-TensorRT-[Post-Merge]-5": ["h100-cr", "l0_h100", 5, 5],
     ]
 
     // TODO: use cpu pod to launch slurm job
