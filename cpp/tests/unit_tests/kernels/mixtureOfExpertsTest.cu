@@ -1860,17 +1860,18 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
         {
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
                 nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, mGroupSize, {}, false,
-                mUseLora, false, MOEParallelismConfig{1, 0, ep, ep - 1});
+                mUseLora, /*min_latency_mode=*/false, /*useFp8BlockScaling=*/false,
+                MOEParallelismConfig{1, 0, ep, ep - 1});
 
-            auto ws_size = backend.getWorkspaceSize(num_tokens);
+            auto ws_size = backend.getWorkspaceSize(num_tokens, /*need_weights=*/true);
             auto workspace = this->allocBuffer<char>(ws_size);
 
             int64_t num_experts_per_node = num_experts / ep;
 
-            backend.prepare(num_tokens, workspace, mStream->get());
+            backend.prepare(num_tokens, workspace, /*need_weights=*/true, mStream->get());
 
             auto getNext = backend.getWorkspacePointerGenerator(
-                workspace, num_tokens, getSMVersion() >= 90 && getSMVersion() < 120);
+                workspace, num_tokens, getSMVersion() >= 90 && getSMVersion() < 120, /*need_weights=*/true);
             auto const* expert_first_token_offset_size = reinterpret_cast<int64_t*>(getNext());
             auto const* source_to_dest_map = reinterpret_cast<int*>(getNext());
             auto const* dest_to_source_map = reinterpret_cast<int*>(getNext());

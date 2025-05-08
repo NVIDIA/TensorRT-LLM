@@ -100,8 +100,8 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(__nv_fp8
 
 template <typename ElementA, typename ElementB, typename ElementD>
 void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(void* mat_d, void const* mat_a,
-    void const* mat_b, int64_t const* problem_m_offsets, size_t num_problems, size_t shape_n, size_t shape_k,
-    cudaStream_t stream, float const* scales_a, float const* scales_b)
+    void const* mat_b, int64_t const* problem_m_offsets, int64_t const* problem_m_padded_offsets, size_t num_problems,
+    size_t shape_n, size_t shape_k, cudaStream_t stream, float const* scales_a, float const* scales_b)
 {
     constexpr bool internal_quantize_a = !std::is_same_v<ElementA, __nv_fp8_e4m3>;
     constexpr bool internal_quantize_b = !std::is_same_v<ElementB, __nv_fp8_e4m3>;
@@ -110,7 +110,6 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(void*
     float* per_token_per_128c_scales;
     __nv_fp8_e4m3* fp8_mat_b;
     float* per_block_scales;
-    int64_t* problem_m_padded_offsets;
 
     auto* ws_ptr = workspace_;
     if constexpr (internal_quantize_a || internal_quantize_b)
@@ -145,9 +144,6 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(void*
             per_block_scales = const_cast<float*>(scales_b);
         }
     }
-
-    problem_m_padded_offsets = reinterpret_cast<int64_t*>(ws_ptr);
-    ws_ptr += (num_problems + 1) * sizeof(int64_t);
 
 #ifdef COMPILE_HOPPER_TMA_GEMMS
     if constexpr (std::is_same_v<ElementA, __nv_bfloat16> && std::is_same_v<ElementB, __nv_bfloat16>)
@@ -243,8 +239,6 @@ size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWorkspac
         // scales_b
         total_workspace_size += num_problems * div_up(shape_k, 128) * div_up(shape_n, 128) * sizeof(float);
     }
-
-    total_workspace_size += (num_problems + 1) * sizeof(int64_t);
 
     return total_workspace_size;
 }
