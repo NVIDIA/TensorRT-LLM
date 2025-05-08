@@ -362,22 +362,7 @@ def _register_fake():
     ) -> List[torch.Tensor]:
         return outputs
 
-    @torch.library.custom_op("trtllm::causal_conv1d_fwd",
-                             mutates_args=("x", "weight", "conv_states"))
-    def causal_conv1d_fwd(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        bias_: Optional[torch.Tensor],
-        conv_states: Optional[torch.Tensor],
-        query_start_loc: Optional[torch.Tensor],
-        cache_indices: Optional[torch.Tensor],
-        has_initial_state: Optional[torch.Tensor],
-        silu_activation: bool,
-        pad_slot_id: int,
-    ) -> None:
-        pass
-
-    @causal_conv1d_fwd.register_fake
+    @torch.library.register_fake("trtllm::causal_conv1d_fwd")
     def _(
         x: torch.Tensor,
         weight: torch.Tensor,
@@ -391,21 +376,7 @@ def _register_fake():
     ) -> None:
         pass
 
-    @torch.library.custom_op("trtllm::causal_conv1d_update",
-                             mutates_args=("x", "conv_state", "weight"))
-    def causal_conv1d_update(
-        x: torch.Tensor,
-        conv_state: torch.Tensor,
-        weight: torch.Tensor,
-        bias_: Optional[torch.Tensor],
-        silu_activation: bool,
-        cache_seqlens_: Optional[torch.Tensor],
-        conv_state_indices_: Optional[torch.Tensor],
-        pad_slot_id: int,
-    ) -> None:
-        pass
-
-    @causal_conv1d_update.register_fake
+    @torch.library.register_fake("trtllm::causal_conv1d_update")
     def _(
         x: torch.Tensor,
         conv_state: torch.Tensor,

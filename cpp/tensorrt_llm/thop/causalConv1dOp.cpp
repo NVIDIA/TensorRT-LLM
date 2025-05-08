@@ -286,6 +286,30 @@ void causalConv1dUpdate(at::Tensor const& x, at::Tensor const& conv_state, at::T
 
 } // namespace torch_ext
 
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def(
+        "causal_conv1d_fwd(Tensor! x,"
+        "Tensor! weight,"
+        "Tensor? bias_,"
+        "Tensor!? conv_states,"
+        "Tensor? query_start_loc,"
+        "Tensor? cache_indices,"
+        "Tensor? has_initial_state,"
+        "bool silu_activation,"
+        "int pad_slot_id) -> ()");
+
+    m.def(
+        "causal_conv1d_update(Tensor! x,"
+        "Tensor! conv_state,"
+        "Tensor! weight,"
+        "Tensor? bias_,"
+        "bool silu_activation,"
+        "Tensor? cache_seqlens_,"
+        "Tensor? conv_state_indices,"
+        "int pad_slot_id) -> ()");
+}
+
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("causal_conv1d_fwd", &torch_ext::causalConv1dFwd);
