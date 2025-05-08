@@ -493,6 +493,11 @@ TensorPtr DecoderState::getSequenceLengths() const
     return mJointDecodingOutput->lengths;
 }
 
+TensorPtr DecoderState::getSequenceLengths(SizeType32 batchIdx) const
+{
+    return ITensor::slice(mJointDecodingOutput->lengths, batchIdx, 1);
+}
+
 TensorPtr DecoderState::getAllNewTokens() const
 {
     return mJointDecodingOutput->newTokensSteps;
