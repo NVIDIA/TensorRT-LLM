@@ -262,6 +262,7 @@ class Llama4MoE(nn.Module):
 
         super().__init__()
         config = model_config.pretrained_config
+        self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.top_k = top_k
         self.experts = FusedMoE(
             routing_method=Llama4RenormalizeMoeRoutingMethod(top_k),
@@ -281,6 +282,7 @@ class Llama4MoE(nn.Module):
             bias=False,
             dtype=dtype,
             config=model_config,
+            overridden_tp_size=1 if self.enable_attention_dp else None,
             reduce_output=False)
 
         self.router = Linear(hidden_size,
@@ -295,10 +297,18 @@ class Llama4MoE(nn.Module):
         self.aux_stream = aux_stream
 
     def compute_routed_output(self, hidden_states, all_rank_num_tokens,
-                              min_latency_mode):
+                              cutlass_min_latency_mode):
+        if self.enable_attention_dp and self.mapping.tp_size > 1:
+            max_num_token_across_dp_ranks = max(all_rank_num_tokens)
+            hidden_states = torch.nn.functional.pad(
+                hidden_states,
+                (0, 0, 0,
+                 max_num_token_across_dp_ranks - hidden_states.shape[0]))
         router_logits = self.router(hidden_states)
-        routed_output = self.experts(hidden_states, router_logits,
-                                     min_latency_mode)
+        routed_output = self.experts(hidden_states,
+                                     router_logits,
+                                     cutlass_min_latency_mode,
+                                     all_rank_num_tokens=all_rank_num_tokens)
         return routed_output
 
     def forward(
@@ -306,22 +316,22 @@ class Llama4MoE(nn.Module):
         hidden_states: torch.Tensor,
         all_rank_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
-        min_latency_mode: Optional[bool] = False,
+        cutlass_min_latency_mode: Optional[bool] = False,
     ) -> torch.Tensor:
         # Only enable multi-stream for cuda graph since switch stream has extra host overhead
         # This design is mainly for low latency use case. Need to improve for max throughput use case.
         fn0 = lambda: self.shared_expert(hidden_states)
         fn1 = lambda: self.compute_routed_output(
-            hidden_states, all_rank_num_tokens, min_latency_mode)
+            hidden_states, all_rank_num_tokens, cutlass_min_latency_mode)
         shared_output, routed_output = maybe_execute_in_parallel(
             fn0, fn1, self.moe_event[0], self.moe_event[1], self.aux_stream)
-        if min_latency_mode:
+        if cutlass_min_latency_mode:
             return [shared_output, *routed_output]
 
         assert shared_output.size() == routed_output.size(
         ), f'unmatched tensor shape'
         final_hidden_states = shared_output + routed_output
-        if self.mapping.tp_size > 1:
+        if not self.enable_attention_dp and self.mapping.tp_size > 1:
             final_hidden_states = self.all_reduce(
                 final_hidden_states, all_reduce_params=final_all_reduce_params)
 
@@ -341,6 +351,8 @@ class Llama4DecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
         self.is_quanted = model_config.quant_config and model_config.quant_config.quant_mode.has_any_quant(
         )
+        self.enable_attention_dp = model_config.mapping.enable_attention_dp
+
         self.fusion_config = EagerFusionConfig()
         # self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp(
         # )
@@ -367,6 +379,7 @@ class Llama4DecoderLayer(DecoderLayer):
                 bias=getattr(config, "mlp_bias", False),
                 dtype=config.torch_dtype,
                 config=model_config,
+                overridden_tp_size=1 if self.enable_attention_dp else None,
                 layer_idx=layer_idx,
             )
 
@@ -409,17 +422,16 @@ class Llama4DecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-
         # Only enable min-latency mode on Blackwell
         # TODO: Remove it after we fix crash on Hopper
         # major, minor = torch.cuda.get_device_capability()
         # is_blackwell = (major * 10 + minor) >= 100
-        # min_latency_mode = hidden_states.size(
+        # cutlass_min_latency_mode = hidden_states.size(
         #     0
         # ) <= 128 and self.fusion_config.POST_MOE_FUSION and is_blackwell and self.is_quanted
 
         # Temporarily disable min-latency mode for Llama4
-        min_latency_mode = False
+        cutlass_min_latency_mode = False
 
         if residual is None:
             residual = hidden_states
@@ -430,9 +442,9 @@ class Llama4DecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(
-                enable_allreduce=not (self.fusion_config.PRE_MOE_FUSION
-                                      or self.mapping.tp_size == 1)),
+            all_reduce_params=AllReduceParams(enable_allreduce=not (
+                self.fusion_config.PRE_MOE_FUSION or self.mapping.tp_size == 1
+                or self.enable_attention_dp)),
             **kwargs,
         )
 
@@ -454,9 +466,10 @@ class Llama4DecoderLayer(DecoderLayer):
             hidden_states,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.POST_MOE_FUSION or self.fusion_config.
-                POST_MLP_FUSION or self.mapping.tp_size == 1)),
-            min_latency_mode=min_latency_mode,
+                self.fusion_config.POST_MOE_FUSION
+                or self.fusion_config.POST_MLP_FUSION
+                or self.mapping.tp_size == 1 or self.enable_attention_dp)),
+            cutlass_min_latency_mode=cutlass_min_latency_mode,
         )
         if spec_metadata is not None:
             # We save the hidden states in the spec metadata here. In _prepare_draft_tokens,
@@ -467,7 +480,7 @@ class Llama4DecoderLayer(DecoderLayer):
                                                       hidden_states, residual)
 
         if self.fusion_config.POST_MOE_FUSION or self.fusion_config.POST_MLP_FUSION:
-            if min_latency_mode:
+            if cutlass_min_latency_mode:
                 shared_output = hidden_states[0]
                 hidden_states_activated_experts = hidden_states[1]
                 num_activated_experts_per_node = hidden_states[2]
@@ -681,14 +694,20 @@ class Llama4Model(DecoderModel):
         self.padding_idx = config.pad_token_id
         self.aux_stream = torch.cuda.Stream()
 
-        self.embed_tokens = Embedding(
-            config.vocab_size,
-            config.hidden_size,
-            dtype=config.torch_dtype,
-            mapping=model_config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            gather_output=True,
-        )
+        if self.model_config.mapping.enable_attention_dp:
+            self.embed_tokens = Embedding(config.vocab_size,
+                                          config.hidden_size,
+                                          dtype=config.torch_dtype)
+        else:
+            self.embed_tokens = Embedding(
+                config.vocab_size,
+                config.hidden_size,
+                dtype=config.torch_dtype,
+                mapping=model_config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=True,
+            )
+
         self.layers = nn.ModuleList([
             Llama4DecoderLayer(
                 model_config,
