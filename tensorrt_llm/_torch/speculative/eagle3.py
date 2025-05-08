@@ -231,6 +231,7 @@ class Eagle3OneModelWorker(nn.Module):
                 attn_metadata, spec_metadata, draft_model):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
+        num_gens = batch_size - num_contexts
 
         # Sample and accept tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
@@ -260,9 +261,11 @@ class Eagle3OneModelWorker(nn.Module):
         for i in range(self.max_draft_tokens):
             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
             if i == 0:
-                gather_ids_gen = torch.cumsum(
-                    num_accepted_tokens[num_contexts:], dim=0,
-                    dtype=torch.long) - 1 + attn_metadata.num_ctx_tokens
+                start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
+                                 (self.max_draft_tokens + 1)).long()
+                gather_ids_gen = (start_ids_gen +
+                                  num_accepted_tokens[num_contexts:] - 1 +
+                                  attn_metadata.num_ctx_tokens)
                 gather_ids = torch.concat(
                     [last_tokens_idx[:num_contexts], gather_ids_gen], dim=0)
             else:
@@ -382,7 +385,8 @@ class Eagle3OneModelWorker(nn.Module):
         '''
 
         draft_tokens = torch.argmax(logits, dim=-1).type(torch.int32)
-        if hasattr(draft_model.model, "d2t") and draft_model.model.d2t is not None:
+        if hasattr(draft_model.model,
+                   "d2t") and draft_model.model.d2t is not None:
             draft_tokens = draft_model.model.d2t[draft_tokens] + draft_tokens
         return draft_tokens
 
