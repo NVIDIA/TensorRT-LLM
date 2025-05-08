@@ -142,66 +142,11 @@ class AllReduce(nn.Module):
         self.mapping = mapping
         self.workspace = None
         self.strategy = strategy
-        self.max_workspace_size = CustomAllReduceHelper.max_workspace_size_auto(
-            self.mapping.tp_size, support_deterministic=False)
-
-        self.fallback_func_mapping = {
-            AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8:
-            self.fallback_residual_rms_norm_quant_fp8,
-            AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
-            self.fallback_residual_rms_norm_out_quant_fp8,
-            AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
-            self.fallback_residual_rms_norm_quant_nvfp4,
-            AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
-            self.fallback_residual_rms_norm_out_quant_nvfp4,
-        }
 
         if self.mapping.tp_size > 1:
             # When Strategy is UB, it is guaranteed that the workspace is not used.
             if self.strategy != AllReduceStrategy.UB:
                 self.workspace = get_allreduce_workspace(self.mapping)
-
-    @staticmethod
-    def fallback_residual_rms_norm_quant_fp8(
-        output: Tuple[torch.Tensor, ...],
-        all_reduce_params: AllReduceParams,
-    ):
-        norm_out, residual_out = output
-        quant_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-            norm_out, all_reduce_params.scale)
-        return quant_fp8, residual_out
-
-    @staticmethod
-    def fallback_residual_rms_norm_out_quant_fp8(
-        output: Tuple[torch.Tensor, ...],
-        all_reduce_params: AllReduceParams,
-    ):
-        norm_out, residual_out = output
-        quant_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-            norm_out, all_reduce_params.scale)
-        return norm_out, quant_fp8, residual_out
-
-    @staticmethod
-    def fallback_residual_rms_norm_quant_nvfp4(
-        output: Tuple[torch.Tensor, ...],
-        all_reduce_params: AllReduceParams,
-    ):
-        norm_out, residual_out = output
-        quant_fp4, scale_factor = torch.ops.trtllm.fp4_quantize(
-            norm_out, all_reduce_params.scale, 16, False)
-
-        return quant_fp4, scale_factor, residual_out
-
-    @staticmethod
-    def fallback_residual_rms_norm_out_quant_nvfp4(
-        output: Tuple[torch.Tensor, ...],
-        all_reduce_params: AllReduceParams,
-    ):
-        norm_out, residual_out = output
-        quant_fp4, scale_factor = torch.ops.trtllm.fp4_quantize(
-            norm_out, all_reduce_params.scale, 16, False)
-
-        return norm_out, quant_fp4, scale_factor, residual_out
 
     def forward(
         self,
@@ -241,16 +186,6 @@ class AllReduce(nn.Module):
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
-        strategy = self.strategy
-        fusion_op = all_reduce_params.fusion_op
-
-        # If the input size is larger than the max workspace size, fallback to NCCL strategy
-        if input.numel() > self.max_workspace_size \
-            and all_reduce_params.fusion_op != AllReduceFusionOp.NONE \
-            and all_reduce_params.fusion_op != AllReduceFusionOp.RESIDUAL_RMS_NORM:
-            strategy = AllReduceStrategy.NCCL
-            fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
-
         output = torch.ops.trtllm.allreduce(
             input=input,
             residual=all_reduce_params.residual,
@@ -259,16 +194,10 @@ class AllReduce(nn.Module):
             bias=all_reduce_params.bias,
             workspace=self.workspace,
             group=self.mapping.tp_group,
-            strategy=strategy,
-            op=fusion_op,
+            strategy=self.strategy,
+            op=all_reduce_params.fusion_op,
             eps=all_reduce_params.eps,
         )
-
-        if input.numel() > self.max_workspace_size \
-            and all_reduce_params.fusion_op != AllReduceFusionOp.NONE \
-            and all_reduce_params.fusion_op != AllReduceFusionOp.RESIDUAL_RMS_NORM:
-            output = self.fallback_func_mapping[all_reduce_params.fusion_op](
-                output, all_reduce_params)
 
         return output if len(output) > 1 else output[0]
 
