@@ -113,7 +113,7 @@ void LookaheadDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth
     TLLM_LOG_TRACE("================ %s start", __PRETTY_FUNCTION__);
 
     TLLM_LOG_TRACE("Before LookaheadDecodingLayer<T>::setup");
-    printLookaheadDecodingLayer(__LINE__);
+    print(__LINE__);
 
     auto setupParams = std::dynamic_pointer_cast<LookaheadSetupParams>(baseSetupParams);
 
@@ -131,8 +131,8 @@ void LookaheadDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth
         auto const prompt{setupParams->prompt[bi]}; // `bi` or `gbi`?
         PRINT_SHAPE(prompt);
         PRINT_TOKEN(prompt);
-        mCpuAlgo->mPrompts[bi]->reshape(prompt->getShape());                              // `bi` or `gbi`?
-        mBufferManager->copy(*prompt, *mCpuAlgo->mPrompts[bi]);                           // `bi` or `gbi`?
+        mCpuAlgo->mPrompts[bi]->reshape(prompt->getShape());    // `bi` or `gbi`?
+        mBufferManager->copy(*prompt, *mCpuAlgo->mPrompts[bi]); // `bi` or `gbi`?
 
         auto [w, n, g] = lookaheadConfigs[(lookaheadConfigs.size() == 1) ? 0 : bi].get(); // `bi` or `gbi`?
         SizeType32 runtimeTokensPerStep = 0;
@@ -144,7 +144,7 @@ void LookaheadDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth
         if (setupParams->randomSeed)
         {
             auto& seeds = setupParams->randomSeed.value();
-            seed = seeds.size() == 1 ? seeds[0] : seeds[bi];                // `bi` or `gbi`?
+            seed = seeds.size() == 1 ? seeds[0] : seeds[bi]; // `bi` or `gbi`?
         }
         mCpuAlgo->mAlgos[gbi].setup(mCpuAlgo->mPrompts[bi], w, n, g, seed); // `bi` or `gbi`?
 
@@ -172,7 +172,7 @@ void LookaheadDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth
         setupParams->randomSeed, batchSize, workspace->getDeviceBatchSlots(), mCurandStatesDevice);
 
     TLLM_LOG_TRACE("After LookaheadDecodingLayer<T>::setup");
-    printLookaheadDecodingLayer(__LINE__);
+    print(__LINE__);
 
     TLLM_LOG_TRACE("================ %s stop", __PRETTY_FUNCTION__);
 }
@@ -185,7 +185,7 @@ void LookaheadDecodingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs
     TLLM_LOG_TRACE("================ %s start", __PRETTY_FUNCTION__);
 
     TLLM_LOG_TRACE("Before LookaheadDecodingLayer<T>::forwardAsync");
-    printLookaheadDecodingLayer(__LINE__);
+    print(__LINE__);
 
     NVTX3_SCOPED_RANGE(LookaheadDecodingLayer_forwardAsync);
 
@@ -232,7 +232,7 @@ void LookaheadDecodingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs
     }
 
     // TLLM_LOG_TRACE("After LookaheadDecodingLayer<T>::forwardAsync");
-    // printLookaheadDecodingLayer(__LINE__);
+    // print(__LINE__);
 
     TLLM_LOG_TRACE("================ %s stop", __PRETTY_FUNCTION__);
 }
@@ -250,7 +250,7 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
     TLLM_LOG_TRACE("================ %s start", __PRETTY_FUNCTION__);
 
     TLLM_LOG_TRACE("Before LookaheadDecodingLayer<T>::forwardSyncCPU");
-    printLookaheadDecodingLayer(__LINE__);
+    print(__LINE__);
 
     PRINT_TOKEN(outputs->generationLengths); // wili, debug
     PRINT_TOKEN(outputs->positionOffsets);
@@ -303,7 +303,7 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
     size_t pi = 0;
     numNewTokensCumSumRange[0] = 0;
 
-    printLookaheadDecodingLayer(__LINE__);
+    print(__LINE__);
 
     for (auto bi = 0; bi < batchSize; bi++)
     {
@@ -334,7 +334,7 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
             );
         }
 
-        printLookaheadDecodingLayer(__LINE__);
+        print(__LINE__);
         auto maxNumNewTokens = mCpuAlgo->mOutputIds->getShape().d[1];
         TLLM_LOG_TRACE("L%d, maxNumNewTokens=%d", __LINE__, maxNumNewTokens);
 
@@ -355,7 +355,7 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
             mCpuAlgo->mAttentionMask, offset, lastToken);
         convertBoolToInt32(ITensor::at(mCpuAlgo->mPackedMask, {gbi}), mCpuAlgo->mAttentionMask);
 
-        printLookaheadDecodingLayer(__LINE__);
+        print(__LINE__);
 
         BufferLocation<SizeType32> posIdsLocation(*ITensor::at(mCpuAlgo->mPositionIds, {gbi}));
         for (auto& posid : posIdsLocation)
@@ -371,7 +371,7 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
             offsetRange[i] = posIdsLocation[i] - posIdsLocation[0];
         }
 
-        printLookaheadDecodingLayer(__LINE__);
+        print(__LINE__);
 
         TensorPtr accepted = ITensor::slice(mCpuAlgo->mOutputIds, {gbi, 0}, numNewTokensRange[gbi]);
         TensorPtr draft = ITensor::slice(mCpuAlgo->mNextDraftTokens, {gbi, 0}, nextDraftLengthsRange[gbi]);
@@ -386,7 +386,7 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
             pathsOffsetBatchLocation[pi++] = pathsOffsetLocation.at(gbi, tj);
         }
 
-        printLookaheadDecodingLayer(__LINE__);
+        print(__LINE__);
     }
 
     while (pi < pathsOffsetBatchLocation.size())
@@ -404,7 +404,7 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
     mBufferManager->copy(*mCpuAlgo->mNumNewTokensCumSum, *outputs->numNewTokensCumSum); //
     mBufferManager->copy(*mCpuAlgo->mNextDraftTokens, *outputs->nextDraftTokens);
 
-    printLookaheadDecodingLayer(__LINE__);
+    print(__LINE__);
 
     for (SizeType32 bi = 0; bi < batchSize; bi++)
     {
@@ -425,15 +425,15 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
 
     mBufferManager->getStream().synchronize();
 
-    printLookaheadDecodingLayer(__LINE__);
+    print(__LINE__);
 
     TLLM_LOG_TRACE("================ %s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-void LookaheadDecodingLayer<T>::printLookaheadDecodingLayer(int const lineNumber) const noexcept
+void LookaheadDecodingLayer<T>::print(int const lineNumber) const noexcept
 {
-    TLLM_LOG_TRACE("================ printLookaheadDecodingLayer @L%d start", lineNumber);
+    TLLM_LOG_TRACE("================ print @L%d start", lineNumber);
     TLLM_LOG_TRACE("mWorkspaceSize=%d, ", mWorkspaceSize);
     TLLM_LOG_TRACE("mSetupWorkspaceSize=%d, ", mSetupWorkspaceSize);
     TLLM_LOG_TRACE("mGlobalSteps=%d, ", mGlobalSteps);
@@ -477,7 +477,7 @@ void LookaheadDecodingLayer<T>::printLookaheadDecodingLayer(int const lineNumber
     for (long unsigned int i = 0; i < cpuAlgoValue.mAlgos.size(); ++i)
     {
         TLLM_LOG_TRACE("mAlgos[%d]:", (int) i);
-        cpuAlgoValue.mAlgos[i].printAlgorithm();
+        cpuAlgoValue.mAlgos[i].print();
     }
 
     TLLM_LOG_TRACE("================ printLookaheadDecodingLayer @L%d end", lineNumber);

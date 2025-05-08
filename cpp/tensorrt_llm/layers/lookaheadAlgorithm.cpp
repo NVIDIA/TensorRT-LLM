@@ -607,7 +607,7 @@ void LookaheadAlgorithm::update(TensorPtr const& acceptedTokens, TensorPtr const
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void LookaheadAlgorithm::printAlgorithm() const noexcept
+void LookaheadAlgorithm::print() const noexcept
 {
     TLLM_LOG_TRACE("======== printAlgorithm start");
 
@@ -639,7 +639,7 @@ void LookaheadAlgorithm::printAlgorithm() const noexcept
     PRINT_TOKEN(mSampledTokensMax);
     PRINT_TOKEN(mSampledTokens);
 
-    mPoolManager.printPoolManager();
+    mPoolManager.print();
 
     TLLM_LOG_TRACE("======== printAlgorithm stop");
 }
