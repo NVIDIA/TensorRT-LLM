@@ -162,6 +162,7 @@ class Linear(nn.Module):
         use_custom_cublas_mm: bool = False,
         use_llama4_qkv: bool = False,
         use_llama4_fc_swiglu_kernel: bool = False,
+        use_llama4_gemv_for_fc_swiglu: bool = False,
         use_llama4_trtllm_gen: bool = False,
         previous_gate_up_proj: nn.Module = None,
     ):
@@ -211,6 +212,10 @@ class Linear(nn.Module):
         # Llama4 FC13+SwiGLU kernel has hard requirement of hidden_size = 5120
         # and targets output_features = 2048 or 4096.
         self.use_llama4_fc_swiglu_kernel = use_llama4_fc_swiglu_kernel and self.in_features == 5120 and (self.out_features == 2048 or self.out_features == 4096)
+        # Currently we have logics inside apply_linear and forward that directs to either
+        # gemv or trtllm_gen kernel based on the token_length. This option here allows us
+        # to force using gemv kernel for FC SwiGLU.
+        self.use_llama4_gemv_for_fc_swiglu = use_llama4_gemv_for_fc_swiglu
         # This knob is for Llama4 FC2 (down_proj in gated_mlp)
         # local_in_features for FC2 is 1024, while global is 8192 (TP8)
         self.use_llama4_trtllm_gen = use_llama4_trtllm_gen and (self.in_features % 512 == 0) and self.out_features == 5120
@@ -383,10 +388,12 @@ class Linear(nn.Module):
                             low_latency_kernel=True,
                             gated_silu=False,
                         )
-                elif self.use_llama4_fc_swiglu_kernel and qinput.shape[0] <= 4:
+                elif (self.use_llama4_fc_swiglu_kernel and qinput.shape[0] <= 4) or self.use_llama4_gemv_for_fc_swiglu:
                     # Outputing fp8 even though self.dtype is bfloat16
                     # That is why we need inv_input_scale from next linear layer to
                     # offset the quantization.
+                    if not hasattr(self, "next_gate_down_inv_input_scale"):
+                        raise ValueError('Expect next_gate_down_inv_input_scale to be set')
                     output = torch.ops.trtllm.llama4_fc_swiglu_tiled_fp8(
                         qinput,
                         weight.t(),
@@ -539,7 +546,7 @@ class Linear(nn.Module):
                                                self.weight,
                                                self.bias)
             elif self.use_llama4_fc_swiglu_kernel:
-                if 4 < input.shape[0] <= 16:
+                if 4 < input.shape[0] <= 16 and not self.use_llama4_gemv_for_fc_swiglu:
                     output = self.apply_linear(input,
                                                self.trtllm_gen_weight,
                                                self.bias)
@@ -553,7 +560,7 @@ class Linear(nn.Module):
                 output = allgather(output, self.mapping)
         else:
             if self.use_llama4_fc_swiglu_kernel:
-                if 4 < input.shape[0] <= 16:
+                if 4 < input.shape[0] <= 16 and not self.use_llama4_gemv_for_fc_swiglu:
                     output = self.apply_linear(input,
                                                self.trtllm_gen_weight,
                                                self.bias)
@@ -727,8 +734,7 @@ class Linear(nn.Module):
                     gate_weight = gate_weight.to(self.dtype) * weight_scale[0]
                     up_weight = up_weight.to(self.dtype) * weight_scale[1]
                     if hasattr(self, "next_gate_down_inv_input_scale"):
-                        self.combined_scale = self.input_scale * self.weight_scale
-                        self.trtllm_gen_global_scale = self.combined_scale * self.next_gate_down_inv_input_scale
+                        raise ValueError("Unexpected weight load sequence. Gate down proj should be loaded after gate up proj.")
                     else:
                         self.combined_scale = self.input_scale * self.weight_scale
 
