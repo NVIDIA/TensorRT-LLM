@@ -13,6 +13,7 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, DeepseekAllReduce)
 from tensorrt_llm._torch.pipeline_interface import PipelineInterface
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
                        register_input_processor)
@@ -262,6 +263,7 @@ class Llama4MoE(nn.Module):
 
         super().__init__()
         config = model_config.pretrained_config
+        self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.top_k = top_k
         self.experts = FusedMoE(
             routing_method=Llama4RenormalizeMoeRoutingMethod(top_k),
@@ -281,6 +283,7 @@ class Llama4MoE(nn.Module):
             bias=False,
             dtype=dtype,
             config=model_config,
+            overridden_tp_size=1 if self.enable_attention_dp else None,
             reduce_output=False)
 
         self.router = Linear(hidden_size,
@@ -296,9 +299,17 @@ class Llama4MoE(nn.Module):
 
     def compute_routed_output(self, hidden_states, all_rank_num_tokens,
                               cutlass_min_latency_mode):
+        if self.enable_attention_dp and self.mapping.tp_size > 1:
+            max_num_token_across_dp_ranks = max(all_rank_num_tokens)
+            hidden_states = torch.nn.functional.pad(
+                hidden_states,
+                (0, 0, 0,
+                 max_num_token_across_dp_ranks - hidden_states.shape[0]))
         router_logits = self.router(hidden_states)
-        routed_output = self.experts(hidden_states, router_logits,
-                                     cutlass_min_latency_mode)
+        routed_output = self.experts(hidden_states,
+                                     router_logits,
+                                     cutlass_min_latency_mode,
+                                     all_rank_num_tokens=all_rank_num_tokens)
         return routed_output
 
     def forward(
@@ -321,7 +332,7 @@ class Llama4MoE(nn.Module):
         assert shared_output.size() == routed_output.size(
         ), f'unmatched tensor shape'
         final_hidden_states = shared_output + routed_output
-        if self.mapping.tp_size > 1:
+        if not self.enable_attention_dp and self.mapping.tp_size > 1:
             final_hidden_states = self.all_reduce(
                 final_hidden_states, all_reduce_params=final_all_reduce_params)
 
@@ -341,6 +352,8 @@ class Llama4DecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
         self.is_quanted = model_config.quant_config and model_config.quant_config.quant_mode.has_any_quant(
         )
+        self.enable_attention_dp = model_config.mapping.enable_attention_dp
+
         self.fusion_config = EagerFusionConfig()
         # self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp(
         # )
@@ -354,8 +367,7 @@ class Llama4DecoderLayer(DecoderLayer):
             use_qk_norm=getattr(config, "use_qk_norm", False),
             nope_layer=config.no_rope_layers[layer_idx] == 0,
             attn_temperature_tuning=config.attn_temperature_tuning > 0,
-            aux_stream=aux_stream,
-        )
+            aux_stream=aux_stream)
 
         is_mlp_layer = (layer_idx + 1) % config.interleave_moe_layer_step != 0
 
@@ -367,6 +379,7 @@ class Llama4DecoderLayer(DecoderLayer):
                 bias=getattr(config, "mlp_bias", False),
                 dtype=config.torch_dtype,
                 config=model_config,
+                overridden_tp_size=1 if self.enable_attention_dp else None,
                 layer_idx=layer_idx,
             )
 
@@ -409,7 +422,6 @@ class Llama4DecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-
         # Only enable min-latency mode on Blackwell
         # TODO: Remove it after we fix crash on Hopper
         # major, minor = torch.cuda.get_device_capability()
@@ -430,9 +442,9 @@ class Llama4DecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(
-                enable_allreduce=not (self.fusion_config.PRE_MOE_FUSION
-                                      or self.mapping.tp_size == 1)),
+            all_reduce_params=AllReduceParams(enable_allreduce=not (
+                self.fusion_config.PRE_MOE_FUSION or self.mapping.tp_size == 1
+                or self.enable_attention_dp)),
             **kwargs,
         )
 
@@ -454,8 +466,9 @@ class Llama4DecoderLayer(DecoderLayer):
             hidden_states,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.POST_MOE_FUSION or self.fusion_config.
-                POST_MLP_FUSION or self.mapping.tp_size == 1)),
+                self.fusion_config.POST_MOE_FUSION
+                or self.fusion_config.POST_MLP_FUSION
+                or self.mapping.tp_size == 1 or self.enable_attention_dp)),
             cutlass_min_latency_mode=cutlass_min_latency_mode,
         )
         if spec_metadata is not None:
@@ -681,14 +694,20 @@ class Llama4Model(DecoderModel):
         self.padding_idx = config.pad_token_id
         self.aux_stream = torch.cuda.Stream()
 
-        self.embed_tokens = Embedding(
-            config.vocab_size,
-            config.hidden_size,
-            dtype=config.torch_dtype,
-            mapping=model_config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            gather_output=True,
-        )
+        if self.model_config.mapping.enable_attention_dp:
+            self.embed_tokens = Embedding(config.vocab_size,
+                                          config.hidden_size,
+                                          dtype=config.torch_dtype)
+        else:
+            self.embed_tokens = Embedding(
+                config.vocab_size,
+                config.hidden_size,
+                dtype=config.torch_dtype,
+                mapping=model_config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=True,
+            )
+
         self.layers = nn.ModuleList([
             Llama4DecoderLayer(
                 model_config,
@@ -754,13 +773,14 @@ class LlamaModel(DecoderModel):
         self.padding_idx = config.pad_token_id
 
         vocab_size = config.vocab_size
-        # TODO smor- hack
-        if hasattr(model_config,
-                   'lora_config') and model_config.lora_config is not None:
+        # TODO smor- we load manually only if there is a single lora dir, need to come up with a better solution
+        if hasattr(
+                model_config,
+                'lora_config') and model_config.lora_config is not None and len(
+                    model_config.lora_config.lora_dir) == 1:
             from tensorrt_llm.lora_manager import HfLoraLoader
             lora_loader = HfLoraLoader(model_config.lora_config.lora_dir)
             weight = lora_loader.embed_tokens
-            # TODO smor - need to split tp matrix here
             vocab_size = lora_loader.vocab_size
 
         self.embed_tokens = Embedding(
@@ -772,9 +792,17 @@ class LlamaModel(DecoderModel):
             gather_output=True,
         )
 
-        if hasattr(model_config,
-                   'lora_config') and model_config.lora_config is not None:
+        if hasattr(
+                model_config,
+                'lora_config') and model_config.lora_config is not None and len(
+                    model_config.lora_config.lora_dir) == 1:
             with torch.no_grad():
+                if model_config.mapping.tp_size > 1:
+                    weight = split_matrix_tp(
+                        weight,
+                        model_config.mapping.tp_size,
+                        model_config.mapping.tp_rank,
+                        dim=0)  # split by vocabulary dimension
                 x = weight.to(self.embed_tokens.dtype)
                 self.embed_tokens.weight.data.copy_(x)
 
@@ -962,13 +990,18 @@ class Llama4ForConditionalGeneration(Llama4ForCausalLM):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: Optional[bool] = False,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         mm_embed = kwargs.get("multi_modal_data", [])
         input_ids, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
                                                      input_ids, mm_embed)
-        logits = super().forward(attn_metadata, input_ids, position_ids,
-                                 inputs_embeds, return_context_logits)
+        logits = super().forward(attn_metadata,
+                                 input_ids,
+                                 position_ids,
+                                 inputs_embeds,
+                                 spec_metadata=spec_metadata,
+                                 return_context_logits=return_context_logits)
         return logits
 
 

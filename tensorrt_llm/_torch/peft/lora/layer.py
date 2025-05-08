@@ -92,8 +92,12 @@ class LoraLayer(torch.nn.Module):
         self.output_hidden_sizes = output_hidden_sizes
         assert len(lora_module_types) == len(output_hidden_sizes)
 
-    def forward(self, x, lora_params: Dict,
-                layer_idx: int) -> Optional[torch.Tensor]:
+    def forward(
+        self,
+        x,
+        lora_params: Dict,
+        layer_idx: int,
+    ) -> Optional[torch.Tensor]:
 
         if bool(lora_params):
             lora_ranks = []
@@ -147,7 +151,6 @@ class LoraLayer(torch.nn.Module):
                                 ],
                                             dtype=x.dtype,
                                             device=x.device))
-                    # TODO smor should be by: dim=q_lora.rank() - 1
                     lora_output = torch.cat(lora_output, dim=-1)
                     return lora_output
 
