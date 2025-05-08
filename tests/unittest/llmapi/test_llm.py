@@ -228,7 +228,7 @@ def test_llm_loading_from_hf():
                      kv_cache_config=global_kvcache_config)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5268351")
+@pytest.mark.skip(reason="https://nvbugs/5266240")
 @force_ampere
 @pytest.mark.part0
 def test_llm_loading_from_ckpt():
@@ -250,7 +250,7 @@ def test_llm_loading_from_ckpt():
 @pytest.mark.parametrize('model_format', [
     'hf',
     pytest.param('ckpt',
-                 marks=pytest.mark.skip(reason="https://nvbugs/5268351"))
+                 marks=pytest.mark.skip(reason="https://nvbugs/5266240"))
 ])
 @pytest.mark.part0
 def test_llm_with_dummy_weights(model_format):
