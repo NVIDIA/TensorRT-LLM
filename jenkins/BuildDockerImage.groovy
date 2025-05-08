@@ -17,7 +17,7 @@ LLM_BRANCH_TAG = LLM_BRANCH.replaceAll('/', '_')
 
 BUILD_JOBS = "32"
 
-def createKubernetesPodConfig(type)
+def createKubernetesPodConfig(type, arch = "amd64")
 {
     def targetCould = "kubernetes-cpu"
     def containerConfig = ""
@@ -75,6 +75,7 @@ def createKubernetesPodConfig(type)
                 nodeSelector:
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux
+                  kubernetes.io/arch: ${arch}
                 containers:
                   ${containerConfig}
                   - name: jnlp
@@ -96,9 +97,10 @@ def createKubernetesPodConfig(type)
 }
 
 
-def buildImage(target, action="build", torchInstallType="skip", args="", custom_tag="", post_tag="")
+def buildImage(target, action="build", torchInstallType="skip", args="", custom_tag="", post_tag="", is_sbsa=false)
 {
-    def tag = "x86_64-${target}-torch_${torchInstallType}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}${post_tag}"
+    def arch = is_sbsa ? "sbsa" : "x86_64"
+    def tag = "${arch}-${target}-torch_${torchInstallType}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}${post_tag}"
 
     // Step 1: cloning tekit source code
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
@@ -236,60 +238,60 @@ pipeline {
         stage("Build")
         {
             parallel {
-                stage("Build trtllm release") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("trtllm", "push", "skip", "", LLM_BRANCH_TAG)
-                    }
-                }
-                stage("Build x86_64-skip") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("devel", params.action, "skip")
-                    }
-                }
-                stage("Build x86_64-pre_cxx11_abi") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("devel", params.action, "src_non_cxx11_abi")
-                    }
-                }
-                stage("Build x86_64-cxx11_abi") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("devel", params.action, "src_cxx11_abi")
-                    }
-                }
-                stage("Build rockylinux8 x86_64-skip-py3.10") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.10.12", "", "-py310")
-                    }
-                }
-                stage("Build rockylinux8 x86_64-skip-py3.12") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.12.3", "", "-py312")
-                    }
-                }
+                // stage("Build trtllm release") {
+                //     agent {
+                //         kubernetes createKubernetesPodConfig("build")
+                //     }
+                //     steps
+                //     {
+                //         buildImage("trtllm", "push", "skip", "", LLM_BRANCH_TAG)
+                //     }
+                // }
+                // stage("Build x86_64-skip") {
+                //     agent {
+                //         kubernetes createKubernetesPodConfig("build")
+                //     }
+                //     steps
+                //     {
+                //         buildImage("devel", params.action, "skip")
+                //     }
+                // }
+                // stage("Build x86_64-pre_cxx11_abi") {
+                //     agent {
+                //         kubernetes createKubernetesPodConfig("build")
+                //     }
+                //     steps
+                //     {
+                //         buildImage("devel", params.action, "src_non_cxx11_abi")
+                //     }
+                // }
+                // stage("Build x86_64-cxx11_abi") {
+                //     agent {
+                //         kubernetes createKubernetesPodConfig("build")
+                //     }
+                //     steps
+                //     {
+                //         buildImage("devel", params.action, "src_cxx11_abi")
+                //     }
+                // }
+                // stage("Build rockylinux8 x86_64-skip-py3.10") {
+                //     agent {
+                //         kubernetes createKubernetesPodConfig("build")
+                //     }
+                //     steps
+                //     {
+                //         buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.10.12", "", "-py310")
+                //     }
+                // }
+                // stage("Build rockylinux8 x86_64-skip-py3.12") {
+                //     agent {
+                //         kubernetes createKubernetesPodConfig("build")
+                //     }
+                //     steps
+                //     {
+                //         buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.12.3", "", "-py312")
+                //     }
+                // }
                 stage("Build SBSA-skip") {
                     agent {
                         kubernetes createKubernetesPodConfig("agent")
@@ -297,6 +299,15 @@ pipeline {
                     steps
                     {
                         triggerSBSARemoteJob(params.action, "skip")
+                    }
+                }
+                stage("Build SBSA-skip-new") {
+                    agent {
+                        kubernetes createKubernetesPodConfig("build", "arm64")
+                    }
+                    steps
+                    {
+                        buildImage("devel", params.action, "skip", "", "", "", true)
                     }
                 }
                 // Waived due to a pytorch issue: https://github.com/pytorch/pytorch/issues/141083
