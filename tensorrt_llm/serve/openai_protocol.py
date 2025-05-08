@@ -237,7 +237,7 @@ class CompletionRequest(OpenAIBaseModel):
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             return_context_logits=self.return_context_logits,
-            guided_decoding_params=_response_format_to_guided_decoding_params(
+            guided_decoding=_response_format_to_guided_decoding_params(
                 self.response_format),
 
             # completion-extra-params
@@ -547,7 +547,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             skip_special_tokens=self.skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
-            guided_decoding_params=_response_format_to_guided_decoding_params(
+            guided_decoding=_response_format_to_guided_decoding_params(
                 self.response_format),
 
             # chat-completion-extra-params

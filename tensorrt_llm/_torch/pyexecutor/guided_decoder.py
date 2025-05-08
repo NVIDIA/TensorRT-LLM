@@ -86,6 +86,12 @@ class GuidedDecoder:
                         case GuidedDecodingParams.GuideType.STRUCTURAL_TAG:
                             structural_tag_parameters = json.loads(guide)
                             structures = structural_tag_parameters["structures"]
+                            structures = [
+                                xgrammar.StructuralTagItem(
+                                    begin=s["begin"],
+                                    schema=json.dumps(s["schema"]),
+                                    end=s["end"]) for s in structures
+                            ]
                             triggers = structural_tag_parameters["triggers"]
                             compiled_grammar = self.xgrammar_compiler.compile_structural_tag(
                                 structures, triggers)
