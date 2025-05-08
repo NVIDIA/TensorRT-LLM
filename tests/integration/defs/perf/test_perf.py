@@ -51,7 +51,7 @@ MODEL_PATH_DICT = {
     "llama_v3.1_405b_instruct_fp4":
     "llm-models/modelopt-hf-model-hub/Llama-3.1-405B-Instruct-fp4",
     "llama_v3.1_70b_instruct": "llama-3.1-model/Meta-Llama-3.1-70B-Instruct",
-    "llama_v3.2_11b": "llama-3.2-models/Llama-3.2-11B-Vision",
+    "llama_v3.2_1b": "llama-3.2-models/Llama-3.2-1B",
     "llama_v3.3_nemotron_49b": "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1/",
     "llama_v3.1_nemotron_nano_8b": "Llama-3.1-Nemotron-Nano-8B-v1",
     # "llama_30b": "llama-models/llama-30b-hf",
@@ -982,28 +982,28 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             istdev = 16
             ostdev = 24
             nloras = self._config.num_loras
-            lora_data = os.path.join(engine_dir,
-                                     f"token-norm-dist-lora-{nloras}.json")
-            # with open(lora_data, 'w') as file:
-            #     pass
+            # lora_data = os.path.join(engine_dir,
+            #                          f"token-norm-dist-lora-{nloras}.json")
+            dataset_path = os.path.join(engine_dir, "synthetic_data.json")
             data_cmd += [
-                "python3", prepare_data_script, f"--output={lora_data}",
+                "python3", prepare_data_script, f"--stdout",
                 f"--rand-task-id 0 {nloras-1}", f"--tokenizer={tokenizer_dir}",
                 f"token-norm-dist", f"--num-requests={self._config.num_reqs}",
                 f"--input-mean={input_len}", f"--output-mean={output_len}",
-                f"--input-stdev={istdev}", f"--output-stdev={ostdev}"
+                f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
+                f" > {dataset_path}"
             ]
-            data_cmd += [";"]
-            generate_rand_lora_script = os.path.join(self._llm_root,
-                                                     "benchmarks", "cpp",
-                                                     "utils",
-                                                     "generate_rand_loras.py")
-            checkpoint_dir = os.path.join(engine_dir, "lora_cpp")
-            lora_dir = os.path.join(engine_dir, f"loras")
-            data_cmd += [
-                "python3", generate_rand_lora_script, checkpoint_dir, lora_dir,
-                "16"
-            ]
+            if self._config.runtime == "cppmanager":
+                data_cmd += [";"]
+                generate_rand_lora_script = os.path.join(
+                    self._llm_root, "benchmarks", "cpp", "utils",
+                    "generate_rand_loras.py")
+                checkpoint_dir = os.path.join(engine_dir, "lora_cpp")
+                lora_dir = os.path.join(engine_dir, f"loras")
+                data_cmd += [
+                    "python3", generate_rand_lora_script, checkpoint_dir,
+                    lora_dir, "16"
+                ]
         else:
             istdev = 0
             ostdev = 0
