@@ -1,0 +1,39 @@
+hostname: localhost
+port: 8000
+model: DeepSeek-V3-Lite/fp8
+backend: "pytorch"
+# speculative_config:
+#   decoding_type: MTP
+#   num_nextn_predict_layers: 1
+pytorch_backend_config:
+  use_cuda_graph: False
+  enable_overlap_scheduler: False
+  autotuner_enabled: False
+context_servers:
+  num_instances: 2
+  router:
+    type: kv_cache_aware
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  kv_cache_config:
+    enable_block_reuse: True
+    enable_partial_reuse: True
+    event_buffer_max_size: 1024
+    free_gpu_memory_fraction: 0.1
+  urls:
+      - "localhost:8001"
+      - "localhost:8002"
+generation_servers:
+  num_instances: 2
+  router:
+    type: kv_cache_aware
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  kv_cache_config:
+    enable_block_reuse: True
+    enable_partial_reuse: True
+    event_buffer_max_size: 1024
+    free_gpu_memory_fraction: 0.1
+  urls:
+      - "localhost:8003"
+      - "localhost:8004"
