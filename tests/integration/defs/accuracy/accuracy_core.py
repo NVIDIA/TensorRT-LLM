@@ -151,13 +151,21 @@ class AccuracyTask:
             raise ValueError(
                 f"Not recognized speculative_config: {llm.args.speculative_config}."
             )
+        is_integration_test = os.getenv('INTEGRATION_TEST', '0') == '1'
 
-        num_samples, threshold = self.get_num_samples_and_threshold(
-            dtype=llm.args.dtype,
-            quant_algo=llm.args.quant_config.quant_algo,
-            kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
-            spec_dec_algo=spec_dec_algo,
-            extra_acc_spec=extra_acc_spec)
+        if is_integration_test:
+            num_samples = 1
+            logger.info(
+                "Running in INTEGRATION_TEST mode: using only 1 sample and skipping accuracy verification"
+            )
+            threshold = 0
+        else:
+            num_samples, threshold = self.get_num_samples_and_threshold(
+                dtype=llm.args.dtype,
+                quant_algo=llm.args.quant_config.quant_algo,
+                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                spec_dec_algo=spec_dec_algo,
+                extra_acc_spec=extra_acc_spec)
 
         sampling_params = SamplingParams(
             max_tokens=self.MAX_OUTPUT_LEN,

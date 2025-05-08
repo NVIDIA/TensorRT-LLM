@@ -265,7 +265,7 @@ class FusedMoE(nn.Module):
                 equals to: dynamic quant + routing(topK, etc.) [+ fp4_allgather] + scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute [no allreduce] + reducescatter
 
         trtllm_gen backend (moe_backend="TRTLLM"):
-            min-latency mode (min_latency_mode flag of forward has no effect when trtllm_gen is used):
+            min-latency mode (cutlass_min_latency_mode flag of forward has no effect when trtllm_gen is used):
                 dynamic quant + FusedMoe Op
                 equals to: dynamic quant + routing(topK, etc.) + scatter + gemm1 + swiglu + gemm2 + finalize MoeRoute
 
@@ -689,7 +689,7 @@ class FusedMoE(nn.Module):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        min_latency_mode: bool = False,
+        cutlass_min_latency_mode: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens=None,
     ) -> torch.Tensor:
@@ -755,18 +755,22 @@ class FusedMoE(nn.Module):
 
         if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
         ) and not self.enable_alltoall:
+            # Fp4 gemm has extra scaling factor
             x_sf, token_selected_experts, token_final_scales = self.all_gather(
                 [x_sf, token_selected_experts, token_final_scales])
             x = allgather(x, self.mapping, gather_dim=0)
-            token_selected_experts = token_selected_experts.flatten(
-                0, 1).contiguous()
-            token_final_scales = token_final_scales.flatten(0, 1).contiguous()
-
             if x_sf is not None:
                 x_sf = reswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
 
-        if self.smart_router and not min_latency_mode:
+            # llama4 token final scales are already multiplied with input x
+            if not self.apply_router_weight_on_input:
+                token_final_scales = token_final_scales.flatten(0,
+                                                                1).contiguous()
+            token_selected_experts = token_selected_experts.flatten(
+                0, 1).contiguous()
+
+        if self.smart_router and not cutlass_min_latency_mode:
             ep_size = self.cluster_size
             ep_rank = self.cluster_rank
             expert_start = ep_rank * self.num_experts // ep_size
@@ -808,15 +812,15 @@ class FusedMoE(nn.Module):
             cluster_size=cluster_size,
             cluster_rank=cluster_rank,
             use_fp8_block_scaling=use_fp8_block_scaling,
-            min_latency_mode=min_latency_mode,
+            min_latency_mode=cutlass_min_latency_mode,
         )
 
-        if min_latency_mode:
+        if cutlass_min_latency_mode:
             assert not self.reduce_results
             return final_hidden_states
         else:
             # Custom op requires all inputs are in the same type.
-            # Only in min_latency_mode, the output is a list of tensors.
+            # Only in cutlass_min_latency_mode, the output is a list of tensors.
             # Otherwise, the output should be unpacked as a single tensor.
             final_hidden_states = final_hidden_states[0]
 
@@ -830,16 +834,17 @@ class FusedMoE(nn.Module):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        min_latency_mode: bool = False,
+        cutlass_min_latency_mode: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """
-        min_latency_mode has no effect when trtllm_gen backend is enabled.
+        cutlass_min_latency_mode has no effect when trtllm_gen backend is enabled.
         """
         if self.is_cutlass():
-            return self.forward_cutlass(x, router_logits, min_latency_mode,
-                                        output_dtype, all_rank_num_tokens)
+            return self.forward_cutlass(x, router_logits,
+                                        cutlass_min_latency_mode, output_dtype,
+                                        all_rank_num_tokens)
         elif self.is_trtllm():
             return self.forward_trtllmgen(x, router_logits)
         else:
@@ -851,7 +856,7 @@ class FusedMoE(nn.Module):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        min_latency_mode: bool = False,
+        cutlass_min_latency_mode: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
@@ -864,18 +869,19 @@ class FusedMoE(nn.Module):
                 max_chunk_size //= len(all_rank_num_tokens)
 
         num_rows = x.shape[0]
+        # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
         num_chunks = (num_rows + max_chunk_size - 1) // max_chunk_size
 
-        if min_latency_mode:
+        if cutlass_min_latency_mode:
             assert num_chunks == 1 and (
                 not self.reduce_results
-            ), "min_latency_mode must be used with a single chunk and reduce_results must be False"
+            ), "cutlass_min_latency_mode must be used with a single chunk and reduce_results must be False"
 
         if num_chunks == 1:
             outputs = self.forward_chunk(
                 x,
                 router_logits,
-                min_latency_mode,
+                cutlass_min_latency_mode,
                 output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens)
             outputs = self.reducescatter_or_allreduce(outputs)
