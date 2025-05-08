@@ -163,8 +163,7 @@ def apply_build_mode_settings(params):
     type=bool,
     default=False,
     help=
-    "Do not load the weights from the checkpoint. Use dummy weights instead."
-)
+    "Do not load the weights from the checkpoint. Use dummy weights instead.")
 @optgroup.group(
     "Build Engine with Dataset Information",
     cls=AllOptionGroup,
