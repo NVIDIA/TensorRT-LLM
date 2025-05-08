@@ -75,7 +75,7 @@ void StopCriteriaLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> con
 
     auto localDecoderDomain = getLocalDecoderDomain(inputs, mDecoderDomain);
     // Beam width might have been changed in Variable-Beam-Width-Search mode
-    localDecoderDomain.setBeamWidth(baseOutputs->variableBeamWidth);
+    localDecoderDomain.setBeamWidth(baseOutputs->beamWidth);
 
     auto const maxSeqLen = outputs->outputIds->getDimension<-1>();
 

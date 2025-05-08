@@ -512,7 +512,6 @@ public:
     TensorPtr outputIdsPtr;     // [maxBatchSize][maxBeamWidth, maxSeqLen], on gpu and outputIdsPtr[i], on gpu
     TensorPtr outputIdsPtrHost; // [maxBatchSize][maxBeamWidth, maxSeqLen], on cpu but outputIdsPtrHost[i], on gpu
     TensorPtr parentIdsPtr;     // [maxBatchSize][maxBeamWidth, maxSeqLen], on cpu but parentIdsPtr[i], on gpu
-
     TensorPtr newTokens;        // [maxBatchSize, maxBeamWidth], on gpu, tokens predicted at current iteration.
 
     // optional parameters
@@ -520,7 +519,9 @@ public:
     std::optional<TensorPtr> finishedSum;  // [1], on pinned
     std::optional<TensorPtr> outputLogProbsTiled; // [maxSeqLen, maxBatchSize, maxBeamWidth], on gpu
 
-    runtime::SizeType32 variableBeamWidth{1};     // For Variable-Beam-Width-Search
+    // Beam width might change in Variable-Beam-Width-Search mode.
+    // So the beam width is updated in beam search layer for the later layers.
+    runtime::SizeType32 beamWidth{1};
 };
 
 class BeamSearchOutputs : public BaseDecodingOutputs
