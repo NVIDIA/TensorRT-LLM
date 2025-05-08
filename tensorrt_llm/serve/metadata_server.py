@@ -60,7 +60,8 @@ class JsonDictionary:
         self._dict = dict
 
     def get(self, key: str) -> str:
-        return json.loads(self._dict.get(key))
+        bytes_data, _ = self._dict.get(key)
+        return json.loads(bytes_data.decode('utf-8'))
 
     def put(self, key: str, value: str):
         self._dict.put(key, json.dumps(value))
