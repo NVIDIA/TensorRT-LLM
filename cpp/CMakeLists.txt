@@ -51,6 +51,10 @@ else()
   message(STATUS "NVTX is enabled")
 endif()
 
+# Add TensorRT-LLM Gen export interface and CUDA support
+add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
+add_compile_definitions("TLLM_ENABLE_CUDA")
+
 set(INTERNAL_CUTLASS_KERNELS_PATH
     ""
     CACHE

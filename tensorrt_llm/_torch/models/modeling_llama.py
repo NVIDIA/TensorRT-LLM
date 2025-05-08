@@ -367,8 +367,7 @@ class Llama4DecoderLayer(DecoderLayer):
             use_qk_norm=getattr(config, "use_qk_norm", False),
             nope_layer=config.no_rope_layers[layer_idx] == 0,
             attn_temperature_tuning=config.attn_temperature_tuning > 0,
-            aux_stream=aux_stream,
-        )
+            aux_stream=aux_stream)
 
         is_mlp_layer = (layer_idx + 1) % config.interleave_moe_layer_step != 0
 

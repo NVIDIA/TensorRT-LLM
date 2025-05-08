@@ -171,6 +171,7 @@ set(TRTLLM_LINK_LIBS
     trtllm_gen_fp8_block_scale_moe
     trtllm_gen_gemm
     trtllm_gen_fp8_batched_gemm
+    trtllm_gen_gemm_gated_act
     selective_scan_src
     ws_layernorm_src
     fpA_intB_gemm_src
