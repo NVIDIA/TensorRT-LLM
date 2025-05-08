@@ -27,7 +27,7 @@ namespace tk = tensorrt_llm::kernels;
 namespace torch_ext
 {
 
-// Must be similar to [cpp/tensorrt_llm/runtime/gptSession.cpp] GptDecoder<T>::gatherTree
+// Must be similar to GptDecoder<T>::gatherTree
 th::Tensor gatherTree(                                    // BS: batch_size, BM: beam_width, MSL: max_seq_length
     th::Tensor& sequence_lengths,                         // [BS*BM], int
     th::Tensor& output_ids,                               // [BS, BM, MSL],int

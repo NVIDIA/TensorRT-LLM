@@ -5,14 +5,12 @@ trt_llm_release_perf_test:
       system_gpu_count:
         gte: 1
   tests:
-  # E2E gptSessionBenchmark
-  - perf/test_perf.py::test_perf[gpt_350m_moe-cpp-plugin-float16-bs:64-input_output_len:128,8+512,32]
-
   # E2E BERT
   - perf/test_perf.py::test_perf[bert_large-cpp-plugin-float16-bs:32+64-input_len:128+512]
   - perf/test_perf.py::test_perf[roberta_base-cpp-plugin-float16-bs:32+64-input_len:128+512]
 
   # E2E gptManagerBenchmark IFB
+  - perf/test_perf.py::test_perf[gpt_350m_moe-cppmanager-exe-plugin-float16-bs:64-input_output_len:128,8+512,32]
   - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-static_batching-plugin_ifb-float16-bs:8+64-input_output_len:128,128+512,32]
   - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-float16-mp-input_output_len:128,128+512,32]
   - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-bfloat16-gwp:0.0-input_output_len:128,128+512,32]

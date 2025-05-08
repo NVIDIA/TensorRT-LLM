@@ -268,7 +268,6 @@ def run_model_benchmarks(root_dir, build_dir, cpp_resources_dir, python_exe,
 
     def _run(
         model_name: str,
-        test_gpt_session_benchmark: bool,
         batching_types: List[str],
         api_types: List[str],
     ):
@@ -280,7 +279,6 @@ def run_model_benchmarks(root_dir, build_dir, cpp_resources_dir, python_exe,
             build_dir=build_dir,
             resources_dir=cpp_resources_dir,
             model_cache=model_cache,
-            test_gpt_session_benchmark=test_gpt_session_benchmark,
             batching_types=batching_types,
             api_types=api_types,
         )
@@ -331,8 +329,8 @@ def test_unit_tests(build_google_tests, test_group, build_dir, lora_setup):
                          indirect=True)
 @pytest.mark.parametrize("model", [
     "bart", "chatglm", "eagle", "encoder", "enc_dec_language_adapter", "gpt",
-    "gpt_executor", "gpt_session", "gpt_tests", "llama", "mamba", "medusa",
-    "recurrentgemma", "redrafter", "t5"
+    "gpt_executor", "gpt_tests", "llama", "mamba", "medusa", "recurrentgemma",
+    "redrafter", "t5"
 ])
 @pytest.mark.parametrize("run_fp8", [False, True], ids=["", "fp8"])
 def test_model(build_google_tests, model, prepare_model, run_model_tests,
@@ -356,13 +354,11 @@ def test_benchmarks(build_benchmarks, model, prepare_model,
 
     prepare_model(model)
 
-    test_gpt_session_benchmark = True if model == "gpt" else False
-    batching_types = ["IFB", "V1"] if model == "gpt" else ["IFB"]
+    batching_types = ["IFB"]
     api_types = ["executor"]
 
     run_model_benchmarks(
         model_name=model,
-        test_gpt_session_benchmark=test_gpt_session_benchmark,
         batching_types=batching_types,
         api_types=api_types,
     )

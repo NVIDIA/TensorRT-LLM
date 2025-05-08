@@ -36,7 +36,6 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
-#include "tensorrt_llm/runtime/utils/sessionUtils.h"
 
 #include <algorithm>
 #include <iterator>

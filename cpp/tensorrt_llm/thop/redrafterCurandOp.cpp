@@ -40,7 +40,7 @@ namespace torch_ext
 
 namespace
 {
-// Must be similar to [cpp/tensorrt_llm/runtime/gptSession.cpp] ExplicitDraftTokensLayer<T>::setup
+// Must be similar to ExplicitDraftTokensLayer<T>::setup
 void initializeDeviceCurandStates(
     int64_t batchSize, th::Tensor& curandState, th::optional<th::Tensor>& randomSeeds, cudaStream_t stream)
 {
