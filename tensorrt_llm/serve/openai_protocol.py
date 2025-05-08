@@ -134,7 +134,9 @@ def _response_format_to_guided_decoding_params(
 ) -> Optional[GuidedDecodingParams]:
     if response_format is None:
         return None
-    if response_format.type == "json_object":
+    elif response_format.type == "text":
+        return None
+    elif response_format.type == "json_object":
         return GuidedDecodingParams(json_object=True)
     elif response_format.type == "structural_tag":
         return GuidedDecodingParams(
@@ -193,10 +195,10 @@ class CompletionRequest(OpenAIBaseModel):
     )
     response_format: Optional[ResponseFormat] = Field(
         default=None,
-        description=(
-            "Similar to chat completion, this parameter specifies the format of "
-            "output. Only {'type': 'json_object'} or {'type': 'text' } is "
-            "supported."),
+        description=
+        ("Similar to chat completion, this parameter specifies the format of "
+         "output. {'type': 'json_object'}, {'type': 'text' }, {'type': 'structural_tag'} are "
+         "supported."),
     )
 
     disaggregated_params: Optional[DisaggregatedParams] = Field(
