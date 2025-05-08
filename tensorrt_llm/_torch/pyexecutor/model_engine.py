@@ -7,6 +7,7 @@ import itertools
 import math
 import os
 import traceback
+import weakref
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from typing import Any, Dict, Optional, Tuple
@@ -41,7 +42,8 @@ from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      timing)
 from ..pipeline_interface import PipelineInterface
 from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
-from ..utils import set_torch_compiling, with_model_extra_attrs
+from ..utils import (get_model_extra_attrs, set_torch_compiling,
+                     with_model_extra_attrs)
 from .config import LoadFormat, PyTorchConfig
 from .cuda_graph_runner import DecodingCUDAGraphRunner
 from .guided_decoder import GuidedDecoder
@@ -428,6 +430,15 @@ class PyTorchModelEngine(ModelEngine):
             logger.info("Skipping warm up as no KV Cache manager allocated.")
             return
 
+        # When we generate last token for the max_seq_len case,
+        # we only need to store (max_seq_len - 1 - max_num_draft_tokens) tokens in the KV cache.
+        # For the max_seq_len, some speculative decoding methods need extra kv tokens in kv cache
+        # manager to support different kv lengths for the draft/target layers. So, we also
+        # need to remove those extra tokens from the max_seq_len.
+        def calculate_warmup_max_seq_lens(max_num_draft_tokens):
+            max_seq_len = self.max_seq_len - 1 - kv_cache_manager.num_extra_kv_tokens - max_num_draft_tokens
+            return max_seq_len
+
         def get_cuda_graph_warmup_request(batch_size):
             available_blocks = kv_cache_manager.get_num_free_blocks()
 
@@ -445,17 +456,10 @@ class PyTorchModelEngine(ModelEngine):
                 )
                 available_blocks -= batch_size - 1
                 available_tokens = available_blocks * kv_cache_manager.tokens_per_block
-                # When we generate last token for the max_seq_len case,
-                # we only need to store (max_seq_len - 1 - max_num_draft_tokens) tokens in the KV cache.
-                # For the max_seq_len, some speculative decoding methods need extra kv tokens in kv cache
-                # manager to support different kv lengths for the draft/target layers. So, we also
-                # need to remove those extra tokens from the max_seq_len.
                 token_num = max(
                     1,
-                    min(
-                        available_tokens, self.max_seq_len -
-                        kv_cache_manager.num_extra_kv_tokens - 1 -
-                        max_num_draft_tokens),
+                    min(available_tokens,
+                        calculate_warmup_max_seq_lens(max_num_draft_tokens)),
                 )
 
                 # Add one dummy request with the maximum possible sequence length.
@@ -577,7 +581,7 @@ class PyTorchModelEngine(ModelEngine):
                         for num_tokens_per_request in [
                                 1,
                                 min(self.max_num_tokens // max(bs, 1),
-                                    kv_cache_manager.max_seq_len - 1)
+                                    calculate_warmup_max_seq_lens(0))
                         ]:
                             with release_batch(
                                     get_torch_compile_warmup_request(
@@ -598,8 +602,8 @@ class PyTorchModelEngine(ModelEngine):
 
             if self.pytorch_backend_config.autotuner_enabled:
                 with no_cuda_graph(), autotune():
-                    num_tokens_per_request = min(self.max_seq_len - 1,
-                                                 self.max_num_tokens)
+                    num_tokens_per_request = min(
+                        calculate_warmup_max_seq_lens(0), self.max_num_tokens)
                     with release_batch(
                             get_torch_compile_warmup_request(
                                 1, num_tokens_per_request)) as batch:
@@ -1934,6 +1938,11 @@ class PyTorchModelEngine(ModelEngine):
             return outputs
 
     def model_forward(self, **kwargs):
+        attrs = get_model_extra_attrs()
+        assert attrs is not None, "Model extra attrs is not set"
+        attrs["attention_metadata"] = weakref.ref(kwargs['attn_metadata'])
+        attrs.update(self.model.model_config.extra_attrs)
+
         if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
             return trace_func(self.model.forward)(**kwargs)
         else:

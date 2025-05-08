@@ -684,7 +684,6 @@ class MTPWorker(nn.Module):
         num_accepted_tokens = torch.ones(batch_size,
                                          dtype=torch.int,
                                          device=logits.device)
-
         if self.spec_config.use_relaxed_acceptance_for_thinking:
             # context
             con_logits = logits[:num_contexts]
@@ -726,8 +725,7 @@ class MTPWorker(nn.Module):
                                                   device=logits.device)
                 accepted_tokens, num_accepted_tokens = torch.ops.trtllm.mtp_sampling_and_accepted_draft_tokens_op(
                     logits, spec_metadata.draft_tokens, target_tokens_cache,
-                    accepted_tokens, num_accepted_tokens, mtp_num_modules,
-                    batch_size, num_contexts, logits.shape[-1])
+                    mtp_num_modules, batch_size, num_contexts, logits.shape[-1])
             else:
                 # Do greedy sampling for the input logits
                 target_tokens = torch.argmax(logits, dim=-1)
