@@ -154,7 +154,16 @@ def call(*popenargs,
          **kwargs):
     if not suppress_output_info:
         print(f"Start subprocess with call({popenargs}, {kwargs})")
-    with Popen(*popenargs, start_new_session=start_new_session, **kwargs) as p:
+
+    running_log = None
+    if "running_log" in kwargs:
+        if isinstance(kwargs["running_log"], str):
+            running_log = open(kwargs["running_log"], "wt")
+        kwargs.pop("running_log", 'Not Found')
+    with Popen(*popenargs,
+               start_new_session=start_new_session,
+               stdout=running_log,
+               **kwargs) as p:
         try:
             retcode = p.wait(timeout=timeout)
             if retcode and start_new_session:
