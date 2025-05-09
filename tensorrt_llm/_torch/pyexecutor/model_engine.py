@@ -315,7 +315,9 @@ class PyTorchModelEngine(ModelEngine):
                     self.model,
                     backend=Backend(
                         pytorch_backend_config.torch_compile_inductor_enabled,
-                        enable_userbuffers=use_ub),
+                        enable_userbuffers=use_ub,
+                        enable_multi_stream=pytorch_backend_config.
+                        torch_compile_multi_stream),
                     fullgraph=pytorch_backend_config.torch_compile_fullgraph)
             else:
                 set_torch_compiling(False)

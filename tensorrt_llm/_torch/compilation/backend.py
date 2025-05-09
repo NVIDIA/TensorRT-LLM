@@ -1,14 +1,15 @@
 import os
-from typing import List, Optional, Union
+from typing import List
 
 import torch
 from torch._functorch.aot_autograd import aot_module_simplified
 from torch._inductor.compile_fx import compile_fx
 from torch._inductor.pattern_matcher import PatternMatcherPass
-from torch.fx import Graph, GraphModule
+from torch.fx import GraphModule
 
 import tensorrt_llm
 
+from .multi_stream import multi_stream_pass
 from .patterns.ar_residual_norm import register_ar_residual_norm
 from .patterns.residual_add_norm import register_add_norm
 from .patterns.ub_allreduce import register_ub_patterns
@@ -19,7 +20,10 @@ class Backend:
 
     _custom_pass_instances: List[PatternMatcherPass] = None
 
-    def __init__(self, enable_inductor=True, enable_userbuffers=False) -> None:
+    def __init__(self,
+                 enable_inductor=True,
+                 enable_userbuffers=False,
+                 enable_multi_stream=True) -> None:
         super().__init__()
         self.elapsed_time = 0
         self.module_inference_event = []
@@ -27,15 +31,11 @@ class Backend:
         self.call_count = 0
         self.custom_passes = Backend.get_custom_pass(enable_userbuffers)
         self.rank = tensorrt_llm.mpi_rank()
-        self.enable_inductor = enable_inductor
-
+        # If multi-stream is enabled, we disable inductor since they are not compatible
+        self.enable_inductor = enable_inductor if not enable_multi_stream else False
+        self.enable_multi_stream = enable_multi_stream
+        self.aux_stream = None
         self.match_count = []
-
-        if enable_inductor:
-            from torch._inductor import config
-
-            self.inductor_config = config.get_config_copy()
-            self.inductor_config["joint_custom_post_pass"] = self.optimize
 
     @classmethod
     def get_custom_pass(cls, enable_userbuffers):
@@ -58,30 +58,33 @@ class Backend:
 
     def optimize(
         self,
-        gm: Union[GraphModule | Graph],
-        example_inputs: Optional[List[torch.Tensor]] = None,
+        gm: GraphModule,
+        example_inputs: List[torch.Tensor],
     ):
-        graph = gm.graph if isinstance(gm, GraphModule) else gm
+        graph = gm.graph
         for custom_pass in self.custom_passes:
             self.match_count.append(custom_pass.apply(graph))
             while self.match_count[-1]:
                 self.match_count.append(custom_pass.apply(graph))
         graph.eliminate_dead_code()
-        if isinstance(gm, GraphModule):
-            gm.recompile()
 
-        return gm
+        gm.recompile()
+
+        if self.enable_multi_stream:
+            # After multi-stream pass, we'd better not to run any pass on the graph since multi-stream relay on the specific op order to work properly
+            gm, aux_stream = multi_stream_pass(gm)
+            self.aux_stream = aux_stream
+
+        if self.enable_inductor:
+            return compile_fx(gm, example_inputs)
+        else:
+            return gm
 
     def __call__(self, gm: GraphModule,
                  example_inputs: List[torch.Tensor]) -> callable:
 
         gm = recover_pass(gm)
 
-        if self.enable_inductor:
-            return compile_fx(gm,
-                              example_inputs,
-                              config_patches=self.inductor_config)
-        else:
-            return aot_module_simplified(gm,
-                                         example_inputs,
-                                         fw_compiler=self.optimize)
+        return aot_module_simplified(gm,
+                                     example_inputs,
+                                     fw_compiler=self.optimize)
