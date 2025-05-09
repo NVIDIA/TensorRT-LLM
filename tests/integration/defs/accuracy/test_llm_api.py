@@ -38,6 +38,25 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
+
+    @pytest.mark.skip_less_device(2)
+    def test_cp2(self):
+        with LLM(self.MODEL_PATH, context_parallel_size=2) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    def test_tp2cp2(self):
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=2,
+                 context_parallel_size=2) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestMistral7B_0_3(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
     MODEL_PATH = f"{llm_models_root()}/Mistral-7B-Instruct-v0.3"
@@ -100,13 +119,6 @@ class TestMixtral8x7B(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @pytest.mark.skip_less_device(2)
-    def test_cp2(self):
-        with LLM(self.MODEL_PATH, context_parallel_size=2) as llm:
-            # TRTLLM_ACCURACY_NO_REFERENCE=1 pytest -vs "test_llm_api.py::TestMixtral8x7B::test_cp2[]"
-            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @skip_pre_ada
