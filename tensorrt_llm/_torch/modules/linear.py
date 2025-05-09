@@ -388,7 +388,7 @@ class Linear(nn.Module):
                             low_latency_kernel=True,
                             gated_silu=False,
                         )
-                elif (self.use_llama4_fc_swiglu_kernel and qinput.shape[0] <= 4) or self.use_llama4_gemv_for_fc_swiglu:
+                elif (self.use_llama4_fc_swiglu_kernel and qinput.shape[0] < 4) or self.use_llama4_gemv_for_fc_swiglu:
                     # Outputing fp8 even though self.dtype is bfloat16
                     # That is why we need inv_input_scale from next linear layer to
                     # offset the quantization.
@@ -400,7 +400,7 @@ class Linear(nn.Module):
                         self.combined_scale,
                         self.next_gate_down_inv_input_scale,
                     )
-                elif self.use_llama4_fc_swiglu_kernel and (4 < qinput.shape[0] <= 16):
+                elif self.use_llama4_fc_swiglu_kernel and (4 <= qinput.shape[0] <= 16):
                     if not hasattr(self, "trtllm_gen_global_scale"):
                         raise ValueError('Expect trtllm_gen_global_scale to be set')
                     # Outputing fp8 even though self.dtype is bfloat16
@@ -546,7 +546,7 @@ class Linear(nn.Module):
                                                self.weight,
                                                self.bias)
             elif self.use_llama4_fc_swiglu_kernel:
-                if 4 < input.shape[0] <= 16 and not self.use_llama4_gemv_for_fc_swiglu:
+                if 4 <= input.shape[0] <= 16 and not self.use_llama4_gemv_for_fc_swiglu:
                     output = self.apply_linear(input,
                                                self.trtllm_gen_weight,
                                                self.bias)
@@ -560,7 +560,7 @@ class Linear(nn.Module):
                 output = allgather(output, self.mapping)
         else:
             if self.use_llama4_fc_swiglu_kernel:
-                if 4 < input.shape[0] <= 16 and not self.use_llama4_gemv_for_fc_swiglu:
+                if 4 <= input.shape[0] <= 16 and not self.use_llama4_gemv_for_fc_swiglu:
                     output = self.apply_linear(input,
                                                self.trtllm_gen_weight,
                                                self.bias)
