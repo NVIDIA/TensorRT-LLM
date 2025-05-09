@@ -339,7 +339,7 @@ class MTPWorker(nn.Module):
         # Sample and verify draft tokens
         raw_logits = logits
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
-            logits, spec_metadata, attn_metadata)
+            input_ids, logits, spec_metadata, attn_metadata)
 
         # Update MTP past hidden states
         self.update_mtp_hidden_states(input_ids=input_ids,
@@ -603,6 +603,7 @@ class MTPWorker(nn.Module):
 
     def sample_and_accept_draft_tokens(
         self,
+        input_ids: torch.LongTensor,
         logits: torch.Tensor,
         spec_metadata: MTPSpecMetadata,
         attn_metadata: AttentionMetadata,
@@ -614,6 +615,10 @@ class MTPWorker(nn.Module):
         for acceptance.
 
         Args:
+            input_ids: torch.LongTensor
+                [num_tokens]
+                The input ids of all requests. Flatten.
+
             logits: torch.Tensor
                 [num_tokens, vocab_size]
                 Logits produced by the target model.
@@ -686,10 +691,31 @@ class MTPWorker(nn.Module):
                                          device=logits.device)
 
         if self.spec_config.use_relaxed_acceptance_for_thinking:
+            mtp_relaxed_delta_pool = spec_metadata.mtp_hidden_states_manager.mtp_relaxed_delta_pool
+
             # context
             con_logits = logits[:num_contexts]
             con_target_tokens = torch.argmax(con_logits, dim=-1)
             accepted_tokens[:num_contexts, 0] = con_target_tokens[:num_contexts]
+            last_tokens_idx = torch.cumsum(
+                attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+            ctx_input_ids = input_ids[:attn_metadata.num_ctx_tokens]
+            ctx_is_think = (ctx_input_ids ==
+                            self.spec_config.BEGIN_THINKING_PHASE_TOKEN).int()
+            ctx_is_think_cumsum = torch.cumsum(ctx_is_think, dim=0)
+            ctx_last_cumsum = ctx_is_think_cumsum[
+                last_tokens_idx[:num_contexts]]
+            ctx_think_tokens_num = torch.diff(
+                ctx_last_cumsum,
+                dim=0,
+                prepend=torch.zeros(1,
+                                    dtype=torch.int,
+                                    device=ctx_last_cumsum.device))
+
+            ctx_delta = (ctx_think_tokens_num
+                         >= 1).int() * self.spec_config.relaxed_delta
+            ctx_slot_ids = spec_metadata.slot_ids[:num_contexts]
+            mtp_relaxed_delta_pool.index_copy_(0, ctx_slot_ids, ctx_delta)
 
             # generation
             gen_logits = logits[num_contexts:]
@@ -709,10 +735,9 @@ class MTPWorker(nn.Module):
 
             accepted_tokens, num_accepted_tokens = torch.ops.trtllm.mtp_relaxed_acceptance_op(
                 spec_metadata.slot_ids, topk_value, topk_indices, draft_tokens,
-                spec_metadata.mtp_hidden_states_manager.mtp_relaxed_delta_pool,
-                num_accepted_tokens, accepted_tokens, mtp_num_modules,
-                batch_size, num_contexts, self.spec_config.relaxed_topk,
-                self.spec_config.relaxed_delta,
+                mtp_relaxed_delta_pool, num_accepted_tokens, accepted_tokens,
+                mtp_num_modules, batch_size, num_contexts,
+                self.spec_config.relaxed_topk, self.spec_config.relaxed_delta,
                 self.spec_config.BEGIN_THINKING_PHASE_TOKEN,
                 self.spec_config.END_THINKING_PHASE_TOKEN)
 
@@ -1003,7 +1028,7 @@ class MTPEagleWorker(MTPWorker):
         # Sample and verify draft tokens
         raw_logits = logits
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
-            logits, spec_metadata, attn_metadata)
+            input_ids, logits, spec_metadata, attn_metadata)
 
         # Save the old attn_metadata and spec_metadata
         if attn_metadata.is_cuda_graph:
