@@ -98,7 +98,7 @@ def createKubernetesPodConfig(type)
 
 def buildImage(target, action="build", torchInstallType="skip", args="", custom_tag="", post_tag="")
 {
-    def tag = "x86_64-${target}-torch_${torchInstallType}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}${post_tag}"
+    def tag = "x86_64-${target}-torch_${torchInstallType}${post_tag}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
     // Step 1: cloning tekit source code
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail

@@ -457,14 +457,14 @@ class Deepseekv3MoE(nn.Module):
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
                               all_rank_num_tokens, cutlass_min_latency_mode):
         # max-throughput
-        if self.use_dp and self.mapping.tp_size > 1 and not self.enable_alltoall:
+        if self.use_dp and self.mapping.tp_size > 1:
             max_num_token = max(all_rank_num_tokens)
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
                 (0, 0, 0, max_num_token - hidden_states.shape[0]))
             # FP4 all_gather moves this bf16 allgather in to after topk and fp4 quantization
             # to reduce allreduce BW
-            if disable_fp4_allgather():
+            if disable_fp4_allgather() and not self.enable_alltoall:
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
                                           gather_dim=0)

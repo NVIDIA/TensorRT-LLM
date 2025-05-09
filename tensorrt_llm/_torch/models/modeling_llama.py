@@ -10,7 +10,7 @@ from transformers.modeling_utils import load_sharded_checkpoint
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, DeepseekAllReduce)
+                                             AllReduceParams, MoEAllReduce)
 from tensorrt_llm._torch.pipeline_interface import PipelineInterface
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.models.convert_utils import split_matrix_tp
@@ -367,8 +367,7 @@ class Llama4DecoderLayer(DecoderLayer):
             use_qk_norm=getattr(config, "use_qk_norm", False),
             nope_layer=config.no_rope_layers[layer_idx] == 0,
             attn_temperature_tuning=config.attn_temperature_tuning > 0,
-            aux_stream=aux_stream,
-        )
+            aux_stream=aux_stream)
 
         is_mlp_layer = (layer_idx + 1) % config.interleave_moe_layer_step != 0
 
@@ -412,7 +411,7 @@ class Llama4DecoderLayer(DecoderLayer):
         self.all_reduce = AllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
 
-        self.deepseek_allreduce = DeepseekAllReduce(self.mapping)
+        self.moe_allreduce = MoEAllReduce(self.mapping)
 
     def forward(
         self,
@@ -486,17 +485,15 @@ class Llama4DecoderLayer(DecoderLayer):
                 hidden_states_activated_experts = hidden_states[1]
                 num_activated_experts_per_node = hidden_states[2]
                 experts_to_token_score = hidden_states[3]
-                activated_expert_global_ids = hidden_states[4]
-                hidden_states, residual = self.deepseek_allreduce(
-                    hidden_states_activated_experts,  # not used
-                    [
-                        residual, self.next_layer_layernorm.weight,
-                        num_activated_experts_per_node, experts_to_token_score,
-                        hidden_states_activated_experts, shared_output,
-                        activated_expert_global_ids
-                    ],
-                    self.next_layer_layernorm.variance_epsilon,
-                    AllReduceFusionOp.MOE_ALLREDUCE_RESIDUAL_RMS_NORM,
+
+                hidden_states, residual = self.moe_allreduce(
+                    residual,
+                    self.next_layer_layernorm.weight,
+                    device_num_experts=num_activated_experts_per_node,
+                    scale_input=experts_to_token_score,
+                    active_experts_token_input=hidden_states_activated_experts,
+                    token_input=shared_output,
+                    eps=self.next_layer_layernorm.variance_epsilon,
                 )
             else:
                 hidden_states, residual = self.all_reduce(
@@ -991,13 +988,18 @@ class Llama4ForConditionalGeneration(Llama4ForCausalLM):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: Optional[bool] = False,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         mm_embed = kwargs.get("multi_modal_data", [])
         input_ids, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
                                                      input_ids, mm_embed)
-        logits = super().forward(attn_metadata, input_ids, position_ids,
-                                 inputs_embeds, return_context_logits)
+        logits = super().forward(attn_metadata,
+                                 input_ids,
+                                 position_ids,
+                                 inputs_embeds,
+                                 spec_metadata=spec_metadata,
+                                 return_context_logits=return_context_logits)
         return logits
 
 
