@@ -125,7 +125,7 @@ class GatedMLP(nn.Module):
                                      final_all_reduce_params, lora_params)
 
         if self.activation == F.silu:
-            if self.is_llama4 and self.down_proj.has_fp8_qdq and x.shape[
+            if self.gate_up_proj.use_llama4_fc_swiglu_kernel and self.down_proj.has_fp8_qdq and x.shape[
                     0] <= 16:
                 # In Llama4, we have two custom kernels for FC+SwiGLU. The first one is a
                 # gemv kernel that is efficient for small input sizes (token_length <= 4).
