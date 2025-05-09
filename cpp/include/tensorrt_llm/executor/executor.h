@@ -88,10 +88,8 @@ public:
     [[nodiscard]] std::optional<SizeType32> getTopPResetIds() const;
     [[nodiscard]] std::optional<FloatType> getTopPDecay() const;
     [[nodiscard]] std::optional<RandomSeedType> getSeed() const;
-    [[nodiscard]] std::optional<RandomSeedType> getRandomSeed() const;
     [[nodiscard]] std::optional<FloatType> getTemperature() const;
     [[nodiscard]] std::optional<SizeType32> getMinTokens() const;
-    [[nodiscard]] std::optional<SizeType32> getMinLength() const;
     [[nodiscard]] std::optional<FloatType> getBeamSearchDiversityRate() const;
     [[nodiscard]] std::optional<FloatType> getRepetitionPenalty() const;
     [[nodiscard]] std::optional<FloatType> getPresencePenalty() const;
@@ -110,10 +108,8 @@ public:
     void setTopPResetIds(std::optional<TokenIdType> const& topPResetIds);
     void setTopPDecay(std::optional<FloatType> const& topPDecay);
     void setSeed(std::optional<RandomSeedType> const& seed);
-    void setRandomSeed(std::optional<RandomSeedType> const& randomSeed);
     void setTemperature(std::optional<FloatType> const& temperature);
     void setMinTokens(std::optional<SizeType32> const& minTokens);
-    void setMinLength(std::optional<SizeType32> const& minLength);
     void setBeamSearchDiversityRate(std::optional<FloatType> const& beamSearchDiversityRate);
     void setRepetitionPenalty(std::optional<FloatType> const& repetitionPenalty);
     void setPresencePenalty(std::optional<FloatType> const& presencePenalty);
@@ -681,7 +677,6 @@ public:
 
     [[nodiscard]] VecTokens getInputTokenIds() const;
     [[nodiscard]] SizeType32 getMaxTokens() const;
-    [[nodiscard]] SizeType32 getMaxNewTokens() const;
     [[nodiscard]] bool getStreaming() const;
     [[nodiscard]] SamplingConfig getSamplingConfig() const;
     [[nodiscard]] OutputConfig getOutputConfig() const;
@@ -709,7 +704,6 @@ public:
     [[nodiscard]] std::optional<SizeType32> getEncoderOutputLength() const;
     [[nodiscard]] std::optional<Tensor> getCrossAttentionMask() const;
     [[nodiscard]] RequestType getRequestType() const;
-    [[nodiscard]] SizeType32 getNumReturnSequences() const;
     [[nodiscard]] std::optional<EagleConfig> getEagleConfig() const;
     [[nodiscard]] std::optional<Tensor> getSkipCrossAttnBlocks() const;
     [[nodiscard]] std::optional<GuidedDecodingParams> getGuidedDecodingParams() const;
@@ -744,7 +738,6 @@ public:
     void setEncoderInputFeatures(Tensor encoderInputFeatures);
     void setEncoderOutputLength(SizeType32 encoderOutputLength);
     void setCrossAttentionMask(Tensor crossAttentionMask);
-    void setNumReturnSequences(SizeType32 numReturnSequences);
     void setEagleConfig(std::optional<EagleConfig> const& eagleConfig);
     void setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks);
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
@@ -806,8 +799,8 @@ struct Result
     /// @brief The context logits. Size [promptLen, vocabSizePadded]
     std::optional<Tensor> contextLogits;
 
-    /// @brief The generation logits. Size [beamSize, maxNewTokens, vocabSizePadded] (non-streaming)
-    /// or [maxNewTokens, beamSize, vocabSizePadded] (streaming and allGeneratedTokens)
+    /// @brief The generation logits. Size [beamSize, maxTokens, vocabSizePadded] (non-streaming)
+    /// or [maxTokens, beamSize, vocabSizePadded] (streaming and allGeneratedTokens)
     /// or [1, beamSize, vocabSizePadded] (streaming and non-allGeneratedTokens)
     std::optional<Tensor> generationLogits;
 

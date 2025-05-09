@@ -40,7 +40,7 @@ def parse_arguments():
 
     parser.add_argument('--max_input_len', type=int, default=512 * 1024)
     parser.add_argument('--max_seq_len', type=int, default=(512 + 8) * 1024)
-    parser.add_argument('--max_batch_size', type=int, default=1)
+    parser.add_argument('--max_batch_size', type=int, default=20)
     parser.add_argument('--max_num_tokens', type=int, default=(256 + 8) * 1024)
     parser.add_argument('--max_new_tokens', type=int, default=128)
     parser.add_argument('--num_kv_cache_max_tokens', type=int, default=270336)
@@ -56,11 +56,7 @@ def similarity_score(a, b):
 
 
 # Generate the outputs using either TRT or PyTorch (based on the use_pytorch argument). It’s the same function for both workflows.
-def generate_llm_outputs(args,
-                         prompts,
-                         backend=None,
-                         fp8=False,
-                         fp8_kv_cache=False):
+def generate_llm_outputs(args, data, fp8=False, fp8_kv_cache=False):
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
                                kv_cache_quant_algo=QuantAlgo.FP8 if fp8_kv_cache
                                else None) if fp8 else QuantConfig()
@@ -85,34 +81,35 @@ def generate_llm_outputs(args,
 
     sampling_params = SamplingParams(add_special_tokens=False,
                                      max_tokens=args.max_new_tokens)
-    for prompt in [prompts[0]]:
-        context = prompt['input_context']
-        query = prompt['input_query']
-        output = llm.generate(context,
-                              queries=query,
+    for sample in data[:1]:
+        inputs = {
+            'prompt': sample['input_context'],
+            'query': sample['input_query']
+        }
+        output = llm.generate(inputs,
                               use_tqdm=False,
                               sampling_params=sampling_params)
     print(f'[StarAttention] LLM warmup done')
 
-    results, contexts, queries = [], [], []
+    results, inputs = [], []
 
     num_samples = args.num_samples if args.num_samples is not None else len(
-        prompts)
-    prompts = prompts[:num_samples]
+        data)
+    data = data[:num_samples]
 
-    for prompt in prompts:
-        contexts.append(prompt['input_context'])
-        queries.append(prompt['input_query'])
+    for sample in data:
+        inputs.append({
+            'prompt': sample['input_context'],
+            'query': sample['input_query']
+        })
 
     t0 = time.time()
-    outputs = llm.generate(contexts,
-                           queries=queries,
+    outputs = llm.generate(inputs,
                            use_tqdm=True,
                            sampling_params=sampling_params)
     t1 = time.time()
     eg_count = 0
-    for prompt, output in zip(prompts, outputs):
-        eg = prompt
+    for eg, output in zip(data, outputs):
         ret = {
             'index': eg.get('index', -1),
             'pred': output.outputs[0].text,
@@ -126,12 +123,13 @@ def generate_llm_outputs(args,
         results.append(ret)
 
         ctx_str = eg['input_context']
+        ctx_len = len(llm.tokenizer.encode(ctx_str))
         pred = eg['outputs'][0]
         pred_index = ctx_str.index(pred)
         pred_pos = len(llm.tokenizer.encode(ctx_str[:pred_index]))
         print('------------------------')
         print(f'eg id = {eg_count}')
-        print(f'magic_number_pos = {pred_pos} / ctx_len = {len(contexts)}')
+        print(f'magic_number_pos = {pred_pos} / ctx_len = {ctx_len}')
         print(f'output = {output.outputs[0].text}')
         print(f'refernce = {pred}')
         eg_count += 1
@@ -150,15 +148,13 @@ def read_input(input_file):
 
 def main():
     args = parse_arguments()
-    prompts = read_input(args.input_file)
+    data = read_input(args.input_file)
     print('read data done')
     # Generate outputs using Pytorch.
-    results, elapsed_time = generate_llm_outputs(args,
-                                                 prompts,
-                                                 backend='pytorch')
+    results, elapsed_time = generate_llm_outputs(args, data)
     torch.cuda.empty_cache()
     num_samples = args.num_samples if args.num_samples is not None else len(
-        prompts)
+        data)
     print(
         f'[StarAttention] Generate done, input files = {args.input_file}, samples = {num_samples}, total latency = {elapsed_time}s, seq average latency = {elapsed_time / num_samples}s'
     )

@@ -17,9 +17,10 @@ from tensorrt_llm.bindings.internal.batch_manager import (DecoderBuffers,
 from tensorrt_llm.bindings.internal.runtime import (BufferManager,
                                                     GptDecoderBatched,
                                                     SpeculativeDecodingMode)
+from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.mapping import Mapping
 
-from .llm_request import LlmRequest, LlmRequestState, LogProbs
+from .llm_request import LlmRequest, LlmRequestState
 from .scheduler import ScheduledRequests
 
 
@@ -30,7 +31,8 @@ class DecoderState:
     logits: torch.Tensor = None
 
     # Set when decode_async() has evaluated these to avoid computing again in update_requests()
-    log_probs: list[LogProbs] | None = None
+    # log_probs[request_idx][token_idx]
+    log_probs: list[list[float] | None] | None = None
 
     new_tensors_device: dict[str, torch.Tensor] = None
     new_tensors_host: dict[str, torch.Tensor] = None
@@ -235,7 +237,7 @@ class TorchDecoder(Decoder):
             request_idx += 1
             token_idx += num_tokens
 
-        def handle_logits(request: LlmRequest, count=1):
+        def handle_logits(request: LlmRequest, tokens: list[int], count=1):
             if decoder_state.logits is None:
                 return
             if not request.py_return_generation_logits and not request.py_return_log_probs:
@@ -249,11 +251,15 @@ class TorchDecoder(Decoder):
             if not request.py_return_log_probs:
                 return
 
-            if decoder_state.log_probs:
-                log_probs = decoder_state.log_probs[request_idx]
-            else:
+            log_probs = decoder_state.log_probs and decoder_state.log_probs[
+                request_idx]
+            if not log_probs:
                 _, log_probs = greedy_search_sampling_batch(current_logits)
-            request.py_result.append_log_probs([log_probs.tolist()])
+
+            token_log_probs = [{
+                token: Logprob(logprob=logprob, rank=1)
+            } for token, logprob in zip(tokens, log_probs.tolist())]
+            request.py_result.append_log_probs([token_log_probs])
 
         for request in scheduled_requests.context_requests:
             if request.get_context_remaining_length() != 0:
@@ -265,7 +271,7 @@ class TorchDecoder(Decoder):
                 num_tokens = request.add_new_token(new_token, beam_idx)
                 self._handle_stop_criteria(request, new_token, num_tokens,
                                            beam_idx)
-                handle_logits(request)
+                handle_logits(request, [new_token])
                 request.py_decoding_iter += 1
             advance_idx()
 
@@ -290,6 +296,7 @@ class TorchDecoder(Decoder):
                 # Accept draft tokens (if we have any) if and only if they match the new
                 # token exactly.
                 num_accepted = 0
+                new_tokens = [new_token]
                 for draft_token in request.py_draft_tokens:
                     if draft_token != new_token:
                         # Reject.
@@ -297,11 +304,12 @@ class TorchDecoder(Decoder):
                     num_accepted += 1
                     new_token = new_tokens_list[token_idx + num_accepted]
                     num_tokens = request.add_new_token(new_token, beam_idx)
+                    new_tokens.append(num_tokens)
 
                     if self._handle_stop_criteria(request, new_token,
                                                   num_tokens, beam_idx):
                         break
-                handle_logits(request, num_accepted)
+                handle_logits(request, new_tokens, num_accepted)
                 request.py_decoding_iter += 1
                 request.py_num_accepted_draft_tokens = num_accepted
                 request.py_rewind_len = request.py_draft_pages_allocated - num_accepted
@@ -313,7 +321,7 @@ class TorchDecoder(Decoder):
                 num_tokens = request.add_new_token(new_token, beam_idx)
                 self._handle_stop_criteria(request, new_token, num_tokens,
                                            beam_idx)
-                handle_logits(request)
+                handle_logits(request, [new_token])
                 request.py_decoding_iter += 1
             advance_idx()
 
@@ -398,7 +406,10 @@ class TorchStarAttentionDecoder(TorchDecoder):
         request.py_result.append_generation_logits(current_logits)
         if request.py_return_log_probs:
             _, log_probs = greedy_search_sampling_batch(current_logits)
-            request.py_result.append_log_probs([log_probs.tolist()])
+            request.py_result.append_log_probs([[{
+                new_token:
+                Logprob(logprob=log_probs.item(), rank=1)
+            }]])
 
         self._handle_stop_criteria(request, new_token, num_tokens, beam_idx)
         if request.state != LlmRequestState.GENERATION_COMPLETE:

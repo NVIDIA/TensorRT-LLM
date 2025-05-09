@@ -10,3 +10,5 @@ deepseek-ai/DeepSeek-R1:
   - quant_algo: NVFP4
     spec_dec_algo: MTP
     accuracy: 70.06
+nvidia/Llama-3_3-Nemotron-Super-49B-v1:
+  - accuracy: 44.95
