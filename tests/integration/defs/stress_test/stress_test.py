@@ -346,7 +346,6 @@ def check_server_health(server_url: str,
     ids=lambda x: f"{os.path.basename(x.model_dir)}_tp{x.tp_size}")
 def test_run_stress_test(config, stress_time_timeout, backend,
                          capacity_scheduler_policy, test_mode):
-    pytest.fail("Test failed")
     """Run the stress test with the provided configuration, backend, and test mode.
 
     This test function calls the stress_test function with the given parameters.
