@@ -20,6 +20,7 @@ class GuidedDecodingParams:
         regex (str, optional): The generated text is amenable to the user-specified regular expression. Defaults to None.
         grammar (str, optional): The generated text is amenable to the user-specified extended Backus-Naur form (EBNF) grammar. Defaults to None.
         json_object (bool): If True, the generated text is amenable to json format. Defaults to False.
+        structural_tag (str, optional): The generated text is amenable to the user-specified structural tag. Defaults to None.
     """
     json: Optional[Union[str, BaseModel, dict]] = None
     regex: Optional[str] = None
