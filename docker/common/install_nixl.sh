@@ -31,4 +31,4 @@ cd nixl
 meson setup builddir -Ducx_path=${UCX_INSTALL_PATH} ${EXTRA_NIXL_ARGS}
 cd builddir && ninja install
 
-echo "export LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib/${ARCH_NAME}:\$LD_LIBRARY_PATH" >> "${ENV}"
+echo "export LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib/${ARCH_NAME}:/opt/nvidia/nvda_nixl/lib64:\$LD_LIBRARY_PATH" >> "${ENV}"
