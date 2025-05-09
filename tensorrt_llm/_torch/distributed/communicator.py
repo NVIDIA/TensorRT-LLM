@@ -264,18 +264,31 @@ class PPComm:
         if dist.is_initialized():
             dist.destroy_process_group()
 
-    def send(self,
-             tensor: torch.Tensor,
-             dest: Optional[int] = None,
-             tag: Optional[int] = None):
+    def send(self, tensor: torch.Tensor, dest: Optional[int] = None):
         if dest is None:
             dest = self.mapping.next_pp_rank()
-        dist.send(tensor, dest, tag=tag)
+        dist.send(tensor, dest)
 
-    def recv(self,
-             tensor: torch.Tensor,
-             src: Optional[int] = None,
-             tag: Optional[int] = None):
+    def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
         if src is None:
             src = self.mapping.prev_pp_rank()
-        dist.recv(tensor, src, tag=tag)
+        dist.recv(tensor, src)
+
+
+_pp_comm = None
+
+
+def init_pp_comm(mapping):
+    """Initialize PPComm once at startup"""
+    global _pp_comm
+    _pp_comm = PPComm(mapping)
+
+
+def pp_recv(tensor):
+    """Receive tensors from previous pp rank."""
+    _pp_comm.recv(tensor)
+
+
+def pp_send(tensor):
+    """Send tensors to next pp rank."""
+    _pp_comm.send(tensor)

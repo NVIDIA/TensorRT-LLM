@@ -463,7 +463,6 @@ class FusedMoE(nn.Module):
     def create_weights(self):
         if self._weights_created:
             return
-        device = torch.device('cuda')
         weight_dtype = self.dtype
         w3_w1_weight_shape = (self.expert_size_per_partition,
                               self.intermediate_size_per_partition * 2,
@@ -486,27 +485,21 @@ class FusedMoE(nn.Module):
                 weight_dtype = torch.float8_e4m3fn
 
                 fc31_dequant = nn.Parameter(torch.empty(
-                    self.expert_size_per_partition,
-                    dtype=torch.float32,
-                    device=device),
+                    self.expert_size_per_partition, dtype=torch.float32),
                                             requires_grad=False)
                 self.register_parameter("fc31_dequant", fc31_dequant)
 
                 fc2_dequant = nn.Parameter(torch.empty(
-                    self.expert_size_per_partition,
-                    dtype=torch.float32,
-                    device=device),
+                    self.expert_size_per_partition, dtype=torch.float32),
                                            requires_grad=False)
                 self.register_parameter("fc2_dequant", fc2_dequant)
 
-                fc2_quant = nn.Parameter(torch.tensor(1.,
-                                                      dtype=torch.float32,
-                                                      device=device),
+                fc2_quant = nn.Parameter(torch.tensor(1., dtype=torch.float32),
                                          requires_grad=False)
                 self.register_parameter("fc2_quant", fc2_quant)
 
                 fc31_input_dequant = nn.Parameter(torch.tensor(
-                    1., dtype=torch.float32, device=device),
+                    1., dtype=torch.float32),
                                                   requires_grad=False)
                 self.register_parameter("fc31_input_dequant",
                                         fc31_input_dequant)
@@ -518,8 +511,7 @@ class FusedMoE(nn.Module):
                     (self.expert_size_per_partition,
                      cell_div(self.intermediate_size_per_partition, 128) * 2,
                      cell_div(w3_w1_weight_shape[2], 128)),
-                    dtype=torch.float32,
-                    device=device),
+                    dtype=torch.float32),
                                                            requires_grad=False)
                 self.register_parameter("w3_w1_weight_scaling_factor",
                                         w3_w1_weight_scaling_factor)
@@ -528,8 +520,7 @@ class FusedMoE(nn.Module):
                     (self.expert_size_per_partition,
                      cell_div(w2_weight_shape[1],
                               128), cell_div(w2_weight_shape[2], 128)),
-                    dtype=torch.float32,
-                    device=device),
+                    dtype=torch.float32),
                                                         requires_grad=False)
                 self.register_parameter("w2_weight_scaling_factor",
                                         w2_weight_scaling_factor)
@@ -564,8 +555,7 @@ class FusedMoE(nn.Module):
                                self.intermediate_size_per_partition * 2,
                                self.hidden_size // self.scaling_vector_size //
                                block_scales_vec_size,
-                               dtype=block_scales_dtype,
-                               device=device),
+                               dtype=block_scales_dtype),
                     requires_grad=False)
                 self.register_parameter("w3_w1_weight_scale",
                                         w3_w1_weight_scale)
@@ -576,41 +566,33 @@ class FusedMoE(nn.Module):
                     self.hidden_size,
                     self.intermediate_size_per_partition //
                     self.scaling_vector_size // block_scales_vec_size,
-                    dtype=block_scales_dtype,
-                    device=device),
+                    dtype=block_scales_dtype),
                                                requires_grad=False)
                 self.register_parameter("w2_weight_scale", w2_weight_scale)
 
                 fc31_input_scale = nn.Parameter(torch.tensor(
-                    1., dtype=torch.float32, device=device),
+                    1., dtype=torch.float32),
                                                 requires_grad=False)
                 self.register_parameter("fc31_input_scale", fc31_input_scale)
 
-                fc2_input_scale = nn.Parameter(torch.tensor(1.,
-                                                            dtype=torch.float32,
-                                                            device=device),
+                fc2_input_scale = nn.Parameter(torch.tensor(
+                    1., dtype=torch.float32),
                                                requires_grad=False)
                 self.register_parameter("fc2_input_scale", fc2_input_scale)
 
                 fc31_alpha = nn.Parameter(torch.ones(
-                    self.expert_size_per_partition,
-                    dtype=torch.float32,
-                    device=device),
+                    self.expert_size_per_partition, dtype=torch.float32),
                                           requires_grad=False)
                 self.register_parameter("fc31_alpha", fc31_alpha)
 
                 fc2_alpha = nn.Parameter(torch.ones(
-                    self.expert_size_per_partition,
-                    dtype=torch.float32,
-                    device=device),
+                    self.expert_size_per_partition, dtype=torch.float32),
                                          requires_grad=False)
                 self.register_parameter("fc2_alpha", fc2_alpha)
 
                 if self.is_trtllm():
                     fc31_scale_c = nn.Parameter(torch.ones(
-                        self.expert_size_per_partition,
-                        dtype=torch.float32,
-                        device=device),
+                        self.expert_size_per_partition, dtype=torch.float32),
                                                 requires_grad=False)
                     self.register_parameter("fc31_scale_c", fc31_scale_c)
 
@@ -622,15 +604,13 @@ class FusedMoE(nn.Module):
 
         # Fused gate_up_proj (column parallel)
         w3_w1_weight = nn.Parameter(torch.empty(w3_w1_weight_shape,
-                                                dtype=weight_dtype,
-                                                device=device),
+                                                dtype=weight_dtype),
                                     requires_grad=False)
         self.register_parameter("w3_w1_weight", w3_w1_weight)
 
         # down_proj (row parallel)
         w2_weight = nn.Parameter(torch.empty(w2_weight_shape,
-                                             dtype=weight_dtype,
-                                             device=device),
+                                             dtype=weight_dtype),
                                  requires_grad=False)
         self.register_parameter("w2_weight", w2_weight)
         self._weights_created = True

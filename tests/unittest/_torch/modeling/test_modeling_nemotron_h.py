@@ -127,7 +127,6 @@ class TestNemotronH(unittest.TestCase):
             max_batch_size=batch_size,
             mapping=mapping,
             dtype=kv_cache_dtype,
-            num_extra_kv_tokens=0,
         )
         kv_cache_manager.add_dummy_requests(request_ids, token_nums)
         kv_cache_manager.prepare_mamba_cache_blocks(request_ids)
