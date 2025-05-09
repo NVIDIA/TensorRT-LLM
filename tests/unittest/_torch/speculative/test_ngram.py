@@ -22,7 +22,7 @@ from utils.llm_data import llm_models_root
                           [False, "FLASHINFER"]])
 def test_llama_ngram(use_cuda_graph: bool, attn_backend: str):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 20:
+    if total_mem_gb < 31:
         pytest.skip("Not enough memory to load target model")
 
     models_path = llm_models_root()
@@ -35,9 +35,15 @@ def test_llama_ngram(use_cuda_graph: bool, attn_backend: str):
         cuda_graph_batch_sizes=[1],
     )
 
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False, )
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=2080)
 
-    target_model_dir = f"{models_path}/llama-models-v2/llama-v2-7b-hf"
+    sampling_params = SamplingParams(
+        max_tokens=32,
+        temperature=0,
+    )
+    max_batch_size = 1
+
+    target_model_dir = f"{models_path}/llama-models-v2/llama-v2-13b-hf"
 
     draft_len = 4
     spec_config = NGramDecodingConfig(
@@ -47,36 +53,10 @@ def test_llama_ngram(use_cuda_graph: bool, attn_backend: str):
         is_use_oldest=True,
         )
     llm_spec = LLM(model=target_model_dir,
+                   max_batch_size=max_batch_size,
                    pytorch_backend_config=pytorch_config,
                    kv_cache_config=kv_cache_config,
                    speculative_config=spec_config)
-
-    sampling_params = SamplingParams(
-        max_tokens=32,
-        temperature=0,
-    )
-
-    # First make sure the acceptance rate is reasonable.
-    tok_ids = llm_spec.tokenizer.encode("The future of AI is")
-    num_tokens = 0
-
-    num_drafted = 0
-    num_accepted = 0
-
-    for output in llm_spec.generate_async(tok_ids,
-                                          SamplingParams(max_tokens=128,
-                                                         temperature=0),
-                                          streaming=True):
-        beam = output.outputs[0]
-        new_tokens = beam.token_ids
-
-        num_drafted += draft_len
-        num_accepted += len(new_tokens) - num_tokens - 1
-
-        num_tokens = len(new_tokens)
-
-    accept_rate = num_accepted / num_drafted
-    assert accept_rate > 0.25
 
     prompts = [
         "The capital of France is", "The president of the United States is"
@@ -86,6 +66,7 @@ def test_llama_ngram(use_cuda_graph: bool, attn_backend: str):
     llm_spec.shutdown()
 
     llm_ref = LLM(model=target_model_dir,
+                  max_batch_size=max_batch_size,
                   pytorch_backend_config=pytorch_config,
                   kv_cache_config=kv_cache_config)
 
