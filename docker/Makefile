@@ -25,7 +25,7 @@ STAGE              ?=
 # Set this to define a custom image name and tag
 IMAGE_WITH_TAG     ?= $(IMAGE_NAME)$(if $(STAGE),/$(STAGE)):$(IMAGE_TAG)
 PUSH_TO_STAGING    ?= 1
-DOCKER_BUILD_OPTS  ?= --pull
+DOCKER_BUILD_OPTS  ?= --pull --load
 DOCKER_BUILD_ARGS  ?=
 DOCKER_PROGRESS    ?= auto
 CUDA_ARCHS         ?=
@@ -64,7 +64,7 @@ endef
 %_build: DEVEL_IMAGE = $(if $(findstring 1,$(JENKINS_DEVEL)),$(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"'))
 %_build:
 	@echo "Building docker image: $(IMAGE_WITH_TAG)"
-	DOCKER_BUILDKIT=1 docker build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
+	docker buildx build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
 		--progress $(DOCKER_PROGRESS) \
 		$(if $(BASE_IMAGE), --build-arg BASE_IMAGE=$(BASE_IMAGE)) \
 		$(if $(BASE_TAG), --build-arg BASE_TAG=$(BASE_TAG)) \
@@ -181,6 +181,9 @@ trtllm_%: DEVEL_IMAGE = $(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRe
 trtllm_%: IMAGE_NAME = $(shell grep 'IMAGE_NAME = ' ../jenkins/BuildDockerImage.groovy | grep -o '".*"' | tr -d '"')
 trtllm_%: IMAGE_TAG = $(shell git rev-parse --abbrev-ref HEAD | tr '/' '_')
 trtllm_run: WORK_DIR = /app/tensorrt_llm
+
+multiplatform_%: STAGE = devel
+multiplatform_%: DOCKER_BUILD_OPTS = --pull --builder=multi-builder --platform linux/arm64,linux/amd64
 
 build: devel_build ;
 
