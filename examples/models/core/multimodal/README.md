@@ -20,6 +20,7 @@ We first describe three runtime modes for running multimodal models and how to r
 - [NeVA](#neva)
 - [Nougat](#nougat)
 - [Phi-3-vision](#phi-3-vision)
+- [Phi-4-multimodal](#phi-4-multimodal)
 - [Qwen2-VL](#qwen2-vl)
 - [Video NeVA](#video-neva)
 - [Dataset Evaluation](#dataset-evaluation)
@@ -49,6 +50,7 @@ Not all models supports end-to-end `cpp` mode, the checked ones below are suppor
 - [x] NeVA
 - [ ] Nougat [^1]
 - [ ] Phi-3-Vision [^2]
+- [ ] Phi-4-multimodal
 - [ ] Qwen2-VL [^4]
 - [x] Video-NeVA
 
@@ -967,7 +969,51 @@ Note that for instruct Vision model, please set the `max_encoder_input_len` as `
         --engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/ \
         --image_path=https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png
     ```
+## Phi-4-multimodal
+Navigate to the folder `TensorRT-LLM/examples/models/core/multimodal`
 
+1. Download Huggingface weights
+
+    ```bash
+    export MODEL_NAME="Phi-4-multimodal-instruct" 
+    export HF_DIR="tmp/hf_models/${MODEL_NAME}"
+    export CKPT_DIR="tmp/trt_models/${MODEL_NAME}/fp16/1-gpu"
+    export ENGINE_DIR="tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu"
+    git clone https://huggingface.co/microsoft/${MODEL_NAME} ${HF_DIR} 
+
+    ```
+
+2. Convert Huggingface weights into TRT-LLM checkpoints and build TRT engines using scripts in `examples/models/core/phi`.
+    ```bash
+    python ../phi/convert_checkpoint.py \
+        --model_dir ${HF_DIR} \
+        --output_dir ${CKPT_DIR} \
+        --dtype float16
+
+    trtllm-build \
+        --checkpoint_dir  ${CKPT_DIR} \
+        --output_dir ${ENGINE_DIR} \
+        --gpt_attention_plugin float16 \
+        --gemm_plugin float16 \
+        --max_batch_size 1 \
+        --max_input_len 4096 \
+        --max_seq_len 4608 \
+        --max_multimodal_len 4096
+    ```
+
+3. Generate TensorRT engines for visual components and combine everything into final pipeline.
+*Note: the encoders are not the TRT engines but are pure Pytorch ones*
+
+    ```bash
+    python build_multimodal_engine.py --model_type phi-4-multimodal --model_path ${HF_DIR} --output_dir ${ENGINE_DIR} 
+
+    python run.py \
+        --hf_model_dir ${HF_DIR} \
+        --kv_cache_free_gpu_memory_fraction 0.7 \
+        --engine_dir ${ENGINE_DIR} \
+        --image_path=https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png
+        --audio_path=${HF_DIR}/examples/what_is_shown_in_this_image.wav
+    ```
 ## Qwen2-VL
 [Qwen2-VL Family](https://github.com/QwenLM/Qwen2-VL): is the latest version of the vision language models in the Qwen model families. Here we show how to deploy Qwen2-VL 2B and 7B in TensorRT-LLM.
 
