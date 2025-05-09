@@ -24,10 +24,8 @@ void launch_kernel(
     config.attrs = attrs;
     config.numAttrs = 0;
 
-#if ENABLE_FDL
     attrs[config.numAttrs].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[config.numAttrs++].val.programmaticStreamSerializationAllowed = 1;
-#endif
 
     cudaLaunchKernelExC(&config, (void const*) kernel_func, args);
 }
