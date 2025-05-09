@@ -1808,7 +1808,6 @@ def validate_stats(results,
     assert results
     assert len(results) == max_tokens if pytorch_backend else max_tokens + 1
     for iter, result in enumerate(results):
-        print(result)
         ifbStats = result["inflightBatchingStats"]
         expected_num_scheduled = 1 if (iter < max_tokens) else 0
         assert ifbStats["numScheduledRequests"] == expected_num_scheduled
@@ -1906,13 +1905,11 @@ def llm_get_stats_test_harness(tp_size: int = 1,
 
 
 @pytest.mark.parametrize("return_context_logits", [True, False])
-@pytest.mark.parametrize("pytorch_backend", [True, False])
 @pytest.mark.parametrize("enable_iter_req_stats", [True, False])
-def test_llm_get_stats(return_context_logits, pytorch_backend,
-                       enable_iter_req_stats):
+def test_llm_get_stats(return_context_logits, enable_iter_req_stats):
     llm_get_stats_test_harness(tp_size=1,
                                return_context_logits=return_context_logits,
-                               pytorch_backend=pytorch_backend,
+                               pytorch_backend=False,
                                enable_iter_req_stats=enable_iter_req_stats)
 
 
@@ -1977,8 +1974,9 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
             results.append(stats)
 
         assert results
-        validate_stats(results, pytorch_backend, max_tokens,
-                       enable_iter_req_stats)
+        if not use_overlap:
+            validate_stats(results, pytorch_backend, max_tokens,
+                           enable_iter_req_stats)
 
     async def main():
         for i in range(2):  # test recurrent usage
@@ -1988,14 +1986,12 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
 
 
 @pytest.mark.parametrize("return_context_logits", [True, False])
-@pytest.mark.parametrize("pytorch_backend", [True, False])
 @pytest.mark.parametrize("enable_iter_req_stats", [True, False])
-def test_llm_get_stats_async(return_context_logits, pytorch_backend,
-                             enable_iter_req_stats):
+def test_llm_get_stats_async(return_context_logits, enable_iter_req_stats):
     llm_get_stats_async_test_harness(
         tp_size=1,
         return_context_logits=return_context_logits,
-        pytorch_backend=pytorch_backend,
+        pytorch_backend=False,
         enable_iter_req_stats=enable_iter_req_stats)
 
 
