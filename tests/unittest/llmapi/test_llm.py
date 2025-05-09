@@ -228,6 +228,7 @@ def test_llm_loading_from_hf():
                      kv_cache_config=global_kvcache_config)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5266240")
 @force_ampere
 @pytest.mark.part0
 def test_llm_loading_from_ckpt():
@@ -246,7 +247,11 @@ def test_llm_loading_from_ckpt():
                      sampling_params=SamplingParams(max_tokens=8))
 
 
-@pytest.mark.parametrize('model_format', ['hf', 'ckpt'])
+@pytest.mark.parametrize('model_format', [
+    'hf',
+    pytest.param('ckpt',
+                 marks=pytest.mark.skip(reason="https://nvbugs/5266240"))
+])
 @pytest.mark.part0
 def test_llm_with_dummy_weights(model_format):
     # dummy_dir contains config.json and tokenizer files only
@@ -1324,6 +1329,7 @@ def test_executor_lookahead_decoding_config():
 
 
 def llama_v2_13b_lora_test_harness(**llm_kwargs):
+    # Shahar- perhaps disable build config
     hf_model_dir = get_model_path("llama-models-v2/llama-v2-13b-hf")
     hf_lora_dir = get_model_path("llama-models-v2/chinese-llama-2-lora-13b")
 

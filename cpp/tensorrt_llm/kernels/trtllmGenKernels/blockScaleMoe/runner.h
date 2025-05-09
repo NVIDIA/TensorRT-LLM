@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -46,13 +46,13 @@ class Runner
 public:
     explicit Runner();
 
-    void run(float* routingLogits, void* routingBias, int32_t num_tokens, int32_t num_experts, int32_t top_k,
+    void run(void* routingLogits, void* routingBias, int32_t num_tokens, int32_t num_experts, int32_t top_k,
         int32_t n_groups, int32_t topk_groups, int32_t local_expert_offset, int32_t local_num_experts,
         float routed_scaling_factor, int32_t* routingExpertIndexes, int32_t* expertCountHistogram,
         int32_t* permuted_idx_size, int32_t* expanded_idx_to_permuted_idx, int32_t* permuted_idx_to_expanded_idx,
         int32_t* permuted_idx_to_token_idx, void* expert_weights, int32_t* num_tokens_per_expert,
         int32_t* cta_idx_xy_to_batch_idx, int32_t* cta_idx_xy_to_mn_limit, int32_t* num_non_exiting_ctas,
-        trtllm::gen::Dtype dtypeElt, cudaStream_t stream);
+        trtllm::gen::Dtype dtypeElt, bool use_routing_scales_on_input, bool use_deep_seek_fp8, cudaStream_t stream);
 };
 } // namespace Routing
 
@@ -63,11 +63,12 @@ class Runner
 public:
     explicit Runner(trtllm::gen::Dtype dtypeElt);
 
-    void run(void* hidden_state, void* hidden_state_scale, void* weight, void* weight_scale,
+    void run(void* hidden_state, void* hidden_state_scale, void* weight, void* weight_scale, void* expert_weights,
         float* output_scales_scalar, float* output_scales_gate_scalar, void* output, void* output_scale, int32_t top_k,
         int32_t hidden_size, int32_t intermediate_size, int32_t num_experts, int32_t num_tokens,
         int32_t* permuted_idx_to_token_idx, int32_t* ptr_num_non_exiting_ctas, int32_t* ptr_total_num_padded_tokens,
-        int32_t* ptr_cta_idx_xy_to_batch_idx, int32_t* ptr_cta_idx_xy_to_mn_limit, cudaStream_t stream);
+        int32_t* ptr_cta_idx_xy_to_batch_idx, int32_t* ptr_cta_idx_xy_to_mn_limit, bool use_routing_scales_on_input,
+        bool use_deep_seek_fp8, cudaStream_t stream);
 
 private:
     trtllm::gen::Dtype mDtypeElt;
@@ -85,7 +86,7 @@ public:
         float* output_scales_scalar, void* output, void* output_scale, int32_t top_k, int32_t hidden_size,
         int32_t intermediate_size, int32_t num_experts, int32_t num_tokens, int32_t* ptr_num_non_exiting_ctas,
         int32_t* ptr_total_num_padded_tokens, int32_t* ptr_cta_idx_xy_to_batch_idx, int32_t* ptr_cta_idx_xy_to_mn_limit,
-        cudaStream_t stream);
+        bool use_deep_seek_fp8, cudaStream_t stream);
 
 private:
     trtllm::gen::Dtype mDtypeElt;
@@ -99,7 +100,7 @@ namespace tg = trtllm::gen;
 
 struct MoERunnerArgs
 {
-    float* routing_logits
+    void* routing_logits
         = nullptr; // [num_tokens, num_experts] in float, generated after gemm(hidden_state, routing_weights)
     void* routing_bias = nullptr;  // [num_experts] in bfloat16 for now = mDtypeExpW
     void* hidden_states = nullptr; // [num_tokens, hidden_size] in fp8 = mDtypeElt
@@ -129,6 +130,10 @@ struct MoERunnerArgs
     tg::Dtype mDtypeElt{tg::Dtype::Void};
     tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
     tg::Dtype mDtypeOut{tg::Dtype::Bfloat16};
+
+    // Apply routing scale factors to input activations
+    bool mUseRoutingScalesOnInput{false};
+    bool mUseDeepSeekFp8{false};
 
     float* output1_scales_scalar = nullptr;
     float* output1_scales_gate_scalar = nullptr;

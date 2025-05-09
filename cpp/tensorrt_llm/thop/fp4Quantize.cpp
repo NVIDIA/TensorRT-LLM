@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/thop/fp4Quantize.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/thop/thUtils.h"

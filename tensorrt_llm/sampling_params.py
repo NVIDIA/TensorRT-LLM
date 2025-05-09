@@ -301,6 +301,11 @@ class SamplingParams:
         if self.guided_decoding is not None:
             self.guided_decoding._validate()
 
+        # correct types as users might pass in logprob=True for Top-1 logprobs
+        self.logprobs = self.logprobs and int(self.logprobs)
+        self.prompt_logprobs = self.prompt_logprobs and int(
+            self.prompt_logprobs)
+
     @property
     def _greedy_decoding(self) -> bool:
         return (not self.use_beam_search
