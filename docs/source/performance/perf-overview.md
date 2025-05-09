@@ -12,18 +12,6 @@ Tuning batch sizes, parallelism configurations, and other options may lead to im
 
 For DeepSeek R1 performance, please check out our [performance guide](../blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md)
 
-## Known Issues
-
-The following issues are being addressed to improve the efficiency of TensorRT-LLM.
-
-### Fused Matmul + Gated-SiLU (LLaMA)
-
-The current implementation combines two Matmul operations into one Matmul followed by
-a separate SwiGLU kernel (when `--use_fused_mlp=enable` is enabled). There is also a more
-efficient implementation that runs single Matmul + SwiGLU fused kernel for FP8 on Hopper
-(when `--use_fused_mlp=enable --gemm_swiglu_plugin fp8` is enabled). The gemm_swiglu_plugin
-will support more data types and GPU architectures in the future release.
-
 ## Throughput Measurements
 
 The below table shows performance data where a local inference client is fed requests at an infinite rate (no delay between messages),
@@ -233,7 +221,6 @@ trtllm-bench --model $model_name throughput --dataset $dataset_file --backend py
   - 2048
   - 4096
   - 8192
-  print_iter_log: true
 ```
 
 In majority of cases, we also use a higher KV cache percentage by setting `--kv_cache_free_gpu_mem_fraction 0.95` in the benchmark command. This allows us to obtain better performance than the default setting of `0.90`. We fall back to `0.90` if we hit an out of memory issue.
