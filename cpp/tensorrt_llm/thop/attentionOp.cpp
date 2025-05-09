@@ -75,7 +75,8 @@ public:
         torch::optional<torch::Tensor> out_scale, torch::optional<torch::Tensor> rotary_inv_freq,
         torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
         torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
-        torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas) const
+        torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
+        torch::optional<torch::Tensor> tile_scheduler_metadata, torch::optional<torch::Tensor> num_splits) const
         = 0;
 };
 
@@ -123,8 +124,9 @@ public:
         torch::optional<torch::Tensor> out_scale, torch::optional<torch::Tensor> rotary_inv_freq,
         torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
         torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
-        torch::optional<torch::Tensor> mrope_rotary_cos_sin,
-        torch::optional<torch::Tensor> mrope_position_deltas) const override
+        torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
+        torch::optional<torch::Tensor> tile_scheduler_metadata,
+        torch::optional<torch::Tensor> num_splits) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
         T* attention_input = static_cast<T*>(qkv.slice(0, token_offset).data_ptr());
@@ -296,8 +298,11 @@ public:
                 if (op.mUseGenFlashMLA == true)
                 {
                     TORCH_CHECK(block_ids_per_seq.has_value());
-                    int const* block_ids_per_seq_ptr = static_cast<int*>(block_ids_per_seq->data_ptr());
-                    mla_params.block_ids_per_seq = block_ids_per_seq_ptr;
+                    TORCH_CHECK(tile_scheduler_metadata.has_value());
+                    TORCH_CHECK(num_splits.has_value());
+                    mla_params.block_ids_per_seq = static_cast<int*>(block_ids_per_seq->data_ptr());
+                    mla_params.tile_scheduler_metadata_ptr = tile_scheduler_metadata.value().data_ptr<int32_t>();
+                    mla_params.num_splits_ptr = num_splits.value().data_ptr<int32_t>();
                 }
                 mla_params.cache_seq_lens = sequence_lengths_ptr;
                 op.mlaGeneration<T>(mla_params, enqueue_params, stream);
@@ -358,7 +363,9 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     std::optional<int64_t> attention_input_type, bool is_mla_enable, std::optional<int64_t> q_lora_rank,
     std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim,
-    torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas)
+    torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
+    bool const use_flash_mla, torch::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
+    torch::optional<torch::Tensor> flash_mla_num_splits)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -454,6 +461,9 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
         int32_t const layer_num = host_kv_cache_pool_mapping.value().size(0);
 
         op->mIsMLAEnabled = true;
+        op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache();
+        // only enable flash mla on sm90 and head_size == 576 and tokens_per_block == 64
+        op->mUseFlashMLA = tensorrt_llm::common::getSMVersion() == 90 && head_size == 576 && tokens_per_block == 64;
         op->mMLAParams = {static_cast<int>(q_lora_rank.value()), static_cast<int>(kv_lora_rank.value()),
             static_cast<int>(qk_nope_head_dim.value()), static_cast<int>(qk_rope_head_dim.value()),
             static_cast<int>(v_head_dim.value()), static_cast<int>(predicted_tokens_per_seq),
@@ -469,6 +479,12 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
         // mNumKVHeads/mHeadSize are overwritten in common/attentionOp.cpp.
         op->mNumKVHeads = 1;
         op->mHeadSize = op->mMLAParams.kv_lora_rank + op->mMLAParams.qk_rope_head_dim;
+        op->mUseFlashMLA = use_flash_mla;
+        if (op->mUseFlashMLA)
+        {
+            TLLM_CHECK(flash_mla_tile_scheduler_metadata.has_value());
+            op->mFlashMlaNumSmParts = flash_mla_tile_scheduler_metadata.value().size(0);
+        }
     }
 
     auto cache_key = std::make_tuple(op->data(), runner->data());
@@ -566,7 +582,8 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
             host_past_key_value_lengths, context_lengths, host_context_lengths, kv_cache_block_offsets,
             host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas);
+            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -581,7 +598,8 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
             host_past_key_value_lengths, context_lengths, host_context_lengths, kv_cache_block_offsets,
             host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas);
+            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
@@ -653,6 +671,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int? v_head_dim"
         ", Tensor? mrope_rotary_cos_sin"
         ", Tensor? mrope_position_deltas"
+        ", bool use_flash_mla"
+        ", Tensor? flash_mla_tile_scheduler_metadata"
+        ", Tensor? flash_mla_num_splits"
         ") -> Tensor");
 }
 

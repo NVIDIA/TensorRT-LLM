@@ -751,28 +751,21 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         size_t flash_mla_workspace_size = 0;
         if (mUseGenFlashMLA)
         {
-            int const FLASH_MLA_NUM_BUFFERS = 5;
+            int const FLASH_MLA_NUM_BUFFERS = 3;
             size_t flash_mla_workspaces[FLASH_MLA_NUM_BUFFERS];
-
-            static constexpr int TileSchedulerMetaDataSize = 8;
 
             int s_q = mMLAParams.predicted_tokens_per_seq;
 
             int num_q_heads = mNumHeads / mCpSize;
-            int num_kv_heads = mNumKVHeads;
             int head_size_v = mMLAParams.kv_lora_rank;
 
-            int num_sm_parts = getFlashMlaNumSmParts(s_q, num_q_heads, num_kv_heads, head_size_v);
-
-            // for mla  metadata
-            flash_mla_workspaces[0] = sizeof(int) * (num_sm_parts * TileSchedulerMetaDataSize);
-            flash_mla_workspaces[1] = sizeof(int) * (batch_beam + 1); // to check in MTP
+            int num_sm_parts = mFlashMlaNumSmParts;
 
             // for mla kernel
-            flash_mla_workspaces[2] = sizeof(float) * (batch_beam * s_q * num_q_heads);            // softmax_lse
-            flash_mla_workspaces[3]
+            flash_mla_workspaces[0] = sizeof(float) * (batch_beam * s_q * num_q_heads);            // softmax_lse
+            flash_mla_workspaces[1]
                 = sizeof(float) * ((batch_beam + num_sm_parts) * num_q_heads * s_q);               // softmax_lse_accum
-            flash_mla_workspaces[4]
+            flash_mla_workspaces[2]
                 = sizeof(float) * ((batch_beam + num_sm_parts) * num_q_heads * s_q * head_size_v); // out_accum
             flash_mla_workspace_size = tc::calculateTotalWorkspaceSize(flash_mla_workspaces, FLASH_MLA_NUM_BUFFERS);
         }
@@ -1015,45 +1008,21 @@ int AttentionOp::mlaGeneration(
     }
     else if (mUseGenFlashMLA)
     {
-        static constexpr int block_size_n = 64;
-        static constexpr int fixed_overhead_num_blocks = 5;
-        static constexpr int TileSchedulerMetaDataSize = 8;
-
         int const num_q_heads = mNumHeads / mCpSize;
         int const ngroups = num_q_heads / num_kv_heads;
 
         int const s_q = params.acc_q_len / batch_beam;
-        assert(s_q == mMLAParams.predicted_tokens_per_seq);
         int const head_size_v = mMLAParams.kv_lora_rank;
-        int const num_sm_parts = getFlashMlaNumSmParts(s_q, num_q_heads, num_kv_heads, head_size_v);
-
-        size_t const num_splits_size = sizeof(int) * (batch_beam + 1);
-        size_t const tile_scheduler_metadata_size = sizeof(int) * (num_sm_parts * TileSchedulerMetaDataSize);
+        int const num_sm_parts = mFlashMlaNumSmParts;
         size_t const softmax_lse_size = sizeof(float) * (batch_beam * s_q * num_q_heads * num_kv_heads); // softmax_lse
         size_t const softmax_lse_accum_size = sizeof(float) * ((batch_beam + num_sm_parts) * num_q_heads * s_q);
         size_t const out_accum_size = sizeof(float) * ((batch_beam + num_sm_parts) * num_q_heads * s_q * head_size_v);
 
-        int* tile_scheduler_metadata_ptr
-            = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, tile_scheduler_metadata_size));
-        int* num_splits_ptr = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, num_splits_size));
         float* softmax_lse_ptr
             = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, softmax_lse_size));
         float* softmax_lse_accum_ptr
             = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, softmax_lse_accum_size));
         float* out_accum_ptr = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, out_accum_size));
-
-        // prepare metadata
-        Mla_metadata_params mlaMetaDataParams = {};
-        mlaMetaDataParams.seqlens_k_ptr = const_cast<int*>(params.cache_seq_lens);
-        mlaMetaDataParams.tile_scheduler_metadata_ptr = tile_scheduler_metadata_ptr;
-        mlaMetaDataParams.num_splits_ptr = num_splits_ptr;
-        mlaMetaDataParams.batch_size = batch_beam;
-        mlaMetaDataParams.block_size_n = block_size_n;
-        mlaMetaDataParams.fixed_overhead_num_blocks = fixed_overhead_num_blocks;
-        mlaMetaDataParams.num_sm_parts = num_sm_parts;
-
-        // metadata should only be init once per iter, to fix later
-        get_mla_metadata_func(mlaMetaDataParams, stream);
 
         Flash_fwd_mla_params flashMlaParams{};
         flashMlaParams.b = batch_beam;
@@ -1102,9 +1071,9 @@ int AttentionOp::mlaGeneration(
         flashMlaParams.descale_q_ptr = const_cast<float*>(params.dequant_scale_q);
         flashMlaParams.descale_k_ptr = const_cast<float*>(params.dequant_scale_kv);
 
-        flashMlaParams.tile_scheduler_metadata_ptr = tile_scheduler_metadata_ptr;
+        flashMlaParams.tile_scheduler_metadata_ptr = params.tile_scheduler_metadata_ptr;
+        flashMlaParams.num_splits_ptr = params.num_splits_ptr;
         flashMlaParams.num_sm_parts = num_sm_parts;
-        flashMlaParams.num_splits_ptr = num_splits_ptr;
 
         flashMlaParams.softmax_lseaccum_ptr = softmax_lse_accum_ptr;
         flashMlaParams.oaccum_ptr = out_accum_ptr;

@@ -43,6 +43,7 @@ add_library(
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
   dynamicDecodeOp.cpp
+  flashMlaOp.cpp
   fmhaPackMaskOp.cpp
   fp8Op.cpp
   fp8PerTensorScalingTrtllmGenGemm.cpp

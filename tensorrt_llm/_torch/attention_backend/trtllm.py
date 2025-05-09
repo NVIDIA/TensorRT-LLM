@@ -3,6 +3,8 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm._torch.utils import get_model_extra_attrs
+from tensorrt_llm._utils import ceil_div, get_sm_count
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -159,6 +161,9 @@ class TrtllmAttentionWrapper:
         latent_cache: Optional[torch.Tensor] = None,
         q_pe: Optional[torch.Tensor] = None,
         mrope_config: Optional[dict] = None,
+        use_flash_mla: bool = True,
+        flash_mla_tile_scheduler_metadata: Optional[torch.Tensor] = None,
+        flash_mla_num_splits: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """
@@ -187,6 +192,9 @@ class TrtllmAttentionWrapper:
             out_scale (torch.Tensor): The tensor to store the scaling factor to quantize output, with shape (1) on GPU.
             use_paged_context_fmha (bool): Sets the mPagedContextFMHA attribute in the op runner.
             mrope_config (dict): The dictionary containing the mRope configuration.
+            use_flash_mla (bool): Whether to use FlashMLA for MLA generation on Hopper (sm90)
+            flash_mla_tile_scheduler_metadata (torch.Tensor): Used by FlashMLA. See cpp/tensorrt_llm/thop/flashMlaOp.cpp for more details.
+            flash_mla_num_splits (torch.Tensor): Used by FlashMLA. See cpp/tensorrt_llm/thop/flashMlaOp.cpp for more details.
         """
         self.tokens_per_block = tokens_per_block
         self.max_num_requests = max_num_requests
@@ -218,11 +226,14 @@ class TrtllmAttentionWrapper:
             'mrope_position_deltas') if mrope_config is not None else None
         self.kwargs.update(kwargs)
         self.block_ids_per_seq = block_ids_per_seq
-
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
             self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
             )
+
+        self.use_flash_mla = use_flash_mla
+        self.flash_mla_tile_scheduler_metadata = flash_mla_tile_scheduler_metadata
+        self.flash_mla_num_splits = flash_mla_num_splits
 
     def run(
         self,
@@ -371,8 +382,17 @@ class TrtllmAttentionWrapper:
             self.v_head_dim,
             self.mrope_rotary_cos_sin,
             self.mrope_position_deltas,
+            self.use_flash_mla,
+            self.flash_mla_tile_scheduler_metadata,
+            self.flash_mla_num_splits,
         )
         return output
+
+
+@dataclass(kw_only=True)
+class FlashMlaMetadata:
+    tile_scheduler_metadata: Optional[torch.Tensor] = None
+    num_splits: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)
@@ -431,6 +451,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+
+        extra_attrs = get_model_extra_attrs()
+        model_config = extra_attrs['model_config']
+
         self.prompt_lens_cuda = torch.empty(
             (self.max_num_requests, ),
             device='cuda',
@@ -467,9 +491,30 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cpu',
                 pin_memory=True,
             )
+
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
+
+            self.flash_mla_metadata = FlashMlaMetadata()
             if self.enable_flash_mla:
+                tile_scheduler_metadata_size = 8  # Note: must be aligned with TileSchedulerMetaDataSize in flash_mla.h
+                block_size_m = 64
+                sm_count = get_sm_count()
+                # Note begin: Be careful to make these configs aligned with tensorrt_llm._torch.modules.attention.MLA
+                num_heads_k = 1
+
+                tp_size = model_config.mapping.tp_size if not model_config.mapping.enable_attention_dp else 1
+                num_heads_q = model_config.pretrained_config.num_attention_heads
+                assert num_heads_q % tp_size == 0
+                num_heads_q = num_heads_q // tp_size
+
+                predicted_tokens_per_seq = model_config.spec_config.num_nextn_predict_layers + 1 if model_config.spec_config is not None else 1
+                # Note end
+                num_heads_per_head_k = predicted_tokens_per_seq * num_heads_q // num_heads_k
+                num_sm_parts = sm_count // num_heads_k // ceil_div(
+                    num_heads_per_head_k, block_size_m)
+
+                # TODO: Management of block ids should not be coupled with flash_mla so tightly.
                 self.block_ids_per_seq = torch.empty(
                     [
                         self.kv_cache_manager.max_batch_size,
@@ -478,7 +523,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     dtype=torch.int32,
                     device='cuda',
                 )
-                self.kv_block_ids_per_seq = torch.zeros(
+                # TODO: kv_block_ids_per_seq is duplicated with block_ids_per_seq
+                self.kv_block_ids_per_seq = torch.empty(
                     [
                         self.kv_cache_manager.max_batch_size,
                         self.kv_cache_manager.max_blocks_per_seq
@@ -486,9 +532,29 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     dtype=torch.int32,
                     device='cuda',
                 )
+                self.flash_mla_metadata.tile_scheduler_metadata = torch.empty(
+                    [num_sm_parts, tile_scheduler_metadata_size],
+                    dtype=torch.int32,
+                    device='cuda',
+                )
+
+                # This is specific to MTP Eagle, where the query seqlen is always 1.
+                num_heads_per_head_k_eagle = num_heads_q // num_heads_k
+                num_sm_parts_eagle = sm_count // num_heads_k // ceil_div(
+                    num_heads_per_head_k_eagle, block_size_m)
+                self.flash_mla_metadata.tile_scheduler_metadata_eagle = torch.empty(
+                    [num_sm_parts_eagle, tile_scheduler_metadata_size],
+                    dtype=torch.int32,
+                    device='cuda',
+                )
+
+                self.flash_mla_metadata.num_splits = torch.empty(
+                    [self.kv_cache_manager.max_batch_size + 1],
+                    dtype=torch.int32,
+                    device='cuda',
+                )
 
     def prepare(self) -> None:
-
         if self.kv_cache_manager is None:
             # Convert the attention metadata to a TRT-LLM no cache attention metadata.
             assert self.kv_cache_manager is None, "no cache attention should not have KV cache manager"
@@ -521,8 +587,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         ) if self.kv_cache_params.use_cache else None
 
-        if self.enable_flash_mla:
-            self.prepare_flash_mla()
         # number of tokens needed in the kv cache for each sequence after the next pass
         kv_lens = cached_token_lens + self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
         # self.kv_lens is the valid kv cache length, while the self.kv_lens_cuda is
@@ -545,14 +609,20 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             assert self.kv_lens[:self.num_seqs].max(
             ) <= self.kv_cache_manager.max_seq_len, f"Please set max_seq_len to at least {self.kv_lens[:self.num_seqs].max()} for kv cache manager."
 
-    def prepare_flash_mla(self) -> None:
-        block_ids_per_seq = self.kv_cache_manager.get_block_ids_per_seq(
-            self.request_ids).pin_memory()
-        num_blocks = block_ids_per_seq.shape[1]
-        self.kv_block_ids_per_seq[:self.num_seqs, :num_blocks].copy_(
-            block_ids_per_seq, non_blocking=True)
-        self.block_ids_per_seq[:self.num_generations, :num_blocks].copy_(
-            block_ids_per_seq[self.num_contexts:], non_blocking=True)
+        if self.enable_flash_mla:
+            block_ids_per_seq = self.kv_cache_manager.get_block_ids_per_seq(
+                self.request_ids).pin_memory()
+            num_blocks = block_ids_per_seq.shape[1]
+            self.kv_block_ids_per_seq[:self.num_seqs, :num_blocks].copy_(
+                block_ids_per_seq, non_blocking=True)
+            self.block_ids_per_seq[:self.num_generations, :num_blocks].copy_(
+                block_ids_per_seq[self.num_contexts:], non_blocking=True)
+
+            torch.ops.trtllm.get_mla_metadata(
+                self.kv_lens_cuda[self.num_contexts:self.num_contexts +
+                                  self.num_generations],
+                self.flash_mla_metadata.tile_scheduler_metadata,
+                self.flash_mla_metadata.num_splits[:self.num_generations + 1])
 
 
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
@@ -663,6 +733,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         ) if metadata.runtime_features else False
 
         num_seqs = metadata.num_seqs
+        num_generations = metadata.num_generations
         self.wrapper.plan(
             tokens_per_block=metadata.tokens_per_block,
             max_num_requests=metadata.max_num_requests,
@@ -692,6 +763,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             latent_cache=latent_cache,
             q_pe=q_pe,
             mrope_config=mrope_config,
+            use_flash_mla=metadata.enable_flash_mla
+            and attention_input_type == AttentionInputType.generation_only,
+            flash_mla_tile_scheduler_metadata=metadata.flash_mla_metadata.
+            tile_scheduler_metadata,
+            flash_mla_num_splits=metadata.flash_mla_metadata.
+            num_splits[:num_generations + 1],
         )
         out_dtype = None
         if out_scale is not None:

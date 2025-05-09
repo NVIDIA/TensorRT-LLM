@@ -163,10 +163,18 @@ def _register_fake():
         v_head_dim,
         mrope_rotary_cos_sin,
         mrope_position_deltas,
+        use_flash_mla,
+        flash_mla_tile_scheduler_metadata,
+        flash_mla_num_splits,
     ):
         output_shape = (q.shape[0], num_heads *
                         v_head_dim if is_mla_enable else num_heads * head_size)
         return q.new_empty(output_shape, dtype=out_dtype or q.dtype)
+
+    @torch.library.register_fake("trtllm::get_mla_metadata")
+    def _(seqlens_k, tile_scheduler_metadata, num_splits):
+        # Nothing returned. This op populates the provided tile_scheduler_metadata and num_splits in place.
+        return
 
     @torch.library.register_fake("trtllm::noaux_tc_op")
     def _(scores, scores_with_bias, n_group, topk_group, topk,

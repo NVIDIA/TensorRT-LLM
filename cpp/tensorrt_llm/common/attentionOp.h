@@ -211,15 +211,6 @@ public:
     int mlaGeneration(
         kernels::MlaParams<T>& params, EnqueueGenerationParams<T> const& generation_params, cudaStream_t stream);
 
-    int getFlashMlaNumSmParts(int s_q, int num_heads, int num_kv_heads, int head_size_v) const
-    {
-        static constexpr int block_size_m = 64;
-        int num_heads_per_head_k = s_q * num_heads / num_kv_heads;
-        int sm_cnt = mMultiProcessorCount;
-        int num_sm_parts = sm_cnt / num_kv_heads / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
-        return num_sm_parts;
-    }
-
     // Called in configurePlugin().
     template <typename T, typename KVCacheBuffer>
     void prepareEnqueueGeneration(EnqueueGenerationParams<T> const& params);
@@ -317,6 +308,11 @@ public:
         return mIsMLAEnabled;
     }
 
+    [[nodiscard]] bool useFlashMLA() const
+    {
+        return mUseFlashMLA;
+    }
+
     [[nodiscard]] int smVersion() const
     {
         return mSM;
@@ -381,6 +377,7 @@ public:
     bool mIsMLAEnabled = false;
     bool mIsGenerationMLA = false;
     bool mUseGenFlashMLA = false;
+    int32_t mFlashMlaNumSmParts = 0;
     tensorrt_llm::kernels::MlaMetaParams mMLAParams;
     int mCpSize = 1;
     int mCpRank = 0;
@@ -421,12 +418,13 @@ public:
             (int8_t) mPositionEmbeddingType, mUseLognScaling, mRemovePadding, (int32_t) mMaskType,
             mBlockSparseParams.data(), mPagedKVCache, mTokensPerBlock, mKVCacheQuantMode.value(), mTpSize, mTpRank,
             mUnfuseQkvGemm, (int32_t) mType, mMaxContextLength, mQKVBiasEnabled, mCrossAttention, mMaxDistance,
-            mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mDenseContextFMHA, mHasFullAttentionMask,
-            mIsSpecDecodingEnabled, mUseSpecDecoding, mSpecDecodingIsGenerationLengthVariable,
-            mSpecDecodingMaxGenerationLength, mIsMLAEnabled, mIsGenerationMLA, mUseGenFlashMLA, mMLAParams.data(),
-            mCpSize, mCpRank, mCpGroup, mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank,
-            mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode,
-            mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant, mNbMultiBlockSemaphores);
+            mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mFP8GenerationMLA, mDenseContextFMHA,
+            mHasFullAttentionMask, mIsSpecDecodingEnabled, mUseSpecDecoding, mSpecDecodingIsGenerationLengthVariable,
+            mSpecDecodingMaxGenerationLength, mIsMLAEnabled, mIsGenerationMLA, mUseGenFlashMLA, mFlashMlaNumSmParts,
+            mMLAParams.data(), mCpSize, mCpRank, mCpGroup, mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin,
+            mAttnTpSize, mAttnTpRank, mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast, mEnableContextFMHA,
+            mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant,
+            mNbMultiBlockSemaphores);
     };
 
 private:
