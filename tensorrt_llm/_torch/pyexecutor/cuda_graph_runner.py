@@ -6,7 +6,7 @@ import torch
 from ..attention_backend.interface import AttentionMetadata
 from ..pipeline_interface import PipelineInterface
 from ..speculative.interface import SpecMetadata
-from ..utils import make_weak_ref
+from ..utils import make_weak_ref, set_piecewise_cuda_graph_flag
 
 _local = threading.local()
 
@@ -113,11 +113,13 @@ class DecodingCUDAGraphRunner:
         # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
         # This also lets us initialize states in the attn_metadata.
         set_graph_capturing(True)
+        set_piecewise_cuda_graph_flag(False)
         for _ in range(2):
             forward_fn(inputs)
         with torch.cuda.graph(self._graph, pool=pool):
             output = forward_fn(inputs)
         set_graph_capturing(False)
+        set_piecewise_cuda_graph_flag(True)
         # Mark weak ref here. The output tensor should be freed properly.
         self._output = make_weak_ref(output)
         return self._graph.pool()

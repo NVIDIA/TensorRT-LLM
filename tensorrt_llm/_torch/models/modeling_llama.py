@@ -10,9 +10,10 @@ from transformers.modeling_utils import load_sharded_checkpoint
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, DeepseekAllReduce)
+                                             AllReduceParams, MoEAllReduce)
 from tensorrt_llm._torch.pipeline_interface import PipelineInterface
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
                        register_input_processor)
@@ -366,8 +367,7 @@ class Llama4DecoderLayer(DecoderLayer):
             use_qk_norm=getattr(config, "use_qk_norm", False),
             nope_layer=config.no_rope_layers[layer_idx] == 0,
             attn_temperature_tuning=config.attn_temperature_tuning > 0,
-            aux_stream=aux_stream,
-        )
+            aux_stream=aux_stream)
 
         is_mlp_layer = (layer_idx + 1) % config.interleave_moe_layer_step != 0
 
@@ -411,7 +411,7 @@ class Llama4DecoderLayer(DecoderLayer):
         self.all_reduce = AllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
 
-        self.deepseek_allreduce = DeepseekAllReduce(self.mapping)
+        self.moe_allreduce = MoEAllReduce(self.mapping)
 
     def forward(
         self,
@@ -485,17 +485,15 @@ class Llama4DecoderLayer(DecoderLayer):
                 hidden_states_activated_experts = hidden_states[1]
                 num_activated_experts_per_node = hidden_states[2]
                 experts_to_token_score = hidden_states[3]
-                activated_expert_global_ids = hidden_states[4]
-                hidden_states, residual = self.deepseek_allreduce(
-                    hidden_states_activated_experts,  # not used
-                    [
-                        residual, self.next_layer_layernorm.weight,
-                        num_activated_experts_per_node, experts_to_token_score,
-                        hidden_states_activated_experts, shared_output,
-                        activated_expert_global_ids
-                    ],
-                    self.next_layer_layernorm.variance_epsilon,
-                    AllReduceFusionOp.MOE_ALLREDUCE_RESIDUAL_RMS_NORM,
+
+                hidden_states, residual = self.moe_allreduce(
+                    residual,
+                    self.next_layer_layernorm.weight,
+                    device_num_experts=num_activated_experts_per_node,
+                    scale_input=experts_to_token_score,
+                    active_experts_token_input=hidden_states_activated_experts,
+                    token_input=shared_output,
+                    eps=self.next_layer_layernorm.variance_epsilon,
                 )
             else:
                 hidden_states, residual = self.all_reduce(
@@ -773,13 +771,14 @@ class LlamaModel(DecoderModel):
         self.padding_idx = config.pad_token_id
 
         vocab_size = config.vocab_size
-        # TODO smor- hack
-        if hasattr(model_config,
-                   'lora_config') and model_config.lora_config is not None:
+        # TODO smor- we load manually only if there is a single lora dir, need to come up with a better solution
+        if hasattr(
+                model_config,
+                'lora_config') and model_config.lora_config is not None and len(
+                    model_config.lora_config.lora_dir) == 1:
             from tensorrt_llm.lora_manager import HfLoraLoader
             lora_loader = HfLoraLoader(model_config.lora_config.lora_dir)
             weight = lora_loader.embed_tokens
-            # TODO smor - need to split tp matrix here
             vocab_size = lora_loader.vocab_size
 
         self.embed_tokens = Embedding(
@@ -791,9 +790,17 @@ class LlamaModel(DecoderModel):
             gather_output=True,
         )
 
-        if hasattr(model_config,
-                   'lora_config') and model_config.lora_config is not None:
+        if hasattr(
+                model_config,
+                'lora_config') and model_config.lora_config is not None and len(
+                    model_config.lora_config.lora_dir) == 1:
             with torch.no_grad():
+                if model_config.mapping.tp_size > 1:
+                    weight = split_matrix_tp(
+                        weight,
+                        model_config.mapping.tp_size,
+                        model_config.mapping.tp_rank,
+                        dim=0)  # split by vocabulary dimension
                 x = weight.to(self.embed_tokens.dtype)
                 self.embed_tokens.weight.data.copy_(x)
 
@@ -981,13 +988,18 @@ class Llama4ForConditionalGeneration(Llama4ForCausalLM):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: Optional[bool] = False,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         mm_embed = kwargs.get("multi_modal_data", [])
         input_ids, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
                                                      input_ids, mm_embed)
-        logits = super().forward(attn_metadata, input_ids, position_ids,
-                                 inputs_embeds, return_context_logits)
+        logits = super().forward(attn_metadata,
+                                 input_ids,
+                                 position_ids,
+                                 inputs_embeds,
+                                 spec_metadata=spec_metadata,
+                                 return_context_logits=return_context_logits)
         return logits
 
 

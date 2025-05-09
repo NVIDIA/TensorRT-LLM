@@ -1,5 +1,6 @@
 import bisect
 import contextlib
+import gc
 import glob
 import inspect
 import itertools
@@ -12,6 +13,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import safetensors
 import torch
+import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
@@ -30,11 +32,13 @@ from ..attention_backend.utils import get_attention_backend
 from ..attention_backend.vanilla import VanillaAttentionMetadata
 from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
+from ..compilation.utils import set_enable_piecewise_cuda_graph_capture_flag
 from ..distributed import MPIDist
 from ..metadata import KVCacheParams
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
-from ..models.modeling_utils import MetaInitMode, timing
+from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
+                                     timing)
 from ..pipeline_interface import PipelineInterface
 from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
 from ..utils import set_torch_compiling, with_model_extra_attrs
@@ -296,6 +300,7 @@ class PyTorchModelEngine(ModelEngine):
 
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
         self._enable_overlap_scheduler = self.pytorch_backend_config.enable_overlap_scheduler
+        self._torch_compile_backend = None
         self.dtype = self.model.config.torch_dtype
         self._init_model_capacity()
 
@@ -306,17 +311,33 @@ class PyTorchModelEngine(ModelEngine):
                                                 self.batch_size,
                                                 self.model.vocab_size_padded)
 
+        self._torch_compile_backend = None
+
         try:
             if pytorch_backend_config.torch_compile_enabled:
                 set_torch_compiling(True)
                 use_ub = pytorch_backend_config.torch_compile_enable_userbuffers and self._init_userbuffers(
                     self.model.config.hidden_size)
-                self.model = torch.compile(
-                    self.model,
-                    backend=Backend(
-                        pytorch_backend_config.torch_compile_inductor_enabled,
-                        enable_userbuffers=use_ub),
-                    fullgraph=pytorch_backend_config.torch_compile_fullgraph)
+                self._torch_compile_backend = Backend(
+                    pytorch_backend_config.torch_compile_inductor_enabled,
+                    enable_userbuffers=use_ub,
+                    enable_piecewise_cuda_graph=pytorch_backend_config.
+                    torch_compile_piecewise_cuda_graph,
+                    cuda_graph_batch_sizes=pytorch_backend_config.
+                    cuda_graph_batch_sizes)
+                if isinstance(self.model, DecoderModelForCausalLM):
+                    self.model.model = torch.compile(
+                        self.model.model,
+                        backend=self._torch_compile_backend,
+                        fullgraph=pytorch_backend_config.torch_compile_fullgraph
+                    )
+                else:
+                    self.model = torch.compile(
+                        self.model,
+                        backend=self._torch_compile_backend,
+                        fullgraph=pytorch_backend_config.torch_compile_fullgraph
+                    )
+                torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
         except Exception as e:
@@ -324,6 +345,7 @@ class PyTorchModelEngine(ModelEngine):
             traceback.print_exception(Exception, e, e.__traceback__)
             raise e
         self._torch_compile_enabled = pytorch_backend_config.torch_compile_enabled
+        self._torch_compile_piecewise_cuda_graph = pytorch_backend_config.torch_compile_piecewise_cuda_graph
 
         self.attn_backend = get_attention_backend(attn_backend)
 
@@ -339,7 +361,7 @@ class PyTorchModelEngine(ModelEngine):
         self.attn_metadata = None
         self.iter_states = {}
         self._cuda_graphs = {}
-        self._cuda_graph_mem_pool = None
+        self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
         self._run_cuda_graphs = pytorch_backend_config.use_cuda_graph
 
         self._cuda_graph_padding_enabled = pytorch_backend_config.cuda_graph_padding_enabled
@@ -531,80 +553,124 @@ class PyTorchModelEngine(ModelEngine):
         if cp_type == 'star_attention':
             return
 
-        if self._torch_compile_enabled:
-            # Disable cuda graph capture here so that we can properly capture it later
-            with no_cuda_graph():
-                warmup_batch_size = [1, self.batch_size // 2]
-                if self.batch_size < 2:
-                    warmup_batch_size = [1]
-                for bs in warmup_batch_size:
-                    for num_tokens_per_request in [
-                            1,
-                            min(self.max_num_tokens // max(bs, 1),
-                                kv_cache_manager.max_seq_len - 1)
-                    ]:
-                        with release_batch(
-                                get_torch_compile_warmup_request(
-                                    bs, num_tokens_per_request)) as batch:
-                            if batch is None:
-                                # No KV cache space!
-                                continue
+        with contextlib.ExitStack() as stack:
+            if self._torch_compile_enabled:
+
+                def disable_optimization(backend: Backend):
+                    # Disable torch.compile optimization and fallback to eager execution
+                    backend.bypass_optimization()
+                    # Disable piecewise CUDA graph capture since the capture run will produce wrong results
+                    set_enable_piecewise_cuda_graph_capture_flag(False)
+
+                stack.callback(disable_optimization,
+                               self._torch_compile_backend)
+
+                self._torch_compile_backend.enable_optimization()
+                set_enable_piecewise_cuda_graph_capture_flag(True)
+
+                # Disable cuda graph capture here so that we can properly capture it later
+                with no_cuda_graph():
+                    warmup_batch_size = [1, self.batch_size // 2]
+                    if self.batch_size < 2:
+                        warmup_batch_size = [1]
+                    for bs in warmup_batch_size:
+                        for num_tokens_per_request in [
+                                1,
+                                min(self.max_num_tokens // max(bs, 1),
+                                    kv_cache_manager.max_seq_len - 1)
+                        ]:
+                            with release_batch(
+                                    get_torch_compile_warmup_request(
+                                        bs, num_tokens_per_request)) as batch:
+                                if batch is None:
+                                    # No KV cache space!
+                                    continue
+                                logger.info(
+                                    f"Run warmup for batch size={bs}, pure {'context' if num_tokens_per_request > 1 else 'generation'} phase"
+                                )
+                                self.forward(
+                                    batch,
+                                    new_tensors_device=None,
+                                    resource_manager=resource_manager,
+                                    extra_model_inputs=_create_extra_inputs(
+                                        bs, num_tokens_per_request))
+                                torch.cuda.synchronize()
+
+            if self.pytorch_backend_config.autotuner_enabled:
+                with no_cuda_graph(), autotune():
+                    num_tokens_per_request = min(self.max_seq_len - 1,
+                                                 self.max_num_tokens)
+                    with release_batch(
+                            get_torch_compile_warmup_request(
+                                1, num_tokens_per_request)) as batch:
+                        if batch is None:
+                            # No KV cache space!
+                            pass
+                        else:
                             logger.info(
-                                f"Run warmup for batch size={bs}, pure {'context' if num_tokens_per_request > 1 else 'generation'} phase"
-                            )
+                                f"Run autotuning warmup for batch size={1}")
                             self.forward(
                                 batch,
                                 new_tensors_device=None,
                                 resource_manager=resource_manager,
                                 extra_model_inputs=_create_extra_inputs(
-                                    bs, num_tokens_per_request))
+                                    1, num_tokens_per_request))
                             torch.cuda.synchronize()
 
-        if self.pytorch_backend_config.autotuner_enabled:
-            with no_cuda_graph(), autotune():
-                num_tokens_per_request = min(self.max_seq_len - 1,
-                                             self.max_num_tokens)
-                with release_batch(
-                        get_torch_compile_warmup_request(
-                            1, num_tokens_per_request)) as batch:
+                    logger.info(f"Autotuner Cache size after warmup " +
+                                str(len(AutoTuner.get().profiling_cache)))
+
+            if not (self._run_cuda_graphs
+                    or self._torch_compile_piecewise_cuda_graph):
+                return
+
+            logger.info(
+                f"Creating CUDA graph instances for {len(self._cuda_graph_batch_sizes)} batch sizes."
+            )
+            # Reverse the order of the cuda graph batch sizes to make smaller batch size graph could reuse larger batch size graph memory
+            cuda_graph_batch_sizes = sorted(self._cuda_graph_batch_sizes,
+                                            reverse=True)
+            for bs in cuda_graph_batch_sizes:
+                if bs > self.batch_size:
+                    # skip batch size larger than self.batch_size
+                    continue
+                with release_batch(get_cuda_graph_warmup_request(bs)) as batch:
                     if batch is None:
                         # No KV cache space!
-                        pass
-                    else:
-                        logger.info(f"Run autotuning warmup for batch size={1}")
-                        self.forward(batch,
-                                     new_tensors_device=None,
-                                     resource_manager=resource_manager,
-                                     extra_model_inputs=_create_extra_inputs(
-                                         1, num_tokens_per_request))
-                        torch.cuda.synchronize()
+                        return
+                    logger.info(
+                        f"Run generation only CUDA graph warmup for batch size={bs}"
+                    )
+                    self.forward(batch,
+                                 new_tensors_device=None,
+                                 resource_manager=resource_manager,
+                                 extra_model_inputs=_create_extra_inputs(bs, 1))
+                    torch.cuda.synchronize()
 
-                logger.info(f"Autotuner Cache size after warmup " +
-                            str(len(AutoTuner.get().profiling_cache)))
+                if self._torch_compile_piecewise_cuda_graph:
+                    with no_cuda_graph():
+                        with release_batch(
+                                get_torch_compile_warmup_request(1,
+                                                                 bs)) as batch:
+                            logger.info(
+                                f"Run piecewise CUDA graph warmup for batch size={bs}"
+                            )
 
-        if not self._run_cuda_graphs:
-            return
-
-        logger.info(
-            f"Creating CUDA graph instances for {len(self._cuda_graph_batch_sizes)} batch sizes."
-        )
-        # Reverse the order of the cuda graph batch sizes to make smaller batch size graph could reuse larger batch size graph memory
-        cuda_graph_batch_sizes = sorted(self._cuda_graph_batch_sizes,
-                                        reverse=True)
-        for bs in cuda_graph_batch_sizes:
-            if bs > self.batch_size:
-                # skip batch size larger than self.batch_size
-                continue
-            with release_batch(get_cuda_graph_warmup_request(bs)) as batch:
-                if batch is None:
-                    # No KV cache space!
-                    return
-                logger.info(f"Run warmup for batch size={bs}")
-                self.forward(batch,
-                             new_tensors_device=None,
-                             resource_manager=resource_manager,
-                             extra_model_inputs=_create_extra_inputs(bs, 1))
-                torch.cuda.synchronize()
+                            for _ in range(3):
+                                self.forward(
+                                    batch,
+                                    new_tensors_device=None,
+                                    resource_manager=resource_manager,
+                                    extra_model_inputs=_create_extra_inputs(
+                                        1, bs))
+                            self.forward(
+                                batch,
+                                new_tensors_device=None,
+                                resource_manager=resource_manager,
+                                extra_model_inputs=_create_extra_inputs(1, bs))
+                            torch.cuda.synchronize()
+                            gc.collect()
+                            torch.cuda.empty_cache()
 
     def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
         if kv_cache_manager is None:
