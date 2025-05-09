@@ -8,7 +8,7 @@ import torch
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm.llmapi import (KvCacheConfig, NGramDecodingConfig)
+from tensorrt_llm.llmapi import KvCacheConfig, NGramDecodingConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
