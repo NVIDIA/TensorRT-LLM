@@ -1824,11 +1824,11 @@ skip_pre_hopper = pytest.mark.skipif(
     reason="This test is not supported in pre-Hopper architecture")
 
 skip_pre_blackwell = pytest.mark.skipif(
-    get_sm_version() < 100 or get_sm_version() >= 120,
+    get_sm_version() < 100,
     reason="This test is not supported in pre-Blackwell architecture")
 
 skip_post_blackwell = pytest.mark.skipif(
-    get_sm_version() >= 100 and get_sm_version() < 120,
+    get_sm_version() >= 100,
     reason="This test is not supported in post-Blackwell architecture")
 
 skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
@@ -1836,6 +1836,9 @@ skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
 skip_no_hopper = pytest.mark.skipif(
     get_sm_version() != 90,
     reason="This test is only  supported in Hopper architecture")
+
+skip_no_sm120 = pytest.mark.skipif(get_sm_version() != 120,
+                                   reason="This test is for Blackwell SM120")
 
 
 def skip_fp8_pre_ada(use_fp8):
