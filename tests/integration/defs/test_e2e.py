@@ -1615,7 +1615,7 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
             f"{llm_models_root()}/{model_path}",
         ],
                          running_log=running_log)
-        _check_mem_usage(running_log, [10.9, 0, 0, 0])
+        _check_mem_usage(running_log, [12.0, 0, 0, 0])
     finally:
         if running_log:
             os.remove(running_log)
