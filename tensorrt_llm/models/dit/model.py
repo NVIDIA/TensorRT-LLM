@@ -134,6 +134,7 @@ class DiTBlock(Module):
                                   tp_rank=mapping.tp_rank,
                                   cp_group=mapping.cp_group,
                                   cp_size=mapping.cp_size,
+                                  cp_rank=mapping.cp_rank,
                                   dtype=dtype,
                                   quant_mode=quant_mode)
         self.norm2 = LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -299,6 +300,7 @@ class DiT(PretrainedModel):
         if self.mapping.cp_size > 1:
             assert x.shape[1] % self.mapping.cp_size == 0
             x = chunk(x, self.mapping.cp_size, dim=1)[self.mapping.cp_rank]
+            input_lengths = input_lengths // self.mapping.cp_size
         for block in self.blocks:
             x = block(x, c, input_lengths)  # (N, T, D)
         self.register_network_output('before_final_layer', x)

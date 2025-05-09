@@ -70,8 +70,13 @@ class _FlashInferPlanner:
         self.__init__()  # reset all state
 
         self.workspace_buffer = workspace_buffer
+        # NOTE (lucaslie): flashinfer fa3 backend has accuracy issue + illegal memory access issues
+        # on H100 PCIe, see https://github.com/NVIDIA/TensorRT-LLM/pull/3686 and
+        # https://github.com/flashinfer-ai/flashinfer/issues/924
         self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            self.workspace_buffer, "NHD"
+            self.workspace_buffer,
+            "NHD",
+            backend="fa2",
         )
         self.decode_wrapper = self._init_decode_wrapper()
 
@@ -383,7 +388,9 @@ class FlashInferAttention(AttentionDescriptor):
     @classmethod
     def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
         def _init_workspace(si: SequenceInfo) -> torch.Tensor:
-            buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=si.device)
+            # NOTE (lucaslie): avoid OOM for many cudagraphs,
+            # see https://github.com/NVIDIA/TensorRT-LLM/pull/3686
+            buffer = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device=si.device)
             cls._get_planner().init_workspace(buffer)
             return buffer
 

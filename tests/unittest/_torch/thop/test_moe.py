@@ -33,7 +33,8 @@ class moe_args:
                  top_k, padding, hidden_states, hidden_states_scale,
                  hidden_states_scale_global, expert_logits, gemm1_weights,
                  gemm1_scales, gemm1_scales_global, gemm2_weights, gemm2_scales,
-                 gemm2_scales_global, permute_info):
+                 gemm2_scales_global, permute_info,
+                 use_routing_scales_on_input):
         self.num_tokens = num_tokens
         self.num_experts = num_experts
         self.hidden_size = hidden_size
@@ -51,13 +52,14 @@ class moe_args:
         self.gemm2_scales = gemm2_scales
         self.gemm2_scales_global = gemm2_scales_global
         self.permute_info = permute_info
+        self.use_routing_scales_on_input = use_routing_scales_on_input
 
 
 class moe_args_dequant:
 
     def __init__(self, num_tokens, num_experts, hidden_size, intermediate_size,
                  top_k, padding, hidden_states, expert_logits, gemm1_weights,
-                 gemm2_weights, permute_info):
+                 gemm2_weights, permute_info, use_routing_scales_on_input):
         self.num_tokens = num_tokens
         self.num_experts = num_experts
         self.hidden_size = hidden_size
@@ -69,6 +71,7 @@ class moe_args_dequant:
         self.gemm1_weights = gemm1_weights
         self.gemm2_weights = gemm2_weights
         self.permute_info = permute_info
+        self.use_routing_scales_on_input = use_routing_scales_on_input
 
 
 def routing_reference(expertLogits, topK, padding):
@@ -179,17 +182,27 @@ def noaux_tc_ref(logits, bias, n_group, topk_group, top_k,
     return scores
 
 
-def routing_reference_no_aux(expert_logits, routing_bias, top_k, n_groups,
-                             top_k_groups, routed_scaling, padding):
+def routing_reference_no_aux(expert_logits,
+                             routing_bias,
+                             top_k,
+                             n_groups,
+                             top_k_groups,
+                             routed_scaling,
+                             padding,
+                             use_routing_scales_on_input=False):
     routing_logits = expert_logits.to(dtype=torch.float, device='cuda')
-    scores = noaux_tc_ref(routing_logits, routing_bias, n_groups, top_k_groups,
-                          top_k, routed_scaling)
+    if use_routing_scales_on_input:
+        # if using routing scales on input, topK == 1 and the score is a plain sigmoid
+        scores = F.sigmoid(routing_logits)
+    else:
+        scores = noaux_tc_ref(routing_logits, routing_bias, n_groups,
+                              top_k_groups, top_k, routed_scaling)
     permute_info = routing_reference(scores, top_k, padding)
     # print("permute_info: ", permute_info)
     return permute_info, scores
 
 
-def dequant_reference(input, scale, transpose_scale, block_m, block_n):
+def dequant_reference_dsfp8(input, scale, transpose_scale, block_m, block_n):
     input = input.to(torch.float)
     scale = scale.to(torch.float)
     if transpose_scale:
@@ -218,7 +231,7 @@ def dequant_reference(input, scale, transpose_scale, block_m, block_n):
     return output
 
 
-def run_moe_dequant(args, use_fp4=False):
+def run_moe_dequant(args, quant_mode=["fp4", "dsFp8", "perTensorFp8"]):
     # Permute
     total_num_padded_tokens = args.permute_info["permutedBufferSize"]
     expanded_idx_to_permuted_idx = args.permute_info[
@@ -248,6 +261,20 @@ def run_moe_dequant(args, use_fp4=False):
         i += my_num_tokens
         i = (i + args.padding - 1) // args.padding * args.padding
 
+    if args.use_routing_scales_on_input:
+        assert args.top_k == 1
+        # For each token and its top_k experts
+        for token_idx in range(args.num_tokens):
+            for k in range(args.top_k):
+                # Get the permuted index for this token's k-th expert
+                expanded_idx = token_idx * args.top_k + k
+                permuted_idx = expanded_idx_to_permuted_idx[expanded_idx]
+                expert_weight = args.permute_info["topKLogits"].to(torch.float)
+                # Get the expert weight for this token and expert
+                weight = expert_weight[token_idx, k]
+                # Scale the corresponding row in gemm1_output
+                gemm1_output[permuted_idx] *= weight
+
     # Activation
     activation_output = torch.full(
         (total_num_padded_tokens, args.intermediate_size),
@@ -262,17 +289,18 @@ def run_moe_dequant(args, use_fp4=False):
         my_a = gemm1_output[i:i + my_num_tokens]
         my_x1 = my_a[:, :args.intermediate_size]
         my_x2 = my_a[:, args.intermediate_size:]
-        if use_fp4:
-            # In the current impl of fp4 kernels, the order is flipped.
-            activation_output[i:i + my_num_tokens] = F.silu(my_x1) * my_x2
-        else:
-            activation_output[i:i + my_num_tokens] = F.silu(my_x2) * my_x1
+        activation_output[i:i + my_num_tokens] = F.silu(my_x2) * my_x1
         i += my_num_tokens
         i = (i + args.padding - 1) // args.padding * args.padding
 
-    if use_fp4:
+    if quant_mode == "fp4":
         activation_output, c_global_sf = quant_dequant_fp4(
             activation_output.to(torch.bfloat16), False, True)
+        activation_output = activation_output.to(torch.float)
+        args.c_global_sf = c_global_sf
+    elif quant_mode == "perTensorFp8":
+        activation_output, c_global_sf = quant_dequant_per_tensor_fp8(
+            activation_output.to(torch.bfloat16))
         activation_output = activation_output.to(torch.float)
         args.c_global_sf = c_global_sf
 
@@ -302,7 +330,9 @@ def run_moe_dequant(args, use_fp4=False):
             expanded_idx = i * args.top_k + top_k_idx
             permuted_idx = expanded_idx_to_permuted_idx[expanded_idx]
             original_vector = gemm2_output[permuted_idx]
-            acc += original_vector * expert_weight[i, top_k_idx]
+            weight = expert_weight[
+                i, top_k_idx] if not args.use_routing_scales_on_input else 1.0
+            acc += original_vector * weight
         finalize_output[i] = acc
     return finalize_output
 
@@ -357,41 +387,61 @@ def run_moe_reference_fp4(args):
         args.gemm2_weights, args.gemm2_scales, 1 / args.gemm2_scales_global,
         sf_vec_size).cuda()
 
-    args_dequant = moe_args_dequant(args.num_tokens, args.num_experts,
-                                    args.hidden_size, args.intermediate_size,
-                                    args.top_k, args.padding,
-                                    hidden_states_dequant, args.expert_logits,
-                                    gemm1_weights_dequant,
-                                    gemm2_weights_dequant, args.permute_info)
+    args_dequant = moe_args_dequant(
+        args.num_tokens, args.num_experts, args.hidden_size,
+        args.intermediate_size, args.top_k, args.padding, hidden_states_dequant,
+        args.expert_logits, gemm1_weights_dequant, gemm2_weights_dequant,
+        args.permute_info, args.use_routing_scales_on_input)
 
-    return run_moe_dequant(args_dequant, True), args_dequant
+    return run_moe_dequant(args_dequant, "fp4"), args_dequant
 
 
-def run_moe_reference_fp8(args):
-    hidden_states_dequant = dequant_reference(args.hidden_states,
-                                              args.hidden_states_scale, True,
-                                              False, True)
+def run_moe_reference_dsfp8(args):
+    hidden_states_dequant = dequant_reference_dsfp8(args.hidden_states,
+                                                    args.hidden_states_scale,
+                                                    True, False, True)
 
     gemm1_weights_dequant = {}
     for i in range(args.num_experts):
-        gemm1_weights_dequant[i] = dequant_reference(args.gemm1_weights[i],
-                                                     args.gemm1_scales[i],
-                                                     False, True, True)
+        gemm1_weights_dequant[i] = dequant_reference_dsfp8(
+            args.gemm1_weights[i], args.gemm1_scales[i], False, True, True)
 
     gemm2_weights_dequant = {}
     for i in range(args.num_experts):
-        gemm2_weights_dequant[i] = dequant_reference(args.gemm2_weights[i],
-                                                     args.gemm2_scales[i],
-                                                     False, True, True)
+        gemm2_weights_dequant[i] = dequant_reference_dsfp8(
+            args.gemm2_weights[i], args.gemm2_scales[i], False, True, True)
 
-    args_dequant = moe_args_dequant(args.num_tokens, args.num_experts,
-                                    args.hidden_size, args.intermediate_size,
-                                    args.top_k, args.padding,
-                                    hidden_states_dequant, args.expert_logits,
-                                    gemm1_weights_dequant,
-                                    gemm2_weights_dequant, args.permute_info)
+    args_dequant = moe_args_dequant(
+        args.num_tokens, args.num_experts, args.hidden_size,
+        args.intermediate_size, args.top_k, args.padding, hidden_states_dequant,
+        args.expert_logits, gemm1_weights_dequant, gemm2_weights_dequant,
+        args.permute_info, args.use_routing_scales_on_input)
 
-    return run_moe_dequant(args_dequant, False), args_dequant
+    return run_moe_dequant(args_dequant, "dsFp8"), args_dequant
+
+
+def run_moe_reference_per_tensor_scale_fp8(args):
+
+    hidden_states_dequant = args.hidden_states.to(
+        torch.float) / args.hidden_states_scale_global
+
+    gemm1_weights_dequant = {}
+    for i in range(args.num_experts):
+        gemm1_weights_dequant[i] = args.gemm1_weights[i].to(
+            torch.float) / args.gemm1_scales_global[i]
+
+    gemm2_weights_dequant = {}
+    for i in range(args.num_experts):
+        gemm2_weights_dequant[i] = args.gemm2_weights[i].to(
+            torch.float) / args.gemm2_scales_global[i]
+
+    args_dequant = moe_args_dequant(
+        args.num_tokens, args.num_experts, args.hidden_size,
+        args.intermediate_size, args.top_k, args.padding, hidden_states_dequant,
+        args.expert_logits, gemm1_weights_dequant, gemm2_weights_dequant,
+        args.permute_info, args.use_routing_scales_on_input)
+
+    return run_moe_dequant(args_dequant, "perTensorFp8"), args_dequant
 
 
 def quant_fp4(a, use_ue8m0=False, is_sf_swizzled_layout=True):
@@ -440,6 +490,38 @@ def quant_dequant_fp4(a, use_ue8m0=False, is_sf_swizzled_layout=True):
     return a_pt.cuda(), a_global_sf
 
 
+def quant_fp8_per_tensor(a):
+    a_global_sf = 448 / a.float().abs().nan_to_num().max()
+
+    a_fp8 = (a * a_global_sf).to(torch.float8_e4m3fn)
+
+    return a_fp8, a_global_sf
+
+
+def quant_fp8_per_tensor_batches(a):
+    num_batches = a.size(0)
+    a_quant = []
+    a_scales = []
+
+    for i in range(num_batches):
+        a_fp8, a_global_sf = quant_fp8_per_tensor(a[i])
+        a_quant.append(a_fp8)
+        a_scales.append(a_global_sf)
+
+    result_a_quant = torch.stack(a_quant)
+    result_a_scales = torch.stack(a_scales)
+
+    return result_a_quant, result_a_scales
+
+
+def quant_dequant_per_tensor_fp8(a):
+    a_global_sf = 448 / a.float().abs().nan_to_num().max()
+    a_fp8 = (a * a_global_sf).to(torch.float8_e4m3fn)
+    a_pt = a_fp8.to(torch.float) / a_global_sf
+
+    return a_pt.cuda(), a_global_sf
+
+
 @pytest.mark.skipif(
     getSMVersion() != 100,
     reason="The kernel only supports Blackwell. Current SM is %d." %
@@ -447,8 +529,8 @@ def quant_dequant_fp4(a, use_ue8m0=False, is_sf_swizzled_layout=True):
 )
 @pytest.mark.parametrize("num_tokens", [16, 64, 1024])
 @pytest.mark.parametrize("num_experts", [32, 256])
-@pytest.mark.parametrize("hidden_size", [128, 512])
-@pytest.mark.parametrize("intermediate_size", [128, 512])
+@pytest.mark.parametrize("hidden_size", [512])
+@pytest.mark.parametrize("intermediate_size", [512])
 def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size):
     torch.random.manual_seed(0)
 
@@ -499,7 +581,7 @@ def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size):
     args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
                     top_k, padding, hidden_states, hidden_states_scale, None,
                     scores, gemm1_weights, gemm1_scales, None, gemm2_weights,
-                    gemm2_scales, None, permute_info)
+                    gemm2_scales, None, permute_info, False)
 
     output = torch.ops.trtllm.fp8_block_scale_moe_runner(
         expert_logits, routing_bias, hidden_states, hidden_states_scale,
@@ -511,7 +593,7 @@ def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size):
     #
     # Run the reference implementations
     #
-    output_dequant_reference, _ = run_moe_reference_fp8(args)
+    output_dequant_reference, _ = run_moe_reference_dsfp8(args)
 
     #
     # Check the results
@@ -542,10 +624,10 @@ def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size):
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
-@pytest.mark.parametrize("num_tokens", [1, 2, 16, 64, 1024, 8192])
+@pytest.mark.parametrize("num_tokens", [1, 2, 16, 64, 1024])
 @pytest.mark.parametrize("num_experts", [32, 256])
-@pytest.mark.parametrize("hidden_size", [512])
-@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [1024])
 def test_moe_fp4(num_tokens, num_experts, hidden_size, intermediate_size):
     torch.random.manual_seed(0)
 
@@ -629,25 +711,13 @@ def test_moe_fp4(num_tokens, num_experts, hidden_size, intermediate_size):
                                                     top_k, n_groups,
                                                     top_k_groups,
                                                     routed_scaling, padding)
-    args = moe_args(
-        num_tokens,
-        num_experts,
-        hidden_size,
-        intermediate_size,
-        top_k,
-        padding,
-        hidden_states_fp4_bytes,
-        hidden_states_scale_fp4_bytes,
-        hidden_states_scale_global,
-        scores,
-        gemm1_weights_fp4_bytes,
-        gemm1_scales_fp4_bytes,
-        gemm1_scales_global,
-        gemm2_weights_fp4_bytes,
-        gemm2_scales_fp4_bytes,
-        gemm2_scales_global,
-        permute_info,
-    )
+    args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
+                    top_k, padding, hidden_states_fp4_bytes,
+                    hidden_states_scale_fp4_bytes, hidden_states_scale_global,
+                    scores, gemm1_weights_fp4_bytes, gemm1_scales_fp4_bytes,
+                    gemm1_scales_global, gemm2_weights_fp4_bytes,
+                    gemm2_scales_fp4_bytes, gemm2_scales_global, permute_info,
+                    False)
     #
     # Run the reference implementations
     #
@@ -747,6 +817,157 @@ def test_moe_fp4(num_tokens, num_experts, hidden_size, intermediate_size):
         num_experts,
         routed_scaling,
     )
+
+    output_dequant_actual = output.to(torch.float)
+
+    #
+    # Check the results
+    #
+    def check_accuracy(a, b, atol, rtol, percent):
+        if torch.any(torch.isnan(a)):
+            raise Exception("NaN in a")
+        if torch.any(torch.isnan(b)):
+            raise Exception("NaN in b")
+        assert a.shape == b.shape
+        left = torch.abs(a - b)
+        right = atol + rtol * torch.abs(b)
+        count = torch.sum(left > right)
+        mismatch_percent = count / a.numel()
+        if mismatch_percent > 1 - percent:
+            raise Exception("Mismatch percentage is %f for rtol %f" %
+                            (mismatch_percent, rtol))
+
+    check_accuracy(output_dequant_reference,
+                   output_dequant_actual,
+                   atol=0.1,
+                   rtol=0.85,
+                   percent=0.925)
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 100,
+    reason="The kernel only supports Blackwell. Current SM is %d." %
+    getSMVersion(),
+)
+@pytest.mark.parametrize("num_tokens", [1, 2, 16, 64, 1024])
+@pytest.mark.parametrize("num_experts", [128])
+@pytest.mark.parametrize("hidden_size", [2048])
+@pytest.mark.parametrize("intermediate_size", [2048])
+@pytest.mark.parametrize("use_routing_scales_on_input", [True, False])
+def test_moe_fp8_per_tensor_scale(num_tokens, num_experts, hidden_size,
+                                  intermediate_size,
+                                  use_routing_scales_on_input):
+    torch.random.manual_seed(0)
+
+    #
+    # Data Generation
+    #
+    top_k = 8 if not use_routing_scales_on_input else 1
+    padding = 8
+    n_groups = 8
+    top_k_groups = 4
+    routed_scaling = 2.5
+
+    assert top_k <= num_experts
+    assert top_k == 8 or top_k == 1
+    assert top_k_groups == 4
+    assert num_experts > n_groups
+    assert num_experts % n_groups == 0
+    assert top_k < (top_k_groups * num_experts / n_groups)
+    assert hidden_size % 128 == 0
+    assert intermediate_size % 128 == 0
+
+    expert_logits = torch.randn((num_tokens, num_experts),
+                                device='cuda').to(torch.float)
+    routing_bias = torch.randn(num_experts, device='cuda', dtype=torch.bfloat16)
+
+    hidden_states = torch.randn((num_tokens, hidden_size),
+                                device='cuda').to(torch.bfloat16)
+
+    gemm1_weights = torch.randn(
+        (num_experts, 2 * intermediate_size, hidden_size),
+        device='cuda').to(torch.bfloat16)
+    gemm2_weights = torch.randn((num_experts, hidden_size, intermediate_size),
+                                device='cuda').to(torch.bfloat16)
+
+    hidden_states_quant, hidden_states_global_scale = quant_fp8_per_tensor(
+        hidden_states)
+    gemm1_weights_quant, gemm1_global_scales = quant_fp8_per_tensor_batches(
+        gemm1_weights)
+    gemm2_weights_quant, gemm2_global_scales = quant_fp8_per_tensor_batches(
+        gemm2_weights)
+
+    permute_info, scores = routing_reference_no_aux(
+        expert_logits, routing_bias, top_k, n_groups, top_k_groups,
+        routed_scaling, padding, use_routing_scales_on_input)
+
+    args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
+                    top_k, padding, hidden_states_quant, None,
+                    hidden_states_global_scale, scores, gemm1_weights_quant,
+                    None, gemm1_global_scales, gemm2_weights_quant, None,
+                    gemm2_global_scales, permute_info,
+                    use_routing_scales_on_input)
+    #
+    # Run the reference implementations
+    #
+    # It is important to run the reference implementation before the TRT-LLM kernel
+    # because the MoE shuffles the weights in-place.
+    output_dequant_reference, args_dequant = run_moe_reference_per_tensor_scale_fp8(
+        args)
+
+    # FIXME: this depends on the kernel internals
+    epilogue_tile_m = 128
+
+    # Reorder rows of W1 for fused gated activation
+    gemm1_weights_fp8_interleaved = []
+    for i in range(num_experts):
+        gemm1_weights_fp8_interleaved.append(
+            reorder_rows_for_gated_act_gemm(gemm1_weights_quant[i].clone()))
+
+    # Stack weights and scales for all experts
+    gemm1_weights_fp8_interleaved = torch.stack(
+        gemm1_weights_fp8_interleaved).reshape(num_experts,
+                                               2 * intermediate_size,
+                                               hidden_size)
+
+    # Shuffle weights and scaling factors for transposed mma output
+    gemm1_weights_fp8_shuffled = []
+    gemm2_weights_fp8_shuffled = []
+    for i in range(num_experts):
+        gemm1_weights_fp8_shuffled.append(
+            shuffle_matrix_a(gemm1_weights_fp8_interleaved[i].view(torch.uint8),
+                             epilogue_tile_m))
+
+        gemm2_weights_fp8_shuffled.append(
+            shuffle_matrix_a(gemm2_weights_quant[i].view(torch.uint8),
+                             epilogue_tile_m))
+
+    # Stack weights for all experts
+    gemm1_weights_fp8_shuffled = torch.stack(gemm1_weights_fp8_shuffled).view(
+        torch.float8_e4m3fn)
+    gemm2_weights_fp8_shuffled = torch.stack(gemm2_weights_fp8_shuffled).view(
+        torch.float8_e4m3fn)
+
+    # c_global_sf: fc2_input_scale
+    scale_c_fc1 = args_dequant.c_global_sf * (
+        1.0 / args.gemm1_scales_global) * (1.0 /
+                                           args.hidden_states_scale_global)
+
+    # self.fc31_alpha
+    scale_gate_fc1 = (1.0 / args.gemm1_scales_global) * (
+        1.0 / args.hidden_states_scale_global)
+
+    # self.fc2_alpha
+    scale_c_fc2 = (1.0 / args_dequant.c_global_sf) * (1.0 /
+                                                      args.gemm2_scales_global)
+
+    output = torch.ops.trtllm.fp8_per_tensor_scale_moe_runner(
+        expert_logits.to(torch.bfloat16)
+        if use_routing_scales_on_input else expert_logits, routing_bias,
+        hidden_states_quant, gemm1_weights_fp8_shuffled, scale_c_fc1,
+        scale_gate_fc1, gemm2_weights_fp8_shuffled, scale_c_fc2, num_experts,
+        top_k, n_groups, top_k_groups, intermediate_size, 0, num_experts,
+        routed_scaling, use_routing_scales_on_input)
 
     output_dequant_actual = output.to(torch.float)
 

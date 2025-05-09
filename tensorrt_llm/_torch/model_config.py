@@ -168,22 +168,18 @@ class ModelConfig(Generic[TConfig]):
                    quant_config_dict=layer_quant_config,
                    **kwargs)
 
-    def get_bindings_model_config(
-            self,
-            tensor_parallelism: int = 1,
-            context_parallelism: int = 1) -> "ModelConfigCpp":
+    def get_bindings_model_config(self) -> "ModelConfigCpp":
         """
         This method is used to construct the bindings config for the model.
         Currently it adheres to gptJsonConfig.cpp::createModelConfig, which assumes
         that an engine has been created.
         """
         # TODO smor- this isn't robust, and currently tested for LlamaConfig only
-        # TODO smor- currently parallelism is not supported, set default to 1
         # TODO smor- currently assuming no rnn layers, no MOE
         from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 
         num_heads = self.pretrained_config.num_attention_heads // (
-            tensor_parallelism * context_parallelism)
+            self.mapping.tp_size * self.mapping.cp_size)
 
         model_config_cpp = ModelConfigCpp(
             vocab_size=self.pretrained_config.vocab_size,
@@ -195,7 +191,7 @@ class ModelConfig(Generic[TConfig]):
             data_type=torch_dtype_to_binding(
                 self.pretrained_config.torch_dtype))
 
-        mlp_hidden_size = self.pretrained_config.intermediate_size // tensor_parallelism
+        mlp_hidden_size = self.pretrained_config.intermediate_size // self.mapping.tp_size
         if "head_size" in self.pretrained_config:
             head_size = self.pretrained_config.head_size
         else:

@@ -9,7 +9,7 @@ from tensorrt_llm.scaffolding.contrib import (StreamGenerationTask,
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    # .e.g. /home/scratch.trt_llm_data/llm-models/DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B
+    # .e.g. DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B
     parser.add_argument(
         '--model_dir',
         type=str,
