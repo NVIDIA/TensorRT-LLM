@@ -803,7 +803,7 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
 
     size_t generation_workspace_size = 0;
     // The minimum number of sequence length tiles (limited by the shared memory size).
-    int minSeqLenTile
+    int const minSeqLenTile
         = estimate_min_multi_block_count(max_attention_window_size, mMaxSharedMemoryPerBlockOptin - 2048, size);
     int32_t const maxSeqLenTile
         = std::max({minSeqLenTile, getMaxNumSeqLenTile(batch_beam), (int) tc::divUp(mMultiProcessorCount, mNumHeads)});
