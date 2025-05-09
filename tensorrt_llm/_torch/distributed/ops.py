@@ -1,11 +1,10 @@
 import threading
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import nn
 
-from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
-                                     AllReduceStrategy)
+from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
@@ -261,47 +260,3 @@ class MoEAllReduce(nn.Module):
             nranks=self.mapping.tp_size,
             eps=eps,
         )
-
-
-class DeepseekAllReduce(nn.Module):
-
-    def __init__(self, mapping: Mapping):
-        super().__init__()
-        self.mapping = mapping
-        self.workspace = None
-        if self.mapping.tp_size > 1:
-            self.workspace = get_allreduce_workspace(mapping)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        reduce_fusion_inputs: List[torch.Tensor],
-        eps: float,
-        fusion_op: AllReduceFusionOp,
-    ) -> Tuple[torch.Tensor, ...]:
-        """
-        hidden_states: hidden_states of the model
-        reduce_fusion_inputs: [residual, norm_weight, scale (if using FP4 quantization)]
-        eps: epsilon for RMSNorm
-        fusion_op: AllReduceFusionOp Type, currently supports RMSNorm:
-          * RESIDUAL_RMS_NORM: allreduce + residual + Norm
-          * RESIDUAL_RMS_NORM_QUANT_NVFP4: allreduce + residual + Norm + fp4 quantization
-        output:
-          * [hidden_states, residual] if using RESIDUAL_RMS_NORM fusion_op
-          * [act_fp4, act_sf, residual] if using RESIDUAL_RMS_NORM_QUANT_NVFP4 fusion_op
-        """
-
-        output = torch.ops.trtllm.deepseek_allreduce_fusion(
-            input=hidden_states,
-            workspace=self.workspace,
-            reduce_fusion_inputs=reduce_fusion_inputs,
-            rank=self.mapping.tp_rank,
-            nranks=self.mapping.tp_size,
-            eps=eps,
-            fusion_op=fusion_op,
-        )
-
-        if len(output) == 0:
-            raise ValueError(f"Unsupported fusion op: {fusion_op}")
-
-        return output

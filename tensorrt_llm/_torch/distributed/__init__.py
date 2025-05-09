@@ -1,7 +1,7 @@
 from .communicator import Distributed, MPIDist, PPComm, TorchDist
 from .ops import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                  AllReduceStrategy, DeepseekAllReduce, MoEAllReduce, allgather,
-                  reducescatter, userbuffers_allreduce_finalize)
+                  AllReduceStrategy, MoEAllReduce, allgather, reducescatter,
+                  userbuffers_allreduce_finalize)
 
 __all__ = [
     "allgather",
@@ -11,7 +11,6 @@ __all__ = [
     "AllReduceParams",
     "AllReduceFusionOp",
     "AllReduceStrategy",
-    "DeepseekAllReduce",
     "MoEAllReduce",
     "TorchDist",
     "PPComm",
