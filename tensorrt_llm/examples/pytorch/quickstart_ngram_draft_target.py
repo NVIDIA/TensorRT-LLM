@@ -1,6 +1,6 @@
 import argparse
+
 from transformers import AutoTokenizer
-import json
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
@@ -112,7 +112,6 @@ def setup_llm(args, max_length):
         print_iter_log=args.print_iter_log,
         enable_iter_perf_stats=args.print_iter_log,
     )
-    print("print_iter_log=",args.print_iter_log)
 
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=args.kv_cache_enable_block_reuse,
@@ -135,7 +134,7 @@ def setup_llm(args, max_length):
             max_matching_ngram_size=args.max_matching_ngram_size,
             is_keep_all=True,
             is_use_oldest=True,
-            )
+        )
     else:
         spec_config = None
 
@@ -167,21 +166,22 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
     prompts = args.prompt if args.prompt else example_prompts
-    max_length = args.max_tokens 
+    max_length = args.max_tokens
 
     llm, sampling_params = setup_llm(args, max_length)
     from time import time
-    begin = time()
+    time()
     outputs = llm.generate(prompts, sampling_params)
-    end = time()
+    time()
 
-    stats = llm.get_stats()
-    for stat in stats:
-        print(stat)
+    if args.print_iter_log:
+        stats = llm.get_stats()
+        for stat in stats:
+            print(stat)
 
     num_tokens = 0
     generated_texts = []
-    for i, (prompt, output) in enumerate(zip(prompts,outputs)):
+    for i, (prompt, output) in enumerate(zip(prompts, outputs)):
         generated_text = output.outputs[0].text
         generated_tokens = tokenizer.encode(generated_text)
         num_tokens = num_tokens + len(generated_tokens)

@@ -38,10 +38,13 @@ class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
 
             # Update pool
             sequence = prefix[bi][self.start_index[gbi]:]  #.tolist()
-            for size in range(min(self.max_matching_ngram_size, prefix_len[bi] - 1), 0, -1):
+            for size in range(
+                    min(self.max_matching_ngram_size, prefix_len[bi] - 1), 0,
+                    -1):
                 # Find each possible key-value combination, and use tuple for hash
                 for l in range(len(sequence) - size):
-                    r = min(l + size + self.prompt_lookup_num_tokens, len(sequence))
+                    r = min(l + size + self.prompt_lookup_num_tokens,
+                            len(sequence))
                     key = tuple(sequence[l:l + size])
                     value = tuple(sequence[l + size:r])
                     if key not in self.pool[gbi] or not self.is_keep_all or \
@@ -56,7 +59,9 @@ class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
                         self.pool[gbi][key].add(value)
 
             # Find match
-            for size in range(min(self.max_matching_ngram_size, prefix_len[bi] - 1), 0, -1):
+            for size in range(
+                    min(self.max_matching_ngram_size, prefix_len[bi] - 1), 0,
+                    -1):
                 pattern = tuple(prefix[bi][-size:])
                 if pattern not in self.pool[gbi]:
                     continue
@@ -69,6 +74,7 @@ class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
                 break
             draft_tokens.append(chosen_ids)
             self.start_index[gbi] = max(
-                0, prefix_len[bi] - (self.prompt_lookup_num_tokens + self.max_matching_ngram_size - 1))
+                0, prefix_len[bi] - (self.prompt_lookup_num_tokens +
+                                     self.max_matching_ngram_size - 1))
 
         return draft_tokens
