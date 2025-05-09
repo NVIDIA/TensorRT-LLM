@@ -155,7 +155,8 @@ def get_cache_transceiver_prealloc_size(executor_config: ExecutorConfig,
                                         model_config: PyTorchModelEngine,
                                         mapping: Mapping):
     if (os.getenv("TRTLLM_USE_MPI_KVCACHE")
-            or os.getenv("TRTLLM_USE_UCX_KVCACHE")):
+            or os.getenv("TRTLLM_USE_UCX_KVCACHE")
+            or os.getenv("TRTLLM_USE_NIXL_KVCACHE")):
         kv_size_per_token = int(get_cache_size_per_token(model_config, mapping))
         logger.info(
             f"get_cache_transceiver_prealloc_size kv_size_per_token: {kv_size_per_token} , executor_config.cache_transceiver_config: {executor_config.cache_transceiver_config}"
