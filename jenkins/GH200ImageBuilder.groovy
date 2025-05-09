@@ -17,7 +17,8 @@ def buildImage(action, type)
 {
     def branch = env.gitlabBranch
     def branchTag = branch.replaceAll('/', '_')
-    def tag = "sbsa-devel-torch_${type}-${branchTag}-${BUILD_NUMBER}"
+    def buildNumber = env.hostBuildNumber ? env.hostBuildNumber : BUILD_NUMBER
+    def tag = "sbsa-devel-torch_${type}-${branchTag}-${buildNumber}"
 
     // Step 1: cloning tekit source code
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail

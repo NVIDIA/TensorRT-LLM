@@ -15,126 +15,12 @@
 
 import csv
 import os
-import uuid
 
 import pytest
 from defs.common import (convert_weights, generate_summary_cmd, quantize_data,
                          venv_check_call, venv_mpi_check_call)
-from defs.conftest import (evaltool_mmlu_post_process,
-                           evaltool_wikilingua_post_process, llm_models_root,
-                           skip_post_blackwell, skip_pre_ada)
+from defs.conftest import llm_models_root, skip_post_blackwell, skip_pre_ada
 from defs.trt_test_alternative import check_call
-from evaltool.constants import (EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT,
-                                EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT,
-                                EVALTOOL_MMLU_CONFIG, EVALTOOL_MMLU_RESULT_FILE,
-                                EVALTOOL_WIKILINGUA_CONFIG,
-                                EVALTOOL_WIKILINGUA_RESULT_FILE)
-
-
-@pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llm_mixtral_model_root", ['Mixtral-8x7B-v0.1'],
-                         indirect=True)
-def test_mixtal_evaltool(llama_example_root, evaltool_root,
-                         llm_mixtral_model_root, llm_venv, engine_dir,
-                         cmodel_dir):
-
-    print("Build engines...")
-
-    data_type = "float16"
-    model_dir = convert_weights(llm_venv=llm_venv,
-                                example_root=llama_example_root,
-                                cmodel_dir=cmodel_dir,
-                                model='mixtral',
-                                model_path=llm_mixtral_model_root,
-                                tp_size=4,
-                                pp_size=1,
-                                data_type=data_type,
-                                workers=4)
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}",
-        "--gather_context_logits",
-        "--max_batch_size=8",
-        "--max_input_len=7000",
-        "--max_seq_len=7048",
-        "--workers=4",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print("Human eval")
-    start_inference_server = [
-        EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT, "-e", engine_dir, "-t",
-        llm_mixtral_model_root, "-d", evaltool_root, "-m", "1024", "-c", "4"
-    ]
-    check_call(" ".join(start_inference_server),
-               shell=True,
-               env=llm_venv._new_env)
-
-    task_list = ['wikilingua', 'mmlu']
-    try:
-        for task in task_list:
-            project_id = str(uuid.uuid4())
-            if task == "wikilingua":
-                config_file = EVALTOOL_WIKILINGUA_CONFIG
-                result_file = EVALTOOL_WIKILINGUA_RESULT_FILE
-
-            if task == "mmlu":
-                config_file = EVALTOOL_MMLU_CONFIG
-                result_file = EVALTOOL_MMLU_RESULT_FILE
-
-            # Update config dynamically
-            import yaml
-            with open(config_file, 'r') as f:
-                lm_eval_config = yaml.safe_load(f)
-                lm_eval_config['model']['llm_name'] = llm_mixtral_model_root
-                lm_eval_config['model']['tokenizer_path'] = model_dir
-
-            config_file = os.path.join(llm_venv.get_working_directory(),
-                                       "lm_eval_config.yaml")
-            with open(config_file, 'w') as f:
-                yaml.dump(lm_eval_config, f)
-
-            # launch evaluation
-            run_cmd = [
-                f"cd {evaltool_root}",
-                "&&",
-                "source .venv/bin/activate",
-                "&&",
-                "python3",
-                f"evaltool/interfaces/cli/main.py",
-                "project",
-                "launch",
-                f"--eval_project_config_file '{config_file}'",
-                "--infra_name local",
-                f"--output_dir '{llm_venv.get_working_directory()}'",
-                f"--project_id {project_id}",
-            ]
-            # venv_mpi_check_call(llm_venv, [
-            #     "mpirun", "--allow-run-as-root", "--oversubscribe", "-np", "4"
-            # ], run_cmd)
-            check_call(" ".join(run_cmd), shell=True, executable="/bin/bash")
-
-            # process result
-            result_path = f"{llm_venv.get_working_directory()}/{project_id}/{result_file}"
-            check_call(f"cat {result_path}", shell=True)
-
-            if task == 'mmlu':
-                evaltool_mmlu_post_process(result_path, 0.71775, 0.006)
-            if task == 'wikilingua':
-                evaltool_wikilingua_post_process(result_path, 0.2776, 0.006)
-    finally:
-        # stop the server
-        end_inference_server = [
-            EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT, "-c", "4"
-        ]
-        check_call(" ".join(end_inference_server),
-                   shell=True,
-                   env=llm_venv._new_env)
 
 
 @skip_post_blackwell

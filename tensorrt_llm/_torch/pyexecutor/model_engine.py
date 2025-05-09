@@ -430,9 +430,6 @@ class PyTorchModelEngine(ModelEngine):
 
         def get_cuda_graph_warmup_request(batch_size):
             available_blocks = kv_cache_manager.get_num_free_blocks()
-
-            max_num_draft_tokens = self.spec_config.max_draft_tokens if self.is_spec_decode else 0
-
             if available_blocks >= batch_size:
                 result = ScheduledRequests()
                 result.context_requests = []
@@ -441,30 +438,19 @@ class PyTorchModelEngine(ModelEngine):
                 requests = kv_cache_manager.add_dummy_requests(
                     list(range(batch_size - 1)),
                     is_gen=True,
-                    max_num_draft_tokens=max_num_draft_tokens,
+                    max_num_draft_tokens=self.max_draft_len,
                 )
-                available_blocks -= batch_size - 1
-                available_tokens = available_blocks * kv_cache_manager.tokens_per_block
-                # When we generate last token for the max_seq_len case,
-                # we only need to store (max_seq_len - 1 - max_num_draft_tokens) tokens in the KV cache.
-                # For the max_seq_len, some speculative decoding methods need extra kv tokens in kv cache
-                # manager to support different kv lengths for the draft/target layers. So, we also
-                # need to remove those extra tokens from the max_seq_len.
-                token_num = max(
-                    1,
-                    min(
-                        available_tokens, self.max_seq_len -
-                        kv_cache_manager.num_extra_kv_tokens - 1 -
-                        max_num_draft_tokens),
-                )
+                available_tokens = kv_cache_manager.get_num_available_tokens(
+                    self.max_draft_len)
 
                 # Add one dummy request with the maximum possible sequence length.
                 # The sequence length is limited by both the max_seq_len and the number of available blocks.
+                token_num = max(1, min(available_tokens, self.max_seq_len - 1))
                 max_seq_len_request = kv_cache_manager.add_dummy_requests(
                     request_ids=[batch_size - 1],
                     token_nums=[token_num],
                     is_gen=True,
-                    max_num_draft_tokens=max_num_draft_tokens,
+                    max_num_draft_tokens=self.max_draft_len,
                 )[0]
                 # Add the longest request before all other seq_len=1 request to simulate the padding CUDA graph case.
                 # This batch contains both the longest request and the shortest requests,
@@ -487,13 +473,12 @@ class PyTorchModelEngine(ModelEngine):
                     num_tokens_per_request / kv_cache_manager.tokens_per_block):
                 # Should only need (at most) one more page per request.
                 is_gen = num_tokens_per_request == 1
-                max_num_draft_tokens = self.spec_config.max_draft_tokens if self.is_spec_decode and is_gen else 0
 
                 requests = kv_cache_manager.add_dummy_requests(
                     list(range(batch_size)),
                     [num_tokens_per_request] * batch_size,
                     is_gen=is_gen,
-                    max_num_draft_tokens=max_num_draft_tokens)
+                    max_num_draft_tokens=self.max_draft_len)
 
                 if spec_resource_manager is not None:
                     spec_resource_manager.add_dummy_requests(
@@ -577,7 +562,7 @@ class PyTorchModelEngine(ModelEngine):
                         for num_tokens_per_request in [
                                 1,
                                 min(self.max_num_tokens // max(bs, 1),
-                                    kv_cache_manager.max_seq_len - 1)
+                                    self.max_seq_len - 1)
                         ]:
                             with release_batch(
                                     get_torch_compile_warmup_request(
@@ -753,11 +738,10 @@ class PyTorchModelEngine(ModelEngine):
         # Set the dummy request ids starting at (uint64 max value - padding_size - 1) to avoid conflict with
         # active request IDs
         max_req_id = MAX_UINT64 - padding_size - 1
-        max_num_draft_tokens = self.spec_config.max_draft_tokens if self.is_spec_decode else 0
         generation_requests = kv_cache_manager.add_dummy_requests(
             [max_req_id + i + 1 for i in range(padding_size)],
             is_gen=True,
-            max_num_draft_tokens=max_num_draft_tokens)
+            max_num_draft_tokens=self.max_draft_len)
         scheduled_requests.generation_requests.extend(generation_requests)
         return generation_requests
 
