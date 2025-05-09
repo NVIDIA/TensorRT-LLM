@@ -119,7 +119,7 @@ class GatedMLP(nn.Module):
         lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         if self.activation == F.silu:
-            if self.is_llama4 and self.down_proj.has_fp8_qdq and x.shape[0] <= 16:
+            if self.gate_up_proj.use_llama4_fc_swiglu_kernel and self.down_proj.has_fp8_qdq and x.shape[0] <= 16:
                 # In Llama4, we have two custom kernels for FC+SwiGLU. The first one is a
                 # gemv kernel that is efficient for small input sizes (token_length <= 4).
                 # The second one is the trtllm-gen kernel that is efficient for (4 < token_length <= 16).
