@@ -19,7 +19,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import llm_models_root, skip_post_blackwell, skip_pre_ada
-from .accuracy_core import MMLU, CnnDailymail, LlmapiAccuracyTestHarness
+from .accuracy_core import GSM8K, MMLU, CnnDailymail, LlmapiAccuracyTestHarness
 
 
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
@@ -100,6 +100,13 @@ class TestMixtral8x7B(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(2)
+    def test_cp2(self):
+        with LLM(self.MODEL_PATH, context_parallel_size=2) as llm:
+            # TRTLLM_ACCURACY_NO_REFERENCE=1 pytest -vs "test_llm_api.py::TestMixtral8x7B::test_cp2[]"
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @skip_pre_ada
