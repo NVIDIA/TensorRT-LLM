@@ -4,7 +4,7 @@
 
 This document summarizes performance measurements of TensorRT-LLM on a number of GPUs across a set of key models.
 
-The data in the following tables is provided as a reference point to help users validate observed performance. 
+The data in the following tables is provided as a reference point to help users validate observed performance.
 It should *not* be considered as the peak performance that can be delivered by TensorRT-LLM.
 
 We attempted to keep commands as simple as possible to ease reproducibility and left many options at their default settings.
@@ -229,7 +229,7 @@ The results will be printed to the terminal upon benchmark completion. For examp
 
 ```shell
 ===========================================================
-= PERFORMANCE OVERVIEW 
+= PERFORMANCE OVERVIEW
 ===========================================================
 Request Throughput (req/sec):                     43.2089
 Total Output Throughput (tokens/sec):             5530.7382
@@ -252,7 +252,7 @@ Average time-per-output-token [TPOT] (ms):        182.9639
 [TPOT] P95    : 206.5064
 [TPOT] P99    : 206.5821
 
--- Per-Request Time-to-First-Token [TTFT] Breakdown (ms) 
+-- Per-Request Time-to-First-Token [TTFT] Breakdown (ms)
 
 [TTFT] MINIMUM: 3914.7621
 [TTFT] MAXIMUM: 107501.2487
