@@ -97,7 +97,7 @@ install_gcctoolset_rockylinux() {
 	  vim \
 	  wget \
 	  git-lfs \
-	  gcc-toolset-13 \
+	  gcc-toolset-11 \
 	  libffi-devel \
 	  -y
   dnf install \
@@ -105,7 +105,7 @@ install_gcctoolset_rockylinux() {
 	  openmpi-devel \
 	  pigz \
 	  -y
-  echo "source scl_source enable gcc-toolset-13" >> "${DEVTOOLSET_ENV_FILE}"
+  echo "source scl_source enable gcc-toolset-11" >> "${DEVTOOLSET_ENV_FILE}"
   echo "source ${DEVTOOLSET_ENV_FILE}" >> "${ENV}"
   echo 'export PATH=/usr/lib64/openmpi/bin:$PATH' >> "${ENV}"
   dnf clean all
