@@ -276,11 +276,12 @@ def prepare_fused_mha_metadata(
 def prepare_fused_mha_metadata_fake(
     input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
 ):
+    num_seq = SequenceInfo._get_sanitized_num_sequences(input_ids, seq_len)
     return (
-        torch.empty_like(seq_len),
-        torch.empty_like(input_pos),
-        torch.empty_like(cache_loc),
-        torch.empty_like(seq_len),
+        torch.empty_like(seq_len[:num_seq]),
+        torch.empty_like(input_pos[:num_seq]),
+        torch.empty_like(cache_loc[:num_seq]),
+        torch.empty_like(seq_len[:num_seq]),
     )
 
 
