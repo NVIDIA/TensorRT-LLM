@@ -404,7 +404,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     model: str
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
-    logprobs: Optional[bool] = False
+    logprobs: Optional[int] = None
     top_logprobs: Optional[int] = 0
     max_completion_tokens: int = Field(default=16,
                                        validation_alias='max_tokens')

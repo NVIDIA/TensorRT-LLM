@@ -83,6 +83,5 @@ class Evaluator(ABC):
         return score
 
     @staticmethod
-    @abstractmethod
     def command(ctx, *args, **kwargs) -> None:
         raise NotImplementedError()
