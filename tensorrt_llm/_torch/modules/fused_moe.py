@@ -385,6 +385,7 @@ class FusedMoE(nn.Module):
 
         if self.is_trtllm():
             # trtllm_gen backend only support min-latency mode now
+            assert not self.apply_router_weight_on_input, "TRTLLM backend does not support applying router weight on input yet."
             assert not self.reduce_results
             assert self.quant_config and (
                 self.quant_config.quant_mode.has_nvfp4()
@@ -712,6 +713,7 @@ class FusedMoE(nn.Module):
         assert token_selected_experts.dtype == torch.int32
 
         if self.apply_router_weight_on_input:
+            assert x.dtype != torch.float8_e4m3fn, "Current workaround for apply_router_weight_on_input does not support fp8 input"
             x = x * token_final_scales.to(x.dtype)
             # TODO: remove this once we have correct fusedmoe kernel ready
             token_final_scales = None
