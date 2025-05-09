@@ -199,10 +199,10 @@ protected:
     void setDefaultParams()
     {
         mBatchSize = 2;
-        mSeqLen = 256;
-        mChunkSize = 32;
-        mNumHeads = 4;
-        mHeadSize = 32;
+        mSeqLen = 128;
+        mChunkSize = 16;
+        mNumHeads = 16;
+        mHeadSize = 128 + 64;
         mIsCausalMask = false;
     }
 
@@ -459,8 +459,6 @@ TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedPrefillCausalMask)
     auto* output_ref_ptr = bufferCast<DataType>(*(this->h_output_tensor_accum_ref));
     for (int i = 0; i < this->h_output_tensor->getSize(); i++)
     {
-        std::cout << "diff: " << std::abs(static_cast<float>(output_ptr[i]) - static_cast<float>(output_ref_ptr[i]))
-                  << std::endl;
         if (std::abs(static_cast<float>(output_ptr[i]) - static_cast<float>(output_ref_ptr[i]))
             > getTolerance<DataType>(output_ptr[i]))
         {

@@ -11,6 +11,7 @@ struct MergeSoftmaxTraits
 {
     static constexpr int kNumThreads = 128;
     static constexpr int kElemPerThread = 16 / sizeof(T);
+    static constexpr int kElemPerBlock = kNumThreads * kElemPerThread;
 
     union VecReader
     {
@@ -48,10 +49,10 @@ __global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float* merged_softmax
     using KT = MergeSoftmaxTraits<T>;
     int const batch_idx = blockIdx.x;
     int const token_idx = blockIdx.y;
-    int const kNumHeadsPerBlock = KT::kElemPerThread * KT::kNumThreads / head_size;
-    int const kNumThreadsPerHead = head_size / KT::kElemPerThread;
-    int const head_idx = (blockIdx.z * kNumHeadsPerBlock) + (threadIdx.x / kNumThreadsPerHead);
-    int const dim_idx = (threadIdx.x % kNumThreadsPerHead) * KT::kElemPerThread;
+    int const CurrentElementIdx = (blockIdx.z * KT::kElemPerBlock) + threadIdx.x * KT::kElemPerThread;
+
+    int const head_idx = CurrentElementIdx / head_size;
+    int const dim_idx = CurrentElementIdx % head_size;
 
     int const global_attn_offset = batch_idx * chunked_token_size * num_heads * head_size
         + token_idx * num_heads * head_size + head_idx * head_size;
@@ -81,7 +82,10 @@ __global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float* merged_softmax
     typename KT::VecReader pre_attn_reader{};
     typename KT::VecReader curr_attn_reader{};
     typename KT::VecReader merged_attn_reader{};
-
+    if (head_idx >= num_heads || dim_idx >= head_size)
+    {
+        return;
+    }
     pre_attn_reader.reader = *reinterpret_cast<decltype(pre_attn_reader.reader)*>(pre_attn_ptr + dim_idx);
     curr_attn_reader.reader = *reinterpret_cast<decltype(curr_attn_reader.reader)*>(curr_attn_ptr + dim_idx);
 
@@ -96,7 +100,7 @@ __global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float* merged_softmax
     *reinterpret_cast<decltype(merged_attn_reader.reader)*>(merged_attn_ptr + dim_idx) = merged_attn_reader.reader;
 
     // write merged softmax sum and max back to global memory
-    if (threadIdx.x % kNumThreadsPerHead == 0)
+    if (dim_idx == 0)
     {
         *merged_softmax_sum_ptr = merged_softmax_sum_val;
         *merged_softmax_max_ptr = merged_softmax_max_val;
@@ -169,10 +173,9 @@ void invokeMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_sum, T* co
 {
 
     using KT = MergeSoftmaxTraits<T>;
-    // static const int kTHreadsPerHead = head_size / kElemPerThread;
-    static int const kNumHeadsPerBlock = KT::kElemPerThread * KT::kNumThreads / head_size;
+    static int const kNumHeadIterNeeded = (num_heads * head_size + KT::kElemPerBlock - 1) / KT::kElemPerThread;
 
-    dim3 grid(batch_size, chunked_token_size, (num_heads + kNumHeadsPerBlock - 1) / kNumHeadsPerBlock);
+    dim3 grid(batch_size, chunked_token_size, kNumHeadIterNeeded);
     dim3 block(KT::kNumThreads);
 
     mergeAttnWithSoftmaxKernel<T><<<grid, block, 0, stream>>>(merged_attn, merged_softmax_sum, pre_attn,
