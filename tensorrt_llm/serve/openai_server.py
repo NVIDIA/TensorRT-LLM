@@ -90,6 +90,8 @@ class OpenAIServer:
         self.register_routes()
 
     async def await_disconnected(self, raw_request: Request, promise):
+        if raw_request is None:
+            return
         while not await raw_request.is_disconnected():
             await asyncio.sleep(1)
         if not promise.finished:
@@ -167,12 +169,7 @@ class OpenAIServer:
                 temperature=0.0 # Deterministic output
             )
 
-            # Create a mock request object using a dictionary, we need this so that we can call
-            # asyncio.create_task(self.await_disconnected(raw_request, promise))
-            mock_request = {
-                '_disconnected': False,
-                'is_disconnected': lambda: mock_request['_disconnected']
-            }
+            mock_request = None
 
             # Call the chat completion logic
             response = await self.openai_chat(health_request, mock_request)
