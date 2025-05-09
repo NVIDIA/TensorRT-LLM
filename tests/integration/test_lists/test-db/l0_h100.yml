@@ -79,19 +79,19 @@ l0_h100:
       backend: cpp
   tests:
   # ------------- CPP tests ---------------
-  - test_cpp.py::test_unit_tests[batch_manager-90]
-  - test_cpp.py::test_unit_tests[common-90]
-  - test_cpp.py::test_unit_tests[executor-90]
-  - test_cpp.py::test_unit_tests[kernels-90]
-  - test_cpp.py::test_unit_tests[layers-90]
-  - test_cpp.py::test_unit_tests[runtime-90]
-  - test_cpp.py::test_unit_tests[thop-90]
-  - test_cpp.py::test_unit_tests[utils-90]
-  - test_cpp.py::test_model[fp8-llama-90]
-  - test_cpp.py::test_model[-t5-90]
-  - test_cpp.py::test_benchmarks[t5-90]
-  - test_cpp.py::test_model[-encoder-90]
-  - test_cpp.py::test_model[-enc_dec_language_adapter-90]
+  - cpp/test_unit_tests.py::test_unit_tests[batch_manager-90]
+  - cpp/test_unit_tests.py::test_unit_tests[common-90]
+  - cpp/test_unit_tests.py::test_unit_tests[executor-90]
+  - cpp/test_unit_tests.py::test_unit_tests[kernels-90]
+  - cpp/test_unit_tests.py::test_unit_tests[layers-90]
+  - cpp/test_unit_tests.py::test_unit_tests[runtime-90]
+  - cpp/test_unit_tests.py::test_unit_tests[thop-90]
+  - cpp/test_unit_tests.py::test_unit_tests[utils-90]
+  - cpp/test_e2e.py::test_model[fp8-llama-90]
+  - cpp/test_e2e.py::test_model[-t5-90]
+  - cpp/test_e2e.py::test_benchmarks[t5-90]
+  - cpp/test_e2e.py::test_model[-encoder-90]
+  - cpp/test_e2e.py::test_model[-enc_dec_language_adapter-90]
 - condition:
     ranges:
       system_gpu_count:
@@ -195,8 +195,8 @@ l0_h100:
       backend: cpp
   tests:
   # ------------- CPP tests ---------------
-  - test_cpp.py::test_model[-bart-90]
-  - test_cpp.py::test_benchmarks[bart-90]
+  - cpp/test_e2e.py::test_model[-bart-90]
+  - cpp/test_e2e.py::test_benchmarks[bart-90]
 - condition:
     ranges:
       system_gpu_count:
