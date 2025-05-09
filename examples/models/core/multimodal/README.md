@@ -975,11 +975,11 @@ Navigate to the folder `TensorRT-LLM/examples/models/core/multimodal`
 1. Download Huggingface weights
 
     ```bash
-    export MODEL_NAME="Phi-4-multimodal-instruct" 
+    export MODEL_NAME="Phi-4-multimodal-instruct"
     export HF_DIR="tmp/hf_models/${MODEL_NAME}"
     export CKPT_DIR="tmp/trt_models/${MODEL_NAME}/fp16/1-gpu"
     export ENGINE_DIR="tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu"
-    git clone https://huggingface.co/microsoft/${MODEL_NAME} ${HF_DIR} 
+    git clone https://huggingface.co/microsoft/${MODEL_NAME} ${HF_DIR}
 
     ```
 
@@ -1005,7 +1005,7 @@ Navigate to the folder `TensorRT-LLM/examples/models/core/multimodal`
 *Note: the encoders are not the TRT engines but are pure Pytorch ones*
 
     ```bash
-    python build_multimodal_engine.py --model_type phi-4-multimodal --model_path ${HF_DIR} --output_dir ${ENGINE_DIR} 
+    python build_multimodal_engine.py --model_type phi-4-multimodal --model_path ${HF_DIR} --output_dir ${ENGINE_DIR}
 
     python run.py \
         --hf_model_dir ${HF_DIR} \
