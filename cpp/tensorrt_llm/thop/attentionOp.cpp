@@ -335,8 +335,8 @@ using RunnerPtr = std::shared_ptr<torch_ext::trtllm::attention::RunnerBase>;
 using torch_ext::trtllm::attention::Runner;
 using torch_ext::trtllm::attention::AttentionInputType;
 
-torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch::optional<torch::Tensor> v,
-    std::optional<torch::ScalarType> out_dtype, torch::optional<torch::Tensor> workspace_,
+void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch::optional<torch::Tensor> v,
+    torch::Tensor& output, std::optional<torch::ScalarType> out_dtype, torch::optional<torch::Tensor> workspace_,
     torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths, torch::Tensor context_lengths,
     torch::Tensor host_context_lengths, torch::Tensor host_request_types,
     torch::optional<torch::Tensor> kv_cache_block_offsets, torch::optional<torch::Tensor> host_kv_cache_block_offsets,
@@ -522,6 +522,17 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
         = beam_width == 1 ? attention_window_size : cache_indirection.value().size(2);
     int64_t const workspace_size = runner->getWorkspaceSize(*op, num_tokens, max_attention_window_size, num_gen_tokens);
     TLLM_LOG_TRACE("Expected workspace size is %ld bytes", workspace_size);
+
+    if (workspace_size >= (16l << 30))
+    {
+        auto const [free_mem, total_mem] = tensorrt_llm::common::getDeviceMemoryInfo(false);
+        if (workspace_size >= static_cast<int64_t const>(free_mem))
+        {
+            throw std::runtime_error("attention workspace size " + std::to_string(workspace_size)
+                + " bytes, exceeds available CUDA memory " + std::to_string(free_mem) + " bytes");
+        }
+    }
+
     torch::Tensor workspace;
     if (workspace_.has_value())
     {
@@ -537,12 +548,6 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     {
         workspace = torch::empty({workspace_size}, torch::dtype(torch::kByte).device(qkv.device()));
     }
-
-    int64_t v_head_size = !op->mIsMLAEnabled ? head_size
-        : is_gen_only                        ? op->mMLAParams.kv_lora_rank
-                                             : v_head_dim.value();
-    auto output = torch::empty(
-        {num_tokens, num_heads * v_head_size}, qkv.options().dtype(out_dtype.value_or(qkv.scalar_type())));
 
     if ((num_contexts > 0) && (attn_input_type != AttentionInputType::GenerationOnly))
     {
@@ -574,8 +579,6 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
-
-    return output;
 }
 
 } // namespace torch_ext
@@ -583,10 +586,11 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "attention("
+        "attention_inplace("
         "Tensor q"
         ", Tensor? k"
         ", Tensor? v"
+        ", Tensor(a!) output"
         ", ScalarType? out_dtype"
         ", Tensor? workspace"
         ", Tensor sequence_length"
@@ -642,10 +646,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int? v_head_dim"
         ", Tensor? mrope_rotary_cos_sin"
         ", Tensor? mrope_position_deltas"
-        ") -> Tensor");
+        ") -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("attention", &torch_ext::attention);
+    m.impl("attention_inplace", &torch_ext::attention_inplace);
 }

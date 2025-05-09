@@ -148,7 +148,7 @@ def test_flat_gqa_op(
     v = torch.randn(1, seq_len.sum(), n_kv_heads * D_HEAD, **dtype_kwargs)
 
     # run op
-    output = torch.ops.attention.fused_flattened_mha_with_cache(
+    output = torch.ops.attention.flattened_mha_with_cache(
         # Q, K, V
         q,
         k,
@@ -162,7 +162,9 @@ def test_flat_gqa_op(
         k_cache,
         v_cache,
         # BUFFERS
-        torch.empty(0, device=device),
+        # <none>
+        # CONSTANTS
+        scale=None,
     )
 
     # prep batched tensors for comparison

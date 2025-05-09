@@ -425,7 +425,9 @@ class AbstractPerfScriptTestClass(abc.ABC):
                             print(collect_and_clean_myelin_time(output))
 
                     # Print the output log to stdout and cache it.
-                    print(buf.getvalue())
+                    # skip the output log for prepare dataset command
+                    if 'prepare_dataset' not in commands.get_cmd_str(cmd_idx):
+                        print(buf.getvalue())
                     outputs[cmd_idx] = buf.getvalue()
             else:
                 print_info(f"Reusing cached logs for command index {cmd_idx}.")

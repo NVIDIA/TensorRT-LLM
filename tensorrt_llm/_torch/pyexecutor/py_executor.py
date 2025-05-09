@@ -18,7 +18,8 @@ import dill  # nosec B403
 import numpy as np
 import torch
 
-from tensorrt_llm._utils import global_mpi_rank, nvtx_range
+from tensorrt_llm._utils import (global_mpi_rank, is_trace_enabled, nvtx_range,
+                                 trace_func)
 from tensorrt_llm.bindings.executor import (FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
                                             RequestType, StaticBatchingStats)
@@ -254,6 +255,9 @@ class PyExecutor:
             self.event_loop = self._executor_loop_pp_overlap if enable_overlap_scheduler else self._executor_loop_pp
         else:
             self.event_loop = self._executor_loop_overlap if enable_overlap_scheduler else self._executor_loop
+
+        if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
+            self.event_loop = trace_func(self.event_loop)
 
         if self.draft_model_engine is not None and self.event_loop.__name__ != self._executor_loop.__name__:
             raise NotImplementedError(
@@ -934,16 +938,10 @@ class PyExecutor:
                     continue
                 req.py_last_draft_tokens = req.py_draft_tokens
                 max_draft_len = self.model_engine.spec_config.max_draft_tokens
-                max_seq_len = self.model_engine.max_seq_len
 
-                # Subtract 1 to account for the token we will add on this forward
-                # pass.
-                draft_len = min(max_seq_len - 1 - req.get_num_tokens(0),
-                                max_draft_len)
-
-                if draft_len > 0:
-                    req.py_draft_tokens = [0] * draft_len
-                    req.py_draft_pages_allocated = draft_len
+                if max_draft_len > 0:
+                    req.py_draft_tokens = [0] * max_draft_len
+                    req.py_draft_pages_allocated = max_draft_len
                 else:
                     req.py_draft_tokens = None
                     req.py_draft_pages_allocated = 0
@@ -1167,20 +1165,32 @@ class PyExecutor:
                             req_id)
 
     @nvtx_range("_broadcast_new_requests")
-    def _broadcast_new_requests(self, new_requests):
+    def _broadcast_new_requests(
+        self,
+        new_requests: List[ExecutorRequest],
+        py_request_objects: tuple[str, dict] = None
+    ) -> tuple[List[ExecutorRequest], Optional[tuple[str, dict]]]:
+        """Broadcasts new_requests and optional Python-only metadata (`py_request_objects`) across pipeline stages.
+           `py_request_objects` is a tuple of (attribute_name, {request_id: object}).
+        """
+        payloads = (new_requests, py_request_objects
+                    ) if py_request_objects is not None else new_requests
+
         if not self.dist.has_pp:
-            return self.dist.broadcast(new_requests, root=0)
+            result = self.dist.broadcast(payloads, root=0)
+            return result if isinstance(result, tuple) else (result, None)
 
         # broadcast within first tp group before send/recv chain to other tp groups
         if self.dist.tp_size > 1 and self.dist.is_first_pp_rank:
-            new_requests = self.dist.tp_broadcast(new_requests, root=0)
+            payloads = self.dist.tp_broadcast(payloads, root=0)
 
         # tag = [0, num_micro_batches - 1] used for new_tokens send/recv
         tag = self.num_micro_batches
 
         # 1. send metadata: len(num_requests) and serialized buffer size
+        new_requests = payloads[0] if isinstance(payloads, tuple) else payloads
         if self.dist.is_first_pp_rank and len(new_requests) > 0:
-            buf = np.array(bytearray(dill.dumps(new_requests)))
+            buf = np.array(bytearray(dill.dumps(payloads)))
             buf_size = len(buf)
         else:
             buf, buf_size = None, 0
@@ -1204,10 +1214,15 @@ class PyExecutor:
                 self.dist.send(buf, self.dist.next_pp_rank, tag)
 
             if not self.dist.is_first_pp_rank:
-                new_requests = dill.loads(buf.tobytes())  # nosec B301
+                buf_data = dill.loads(buf.tobytes())  # nosec B301
+                if isinstance(buf_data, tuple):
+                    new_requests, py_request_objects = buf_data
+                else:
+                    new_requests = buf_data
+
                 assert len(new_requests) == num_new_requests
 
-        return new_requests
+        return new_requests, py_request_objects
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(self):
@@ -1226,7 +1241,25 @@ class PyExecutor:
                 self.request_queue, timeout,
                 total_max_num_active_requests - total_num_active_requests)
 
-        new_requests = self._broadcast_new_requests(new_requests)
+        if self.dist.rank == 0:
+            py_request_objects = self._collect_py_objects_from_requests(
+                new_requests, "py_logits_post_processors")
+        else:
+            py_request_objects = None
+
+        if self.dist.rank == 0:
+            # Preserve original `new_requests` on rank 0 since it may contain
+            # Python-only objects (e.g., custom logits processors) not serializable by pybind.
+            _ = self._broadcast_new_requests(new_requests, py_request_objects)
+        else:
+            new_requests, py_request_objects = self._broadcast_new_requests(
+                new_requests, py_request_objects)
+
+        if py_request_objects and (self.dist.tp_size > 1
+                                   or self.dist.has_pp) and self.dist.rank > 0:
+            attr_name, req_obj_dict = py_request_objects
+            self._attach_py_objects_to_requests(new_requests, attr_name,
+                                                req_obj_dict)
 
         if not self.enable_attention_dp:
             self._update_new_active_requests_queue_latency(new_requests)
@@ -1358,6 +1391,37 @@ class PyExecutor:
                 self.inflight_req_ids.erase(req.request_id)
                 self._terminate_request(req)
                 self.active_requests.remove(req)
+
+    def _collect_py_objects_from_requests(
+            self, requests, attribute_name: str) -> Optional[tuple[str, dict]]:
+        """WAR to gather dynamic Python-only attributes (e.g., custom logits processors)
+        that cannot be handled by pybind serialization during MP communication.
+
+        Returns:
+            A tuple of (attribute_name, {request_id: object}) or None.
+        """
+        req_id_to_obj = {}
+        for item in requests:
+            if item is None:
+                continue
+            req_id, req = item[:2]
+            obj = getattr(req, attribute_name, None)
+            if obj is not None:
+                req_id_to_obj[req_id] = obj
+        return None if not req_id_to_obj else (attribute_name, req_id_to_obj)
+
+    def _attach_py_objects_to_requests(self, requests, attribute_name: str,
+                                       py_request_objects: dict):
+        """Attaches Python-only objects (e.g., dynamic attributes not handled by pybind)
+        to each request.
+        """
+        for item in requests:
+            if item is None:
+                continue
+            req_id, req = item[:2]
+            py_obj = py_request_objects.get(req_id)
+            if py_obj is not None:
+                setattr(req, attribute_name, py_obj)
 
     def _partition_context(self, ctx_ids_list):
         ctx_ids = torch.tensor(ctx_ids_list).unsqueeze(0)
@@ -1835,8 +1899,19 @@ class PyExecutor:
 
                 return new_requests
 
+            # The TRTLLM attention kernels cannot handle generation requests with
+            # different seqlens. No issues with flashinfer, should we look into removing
+            # this? Just needs proper kernel support.
+            def _pad_to_max_draft_tokens():
+                for req in scheduled_requests.generation_requests:
+                    max_draft_tokens = spec_metadata.max_draft_tokens
+                    num_draft_tokens = len(req.py_draft_tokens)
+                    req.py_draft_tokens.extend(
+                        0 for _ in range(max_draft_tokens - num_draft_tokens))
+
             new_requests = _process_decoded_tokens()
             if not new_requests:
+                _pad_to_max_draft_tokens()
                 return
 
             draft_batch.generation_requests = new_requests
@@ -1862,8 +1937,10 @@ class PyExecutor:
 
                 new_requests = _process_decoded_tokens()
                 if not new_requests:
-                    return
+                    break
                 draft_batch.generation_requests = new_requests
+
+            _pad_to_max_draft_tokens()
 
         except Exception as e:
             traceback.print_exc()

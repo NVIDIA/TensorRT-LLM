@@ -83,6 +83,14 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true',
                         help='Print iteration logs during execution')
+    parser.add_argument('--use_torch_compile',
+                        default=False,
+                        action='store_true',
+                        help='Use torch.compile to optimize the model')
+    parser.add_argument('--use_piecewise_cuda_graph',
+                        default=False,
+                        action='store_true',
+                        help='Use piecewise CUDA graph to optimize the model')
 
     # Sampling
     parser.add_argument("--max_tokens", type=int, default=64)
@@ -95,6 +103,13 @@ def add_llm_args(parser):
     parser.add_argument('--spec_decode_algo', type=str, default=None)
     parser.add_argument('--spec_decode_nextn', type=int, default=1)
     parser.add_argument('--eagle_model_dir', type=str, default=None)
+
+    # Relaxed acceptance
+    parser.add_argument('--use_relaxed_acceptance_for_thinking',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--relaxed_topk', type=int, default=1)
+    parser.add_argument('--relaxed_delta', type=float, default=0.)
 
     return parser
 
@@ -115,6 +130,8 @@ def setup_llm(args):
         use_cuda_graph=args.use_cuda_graph,
         load_format=args.load_format,
         print_iter_log=args.print_iter_log,
+        torch_compile_enabled=args.use_torch_compile,
+        torch_compile_piecewise_cuda_graph=args.use_piecewise_cuda_graph,
         moe_backend=args.moe_backend,
         enable_trtllm_decoder=args.enable_trtllm_decoder)
 
@@ -128,7 +145,11 @@ def setup_llm(args):
 
     if spec_decode_algo == 'MTP':
         spec_config = MTPDecodingConfig(
-            num_nextn_predict_layers=args.spec_decode_nextn)
+            num_nextn_predict_layers=args.spec_decode_nextn,
+            use_relaxed_acceptance_for_thinking=args.
+            use_relaxed_acceptance_for_thinking,
+            relaxed_topk=args.relaxed_topk,
+            relaxed_delta=args.relaxed_delta)
     elif spec_decode_algo == "EAGLE3":
         spec_config = EagleDecodingConfig(
             max_draft_len=args.spec_decode_nextn,

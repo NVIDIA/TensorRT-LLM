@@ -1,11 +1,10 @@
 import threading
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import nn
 
-from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
-                                     AllReduceStrategy)
+from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
@@ -14,8 +13,9 @@ _thread_local = threading.local()
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
     if not hasattr(_thread_local, 'allreduce_workspaces'):
-        _thread_local.allreduce_workspaces = {}
-    allreduce_workspaces = _thread_local.allreduce_workspaces
+        _thread_local.allreduce_workspaces = [{}
+                                              for _ in range(mapping.pp_size)]
+    allreduce_workspaces = _thread_local.allreduce_workspaces[mapping.pp_rank]
     if mapping not in allreduce_workspaces:
         ipc_buffers, workspace = CustomAllReduceHelper.allocate_allreduce_fusion_workspace(
             mapping,
@@ -132,11 +132,16 @@ class AllReduce(nn.Module):
                     - RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
 
                 - AUTO: AUTO chooses between NCCL and MIN_LATENCY mode based on a heuristic policy.
+
+        Note:
+            For the reference implementation for each pattern, please refer to the following unit test:
+            https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/unittest/_torch/multi_gpu/test_allreduce.py
         """
 
         self.mapping = mapping
         self.workspace = None
         self.strategy = strategy
+
         if self.mapping.tp_size > 1:
             # When Strategy is UB, it is guaranteed that the workspace is not used.
             if self.strategy != AllReduceStrategy.UB:
@@ -196,45 +201,62 @@ class AllReduce(nn.Module):
         return output if len(output) > 1 else output[0]
 
 
-class DeepseekAllReduce(nn.Module):
+class MoEAllReduce(nn.Module):
 
     def __init__(self, mapping: Mapping):
+        """
+        MoEAllReduce is a module that performs a specific fused MoE reduction
+        followed by a regular AR + RMS norm.
+
+        Args:
+            mapping (Mapping):  The parallel mapping config.
+
+        Notes:
+            Support pattern: MoE Reduction + Add + AR + ADD_RMS, see this torch reference implementation:
+            expert_reduction = torch.sum(active_experts_token_input *
+                                        scale.unsqueeze(-1),
+                                        dim=0)
+            output_add = expert_reduction + shared_expert_output
+            output_residual = output_add + residual
+            output_hidden_states = rms_norm(output_residual, norm_weight, eps)
+        """
         super().__init__()
         self.mapping = mapping
-        self.workspace = None
-        if self.mapping.tp_size > 1:
-            self.workspace = get_allreduce_workspace(mapping)
+        self.workspace = get_allreduce_workspace(self.mapping)
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        reduce_fusion_inputs: List[torch.Tensor],
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        device_num_experts: torch.Tensor,
+        scale_input: torch.Tensor,
+        active_experts_token_input: torch.Tensor,
+        token_input: torch.Tensor,
         eps: float,
-        fusion_op: AllReduceFusionOp,
-    ) -> Tuple[torch.Tensor, ...]:
+    ) -> torch.Tensor:
         """
-        hidden_states: hidden_states of the model
-        reduce_fusion_inputs: [residual, norm_weight, scale (if using FP4 quantization)]
-        eps: epsilon for RMSNorm
-        fusion_op: AllReduceFusionOp Type, currently supports RMSNorm:
-          * RESIDUAL_RMS_NORM: allreduce + residual + Norm
-          * RESIDUAL_RMS_NORM_QUANT_NVFP4: allreduce + residual + Norm + fp4 quantization
-        output:
-          * [hidden_states, residual] if using RESIDUAL_RMS_NORM fusion_op
-          * [act_fp4, act_sf, residual] if using RESIDUAL_RMS_NORM_QUANT_NVFP4 fusion_op
-        """
+        Args:
+            residual: residual tensor
+            norm_weight: RMS norm weight
+            device_num_experts: number of experts per device
+            scale_input: experts to token score
+            active_experts_token_input: per token per expert input
+            token_input: per token input, shared expert output
+            eps: epsilon for RMSNorm
 
-        output = torch.ops.trtllm.deepseek_allreduce_fusion(
-            input=hidden_states,
+        Output:
+            hidden_states: hidden_states of the model
+            residual: residual tensor
+        """
+        return torch.ops.trtllm.moe_allreduce(
+            residual=residual,
+            norm_weight=norm_weight,
+            device_num_experts=device_num_experts,
+            scale_input=scale_input,
+            active_experts_token_input=active_experts_token_input,
+            token_input=token_input,
             workspace=self.workspace,
-            reduce_fusion_inputs=reduce_fusion_inputs,
             rank=self.mapping.tp_rank,
             nranks=self.mapping.tp_size,
             eps=eps,
-            fusion_op=fusion_op,
         )
-
-        if len(output) == 0:
-            raise ValueError(f"Unsupported fusion op: {fusion_op}")
-
-        return output

@@ -237,6 +237,9 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
 class MTPDecodingConfig(DecodingBaseConfig):
     num_nextn_predict_layers: Optional[int] = 1
+    use_relaxed_acceptance_for_thinking: Optional[bool] = False
+    relaxed_topk: Optional[int] = 1
+    relaxed_delta: Optional[float] = 0.
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -918,6 +921,11 @@ class LlmArgs(BaseModel):
         description="The postprocess tokenizer directory.",
         alias="_postprocess_tokenizer_dir")
 
+    reasoning_parser: Optional[str] = Field(
+        default=None,
+        description="The parser to separate reasoning content from output.",
+        alias="_reasoning_parser")
+
     # TODO[Superjomn]: To deprecate this config.
     decoding_config: Optional[object] = Field(
         default=None,
@@ -1199,7 +1207,11 @@ class LlmArgs(BaseModel):
                 self.speculative_config = MTPConfig(
                     num_nextn_predict_layers=self.speculative_config.
                     num_nextn_predict_layers,
-                    max_batch_size=self.build_config.max_batch_size)
+                    max_batch_size=self.build_config.max_batch_size,
+                    use_relaxed_acceptance_for_thinking=self.speculative_config.
+                    use_relaxed_acceptance_for_thinking,
+                    relaxed_topk=self.speculative_config.relaxed_topk,
+                    relaxed_delta=self.speculative_config.relaxed_delta)
             else:
                 raise ValueError(
                     f"Speculative config type not recognized: {self.speculative_config}"

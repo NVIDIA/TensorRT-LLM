@@ -5,8 +5,137 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from ...attention_backend.vanilla import repeat_kv
+
+@torch.library.custom_op("attention::repeat_kv", mutates_args=())
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states.clone()  # Ensure we don't return an alias
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
+    # Return a contiguous clone to avoid aliasing issues
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim).contiguous()
+
+
+@repeat_kv.register_fake
+def repeat_kv_fake(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    replicated_shape = (batch, num_key_value_heads * n_rep, slen, head_dim)
+    return torch.empty(replicated_shape, device=hidden_states.device, dtype=hidden_states.dtype)
+
+
+@torch.library.custom_op("attention::scaled_dot_product_attention", mutates_args=())
+def scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
+    """A carbon copy of torch.nn.functional.scaled_dot_product_attention as custom op.
+
+    Using this custom op instead of using the functional directly ensures consistent representation
+    of the vanilla sdpa in a graph.
+    """
+
+    return F.scaled_dot_product_attention(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        scale=scale,
+    )
+
+
+@scaled_dot_product_attention.register_fake
+def scaled_dot_product_attention_fake(
+    query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
+):
+    """Fake implementation of scaled_dot_product_attention."""
+    return torch.empty_like(query.contiguous())
+
+
+@torch.library.custom_op("attention::grouped_sdpa", mutates_args=())
+def grouped_sdpa(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
+    """SDPA attention that can handle GQA."""
+
+    return F.scaled_dot_product_attention(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        scale=scale,
+        enable_gqa=True,
+    )
+
+
+@grouped_sdpa.register_fake
+def grouped_sdpa_fake(
+    query,
+    key,
+    value,
+    attn_mask=None,
+    dropout_p=0.0,
+    is_causal=False,
+    scale=None,
+):
+    """Fake implementation of grouped SDPA."""
+    return torch.empty_like(query.contiguous())
+
+
+@torch.library.custom_op("attention::bsnd_grouped_sdpa", mutates_args=())
+def bsnd_grouped_sdpa(
+    query: torch.Tensor,  # layout: [b, n, s_q, d]
+    key: torch.Tensor,  # layout: [b, n, s_k, d]
+    value: torch.Tensor,  # layout: [b, n, s_k, d]
+    attn_mask: Optional[torch.Tensor] = None,  # layout: [b, n, s_q, s_k]
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
+    """Attention that assumes the input layout is bsnd.
+
+    Note that attn_mask layout is still assumed to be [b, n, s_q, s_k] and is consistent with the
+    original sdpa op!
+    """
+    # let's transpose to bnsd so we can use the grouped sdpa
+    query = query.transpose(1, 2).contiguous()
+    key = key.transpose(1, 2).contiguous()
+    value = value.transpose(1, 2).contiguous()
+
+    out = grouped_sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale)
+
+    # let's transpose back to bnsd
+    return out.transpose(1, 2).contiguous()
+
+
+@bsnd_grouped_sdpa.register_fake
+def bsnd_grouped_sdpa_fake(
+    query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
+):
+    """Fake implementation of bnsd grouped SDPA."""
+    return torch.empty_like(query.contiguous())
 
 
 # Function to apply rotary positional embeddings (RoPE)
@@ -93,75 +222,6 @@ def apply_rotary_pos_emb(
 
     # Convert back to the original dtype
     return q_rotated.to(dtype=original_dtype), k_rotated.to(dtype=original_dtype)
-
-
-@torch.library.custom_op("attention::fused_mha", mutates_args=())
-def fused_mha(
-    q: torch.Tensor,  # [b, s, n, h_d]
-    k: torch.Tensor,  # [b, s, n, h_d]
-    v: torch.Tensor,  # [b, s, n, h_d]
-    head_dim: int,
-    pos_embd_mode: Optional[str] = None,
-    rope_theta: Optional[float] = None,
-    rope_scale: Optional[float] = None,
-) -> torch.Tensor:
-    """Fused MHA+Rope that takes raw input from q, k, v GEMMs.
-    Rope is performed according to the specified rope configuration. No support for caching.
-    """
-    # b, s info
-    b, s = q.shape[:2]
-
-    # reshapes and transpose to [bnsd] layout
-    q = q.view(b, s, -1, head_dim).transpose(1, 2)
-    k = k.view(b, s, -1, head_dim).transpose(1, 2)
-    v = v.view(b, s, -1, head_dim).transpose(1, 2)
-
-    # some more info
-    num_heads = q.shape[1]
-    num_kv_heads = k.shape[1]
-
-    # rope embedding
-    if pos_embd_mode == "rope":
-        # Apply rotary positional embeddings
-        q, k = apply_rotary_pos_emb(q, k, s, head_dim, rope_theta, rope_scale)
-    elif pos_embd_mode is not None:
-        raise ValueError(f"Unknown positional embedding mode: {pos_embd_mode}.")
-
-    # repeat kv
-    k = repeat_kv(k, num_heads // num_kv_heads)
-    v = repeat_kv(v, num_heads // num_kv_heads)
-
-    # Make sure all tensors have the same dtype before attention
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
-
-    # attention (assumed layout is bnsd)
-    y = torch.nn.functional.scaled_dot_product_attention(
-        query=q,
-        key=k,
-        value=v,
-        is_causal=True,
-    )
-
-    # back to [b, s, n*h_d] layout
-    y = y.transpose(1, 2).contiguous().view(b, s, -1)
-
-    return y
-
-
-@fused_mha.register_fake
-def fused_mha_fake(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    head_dim: int,
-    pos_embd_mode: Optional[str] = None,
-    rope_theta: Optional[float] = None,
-    rope_scale: Optional[float] = None,
-) -> torch.Tensor:
-    """Fake Fused MHA+Rope that takes raw input from q, k, v GEMMs."""
-    return torch.empty_like(q)
 
 
 def update_kv_cache(

@@ -336,7 +336,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         fused_input_ids = self._postprocess(input_ids[0])
 
         return fused_input_ids.to(torch.int32).tolist(), {
-            "prompt_tuning_config": [mm_features, None, None],
+            "mm_embedding": mm_features,
             "mrope_config": mrope_config
         }
 

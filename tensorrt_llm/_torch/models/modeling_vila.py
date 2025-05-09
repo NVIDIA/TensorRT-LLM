@@ -1108,7 +1108,7 @@ class VilaInputProcessor(InputProcessor):
         mm_features = self._process(mm_tensor, block_sizes)
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
         return fused_input_ids.to(torch.int32).tolist(), {
-            "prompt_tuning_config": [mm_features, None, None]
+            "mm_embedding": mm_features
         }
 
 

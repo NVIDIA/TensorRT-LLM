@@ -314,7 +314,7 @@ void DecoderState::setupSpeculativeDecoding(SpeculativeDecodingMode const& specu
         auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
 
         auto const probsShape = ITensor::makeShape(
-            {mMaxBatchSize, mMaxBeamWidth, mMaxSequenceLength, static_cast<SizeType32>(vocabSizePadded)});
+            {mMaxBatchSize, mMaxDecodingEngineTokens, mMaxBeamWidth, static_cast<SizeType32>(vocabSizePadded)});
         dInput.externalDraftTokensInputs->draftProbs->reshape(probsShape);
         dInput.externalDraftTokensInputs->targetProbs->reshape(probsShape);
         dInput.externalDraftTokensInputs->draftLogits->reshape(

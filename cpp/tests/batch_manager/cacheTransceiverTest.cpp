@@ -345,9 +345,9 @@ protected:
                 int64_t bufferSize = buffer.size();
                 TLLM_LOG_DEBUG(
                     tensorrt_llm::mpi::MpiComm::world().getRank(), "send bufferSize: %ld to %d", bufferSize, genRank);
-                tensorrt_llm::mpi::MpiComm::world().send(
+                tensorrt_llm::mpi::MpiComm::world().sendRawTag(
                     &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, genRank, 0x1F);
-                tensorrt_llm::mpi::MpiComm::world().send(
+                tensorrt_llm::mpi::MpiComm::world().sendRawTag(
                     buffer.data(), buffer.size(), tensorrt_llm::mpi::MpiType::kCHAR, genRank, 0x2F);
                 TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send buffer to %d", genRank);
                 mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(commState);
@@ -355,11 +355,12 @@ protected:
             else
             {
                 int64_t bufferSize;
-                tensorrt_llm::mpi::MpiComm::world().recv(&bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, 0, 0x1F);
+                tensorrt_llm::mpi::MpiComm::world().recvRawTag(
+                    &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, 0, 0x1F);
                 TLLM_LOG_DEBUG(
                     tensorrt_llm::mpi::MpiComm::world().getRank(), "recv bufferSize: %ld from 0", bufferSize);
                 std::vector<char> recvBuffer(bufferSize);
-                tensorrt_llm::mpi::MpiComm::world().recv(
+                tensorrt_llm::mpi::MpiComm::world().recvRawTag(
                     recvBuffer.data(), bufferSize, tensorrt_llm::mpi::MpiType::kCHAR, 0, 0x2F);
                 TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "recv buffer from 0", bufferSize);
                 std::istringstream iStream(std::string(recvBuffer.begin(), recvBuffer.end()));
@@ -752,9 +753,9 @@ protected:
                         int64_t bufferSize = buffer.size();
                         TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send bufferSize: %ld to %d",
                             bufferSize, genRank);
-                        tensorrt_llm::mpi::MpiComm::world().send(
+                        tensorrt_llm::mpi::MpiComm::world().sendRawTag(
                             &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, genRank, 0x1F);
-                        tensorrt_llm::mpi::MpiComm::world().send(
+                        tensorrt_llm::mpi::MpiComm::world().sendRawTag(
                             buffer.data(), buffer.size(), tensorrt_llm::mpi::MpiType::kCHAR, genRank, 0x2F);
                         TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send buffer to %d", genRank);
                     }
@@ -763,12 +764,12 @@ protected:
                 if (mIsGeneration)
                 {
                     int64_t bufferSize;
-                    tensorrt_llm::mpi::MpiComm::world().recv(
+                    tensorrt_llm::mpi::MpiComm::world().recvRawTag(
                         &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, 0, 0x1F);
                     TLLM_LOG_DEBUG(
                         tensorrt_llm::mpi::MpiComm::world().getRank(), "recv bufferSize: %ld from 0", bufferSize);
                     std::vector<char> recvBuffer(bufferSize);
-                    tensorrt_llm::mpi::MpiComm::world().recv(
+                    tensorrt_llm::mpi::MpiComm::world().recvRawTag(
                         recvBuffer.data(), bufferSize, tensorrt_llm::mpi::MpiType::kCHAR, 0, 0x2F);
                     TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "recv buffer from 0", bufferSize);
                     std::istringstream iStream(std::string(recvBuffer.begin(), recvBuffer.end()));

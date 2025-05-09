@@ -21,7 +21,9 @@ class SimpleConfig:
     # If no `model` argument is provided, the checkpoint directory is used to infer the model
     # architecture.
     model: Optional[str] = None
-    skip_loading_weights: bool = False
+    model_factory: str = "hf"  # choose from 'hf' or 'llama4' (only 'hf' supported for "trtllm"!)
+    skip_loading_weights: bool = False  # only load the architecture, not the weights
+    customize_tokenizer: bool = False  # True: tokenizer from the model factory, False: from LLM api
 
     ### MODEL EXTRA KWARGS #########################################################################
     # Extra kwargs for the model config class to customize the model config. Those arguments will
@@ -39,7 +41,14 @@ class SimpleConfig:
         }
     )
 
-    ### CONFIGURE MODEL FACTORY, BACKEND, RUNTIME, AND WORLD SIZE ##################################
+    ### TOKENIZER EXTRA KWARGS #####################################################################
+    # Extra kwargs for the tokenizer class to customize the tokenizer. Same as model_kwargs.
+    # For example, the default HF Llama tokenizer can be initialized with the arguments specified
+    # [here](https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/tokenization_llama_fast.py#L127).
+    # NOTE: This is only used if customize_tokenizer is True
+    tokenizer_kwargs: Dict = field(default_factory=dict)
+
+    ### CONFIGURE BACKEND, RUNTIME, AND WORLD SIZE ##################################
     world_size: int = 1  # choose from number of GPUs for TP (0--> no TP, no spawned processes)
     runtime: str = "demollm"  # chose from "demollm" or "trtllm" (production-grade runtime)
     compile_backend: str = "torch-opt"  # choose from "torch-simple", "torch-opt"

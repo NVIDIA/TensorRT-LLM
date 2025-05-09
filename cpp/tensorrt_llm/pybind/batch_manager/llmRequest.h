@@ -50,7 +50,7 @@ public:
     using VecTokenExtraIds = Base::VecTokenExtraIds;
     using LogitsPostProcessor = Base::LogitsPostProcessor;
 
-    // 45 parameters
+    // 46 parameters
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
         runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -58,6 +58,7 @@ public:
         std::optional<std::vector<SizeType32>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
+        std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
@@ -95,6 +96,7 @@ public:
                                     : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),     //
             promptEmbeddingTable,                                                                                //
             promptVocabSize,                                                                                     //
+            multimodalEmbedding,                                                                                 //
             mropeRotaryCosSin,                                                                                   //
             mropePositionDeltas,                                                                                 //
             loraTaskId,                                                                                          //

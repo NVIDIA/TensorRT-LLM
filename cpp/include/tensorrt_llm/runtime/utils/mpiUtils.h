@@ -16,7 +16,9 @@
 
 #pragma once
 
+#include "tensorrt_llm/runtime/utils/mpiTags.h"
 #include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
+
 #include <functional>
 #include <limits>
 
@@ -226,7 +228,16 @@ public:
     {
 #if ENABLE_MULTI_DEVICE
         // TODO: Don't ignore return status
-        MPI_Wait(&mRequest, MPI_STATUS_IGNORE);
+        TLLM_MPI_CHECK(MPI_Wait(&mRequest, MPI_STATUS_IGNORE));
+#else
+        TLLM_THROW("Multi device support is disabled.");
+#endif
+    }
+
+    void cancel()
+    {
+#if ENABLE_MULTI_DEVICE
+        TLLM_MPI_CHECK(MPI_Cancel(&mRequest));
 #else
         TLLM_THROW("Multi device support is disabled.");
 #endif
@@ -342,16 +353,16 @@ public:
         }
     }
 
-    std::shared_ptr<MpiRequest> sendAsync(void const* buffer, std::size_t size, MpiType dtype, int dest, int tag) const;
-
-    std::shared_ptr<MpiRequest> sendAsync(runtime::IBuffer const& buf, int dest, int tag) const;
-
-    void send(void const* buffer, std::size_t size, MpiType dtype, int dest, int tag) const;
-
-    void send(runtime::IBuffer const& buf, int dest, int tag) const;
+    std::shared_ptr<MpiRequest> sendAsync(
+        void const* buffer, std::size_t size, MpiType dtype, int dest, MpiTag tag) const;
+    std::shared_ptr<MpiRequest> sendAsync(runtime::IBuffer const& buf, int dest, MpiTag tag) const;
+    //! \deprecated This function is discouraged. Use the one with MpiTag enum instead.
+    void sendRawTag(void const* buffer, std::size_t size, MpiType dtype, int dest, int tag) const;
+    void send(void const* buffer, std::size_t size, MpiType dtype, int dest, MpiTag tag) const;
+    void send(runtime::IBuffer const& buf, int dest, MpiTag tag) const;
 
     template <typename T>
-    void sendValue(T const& value, int dest, int tag) const
+    void sendValue(T const& value, int dest, MpiTag tag) const
     {
         if constexpr (std::is_fundamental_v<std::remove_cv_t<T>>)
         {
@@ -363,12 +374,13 @@ public:
         }
     }
 
-    MPI_Status recv(void* buffer, size_t size, MpiType dtype, int source, int tag) const;
-
-    MPI_Status recv(runtime::IBuffer& buf, int source, int tag) const;
+    //! \deprecated This function is discouraged. Use the one with MpiTag enum instead.
+    MPI_Status recvRawTag(void* buffer, size_t size, MpiType dtype, int source, int tag) const;
+    MPI_Status recv(void* buffer, size_t size, MpiType dtype, int source, MpiTag tag) const;
+    MPI_Status recv(runtime::IBuffer& buf, int source, MpiTag tag) const;
 
     template <typename T>
-    MPI_Status recvValue(T& value, int source, int tag) const
+    MPI_Status recvValue(T& value, int source, MpiTag tag) const
     {
 #if ENABLE_MULTI_DEVICE
         if constexpr (std::is_fundamental_v<std::remove_cv_t<T>>)
@@ -392,14 +404,16 @@ public:
 
     void barrier() const;
 
-    void mprobe(int source, int tag, MPI_Message* msg, MPI_Status* status) const;
-    bool improbe(int source, int tag, MPI_Message* msg, MPI_Status* status) const;
+    //! \deprecated This function is discouraged. Use the one with MpiTag enum instead.
+    void mprobeRawTag(int source, int tag, MPI_Message* msg, MPI_Status* status) const;
+    void mprobe(int source, MpiTag tag, MPI_Message* msg, MPI_Status* status) const;
+    bool improbe(int source, MpiTag tag, MPI_Message* msg, MPI_Status* status) const;
 
     //! \brief Returns if a message with the specified source and tag is available
-    bool iprobe(int source, int tag, MPI_Status* status) const;
+    bool iprobe(int source, MpiTag tag, MPI_Status* status) const;
 
     //! \brief Poll every periodMs until a message is available
-    void recvPoll(int source, int tag, int periodMs) const;
+    void recvPoll(int source, MpiTag tag, int periodMs) const;
 
     bool operator==(MpiComm const& rhs) const
     {

@@ -114,7 +114,7 @@ std::vector<SizeType32> getActiveSlots(RequestVector const& contextRequests, Req
 }
 
 void copySequenceLengths(RequestVector const& contextRequests, RequestVector const& generationRequests,
-    DecoderInputBuffers const& inputBuffers, TensorPtr const& sequenceLengths, SizeType32 beamWidth,
+    DecoderInputBuffers const& inputBuffers, TensorPtr const& sequenceLengths, SizeType32 beamWidth, bool isTrtOverlap,
     runtime::BufferManager const& manager, runtime::CudaStream const& stream)
 {
     auto const batchSize = contextRequests.size() + generationRequests.size();
@@ -126,17 +126,24 @@ void copySequenceLengths(RequestVector const& contextRequests, RequestVector con
 
     // fill buffers on host
     SizeType32 batchIdx{0};
-    for (auto const& requests : {contextRequests, generationRequests})
+    for (auto const& llmReq : contextRequests)
     {
-        for (auto const& llmReq : requests)
-        {
-            auto const currentSequenceLen = llmReq->mPromptLen + llmReq->getMaxNumGeneratedTokens();
-            // Get position of the current sequence in the decoder
-            auto const seqSlot = llmReq->mSeqSlot.value();
-            batchSlotsRange[batchIdx] = seqSlot;
-            fillValuesRange[batchIdx] = currentSequenceLen;
-            ++batchIdx;
-        }
+        auto const currentSequenceLen = llmReq->mPromptLen + llmReq->getMaxNumGeneratedTokens();
+        // Get position of the current sequence in the decoder
+        auto const seqSlot = llmReq->mSeqSlot.value();
+        batchSlotsRange[batchIdx] = seqSlot;
+        fillValuesRange[batchIdx] = currentSequenceLen;
+        ++batchIdx;
+    }
+    for (auto const& llmReq : generationRequests)
+    {
+        auto const currentSequenceLen
+            = llmReq->mPromptLen + llmReq->getMaxNumGeneratedTokens() + static_cast<SizeType32>(isTrtOverlap);
+        // Get position of the current sequence in the decoder
+        auto const seqSlot = llmReq->mSeqSlot.value();
+        batchSlotsRange[batchIdx] = seqSlot;
+        fillValuesRange[batchIdx] = currentSequenceLen;
+        ++batchIdx;
     }
 
     // copy sequence lengths
@@ -155,7 +162,7 @@ std::tuple<std::unique_ptr<tr::decoder_batch::Input>, std::unique_ptr<tr::decode
 MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
     DecoderBuffers& decoderBuffers, DecoderInputBuffers const& inputBuffers,
     runtime::decoder::DecoderState& decoderState, runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences,
-    SizeType32 beamWidth, runtime::BufferManager const& manager, runtime::CudaStream const& stream,
+    SizeType32 beamWidth, bool isTrtOverlap, runtime::BufferManager const& manager, runtime::CudaStream const& stream,
     OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -188,7 +195,7 @@ MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests, R
     }
 
     copySequenceLengths(contextRequests, generationRequests, inputBuffers,
-        decoderState.getJointDecodingOutput().lengths, beamWidth, manager, stream);
+        decoderState.getJointDecodingOutput().lengths, beamWidth, isTrtOverlap, manager, stream);
 
     auto decodingOutput = std::make_unique<tr::decoder_batch::Output>();
     decodingOutput->cacheIndirection = decoderBuffers.cacheIndirectionOutput;

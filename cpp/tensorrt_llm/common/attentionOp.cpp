@@ -2416,7 +2416,10 @@ int AttentionOp::initialize() noexcept
         fmhaParams.numTokensPerBlock = mTokensPerBlock;
         fmhaParams.headSize = mHeadSize;
         fmhaParams.headSizeV = mHeadSize;
-        if (mIsMLAEnabled && !mIsGenerationMLA)
+
+        // mFmhaDispatcher is not used for generation MLA, but we still need to modify these values to avoid selecting
+        // the wrong kernel, no matter mIsGenerationMLA is true or false
+        if (mIsMLAEnabled)
         {
             // Context attention of MLA is different
             fmhaParams.numKvHeads = mNumHeads;
@@ -2650,6 +2653,12 @@ void AttentionOp::debugCheckSemaphores(cudaStream_t stream)
 #ifdef NDEBUG
     TLLM_CHECK_WITH_INFO(false, "debugCheckSemaphores should not be called in release build");
 #endif
+
+    if (isCapturing(stream))
+    {
+        // The sync for the d2h copy below won't work when we're capturing CUDA graphs.
+        return;
+    }
     if (mNbMultiBlockSemaphores == 0)
     {
         return;

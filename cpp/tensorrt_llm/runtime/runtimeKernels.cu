@@ -85,6 +85,41 @@ void invokeFillBatch(IBuffer& buffer, IBuffer const& slotIndices, std::size_t sl
     fillBatch<<<gridSize, blockSize, 0, stream.get()>>>(data, indices, size, fillValues);
 }
 
+//! @param data    expected shape [gridDim.y, size]
+//! @param indices expected shape [gridDim.y]
+//! @param size
+//! @param values  expected shape [indicesRange, size]
+template <typename T>
+__global__ void gatherBatch(T* data, T const* values, std::int32_t const* indices, std::size_t size)
+{
+    auto const tidx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    auto const stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+
+    for (auto idx = tidx; idx < size; idx += stride)
+    {
+        auto const batchIdx = blockIdx.y;
+        auto const slotIdx = indices[blockIdx.y];
+        data[batchIdx + idx] = values[slotIdx + idx];
+    }
+}
+
+template <typename T>
+void invokeGatherBatch(IBuffer& buffer, IBuffer const& values, IBuffer const& slotIndices, std::size_t slotStride,
+    CudaStream const& stream)
+{
+    auto data = bufferCast<T>(buffer);
+    auto const* const indices = bufferCast<std::int32_t>(slotIndices);
+    auto sparseValues = bufferCast<T>(values);
+    auto numSlots = slotIndices.getSize();
+    auto const size = slotStride;
+    dim3 const blockSize{256};
+    std::size_t const gridx{tc::ceilDiv(size, blockSize.x)};
+    std::size_t const gridMax{std::numeric_limits<std::uint32_t>::max()};
+    dim3 const gridSize{static_cast<std::uint32_t>(std::min(gridx, gridMax)), static_cast<std::uint32_t>(numSlots)};
+
+    gatherBatch<<<gridSize, blockSize, 0, stream.get()>>>(data, sparseValues, indices, size);
+}
+
 template <typename VecT>
 __global__ void copyBatch(uint8_t const* srcData, uint8_t* dstData, SizeType64 const* srcOffsets,
     SizeType64 const* dstOffsets, SizeType64 const* sizes, SizeType64 const dataTypeSize)
@@ -536,6 +571,22 @@ void invokeFillBatch(IBuffer& buffer, IBuffer const& slotIndices, std::size_t sl
         invokeFillBatch<std::int8_t>(buffer, slotIndices, slotStride, values, stream);
         break;
     case nvinfer1::DataType::kFLOAT: invokeFillBatch<float>(buffer, slotIndices, slotStride, values, stream); break;
+    default: TLLM_THROW("data type not supported");
+    }
+}
+
+void invokeGatherBatch(IBuffer& buffer, IBuffer const& values, IBuffer const& slotIndices, std::size_t slotStride,
+    CudaStream const& stream)
+{
+    switch (buffer.getDataType())
+    {
+    case nvinfer1::DataType::kINT32:
+        invokeGatherBatch<std::int32_t>(buffer, values, slotIndices, slotStride, stream);
+        break;
+    case nvinfer1::DataType::kINT8:
+        invokeGatherBatch<std::int8_t>(buffer, values, slotIndices, slotStride, stream);
+        break;
+    case nvinfer1::DataType::kFLOAT: invokeGatherBatch<float>(buffer, values, slotIndices, slotStride, stream); break;
     default: TLLM_THROW("data type not supported");
     }
 }

@@ -7,7 +7,7 @@
 #include <gtest/gtest.h>
 #include <numeric>
 
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h"
+#include "moe_kernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 
 #include <tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h>

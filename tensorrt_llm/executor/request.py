@@ -80,7 +80,7 @@ class GenerationRequest:
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
-        prompt_tuning_config: Optional[list] = None,
+        multimodal_embedding: Optional[list] = None,
         mrope_config: Optional[dict] = None,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
@@ -103,7 +103,7 @@ class GenerationRequest:
         self.lora_request = lora_request
         self.prompt_adapter_request = prompt_adapter_request
         self.streaming = streaming
-        self.prompt_tuning_config = prompt_tuning_config
+        self.multimodal_embedding = multimodal_embedding
         self.mrope_config = mrope_config
         self.kv_cache_retention_config = kv_cache_retention_config
         self.id: Optional[int] = None

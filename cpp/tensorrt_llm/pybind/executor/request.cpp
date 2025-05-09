@@ -21,6 +21,7 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 
 #include <pybind11/cast.h>
 #include <pybind11/chrono.h>
@@ -28,9 +29,6 @@
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-
-#include "streamCaster.h"
-#include "tensorCaster.h"
 
 #include <optional>
 #include <vector>
@@ -98,56 +96,47 @@ void initRequestBindings(pybind11::module_& m)
         );
     };
     py::class_<tle::SamplingConfig>(m, "SamplingConfig")
-        // A modified version of constructor to accpect deprecated args randomSeed and minLength
-        // TODO(enweiz): use the original constructor after the deprecated args are removed
-        .def(
-            py::init(
-                [](tle::SizeType32 beamWidth, std::optional<tle::SizeType32> const& topK,
-                    std::optional<tle::FloatType> const& topP, std::optional<tle::FloatType> const& topPMin,
-                    std::optional<tle::TokenIdType> const& topPResetIds, std::optional<tle::FloatType> const& topPDecay,
-                    std::optional<tle::RandomSeedType> seed, std::optional<tle::RandomSeedType> const& randomSeed,
-                    std::optional<tle::FloatType> const& temperature, std::optional<tle::SizeType32> minTokens,
-                    std::optional<tle::SizeType32> const& minLength,
-                    std::optional<tle::FloatType> const& beamSearchDiversityRate,
-                    std::optional<tle::FloatType> const& repetitionPenalty,
-                    std::optional<tle::FloatType> const& presencePenalty,
-                    std::optional<tle::FloatType> const& frequencyPenalty,
-                    std::optional<tle::FloatType> const& lengthPenalty,
-                    std::optional<tle::SizeType32> const& earlyStopping,
-                    std::optional<tle::SizeType32> const& noRepeatNgramSize,
-                    std::optional<tle::SizeType32> const& numReturnSequences, std::optional<tle::FloatType> const& minP,
-                    std::optional<std::vector<tle::SizeType32>> const& beamWidthArray)
-                {
-                    if (randomSeed.has_value())
-                    {
-                        TLLM_LOG_WARNING("random_seed is being deprecated; please use seed instead.");
-                        if (!seed.has_value())
-                        {
-                            seed = randomSeed;
-                        }
-                    }
-                    if (minLength.has_value())
-                    {
-                        TLLM_LOG_WARNING("min_length is being deprecated; please use min_tokens instead.");
-                        if (!minTokens.has_value())
-                        {
-                            minTokens = minLength;
-                        }
-                    }
-                    return std::make_unique<tle::SamplingConfig>(beamWidth, topK, topP, topPMin, topPResetIds,
-                        topPDecay, seed, temperature, minTokens, beamSearchDiversityRate, repetitionPenalty,
-                        presencePenalty, frequencyPenalty, lengthPenalty, earlyStopping, noRepeatNgramSize,
-                        numReturnSequences, minP, beamWidthArray);
-                }),
-            py::arg("beam_width") = 1, py::kw_only(), py::arg("top_k") = py::none(), py::arg("top_p") = py::none(),
-            py::arg("top_p_min") = py::none(), py::arg("top_p_reset_ids") = py::none(),
-            py::arg("top_p_decay") = py::none(), py::arg("seed") = py::none(), py::arg("random_seed") = py::none(),
-            py::arg("temperature") = py::none(), py::arg("min_tokens") = py::none(), py::arg("min_length") = py::none(),
-            py::arg("beam_search_diversity_rate") = py::none(), py::arg("repetition_penalty") = py::none(),
-            py::arg("presence_penalty") = py::none(), py::arg("frequency_penalty") = py::none(),
-            py::arg("length_penalty") = py::none(), py::arg("early_stopping") = py::none(),
-            py::arg("no_repeat_ngram_size") = py::none(), py::arg("num_return_sequences") = py::none(),
-            py::arg("min_p") = py::none(), py::arg("beam_width_array") = py::none())
+        .def(py::init<tle::SizeType32,
+                 std::optional<tle::SizeType32> const&,             // beamWidth
+                 std::optional<tle::FloatType> const&,              // topP
+                 std::optional<tle::FloatType> const&,              // topPMin
+                 std::optional<tle::TokenIdType> const&,            // topPResetIds
+                 std::optional<tle::FloatType> const&,              // topPDecay
+                 std::optional<tle::RandomSeedType> const&,         // seed
+                 std::optional<tle::FloatType> const&,              // temperature
+                 std::optional<tle::SizeType32> const&,             // minTokens
+                 std::optional<tle::FloatType> const&,              // beamSearchDiversityRate
+                 std::optional<tle::FloatType> const&,              // repetitionPenalty
+                 std::optional<tle::FloatType> const&,              // presencePenalty
+                 std::optional<tle::FloatType> const&,              // frequencyPenalty
+                 std::optional<tle::FloatType> const&,              // lengthPenalty
+                 std::optional<tle::SizeType32> const&,             // earlyStopping
+                 std::optional<tle::SizeType32> const&,             // noRepeatNgramSize
+                 std::optional<tle::SizeType32> const&,             // numReturnSequences
+                 std::optional<tle::FloatType> const&,              // minP
+                 std::optional<std::vector<tle::SizeType32>> const& // beamWidthArray
+                 >(),
+            // clang-format off
+            py::arg("beam_width") = 1,
+            py::kw_only(),
+            py::arg("top_k") = py::none(),
+            py::arg("top_p") = py::none(),
+            py::arg("top_p_min") = py::none(),
+            py::arg("top_p_reset_ids") = py::none(),
+            py::arg("top_p_decay") = py::none(),
+            py::arg("seed") = py::none(),
+            py::arg("temperature") = py::none(),
+            py::arg("min_tokens") = py::none(),
+            py::arg("beam_search_diversity_rate") = py::none(),
+            py::arg("repetition_penalty") = py::none(),
+            py::arg("presence_penalty") = py::none(),
+            py::arg("frequency_penalty") = py::none(),
+            py::arg("length_penalty") = py::none(),
+            py::arg("early_stopping") = py::none(),
+            py::arg("no_repeat_ngram_size") = py::none(),
+            py::arg("num_return_sequences") = py::none(),
+            py::arg("min_p") = py::none(),
+            py::arg("beam_width_array") = py::none())               // clang-format on
         .def_property("beam_width", &tle::SamplingConfig::getBeamWidth, &tle::SamplingConfig::setBeamWidth)
         .def_property("top_k", &tle::SamplingConfig::getTopK, &tle::SamplingConfig::setTopK)
         .def_property("top_p", &tle::SamplingConfig::getTopP, &tle::SamplingConfig::setTopP)
@@ -155,10 +144,8 @@ void initRequestBindings(pybind11::module_& m)
         .def_property("top_p_reset_ids", &tle::SamplingConfig::getTopPResetIds, &tle::SamplingConfig::setTopPResetIds)
         .def_property("top_p_decay", &tle::SamplingConfig::getTopPDecay, &tle::SamplingConfig::setTopPDecay)
         .def_property("seed", &tle::SamplingConfig::getSeed, &tle::SamplingConfig::setSeed)
-        .def_property("random_seed", &tle::SamplingConfig::getRandomSeed, &tle::SamplingConfig::setRandomSeed)
         .def_property("temperature", &tle::SamplingConfig::getTemperature, &tle::SamplingConfig::setTemperature)
         .def_property("min_tokens", &tle::SamplingConfig::getMinTokens, &tle::SamplingConfig::setMinTokens)
-        .def_property("min_length", &tle::SamplingConfig::getMinLength, &tle::SamplingConfig::setMinLength)
         .def_property("beam_search_diversity_rate", &tle::SamplingConfig::getBeamSearchDiversityRate,
             &tle::SamplingConfig::setBeamSearchDiversityRate)
         .def_property("repetition_penalty", &tle::SamplingConfig::getRepetitionPenalty,
@@ -502,16 +489,16 @@ void initRequestBindings(pybind11::module_& m)
         return py::make_tuple(self.getInputTokenIds(), self.getMaxTokens(), self.getStreaming(),
             self.getSamplingConfig(), self.getOutputConfig(), self.getEndId(), self.getPadId(), self.getPositionIds(),
             self.getBadWords(), self.getStopWords(), self.getEmbeddingBias(), self.getExternalDraftTokensConfig(),
-            self.getPromptTuningConfig(), self.getMropeConfig(), self.getLoraConfig(), self.getLookaheadConfig(),
-            self.getKvCacheRetentionConfig(), self.getLogitsPostProcessorName(), self.getLogitsPostProcessor(),
-            self.getEncoderInputTokenIds(), self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(),
-            self.getRequestType(), self.getContextPhaseParams(), self.getEncoderInputFeatures(),
-            self.getEncoderOutputLength(), self.getCrossAttentionMask(), self.getEagleConfig(),
-            self.getSkipCrossAttnBlocks(), self.getGuidedDecodingParams());
+            self.getPromptTuningConfig(), self.getMultimodalEmbedding(), self.getMropeConfig(), self.getLoraConfig(),
+            self.getLookaheadConfig(), self.getKvCacheRetentionConfig(), self.getLogitsPostProcessorName(),
+            self.getLogitsPostProcessor(), self.getEncoderInputTokenIds(), self.getClientId(),
+            self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(), self.getContextPhaseParams(),
+            self.getEncoderInputFeatures(), self.getEncoderOutputLength(), self.getCrossAttentionMask(),
+            self.getEagleConfig(), self.getSkipCrossAttnBlocks(), self.getGuidedDecodingParams());
     };
     auto requestSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 31)
+        if (state.size() != 32)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -521,88 +508,97 @@ void initRequestBindings(pybind11::module_& m)
             state[7].cast<std::optional<std::vector<SizeType32>>>(),
             state[8].cast<std::optional<std::list<VecTokens>>>(), state[9].cast<std::optional<std::list<VecTokens>>>(),
             state[10].cast<std::optional<Tensor>>(), state[11].cast<std::optional<tle::ExternalDraftTokensConfig>>(),
-            state[12].cast<std::optional<tle::PromptTuningConfig>>(), state[13].cast<std::optional<tle::MropeConfig>>(),
-            state[14].cast<std::optional<tle::LoraConfig>>(),
-            state[15].cast<std::optional<tle::LookaheadDecodingConfig>>(),
-            state[16].cast<std::optional<tle::KvCacheRetentionConfig>>(), state[17].cast<std::optional<std::string>>(),
-            state[18].cast<std::optional<tle::LogitsPostProcessor>>(), state[19].cast<std::optional<VecTokens>>(),
-            state[20].cast<std::optional<IdType>>(), state[21].cast<bool>(), state[22].cast<tle::PriorityType>(),
-            state[23].cast<tle::RequestType>(), state[24].cast<std::optional<tle::ContextPhaseParams>>(),
-            state[25].cast<std::optional<tle::Tensor>>(), state[26].cast<std::optional<SizeType32>>(),
-            state[27].cast<std::optional<tle::Tensor>>(), 1, state[28].cast<std::optional<tle::EagleConfig>>(),
-            state[29].cast<std::optional<tle::Tensor>>(), state[30].cast<std::optional<tle::GuidedDecodingParams>>());
+            state[12].cast<std::optional<tle::PromptTuningConfig>>(), state[13].cast<std::optional<Tensor>>(),
+            state[14].cast<std::optional<tle::MropeConfig>>(), state[15].cast<std::optional<tle::LoraConfig>>(),
+            state[16].cast<std::optional<tle::LookaheadDecodingConfig>>(),
+            state[17].cast<std::optional<tle::KvCacheRetentionConfig>>(), state[18].cast<std::optional<std::string>>(),
+            state[19].cast<std::optional<tle::LogitsPostProcessor>>(), state[20].cast<std::optional<VecTokens>>(),
+            state[21].cast<std::optional<IdType>>(), state[22].cast<bool>(), state[23].cast<tle::PriorityType>(),
+            state[24].cast<tle::RequestType>(), state[25].cast<std::optional<tle::ContextPhaseParams>>(),
+            state[26].cast<std::optional<tle::Tensor>>(), state[27].cast<std::optional<SizeType32>>(),
+            state[28].cast<std::optional<tle::Tensor>>(), 1, state[29].cast<std::optional<tle::EagleConfig>>(),
+            state[30].cast<std::optional<tle::Tensor>>(), state[31].cast<std::optional<tle::GuidedDecodingParams>>());
     };
 
-    py::class_<tle::Request> request(m, "Request");
+    py::class_<tle::Request> request(m, "Request", pybind11::dynamic_attr());
     request
-        // A modified version of constructor to accpect deprecated args maxNewTokens
-        // TODO(enweiz): use the original constructor after the deprecated args are removed
-        .def(py::init(
-                 [](tle::VecTokens const& inputTokenIds, std::optional<tle::SizeType32> maxTokens,
-                     std::optional<tle::SizeType32> maxNewTokens, bool streaming,
-                     tle::SamplingConfig const& samplingConfig, tle::OutputConfig const& outputConfig,
-                     std::optional<tle::SizeType32> const& endId, std::optional<tle::SizeType32> const& padId,
-                     std::optional<std::vector<SizeType32>> const& positionIds,
-                     std::optional<std::list<tle::VecTokens>> const& badWords,
-                     std::optional<std::list<tle::VecTokens>> const& stopWords,
-                     std::optional<tle::Tensor> const& embeddingBias,
-                     std::optional<tle::ExternalDraftTokensConfig> const& externalDraftTokensConfig,
-                     std::optional<tle::PromptTuningConfig> const& pTuningConfig,
-                     std::optional<tle::MropeConfig> const& mRopeConfig,
-                     std::optional<tle::LoraConfig> const& loraConfig,
-                     std::optional<tle::LookaheadDecodingConfig> lookaheadConfig,
-                     std::optional<tle::KvCacheRetentionConfig> const& kvCacheRetentionConfig,
-                     std::optional<std::string> const& logitsPostProcessorName,
-                     std::optional<tle::LogitsPostProcessor> const& logitsPostProcessor,
-                     std::optional<tle::VecTokens> const& encoderInputTokenIds, std::optional<tle::IdType> clientId,
-                     bool returnAllGeneratedTokens, tle::PriorityType priority, tle::RequestType type,
-                     std::optional<tle::ContextPhaseParams> const& contextPhaseParams,
-                     std::optional<tle::Tensor> const& encoderInputFeatures,
-                     std::optional<tle::SizeType32> encoderOutputLength,
-                     std::optional<tle::Tensor> const& crossAttentionMask,
-                     std::optional<tle::EagleConfig> const& eagleConfig,
-                     std::optional<tle::Tensor> const& skipCrossAttnBlocks,
-                     std::optional<tle::GuidedDecodingParams> const& guidedDecodingParams,
-                     std::optional<tle::SizeType32> const& languageAdapterUid)
-                 {
-                     if (maxNewTokens.has_value())
-                     {
-                         TLLM_LOG_WARNING("max_new_tokens is being deprecated; please use max_tokens instead.");
-                         if (!maxTokens.has_value())
-                         {
-                             maxTokens = maxNewTokens;
-                         }
-                     }
-                     TLLM_CHECK_WITH_INFO(maxTokens.has_value(), "missing required argument max_tokens");
-                     return std::make_unique<tle::Request>(inputTokenIds, maxTokens.value(), streaming, samplingConfig,
-                         outputConfig, endId, padId, positionIds, badWords, stopWords, embeddingBias,
-                         externalDraftTokensConfig, pTuningConfig, mRopeConfig, loraConfig, lookaheadConfig,
-                         kvCacheRetentionConfig, logitsPostProcessorName, logitsPostProcessor, encoderInputTokenIds,
-                         clientId, returnAllGeneratedTokens, priority, type, contextPhaseParams, encoderInputFeatures,
-                         encoderOutputLength, crossAttentionMask, 1, eagleConfig, skipCrossAttnBlocks,
-                         guidedDecodingParams, languageAdapterUid);
-                 }),
-            py::arg("input_token_ids"), py::kw_only(), py::arg("max_tokens") = py::none(),
-            py::arg("max_new_tokens") = py::none(), py::arg("streaming") = false,
-            py::arg_v("sampling_config", tle::SamplingConfig(), "SamplingConfig()"),
-            py::arg_v("output_config", tle::OutputConfig(), "OutputConfig()"), py::arg("end_id") = py::none(),
-            py::arg("pad_id") = py::none(), py::arg("position_ids") = py::none(), py::arg("bad_words") = py::none(),
-            py::arg("stop_words") = py::none(), py::arg("embedding_bias") = py::none(),
-            py::arg("external_draft_tokens_config") = py::none(), py::arg("prompt_tuning_config") = py::none(),
-            py::arg("mrope_config") = py::none(), py::arg("lora_config") = py::none(),
-            py::arg("lookahead_config") = py::none(), py::arg("kv_cache_retention_config") = py::none(),
-            py::arg("logits_post_processor_name") = py::none(), py::arg("logits_post_processor") = py::none(),
-            py::arg("encoder_input_token_ids") = py::none(), py::arg("client_id") = py::none(),
-            py::arg("return_all_generated_tokens") = false, py::arg("priority") = tle::Request::kDefaultPriority,
-            py::arg_v("type", tle::RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION,
-                "RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION"),
-            py::arg("context_phase_params") = py::none(), py::arg("encoder_input_features") = py::none(),
-            py::arg("encoder_output_length") = py::none(), py::arg("cross_attention_mask") = py::none(),
-            py::arg("eagle_config") = py::none(), py::arg("skip_cross_attn_blocks") = py::none(),
-            py::arg("guided_decoding_params") = py::none(), py::arg("language_adapter_uid") = py::none())
+        .def(py::init<tle::VecTokens,                           // inputTokenIds
+                 tle::SizeType32,                               // maxTokens
+                 bool,                                          // streaming
+                 tle::SamplingConfig const&,                    // samplingConfig
+                 tle::OutputConfig const&,                      // outputConfig
+                 std::optional<tle::SizeType32> const&,         // endId
+                 std::optional<tle::SizeType32> const&,         // padId
+                 std::optional<std::vector<SizeType32>>,        // positionIds
+                 std::optional<std::list<tle::VecTokens>>,      // badWords
+                 std::optional<std::list<tle::VecTokens>>,      // stopWords
+                 std::optional<tle::Tensor>,                    // embeddingBias
+                 std::optional<tle::ExternalDraftTokensConfig>, // externalDraftTokensConfig
+                 std::optional<tle::PromptTuningConfig>,        // pTuningConfig
+                 std::optional<tle::Tensor>,                    // multimodalEmbedding
+                 std::optional<tle::MropeConfig>,               // mRopeConfig
+                 std::optional<tle::LoraConfig>,                // loraConfig
+                 std::optional<tle::LookaheadDecodingConfig>,   // lookaheadConfig
+                 std::optional<tle::KvCacheRetentionConfig>,    // kvCacheRetentionConfig
+                 std::optional<std::string>,                    // logitsPostProcessorName
+                 std::optional<tle::LogitsPostProcessor>,       // logitsPostProcessor
+                 std::optional<tle::VecTokens>,                 // encoderInputTokenIds
+                 std::optional<tle::IdType>,                    // clientId
+                 bool,                                          // returnAllGeneratedTokens
+                 tle::PriorityType,                             // priority
+                 tle::RequestType,                              // type
+                 std::optional<tle::ContextPhaseParams>,        // contextPhaseParams
+                 std::optional<tle::Tensor>,                    // encoderInputFeatures
+                 std::optional<tle::SizeType32>,                // encoderOutputLength
+                 std::optional<tle::Tensor>,                    // crossAttentionMask
+                 SizeType32,                                    // numReturnSequences
+                 std::optional<tle::EagleConfig>,               // eagleConfig
+                 std::optional<tle::Tensor>,                    // skipCrossAttnBlocks
+                 std::optional<tle::GuidedDecodingParams>,      // guidedDecodingParams
+                 std::optional<tle::SizeType32>,                // languageAdapterUid
+                 std::optional<tle::MillisecondsType>           // allottedTimeMs
+                 >(),
+            // clang-format off
+        py::arg("input_token_ids"),
+        py::arg("max_tokens"),
+        py::kw_only(),
+        py::arg("streaming") = false,
+        py::arg_v("sampling_config", tle::SamplingConfig(), "SamplingConfig()"),
+        py::arg_v("output_config", tle::OutputConfig(), "OutputConfig()"),
+        py::arg("end_id") = py::none(),
+        py::arg("pad_id") = py::none(),
+        py::arg("position_ids") = py::none(),
+        py::arg("bad_words") = py::none(),
+        py::arg("stop_words") = py::none(),
+        py::arg("embedding_bias") = py::none(),
+        py::arg("external_draft_tokens_config") = py::none(),
+        py::arg("prompt_tuning_config") = py::none(),
+        py::arg("multimodal_embedding") = py::none(),
+        py::arg("mrope_config") = py::none(),
+        py::arg("lora_config") = py::none(),
+        py::arg("lookahead_config") = py::none(),
+        py::arg("kv_cache_retention_config") = py::none(),
+        py::arg("logits_post_processor_name") = py::none(),
+        py::arg("logits_post_processor") = py::none(),
+        py::arg("encoder_input_token_ids") = py::none(),
+        py::arg("client_id") = py::none(),
+        py::arg("return_all_generated_tokens") = false,
+        py::arg("priority") = tle::Request::kDefaultPriority,
+        py::arg_v("type", tle::RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION,
+            "RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION"),
+        py::arg("context_phase_params") = py::none(),
+        py::arg("encoder_input_features") = py::none(),
+        py::arg("encoder_output_length") = py::none(),
+        py::arg("cross_attention_mask") = py::none(),
+        py::arg("num_return_sequences") = 1,
+        py::arg("eagle_config") = py::none(),
+        py::arg("skip_cross_attn_blocks") = py::none(),
+        py::arg("guided_decoding_params") = py::none(),
+        py::arg("language_adapter_uid") = py::none(),
+        py::arg("allotted_time_ms") = py::none()
+    )          // clang-format on
         .def_property_readonly("input_token_ids", &tle::Request::getInputTokenIds)
         .def_property_readonly("max_tokens", &tle::Request::getMaxTokens)
-        .def_property_readonly("max_new_tokens", &tle::Request::getMaxNewTokens)
         .def_property("streaming", &tle::Request::getStreaming, &tle::Request::setStreaming)
         .def_property("sampling_config", &tle::Request::getSamplingConfig, &tle::Request::setSamplingConfig)
         .def_property("output_config", &tle::Request::getOutputConfig, &tle::Request::setOutputConfig)
@@ -616,6 +612,8 @@ void initRequestBindings(pybind11::module_& m)
             &tle::Request::setExternalDraftTokensConfig)
         .def_property(
             "prompt_tuning_config", &tle::Request::getPromptTuningConfig, &tle::Request::setPromptTuningConfig)
+        .def_property(
+            "multimodal_embedding", &tle::Request::getMultimodalEmbedding, &tle::Request::setMultimodalEmbedding)
         .def_property("mrope_config", &tle::Request::getMropeConfig, &tle::Request::setMropeConfig)
         .def_property("lora_config", &tle::Request::getLoraConfig, &tle::Request::setLoraConfig)
         .def_property("lookahead_config", &tle::Request::getLookaheadConfig, &tle::Request::setLookaheadConfig)
@@ -766,6 +764,24 @@ void initRequestBindings(pybind11::module_& m)
         .def("has_error", &tle::Response::hasError)
         .def_property_readonly("error_msg", &tle::Response::getErrorMsg)
         .def_property_readonly("result", &tle::Response::getResult)
+        .def("clear_context_logits",
+            [](tle::Response& self)
+            {
+                if (!self.hasError())
+                {
+                    auto& result = const_cast<tle::Result&>(self.getResult());
+                    result.contextLogits.reset();
+                }
+            })
+        .def("clear_generation_logits",
+            [](tle::Response& self)
+            {
+                if (!self.hasError())
+                {
+                    auto& result = const_cast<tle::Result&>(self.getResult());
+                    result.generationLogits.reset();
+                }
+            })
         .def(py::pickle(responseGetstate, responseSetstate));
 }
 

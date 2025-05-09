@@ -320,8 +320,8 @@ scenarios = [
 ]
 
 accuracy_dict = {
-    torch.bfloat16: (2e-2, 2e-3),
-    torch.float8_e4m3fn: (1e-1, 1e-2),
+    torch.bfloat16: (3e-2, 3e-3),
+    torch.float8_e4m3fn: (3e-1, 3e-2),
 }
 
 

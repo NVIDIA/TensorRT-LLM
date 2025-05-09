@@ -3,7 +3,7 @@ import copy
 import inspect
 import os
 import pathlib
-from dataclasses import dataclass, fields
+from dataclasses import _HAS_DEFAULT_FACTORY_CLASS, dataclass, fields
 from types import MethodType, NoneType
 from typing import (Any, Callable, ClassVar, Dict, List, Literal, Optional,
                     Sequence, Tuple, Union, _type_repr)
@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 import tensorrt_llm
 from tensorrt_llm.executor import GenerationResult
+from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.llmapi import (LLM, CalibConfig, CompletionOutput,
                                  GuidedDecodingParams, QuantConfig,
                                  RequestOutput, SamplingParams)
@@ -118,7 +119,8 @@ class ParamSnapshot:
     def assert_equal(self, other: 'ParamSnapshot'):
         qual_name = StackTrace().get_qual_name()
         assert self.annotation == other.annotation, f"{qual_name} annotation: {self.annotation} != {other.annotation}"
-        assert self.default == other.default, f"{qual_name} default: {self.default} != {other.default}"
+        if not isinstance(self.default, _HAS_DEFAULT_FACTORY_CLASS):
+            assert self.default == other.default, f"{qual_name} default: {self.default} != {other.default}"
 
 
 @dataclass(slots=True)

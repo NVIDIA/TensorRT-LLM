@@ -86,7 +86,8 @@ public:
     }
 
     explicit TrtGptModelOptionalParams(executor::ExecutorConfig const& executorConfig, bool isLeaderInOrchMode)
-        : TrtGptModelOptionalParams(KvCacheConfig(executorConfig.getKvCacheConfig()), false,
+        : TrtGptModelOptionalParams(KvCacheConfig(executorConfig.getKvCacheConfig()),
+            executorConfig.getEnableTrtOverlap(),
             executorConfig.getParallelConfig().value_or(executor::ParallelConfig()).getDeviceIds(),
             executorConfig.getNormalizeLogProbs(), executorConfig.getEnableChunkedContext(),
             PeftCacheManagerConfig(executorConfig.getPeftCacheConfig().value_or(executor::PeftCacheConfig())),

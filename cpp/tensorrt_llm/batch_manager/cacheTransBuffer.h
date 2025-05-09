@@ -78,7 +78,7 @@ private:
     size_t mRecvBufferCount;
     size_t mSendBufferCount;
     size_t mTransferBufferSize;
-    bool monlyUseDynamicBuffer;
+    bool mOnlyUseDynamicBuffer;
     size_t mBufferEleSize;
     nvinfer1::DataType mDataType;
     ConcurrenceResource mConcurrenceSendResource;

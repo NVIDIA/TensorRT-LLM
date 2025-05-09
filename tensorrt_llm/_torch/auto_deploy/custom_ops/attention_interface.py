@@ -14,21 +14,9 @@ from dataclasses import dataclass, field, fields
 from typing import Dict, List, Literal, Optional, Protocol, Sequence, Tuple, Type, Union
 
 import torch
+from torch._ops import OpOverloadPacket
 from torch.export import Dim
-
-
-@dataclass
-class PositionalEmbeddingConfig:
-    """A dataclass to hold positional embedding information."""
-
-    mode: Optional[Literal["rope"]] = None
-    rope_theta: float = 10000.0
-    rope_scale: float = 1.0
-
-    def __post_init__(self):
-        assert self.mode in [None, "rope"], f"Invalid mode: {self.mode}."
-        if self.mode == "rope":
-            assert self.rope_theta > 0, f"Invalid rope theta: {self.rope_theta}."
+from torch.fx import Node
 
 
 @dataclass
@@ -36,26 +24,6 @@ class CacheConfig:
     """A dataclass to hold information how to configure the cache."""
 
     dtype: Optional[torch.dtype] = None
-
-
-@dataclass
-class AttentionInfo:
-    """Information about the attention op.
-
-    This is the dataclass collected by the kvcache transformation and passed in to the
-    AttentionDescriptor methods to inform the attention op about the attention configuration.
-    """
-
-    num_heads: int
-    num_kv_heads: int
-    head_dim: int  # embedding size of each head
-    dtype: torch.dtype
-
-    cache_config: CacheConfig
-    pos_embd_config: PositionalEmbeddingConfig
-    # rope_dim represents embedding size of decoupled q/k that carry rope information
-    # when rope_dim != 0 the decoupled q/k tensor carrying rope information is the last part of the tensor [-rope_dim: ]
-    rope_dim: Optional[int] = 0
 
 
 @dataclass
@@ -110,6 +78,8 @@ class SequenceInfo:
     ## [UPDATE WITH CARE] TENSOR FIELDS THAT WILL BE PASSED TO PREPARE_METADATA OP #################
     # input_ids MUST ALWAYS BE THE FIRST FIELD
     input_ids: torch.Tensor = field(default_factory=lambda: torch.zeros(1, 1, dtype=torch.int))
+    position_ids: torch.Tensor = field(default_factory=lambda: torch.zeros(1, 1, dtype=torch.int))
+
     seq_len: torch.Tensor = field(default_factory=lambda: torch.ones(1, dtype=torch.int))
     input_pos: torch.Tensor = field(default_factory=lambda: torch.zeros(1, dtype=torch.int))
     cache_loc: torch.Tensor = field(default_factory=lambda: torch.arange(1, dtype=torch.int))
@@ -130,6 +100,7 @@ class SequenceInfo:
         total_tokens = min(self.max_num_tokens, self.max_batch_size * self.max_seq_len)
         self._num_pages = (total_tokens) // self.page_size + (total_tokens % self.page_size > 0)
         self.input_ids = torch.ones(self.max_batch_size, 1, dtype=torch.int)
+        self.position_ids = torch.zeros(self.max_batch_size, 1, dtype=torch.int)
         self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int)
         self.input_pos = torch.empty_like(self.seq_len)
         self.cache_loc = torch.empty(self.num_pages, dtype=torch.int)
@@ -149,18 +120,30 @@ class SequenceInfo:
         return self.input_pos.device
 
     @property
-    def args(self) -> List[torch.Tensor]:
+    def args(self) -> Tuple[torch.Tensor, ...]:
         args = []
         for f in fields(self):
             val = getattr(self, f.name)
             if isinstance(val, torch.Tensor):
                 args.append(val)
-        return args
+        return tuple(args)
+
+    @property
+    def num_original_args(self) -> int:
+        """Return the number of original graph arguments expected by the model."""
+        return 2
+
+    @property
+    def args_original(self) -> Tuple[torch.Tensor, ...]:
+        """Return the original graph arguments expected by the model."""
+        return self.args[: self.num_original_args]
 
     @property
     def extra_arg_names(self) -> List[str]:
-        """Return extra arg names for the prepare_metadata op beyond input_ids."""
-        return [f.name for f in fields(self) if isinstance(getattr(self, f.name), torch.Tensor)][1:]
+        """Return extra arg names for the prepare_metadata op beyond input_ids and position_ids."""
+        return [f.name for f in fields(self) if isinstance(getattr(self, f.name), torch.Tensor)][
+            self.num_original_args :
+        ]
 
     @property
     def dynamic_shapes(self) -> Tuple[Dict[str, Dim]]:
@@ -169,13 +152,22 @@ class SequenceInfo:
         NOTE: will be lazily initialized since the Dim object is not picklable for multi-processing.
         """
         if self._dynamic_shapes is None:
-            dynamic_shapes = ({},)
+            # set up shape for input_ids and position_ids
+            dynamic_shapes = ({}, {})
             if self.max_batch_size > 1:
                 dynamic_shapes[0][0] = Dim("batch_size", max=self.max_batch_size)
             dynamic_shapes[0][1] = Dim("seq_len", max=self.max_seq_len)
+            # set up shape for position_ids (same as input_ids)
+            dynamic_shapes[1].update(dynamic_shapes[0])
+            # set up shape for extra args
             dynamic_shapes += ({},) * len(self.extra_arg_names)
             self._dynamic_shapes = dynamic_shapes
         return self._dynamic_shapes
+
+    @property
+    def original_dynamic_shapes(self) -> Tuple[Dict[str, Dim]]:
+        """Return the dynamic shapes of the original graph arguments."""
+        return self.dynamic_shapes[: self.num_original_args]
 
     @property
     def num_sequences(self) -> int:
@@ -283,7 +275,7 @@ class SequenceInfo:
         for f in fields(self):
             val = getattr(self, f.name)
             val_other = getattr(other, f.name)
-            if f.name == "input_ids":
+            if f.name in ["input_ids", "position_ids"]:
                 setattr(self, f.name, val_other.to(self.device))
             elif f.name == "_sequence_lengths":
                 self._sequence_lengths = val_other
@@ -298,25 +290,29 @@ class SequenceInfo:
         After reset the sequence information should correspond to a "generate-only" batch of
         sequences (b, s==1) without cache history.
         """
-        # set a dummy sequence corresponding to a generate-only batch
+        # reset input_pos
+        self.input_pos.zero_()
+
+        # set a dummy sequence corresponding to a generate-only batch (will also reset position_ids)
         self.nest_sequences(torch.zeros(self.max_batch_size, 1, dtype=torch.int))
 
         # reset cache information
-        self.input_pos.zero_()
         self.cache_loc[:] = torch.arange(self.num_pages, dtype=torch.int, device=self.device)
         self.pages_per_seq.fill_(1)
 
     def _set_example_sequence(self) -> None:
-        """Set an example sequence for export purposes."""
+        """Set an example sequence for export purposes with shape [bs, seq_len]."""
         self.reset()
+        bs, seq_len = min(2, self.max_batch_size), min(4, self.max_seq_len)
         input_ids = torch.ones(
-            min(2, self.max_batch_size),
-            min(4, self.max_seq_len),
+            bs,
+            seq_len,
             dtype=torch.int,
             device=self.device,
         )
         self.nest_sequences(input_ids)
-        self.input_ids = input_ids
+        self.input_ids = self.input_ids.view(bs, seq_len)
+        self.position_ids = self.position_ids.view(bs, seq_len)
 
     def _set_max_num_tokens_sample(self) -> None:
         """Set an example sequence with max_num_tokens."""
@@ -335,6 +331,20 @@ class SequenceInfo:
         """Set an example sequence for generate-only batch."""
         self.reset()
         self.nest_sequences([[1]] * self.max_batch_size)
+
+    def _update_position_ids(self) -> None:
+        # set new position_ids as new tensor from input_pos and seq_len via torch.arange
+        position_ids_list = [
+            torch.arange(in_pos, in_pos + seq_len, dtype=torch.int)
+            for in_pos, seq_len in zip(self.input_positions, self.sequence_lengths)
+        ]
+        self.position_ids = torch.cat(position_ids_list, dim=0).to(self.device)
+
+        # use [b,1] shape to indicate generate-only batch, otherwise use [1,total_len]
+        if self.is_generate:
+            self.position_ids = self.position_ids.view(-1, 1)
+        else:
+            self.position_ids = self.position_ids.view(1, -1)
 
     def nest_sequences(self, input_ids: Sequence[Sequence[int]]) -> None:
         """Create and store a flattened list of input_ids from the provided list of sequences.
@@ -362,6 +372,9 @@ class SequenceInfo:
         else:
             self.input_ids = self.input_ids.view(1, -1, *self.input_ids.shape[1:])
 
+        # update position_ids
+        self._update_position_ids()
+
     def unnest_sequences(self, t_nested: torch.Tensor) -> List[torch.Tensor]:
         t_squeezed = t_nested.squeeze(1) if self.is_generate else t_nested.squeeze(0)
         return list(torch.split(t_squeezed, self.sequence_lengths))
@@ -379,6 +392,9 @@ class SequenceInfo:
             self.input_pos[:bs] = seq_len.to(self.device)
         else:
             self.input_pos[:bs] += seq_len.to(self.device)
+
+        # update position_ids
+        self._update_position_ids()
 
     def assign_cache_loc(self, page_assignments: Sequence[Sequence[int]]) -> None:
         """Set the cache location and pages_per_seq tensors from page assignments."""
@@ -405,6 +421,7 @@ class PrepareMetadataCallable(Protocol):
     def __call__(
         self,
         input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
         seq_len: torch.Tensor,
         input_pos: torch.Tensor,
         cache_loc: torch.Tensor,
@@ -421,12 +438,9 @@ class GetBufferCallable(GetCacheCallable):
     pass
 
 
-class GetAttentionInfo(Protocol):
-    def __call__() -> AttentionInfo: ...
-
-
 CacheInitializerDict = Dict[str, GetCacheCallable]
 BufferInitializerDict = Dict[str, GetBufferCallable]
+AttentionLayout = Literal["bsnd", "bnsd"]
 
 
 class AttentionDescriptor(ABC):
@@ -443,14 +457,30 @@ class AttentionDescriptor(ABC):
         """Return if the attention op is paged or not."""
 
     @classmethod
-    def get_attention_op(cls) -> Tuple[MHACallable, int]:
-        """Get the attention op and the number of arguments corresponding to qkv.
+    @abstractmethod
+    def get_attention_layout(cls) -> AttentionLayout:
+        """Get the attention layout expected by the source op and the cached attention op."""
+
+    @classmethod
+    @abstractmethod
+    def get_num_qkv_args(cls) -> int:
+        """Get the number of qkv arguments expected by the source op."""
+
+    @classmethod
+    @abstractmethod
+    def get_source_attention_op(cls) -> OpOverloadPacket:
+        """Get the source attention op that we target for replacement."""
+
+    @classmethod
+    @abstractmethod
+    def get_cached_attention_op(cls) -> MHACallable:
+        """Get the cached attention op .
 
         The attention_op should follow the below signature:
 
         ```
         def attention_op(
-            *qkv,       # list of tensors corresponding to Q, K, V as in original op
+            *qkv,       # list of tensors corresponding to Q, K, V as in source attention op
             *metadata,  # global info about the sequences as returned by the prepare_metadata op
             *caches,    # contains layer-specific caches per provided cache initializers
             *buffers,   # global buffers used by the attention op as provided by buffer initializers
@@ -462,7 +492,7 @@ class AttentionDescriptor(ABC):
         restrictions on the supported types in the signature.**
 
         **Note that the `qkv` tuple should be consistent across both the cached attention
-        op and the op that it is replacing.**
+        op and the source attention op that it is replacing.**
 
         """
         raise NotImplementedError
@@ -477,6 +507,7 @@ class AttentionDescriptor(ABC):
         ```
         def prepare_metadata(
             input_ids: torch.Tensor,
+            position_ids: torch.Tensor,
             seq_len: torch.Tensor,
             input_pos: torch.Tensor,
             cache_loc: torch.Tensor,
@@ -491,11 +522,12 @@ class AttentionDescriptor(ABC):
         **Note that the prepare_metadata op should be a valid torch custom op, which comes with
         restrictions on the supported types in the signature.**
         """
-        return NotImplementedError
 
     @classmethod
     @abstractmethod
-    def get_cache_initializers(cls, get_info: GetAttentionInfo) -> CacheInitializerDict:
+    def get_cache_initializers(
+        cls, source_attn_node: Node, cache_config: CacheConfig
+    ) -> CacheInitializerDict:
         """Provide a dictionary of function pointers that can be used to initialize the caches.
 
         The key corresponds to the argument name used in the attention op signature. The function
@@ -503,19 +535,17 @@ class AttentionDescriptor(ABC):
         describe the cache in the graph will be patched with the attention node index to ensure
         uniqueness.
 
-        ``get_cache_initializers`` will be called *once* after the model initialization and before
+        ``get_cache_initializers`` will be called *once* during cache initialization and before
         the initial forward pass for each attention op detected in the graph. The caches will be
         managed by the global CacheManager and passed back to the attention op during the forward
         pass.
 
-        If the cache initializer requires information about the attention op, the ``get_info``
-        function can be called **inside** the cache initializer to retrieve the necessary
-        information.
+        If the cache initializer requires information about the attention op, it can retrieve
+        the necessary information from the source attention node and cache config.
         """
-        raise NotImplementedError
 
     @classmethod
-    def get_global_buffer_initializers(cls, get_info: GetAttentionInfo) -> BufferInitializerDict:
+    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
         """Provide a dictionary of function pointers that can be used to initialize buffers.
 
         The key corresponds to the buffer name used in the graph module and will **not**
@@ -528,20 +558,18 @@ class AttentionDescriptor(ABC):
         pass for each attention op detected in the graph. The buffer will be managed by the global
         CacheManager and passed back to the attention op during the forward pass.
 
-        If the buffer initializer requires information about the attention op, the ``get_info``
-        function can be called **inside** the buffer initializer to retrieve the necessary
-        information.
+        If the buffer initializer requires information about the attention op, it can retrieve
+        the necessary information from the source attention node.
         """
-        return {}
 
     @classmethod
-    def get_constants(cls, attention_info: AttentionInfo) -> List[Constant]:
+    @abstractmethod
+    def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         """Provide a list of constant arguments to be passed to the attention op.
 
         The constant arguments are passed to the attention op as additional arguments after the
         caches and buffers. The constants are expected to be of type int, float, str, or None.
         """
-        return []
 
 
 class AttentionRegistry:
