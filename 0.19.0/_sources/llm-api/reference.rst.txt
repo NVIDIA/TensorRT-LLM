@@ -1,0 +1,128 @@
+API Reference
+-------------
+
+.. autoclass:: tensorrt_llm.llmapi.LLM
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.CompletionOutput
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.RequestOutput
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.GuidedDecodingParams
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.SamplingParams
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.DisaggregatedParams
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.KvCacheConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.KvCacheRetentionConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.LookaheadDecodingConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.MedusaDecodingConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.EagleDecodingConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.MTPDecodingConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.SchedulerConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.CapacitySchedulerPolicy
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.BuildConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.QuantConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.QuantAlgo
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.CalibConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.BuildCacheConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.RequestError
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.MpiCommSession
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.BatchingType
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.ContextChunkingPolicy
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.DynamicBatchConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
