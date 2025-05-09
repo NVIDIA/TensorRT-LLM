@@ -14,8 +14,8 @@ class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
         is_use_oldest: bool = True,
     ):
         self.input_batch_size = input_batch_size
-        self.plnt = prompt_lookup_num_tokens  # Shorter name
-        self.mmns = max_matching_ngram_size  # Shorter name
+        self.prompt_lookup_num_tokens = prompt_lookup_num_tokens
+        self.max_matching_ngram_size = max_matching_ngram_size
         self.max_seq_len = max_seq_len
         self.is_keep_all = is_keep_all
         self.is_use_oldest = is_use_oldest
@@ -38,14 +38,14 @@ class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
 
             # Update pool
             sequence = prefix[bi][self.start_index[gbi]:]  #.tolist()
-            for size in range(min(self.mmns, prefix_len[bi] - 1), 0, -1):
+            for size in range(min(self.max_matching_ngram_size, prefix_len[bi] - 1), 0, -1):
                 # Find each possible key-value combination, and use tuple for hash
                 for l in range(len(sequence) - size):
-                    r = min(l + size + self.plnt, len(sequence))
+                    r = min(l + size + self.prompt_lookup_num_tokens, len(sequence))
                     key = tuple(sequence[l:l + size])
                     value = tuple(sequence[l + size:r])
                     if key not in self.pool[gbi] or not self.is_keep_all or \
-                        len(self.pool[gbi][key][0]) < self.plnt:
+                        len(self.pool[gbi][key][0]) < self.prompt_lookup_num_tokens:
                         # Update the value if
                         # 1. the key does not exist
                         # 2. we only keep one value for each key
@@ -56,7 +56,7 @@ class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
                         self.pool[gbi][key].add(value)
 
             # Find match
-            for size in range(min(self.mmns, prefix_len[bi] - 1), 0, -1):
+            for size in range(min(self.max_matching_ngram_size, prefix_len[bi] - 1), 0, -1):
                 pattern = tuple(prefix[bi][-size:])
                 if pattern not in self.pool[gbi]:
                     continue
@@ -69,6 +69,6 @@ class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
                 break
             draft_tokens.append(chosen_ids)
             self.start_index[gbi] = max(
-                0, prefix_len[bi] - (self.plnt + self.mmns - 1))
+                0, prefix_len[bi] - (self.prompt_lookup_num_tokens + self.max_matching_ngram_size - 1))
 
         return draft_tokens
