@@ -1,34 +1,19 @@
 import argparse
+from transformers import AutoTokenizer
+import json
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
-                                 MTPDecodingConfig, NGramDrafterConfig)
+                                 MTPDecodingConfig, NGramDecodingConfig)
 
-import json
-
-
-def read_dataset(dataset_file):
-    dataset = []
-    with open(dataset_file, "r") as f:
-        for l in f.readlines():
-            sample = json.loads(l)
-            dataset.append(sample)
-
-    max_length = 0
-    for sample in dataset:
-        max_length = max_length if max_length > sample['output_tokens'] else sample['output_tokens']
-
-    prompts = []
-    for sample in dataset:
-        prompts.append([sample['system_prompt'] + sample['user_prompt']])
-
-    return dataset, max_length
-
-
-def get_prompt_from_sample(sample):
-    return sample['system_prompt'] + sample['user_prompt']
+example_prompts = [
+    "Hello, my name is",
+    "The president of the United States is",
+    "The capital of France is",
+    "The future of AI is",
+]
 
 
 def add_llm_args(parser):
@@ -36,10 +21,10 @@ def add_llm_args(parser):
                         type=str,
                         required=True,
                         help="Model checkpoint directory.")
-    parser.add_argument("--dataset",
+    parser.add_argument("--prompt",
                         type=str,
                         nargs="+",
-                        help="A json file containing text samples")
+                        help="A single or a list of text prompts.")
     # Build config
     parser.add_argument("--max_seq_len",
                         type=int,
@@ -104,8 +89,7 @@ def add_llm_args(parser):
     parser.add_argument('--spec_decode_algo', type=str, default=None)
     parser.add_argument('--spec_decode_nextn', type=int, default=1)
     parser.add_argument('--eagle_model_dir', type=str, default=None)
-    parser.add_argument('--prompt_lookup_num_tokens', type=int, default=5)
-    parser.add_argument('--is_use_newest', default=False, action='store_true')
+    parser.add_argument('--max_matching_ngram_size', type=int, default=5)
 
     return parser
 
@@ -118,7 +102,7 @@ def parse_arguments():
     return args
 
 
-def setup_llm(args):
+def setup_llm(args, max_length):
     pytorch_config = PyTorchConfig(
         enable_overlap_scheduler=args.enable_overlap_scheduler,
         kv_cache_dtype=args.kv_cache_dtype,
@@ -126,7 +110,9 @@ def setup_llm(args):
         use_cuda_graph=args.use_cuda_graph,
         load_format=args.load_format,
         print_iter_log=args.print_iter_log,
+        enable_iter_perf_stats=args.print_iter_log,
     )
+    print("print_iter_log=",args.print_iter_log)
 
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=args.kv_cache_enable_block_reuse,
@@ -144,11 +130,12 @@ def setup_llm(args):
             max_draft_len=args.spec_decode_nextn,
             pytorch_eagle_weights_path=args.eagle_model_dir)
     elif spec_decode_algo == "NGRAM":
-        spec_config = NGramDrafterConfig(
-            prompt_lookup_num_tokens=args.prompt_lookup_num_tokens,
-            max_draft_len=args.spec_decode_nextn,
+        spec_config = NGramDecodingConfig(
+            prompt_lookup_num_tokens=args.spec_decode_nextn,
+            max_matching_ngram_size=args.max_matching_ngram_size,
             is_keep_all=True,
-            is_use_oldest=!args.is_use_newest)
+            is_use_oldest=True,
+            )
     else:
         spec_config = None
 
@@ -167,7 +154,7 @@ def setup_llm(args):
               speculative_config=spec_config)
 
     sampling_params = SamplingParams(
-        max_tokens=args.max_tokens,
+        max_tokens=max_length,
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
@@ -177,17 +164,29 @@ def setup_llm(args):
 
 def main():
     args = parse_arguments()
-    prompts = [get_prompt_from_sample(sample)[0] for sample in read_dataset(args.dataset)]
-    for prompt in prompts[:3]:
-        print(prompt)
 
-    #llm, sampling_params = setup_llm(args)
-    #outputs = llm.generate(prompts, sampling_params)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
+    prompts = args.prompt if args.prompt else example_prompts
+    max_length = args.max_tokens 
 
-    #for i, output in enumerate(outputs):
-    #    prompt = output.prompt
-    #    generated_text = output.outputs[0].text
-    #    print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+    llm, sampling_params = setup_llm(args, max_length)
+    from time import time
+    begin = time()
+    outputs = llm.generate(prompts, sampling_params)
+    end = time()
+
+    stats = llm.get_stats()
+    for stat in stats:
+        print(stat)
+
+    num_tokens = 0
+    generated_texts = []
+    for i, (prompt, output) in enumerate(zip(prompts,outputs)):
+        generated_text = output.outputs[0].text
+        generated_tokens = tokenizer.encode(generated_text)
+        num_tokens = num_tokens + len(generated_tokens)
+        generated_texts.append({"prompt": prompt, "response": generated_text})
+        print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
 
 if __name__ == '__main__':
