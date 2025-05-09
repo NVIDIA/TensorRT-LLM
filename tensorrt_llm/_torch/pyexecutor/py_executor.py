@@ -1771,7 +1771,7 @@ class PyExecutor:
                     request.get_tokens()[beam_idx])
 
                 # Generate draft tokens. Add to request
-                draft_tokens, _ = self.pld_pool.get_draft_tokens(
+                draft_tokens = self.pld_pool.get_draft_tokens(
                     [input_tokens], [0], [request.py_end_id])
                 draft_tokens = list(draft_tokens[0])
                 max_draft_tokens = self.pld_pool.plnt

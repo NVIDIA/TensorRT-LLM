@@ -71,4 +71,4 @@ class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
             self.start_index[gbi] = max(
                 0, prefix_len[bi] - (self.plnt + self.mmns - 1))
 
-        return draft_tokens, None
+        return draft_tokens
