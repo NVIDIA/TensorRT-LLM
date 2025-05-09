@@ -289,11 +289,66 @@ def optimize_rope(gm: GraphModule) -> GraphModule:
     for node in list(graph.nodes):
         if is_op(node, torch.ops.rope.torch_apply_rope_with_explicit_cos_sin):
             _optimize_explicit(graph, node, rope_flash_cache, rope_position_ids_cache)
+            # _optimize_explicit_debug(graph, node)
         elif is_op(node, torch.ops.rope.torch_apply_rope_with_complex_freqs):
             _optimize_complex(graph, node, rope_flash_cache, rope_position_ids_cache)
 
     gm = canonicalize_graph(gm)
     return gm
+
+
+def _optimize_explicit_debug(
+    graph: GraphModule,
+    node: Node,
+) -> None:
+    # Only target the original HF‐style explicit‐cos/sin op
+    if not is_op(node, torch.ops.rope.torch_apply_rope_with_explicit_cos_sin):
+        return
+
+    # Unpack args: (q, k, cos, sin[, unsq])
+    q_node, k_node, cos_node, sin_node, *rest = node.args
+    # figure out unsqueeze_dim (literal or default)
+    if rest:
+        unsqueeze_dim = rest[0]
+    else:
+        # match the default from the schema
+        unsq_schema = next(
+            iter(torch.ops.rope.torch_apply_rope_with_explicit_cos_sin._schemas.values())
+        ).arguments
+        unsqueeze_dim = next(
+            arg.default_value
+            for arg in unsq_schema
+            if arg.name == "unsqueeze_dim" and arg.has_default_value
+        )
+
+    # Grab the old outputs so we can copy their metadata & replace uses
+    old_q, old_k = extract_output_tuple(node, 2)
+    if old_q is None or old_k is None:
+        return  # nothing to do if we couldn’t pull them out
+
+    # Insert your debug‐mode op right before the original call
+    with graph.inserting_before(node):
+        debug_node = graph.call_function(
+            torch.ops.rope.torch_apply_rope_with_explicit_cos_sin_debug,
+            args=(q_node, k_node, cos_node, sin_node, unsqueeze_dim),
+        )
+
+    # Unpack its tuple‐of‐(q,k)
+    with graph.inserting_after(debug_node):
+        new_q = graph.call_function(operator.getitem, args=(debug_node, 0))
+        new_k = graph.call_function(operator.getitem, args=(debug_node, 1))
+
+    # Preserve metadata (shape/dtype) so later passes remain valid
+    new_q.meta["val"] = old_q.meta.get("val", None)
+    new_k.meta["val"] = old_k.meta.get("val", None)
+
+    # Reroute all users of the old outputs onto the new ones
+    old_q.replace_all_uses_with(new_q)
+    old_k.replace_all_uses_with(new_k)
+
+    # And finally kill off the old outputs (the original op node can be left around or erased if unused)
+    graph.erase_node(old_q)
+    graph.erase_node(old_k)
 
 
 def _optimize_explicit(
@@ -332,7 +387,7 @@ def _optimize_explicit(
 
     cache_key = (cos_node, sin_node)
     if cache_key in cache:
-        fused_cos_sin_0 = cache[cache_key]
+        fused_cos_sin = cache[cache_key]
     else:
         with graph.inserting_after(cos_node):
             cos_prefix = graph.call_function(
@@ -346,25 +401,35 @@ def _optimize_explicit(
             fused_cos_sin = graph.call_function(
                 torch.ops.aten.cat, args=((cos_prefix, sin_prefix), -1)
             )
-        with graph.inserting_after(fused_cos_sin):
-            fused_cos_sin_0 = graph.call_function(operator.getitem, args=(fused_cos_sin, 0))
-        with graph.inserting_after(fused_cos_sin_0):
-            fused_cos_sin_0 = graph.call_function(
-                torch.ops.aten.to, args=(fused_cos_sin_0, torch.float32)
-            )
-        cache[cache_key] = fused_cos_sin_0
+        # with graph.inserting_after(q_node):
+        #     # fused_cos_sin_flat = graph.call_function(operator.getitem, args=(fused_cos_sin, 0))
+        #     sym_batch = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 0)) # batch_dim = 0
+        # with graph.inserting_after(sym_batch):
+        #     sym_seq = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 1)) # seq_dim = 1
+        # with graph.inserting_after(sym_seq):
+        #     bs_seq = graph.call_function(torch.ops.aten.mul.int ,args=(sym_batch, sym_seq))
+        # with graph.inserting_after(bs_seq):
+        #     fused_cos_sin_flat = graph.call_function(
+        #         torch.ops.aten.view.default, args=(fused_cos_sin, [bs_seq, -1]),
+        #     )
+        # with graph.inserting_after(fused_cos_sin_flat):
+        #     fused_cos_sin_flat = graph.call_function(
+        #         torch.ops.aten.to, args=(fused_cos_sin_flat, torch.float32)
+        #     )
+        cache[cache_key] = fused_cos_sin
 
     with graph.inserting_before(node):
         position_ids = _get_position_ids(
             graph,
             q_node,
+            # bs_seq,
             batch_dim=0,
             seq_dim=1,
             rope_position_ids_cache=pos_cache,
         )
         flash_node = graph.call_function(
             torch.ops.rope.flashinfer,
-            args=(q_node, k_node, position_ids, fused_cos_sin_0, True),
+            args=(q_node, k_node, position_ids, fused_cos_sin, True),
         )
 
     with graph.inserting_after(flash_node):
@@ -802,6 +867,7 @@ def _validate_rope_inputs(q_node: Node, k_node: Node) -> bool:
 def _get_position_ids(
     graph: GraphModule,
     q_node: Node,
+    # bs_seq_flat: Node,
     batch_dim: int = 0,
     seq_dim: int = 1,
     rope_position_ids_cache: Dict[str, Node] = None,
@@ -818,6 +884,7 @@ def _get_position_ids(
 
     sym_batch = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, batch_dim))
     sym_seq = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, seq_dim))
+    bs_seq = graph.call_function(torch.ops.aten.mul, args=(sym_batch, sym_seq))
 
     # Retrieve device information, ensuring it is a torch.device.
     device = q_node.meta.get("device", "cpu")
@@ -825,15 +892,26 @@ def _get_position_ids(
         device = torch.device(device)
 
     # Build positions: arange(sym_seq) -> view -> expand -> flatten.
-    positions_node = graph.call_function(
-        torch.ops.aten.arange,
-        args=(sym_seq,),
+    position_ids = graph.call_function(
+        torch.arange,  # torch.ops.aten.arange cannot take in symbolic arg as start/end
+        args=(bs_seq,),
         kwargs={"dtype": torch.float32, "device": device, "pin_memory": False},
     )
-    positions_node = graph.call_function(torch.ops.aten.view, args=(positions_node, (1, -1)))
-    positions_node = graph.call_function(
-        torch.ops.aten.expand, args=(positions_node, (sym_batch, -1))
-    )
-    position_ids = graph.call_function(torch.ops.aten.flatten, args=(positions_node,))
+
+    # position_ids = graph.call_function(
+    #     torch.ops.aten.arange.start,     # the “start/end” overload
+    #     args=(0, bs_seq),                # start=0, end=bs_seq (a SymInt)
+    #     kwargs={
+    #     "step":       1,
+    #     "dtype":      torch.float32,
+    #     "device":     device,
+    #     "pin_memory": False,
+    #     },
+    # )
+    # positions_node = graph.call_function(torch.ops.aten.view, args=(positions_node, (1, -1)))
+    # positions_node = graph.call_function(
+    #     torch.ops.aten.expand, args=(positions_node, (sym_batch, -1))
+    # )
+    # position_ids = graph.call_function(torch.ops.aten.flatten, args=(positions_node,))
     rope_position_ids_cache["position_ids"] = position_ids
     return position_ids
