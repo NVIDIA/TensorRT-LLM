@@ -428,14 +428,18 @@ class TestLlama2_7B(CliFlowAccuracyTestHarness):
                  extra_build_args=["--gemm_plugin=fp8"])
 
     @skip_pre_ada
+    @skip_post_blackwell
     def test_fp8_gemm_swiglu_plugin(self):
+        # gemm_swiglu_plugin=fp8 is not supported on SM 100.
         self.run(
             quant_algo=QuantAlgo.FP8,
             kv_cache_quant_algo=QuantAlgo.FP8,
             extra_build_args=["--gemm_plugin=fp8", "--gemm_swiglu_plugin=fp8"])
 
     @skip_pre_ada
+    @skip_post_blackwell
     def test_fp8_low_latency_gemm_plugin(self):
+        # low_latency_gemm_plugin=fp8 is not supported on SM 100.
         self.run(quant_algo=QuantAlgo.FP8,
                  kv_cache_quant_algo=QuantAlgo.FP8,
                  extra_build_args=["--low_latency_gemm_plugin=fp8"])
@@ -635,6 +639,7 @@ class TestLlama3_1_8B(CliFlowAccuracyTestHarness):
             tp_size=4,
             extra_build_args=extra_build_args)
 
+    @skip_post_blackwell
     @skip_pre_ada
     def test_autoq(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
@@ -1064,6 +1069,7 @@ class TestGemma2_9BIt(CliFlowAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-2-9b-it"
     EXAMPLE_FOLDER = "models/core/gemma"
 
+    @skip_post_blackwell
     def test_auto_dtype(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
                         MMLU(self.MODEL_NAME)],
