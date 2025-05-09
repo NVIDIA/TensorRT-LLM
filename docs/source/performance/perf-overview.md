@@ -15,7 +15,7 @@ For DeepSeek R1 performance, please check out our [performance guide](../blogs/B
 ## Throughput Measurements
 
 The below table shows performance data where a local inference client is fed requests at an infinite rate (no delay between messages),
-and shows the throughput scenario under maximum load.
+and shows the throughput scenario under maximum load. The reported metric is `Total Output Throughput (tokens/sec)`.
 
 The performance numbers below were collected using the steps described in this document.
 
@@ -31,7 +31,7 @@ nvidia/Llama-3.1-405B-Instruct-FP4
 | GPU:                         |    | B200      |           |           |           |
 |:-----------------------------|:---|:----------|:----------|:----------|:----------|
 | Tensor Parallel Size         |    | 1         | 2         | 4         | 8         |
-| Runtime Input/Output Lengths |    |           |           |           |           |
+| Runtime Input/ Output Lengths|    |           |           |           |           |
 |                              |    |           |           |           |           |
 | 128, 128                     |    | 11,253.28 | 17,867.66 | 24,944.50 | 27,471.49 |
 | 128, 2048                    |    | 9,925.00  | 15,459.71 | 23,608.58 | 30,742.86 |
@@ -49,7 +49,7 @@ nvidia/Llama-3.1-405B-Instruct-FP4
 | GPU:                         |    | B200      |
 |:-----------------------------|:---|:----------|
 | Tensor Parallel Size         |    | 8         |
-| Runtime Input/Output Lengths |    |           |
+| Runtime Input/ Output Lengths|    |           |
 |                              |    |           |
 | 128, 128                     |    | 9,184.83  |
 | 128, 2048                    |    | 10,387.23 |
@@ -73,7 +73,7 @@ nvidia/Llama-3.1-405B-Instruct-FP8
 #### Llama 3.1 8B FP8
 | GPU:                         |    | H200 141GB HBM3   | H100 80GB HBM3   |
 |:-----------------------------|:---|:------------------|:-----------------|
-| Tensor Parallel Size         |    |                   |                  |
+| Tensor Parallel Size         |    | 1                 | 1                |
 | Runtime Input/Output Lengths |    |                   |                  |
 |                              |    |                   |                  |
 | 128, 128                     |    | 28,447.38         | 27,568.68        |
@@ -89,10 +89,10 @@ nvidia/Llama-3.1-405B-Instruct-FP8
 | 20000, 2000                  |    | 1,706.06          | 1,340.92         |
 
 #### Llama 3.1 70B FP8
-| GPU                          |    | H200 141GB HBM3   |          |           |           | H100 80GB HBM3   |          |           |           |
+| GPU:                         |    | H200 141GB HBM3   |          |           |           | H100 80GB HBM3   |          |           |           |
 |:-----------------------------|:---|:------------------|:---------|:----------|:----------|:-----------------|:---------|:----------|:----------|
-| Tensor Parallel Size         |    | 1                 | 2        | 4         | 8         | 1                |          |           |           |
-| Runtime Input/Output Lengths:|    |                   |          |           |           |                  |          |           |           |
+| Tensor Model Parallel Size   |    | 1                 | 2        | 4         | 8         | 1                | 2        | 4         | 8         |
+| Runtime Input/ Output Lengths|    |                   |          |           |           |                  |          |           |           |
 |                              |    |                   |          |           |           |                  |          |           |           |
 | 128, 128                     |    | 3,657.58          | 6,477.50 | 10,466.04 | 15,554.57 | 3,191.27         | 6,183.41 | 10,260.68 | 14,686.01 |
 | 128, 2048                    |    | 4,351.07          | 8,450.31 | 13,438.71 | 20,750.58 | 745.19           | 5,822.02 | 11,442.01 | 17,463.99 |
@@ -110,7 +110,7 @@ nvidia/Llama-3.1-405B-Instruct-FP8
 | GPU:                         |    | H200 141GB HBM3   | H100 80GB HBM3   |
 |:-----------------------------|:---|:------------------|:-----------------|
 | Tensor Parallel Size         |    | 8                 | 8                |
-| Runtime Input/Output Lengths |    |                   |                  |
+| Runtime Input/ Output Lengths|    |                   |                  |
 |                              |    |                   |                  |
 | 128, 128                     |    | 3,800.11          | 3,732.40         |
 | 128, 2048                    |    | 5,661.13          | 4,572.23         |
