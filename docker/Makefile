@@ -121,6 +121,7 @@ else
 endif
 SOURCE_DIR        ?= $(shell readlink -f ..)
 CODE_DIR          ?= /code/tensorrt_llm
+EXTRA_VOLUMES     ?=
 CCACHE_DIR        ?= ${CODE_DIR}/cpp/.ccache
 CONAN_DIR         ?= ${CODE_DIR}/cpp/.conan
 RUN_CMD           ?=
@@ -138,6 +139,7 @@ endif
 	docker run $(DOCKER_RUN_OPTS) $(DOCKER_RUN_ARGS) \
     		$(GPU_OPTS) \
     		--volume $(SOURCE_DIR):$(CODE_DIR) \
+			$(EXTRA_VOLUMES) \
     		--env "CCACHE_DIR=${CCACHE_DIR}" \
     		--env "CCACHE_BASEDIR=${CODE_DIR}" \
     	    --env "CONAN_HOME=${CONAN_DIR}" \
