@@ -19,50 +19,74 @@
 #include "KernelRunner.h"
 #include "tensorrt_llm/common/assert.h"
 #include "trtllmGen_export/GemmInterface.h"
+#include "trtllmGen_export/GemmOptions.h"
+#include "trtllmGen_export/trtllm/gen/DtypeDecl.h"
 
 namespace tensorrt_llm
 {
 namespace kernels
 {
 
-TrtllmGenGemmRunner::TrtllmGenGemmRunner(tg::Dtype eltType, tg::Dtype outputType)
-    : mEltType(eltType)
-    , mOutputType(outputType)
+namespace tg = trtllm::gen;
+
+namespace
+{
+tg::Dtype dtypeToTrtllmDtype(Dtype dtype)
+{
+    switch (dtype)
+    {
+    case Dtype::Bfloat16: return tg::Dtype::Bfloat16;
+    case Dtype::Fp16: return tg::Dtype::Fp16;
+    case Dtype::Fp32: return tg::Dtype::Fp32;
+    case Dtype::E2m1: return tg::Dtype::E2m1;
+    case Dtype::E4m3: return tg::Dtype::E4m3;
+    default: TLLM_CHECK_WITH_INFO(false, "Invalid dtype");
+    }
+}
+} // namespace
+
+TrtllmGenGemmRunner::TrtllmGenGemmRunner(TrtllmGenGemmRunnerOptions const& options_)
+    : mOptions(options_)
 {
     // Select a GEMM kernel config to use
     auto const gemm = gemm::GemmInterface();
     auto const configs = gemm.getGemmConfigs();
 
-    std::vector<int32_t> selectedIndex;
+    mPassingConfigIndices.clear();
 
     for (size_t i = 0; i < gemm.getNumGemmConfigs(); ++i)
     {
         auto const options = configs[i].mOptions;
 
         // When we include low-latency kernels we can set transposeMmaOutput via constructor
-        if (options.mDtypeElt == eltType && options.mDtypeC == outputType && !options.mTransposeMmaOutput)
+        if (options.mDtypeElt == dtypeToTrtllmDtype(mOptions.eltType)
+            && options.mDtypeC == dtypeToTrtllmDtype(mOptions.outputType)
+            && options.mUseDeepSeekFp8 == mOptions.deepSeekFp8
+            && options.mTransposeMmaOutput == mOptions.transposeMmaOutput)
         {
-            selectedIndex.push_back(i);
+            mPassingConfigIndices.push_back(i);
         }
     }
 
-    TLLM_CHECK_WITH_INFO(selectedIndex.size() != 0, "No kernel found for the given output type");
-    TLLM_CHECK_WITH_INFO(selectedIndex.size() == 1, "Multiple kernels found for the given output type");
-
-    mGemmConfig = &configs[selectedIndex[0]];
+    TLLM_CHECK_WITH_INFO(mPassingConfigIndices.size() != 0, "No kernel found for the given output type");
 }
 
-size_t TrtllmGenGemmRunner::getWorkspaceSizeInBytes(
-    int32_t m, int32_t n, int32_t k, tg::Dtype eltType, tg::Dtype outputType) const
+size_t TrtllmGenGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k)
 {
     gemm::GemmData gemmData;
-    gemmData.mProblemDimensions.mM = m;
-    gemmData.mProblemDimensions.mN = n;
+    gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
+    gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
 
-    auto gemm = gemm::GemmInterface();
+    selectGemmConfig(m, n, k);
 
-    return gemm.getWorkspaceSizeInBytes(*mGemmConfig, gemmData);
+    auto gemm = gemm::GemmInterface();
+    auto const configs = gemm.getGemmConfigs();
+    TLLM_CHECK_WITH_INFO(
+        mSelectedConfigIndex.has_value(), "No valid kernel found for given param config and problem size");
+    auto const config = configs[mSelectedConfigIndex.value()];
+
+    return gemm.getWorkspaceSizeInBytes(config, gemmData);
 }
 
 void TrtllmGenGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, float const* aScale, void const* b,
@@ -72,33 +96,66 @@ void TrtllmGenGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, fl
 
     gemm::GemmData gemmData;
 
+    auto const configs = gemm.getGemmConfigs();
+    TLLM_CHECK_WITH_INFO(
+        mSelectedConfigIndex.has_value(), "No valid kernel found for given param config and problem size");
+    auto const& config = configs[mSelectedConfigIndex.value()];
+
     // Dims
-    gemmData.mProblemDimensions.mM = m;
-    gemmData.mProblemDimensions.mN = n;
+    gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
+    gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
 
     // Inputs
-    gemmData.mInputBuffers.mPtrA = a;
-    gemmData.mInputBuffers.mPtrSfA = aScale;
-    gemmData.mInputBuffers.mPtrB = b;
-    gemmData.mInputBuffers.mPtrSfB = bScale;
+    gemmData.mInputBuffers.mPtrA = mOptions.transposeMmaOutput ? b : a;
+    gemmData.mInputBuffers.mPtrSfA = mOptions.transposeMmaOutput ? bScale : aScale;
+    gemmData.mInputBuffers.mPtrB = mOptions.transposeMmaOutput ? a : b;
+    gemmData.mInputBuffers.mPtrSfB = mOptions.transposeMmaOutput ? aScale : bScale;
     gemmData.mInputBuffers.mPtrScaleC = cScale;
 
     // Outputs
     gemmData.mOutputBuffers.mPtrC = c;
 
-    auto isValidConfig = gemm.isValidConfig(*mGemmConfig, gemmData);
-    TLLM_CHECK_WITH_INFO(isValidConfig, "Invalid GEMM config selected!");
-
-    cudaDeviceProp deviceProperties;
-    cudaGetDeviceProperties(&deviceProperties, device);
+    int32_t multiProcessorCount;
+    cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
 
     // FIXME once we start using all-reduce in the epilogue of the gemm this can be moved elsewhere
-    gemm.runInitBeforeWorldSync(*mGemmConfig, gemmData, static_cast<void*>(stream));
+    gemm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
-    auto const err = gemm.run(*mGemmConfig, workspace, gemmData, static_cast<void*>(stream), deviceProperties);
+    auto const err = gemm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount);
 
     TLLM_CHECK_WITH_INFO(err == 0, "Error occurred when running GEMM!");
+}
+
+void TrtllmGenGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, void const* b, void* c, float* cScale,
+    void* workspace, CUstream stream, int device)
+{
+    run(m, n, k, a, /*aScale*/ nullptr, b, /*bScale*/ nullptr, c, cScale, workspace, stream, device);
+}
+
+void TrtllmGenGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k)
+{
+    auto const gemm = gemm::GemmInterface();
+    auto const configs = gemm.getGemmConfigs();
+
+    gemm::GemmData gemmData;
+    // Dims
+    gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
+    gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
+    gemmData.mProblemDimensions.mK = k;
+
+    for (auto const& configIndex : mPassingConfigIndices)
+    {
+        auto const& config = configs[configIndex];
+        // FIXME: We select the first valid config,
+        // but must instead choose the "best" config based on some heruistics.
+        auto isValidConfig = gemm.isValidConfig(config, gemmData);
+        if (isValidConfig)
+        {
+            mSelectedConfigIndex = configIndex;
+            return;
+        }
+    }
 }
 
 } // namespace kernels

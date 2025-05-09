@@ -130,7 +130,8 @@ torch::Tensor fp4_block_scale_moe_runner(torch::Tensor const& routing_logits, to
         nullptr, /*permuted_idx_to_expanded_idx.data_ptr<int>(),*/
         permuted_idx_to_token_idx.data_ptr<int>(), expert_weights.data_ptr(), num_tokens_per_expert.data_ptr<int>(),
         cta_idx_xy_to_batch_idx.data_ptr<int>(), cta_idx_xy_to_mn_limit.data_ptr<int>(),
-        num_non_exiting_ctas.data_ptr<int>(), args.mDtypeElt, stream);
+        num_non_exiting_ctas.data_ptr<int>(), args.mDtypeElt, false /* use_routing_scales_on_input */,
+        false /* use_deep_seek_fp8 */, stream);
 
     // MoE kernel except routing
     TORCH_CHECK(hidden_states.scalar_type() == FLOAT4_E2M1X2, "hidden_states must be byte.");

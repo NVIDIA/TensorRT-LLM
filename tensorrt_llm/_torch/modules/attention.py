@@ -88,6 +88,9 @@ class Attention(nn.Module):
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
         )
+        self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
+                                [self.hidden_size])
+
         self.o_proj = Linear(
             tp_size * self.q_size,
             self.hidden_size,
@@ -97,6 +100,7 @@ class Attention(nn.Module):
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
+            lora=self.o_lora,
         )
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
@@ -229,13 +233,9 @@ class Attention(nn.Module):
                                         mrope_config=mrope_config)
         hidden_states = attn_output
         attn_output = self.o_proj(attn_output,
-                                  all_reduce_params=all_reduce_params)
-        if bool(lora_params):
-            attn_lora_output = self.o_lora(hidden_states, lora_params,
-                                           self.layer_idx)
-            if attn_lora_output is not None:
-                attn_output = attn_output + attn_lora_output
-
+                                  all_reduce_params=all_reduce_params,
+                                  lora_params=lora_params,
+                                  layer_idx=self.layer_idx)
         return attn_output
 
 
