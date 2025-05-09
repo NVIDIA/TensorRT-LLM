@@ -492,12 +492,22 @@ __global__ void finalizeKernel(KernelParams params)
             for (int k = 0; k < params.topK; k++)
             {
                 int const expandedIdx = tokenIdx * params.topK + k;
-                const TypeExpW scale = params.expertWeightsPtr[expandedIdx];
-
                 int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
+
                 if (permutedIdx == -1)
+                {
                     continue;
-                data += float{scale} * float{params.inPtr[permutedIdx * params.hiddenDim + hiddenIdx]};
+                }
+
+                if (params.expertWeightsPtr != nullptr)
+                {
+                    TypeExpW const scale = params.expertWeightsPtr[expandedIdx];
+                    data += float{scale} * float{params.inPtr[permutedIdx * params.hiddenDim + hiddenIdx]};
+                }
+                else
+                {
+                    data += float{params.inPtr[permutedIdx * params.hiddenDim + hiddenIdx]};
+                }
             }
 
             params.outPtr[tokenIdx * params.hiddenDim + hiddenIdx] = static_cast<Type>(data);

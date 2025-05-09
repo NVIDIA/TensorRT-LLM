@@ -181,4 +181,129 @@ void run(Data const& data, void* stream);
 
 } // namespace routing
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace routingLlama4
+{
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace tg = trtllm::gen;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename TypeExpW>
+struct PackedScoreIdx
+{
+    TypeExpW score;
+    int16_t idx;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct Data
+{
+    tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
+    bool mUsePdl{false};
+
+    // optional: if `nullptr`, `mPtrExpertIdx` must be provided.
+    // If it is given, it represents the scores without sigmoid activation for
+    // each token and expert.
+    // note: if it is provided, we always re-compute the top1 scores
+    // dim: [mNumTokens, mNumExperts]
+    void const* mPtrScores{nullptr};
+    // optional: if `nullptr`, scores are used directly as input.
+    // If it is given, it must represent a packed value s.t. the most significant
+    // 16/32 bits represent the score without sigmoid activation and
+    // the least significant 16 bits represent the index of the chosen expert (unsigned).
+    // note: this is required if the number of tokens is large.
+    // dim: [mNumTokens, mTopK]
+    void* mPtrExpertIdx{nullptr};
+
+    // note: at least one of the optional outputs below must be provided
+    // optional: only used as an intermediate buffer when the number of tokens is large.
+    // dim: [2, mNumExperts]
+    int32_t* mPtrExpertCounts{nullptr};
+    // dim: [1]
+    int32_t* mPtrPermutedIdxSize{nullptr};
+    // optional: if `nullptr`, it is not filled
+    // dim: [mNumTokens * mTopK]
+    int32_t* mPtrExpandedIdxToPermutedIdx{nullptr};
+    // optional: if `nullptr`, it is not filled
+    // dim: [mNumTokens * mTopK + (mNumExperts << mPaddingLog2) - mNumExperts]
+    int32_t* mPtrPermutedIdxToTokenIdx{nullptr};
+    // optional: if `nullptr`, it is not filled
+    // dim: [mNumTokens, mTopK]
+    void* mPtrExpertWeights{nullptr};
+    //
+    // Grouped Gemm Launch Config Buffers
+    //
+    int32_t* mPtrCtaIdxXyToBatchIdx{nullptr};
+    int32_t* mPtrCtaIdxXyToMnLimit{nullptr};
+    int32_t* mPtrNumNonExitingCtas{nullptr};
+
+    int32_t mNumTokens;
+    int32_t mNumExperts;
+    int32_t mTopK;
+    int32_t mPaddingLog2;
+    int32_t mLocalExpertsStartIdx;
+    int32_t mLocalExpertsStrideLog2;
+    int32_t mNumLocalExperts;
+};
+
+template <typename Type_, typename TypeExpW_, bool UsePdl_>
+struct KernelParams
+{
+    using Type = Type_;
+    using TypeExpW = TypeExpW_;
+    static constexpr bool UsePdl = UsePdl_;
+
+    PackedScoreIdx<TypeExpW>* mPtrExpertIdx;
+    TypeExpW const* mPtrScores;
+    int32_t* mPtrExpertCounts;
+    int32_t* mPtrPermutedIdxSize;
+    int32_t* mPtrExpandedIdxToPermutedIdx;
+    int32_t* mPtrPermutedIdxToTokenIdx;
+    int32_t* mPtrCtaIdxXyToBatchIdx;
+    int32_t* mPtrCtaIdxXyToMnLimit;
+    int32_t* mPtrNumNonExitingCtas;
+    TypeExpW* mPtrExpertWeights;
+
+    int32_t mNumTokens;
+    int32_t mNumExperts;
+    int32_t mPaddingLog2;
+    int32_t mLocalExpertsStartIdx;
+    int32_t mLocalExpertsStrideLog2;
+    int32_t mNumLocalExperts;
+
+    static KernelParams setKernelParams(Data const& data)
+    {
+        KernelParams params;
+
+        params.mPtrExpertIdx = (PackedScoreIdx<TypeExpW>*) data.mPtrExpertIdx;
+        params.mPtrScores = (TypeExpW const*) data.mPtrScores;
+        params.mPtrExpertCounts = data.mPtrExpertCounts;
+        params.mPtrPermutedIdxSize = data.mPtrPermutedIdxSize;
+        params.mPtrExpandedIdxToPermutedIdx = data.mPtrExpandedIdxToPermutedIdx;
+        params.mPtrPermutedIdxToTokenIdx = data.mPtrPermutedIdxToTokenIdx;
+        params.mPtrCtaIdxXyToBatchIdx = data.mPtrCtaIdxXyToBatchIdx;
+        params.mPtrCtaIdxXyToMnLimit = data.mPtrCtaIdxXyToMnLimit;
+        params.mPtrNumNonExitingCtas = data.mPtrNumNonExitingCtas;
+        params.mPtrExpertWeights = (TypeExpW*) data.mPtrExpertWeights;
+
+        params.mNumTokens = data.mNumTokens;
+        params.mNumExperts = data.mNumExperts;
+        params.mPaddingLog2 = data.mPaddingLog2;
+        params.mLocalExpertsStartIdx = data.mLocalExpertsStartIdx;
+        params.mLocalExpertsStrideLog2 = data.mLocalExpertsStrideLog2;
+        params.mNumLocalExperts = data.mNumLocalExperts;
+
+        return params;
+    }
+};
+
+void run(Data const& data, void* stream);
+
+} // namespace routingLlama4
+
 } // namespace moe::dev

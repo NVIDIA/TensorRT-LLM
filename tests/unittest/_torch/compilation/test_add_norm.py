@@ -35,7 +35,8 @@ def test_add_norm_fusion(dtype, enable_inductor):
         x = flashinfer_rmsnorm(inter_output, norm_weight, eps)
         return x, inter_output
 
-    final_output, inter_output = func(x, residual, norm_weight, eps)
+    final_output, inter_output = func(x.clone(), residual.clone(), norm_weight,
+                                      eps)
 
     assert backend.match_count[0] == 1, "Pattern Matching Failed"
 
