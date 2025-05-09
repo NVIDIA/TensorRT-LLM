@@ -280,7 +280,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
             kv_cache_dtype = str_dtype_to_binding(
                 torch_dtype_to_str(model_engine.dtype))
 
-        num_hidden_layers = len(mapping.pp_layers(config.num_hidden_layers))
+        num_hidden_layers = config.num_hidden_layers
 
         if is_mla(config):
             if spec_config is not None:

@@ -85,6 +85,12 @@ class KVCacheManager(BaseResourceManager):
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
+        self.pp_layers = mapping.pp_layers(num_layers)
+        self.num_local_layers = len(self.pp_layers)
+        self.layer_offsets = {
+            idx: offset
+            for offset, idx in enumerate(self.pp_layers)
+        }
 
         tp_size = mapping.tp_size
         if mapping.enable_attention_dp:
@@ -93,24 +99,22 @@ class KVCacheManager(BaseResourceManager):
         if isinstance(num_kv_heads, int):
             self.num_kv_heads_per_layer = [
                 (num_kv_heads + tp_size - 1) // tp_size
-                for _ in range(num_layers)
+                for _ in range(self.num_local_layers)
             ]
 
         else:
             assert len(num_kv_heads) == self.num_layers
 
             self.num_kv_heads_per_layer = []
-            for layer_idx, kv_head in enumerate(num_kv_heads):
-                if kv_head is not None:
-                    self.num_kv_heads_per_layer.append(
-                        (kv_head + tp_size - 1) // tp_size)
-                else:
-                    self.num_kv_heads_per_layer.append(0)
-
-        assert len(self.num_kv_heads_per_layer) > 0
-
-        self.is_homongenous = all(val == self.num_kv_heads_per_layer[0]
-                                  for val in self.num_kv_heads_per_layer[1:])
+            if self.num_local_layers > 0:
+                for kv_head in num_kv_heads[self.
+                                            pp_layers[0]:self.pp_layers[-1] +
+                                            1]:
+                    if kv_head is not None:
+                        self.num_kv_heads_per_layer.append(
+                            (kv_head + tp_size - 1) // tp_size)
+                    else:
+                        self.num_kv_heads_per_layer.append(0)
 
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -410,12 +414,13 @@ class KVCacheManager(BaseResourceManager):
         return (num_tokens + self.tokens_per_block - 1) // self.tokens_per_block
 
     def get_buffers(self, layer_idx: int) -> Optional[torch.Tensor]:
-        result = self.impl.get_primary_pool_data(layer_idx)
+        layer_offset = self.layer_offsets[layer_idx]
+        result = self.impl.get_primary_pool_data(layer_offset)
         return result.reshape(
             result.shape[0],
             self.kv_factor,
             self.tokens_per_block,
-            self.num_kv_heads_per_layer[layer_idx],
+            self.num_kv_heads_per_layer[layer_offset],
             self.head_dim,
         )
 
