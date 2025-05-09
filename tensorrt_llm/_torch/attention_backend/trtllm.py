@@ -545,6 +545,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             assert self.kv_lens[:self.num_seqs].max(
             ) <= self.kv_cache_manager.max_seq_len, f"Please set max_seq_len to at least {self.kv_lens[:self.num_seqs].max()} for kv cache manager."
 
+        self.kv_lens_cuda_runtime = self.kv_lens_cuda[:self.num_seqs]
+        self.kv_lens_runtime = self.kv_lens[:self.num_seqs]
+        self.prompt_lens_cuda_runtime = self.prompt_lens_cuda[:self.num_seqs]
+        self.prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
+        self.host_request_types_runtime = self.host_request_types[:self.
+                                                                  num_seqs]
+
     def prepare_flash_mla(self) -> None:
         block_ids_per_seq = self.kv_cache_manager.get_block_ids_per_seq(
             self.request_ids).pin_memory()
@@ -553,6 +560,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             block_ids_per_seq, non_blocking=True)
         self.block_ids_per_seq[:self.num_generations, :num_blocks].copy_(
             block_ids_per_seq[self.num_contexts:], non_blocking=True)
+
+        self.kv_lens_cuda_runtime = self.kv_lens_cuda[:self.num_seqs]
+        self.kv_lens_runtime = self.kv_lens[:self.num_seqs]
+        self.prompt_lens_cuda_runtime = self.prompt_lens_cuda[:self.num_seqs]
+        self.prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
+        self.host_request_types_runtime = self.host_request_types[:self.
+                                                                  num_seqs]
 
 
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
@@ -662,7 +676,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             or metadata.runtime_features.has_speculative_draft_tokens
         ) if metadata.runtime_features else False
 
-        num_seqs = metadata.num_seqs
         self.wrapper.plan(
             tokens_per_block=metadata.tokens_per_block,
             max_num_requests=metadata.max_num_requests,
@@ -672,11 +685,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             attention_window_size=None,
             sink_token_length=0,
             beam_width=1,
-            sequence_length=metadata.kv_lens_cuda[:num_seqs],
-            host_past_key_value_lengths=metadata.kv_lens[:num_seqs],
-            context_lengths=metadata.prompt_lens_cuda[:num_seqs],
-            host_context_lengths=metadata.prompt_lens_cpu[:num_seqs],
-            host_request_types=metadata.host_request_types[:num_seqs],
+            sequence_length=metadata.kv_lens_cuda_runtime,
+            host_past_key_value_lengths=metadata.kv_lens_runtime,
+            context_lengths=metadata.prompt_lens_cuda_runtime,
+            host_context_lengths=metadata.prompt_lens_cpu_runtime,
+            host_request_types=metadata.host_request_types_runtime,
             kv_cache_block_offsets=metadata.kv_cache_block_offsets,
             host_kv_cache_block_offsets=metadata.host_kv_cache_block_offsets,
             host_kv_cache_pool_pointers=metadata.host_kv_cache_pool_pointers,
