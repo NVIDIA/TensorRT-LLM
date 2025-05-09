@@ -15,7 +15,6 @@
 import os
 from subprocess import CalledProcessError
 
-import pytest
 from defs.conftest import tests_path
 
 
@@ -63,8 +62,6 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
 
 
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
-    pytest.fail("Test failed")
-
     import pandas as pd
     import pynvml
     pynvml.nvmlInit()
