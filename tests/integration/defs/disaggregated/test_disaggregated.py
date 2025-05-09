@@ -123,7 +123,7 @@ def run_disaggregated_test(example_dir,
         str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
         config_file
     ]
-    with open('output_workers', 'w') as f:
+    with open('output_workers.log', 'w') as f:
         workers_proc = subprocess.Popen(workers_cmd,
                                         stdout=f,
                                         stderr=subprocess.STDOUT,
@@ -136,7 +136,7 @@ def run_disaggregated_test(example_dir,
         'trtllm-serve', 'disaggregated', '--server_start_timeout',
         str(server_start_timeout), '-c', config_file
     ]
-    with open('output_disagg', 'w') as f:
+    with open('output_disagg.log', 'w') as f:
         server_proc = subprocess.Popen(server_cmd,
                                        stdout=f,
                                        stderr=subprocess.STDOUT,
@@ -202,13 +202,13 @@ def run_disaggregated_test(example_dir,
     print("------------------")
     print("Workers output:")
     print("------------------")
-    with open('output_workers', 'r') as f:
+    with open('output_workers.log', 'r') as f:
         print(f.read())
 
     print("\n\n------------------")
     print("Disagg server output")
     print("------------------")
-    with open('output_disagg', 'r') as f:
+    with open('output_disagg.log', 'r') as f:
         print(f.read())
 
     kill_disaggregated_processes()
