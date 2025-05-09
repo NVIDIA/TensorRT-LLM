@@ -463,6 +463,7 @@ class CanaryEncoder:
         enc_mask, emb_len = self.get_masked_emb(enc_outputs)
         if self.enc_dec_proj is not None:
             enc_mask = self.enc_dec_proj(enc_mask.to(dtype=torch.float32))
+        emb_len = torch.clip(emb_len, max=enc_mask.shape[1])
         return enc_mask, emb_len
 
 
