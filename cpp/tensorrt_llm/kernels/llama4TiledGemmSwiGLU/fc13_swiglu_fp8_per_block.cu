@@ -19,10 +19,8 @@ void launch_kernel(dim3 grid_dim, dim3 block_dim, cudaStream_t stream, void* ker
     config.attrs = attrs;
     config.numAttrs = 0;
 
-#if ENABLE_FDL
     attrs[config.numAttrs].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[config.numAttrs++].val.programmaticStreamSerializationAllowed = 1;
-#endif
 
     cudaLaunchKernelExC(&config, (void const*) kernel_func, args);
 }
