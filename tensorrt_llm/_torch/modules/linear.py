@@ -159,6 +159,8 @@ class Linear(nn.Module):
         skip_create_weights_in_init: bool = False,
         use_custom_cublas_mm: bool = False,
         lora: Optional[LoraLayer] = None,
+        use_llama4_qkv: bool = False,
+        use_llama4_fc_swiglu: bool = False,
     ):
         from ..distributed import AllReduce
 
@@ -194,13 +196,22 @@ class Linear(nn.Module):
 
         self.in_features = local_in_features
         self.out_features = local_out_features
+        self.global_out_features = out_features
 
         self.all_reduce = AllReduce(self.mapping) if reduce_output else None
         self._weights_created = False
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm
         self.lora = lora
+        # Llama4 QKV gemm kernel has hard requirement of hidden_size = 5120
+        # and soft requirement of out_features = 896.
+        self.use_llama4_qkv = use_llama4_qkv and self.in_features == 5120 and self.out_features == 896
+        # Llama4 FC13+SwiGLU kernel has hard requirement of hidden_size = 5120
+        # and targets output_features = 2048 or 4096.
+        self.use_llama4_fc_swiglu = use_llama4_fc_swiglu and self.in_features == 5120 and (
+            self.out_features == 2048 or self.out_features == 4096)
 
+        self.combined_scale = torch.randn(1, dtype=torch.float32, device='cuda')
         if not skip_create_weights_in_init:
             self.create_weights()
 
@@ -313,12 +324,16 @@ class Linear(nn.Module):
             self.register_parameter("bias", None)
         self._weights_created = True
 
-    def apply_linear(self,
-                     input,
-                     weight,
-                     bias,
-                     lora_params: Optional[dict] | None = None,
-                     layer_idx: Optional[int] | None = None):
+    def apply_linear(
+        self,
+        input,
+        weight,
+        bias,
+        lora_params: Optional[dict] | None = None,
+        layer_idx: Optional[int] | None = None,
+        inv_input_scale: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
         if self.has_any_quant:
             qc = self.quant_config
             if self.has_fp8_qdq:
@@ -327,15 +342,27 @@ class Linear(nn.Module):
                         input, self.input_scale)
                 else:
                     qinput = input
-                # This op does not support bias now.
-                output = torch.ops.trtllm.cublas_scaled_mm(
-                    qinput,
-                    weight.t(),
-                    scale_a=self.input_scale,
-                    scale_b=self.weight_scale,
-                    bias=None,
-                    out_dtype=self.dtype or input.dtype,
-                )
+                if self.use_llama4_qkv and (qinput.shape[0] <= 8):
+                    # Kernel is only supported when M <= 8
+                    output = torch.ops.trtllm.llama4_qkv_gemm(
+                        qinput, weight.t(), self.combined_scale, position_ids)
+                elif self.use_llama4_fc_swiglu and inv_input_scale is not None:
+                    output = torch.ops.trtllm.llama4_fc_swiglu_tiled_fp8(
+                        qinput,
+                        weight.t(),
+                        self.combined_scale,
+                        inv_input_scale,
+                    )
+                else:
+                    # This op does not support bias now.
+                    output = torch.ops.trtllm.cublas_scaled_mm(
+                        qinput,
+                        weight.t(),
+                        scale_a=self.input_scale,
+                        scale_b=self.weight_scale,
+                        bias=None,
+                        out_dtype=self.dtype or input.dtype,
+                    )
                 if bias is not None:
                     output = output + bias
             elif self.has_fp8_block_scales:
@@ -401,11 +428,22 @@ class Linear(nn.Module):
             assert all_reduce_params is None or all_reduce_params.enable_allreduce is False, "Cannot fuse norm/residual/bias ops into allreduce op since we do not call allreduce op when tp_size is 1."
             return False
 
+    def llama4_router_forward(self, input: torch.Tensor):
+        # This magic number 4 is empircal choice, and can be changed later.
+        # The router gemm is currently only available for 128 experts (and not 16).
+        if input.shape[0] <= 8 and self.global_out_features == 128:
+            return torch.ops.trtllm.llama4_router_gemm(
+                input, torch.transpose(self.weight, 0, 1))
+        else:
+            return self.forward(input)
+
     def forward(
         self,
         input: Union[torch.Tensor, Fp4QuantizedTensor],
         *,
         all_reduce_params: Optional[AllReduceParams] = None,
+        inv_input_scale: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
         lora_params: Optional[dict] = None,
         layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
@@ -427,8 +465,26 @@ class Linear(nn.Module):
                 output = self.apply_linear(input, self.weight, bias,
                                            lora_params, layer_idx)
         elif self.tp_mode == TensorParallelMode.COLUMN:
-            output = self.apply_linear(input, self.weight, self.bias,
-                                       lora_params, layer_idx)
+            if self.use_llama4_fc_swiglu and self.has_fp8_qdq and input.shape[
+                    0] <= 4:
+                # We are passing the input_scale's inverse of the next layer to the current layer
+                # Caller (gated_mlp.py) guards the feeding of inv_input_scale with
+                # "if self.is_llama4 and self.down_proj.has_fp8_qdq and x.shape[0] <= 4".
+                # If the statement is not satisfied, inv_input_scale is None.
+                output = self.apply_linear(input,
+                                           self.weight,
+                                           self.bias,
+                                           lora_params,
+                                           layer_idx,
+                                           inv_input_scale=inv_input_scale)
+            elif self.use_llama4_qkv and position_ids is not None:
+                output = self.apply_linear(input,
+                                           self.weight,
+                                           self.bias,
+                                           position_ids=position_ids)
+            else:
+                output = self.apply_linear(input, self.weight, self.bias,
+                                           lora_params, layer_idx)
             if self.gather_output:
                 output = allgather(output, self.mapping)
         else:
@@ -471,6 +527,7 @@ class Linear(nn.Module):
                     _copy(self.input_scale, input_scale[0])
                     _copy(self.weight_scale, weight_scale[0])
                     self.inv_input_scale.data = 1.0 / self.input_scale
+                    self.combined_scale = self.input_scale * self.weight_scale
                 elif quant_mode.has_nvfp4():
                     input_scale, weight_scale, alpha = load_weight_scales_nvfp4(
                         weights,
@@ -520,6 +577,7 @@ class Linear(nn.Module):
                     q_weight = q_weight.to(self.dtype) * weight_scale[0]
                     k_weight = k_weight.to(self.dtype) * weight_scale[1]
                     v_weight = v_weight.to(self.dtype) * weight_scale[2]
+                    self.combined_scale = self.input_scale * self.weight_scale
                 elif quant_mode.has_nvfp4():
                     input_scale, weight_scale, alpha = load_weight_scales_nvfp4(
                         weights,
@@ -581,6 +639,7 @@ class Linear(nn.Module):
                     _copy(self.weight_scale, max(weight_scale))
                     gate_weight = gate_weight.to(self.dtype) * weight_scale[0]
                     up_weight = up_weight.to(self.dtype) * weight_scale[1]
+                    self.combined_scale = self.input_scale * self.weight_scale
                 elif quant_mode.has_nvfp4():
                     input_scale, weight_scale, alpha = load_weight_scales_nvfp4(
                         weights,

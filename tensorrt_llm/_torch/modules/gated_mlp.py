@@ -37,7 +37,8 @@ class GatedMLP(nn.Module):
                  config: Optional[ModelConfig] = None,
                  overridden_tp_size: Optional[int] = None,
                  reduce_output: bool = True,
-                 layer_idx: Optional[int] = None):
+                 layer_idx: Optional[int] = None,
+                 is_llama4: bool = False):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
@@ -63,6 +64,7 @@ class GatedMLP(nn.Module):
             pp_size=pp_size,
         )
 
+        self.is_llama4 = is_llama4
         self.gate_up_proj = Linear(
             self.hidden_size,
             self.intermediate_size * 2,
@@ -73,9 +75,11 @@ class GatedMLP(nn.Module):
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
             quant_config=config.get_quant_config(),
-            reduce_output=False,
+            reduce_output=reduce_output,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-        )
+            # During llama4, we are using the custom kernel that performs FC+SwiGLU
+            # in one kernel.
+            use_llama4_fc_swiglu=is_llama4)
         self.down_lora = LoraLayer([LoraModuleType.MLP_4H_TO_H],
                                    [self.hidden_size])
 
@@ -117,9 +121,18 @@ class GatedMLP(nn.Module):
                                      final_all_reduce_params, lora_params)
 
         if self.activation == F.silu:
-            h1 = self.gate_up_proj(x)
-
-            h2 = swiglu(h1)
+            if self.is_llama4 and self.down_proj.has_fp8_qdq and x.shape[0] <= 4:
+                # In Llama4, we have added a custom kernel that performs both FC+SwiGLU in one
+                # kernel. This was toggled by use_llama4_fc_swiglu in the Linear layer.
+                # Currently, we are replacing a kernel that gives fp8 in and bf16 out with
+                # fp8 in and fp8 out. Since next gemm is also fp8, we will need to feed
+                # the next gemm layer's input_scale inverse to the current layer as output
+                # scaling factor.
+                h2 = self.gate_up_proj(
+                    x, inv_input_scale=self.down_proj.inv_input_scale)
+            else:
+                h1 = self.gate_up_proj(x)
+                h2 = swiglu(h1)
             output = self.down_proj(h2,
                                     all_reduce_params=final_all_reduce_params,
                                     layer_idx=self.layer_idx)

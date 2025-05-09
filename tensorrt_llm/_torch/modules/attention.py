@@ -42,6 +42,7 @@ class Attention(nn.Module):
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
         qk_norm_type: QkNormType = QkNormType.none,
+        is_llama4: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -93,6 +94,7 @@ class Attention(nn.Module):
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
+            use_llama4_qkv=is_llama4,
         )
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
