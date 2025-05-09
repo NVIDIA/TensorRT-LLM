@@ -1842,7 +1842,8 @@ def llm_get_stats_test_harness(tp_size: int = 1,
         from tensorrt_llm._torch import LLM as LLM_torch
         from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
         llm_args_extra["pytorch_backend_config"] = PyTorchConfig(
-            enable_iter_perf_stats=True, enable_overlap_scheduler=use_overlap)
+            enable_iter_perf_stats=True,
+            disable_overlap_scheduler=not use_overlap)
         LLM_CLASS = LLM_torch
     else:
         LLM_CLASS = LLM
@@ -1895,7 +1896,8 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
         from tensorrt_llm._torch import LLM as LLM_torch
         from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
         llm_args_extra["pytorch_backend_config"] = PyTorchConfig(
-            enable_iter_perf_stats=True, enable_overlap_scheduler=use_overlap)
+            enable_iter_perf_stats=True,
+            disable_overlap_scheduler=not use_overlap)
         LLM_CLASS = LLM_torch
     else:
         LLM_CLASS = LLM

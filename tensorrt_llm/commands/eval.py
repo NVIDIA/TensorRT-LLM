@@ -115,7 +115,7 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
         backend = None
     pytorch_backend_config = None
     if backend == "pytorch":
-        pytorch_backend_config = PyTorchConfig(enable_overlap_scheduler=True)
+        pytorch_backend_config = PyTorchConfig()
 
     llm_args = {
         "model": model,

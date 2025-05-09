@@ -436,8 +436,8 @@ def create_py_executor_instance(dist,
             lora_config.trtllm_modules_to_hf_modules)
 
     num_micro_batches = 1
-    if mapping.has_pp:
-        num_micro_batches = mapping.pp_size + pytorch_backend_config.enable_overlap_scheduler
+    if mapping.has_pp and not pytorch_backend_config.disable_overlap_scheduler:
+        num_micro_batches = mapping.pp_size + 1
 
     resources["seq_slot_manager"] = SeqSlotManager(
         executor_config.max_batch_size * num_micro_batches)
@@ -472,8 +472,8 @@ def create_py_executor_instance(dist,
                       model_engine=model_engine,
                       decoder=decoder,
                       dist=dist,
-                      enable_overlap_scheduler=pytorch_backend_config.
-                      enable_overlap_scheduler,
+                      disable_overlap_scheduler=pytorch_backend_config.
+                      disable_overlap_scheduler,
                       max_batch_size=executor_config.max_batch_size,
                       max_draft_tokens=spec_config.max_draft_tokens
                       if spec_config is not None else 0,
@@ -493,9 +493,9 @@ def instantiate_decoder(model_engine, executor_config, pytorch_backend_config,
                                    spec_config=model_engine.spec_config)
     elif pytorch_backend_config.enable_trtllm_decoder:
         decoding_mode = get_decoding_mode(executor_config)
-        decoder = TRTLLMDecoder(executor_config, model_engine.model,
-                                model_engine.dtype, mapping, decoding_mode,
-                                pytorch_backend_config.enable_overlap_scheduler)
+        decoder = TRTLLMDecoder(
+            executor_config, model_engine.model, model_engine.dtype, mapping,
+            decoding_mode, pytorch_backend_config.disable_overlap_scheduler)
     elif not model_engine.model.model_config.is_generation:
         # NOTE: choose decoder based on model type
         decoder = EarlyStopDecoder()

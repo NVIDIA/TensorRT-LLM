@@ -135,7 +135,6 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
 
     pyt_options = {
         "use_cuda_graph": True,
-        "enable_overlap_scheduler": True,
         "kv_cache_dtype": kv_cache_dtype,
     }
     backend = params.get("backend", "pytorch")

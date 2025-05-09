@@ -159,7 +159,7 @@ class PyExecutor:
                  model_engine: ModelEngine,
                  decoder: Decoder,
                  dist: Distributed,
-                 enable_overlap_scheduler: bool = False,
+                 disable_overlap_scheduler: bool = False,
                  max_input_len: int = 2048,
                  max_batch_size: int = 8,
                  max_draft_tokens: int = 0,
@@ -184,7 +184,7 @@ class PyExecutor:
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.decoder = decoder
         self.dist = dist
-        self.enable_overlap_scheduler = enable_overlap_scheduler
+        self.disable_overlap_scheduler = disable_overlap_scheduler
 
         # Draft model for certain spec decode algorithms, e.g. EAGLE3
         self.draft_model_engine = draft_model_engine
@@ -230,7 +230,8 @@ class PyExecutor:
         self.num_scheduled_requests: int = 0
 
         # list of requests in each PP micro batch
-        self.num_micro_batches = self.dist.pp_size + enable_overlap_scheduler
+        if not disable_overlap_scheduler:
+            self.num_micro_batches = self.dist.pp_size + 1
         self.micro_batches: List[BatchStatePP
                                  | None] = [None] * self.num_micro_batches
         self.send_handles = [None] * self.num_micro_batches
@@ -252,9 +253,9 @@ class PyExecutor:
 
         self.kv_cache_transceiver = kv_cache_transceiver
         if self.dist.pp_size > 1:
-            self.event_loop = self._executor_loop_pp_overlap if enable_overlap_scheduler else self._executor_loop_pp
+            self.event_loop = self._executor_loop_pp if disable_overlap_scheduler else self._executor_loop_pp_overlap
         else:
-            self.event_loop = self._executor_loop_overlap if enable_overlap_scheduler else self._executor_loop
+            self.event_loop = self._executor_loop if disable_overlap_scheduler else self._executor_loop_overlap
 
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
             self.event_loop = trace_func(self.event_loop)
@@ -2044,7 +2045,7 @@ class PyExecutor:
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first token has already been emitted by context server
                 if request.is_disagg_generation_transmission_in_progress or (
-                        self.enable_overlap_scheduler
+                        not self.disable_overlap_scheduler
                         and request.py_decoding_iter <= 1):
                     new_active_requests.append(request)
                     continue
