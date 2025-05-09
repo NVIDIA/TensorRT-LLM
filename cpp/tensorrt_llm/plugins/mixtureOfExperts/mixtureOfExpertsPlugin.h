@@ -18,9 +18,9 @@
 #define TRT_MIXTURE_OF_EXPERTS_PLUGIN_H
 
 #include "NvInferPlugin.h"
+#include "moe_kernels.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h"
 #include "tensorrt_llm/kernels/lora/lora.h"
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"

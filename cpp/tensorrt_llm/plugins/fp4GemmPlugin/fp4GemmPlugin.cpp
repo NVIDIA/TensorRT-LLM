@@ -19,7 +19,6 @@
 
 #include "fp4GemmPlugin.h"
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp4_gemm.h"
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::common;

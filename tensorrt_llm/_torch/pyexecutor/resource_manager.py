@@ -30,6 +30,7 @@ KVCacheEventManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheEve
 RequestList = list[LlmRequest]
 PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheManager
 PeftCacheConfig = tensorrt_llm.bindings.executor.PeftCacheConfig
+WorldConfig = tensorrt_llm.bindings.WorldConfig
 
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
@@ -715,8 +716,10 @@ class ResourceManager:
 
 class PeftCacheManager(BaseResourceManager):
 
-    def __init__(self, peft_cache_config: PeftCacheConfig,
-                 model_config: ModelConfig):
+    def __init__(self,
+                 peft_cache_config: PeftCacheConfig,
+                 model_config: ModelConfig,
+                 world_config: WorldConfig | None = None):
         import tensorrt_llm.bindings as _tb
 
         peft_cache_manager_config = _tb.PeftCacheManagerConfig(
@@ -735,14 +738,12 @@ class PeftCacheManager(BaseResourceManager):
             lora_prefetch_dir=peft_cache_config.lora_prefetch_dir,
         )
 
-        # TODO smor- currently set manually, change that
-        world_config = _tb.WorldConfig()
+        if world_config is None:
+            world_config = _tb.WorldConfig()
 
         BufferManager = tensorrt_llm.bindings.internal.runtime.BufferManager
-        CudaStream = tensorrt_llm.bindings.internal.runtime.CudaStream
-        self._stream = torch.cuda.Stream().cuda_stream  # FIXME
-        cuda_stream = CudaStream(self._stream)
-        buffer_manager = BufferManager(cuda_stream, True)
+        buffer_manager = BufferManager(torch.cuda.current_stream().cuda_stream,
+                                       True)
         self.impl = PeftCacheManagerCpp(config=peft_cache_manager_config,
                                         model_config=model_config,
                                         world_config=world_config,

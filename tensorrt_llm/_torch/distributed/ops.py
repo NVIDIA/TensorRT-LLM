@@ -14,8 +14,9 @@ _thread_local = threading.local()
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
     if not hasattr(_thread_local, 'allreduce_workspaces'):
-        _thread_local.allreduce_workspaces = {}
-    allreduce_workspaces = _thread_local.allreduce_workspaces
+        _thread_local.allreduce_workspaces = [{}
+                                              for _ in range(mapping.pp_size)]
+    allreduce_workspaces = _thread_local.allreduce_workspaces[mapping.pp_rank]
     if mapping not in allreduce_workspaces:
         ipc_buffers, workspace = CustomAllReduceHelper.allocate_allreduce_fusion_workspace(
             mapping,
@@ -141,6 +142,7 @@ class AllReduce(nn.Module):
         self.mapping = mapping
         self.workspace = None
         self.strategy = strategy
+
         if self.mapping.tp_size > 1:
             # When Strategy is UB, it is guaranteed that the workspace is not used.
             if self.strategy != AllReduceStrategy.UB:

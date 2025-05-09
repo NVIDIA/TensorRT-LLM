@@ -51,19 +51,21 @@ else()
   message(STATUS "NVTX is enabled")
 endif()
 
-if(EXISTS
-   "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/kernels/internal_cutlass_kernels/CMakeLists.txt"
-)
-  set(BUILD_INTERNAL_CUTLASS_KERNELS_DEFAULT ON)
-else()
-  set(BUILD_INTERNAL_CUTLASS_KERNELS_DEFAULT OFF)
-endif()
-option(BUILD_INTERNAL_CUTLASS_KERNELS
-       "Build internal cutlass kernels from source"
-       ${BUILD_INTERNAL_CUTLASS_KERNELS_DEFAULT})
+# Add TensorRT-LLM Gen export interface and CUDA support
+add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
+add_compile_definitions("TLLM_ENABLE_CUDA")
 
-if(BUILD_INTERNAL_CUTLASS_KERNELS)
-  message(STATUS "Building internal cutlass kernels")
+set(INTERNAL_CUTLASS_KERNELS_PATH
+    ""
+    CACHE
+      PATH
+      "The path to internal cutlass kernels sources. Prebuilt binary for internal cutlass kernels will be used if this is not set."
+)
+if(INTERNAL_CUTLASS_KERNELS_PATH)
+  message(
+    STATUS
+      "Building internal cutlass kernels from source at ${INTERNAL_CUTLASS_KERNELS_PATH}"
+  )
 else()
   message(STATUS "Importing internal cutlass kernels")
 endif()

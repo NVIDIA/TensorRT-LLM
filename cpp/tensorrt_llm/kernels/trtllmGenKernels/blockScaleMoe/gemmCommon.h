@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -101,6 +101,8 @@ struct MyOptions
     int mNumBatches;
     bool mAllToAllRouteAct;
     bool mIsStaticBatch;
+    bool mUsePerTokenSfA;
+    bool mUsePerTokenSfB;
 };
 
 void copyKernelInfoToOptions(GemmInfo const& kernelInfo, MyOptions& options)
@@ -132,6 +134,8 @@ void copyKernelInfoToOptions(GemmInfo const& kernelInfo, MyOptions& options)
     options.mNumSlicesForSliceK = kernelInfo.mNumSlicesForSliceK;
     options.mSfLayoutB = kernelInfo.mSfLayoutB;
     options.mSfLayoutC = kernelInfo.mSfLayoutC;
+    options.mUsePerTokenSfA = kernelInfo.usePerTokenSfA;
+    options.mUsePerTokenSfB = kernelInfo.usePerTokenSfB;
 }
 
 namespace gemm
@@ -442,6 +446,10 @@ inline void checkAndUpdateGemmOptions(
             hiddenDimPerMma, ")");
     }
 
+    TLLM_CHECK_ERROR((options.mK / options.mNumSlicesForSplitK) % (options.mTileK * 2) == 0,
+        "Size K / splitK must be a multiple of TileK * 2. Found TileK=", options.mTileK, " and K=", options.mK,
+        " and numSlicesForSplitK=", options.mNumSlicesForSplitK);
+
     if (options.mSliceK)
     {
         TLLM_CHECK_ERROR(isBlackwell, "Slice-K is not supported on Hopper");
@@ -506,12 +514,6 @@ inline void checkAndUpdateGemmGatedActOptions(
 
     gemm::checkAndUpdateGemmOptions(options, isBlackwell, usesAtolFromArg, usesRtolFromArg,
         /* tpGrpSize */ 1);
-
-    if (options.mNumSlicesForSplitK > 1)
-    {
-        TLLM_CHECK_WITH_INFO(
-            doesSplitKUseDsmem(options.mSplitK), "Split-k GMEM and GemmGatedAct are not supported yet.");
-    }
 }
 } // namespace gemmGatedAct
 
@@ -623,27 +625,27 @@ public:
     int mNumCtaX;
     int mNumCtaY;
     int mNumCtaZ;
+
+    int mClusterDimX;
+    int mClusterDimY;
+    int mClusterDimZ;
+
     void* mA;
     void* mB;
     void* mC;
+
     float* mScaleC;
-    // For DeepSeek FP8 block scaling
-    float* mDqSfsA;
-    float* mDqSfsB;
-    float* mDqSfsC;
     float* mScaleGate;
 
-    // For blocking scaling factors for NVFP4
     void* mSfA;
     void* mSfB;
     void* mSfC;
 
-    void* mSfTokens;
-
-    void* mTokens;
     int32_t const* mRouteMap;
 
     float* mDqSfsTokens;
+
+    void* mPerTokenSfB;
 
     // Pointer for partial row max for DeepSeek computation.
     float* mPtrPartialRowMax;
@@ -661,39 +663,45 @@ public:
 
 void setSingleBatchedGemmData(void* A, void* B, void* C, float* scaleC, float* scaleGate, float* dqSfsA, float* dqSfsB,
     float* dqSfsC, void* sfA, void* sfB, void* sfC, int32_t* permutedIdxToTokenIdx, float* ptrPartialRowMax,
-    uint32_t* ptrRowMaxCompletionBars,
+    uint32_t* ptrRowMaxCompletionBars, void* expertWeights,
     // const bool projUp,
     int const numSlicesForSplitK, MyOptions& args, BatchedGemmData& data, int32_t maxNumPaddedTokens)
 {
-
-    data.mB = B;
     data.mA = A;
+    data.mB = B;
     data.mC = C;
 
     if (args.mUseDeepSeekFp8)
     {
-        data.mDqSfsA = dqSfsA;
-        data.mDqSfsB = dqSfsB;
-        data.mDqSfsC = dqSfsC;
+        data.mSfA = dqSfsA;
+        data.mSfB = dqSfsB;
+        data.mSfC = dqSfsC;
 
         // Avoid illegal read when compiling with debug info
         data.mScaleC = dqSfsC;
         data.mScaleGate = dqSfsC;
     }
-    else
+    else if (args.mDtypeElt == tg::Dtype::E4m3)
     {
         data.mScaleC = scaleC;
         data.mScaleGate = scaleGate;
+    }
+    else // dtypeElt == e2m1
+    {
         data.mSfA = sfA;
         data.mSfB = sfB;
         data.mSfC = sfC;
+        data.mScaleC = scaleC;
+        data.mScaleGate = scaleGate;
+    }
+
+    if (args.mUsePerTokenSfA || args.mUsePerTokenSfB)
+    {
+        data.mPerTokenSfB = expertWeights;
     }
 
     if (args.mUseRouteAct)
     {
-        data.mTokens = B;
-        data.mSfTokens = sfB;
-        data.mDqSfsTokens = dqSfsB;
         data.mRouteMap = permutedIdxToTokenIdx;
     }
 
@@ -725,6 +733,10 @@ void setSingleBatchedGemmData(void* A, void* B, void* C, float* scaleC, float* s
     data.mNumCtaX = gemm::divUp(m, tileM);
     data.mNumCtaZ = numSlicesForSplitK;
 
+    data.mClusterDimX = 1;
+    data.mClusterDimY = 1;
+    data.mClusterDimZ = numSlicesForSplitK;
+
     // Pointer to total number of padded tokens
     data.mPtrTotalNumPaddedTokens = args.mPtrTotalNumPaddedTokens;
     data.mPtrCtaIdxXyToBatchIdx = args.mPtrCtaIdxXyToBatchIdx;
@@ -747,12 +759,12 @@ void launchGemmFromData(GemmInfo const& kernelInfo, MyOptions const& options, Ba
     }
 
     auto params = KernelParams::setKernelParams(options, batchedGemmData.mA, batchedGemmData.mB, batchedGemmData.mC,
-        batchedGemmData.mScaleC, batchedGemmData.mDqSfsA, batchedGemmData.mDqSfsB, batchedGemmData.mDqSfsC,
-        batchedGemmData.mSfA, batchedGemmData.mSfB, batchedGemmData.mSfTokens, batchedGemmData.mSfC,
-        batchedGemmData.mScaleGate, batchedGemmData.mTokens, batchedGemmData.mRouteMap, batchedGemmData.mDqSfsTokens,
-        batchedGemmData.mPtrPartialRowMax, batchedGemmData.mPtrRowMaxCompletionBars,
-        batchedGemmData.mPtrNumNonExitingCtas, batchedGemmData.mPtrTotalNumPaddedTokens,
-        batchedGemmData.mPtrCtaIdxXyToBatchIdx, batchedGemmData.mPtrCtaIdxXyToMnLimit);
+        batchedGemmData.mSfA, batchedGemmData.mSfB,
+        /* mPerTokenSfA */ nullptr, batchedGemmData.mPerTokenSfB, batchedGemmData.mSfC, batchedGemmData.mScaleC,
+        batchedGemmData.mScaleGate, batchedGemmData.mRouteMap, batchedGemmData.mPtrPartialRowMax,
+        batchedGemmData.mPtrRowMaxCompletionBars, batchedGemmData.mPtrNumNonExitingCtas,
+        batchedGemmData.mPtrTotalNumPaddedTokens, batchedGemmData.mPtrCtaIdxXyToBatchIdx,
+        batchedGemmData.mPtrCtaIdxXyToMnLimit);
     CUlaunchConfig launch_config;
     launch_config.blockDimX = kernelInfo.threadsPerCTA;
     launch_config.blockDimY = 1;
@@ -764,9 +776,9 @@ void launchGemmFromData(GemmInfo const& kernelInfo, MyOptions const& options, Ba
     launch_config.sharedMemBytes = kernelInfo.sharedMemSize;
     CUlaunchAttribute launch_attribute[3];
     launch_attribute[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
-    launch_attribute[0].value.clusterDim.x = 1;
-    launch_attribute[0].value.clusterDim.y = 1;
-    launch_attribute[0].value.clusterDim.z = 1;
+    launch_attribute[0].value.clusterDim.x = batchedGemmData.mClusterDimX;
+    launch_attribute[0].value.clusterDim.y = batchedGemmData.mClusterDimY;
+    launch_attribute[0].value.clusterDim.z = batchedGemmData.mClusterDimZ;
     launch_attribute[1].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE;
     launch_attribute[1].value.clusterSchedulingPolicyPreference = CU_CLUSTER_SCHEDULING_POLICY_DEFAULT;
     launch_attribute[2].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;

@@ -46,6 +46,7 @@ add_library(
   dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
   fp8Op.cpp
+  fp8PerTensorScalingTrtllmGenGemm.cpp
   fp4Op.cpp
   fp4Gemm.cpp
   fp4GemmTrtllmGen.cpp
@@ -56,11 +57,13 @@ add_library(
   fp8Quantize.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
+  groupRmsNormOp.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
   moeOp.cpp
   moeCommOp.cpp
   fp8BlockScaleMoe.cpp
+  fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
   ncclCommunicatorOp.cpp

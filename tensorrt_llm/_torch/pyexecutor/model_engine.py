@@ -1,6 +1,8 @@
 import bisect
 import contextlib
 import glob
+import inspect
+import itertools
 import math
 import os
 import traceback
@@ -12,8 +14,8 @@ import safetensors
 import torch
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
-from tensorrt_llm._utils import (nvtx_range, release_gc, torch_dtype_to_str,
-                                 trace_func)
+from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
+                                 torch_dtype_to_str, trace_func)
 from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, LoraModelConfig
@@ -215,6 +217,19 @@ def initialize_dummy_weights(
 
 KV_CACHE_MANAGER_KEY = 'kv_cache_manager'
 DRAFT_KV_CACHE_MANAGER_KEY = 'draft_kv_cache_manager'
+
+
+def get_rank_model_storage(model):
+    total_bytes = 0
+    for _, param in model.named_parameters():
+        if param.device.type == 'cuda' and param.device.index == torch.cuda.current_device(
+        ):
+            total_bytes += param.element_size() * param.nelement()
+    for _, buf in model.named_buffers():
+        if buf.device.type == 'cuda' and buf.device.index == torch.cuda.current_device(
+        ):
+            total_bytes += buf.element_size() * buf.nelement()
+    return total_bytes
 
 
 class PyTorchModelEngine(ModelEngine):
@@ -819,6 +834,9 @@ class PyTorchModelEngine(ModelEngine):
                 model = AutoModelForCausalLM.from_config(config)
 
             model.to("cuda")
+            logger.info(
+                f"Rank {self.mapping.rank} uses {get_rank_model_storage(model) / (1024**3):.2f} GB for model weights."
+            )
 
             if load_format == LoadFormat.AUTO:
                 if hasattr(model, 'llm_checkpoint_dir'):
@@ -1845,11 +1863,12 @@ class PyTorchModelEngine(ModelEngine):
                 self.guided_decoder.execute(scheduled_requests,
                                             outputs['logits'], seq_slot_manager)
 
+            self._execute_logit_post_processors(scheduled_requests, outputs)
+
             return outputs
 
     def model_forward(self, **kwargs):
-        if self.mapping.rank == 0 and int(
-                os.environ.get("TLLM_TRACE_MODEL_FORWARD", "0")) == 1:
+        if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
             return trace_func(self.model.forward)(**kwargs)
         else:
             return self.model.forward(**kwargs)
@@ -1932,3 +1951,46 @@ class PyTorchModelEngine(ModelEngine):
         loader = getattr(self.model, "load_weights_from_target_model", None)
         if callable(loader):
             loader(target_model)
+
+    def _execute_logit_post_processors(self,
+                                       scheduled_requests: ScheduledRequests,
+                                       outputs: dict):
+        """Apply logit post processors (in-place modify outputs Tensors) if any."""
+
+        if not (self.mapping.is_last_pp_rank()):
+            return
+
+        if not isinstance(outputs, dict) or "logits" not in outputs:
+            # TODO: support models that don't return outputs as dict
+            return
+
+        num_ctx_req = len(scheduled_requests.context_requests)
+        logits_tensor = outputs["logits"]
+
+        for idx, request in enumerate(
+                itertools.chain(scheduled_requests.context_requests,
+                                scheduled_requests.generation_requests)):
+            logits_processors = getattr(request, "py_logits_post_processors",
+                                        None)
+            if not logits_processors:
+                continue
+
+            token_ids = request.get_tokens(0)
+            if idx < num_ctx_req and request.py_orig_prompt_len < len(
+                    token_ids):
+                # Skip as we only need to apply logit processor on the last context request
+                continue
+
+            logits_row = logits_tensor[request.py_batch_idx]
+            # Reshape to align w/ the shape used in the TRT backend,
+            # so the same logit processors can be used across both backends.
+            logits_row = logits_row.view(1, 1, -1)
+            for lp in logits_processors:
+                lp_params = inspect.signature(lp).parameters
+
+                assert 4 <= len(lp_params) <= 5, (
+                    "Logit post processor signature must match the `LogitsProcessor` interface "
+                    "defined in `tensorrtllm.sampling_params`.")
+                lp(request.py_request_id, logits_row, token_ids, None, None)
+
+            logits_tensor[request.py_batch_idx] = logits_row.view(-1)

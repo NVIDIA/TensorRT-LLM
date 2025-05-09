@@ -89,6 +89,35 @@ python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MT
 
 `N` is the number of MTP modules. When `N` is equal to `0`, which means that MTP is not used (default). When `N` is greater than `0`, which means that `N` MTP modules are enabled. In the current implementation, the weight of each MTP module is shared.
 
+#### Relaxed acceptance
+**NOTE: This feature can only be used for DeepSeek R1.**
+When verifying and receiving draft tokens, there are two ways:
+- Strict acceptance: (default)
+
+  The draft token is accepted only when it is exactly the same as the token sampled by the target model based on the Top-1 strategy.
+- Relaxed acceptance:
+
+  For the reasoning model (such as DeepSeek R1), the generation may consist of two phases: `thinking phase` and `actual output` (`<think>[thinking phase]</think>[actual output]`).
+
+  **During the thinking phase**, if we enable relaxed acceptance, the draft token can be accepted when it is in a candidate. This candidate is generated based on the logits and the below 2 knobs.
+  - Knob 1: Top-N. The top-N tokens are sampled from logits.
+  - Knob 2: Probability threshold (delta). Based on Top-N candidates, only those tokens with a probability greater than the Top-1's probability - delta can remain in the candidate set.
+
+  During the non-thinking phase, we still use the strict acceptance.
+
+  This is a relaxed way of verification and comparison, which can improve the acceptance rate and bring positive speedup.
+
+  Here is an example. We allow the first 15 (`--relaxed_topk 15`) tokens to be used as the initial candidate set, and use delta (`--relaxed_delta 0.5`) to filter out tokens with a large probability gap, which may be semantically different from the top-1 token.
+
+  ```bash
+  cd examples/pytorch
+  python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N --use_relaxed_acceptance_for_thinking --relaxed_topk 15 --relaxed_delta 0.5
+  ```
+
+  Note: There are still compatibility issues between relaxed acceptance and attention_dp. These two flags cannot be enabled at the same time for now.
+
+
+
 ### Long context support
 DeepSeek-V3 model can support up to 128k context length. The following shows how to benchmark 64k and 128k input_seq_length using trtllm-bench on B200.
 To avoid OOM (out of memory) error, you need to adjust the values of "--max_batch_size", "--max_num_tokens" and "--kv_cache_free_gpu_mem_fraction".

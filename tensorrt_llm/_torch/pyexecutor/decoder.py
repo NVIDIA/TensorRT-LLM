@@ -5,8 +5,8 @@ from dataclasses import dataclass
 import torch
 
 from tensorrt_llm._utils import torch_dtype_to_binding
-from tensorrt_llm.bindings import (DataType, ModelConfig, WorldConfig,
-                                   make_sampling_config)
+from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
+                                   WorldConfig, make_sampling_config)
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import (
@@ -14,12 +14,13 @@ from tensorrt_llm.bindings.internal.algorithms import (
     HandleGenerationLogits, MakeDecodingBatchInputOutput)
 from tensorrt_llm.bindings.internal.batch_manager import (DecoderBuffers,
                                                           DecoderInputBuffers)
-from tensorrt_llm.bindings.internal.runtime import (BufferManager, CudaStream,
+from tensorrt_llm.bindings.internal.runtime import (BufferManager,
                                                     GptDecoderBatched,
                                                     SpeculativeDecodingMode)
+from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.mapping import Mapping
 
-from .llm_request import LlmRequest, LlmRequestState, LogProbs
+from .llm_request import LlmRequest, LlmRequestState
 from .scheduler import ScheduledRequests
 
 
@@ -30,7 +31,8 @@ class DecoderState:
     logits: torch.Tensor = None
 
     # Set when decode_async() has evaluated these to avoid computing again in update_requests()
-    log_probs: list[LogProbs] | None = None
+    # log_probs[request_idx][token_idx]
+    log_probs: list[list[float] | None] | None = None
 
     new_tensors_device: dict[str, torch.Tensor] = None
     new_tensors_host: dict[str, torch.Tensor] = None
@@ -235,7 +237,7 @@ class TorchDecoder(Decoder):
             request_idx += 1
             token_idx += num_tokens
 
-        def handle_logits(request: LlmRequest, count=1):
+        def handle_logits(request: LlmRequest, tokens: list[int], count=1):
             if decoder_state.logits is None:
                 return
             if not request.py_return_generation_logits and not request.py_return_log_probs:
@@ -249,11 +251,15 @@ class TorchDecoder(Decoder):
             if not request.py_return_log_probs:
                 return
 
-            if decoder_state.log_probs:
-                log_probs = decoder_state.log_probs[request_idx]
-            else:
+            log_probs = decoder_state.log_probs and decoder_state.log_probs[
+                request_idx]
+            if not log_probs:
                 _, log_probs = greedy_search_sampling_batch(current_logits)
-            request.py_result.append_log_probs([log_probs.tolist()])
+
+            token_log_probs = [{
+                token: Logprob(logprob=logprob, rank=1)
+            } for token, logprob in zip(tokens, log_probs.tolist())]
+            request.py_result.append_log_probs([token_log_probs])
 
         for request in scheduled_requests.context_requests:
             if request.get_context_remaining_length() != 0:
@@ -265,7 +271,7 @@ class TorchDecoder(Decoder):
                 num_tokens = request.add_new_token(new_token, beam_idx)
                 self._handle_stop_criteria(request, new_token, num_tokens,
                                            beam_idx)
-                handle_logits(request)
+                handle_logits(request, [new_token])
                 request.py_decoding_iter += 1
             advance_idx()
 
@@ -290,6 +296,7 @@ class TorchDecoder(Decoder):
                 # Accept draft tokens (if we have any) if and only if they match the new
                 # token exactly.
                 num_accepted = 0
+                new_tokens = [new_token]
                 for draft_token in request.py_draft_tokens:
                     if draft_token != new_token:
                         # Reject.
@@ -297,11 +304,12 @@ class TorchDecoder(Decoder):
                     num_accepted += 1
                     new_token = new_tokens_list[token_idx + num_accepted]
                     num_tokens = request.add_new_token(new_token, beam_idx)
+                    new_tokens.append(num_tokens)
 
                     if self._handle_stop_criteria(request, new_token,
                                                   num_tokens, beam_idx):
                         break
-                handle_logits(request, num_accepted)
+                handle_logits(request, new_tokens, num_accepted)
                 request.py_decoding_iter += 1
                 request.py_num_accepted_draft_tokens = num_accepted
                 request.py_rewind_len = request.py_draft_pages_allocated - num_accepted
@@ -313,7 +321,7 @@ class TorchDecoder(Decoder):
                 num_tokens = request.add_new_token(new_token, beam_idx)
                 self._handle_stop_criteria(request, new_token, num_tokens,
                                            beam_idx)
-                handle_logits(request)
+                handle_logits(request, [new_token])
                 request.py_decoding_iter += 1
             advance_idx()
 
@@ -398,7 +406,10 @@ class TorchStarAttentionDecoder(TorchDecoder):
         request.py_result.append_generation_logits(current_logits)
         if request.py_return_log_probs:
             _, log_probs = greedy_search_sampling_batch(current_logits)
-            request.py_result.append_log_probs([log_probs.tolist()])
+            request.py_result.append_log_probs([[{
+                new_token:
+                Logprob(logprob=log_probs.item(), rank=1)
+            }]])
 
         self._handle_stop_criteria(request, new_token, num_tokens, beam_idx)
         if request.state != LlmRequestState.GENERATION_COMPLETE:
@@ -438,6 +449,7 @@ class TRTLLMDecoder(Decoder):
         model_dtype,
         mapping: Mapping,
         decoding_mode: DecodingMode,
+        enable_overlap_scheduler: bool,
     ):
 
         vocab_size = model.config.vocab_size
@@ -456,6 +468,7 @@ class TRTLLMDecoder(Decoder):
         self.max_num_sequences = mapping.pp_size * self.executor_config.max_batch_size
         self.max_seq_idle_microseconds = 180 * 1000 * 1000
         self.max_decoding_tokens = 1  # It must be 1 when not in speculative decoding
+        self.is_trt_overlap = enable_overlap_scheduler
 
         self.world_config = WorldConfig.mpi(mapping.gpus_per_node,
                                             mapping.tp_size, mapping.pp_size)
@@ -467,9 +480,9 @@ class TRTLLMDecoder(Decoder):
         self._instantiate_algorithms()
 
     def _initialize_store(self):
-        torch_stream = torch.cuda.current_stream()
-        cuda_stream = CudaStream(torch_stream.cuda_stream)
-        buffer_manager = BufferManager(stream=cuda_stream)
+        torch_stream = torch.cuda.current_stream().cuda_stream
+        cuda_stream = CudaStream(torch_stream)
+        buffer_manager = BufferManager(stream=torch_stream)
 
         self.store = {
             "torch_stream":
@@ -505,7 +518,7 @@ class TRTLLMDecoder(Decoder):
     def _instantiate_algorithms(self):
         self.algs = Algorithms()
         self.algs.decoder = GptDecoderBatched(
-            stream=self.store["cuda_stream"],
+            stream=self.store["torch_stream"],
             speculative_decoding_mode=SpeculativeDecodingMode.NoneType(),
             dtype=self.logits_datatype)
         self.algs.decoder.setup(
@@ -580,7 +593,7 @@ class TRTLLMDecoder(Decoder):
             scheduled_requests.generation_requests,
             self.store["decoder_buffers"], self.store["decoder_input_buffers"],
             self.algs.decoder.decoder_state, self.model_config,
-            self.max_num_sequences, self.beam_width,
+            self.max_num_sequences, self.beam_width, self.is_trt_overlap,
             self.store["buffer_manager"], self.store["cuda_stream"])
 
         self.algs.decoder.forward_async(self.decoding_output, decoding_input)
@@ -601,20 +614,13 @@ class TRTLLMDecoder(Decoder):
             non_blocking=True)
         new_tokens_device_tensor = new_tokens_device_tensor.view(-1)
 
-        # NOTE: If we overwrite seq lens on every iteration then overlap scheduling seemingly works.
-        #       This could be a race condition.
-        self.store["sequence_lengths_host"].copy_(
-            self.algs.decoder.decoder_state.sequence_lengths, non_blocking=True)
-
-        # TODO: We should instead copy on every iteration, however this doesn't work for overlap scheduling atm.
-        #       It's still not understood why.
-        # sequence_lengths = self.store["decoder_buffers"].sequence_lengths.to('cpu', non_blocking=True)
-
         new_output_tokens = self.algs.decoder.decoder_state.all_new_tokens.to(
             'cpu', non_blocking=True)
         finished_sum = self.algs.decoder.decoder_state.finished_sum.to(
             'cpu', non_blocking=True)
         finish_reasons = self.algs.decoder.decoder_state.finish_reasons.to(
+            'cpu', non_blocking=True)
+        sequence_lengths = self.algs.decoder.decoder_state.sequence_lengths.to(
             'cpu', non_blocking=True)
 
         new_tensors_device = {"new_tokens_device": new_tokens_device_tensor}
@@ -623,7 +629,7 @@ class TRTLLMDecoder(Decoder):
             "new_tokens_host": new_output_tokens,
             "finished_sum_host": finished_sum,
             "finish_reasons_host": finish_reasons,
-            "sequence_lengths_host": self.store["sequence_lengths_host"]
+            "sequence_lengths_host": sequence_lengths
         }
 
         decoder_event = torch.cuda.Event()

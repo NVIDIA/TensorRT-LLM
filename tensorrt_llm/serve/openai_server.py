@@ -209,6 +209,7 @@ class OpenAIServer:
                         prompt["multi_modal_data"][media_type] = []
                     prompt["multi_modal_data"][media_type].extend(media_values)
 
+            postproc_args.reasoning_parser = self.llm.args.reasoning_parser
             if conversation and conversation[-1].get(
                     "content") and conversation[-1].get("role") == get_role():
                 postproc_args.last_message_content = conversation[-1]["content"]
