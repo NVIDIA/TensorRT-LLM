@@ -11,11 +11,14 @@ context_servers:
   num_instances: 2
   router:
     type: kv_cache_aware
+  max_batch_size: 16
+  max_num_tokens: 3000
+  max_seq_len: 4096
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
   kv_cache_config:
     enable_block_reuse: True
-    enable_partial_reuse: True
+    enable_partial_reuse: False
     event_buffer_max_size: 1024
     free_gpu_memory_fraction: 0.1
   urls:
@@ -25,11 +28,14 @@ generation_servers:
   num_instances: 2
   router:
     type: kv_cache_aware
+  max_batch_size: 256
+  max_num_tokens: 4096
+  max_seq_len: 4096
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
   kv_cache_config:
     enable_block_reuse: True
-    enable_partial_reuse: True
+    enable_partial_reuse: False
     event_buffer_max_size: 1024
     free_gpu_memory_fraction: 0.1
   urls:

@@ -256,7 +256,7 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
         events = await self.query_kv_cache_events(session, url)
         async with self.kv_cache_block_maps[url]._lock:
             self.kv_cache_block_maps[url].update_with_events(events)
-        self.kv_cache_event_maps[url].extend(events)
+            self.kv_cache_event_maps[url].extend(events)
         return response
 
     async def multi_round_request(self,
@@ -287,6 +287,9 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
             block_hashes = []
             for t in range(0, len(tokens) - 1, tokens_per_block):
                 t_end = min(t + tokens_per_block, len(tokens) - 1)
+                if t_end - t < tokens_per_block:
+                    # partial block
+                    break
                 block_hashes.append(
                     block_key_hasher(tokens[t:t_end],
                                      None if t == 0 else block_hashes[-1]))
