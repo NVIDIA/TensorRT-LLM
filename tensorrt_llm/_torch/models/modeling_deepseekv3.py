@@ -47,9 +47,10 @@ from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, allgather)
 from ..model_config import ModelConfig
-from ..models.modeling_utils import MissingLayer, ModelConfig
+from ..models.modeling_utils import ModelConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
+from ..modules.embedding import Embedding
 from ..modules.fused_moe import BaseMoeRoutingMethod, FusedMoE
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear
@@ -853,7 +854,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         position_ids: torch.LongTensor,
         hidden_states: torch.Tensor,
         lm_head: Linear,
-        embed_tokens: nn.Embedding,
+        embed_tokens: Embedding,
         attn_metadata: AttentionMetadata,
         spec_metadata: MTPSpecMetadata,
         **kwargs,
@@ -935,9 +936,11 @@ class DeepseekV3Model(DecoderModel):
             ]
         }
 
-        self.embed_tokens = nn.Embedding(config.vocab_size,
-                                         config.hidden_size,
-                                         dtype=config.torch_dtype)
+        self.embed_tokens = Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            dtype=config.torch_dtype,
+        )
 
         self.layers = nn.ModuleList([
             DeepseekV3DecoderLayer(model_config, layer_idx,
@@ -997,6 +1000,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 mtp_layer = DeepseekV3MTP(model_config, self.num_hidden_layers,
                                           self.model.aux_stream_dict)
                 self.model.layers.append(mtp_layer)
+                self.epilogue.append(mtp_layer)
                 self.mtp_worker = MTPEagleWorker(model_config.spec_config)
             else:
                 # TODO: fix the accuracy issue and remove this assert.
@@ -1008,6 +1012,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                     for layer_idx in range(model_nextn)
                 ])
                 self.model.layers.extend(mtp_layers)
+                self.epilogue.extend(mtp_layers)
                 self.mtp_worker = MTPWorker(model_config.spec_config)
                 # modify the QuantConfig to support duplicated mtp layers
                 if model_config.quant_config.exclude_modules is not None:
@@ -1026,6 +1031,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                                         ckpt_prefix, model_prefix))
                     self.model_config.quant_config.exclude_modules.extend(
                         extend_exclude_modules)
+            self.epilogue.append(self.mtp_worker)
 
     def forward(
         self,
@@ -1319,7 +1325,6 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
-            elif not isinstance(self.model.layers[idx + 1], MissingLayer):
-                # layers[idx + 1] is MissingLayer for last layer in pp rank
+            else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm

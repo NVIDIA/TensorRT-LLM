@@ -117,20 +117,6 @@ def duplicate_kv_weight(weight: torch.Tensor, head_dim: int,
     return weight.reshape(num_kv_heads * reps * head_dim, -1).clone().detach()
 
 
-def unpack_hidden_states(hidden_states):
-    if isinstance(hidden_states, (tuple, list)):
-        return hidden_states
-    else:
-        return hidden_states, None
-
-
-class MissingLayer(torch.nn.Identity):
-    """Signature of missing layers in pipeline parallel setup."""
-
-    def __init__(self):
-        super().__init__()
-
-
 def iter_modules(
     module: nn.Module,
     ignore_modules: Optional[List[nn.Module]] = None,
@@ -162,9 +148,9 @@ def skip_forward(
     ignore_modules: Optional[List[nn.Module]] = None,
 ):
     """Skip forward of a module."""
-    for mod in iter_modules(module, ignore_modules):
-        if hasattr(mod, 'skip_forward'):
-            mod.forward = mod.skip_forward
+    if hasattr(module, 'skip_forward'):
+        module.forward = module.skip_forward
+    remove_weights(module, ignore_modules)
 
 
 def forward_after_recv(forward_fn):
@@ -295,20 +281,20 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
             for module in self.epilogue:
                 skip_forward(module)
 
-        num_hidden_layers = len(self.layers)
+        num_hidden_layers = self.model_config.pretrained_config.num_hidden_layers
+        assert num_hidden_layers >= mapping.pp_size, f"{num_hidden_layers} layers are not enough for PP{mapping.pp_size}"
         pp_layer_list = mapping.pp_layers(num_hidden_layers)
         has_pp_layer = len(pp_layer_list) > 0
         for layer_idx in range(num_hidden_layers):
             layer = self.layers[layer_idx]
             is_last_layer = (layer_idx == num_hidden_layers - 1)
             if layer_idx not in pp_layer_list:
-                layer.forward = layer.skip_forward
                 # keep next layer's input_layernorm's weights for fusion
                 is_next_pp_layer = (has_pp_layer
                                     and layer_idx - 1 == pp_layer_list[-1])
                 keep_input_layernorm = (is_next_pp_layer
                                         and hasattr(layer, "input_layernorm"))
-                remove_weights(
+                skip_forward(
                     layer,
                     ignore_modules=[layer.input_layernorm]
                     if keep_input_layernorm else None,
@@ -328,6 +314,12 @@ class PostInitCaller(type):
     def __call__(cls, *args, **kwargs):
         obj = type.__call__(cls, *args, **kwargs)
         obj.__post_init__()
+        # We create weights in __init__ and __post_init__
+        # and remove unneeded weights in __pp_init__.
+        # We use MetaInitMode to skip memory allocation when creating weights,
+        # which avoids OOM when GPU memory is not enough for all weights.
+        # The memory allocation is delayed until __pp_init__ is finished,
+        # so only needed weights are allocated and loaded.
         obj.__pp_init__()
         return obj
 

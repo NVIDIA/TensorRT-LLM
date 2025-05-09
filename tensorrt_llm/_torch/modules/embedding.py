@@ -187,7 +187,7 @@ class Embedding(LMHead):
         output_shape = input.shape[:] + (self.embedding_dim, )
         output = torch.empty(
             output_shape,
-            dtype=self.weight.dtype,
-            device=self.weight.device,
+            dtype=self.dtype,
+            device=input.device,
         )
         return output

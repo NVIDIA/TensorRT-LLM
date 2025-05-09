@@ -1866,8 +1866,6 @@ class PyTorchModelEngine(ModelEngine):
                     )
                     self._cuda_graph_mem_pool = pool
 
-                if not self.mapping.is_first_pp_rank():
-                    inputs['pipeline_interface'].recv()
                 outputs = maybe_graph.run(inputs, extra_model_inputs)
 
             # Note: To overlap the CPU and GPU computation as much as possible,
