@@ -34,6 +34,9 @@ def test_health(client):
     response = client.get("/health")
     assert response.status_code == 200
 
+def test_health_generate(client):
+    response = client.get("/health_generate")
+    assert response.status_code == 200
 
 def test_generate(client):
     response = client.post("/generate", json={"prompt": "A B C"})
