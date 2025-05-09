@@ -29,14 +29,9 @@ install_triton_deps() {
 
 # Install Triton only if base image is Ubuntu
 ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
-if [ "$INSTALL_TRITON" == "1" ]; then
-  if [ "$ID" == "ubuntu" ]; then
-    install_triton_deps
-  else
-    rm -rf /opt/tritonserver
-    echo "Skip Triton installation for non-Ubuntu base image"
-  fi
+if [ "$ID" == "ubuntu" ]; then
+  install_triton_deps
 else
-  echo "Skip Triton installation when INSTALL_TRITON is set to 0"
   rm -rf /opt/tritonserver
+  echo "Skip Triton installation for non-Ubuntu base image"
 fi
