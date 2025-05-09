@@ -510,8 +510,11 @@ def test_llm_phi_lora_1gpu(data_type, lora_data_type, phi_example_root,
 @pytest.mark.parametrize("data_type", ['float16', 'bfloat16'])
 @pytest.mark.parametrize("qformat", ['fp8'])
 @pytest.mark.parametrize("llm_phi_model_root", [
-    "phi-2", "Phi-3-mini-128k-instruct", "Phi-3-small-128k-instruct",
-    "Phi-3.5-mini-instruct", "Phi-3.5-MoE-instruct", "Phi-4-mini-instruct"
+    pytest.param("phi-2", marks=skip_post_blackwell),
+    pytest.param("Phi-3-mini-128k-instruct", marks=skip_post_blackwell),
+    pytest.param("Phi-3-small-128k-instruct", marks=skip_post_blackwell),
+    pytest.param("Phi-3.5-mini-instruct", marks=skip_post_blackwell),
+    "Phi-3.5-MoE-instruct", "Phi-4-mini-instruct"
 ],
                          indirect=True)
 def test_llm_phi_quantization_1gpu(data_type, llm_phi_model_root, llm_venv,

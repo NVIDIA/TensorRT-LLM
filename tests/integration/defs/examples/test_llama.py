@@ -4141,6 +4141,7 @@ def test_llm_llama_v3_2_smoothquant_1node_single_gpu(
 
 
 # TODO: remove skip after support fp8 rowwise gemm on B200
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("fp8_quant",
