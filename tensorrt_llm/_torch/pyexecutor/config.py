@@ -64,8 +64,9 @@ class PyTorchConfig:
     print_iter_log: bool = False
 
     torch_compile_enabled: bool = False
-    torch_compile_fullgraph: bool = False
+    torch_compile_fullgraph: bool = True
     torch_compile_inductor_enabled: bool = False
+    torch_compile_piecewise_cuda_graph: bool = False
     # When torch compile is enabled, userbuffers is enabled by default
     torch_compile_enable_userbuffers: bool = True
 
@@ -88,6 +89,9 @@ class PyTorchConfig:
         self.load_format = LoadFormat[load_format]
 
     def __post_init__(self) -> None:
+        if self.torch_compile_enabled and self.torch_compile_piecewise_cuda_graph:
+            assert self.torch_compile_fullgraph, "Fullgraph must be enabled for piecewise CUDA graph."
+
         if self.cuda_graph_batch_sizes is not None:
             assert self.cuda_graph_max_batch_size == 0, (
                 "Please don't set both cuda_graph_batch_sizes "
