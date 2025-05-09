@@ -88,6 +88,9 @@ class Attention(nn.Module):
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
         )
+        self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
+                                [self.hidden_size])
+
         self.o_proj = Linear(
             tp_size * self.q_size,
             self.hidden_size,
@@ -97,6 +100,7 @@ class Attention(nn.Module):
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
+            lora=self.o_lora,
         )
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
@@ -229,13 +233,9 @@ class Attention(nn.Module):
                                         mrope_config=mrope_config)
         hidden_states = attn_output
         attn_output = self.o_proj(attn_output,
-                                  all_reduce_params=all_reduce_params)
-        if bool(lora_params):
-            attn_lora_output = self.o_lora(hidden_states, lora_params,
-                                           self.layer_idx)
-            if attn_lora_output is not None:
-                attn_output = attn_output + attn_lora_output
-
+                                  all_reduce_params=all_reduce_params,
+                                  lora_params=lora_params,
+                                  layer_idx=self.layer_idx)
         return attn_output
 
 
@@ -468,8 +468,11 @@ class MLA(nn.Module):
         self.mha.update_quant_config(self.quant_config)
         self.mqa.update_quant_config(self.quant_config)
 
-        has_fp8_block_scales = self.quant_config and self.quant_config.quant_mode.has_fp8_block_scales(
-        )
+        # k_b_proj_trans's dtype must be consistent with self.kv_b_proj,
+        # which can be modified after __init__
+        has_fp8_block_scales = (
+            self.kv_b_proj.quant_config
+            and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales())
 
         mla_weight_dtype = torch.float8_e4m3fn if has_fp8_block_scales else self.dtype
         self.k_b_proj_trans = nn.Parameter(
@@ -693,6 +696,7 @@ class MLA(nn.Module):
             dtype=q.dtype,
             device=q.device,
         )
+
         if self.k_b_proj_trans.dtype == torch.bfloat16:
             # [num_heads, num_tokens, self.qk_nope_head_dim]
             q_nope_t = q_nope.transpose(0, 1)

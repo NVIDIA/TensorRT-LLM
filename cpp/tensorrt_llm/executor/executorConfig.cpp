@@ -34,7 +34,7 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     std::optional<SpeculativeDecodingConfig> specDecConfig, std::optional<GuidedDecodingConfig> guidedDecodingConfig,
     std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs,
     std::optional<CacheTransceiverConfig> cacheTransceiverConfig, bool gatherGenerationLogits,
-    bool useVariableBeamWidthSearch, bool promptTableOffloading)
+    bool useVariableBeamWidthSearch, bool promptTableOffloading, bool enableTrtOverlap)
     : mMaxBeamWidth(maxBeamWidth)
     , mSchedulerConfig(std::move(schedulerConfig))
     , mKvCacheConfig(std::move(kvCacheConfig))
@@ -63,12 +63,15 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     , mGatherGenerationLogits(gatherGenerationLogits)
     , mUseVariableBeamWidthSearch(useVariableBeamWidthSearch)
     , mPromptTableOffloading(promptTableOffloading)
+    , mEnableTrtOverlap(enableTrtOverlap)
 {
     TLLM_CHECK(iterStatsMaxIterations >= 0);
     TLLM_CHECK(requestStatsMaxIterations >= 0);
     TLLM_CHECK(mMaxBeamWidth > 0);
     TLLM_CHECK(maxSeqIdleMicroseconds > 0);
 }
+
+// getters
 
 SizeType32 ExecutorConfig::getMaxBeamWidth() const
 {
@@ -220,6 +223,13 @@ bool ExecutorConfig::getPromptTableOffloading() const
     return mPromptTableOffloading;
 }
 
+bool ExecutorConfig::getEnableTrtOverlap() const
+{
+    return mEnableTrtOverlap;
+}
+
+// setters
+
 void ExecutorConfig::setMaxBeamWidth(SizeType32 maxBeamWidth)
 {
     mMaxBeamWidth = maxBeamWidth;
@@ -365,6 +375,11 @@ void ExecutorConfig::setUseVariableBeamWidthSearch(bool useVariableBeamWidthSear
 void ExecutorConfig::setPromptTableOffloading(bool promptTableOffloading)
 {
     mPromptTableOffloading = promptTableOffloading;
+}
+
+void ExecutorConfig::setEnableTrtOverlap(bool enableTrtOverlap)
+{
+    mEnableTrtOverlap = enableTrtOverlap;
 }
 
 } // namespace tensorrt_llm::executor

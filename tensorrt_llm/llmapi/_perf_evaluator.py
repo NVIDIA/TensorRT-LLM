@@ -375,7 +375,8 @@ class LLMPerfEvaluator:
         sampling_params = SamplingParams(
             end_id=end_id,
             pad_id=end_id,
-            beam_width=beam_width,
+            n=beam_width,
+            use_beam_search=beam_width > 1,
         )
         postproc_params = PostprocParams(
             post_processor=self.postprocess_result_handler,

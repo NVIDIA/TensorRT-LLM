@@ -4449,7 +4449,10 @@ def bert_attention(tensor: Tensor,
                    sage_attn: bool = False,
                    sage_attn_q_block_size: int = 0,
                    sage_attn_k_block_size: int = 0,
-                   sage_attn_v_block_size: int = 0) -> Tuple[Tensor]:
+                   sage_attn_v_block_size: int = 0,
+                   cp_group: list[int] = None,
+                   cp_size: int = 1,
+                   cp_rank: int = 0) -> Tuple[Tensor]:
     '''
     Add an operation that performs the multi-head attention in BERT.
 
@@ -4516,6 +4519,15 @@ def bert_attention(tensor: Tensor,
         sage_attn_v_quant_size: int = 0
             dynamic quant block size along sequence dimension of v tensor. Each quant block will share one scale.
 
+        cp_group: list[int] = None
+            The communication group for context parallel
+
+        cp_size: int = 1
+            The communication size for context parallel
+
+        cp_rank: int = 0
+            The communication rank for context parallel
+
     Returns:
         The tensor produced by that layer.
     '''
@@ -4570,10 +4582,31 @@ def bert_attention(tensor: Tensor,
         np.array(sage_attn_v_block_size, dtype=np.int32),
         trt.PluginFieldType.INT32)
 
+    if cp_size > 1:
+        # transpose q,k,v inside qkv to make kv contiguous, which is required by ring attention
+        # (b, s, 3d)
+        query, key, value = chunk(tensor, 3, dim=-1)
+        bs = shape(query, 0)
+        seq_len = shape(query, 1)
+        # (b, s, d) -> (b, s, 2d) -> (2b, s, d)
+        kv = concat([key, value],
+                    dim=-1).view(concat((2 * bs, seq_len, query.shape[-1])))
+        tensor = concat((query, kv),
+                        dim=0).view(concat((bs, seq_len, query.shape[-1] * 3)))
+
+    cp_size = trt.PluginField("cp_size", np.array(cp_size, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_rank = trt.PluginField("cp_rank", np.array(cp_rank, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_group = cp_group or [0]
+    cp_group = np.array(cp_group, dtype=np.int32)
+    cp_group = trt.PluginField("cp_group", cp_group, trt.PluginFieldType.INT32)
+
     pfc = trt.PluginFieldCollection([
         nheads, head_size, q_scaling, context_fmha_type, pf_type,
         do_relative_attention, max_distance, remove_padding, sage_attn,
-        sage_attn_q_block_size, sage_attn_k_block_size, sage_attn_v_block_size
+        sage_attn_q_block_size, sage_attn_k_block_size, sage_attn_v_block_size,
+        cp_size, cp_rank, cp_group
     ])
 
     attn_plug = attn_plg_creator.create_plugin("padding_attn", pfc)

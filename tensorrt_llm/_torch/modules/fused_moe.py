@@ -1,5 +1,6 @@
 import math
 import os
+import threading
 from enum import Enum
 from typing import Dict, List, NamedTuple, Optional, Union
 
@@ -265,7 +266,7 @@ class FusedMoE(nn.Module):
                 equals to: dynamic quant + routing(topK, etc.) [+ fp4_allgather] + scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute [no allreduce] + reducescatter
 
         trtllm_gen backend (moe_backend="TRTLLM"):
-            min-latency mode (min_latency_mode flag of forward has no effect when trtllm_gen is used):
+            min-latency mode (cutlass_min_latency_mode flag of forward has no effect when trtllm_gen is used):
                 dynamic quant + FusedMoe Op
                 equals to: dynamic quant + routing(topK, etc.) + scatter + gemm1 + swiglu + gemm2 + finalize MoeRoute
 
@@ -689,7 +690,7 @@ class FusedMoE(nn.Module):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        min_latency_mode: bool = False,
+        cutlass_min_latency_mode: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens=None,
     ) -> torch.Tensor:
@@ -755,18 +756,22 @@ class FusedMoE(nn.Module):
 
         if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
         ) and not self.enable_alltoall:
+            # Fp4 gemm has extra scaling factor
             x_sf, token_selected_experts, token_final_scales = self.all_gather(
                 [x_sf, token_selected_experts, token_final_scales])
             x = allgather(x, self.mapping, gather_dim=0)
-            token_selected_experts = token_selected_experts.flatten(
-                0, 1).contiguous()
-            token_final_scales = token_final_scales.flatten(0, 1).contiguous()
-
             if x_sf is not None:
                 x_sf = reswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
 
-        if self.smart_router and not min_latency_mode:
+            # llama4 token final scales are already multiplied with input x
+            if not self.apply_router_weight_on_input:
+                token_final_scales = token_final_scales.flatten(0,
+                                                                1).contiguous()
+            token_selected_experts = token_selected_experts.flatten(
+                0, 1).contiguous()
+
+        if self.smart_router and not cutlass_min_latency_mode:
             ep_size = self.cluster_size
             ep_rank = self.cluster_rank
             expert_start = ep_rank * self.num_experts // ep_size
@@ -808,23 +813,20 @@ class FusedMoE(nn.Module):
             cluster_size=cluster_size,
             cluster_rank=cluster_rank,
             use_fp8_block_scaling=use_fp8_block_scaling,
-            min_latency_mode=min_latency_mode,
+            min_latency_mode=cutlass_min_latency_mode,
         )
 
-        if min_latency_mode:
+        if cutlass_min_latency_mode:
             assert not self.reduce_results
             return final_hidden_states
         else:
             # Custom op requires all inputs are in the same type.
-            # Only in min_latency_mode, the output is a list of tensors.
+            # Only in cutlass_min_latency_mode, the output is a list of tensors.
             # Otherwise, the output should be unpacked as a single tensor.
             final_hidden_states = final_hidden_states[0]
 
         if not self.enable_alltoall:
-            if self.reduce_results and self.parallel_size > 1:
-                return self.all_reduce(final_hidden_states)
-            else:
-                return final_hidden_states
+            return final_hidden_states
         else:
             return self.alltoall_combine(final_hidden_states, alltoall_info,
                                          token_count)
@@ -833,16 +835,17 @@ class FusedMoE(nn.Module):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        min_latency_mode: bool = False,
+        cutlass_min_latency_mode: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """
-        min_latency_mode has no effect when trtllm_gen backend is enabled.
+        cutlass_min_latency_mode has no effect when trtllm_gen backend is enabled.
         """
         if self.is_cutlass():
-            return self.forward_cutlass(x, router_logits, min_latency_mode,
-                                        output_dtype, all_rank_num_tokens)
+            return self.forward_cutlass(x, router_logits,
+                                        cutlass_min_latency_mode, output_dtype,
+                                        all_rank_num_tokens)
         elif self.is_trtllm():
             return self.forward_trtllmgen(x, router_logits)
         else:
@@ -854,7 +857,7 @@ class FusedMoE(nn.Module):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        min_latency_mode: bool = False,
+        cutlass_min_latency_mode: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
@@ -867,18 +870,19 @@ class FusedMoE(nn.Module):
                 max_chunk_size //= len(all_rank_num_tokens)
 
         num_rows = x.shape[0]
+        # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
         num_chunks = (num_rows + max_chunk_size - 1) // max_chunk_size
 
-        if min_latency_mode:
+        if cutlass_min_latency_mode:
             assert num_chunks == 1 and (
                 not self.reduce_results
-            ), "min_latency_mode must be used with a single chunk and reduce_results must be False"
+            ), "cutlass_min_latency_mode must be used with a single chunk and reduce_results must be False"
 
         if num_chunks == 1:
             outputs = self.forward_chunk(
                 x,
                 router_logits,
-                min_latency_mode,
+                cutlass_min_latency_mode,
                 output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens)
             outputs = self.reducescatter_or_allreduce(outputs)
@@ -900,14 +904,13 @@ class FusedMoE(nn.Module):
             if self.use_dp and self.enable_alltoall:
                 all_rank_chunk_size_list = []
                 for single_rank_num_tokens in all_rank_num_tokens:
-                    single_rank_num_chunks = (single_rank_num_tokens +
-                                              max_chunk_size -
-                                              1) // max_chunk_size
-                    assert single_rank_num_chunks == num_chunks,\
-                        "num_chunks should be the same for attention dp and ep"
-                    all_rank_chunk_size_list.append(
-                        split_chunk(single_rank_num_tokens,
-                                    single_rank_num_chunks))
+                    single_rank_num_chunks = num_chunks
+                    single_rank_chunk_size_list = split_chunk(
+                        single_rank_num_tokens, single_rank_num_chunks)
+                    single_rank_chunk_size_list = [
+                        1 if x == 0 else x for x in single_rank_chunk_size_list
+                    ]
+                    all_rank_chunk_size_list.append(single_rank_chunk_size_list)
 
                 for chunk_id in range(num_chunks):
                     chunk_all_rank_num_tokens = [
@@ -1165,6 +1168,12 @@ class FusedMoE(nn.Module):
                                                    epilogue_tile_m)
             dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype))
 
+        # Use multi-threading to load expert weights in parallel.
+        # Even though CPython has global interpreter lock (GIL),
+        # it's still faster to load weights in parallel because it can utilize
+        # CPU memory bandwidth better.
+        threads = []
+
         for expert_id in range(self.expert_start, self.expert_end):
             expert_idx = expert_id - self.expert_start
 
@@ -1176,24 +1185,32 @@ class FusedMoE(nn.Module):
                 w1_w3_weight = weights["gate_up_proj"][expert_id].transpose(
                     0, 1)
                 w1_weight, w3_weight = w1_w3_weight.chunk(2, dim=0)
-                w2_weight = weights["down_proj"][expert_id].transpose(0, 1)
+                w2_weight = weights["down_proj"][expert_id].transpose(
+                    0, 1).contiguous()
             else:
                 raise NotImplementedError(
                     f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
                 )
 
-            # TODO: remove w1, w3 swap when kernel is ready
-            if self.is_trtllm() and self.quant_config.quant_mode.has_nvfp4():
-                is_trtllm_nvfp4 = True
-                w1_weight, w3_weight = w3_weight, w1_weight
-            else:
-                is_trtllm_nvfp4 = False
+            is_trtllm_nvfp4 = self.is_trtllm(
+            ) and self.quant_config.quant_mode.has_nvfp4()
 
-            load_expert_w3_w1_weight(w1_weight, w3_weight,
-                                     self.w3_w1_weight.data[expert_idx],
-                                     is_trtllm_nvfp4)
-            load_expert_w2_weight(w2_weight, self.w2_weight.data[expert_idx],
-                                  is_trtllm_nvfp4)
+            thread = threading.Thread(target=load_expert_w3_w1_weight,
+                                      args=(w1_weight, w3_weight,
+                                            self.w3_w1_weight.data[expert_idx],
+                                            is_trtllm_nvfp4))
+            thread.start()
+            threads.append(thread)
+
+            thread = threading.Thread(target=load_expert_w2_weight,
+                                      args=(w2_weight,
+                                            self.w2_weight.data[expert_idx],
+                                            is_trtllm_nvfp4))
+            thread.start()
+            threads.append(thread)
+
+        for thread in threads:
+            thread.join()
 
         if self.quant_config and self.quant_config.quant_mode.has_any_quant(
                 exclude_kv_cache=True):
@@ -1491,18 +1508,29 @@ class FusedMoE(nn.Module):
                                (final_fc2_input_scale * w2_weight_scale_2))
 
         for expert_id in range(self.expert_start, self.expert_end):
-            w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
-            w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
-            w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
-            w1_weight_scale_2 = weights[f"{expert_id}.w1.weight_scale_2"]
-            w3_weight_scale_2 = weights[f"{expert_id}.w3.weight_scale_2"]
-            w2_weight_scale_2 = weights[f"{expert_id}.w2.weight_scale_2"]
+            if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
+                w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
+                w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
+                w1_weight_scale_2 = weights[f"{expert_id}.w1.weight_scale_2"]
+                w3_weight_scale_2 = weights[f"{expert_id}.w3.weight_scale_2"]
+                w2_weight_scale_2 = weights[f"{expert_id}.w2.weight_scale_2"]
+            elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                w1_w3_weight_scale = weights["gate_up_proj_weight_scale"][
+                    expert_id].transpose(0, 1).contiguous()
+                w1_weight_scale, w3_weight_scale = w1_w3_weight_scale.chunk(
+                    2, dim=0)
+                w2_weight_scale = weights["down_proj_weight_scale"][
+                    expert_id].transpose(0, 1).contiguous()
+                w1_weight_scale_2 = weights["gate_up_proj_weight_scale_2"]
+                w3_weight_scale_2 = weights["gate_up_proj_weight_scale_2"]
+                w2_weight_scale_2 = weights["down_proj_weight_scale_2"]
+            else:
+                raise NotImplementedError(
+                    f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
+                )
 
             expert_idx = expert_id - self.expert_start
-
-            # TODO: remove w1, w3 swap
-            if self.is_trtllm():
-                w1_weight_scale, w3_weight_scale = w3_weight_scale, w1_weight_scale
 
             load_expert_w3_w1_weight_scale_nvfp4(
                 w1_weight_scale, w3_weight_scale,

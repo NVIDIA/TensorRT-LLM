@@ -1,6 +1,5 @@
 import copy
 from abc import ABC
-from dataclasses import dataclass
 from enum import Enum
 from typing import Any, List, Mapping
 
@@ -22,6 +21,9 @@ class ScaffoldingOutput:
 
 class Controller(ABC):
 
+    def __init__(self):
+        self.task_collections = {}
+
     def clone(self):
         return copy.deepcopy(self)
 
@@ -36,11 +38,16 @@ class Controller(ABC):
         raise NotImplementedError
 
 
-@dataclass(frozen=True)
 class ParallelProcess:
-    controllers: List[Controller]
-    tasks_list: List[List[Task]]
-    kwargs_list: List[Mapping[str, Any]]
+
+    def __init__(self, controllers: List[Controller],
+                 tasks_list: List[List[Task]], kwargs_list: List[Mapping[str,
+                                                                         Any]]):
+        self.sub_gens = []
+        for controller, tasks, kwargs in zip(controllers, tasks_list,
+                                             kwargs_list):
+            gen = controller.process(tasks, **kwargs)
+            self.sub_gens.append(gen)
 
 
 # Controller runs multiple generation tasks.

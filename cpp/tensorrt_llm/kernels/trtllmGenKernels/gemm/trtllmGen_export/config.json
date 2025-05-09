@@ -78,12 +78,86 @@
             "useDeepSeekFp8": true,
             "useTmaStore": true,
             "useCustomMmaSchedule": true
+        },
+        "GemmPerTensorScalingFp8Throughput": {
+            "dtypeElt": "e4m3",
+            "dtypeC": "e4m3",
+            "mmaM": 128,
+            "mmaN": 128,
+            "mmaK": 32,
+            "tileM": 128,
+            "tileN": 128,
+            "tileK": 256,
+            "epilogueTileM": 128,
+            "epilogueTileN": 128,
+            "numStages": 3,
+            "numMmaStages": 1,
+            "numSlicesForSplitK": 1,
+            "useTwoTmaLoadWarps": true,
+            "clusterDimX": 1,
+            "clusterDimY": 1,
+            "clusterDimZ": 1,
+            "sliceK": false,
+            "transposeMmaOutput": false,
+            "useShuffledMatrixA": false,
+            "useDeepSeekFp8": false,
+            "useTmaStore": true,
+            "useCustomMmaSchedule": true
+        },
+        "GemmPerTensorScalingFp8LowLatency": {
+            "dtypeElt": "e4m3",
+            "dtypeC": "e4m3",
+            "mmaM": 128,
+            "mmaN": 8,
+            "mmaK": 32,
+            "tileM": 128,
+            "tileN": 8,
+            "tileK": 512,
+            "epilogueTileM": 128,
+            "epilogueTileN": 8,
+            "numStages": 3,
+            "numMmaStages": 1,
+            "numSlicesForSplitK": 2,
+            "useTwoTmaLoadWarps": true,
+            "clusterDimX": 1,
+            "clusterDimY": 1,
+            "clusterDimZ": 2,
+            "sliceK": false,
+            "transposeMmaOutput": true,
+            "useShuffledMatrixA": true,
+            "useDeepSeekFp8": false,
+            "useTmaStore": true,
+            "useCustomMmaSchedule": true,
+            "gridTriggerSecondary": true,
+            "gridWaitForPrimary": true,
+            "gridDepTriggerA": true
         }
     },
     "configs": [
         {
             "_template": "GemmFp4Throughput",
             "dtypeC": ["bf16", "fp16", "fp32"]
+        },
+        {
+            "_template": "GemmPerTensorScalingFp8Throughput",
+            "dtypeC": ["e4m3"]
+        },
+        {
+            "_template": "GemmPerTensorScalingFp8Throughput",
+            "dtypeC": ["bf16", "fp16"],
+            "numStages": 2
+        },
+        {
+            "_template": "GemmPerTensorScalingFp8LowLatency",
+            "dtypeC": ["bf16", "fp16", "e4m3"],
+            "numSlicesForSplitK": 2,
+            "clusterDimZ": 2
+        },
+        {
+            "_template": "GemmPerTensorScalingFp8LowLatency",
+            "dtypeC": ["bf16", "fp16", "e4m3"],
+            "numSlicesForSplitK": 1,
+            "clusterDimZ": 1
         }
     ]
 }

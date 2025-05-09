@@ -16,7 +16,7 @@ AARCH64_TRIPLE = "aarch64-linux-gnu"
 
 LLM_DOCKER_IMAGE = env.dockerImage
 
-AGENT_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.03-py3-x86_64-ubuntu24.04-trt10.9.0.34-skip-devel-202504250100-3759"
+AGENT_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.03-py3-x86_64-ubuntu24.04-trt10.9.0.34-skip-devel-202505081324-9379"
 
 POD_TIMEOUT_SECONDS = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
 
@@ -74,6 +74,18 @@ def BUILD_CONFIGS = [
     (TARNAME) : "llvm-TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;120-real",
   ],
+]
+
+@Field
+def GITHUB_PR_API_URL = "github_pr_api_url"
+@Field
+def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
+@Field
+def ACTION_INFO = "action_info"
+def globalVars = [
+    (GITHUB_PR_API_URL): null,
+    (CACHED_CHANGED_FILE_LIST): null,
+    (ACTION_INFO): null,
 ]
 
 // TODO: Move common variables to an unified location
@@ -585,7 +597,7 @@ def runLLMPackage(pipeline, archTriple, tarFileName, linuxPkgName)
     sh "cd ${llmPath} && ls -alh"
 }
 
-def launchStages(pipeline, cpu_arch, enableFailFast)
+def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
 {
     stage("Show Environment") {
         sh "env | sort"
@@ -594,6 +606,10 @@ def launchStages(pipeline, cpu_arch, enableFailFast)
         echo "gitlabCommit: ${env.gitlabCommit}"
         echo "alternativeTRT: ${env.alternativeTRT}"
         echo "Using GitLab repo: ${LLM_REPO}. Commit: ${env.gitlabCommit}"
+
+        echo "env.globalVars is: ${env.globalVars}"
+        globalVars = trtllm_utils.updateMapWithJson(pipeline, globalVars, env.globalVars, "globalVars")
+        globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(pipeline, globalVars[ACTION_INFO])
     }
 
     def wheelDockerImage = env.wheelDockerImage
@@ -710,7 +726,7 @@ pipeline {
     stages {
         stage("BuildJob") {
             steps {
-                launchStages(this, params.targetArch, params.enableFailFast)
+                launchStages(this, params.targetArch, params.enableFailFast, globalVars)
             }
         }
     } // stage

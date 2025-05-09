@@ -8,7 +8,7 @@ import torch
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm.llmapi import EagleDecodingConfig, KvCacheConfig
+from tensorrt_llm.llmapi import BuildConfig, EagleDecodingConfig, KvCacheConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
@@ -41,10 +41,18 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
     spec_config = EagleDecodingConfig(
         max_draft_len=draft_len, pytorch_eagle_weights_path=eagle_model_dir)
 
+    build_config = None
+    if attn_backend == "FLASHINFER":
+        # TODO: fix max seq len logic in py_executor_creator. We will get
+        # an illegal memory access if this is not set to a preset value,
+        # which is definitely not right.
+        build_config = BuildConfig(max_seq_len=2048)
+
     llm_spec = LLM(model=target_model_dir,
                    pytorch_backend_config=pytorch_config,
                    kv_cache_config=kv_cache_config,
-                   speculative_config=spec_config)
+                   speculative_config=spec_config,
+                   build_config=build_config)
 
     sampling_params = SamplingParams(
         max_tokens=32,
@@ -82,7 +90,8 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
 
     llm_ref = LLM(model=target_model_dir,
                   pytorch_backend_config=pytorch_config,
-                  kv_cache_config=kv_cache_config)
+                  kv_cache_config=kv_cache_config,
+                  build_config=build_config)
 
     results_ref = llm_ref.generate(prompts, sampling_params)
     generated_text_ref = [result.outputs[0].text for result in results_ref]

@@ -83,6 +83,14 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true',
                         help='Print iteration logs during execution')
+    parser.add_argument('--use_torch_compile',
+                        default=False,
+                        action='store_true',
+                        help='Use torch.compile to optimize the model')
+    parser.add_argument('--use_piecewise_cuda_graph',
+                        default=False,
+                        action='store_true',
+                        help='Use piecewise CUDA graph to optimize the model')
 
     # Sampling
     parser.add_argument("--max_tokens", type=int, default=64)
@@ -122,6 +130,8 @@ def setup_llm(args):
         use_cuda_graph=args.use_cuda_graph,
         load_format=args.load_format,
         print_iter_log=args.print_iter_log,
+        torch_compile_enabled=args.use_torch_compile,
+        torch_compile_piecewise_cuda_graph=args.use_piecewise_cuda_graph,
         moe_backend=args.moe_backend,
         enable_trtllm_decoder=args.enable_trtllm_decoder)
 

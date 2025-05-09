@@ -33,6 +33,9 @@ void invokeFill(IBuffer& buffer, T value, CudaStream const& stream);
 void invokeFillBatch(
     IBuffer& buffer, IBuffer const& indices, std::size_t stride, IBuffer const& values, CudaStream const& stream);
 
+void invokeGatherBatch(IBuffer& buffer, IBuffer const& values, IBuffer const& slotIndices, std::size_t slotStride,
+    CudaStream const& stream);
+
 void invokeCopyBatch(IBuffer const& srcBuffer, IBuffer& dstBuffer, IBuffer const& srcOffsets, IBuffer const& dstOffsets,
     IBuffer const& sizes, std::size_t maxStride, CudaStream const& stream);
 
