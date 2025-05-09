@@ -38,6 +38,58 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestMistral7B_0_3(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
+    MODEL_PATH = f"{llm_models_root()}/Mistral-7B-Instruct-v0.3"
+
+    @skip_post_blackwell
+    @skip_pre_ada
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.parametrize("quant", ['int4', 'int4_awq', 'int8_awq'])
+    def test_quant_tp4(self, quant):
+        if quant == 'int4':
+            quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16)
+        elif quant == 'int4_awq':
+            quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ)
+        elif quant == 'int8_awq':
+            quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_AWQ)
+
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=4,
+                 quant_config=quant_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestMistral_Nemo_12B_Base(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Mistral-Nemo-Base-2407"
+    MODEL_PATH = f"{llm_models_root()}/Mistral-Nemo-Base-2407"
+
+    def test_fp8(self):
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
+                                   kv_cache_quant_algo=QuantAlgo.FP8)
+
+        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestMistral_NeMo_Minitron_8B_Instruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Mistral-NeMo-Minitron-8B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/Mistral-NeMo-Minitron-8B-Instruct"
+
+    @skip_pre_ada
+    def test_fp8(self):
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
+
+        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestMixtral8x7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mixtral-8x7B-v0.1"
     MODEL_PATH = f"{llm_models_root()}/Mixtral-8x7B-v0.1"
@@ -48,6 +100,32 @@ class TestMixtral8x7B(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    @pytest.mark.skip_less_device(4)
+    def test_smooth_quant_tp2pp2(self):
+        quant_config = QuantConfig(
+            quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN)
+        with LLM(self.MODEL_PATH,
+                 quant_config=quant_config,
+                 tensor_parallel_size=2,
+                 pipeline_parallel_size=2) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestMixtral8x7BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+    MODEL_PATH = f"{llm_models_root()}/Mixtral-8x7B-Instruct-v0.1"
+
+    @skip_post_blackwell
+    def test_awq_tp2(self):
+        quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ)
+        with LLM(self.MODEL_PATH,
+                 quant_config=quant_config,
+                 tensor_parallel_size=2) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
 
