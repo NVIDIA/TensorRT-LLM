@@ -50,7 +50,7 @@ python3 quickstart_multimodal.py --model_dir Efficient-Large-Model/NVILA-8B --mo
 | `DeepseekV3ForCausalLM` | DeepSeek-V3 | `deepseek-ai/DeepSeek-V3 `| L |
 | `LlavaLlamaModel` | VILA | `Efficient-Large-Model/NVILA-8B` | L + V |
 | `LlavaNextForConditionalGeneration` | LLaVA-NeXT | `llava-hf/llava-v1.6-mistral-7b-hf` | L + V |
-| `LlamaForCausalLM` | Llama 3 <br> Llama 3.1 <br> Llama 2 <br> LLaMA | `meta-llama/Meta-Llama-3.1-70B` <br>`naver-hyperclovax/HyperCLOVAX-SEED-Text-Instruct-0.5B` | L |
+| `LlamaForCausalLM` | Llama 3 <br> Llama 3.1 <br> Llama 2 <br> LLaMA | `meta-llama/Meta-Llama-3.1-70B` | L |
 | `Llama4ForConditionalGeneration` | Llama 4 Scout <br> Llama 4 Maverick | `meta-llama/Llama-4-Scout-17B-16E-Instruct` <br> `meta-llama/Llama-4-Maverick-17B-128E-Instruct` | L + V |
 | `MistralForCausalLM` | Mistral | `mistralai/Mistral-7B-v0.1` | L |
 | `MixtralForCausalLM` | Mixtral | `mistralai/Mixtral-8x7B-v0.1` | L |
