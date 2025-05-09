@@ -201,8 +201,6 @@ class LlamaAttention(Attention):
             dtype=config.torch_dtype,
             config=model_config,
         )
-
-
 class Llama4MoE(nn.Module):
 
     def __init__(
@@ -482,6 +480,7 @@ class LlamaDecoderLayer(DecoderLayer):
         self,
         model_config: ModelConfig[LlamaConfig],
         layer_idx: int,
+        bidirectional: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         super().__init__()
         config = model_config.pretrained_config
@@ -507,6 +506,10 @@ class LlamaDecoderLayer(DecoderLayer):
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
+        
+        self.attention_mask = PredefinedAttentionMask.CAUSAL
+        if bidirectional:
+            self.attention_mask = PredefinedAttentionMask.FULL
 
     def forward(
         self,
@@ -529,6 +532,7 @@ class LlamaDecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            attention_mask=self.attention_mask,
             **kwargs,
         )
 
@@ -717,7 +721,7 @@ class Llama4Model(DecoderModel):
 
 class LlamaModel(DecoderModel):
 
-    def __init__(self, model_config: ModelConfig[LlamaConfig]):
+    def __init__(self, model_config: ModelConfig[LlamaConfig], bidirectional=False):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
         self.padding_idx = config.pad_token_id
@@ -760,6 +764,7 @@ class LlamaModel(DecoderModel):
             LlamaDecoderLayer(
                 model_config,
                 layer_idx,
+                bidirectional=bidirectional
             ) for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(hidden_size=config.hidden_size,
