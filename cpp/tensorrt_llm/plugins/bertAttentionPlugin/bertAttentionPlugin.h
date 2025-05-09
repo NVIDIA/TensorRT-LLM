@@ -21,7 +21,9 @@
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmhaRunner.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <cassert>
+#include <cuda_runtime.h>
 #include <set>
 #include <string>
 #include <vector>
@@ -37,7 +39,8 @@ public:
     BertAttentionPlugin(int num_heads, int head_size, float q_scaling,
         tensorrt_llm::kernels::ContextFMHAType context_fmha_type, nvinfer1::DataType type,
         bool do_relative_attention = false, int max_distance = 0, bool remove_padding = false, bool sage_attn = false,
-        int sage_attn_q_block_size = 0, int sage_attn_k_block_size = 0, int sage_attn_v_block_size = 0);
+        int sage_attn_q_block_size = 0, int sage_attn_k_block_size = 0, int sage_attn_v_block_size = 0, int cp_size = 1,
+        int cp_rank = 0, std::set<int> cp_group = {});
 
     BertAttentionPlugin(void const* data, size_t length);
 
@@ -100,6 +103,15 @@ private:
     std::set<std::vector<int>> mSageAttnSupportedBlockSizes{{64, 64, 256}, {64, 32, 32}};
 
     int mSM = tensorrt_llm::common::getSMVersion();
+
+    // comm group for RingAttention
+    int mCpSize = 1;
+    int mCpRank = 0;
+    std::set<int> mCpGroup = {};
+#if ENABLE_MULTI_DEVICE
+    std::shared_ptr<ncclComm_t> mNcclComm;
+#endif // ENABLE_MULTI_DEVICE
+    cudaStream_t mNcclStream;
 
     // The default copy constructor will leave them as nullptr. clone() shall initialize it.
     UniqPtrWNullCopy<tensorrt_llm::kernels::FusedMHARunnerV2> mFMHARunner;
