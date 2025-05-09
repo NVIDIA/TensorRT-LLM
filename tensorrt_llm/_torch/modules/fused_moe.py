@@ -903,14 +903,13 @@ class FusedMoE(nn.Module):
             if self.use_dp and self.enable_alltoall:
                 all_rank_chunk_size_list = []
                 for single_rank_num_tokens in all_rank_num_tokens:
-                    single_rank_num_chunks = (single_rank_num_tokens +
-                                              max_chunk_size -
-                                              1) // max_chunk_size
-                    assert single_rank_num_chunks == num_chunks,\
-                        "num_chunks should be the same for attention dp and ep"
-                    all_rank_chunk_size_list.append(
-                        split_chunk(single_rank_num_tokens,
-                                    single_rank_num_chunks))
+                    single_rank_num_chunks = num_chunks
+                    single_rank_chunk_size_list = split_chunk(
+                        single_rank_num_tokens, single_rank_num_chunks)
+                    single_rank_chunk_size_list = [
+                        1 if x == 0 else x for x in single_rank_chunk_size_list
+                    ]
+                    all_rank_chunk_size_list.append(single_rank_chunk_size_list)
 
                 for chunk_id in range(num_chunks):
                     chunk_all_rank_num_tokens = [
