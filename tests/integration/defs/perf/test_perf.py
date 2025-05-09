@@ -775,8 +775,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         elif self._config.runtime == "bench":
             benchmark_script = "trtllm-bench"
         else:
-            benchmark_script = os.path.join(llm_root, "benchmarks", "python",
-                                            "benchmark.py")
+            raise RuntimeError(f"Invalid runtime {self._config.runtime}.")
         allowed_configs = import_allowed_perf_config()
         allowed_models = allowed_configs.get_allowed_models()
         if self._config.runtime == "bench":
