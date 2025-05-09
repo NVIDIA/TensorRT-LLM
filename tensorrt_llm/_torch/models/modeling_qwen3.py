@@ -9,11 +9,12 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
+from ..modules.attention import Attention, QkNormType
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import TensorParallelMode
+from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..pipeline_interface import PipelineInterface
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
@@ -51,6 +52,7 @@ class Qwen3Attention(Attention):
             dtype=config.torch_dtype,
             dense_bias=config.attention_bias,
             config=model_config,
+            qk_norm_type=QkNormType.pre_rope,
         )
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
@@ -63,6 +65,26 @@ class Qwen3Attention(Attention):
                               has_weights=True)
         self.aux_stream = torch.cuda.Stream()
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+
+    def apply_qk_norm(self, q, k):
+
+        def q_l2norm():
+            return self.q_norm(q.reshape(-1, self.head_dim)).reshape(
+                -1, self.q_size)
+
+        def k_l2norm():
+            return self.k_norm(k.reshape(-1, self.head_dim)).reshape(
+                -1, self.kv_size)
+
+        q, k = maybe_execute_in_parallel(
+            q_l2norm,
+            k_l2norm,
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+
+        return q, k
 
 
 class Qwen3DecoderLayer(DecoderLayer):
