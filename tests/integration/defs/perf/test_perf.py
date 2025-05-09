@@ -1392,7 +1392,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         """
         Run through the commands and parse multiple perf metrics from the logs.
         """
-
+        #print info to separate cases
+        print_info(f"Running perf test for case: {self._short_test_name_body}")
         self._current_cmd_idx = 0
         metrics = self._get_metrics()
         outputs = {}

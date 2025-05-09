@@ -272,6 +272,12 @@ class KVCacheManager(BaseResourceManager):
     def add_dummy_requests(
         self,
         request_ids: List[int],
+        # Note that token_nums should be past_kv_len + input_len (without
+        # spec decoding). The draft tokens will be added in this function,
+        # so we don't need to take care of it in the caller. When preparing
+        # token_nums, we should not take the draft tokens into account, so
+        # don't use the kv_cache_manager.max_seq_len, which includes both
+        # extra tokens and draft tokens.
         token_nums: Optional[List[int]] = None,
         is_gen: bool = False,
         prepare_resource: bool = True,
@@ -281,8 +287,7 @@ class KVCacheManager(BaseResourceManager):
         requests = []
         for i, req_id in enumerate(request_ids):
             sampling_params = SamplingParams()
-            token_num = token_nums[
-                i] if token_nums is not None else 1 + max_num_draft_tokens
+            token_num = token_nums[i] if token_nums is not None else 1
             encoder_input_tokens = [
                 1
             ] * token_num if self.impl.cross_kv else None
@@ -297,12 +302,17 @@ class KVCacheManager(BaseResourceManager):
             req.paged_kv_block_ids = []
             if prepare_resource:
                 self.impl.add_sequence(req_id, token_num, beam_width, req)
+                for _ in range(self.num_extra_kv_tokens):
+                    self.impl.add_token(req_id)
             if is_gen:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
-                req.prompt_len = token_num - 1 + max_num_draft_tokens
+                req.prompt_len = token_num - 1
                 req.py_prompt_len = req.prompt_len
                 if max_num_draft_tokens > 0:
-                    req.py_draft_tokens = [0] * max_num_draft_tokens
+                    req.py_draft_tokens = [1] * max_num_draft_tokens
+                    if prepare_resource:
+                        for _ in range(max_num_draft_tokens):
+                            self.impl.add_token(req_id)
             requests.append(req)
         return requests
 
@@ -408,6 +418,10 @@ class KVCacheManager(BaseResourceManager):
 
     def get_num_kv_blocks(self, num_tokens: int) -> int:
         return (num_tokens + self.tokens_per_block - 1) // self.tokens_per_block
+
+    def get_num_available_tokens(self, max_num_draft_tokens: int = 0) -> int:
+        return (self.get_num_free_blocks() * self.tokens_per_block -
+                self.num_extra_kv_tokens - max_num_draft_tokens)
 
     def get_buffers(self, layer_idx: int) -> Optional[torch.Tensor]:
         result = self.impl.get_primary_pool_data(layer_idx)

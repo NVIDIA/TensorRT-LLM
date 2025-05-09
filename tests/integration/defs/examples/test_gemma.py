@@ -517,6 +517,7 @@ def test_llm_gemma_1gpu_evaltool(gemma_model_root, llm_venv, cmodel_dir,
 
 
 @skip_pre_hopper
+@skip_post_blackwell
 @pytest.mark.parametrize("gemma_model_root",
                          ["gemma-2b", "gemma-7b", *GEMMA2_MODELS],
                          indirect=True)
