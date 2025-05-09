@@ -335,8 +335,8 @@ using RunnerPtr = std::shared_ptr<torch_ext::trtllm::attention::RunnerBase>;
 using torch_ext::trtllm::attention::Runner;
 using torch_ext::trtllm::attention::AttentionInputType;
 
-torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch::optional<torch::Tensor> v,
-    std::optional<torch::ScalarType> out_dtype, torch::optional<torch::Tensor> workspace_,
+void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch::optional<torch::Tensor> v,
+    torch::Tensor& output, std::optional<torch::ScalarType> out_dtype, torch::optional<torch::Tensor> workspace_,
     torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths, torch::Tensor context_lengths,
     torch::Tensor host_context_lengths, torch::Tensor host_request_types,
     torch::optional<torch::Tensor> kv_cache_block_offsets, torch::optional<torch::Tensor> host_kv_cache_block_offsets,
@@ -549,12 +549,6 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
         workspace = torch::empty({workspace_size}, torch::dtype(torch::kByte).device(qkv.device()));
     }
 
-    int64_t v_head_size = !op->mIsMLAEnabled ? head_size
-        : is_gen_only                        ? op->mMLAParams.kv_lora_rank
-                                             : v_head_dim.value();
-    auto output = torch::empty(
-        {num_tokens, num_heads * v_head_size}, qkv.options().dtype(out_dtype.value_or(qkv.scalar_type())));
-
     if ((num_contexts > 0) && (attn_input_type != AttentionInputType::GenerationOnly))
     {
         auto seq_offset = 0;
@@ -585,8 +579,6 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
-
-    return output;
 }
 
 } // namespace torch_ext
@@ -594,10 +586,11 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "attention("
+        "attention_inplace("
         "Tensor q"
         ", Tensor? k"
         ", Tensor? v"
+        ", Tensor(a!) output"
         ", ScalarType? out_dtype"
         ", Tensor? workspace"
         ", Tensor sequence_length"
@@ -653,10 +646,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int? v_head_dim"
         ", Tensor? mrope_rotary_cos_sin"
         ", Tensor? mrope_position_deltas"
-        ") -> Tensor");
+        ") -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("attention", &torch_ext::attention);
+    m.impl("attention_inplace", &torch_ext::attention_inplace);
 }

@@ -75,7 +75,7 @@ class DummyParallelController(DummyControllerBase):
             ]
 
             kwargs_list = [kwargs for _ in range(len(self.controllers))]
-            #yield from parallel_process_helper(self.controllers, tasks_list, kwargs_list)
+
             yield ParallelProcess(self.controllers, tasks_list, kwargs_list)
 
             tasks = tasks_list[0]
