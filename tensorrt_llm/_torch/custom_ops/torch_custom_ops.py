@@ -4,6 +4,7 @@ import torch
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
+from ..attention_backend.interface import AttentionInputType
 from ..autotuner import AutoTuner, TunableRunner, TuningConfig
 from ..utils import (get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2, next_positive_power_of_2)
@@ -328,3 +329,167 @@ def _(
 ) -> torch.Tensor:
     return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
                              dtype=output_dtype)
+
+
+@torch.library.custom_op("trtllm::attention", mutates_args=())
+def attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out_dtype: Optional[torch.dtype],
+    workspace: Optional[torch.Tensor],
+    sequence_length: torch.Tensor,
+    host_past_key_value_lengths: torch.Tensor,
+    context_lengths: torch.Tensor,
+    host_context_lengths: torch.Tensor,
+    host_request_types: torch.Tensor,
+    kv_cache_block_offsets: Optional[torch.Tensor],
+    host_kv_cache_block_offsets: Optional[torch.Tensor],
+    host_kv_cache_pool_pointers: Optional[torch.Tensor],
+    host_kv_cache_pool_mapping: Optional[torch.Tensor],
+    cache_indirection: Optional[torch.Tensor],
+    kv_scale_orig_quant: Optional[torch.Tensor],
+    kv_scale_quant_orig: Optional[torch.Tensor],
+    out_scale: Optional[torch.Tensor],
+    rotary_inv_freq: Optional[torch.Tensor],
+    rotary_cos_sin: Optional[torch.Tensor],
+    latent_cache: Optional[torch.Tensor],
+    q_pe: Optional[torch.Tensor],
+    block_ids_per_seq: Optional[torch.Tensor],
+    is_fused_qkv: bool,
+    update_kv_cache: bool,
+    predicted_tokens_per_seq: int,
+    layer_idx: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    tokens_per_block: Optional[int],
+    max_num_requests: int,
+    max_context_length: int,
+    attention_window_size: int,
+    sink_token_length: int,
+    beam_width: int,
+    mask_type: int,
+    quant_mode: int,
+    q_scaling: float,
+    position_embedding_type: int,
+    rotary_embedding_dim: int,
+    rotary_embedding_base: float,
+    rotary_embedding_scale_type: int,
+    rotary_embedding_scale: float,
+    rotary_embedding_short_m_scale: float,
+    rotary_embedding_long_m_scale: float,
+    rotary_embedding_max_positions: int,
+    rotary_embedding_original_max_positions: int,
+    use_paged_context_fmha: bool,
+    attention_input_type: Optional[int],
+    is_mla_enable: bool,
+    q_lora_rank: Optional[int],
+    kv_lora_rank: Optional[int],
+    qk_nope_head_dim: Optional[int],
+    qk_rope_head_dim: Optional[int],
+    v_head_dim: Optional[int],
+    mrope_rotary_cos_sin: Optional[torch.Tensor],
+    mrope_position_deltas: Optional[torch.Tensor],
+) -> torch.Tensor:
+    num_tokens = q.size(0)
+    attention_input_type = (AttentionInputType(attention_input_type)
+                            if attention_input_type is not None else
+                            AttentionInputType.mixed)
+    is_gen_only = attention_input_type == AttentionInputType.generation_only
+    v_head_size = head_size if not is_mla_enable else kv_lora_rank if is_gen_only else v_head_dim
+    if out_dtype is None:
+        out_dtype = q.dtype
+
+    output = q.new_empty((num_tokens, num_heads * v_head_size), dtype=out_dtype)
+    torch.ops.trtllm.attention_inplace(
+        q, k, v, output, out_dtype, workspace, sequence_length,
+        host_past_key_value_lengths, context_lengths, host_context_lengths,
+        host_request_types, kv_cache_block_offsets, host_kv_cache_block_offsets,
+        host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
+        cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale,
+        rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq,
+        is_fused_qkv, update_kv_cache, predicted_tokens_per_seq, layer_idx,
+        num_heads, num_kv_heads, head_size, tokens_per_block, max_num_requests,
+        max_context_length, attention_window_size, sink_token_length,
+        beam_width, mask_type, quant_mode, q_scaling, position_embedding_type,
+        rotary_embedding_dim, rotary_embedding_base,
+        rotary_embedding_scale_type, rotary_embedding_scale,
+        rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
+        rotary_embedding_max_positions, rotary_embedding_original_max_positions,
+        use_paged_context_fmha, attention_input_type, is_mla_enable,
+        q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim,
+        v_head_dim, mrope_rotary_cos_sin, mrope_position_deltas)
+    return output
+
+
+@attention.register_fake
+def _(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out_dtype: Optional[torch.dtype],
+    workspace: Optional[torch.Tensor],
+    sequence_length: torch.Tensor,
+    host_past_key_value_lengths: torch.Tensor,
+    context_lengths: torch.Tensor,
+    host_context_lengths: torch.Tensor,
+    host_request_types: torch.Tensor,
+    kv_cache_block_offsets: Optional[torch.Tensor],
+    host_kv_cache_block_offsets: Optional[torch.Tensor],
+    host_kv_cache_pool_pointers: Optional[torch.Tensor],
+    host_kv_cache_pool_mapping: Optional[torch.Tensor],
+    cache_indirection: Optional[torch.Tensor],
+    kv_scale_orig_quant: Optional[torch.Tensor],
+    kv_scale_quant_orig: Optional[torch.Tensor],
+    out_scale: Optional[torch.Tensor],
+    rotary_inv_freq: Optional[torch.Tensor],
+    rotary_cos_sin: Optional[torch.Tensor],
+    latent_cache: Optional[torch.Tensor],
+    q_pe: Optional[torch.Tensor],
+    block_ids_per_seq: Optional[torch.Tensor],
+    is_fused_qkv: bool,
+    update_kv_cache: bool,
+    predicted_tokens_per_seq: int,
+    layer_idx: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    tokens_per_block: Optional[int],
+    max_num_requests: int,
+    max_context_length: int,
+    attention_window_size: int,
+    sink_token_length: int,
+    beam_width: int,
+    mask_type: int,
+    quant_mode: int,
+    q_scaling: float,
+    position_embedding_type: int,
+    rotary_embedding_dim: int,
+    rotary_embedding_base: float,
+    rotary_embedding_scale_type: int,
+    rotary_embedding_scale: float,
+    rotary_embedding_short_m_scale: float,
+    rotary_embedding_long_m_scale: float,
+    rotary_embedding_max_positions: int,
+    rotary_embedding_original_max_positions: int,
+    use_paged_context_fmha: bool,
+    attention_input_type: Optional[int],
+    is_mla_enable: bool,
+    q_lora_rank: Optional[int],
+    kv_lora_rank: Optional[int],
+    qk_nope_head_dim: Optional[int],
+    qk_rope_head_dim: Optional[int],
+    v_head_dim: Optional[int],
+    mrope_rotary_cos_sin: Optional[torch.Tensor],
+    mrope_position_deltas: Optional[torch.Tensor],
+) -> torch.Tensor:
+    num_tokens = q.size(0)
+    attention_input_type = (AttentionInputType(attention_input_type)
+                            if attention_input_type is not None else
+                            AttentionInputType.mixed)
+    if out_dtype is None:
+        out_dtype = q.dtype
+    is_gen_only = attention_input_type == AttentionInputType.generation_only
+    v_head_size = head_size if not is_mla_enable else kv_lora_rank if is_gen_only else v_head_dim
+    return q.new_empty((num_tokens, num_heads * v_head_size), dtype=out_dtype)

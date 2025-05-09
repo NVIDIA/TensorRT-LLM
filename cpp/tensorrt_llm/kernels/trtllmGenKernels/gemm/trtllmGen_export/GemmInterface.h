@@ -16,9 +16,6 @@
  */
 #pragma once
 
-#include <cuda.h>
-#include <cuda_runtime_api.h>
-
 #include <numeric>
 
 #include "GemmOptions.h"
@@ -83,6 +80,17 @@ struct GemmData
         // Otherwise should be set to nullptr.
         void const* mPtrSfA{nullptr};
 
+        // The per-token scaling factors from scale A.
+        //
+        // This is used for either:
+        //   * Per-token scaling factor quantization schemes, such as MetaFP8. The dtype is
+        //   Dtype::Float32
+        //   * When the routing scales are applied to the input activations (only when output is not
+        //   transposed). The dtype is Dtype::Bfloat16
+        //
+        // The shape is [M]
+        void const* mPtrPerTokenSfA{nullptr};
+
         // The matrix B. The data type is controlled by options.mDtypeElt.
         // The shape is [N, K]. The rightmost dimension is contiguous in memory.
         void const* mPtrB{nullptr};
@@ -112,6 +120,17 @@ struct GemmData
         //
         // Otherwise should be set to nullptr.
         void const* mPtrSfB{nullptr};
+
+        // The per-token scaling factors from scale B.
+        //
+        // This is used for either:
+        //   * Per-token scaling factor quantization schemes, such as MetaFP8. The dtype is
+        //   Dtype::Float32
+        //   * When the routing scales are applied to the input activations (only when output is
+        //   transposed). The dtype is Dtype::Bfloat16
+        //
+        // The shape is [N]
+        void const* mPtrPerTokenSfB{nullptr};
 
         // The output tensor scaling factor for MxFp{4,8}, Fp8, NvFp4 and DeepSeek FP8 quantization.
         // TensorRT-LLM API requires a scaling factor on the device.
@@ -199,7 +218,7 @@ public:
     // Launch the cubin from the provided config. It calls all necessary memsets for internal buffers.
     // Provided config must be validated with isValidConfig before the call.
     int32_t run(GemmConfig const& config, void* workspace, GemmData const& options, void* cudaStream,
-        cudaDeviceProp const& deviceProp) const;
+        int32_t multiProcessorCount) const;
 
     // Initializes the buffers before the world sync. Must be called before run.
     int32_t runInitBeforeWorldSync(GemmConfig const& config, GemmData const& data, void* cudaStream) const;
@@ -356,7 +375,7 @@ bool GemmInterface::isValidConfig(GemmConfig const& config, GemmData const& data
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 int32_t GemmInterface::run(GemmConfig const& config, void* workspace, GemmData const& data, void* cudaStream,
-    cudaDeviceProp const& deviceProp) const
+    int32_t multiProcessorCount) const
 {
     // Get options from config and data.
     auto options = getOptionsFromConfigAndData(config, data);
@@ -386,7 +405,8 @@ int32_t GemmInterface::run(GemmConfig const& config, void* workspace, GemmData c
 
     // Create kernel params.
     auto kernelParams = gemm::KernelParams::setKernelParams(options, data.mInputBuffers.mPtrA,
-        data.mInputBuffers.mPtrSfA, data.mInputBuffers.mPtrB, data.mInputBuffers.mPtrSfB, data.mOutputBuffers.mPtrC,
+        data.mInputBuffers.mPtrSfA, data.mInputBuffers.mPtrPerTokenSfA, data.mInputBuffers.mPtrB,
+        data.mInputBuffers.mPtrSfB, data.mInputBuffers.mPtrPerTokenSfB, data.mOutputBuffers.mPtrC,
         data.mOutputBuffers.mPtrSfC, data.mOutputBuffers.mPtrMultiMemC, (float*) data.mInputBuffers.mPtrScaleC,
         dSplitKSlices, data.mAllReduceBuffers.mPtrTileBars, data.mAllReduceBuffers.mPtrMultiMemTileBars,
         data.mAllReduceBuffers.mPtrCompletionBars, data.mAllReduceBuffers.mPtrMultiMemCompletionBars,
@@ -400,7 +420,7 @@ int32_t GemmInterface::run(GemmConfig const& config, void* workspace, GemmData c
     // of tiles is less than number of SMs. This way, at least one CTA in the grid can make forward.
     if (doesSplitKUseGmem(options.mSplitK))
     {
-        if (grid[0] * grid[1] >= deviceProp.multiProcessorCount)
+        if (grid[0] * grid[1] >= multiProcessorCount)
         {
             // The number of MN tiles in Split-K (grid[0] * grid[1]) must be less than the number of SMs.
             return 2;

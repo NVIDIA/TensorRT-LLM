@@ -77,7 +77,7 @@ def iterate_hf_lora(iter_fn, lora_weights, hf_modules, component=None):
             hf_module = m.group(3) + "." + module_name
         if hf_module not in hf_modules:
             hf_module = module_name
-            assert hf_module in hf_modules, f"hf_module {hf_module} is not in supported llist {hf_modules}"
+            assert hf_module in hf_modules, f"hf_module {hf_module} is not in supported list {hf_modules}"
 
         is_lora_a_or_b = m.group(8) is not None
         if is_lora_a_or_b:
@@ -276,6 +276,7 @@ def load_torch_hf_lora(lora_config: LoraConfig):
     lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules(
     )
 
+    assert len(lora_config.lora_dir) == 1, "Expecting only a single lora dir"
     lora_loader = HfLoraLoader(lora_config.lora_dir)
 
     if len(lora_config.lora_target_modules) == 0:
