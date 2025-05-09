@@ -502,9 +502,6 @@ def stress_test(config,
             "capacity_scheduler_policy":
             test_server_config.capacity_scheduler_policy
         },
-        "pytorch_backend_config": {
-            "enable_overlap_scheduler": True,
-        },
     }
 
     # Add DeepSeek-V3 specific configuration
@@ -519,7 +516,6 @@ def stress_test(config,
                 "cuda_graph_batch_sizes":
                 [1, 2, 4, 8, 16, 32, 64, 128, 256, 384],
                 "print_iter_log": True,
-                "enable_overlap_scheduler": True
             }
 
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',

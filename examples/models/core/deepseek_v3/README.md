@@ -21,7 +21,10 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
   - [Quick Start](#quick-start)
     - [Run a single inference](#run-a-single-inference)
     - [Multi-Token Prediction (MTP)](#multi-token-prediction-mtp)
+      - [Relaxed acceptance](#relaxed-acceptance)
     - [Long context support](#long-context-support)
+      - [ISL-64k-OSL-1024](#isl-64k-osl-1024)
+      - [ISL-128k-OSL-1024](#isl-128k-osl-1024)
   - [Evaluation](#evaluation)
   - [Serving](#serving)
   - [Advanced Usages](#advanced-usages)
@@ -33,6 +36,7 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
     - [FlashMLA](#flashmla)
     - [FP8 KV Cache and MLA](#fp8-kv-cache-and-mla)
   - [Notes and Troubleshooting](#notes-and-troubleshooting)
+  - [Known Issues](#known-issues)
 
 
 ## Hardware Requirements
@@ -133,7 +137,6 @@ python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
 
 cat <<EOF > /tmp/extra-llm-api-config.yml
 pytorch_backend_config:
-  enable_overlap_scheduler: true
   use_cuda_graph: true
   cuda_graph_padding_enabled: true
   cuda_graph_batch_sizes: [1, 4, 8, 12]
@@ -162,7 +165,6 @@ python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
 
 cat <<EOF > /tmp/extra-llm-api-config.yml
 pytorch_backend_config:
-  enable_overlap_scheduler: true
   use_cuda_graph: true
   cuda_graph_padding_enabled: true
   cuda_graph_batch_sizes: [1, 2]
@@ -189,7 +191,6 @@ Evaluate the model accuracy using `trtllm-eval`.
 cat >./extra-llm-api-config.yml <<EOF
 pytorch_backend_config:
     use_cuda_graph: true
-    enable_overlap_scheduler: true
 enable_attention_dp: true
 EOF
 ```
@@ -245,7 +246,6 @@ pytorch_backend_config:
     - 256
     - 384
     print_iter_log: true
-    enable_overlap_scheduler: true
 enable_attention_dp: true
 EOF
 
@@ -416,7 +416,6 @@ pytorch_backend_config:
     - 256
     - 384
     print_iter_log: true
-    enable_overlap_scheduler: true
 enable_attention_dp: true
 EOF
 ```
