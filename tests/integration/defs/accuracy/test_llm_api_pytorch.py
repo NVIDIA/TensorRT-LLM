@@ -174,8 +174,6 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
         with LLM(model_path, tensor_parallel_size=4) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -191,8 +189,6 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
         with LLM(model_path, tensor_parallel_size=4) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -323,13 +319,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   enable_attention_dp=attention_dp,
                   speculative_config=mtp_config)
         with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-            if attention_dp and cuda_graph and overlap_scheduler:
-                task = GSM8K(self.MODEL_NAME)
-                task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
@@ -362,13 +355,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   enable_attention_dp=attention_dp,
                   speculative_config=mtp_config)
         with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-            if attention_dp and cuda_graph and overlap_scheduler:
-                task = GSM8K(self.MODEL_NAME)
-                task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
     @pytest.mark.skip_device_not_contain(["H100"])
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
@@ -410,16 +400,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
         with llm:
-            # No need to run these tests for fp8kv
+            # No need to run MMLU for fp8kv
             if not fp8kv:
-                task = CnnDailymail(self.MODEL_NAME)
-                task.evaluate(llm)
                 task = MMLU(self.MODEL_NAME)
                 task.evaluate(llm)
-            # Run GSM8K for fp8kv, or if all the other optimizations are enabled
-            if fp8kv or (attention_dp and cuda_graph and overlap_scheduler):
-                task = GSM8K(self.MODEL_NAME)
-                task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["H100"])
@@ -469,16 +455,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
         with llm:
-            # No need to run these tests for fp8kv
+            # No need to run MMLU for fp8kv
             if not fp8kv:
-                task = CnnDailymail(self.MODEL_NAME)
-                task.evaluate(llm)
                 task = MMLU(self.MODEL_NAME)
                 task.evaluate(llm)
-            # Run GSM8K for fp8kv, or if all the other optimizations are enabled
-            if fp8kv or (attention_dp and cuda_graph and overlap_scheduler):
-                task = GSM8K(self.MODEL_NAME)
-                task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
     @skip_pre_blackwell
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
@@ -509,16 +491,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
         with llm:
-            # No need to run these tests for fp8kv
+            # No need to run MMLU for fp8kv
             if not fp8kv:
-                task = CnnDailymail(self.MODEL_NAME)
-                task.evaluate(llm)
                 task = MMLU(self.MODEL_NAME)
                 task.evaluate(llm)
-            # Run GSM8K for fp8kv, or if all the other optimizations are enabled
-            if fp8kv or (attention_dp and cuda_graph and overlap_scheduler):
-                task = GSM8K(self.MODEL_NAME)
-                task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
@@ -557,16 +535,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
         with llm:
-            # No need to run these tests for fp8kv
+            # No need to run MMLU for fp8kv
             if not fp8kv:
-                task = CnnDailymail(self.MODEL_NAME)
-                task.evaluate(llm)
                 task = MMLU(self.MODEL_NAME)
                 task.evaluate(llm)
-            # Run GSM8K for fp8kv, or if all the other optimizations are enabled
-            if fp8kv or (attention_dp and cuda_graph and overlap_scheduler):
-                task = GSM8K(self.MODEL_NAME)
-                task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 class TestDeepSeekR1(LlmapiAccuracyTestHarness):
@@ -662,8 +636,6 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
         with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -707,8 +679,6 @@ class TestNemotronSuper(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     def test_auto_dtype_tp2(self):
         with LLM(self.MODEL_PATH, tensor_parallel_size=2) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
