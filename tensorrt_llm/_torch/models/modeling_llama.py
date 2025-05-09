@@ -57,8 +57,10 @@ class Llama4Attention(Attention):
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         self.use_rope = not nope_layer
+        self.attn_temperature_tuning = nope_layer and attn_temperature_tuning
         self.use_qk_norm = use_qk_norm and not nope_layer
-        if self.use_rope and not self.use_qk_norm:
+        if self.use_rope and not self.use_qk_norm and not self.attn_temperature_tuning and model_config.fuse_pos_embd:
+            # We can fuse pos embed only when: is_rope=True, is_qk_norm=False and fuse_pos_embd=True
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gptj,
                 rope=RopeParams.from_config(config),
@@ -95,7 +97,6 @@ class Llama4Attention(Attention):
         else:
             self.qk_norm = None
 
-        self.attn_temperature_tuning = attn_temperature_tuning and nope_layer
         self.floor_scale = getattr(config, "floor_scale", 8192.0)
         self.attn_scale = getattr(config, "attn_scale", 0.1)
 
@@ -265,6 +266,16 @@ class Llama4MoE(nn.Module):
         config = model_config.pretrained_config
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.top_k = top_k
+
+        self.shared_expert = GatedMLP(
+            hidden_size=hidden_size,
+            intermediate_size=shared_expert_intermediate_size,
+            bias=False,
+            dtype=dtype,
+            config=model_config,
+            overridden_tp_size=1 if self.enable_attention_dp else None,
+            reduce_output=False)
+
         self.experts = FusedMoE(
             routing_method=Llama4RenormalizeMoeRoutingMethod(top_k),
             num_experts=num_experts,
@@ -276,15 +287,6 @@ class Llama4MoE(nn.Module):
             weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             model_config=model_config,
             apply_router_weight_on_input=True)
-
-        self.shared_expert = GatedMLP(
-            hidden_size=hidden_size,
-            intermediate_size=shared_expert_intermediate_size,
-            bias=False,
-            dtype=dtype,
-            config=model_config,
-            overridden_tp_size=1 if self.enable_attention_dp else None,
-            reduce_output=False)
 
         self.router = Linear(hidden_size,
                              num_experts,
@@ -352,6 +354,17 @@ class Llama4DecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
         self.is_quanted = model_config.quant_config and model_config.quant_config.quant_mode.has_any_quant(
         )
+        self.is_fp8_quant = self.is_quanted and model_config.quant_config.quant_mode.has_fp8_qdq(
+        )
+        self.is_nvfp4 = self.is_quanted and model_config.quant_config.quant_mode.has_nvfp4(
+        )
+        self.tp_size = model_config.mapping.moe_tp_size
+        self.ep_size = model_config.mapping.moe_ep_size
+        self.num_experts = model_config.pretrained_config.num_local_experts
+        self.topk = model_config.pretrained_config.num_experts_per_tok
+        self.hidden_size = model_config.pretrained_config.hidden_size
+        self.intermediate_size = model_config.pretrained_config.intermediate_size
+
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
 
         self.fusion_config = EagerFusionConfig()
@@ -424,12 +437,11 @@ class Llama4DecoderLayer(DecoderLayer):
     ) -> torch.Tensor:
         # Only enable min-latency mode on Blackwell
         # TODO: Remove it after we fix crash on Hopper
-        # major, minor = torch.cuda.get_device_capability()
-        # is_blackwell = (major * 10 + minor) >= 100
+        major, minor = torch.cuda.get_device_capability()
+        is_blackwell = (major * 10 + minor) >= 100
         # cutlass_min_latency_mode = hidden_states.size(
         #     0
         # ) <= 128 and self.fusion_config.POST_MOE_FUSION and is_blackwell and self.is_quanted
-
         # Temporarily disable min-latency mode for Llama4
         cutlass_min_latency_mode = False
 
