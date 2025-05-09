@@ -384,7 +384,7 @@ def prepare_model_multi_gpu(python_exe, root_dir, cpp_resources_dir,
 
             start_time = time.time()
 
-            _cpp.prepare_multi_gpu_model_tests(
+            prepare_multi_gpu_model_tests(
                 test_list=[model_name],
                 python_exe=python_exe,
                 root_dir=root_dir,
