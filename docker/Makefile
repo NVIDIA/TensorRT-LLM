@@ -143,7 +143,7 @@ endif
     		$(IMAGE_WITH_TAG)$(IMAGE_TAG_SUFFIX) $(RUN_CMD)
 
 devel_%: STAGE = devel
-triton-devel_%: STAGE = triton-devel
+tritondevel_%: STAGE = tritondevel
 
 wheel_%: STAGE = wheel
 wheel_run: WORK_DIR = /src/tensorrt_llm
