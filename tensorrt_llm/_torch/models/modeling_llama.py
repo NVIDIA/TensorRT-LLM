@@ -839,7 +839,16 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                 model_config.quant_config.kv_cache_quant_algo
             self.draft_model = Eagle3LlamaForCausalLM(
                 draft_config, model_config.pretrained_config.num_hidden_layers)
-            self.spec_worker = get_spec_worker(model_config.spec_config)
+            self.spec_worker = get_spec_worker(model_config.spec_config, model_config.mapping)
+
+            # Set to True to enable delayed all-gather for LM head.
+            # This means LM head will not perform all-gather on the output logits, so each rank will only have
+            # a subset of the logits. The decoding part must be aware of that and apply all gather after top1 reduction.
+            self.enable_lm_head_delayed_all_gather = True
+            if self.enable_lm_head_delayed_all_gather:
+                # Delay all-gather until after top1 reduction.
+                self.lm_head.gather_output = False
+                self.draft_model.lm_head.gather_output = False
 
     def forward(
         self,
@@ -884,14 +893,15 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                 attn_metadata,
                 True,
             )
-            # get accepetd tokens and next draft tokens
+            # get accepted tokens and next draft tokens
             return self.spec_worker(input_ids=input_ids,
                                     position_ids=position_ids,
                                     hidden_states=hidden_states,
                                     logits=logits,
                                     attn_metadata=attn_metadata,
                                     spec_metadata=spec_metadata,
-                                    draft_model=self.draft_model)
+                                    draft_model=self.draft_model,
+                                    main_model_lm_head=self.lm_head)
         else:
             logits = self.logits_processor.forward(
                 hidden_states,
@@ -943,7 +953,16 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
                 model_config.quant_config.kv_cache_quant_algo
             self.draft_model = Eagle3LlamaForCausalLM(
                 draft_config, model_config.pretrained_config.num_hidden_layers)
-            self.spec_worker = get_spec_worker(model_config.spec_config)
+            self.spec_worker = get_spec_worker(model_config.spec_config, model_config.mapping)
+
+            # Set to True to enable delayed all-gather for LM head.
+            # This means LM head will not perform all-gather on the output logits, so each rank will only have
+            # a subset of the logits. The decoding part must be aware of that and apply all gather after top1 reduction.
+            self.enable_lm_head_delayed_all_gather = True
+            if self.enable_lm_head_delayed_all_gather:
+                # Delay all-gather until after top1 reduction.
+                self.lm_head.gather_output = False
+                self.draft_model.lm_head.gather_output = False
 
     def forward(
         self,
@@ -988,14 +1007,15 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
                 attn_metadata,
                 True,
             )
-            # get accepetd tokens and next draft tokens
+            # get accepted tokens and next draft tokens
             return self.spec_worker(input_ids=input_ids,
                                     position_ids=position_ids,
                                     hidden_states=hidden_states,
                                     logits=logits,
                                     attn_metadata=attn_metadata,
                                     spec_metadata=spec_metadata,
-                                    draft_model=self.draft_model)
+                                    draft_model=self.draft_model,
+                                    main_model_lm_head=self.lm_head)
         else:
             logits = self.logits_processor.forward(
                 hidden_states,
@@ -1064,6 +1084,7 @@ class Eagle3LlamaDraftModel(DecoderModel):
         self.spec_config = model_config.spec_config
         self.dtype = config.torch_dtype
         self.hidden_size = config.hidden_size
+        self.mapping = model_config.mapping
 
         if hasattr(config, "target_hidden_size"):
             self.hidden_size_in = config.target_hidden_size

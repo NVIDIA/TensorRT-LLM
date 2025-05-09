@@ -7,8 +7,10 @@ import torch
 from torch import nn
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
+from ..distributed import AllReduce, allreduce_argmax
 from ..pyexecutor.decoder import TorchDecoder
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 from .mtp import MTPDecoder
@@ -221,21 +223,22 @@ class Eagle3OneModelDecoder(MTPDecoder):
 
 class Eagle3OneModelWorker(nn.Module):
 
-    def __init__(self, spec_config: Eagle3Config):
+    def __init__(self, spec_config: Eagle3Config, mapping: Mapping):
         super().__init__()
         self.spec_config = spec_config
         self.max_draft_tokens = self.spec_config.max_draft_tokens
+        self.all_reduce = AllReduce(mapping=mapping)
 
     @torch.compile(mode="max-autotune-no-cudagraphs")
     def forward(self, input_ids, position_ids, hidden_states, logits,
-                attn_metadata, spec_metadata, draft_model):
+                attn_metadata, spec_metadata, draft_model, main_model_lm_head):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
         # Sample and accept tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
-            logits, attn_metadata, spec_metadata)
+            logits, attn_metadata, spec_metadata, main_model_lm_head)
 
         # Save the old attn_metadata and spec_metadata
         if attn_metadata.is_cuda_graph:
@@ -329,6 +332,7 @@ class Eagle3OneModelWorker(nn.Module):
         logits: torch.Tensor,
         attn_metadata: AttentionMetadata,
         spec_metadata: Eagle3OneModelSpecMetadata,
+        main_model_lm_head: nn.Module,
     ):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
@@ -346,7 +350,12 @@ class Eagle3OneModelWorker(nn.Module):
                                          device=logits.device)
 
         # Do greedy sampling for the input logits
-        target_tokens = torch.argmax(logits, dim=-1)
+        # If the main model LM head did not gather output, we should get argmax across all ranks.
+        if main_model_lm_head.gather_output:
+            target_tokens = torch.argmax(logits, dim=-1)
+        else:
+            target_tokens = allreduce_argmax(
+                logits, all_reduce=self.all_reduce, padding=main_model_lm_head.padding_size, dim=-1)
 
         # context
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
@@ -384,10 +393,18 @@ class Eagle3OneModelWorker(nn.Module):
                 Draft token ids. Flattened.
         '''
 
-        draft_tokens = torch.argmax(logits, dim=-1).type(torch.int32)
+        # If draft model LM head did not gather output, we should get argmax across all ranks.
+        if draft_model.lm_head.gather_output:
+            draft_tokens = torch.argmax(logits, dim=-1).type(torch.int32)
+        else:
+            draft_tokens = allreduce_argmax(
+                logits, all_reduce=self.all_reduce, padding=draft_model.lm_head.padding_size, dim=-1).type(torch.int32)
+
+        # Apply d2t (offsets between draft model dictionary and main model dictionary).
         if hasattr(draft_model.model,
                    "d2t") and draft_model.model.d2t is not None:
             draft_tokens = draft_model.model.d2t[draft_tokens] + draft_tokens
+
         return draft_tokens
 
     def prepare_1st_drafter_inputs(
