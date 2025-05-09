@@ -415,22 +415,17 @@ private:
             {
                 // Otherwise, we use the high-throughput kernel.
                 kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
-                // The 2CTA keepsMmaAbForGeneration kernel is used when the following conditions are met
-                if (params.mNumHeadsQPerKv == 128 && mDtypeQ != DATA_TYPE_E4M3)
+                // The 2CTA keepsMmaAbForGeneration kernel is used when the following conditions (based on the benchmark
+                // results) are met:
+                if (params.mNumHeadsQPerKv == 128
+                    && (mDtypeQ != DATA_TYPE_E4M3
+                        || (static_cast<int32_t>(params.mBatchSize * params.mMaxSeqLenQ * 2) * 2
+                            > params.mMultiProcessorCount)))
                 {
                     selectKernelParams.mUses2CtaMma = true;
                     // Each Cta only handles 256 headDimV.
                     selectKernelParams.mHeadDimPerCtaV = 256;
                 }
-                else if (params.mNumHeadsQPerKv == 128
-                    && static_cast<int32_t>(params.mBatchSize * params.mMaxSeqLenQ * 2) * 2
-                        > params.mMultiProcessorCount)
-                {
-                    selectKernelParams.mUses2CtaMma = true;
-                    // Each Cta only handles 256 headDimV.
-                    selectKernelParams.mHeadDimPerCtaV = 256;
-                }
-
                 // Disable the multiCtasKvMode and use the persistent scheduler for high-throughput generation
                 // kernels.
                 selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
