@@ -1194,7 +1194,7 @@ class FusedMoE(nn.Module):
 
             is_trtllm_nvfp4 = self.is_trtllm(
             ) and self.quant_config.quant_mode.has_nvfp4()
-        
+
             thread = threading.Thread(target=load_expert_w3_w1_weight,
                                       args=(w1_weight, w3_weight,
                                             self.w3_w1_weight.data[expert_idx],
