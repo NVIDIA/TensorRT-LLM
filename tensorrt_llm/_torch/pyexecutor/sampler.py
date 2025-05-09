@@ -269,6 +269,7 @@ class TorchSampler(Sampler):
 
         if hasattr(scheduled_requests, 'chunked_requests'):
             request_idx += len(scheduled_requests.chunked_requests)
+            token_idx += len(scheduled_requests.chunked_requests)
 
         for request in scheduled_requests.context_requests:
             if request.get_context_remaining_length() != 0:
