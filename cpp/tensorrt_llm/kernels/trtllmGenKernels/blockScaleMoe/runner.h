@@ -21,6 +21,7 @@
 #include "trtllmGenSrc/Dtype.h"
 #include "trtllmGenSrc/RoutingKernel.h"
 #include "trtllmGenSrc/SfLayoutDecl.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h"
 #include <string>
 
 namespace tensorrt_llm
@@ -63,15 +64,20 @@ class Runner
 public:
     explicit Runner(trtllm::gen::Dtype dtypeElt);
 
+    int32_t getMaxNumCtasInBatchDim(int32_t numTokens, int32_t topK, int32_t numExperts);
+
+    size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens, bool useDeepSeekFp8);
+
     void run(void* hidden_state, void* hidden_state_scale, void* weight, void* weight_scale, void* expert_weights,
         float* output_scales_scalar, float* output_scales_gate_scalar, void* output, void* output_scale, int32_t top_k,
         int32_t hidden_size, int32_t intermediate_size, int32_t num_experts, int32_t num_tokens,
         int32_t* permuted_idx_to_token_idx, int32_t* ptr_num_non_exiting_ctas, int32_t* ptr_total_num_padded_tokens,
-        int32_t* ptr_cta_idx_xy_to_batch_idx, int32_t* ptr_cta_idx_xy_to_mn_limit, bool use_routing_scales_on_input,
-        bool use_deep_seek_fp8, cudaStream_t stream);
+        int32_t* ptr_cta_idx_xy_to_batch_idx, int32_t* ptr_cta_idx_xy_to_mn_limit, void* bmm1Workspace, bool use_routing_scales_on_input,
+        bool use_deep_seek_fp8, int device, cudaStream_t stream);
 
 private:
     trtllm::gen::Dtype mDtypeElt;
+    int32_t mTileTokensDim{8};
 };
 } // namespace PermuteGemm1
 
@@ -85,7 +91,7 @@ public:
     void run(void* permuted_hidden_state, void* permuted_hidden_state_scale, void* weight, void* weight_scale,
         float* output_scales_scalar, void* output, void* output_scale, int32_t top_k, int32_t hidden_size,
         int32_t intermediate_size, int32_t num_experts, int32_t num_tokens, int32_t* ptr_num_non_exiting_ctas,
-        int32_t* ptr_total_num_padded_tokens, int32_t* ptr_cta_idx_xy_to_batch_idx, int32_t* ptr_cta_idx_xy_to_mn_limit,
+        int32_t* ptr_total_num_padded_tokens, int32_t* ptr_cta_idx_xy_to_batch_idx, int32_t* ptr_cta_idx_xy_to_mn_limit, void* bmm2Workspace,
         bool use_deep_seek_fp8, cudaStream_t stream);
 
 private:
@@ -183,6 +189,12 @@ struct MoEWorkspace
     // Finalize intermediate outputs (placeholder not used)
     void* finalize_output = nullptr;
     float* finalize_output_scale = nullptr;
+
+    // FC1 workspace:
+    void* bmm1_workspace = nullptr;
+
+    // FC2 workspace:
+    void* bmm2_workspace = nullptr;
 };
 
 class Runner
@@ -190,7 +202,9 @@ class Runner
 public:
     explicit Runner();
 
-    void run(MoERunnerArgs const& args, MoEWorkspace const& workspace, cudaStream_t stream);
+    void run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device, cudaStream_t stream);
+
+    std::tuple<int32_t, int32_t> getWorkspaceSizeInBytes(MoERunnerArgs const& args);
 
 private:
     void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace, moe::dev::convertsf::Data& convertSfData,

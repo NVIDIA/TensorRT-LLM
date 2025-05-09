@@ -16,8 +16,6 @@
 
 #pragma once
 
-//// FIX
-#define TLLM_ENABLE_CUDA
 // #include "BatchedGemmOptions.h"
 #include "Dtype.h"
 #include "SfLayoutDecl.h"

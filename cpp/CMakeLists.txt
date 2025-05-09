@@ -380,8 +380,6 @@ print(os.path.dirname(torch.__file__),end='');"
   message(STATUS "TORCH_CXX_FLAGS: ${TORCH_CXX_FLAGS}")
   add_compile_options(${TORCH_CXX_FLAGS})
   add_compile_definitions(TORCH_CUDA=1)
-  add_compile_definitions("TLLM_ENABLE_CUDA")
-  add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
 
   if(DEFINED USE_CXX11_ABI)
     parse_make_options(${TORCH_CXX_FLAGS} "TORCH_CXX_FLAGS")

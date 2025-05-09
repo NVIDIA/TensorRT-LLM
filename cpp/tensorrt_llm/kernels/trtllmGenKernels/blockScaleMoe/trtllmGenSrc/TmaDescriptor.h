@@ -22,7 +22,6 @@
 #include <cassert>
 #include <iostream>
 
-#define TLLM_ENABLE_CUDA
 #ifdef TLLM_ENABLE_CUDA
 #include <cute/tensor.hpp>
 #endif
