@@ -79,8 +79,8 @@ BUILD_MEMORY_REQUEST = "48Gi"
 BUILD_MEMORY_LIMIT = "64Gi"
 BUILD_JOBS = "8"
 
-TESTER_CORES = "12"
-TESTER_MEMORY = "96Gi"
+TESTER_CORES = "2"
+TESTER_MEMORY = "16Gi"
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
@@ -510,6 +510,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                                 values:
                                 - "core"
                 nodeSelector: ${selectors}
+                restartPolicy: Never
                 containers:
                   ${containerConfig}
                     env:
@@ -980,6 +981,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
     stage ("[${stageName}] Run Pytest")
     {
+        //try {
         echoNodeAndGpuInfo(pipeline, stageName)
         sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C; fi'
 
@@ -1081,6 +1083,23 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 """
             }
         }
+        //}
+        /*catch (err) {
+            try {
+                def exitCode = sh(
+                    script: "kubectl get pod ${env.HOSTNAME} -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}'",
+                    returnStdout: true
+                ).trim()
+                if (exitCode == "137") {
+                    error("OOMKilled detected: Test failed due to memory limit")
+                } else {
+                    error("Test failed with exit code ${exitCode}")
+                }
+            } catch (innerErr) {
+                echo "Failed to retrieve exit code: ${innerErr.message}"
+                error("Test failed with unknown exit code")
+            }
+        }*/
     }
 }
 
