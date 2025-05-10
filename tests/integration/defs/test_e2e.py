@@ -297,6 +297,15 @@ class BenchRunner:
         self.mpirun_cmd = f"mpirun -n {self.tp_size} trtllm-llmapi-launch" if self.use_mpirun else ""
         self.engine_path = None
 
+        if self.use_mpirun:
+            assert "mpirun" in check_output(
+                f"which mpirun", shell=True), "mpirun is not installed"
+            assert "trtllm-llmapi-launch" in check_output(
+                f"which trtllm-llmapi-launch",
+                shell=True), "trtllm-llmapi-launch is not installed"
+        assert "trtllm-bench" in check_output(
+            f"which trtllm-bench", shell=True), "trtllm-bench is not installed"
+
     def __call__(self):
         self.prepare_dataset()
         if not (self.skip_engine_build or self.use_pytorch_backend):
