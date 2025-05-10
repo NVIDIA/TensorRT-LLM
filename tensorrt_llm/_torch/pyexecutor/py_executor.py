@@ -27,6 +27,7 @@ from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
 from tensorrt_llm.logger import logger
 
 from ..distributed import Distributed
+from ..speculative import PLDPool
 from .decoder import Decoder, DecoderState
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
@@ -165,6 +166,7 @@ class PyExecutor:
                  max_draft_tokens: int = 0,
                  kv_cache_transceiver: KvCacheTransceiver = None,
                  draft_model_engine: Optional[ModelEngine] = None,
+                 pld_pool: Optional[PLDPool] = None,
                  start_worker: bool = True):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
@@ -188,6 +190,8 @@ class PyExecutor:
 
         # Draft model for certain spec decode algorithms, e.g. EAGLE3
         self.draft_model_engine = draft_model_engine
+        # PLDPool for ngram spec decode algorithm
+        self.pld_pool = pld_pool
 
         # enqueue and _fetch_new_requests used data
         self.enqueue_lock = threading.Lock()
@@ -847,7 +851,7 @@ class PyExecutor:
                 if num_dummy_request > 0:
                     self._merge_dummy_request(num_dummy_request)
 
-                if self.draft_model_engine is not None:
+                if self.draft_model_engine is not None or self.pld_pool is not None:
                     self._prepare_draft_requests()
 
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
@@ -882,6 +886,8 @@ class PyExecutor:
                     self.resource_manager.prepare_resources(scheduled_batch)
                     if self.draft_model_engine is not None:
                         self._prepare_draft_tokens(scheduled_batch)
+                    if self.pld_pool is not None:
+                        self._generate_ngram_draft_tokens(scheduled_batch)
 
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -1746,6 +1752,52 @@ class PyExecutor:
     def _update_requests(self, decoder_state: DecoderState):
         try:
             self.decoder.update_requests(decoder_state)
+        except Exception as e:
+            traceback.print_exc()
+            error_msg = str(e)
+            logger.error(f"Encountered an error in decode: {error_msg}")
+            self._handle_errors(error_msg)
+
+    @nvtx_range("_generate_ngram_draft_tokens")
+    def _generate_ngram_draft_tokens(
+        self, scheduled_requests: ScheduledRequests
+    ) -> Tuple[ScheduledRequests, Dict[int, LlmRequest]]:
+        """
+        Generate draft tokens for generation requests using ngram lookup table.
+        """
+        try:
+            for request in scheduled_requests.generation_requests:
+                if request.py_draft_pages_allocated == 0:
+                    # No space for draft tokens.
+                    continue
+
+                num_draft_tokens = len(
+                    request.py_last_draft_tokens
+                ) if request.py_last_draft_tokens is not None else 0
+                request.py_draft_tokens = []
+
+                num_accepted_tokens = getattr(request,
+                                              "py_num_accepted_draft_tokens", 0)
+                num_rejected_tokens = num_draft_tokens - num_accepted_tokens
+                assert num_rejected_tokens >= 0
+
+                spec_config = self.model_engine.spec_config
+                beam_idx = 0
+                input_tokens = spec_config.get_draft_model_prompt(
+                    request.get_tokens()[beam_idx])
+
+                # Generate draft tokens. Add to request
+                draft_tokens = self.pld_pool.get_draft_tokens(
+                    [input_tokens], [0], [request.py_end_id])
+                draft_tokens = list(draft_tokens[0])
+                max_draft_tokens = self.pld_pool.plnt
+                num_draft_tokens = len(draft_tokens)
+                # Pad to max_draft_tokens
+                if num_draft_tokens > 1 or draft_tokens[0] != request.py_end_id:
+                    if num_draft_tokens < max_draft_tokens:
+                        draft_tokens.extend(0 for _ in range(max_draft_tokens -
+                                                             num_draft_tokens))
+                    request.py_draft_tokens = draft_tokens
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)

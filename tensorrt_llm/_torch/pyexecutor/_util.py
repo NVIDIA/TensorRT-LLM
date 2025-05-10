@@ -15,7 +15,7 @@ from tensorrt_llm.lora_manager import (LoraConfig,
                                        load_torch_hf_lora)
 from tensorrt_llm.mapping import Mapping
 
-from ..speculative import get_num_spec_layers, get_spec_decoder
+from ..speculative import NGramConfig, get_num_spec_layers, get_spec_decoder
 from .decoder import (EarlyStopDecoder, TorchDecoder, TorchStarAttentionDecoder,
                       TRTLLMDecoder)
 from .kv_cache_transceiver import (AttentionTypeCpp, CacheTransBufferManager,
@@ -358,6 +358,7 @@ def create_py_executor_instance(dist,
                                 ctx_chunk_config,
                                 model_engine,
                                 draft_model_engine,
+                                pld_pool,
                                 start_worker,
                                 decoder,
                                 lora_config: LoraConfig = None):
@@ -479,6 +480,7 @@ def create_py_executor_instance(dist,
                       if spec_config is not None else 0,
                       kv_cache_transceiver=kv_cache_transceiver,
                       draft_model_engine=draft_model_engine,
+                      pld_pool=pld_pool,
                       start_worker=start_worker)
 
 
@@ -488,7 +490,8 @@ def instantiate_decoder(model_engine, executor_config, pytorch_backend_config,
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         decoder = TorchStarAttentionDecoder(
             max_seq_len=model_engine.max_seq_len)
-    elif model_engine.spec_config is not None:
+    elif model_engine.spec_config is not None and not isinstance(
+            model_engine.spec_config, NGramConfig):
         decoder = get_spec_decoder(max_seq_len=model_engine.max_seq_len,
                                    spec_config=model_engine.spec_config)
     elif pytorch_backend_config.enable_trtllm_decoder:
