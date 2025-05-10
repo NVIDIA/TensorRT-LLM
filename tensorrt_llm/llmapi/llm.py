@@ -312,6 +312,7 @@ class LLM:
                 sampling_params.add_special_tokens = False
 
         query_token_ids = None
+        multimodal_input = None
         multimodal_embedding = None
         mrope_config = None
         if "prompt_token_ids" in inputs:
@@ -340,8 +341,7 @@ class LLM:
                     'mm_embedding')
                 mrope_config = extra_processed_inputs.get('mrope_config')
                 multimodal_input = extra_processed_inputs.get(
-                    'multimodal_input'
-                ) if 'multimodal_input' in extra_processed_inputs else None
+                    'multimodal_input')
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
