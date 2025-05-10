@@ -272,6 +272,8 @@ def prepare_fused_mha_metadata(
     )
 
 
+# TODO: Move the truncation of inputs out of this custom op
+# SequenceInfo._get_sanitized_num_sequences could break in fake mode
 @prepare_fused_mha_metadata.register_fake
 def prepare_fused_mha_metadata_fake(
     input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
