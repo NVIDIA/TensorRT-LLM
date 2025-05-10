@@ -156,8 +156,6 @@ class BertPooler(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.activation = nn.Tanh()
 
     def forward(
         self,
@@ -165,22 +163,16 @@ class BertPooler(nn.Module):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
 
-        # We "pool" the model by simply taking the hidden state corresponding
-        # to the first token.
+         # Apply average pooling over all token embeddings
         if attn_metadata is not None:
-            #NOTE: select the first tokens
-            offset = attn_metadata.seq_lens_cuda
-            selected_tokens = torch.cumsum(
-                attn_metadata.seq_lens_cuda,
-                dim=0,
-                dtype=torch.long,
-            ) - offset
-            hidden_states = hidden_states[selected_tokens]
+            # Use sequence lengths from attn_metadata to mask padding tokens
+            seq_lens = attn_metadata.seq_lens_cuda
+            mask = torch.arange(hidden_states.size(1), device=hidden_states.device).unsqueeze(0) < seq_lens.unsqueeze(1)
+            hidden_states = hidden_states * mask.unsqueeze(-1)  # Mask padding tokens
+            pooled_output = hidden_states.sum(dim=1) / seq_lens.unsqueeze(1)
         else:
-            # hidden_states: [B, N, H]
-            hidden_states = hidden_states[:, 0]
-        pooled_output = self.dense(hidden_states)
-        pooled_output = self.activation(pooled_output)
+            # Average pooling over all tokens (assumes no padding)
+            pooled_output = hidden_states.mean(dim=1)
         return pooled_output
 
 

@@ -1,6 +1,8 @@
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 
+import torch
+
 
 def main():
     prompts = [
@@ -9,15 +11,23 @@ def main():
         "The capital of France is",
         "The future of AI is",
     ]
-    sampling_params = SamplingParams(max_tokens=32)
+    sampling_params = SamplingParams(max_tokens=32, return_context_logits=True)
 
-    llm = LLM(model='TinyLlama/TinyLlama-1.1B-Chat-v1.0')
+    model_path = "/code/tensorrt_llm/custom_bert_classifier"
+    llm = LLM(model=model_path)
     outputs = llm.generate(prompts, sampling_params)
 
+    tllm_logits = []
     for i, output in enumerate(outputs):
         prompt = output.prompt
-        generated_text = output.outputs[0].text
-        print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+        logits = output.context_logits.cpu()
+        print(f"[{i}] Prompt: {prompt!r}, logits: {logits}")
+        tllm_logits += [logits]
+
+    # stack logits
+    tllm_logits = torch.stack(tllm_logits)
+    print(f"tllm_logits: {tllm_logits}")
+
 
 
 if __name__ == '__main__':
