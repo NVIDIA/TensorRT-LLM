@@ -462,7 +462,8 @@ void initRequestBindings(pybind11::module_& m)
         .value("JSON", tle::GuidedDecodingParams::GuideType::kJSON)
         .value("JSON_SCHEMA", tle::GuidedDecodingParams::GuideType::kJSON_SCHEMA)
         .value("REGEX", tle::GuidedDecodingParams::GuideType::kREGEX)
-        .value("EBNF_GRAMMAR", tle::GuidedDecodingParams::GuideType::kEBNF_GRAMMAR);
+        .value("EBNF_GRAMMAR", tle::GuidedDecodingParams::GuideType::kEBNF_GRAMMAR)
+        .value("STRUCTURAL_TAG", tle::GuidedDecodingParams::GuideType::kSTRUCTURAL_TAG);
 
     auto guidedDecodingParamsGetstate
         = [](tle::GuidedDecodingParams const& self) { return py::make_tuple(self.getGuideType(), self.getGuide()); };
