@@ -647,7 +647,6 @@ def modify_by_test_list(test_list, items, config):
             selected.append(item)
             # Also update the item based on the marker specified in the file
             marker, reason, timeout = full_test_name_to_marker_dict[name]
-            print_info(f"---------------marker: {marker}")
             if marker:
                 if marker == "TIMEOUT" and timeout:
                     print_info('Marker is TIMEOUT')
