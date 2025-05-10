@@ -195,6 +195,8 @@ protected:
     void TearDown() override
     {
         managed_buffers.clear();
+        ASSERT_EQ(cudaStreamSynchronize(mStream->get()), cudaSuccess);
+        ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     }
 
     void initWeights(DataType* buffer, int64_t w, int64_t h, float base, float scalar)
@@ -307,6 +309,8 @@ protected:
 
     float mMaxInput{};
 
+    char mMemsetValue = 0xD5;
+
     template <class AllocType>
     AllocType* allocBuffer(size_t size)
     {
@@ -315,7 +319,7 @@ protected:
         EXPECT_EQ(cudaGetLastError(), cudaSuccess) << "Error allocating buffer of size: " << size;
         AllocType* ptr = static_cast<AllocType*>(managed_buffers.back()->data());
         // Memset to an obviously incorrect value, so we detect any issues with uninitialised fields
-        check_cuda_error(cudaMemsetAsync(ptr, 0xD5, size_bytes, mStream->get()));
+        check_cuda_error(cudaMemsetAsync(ptr, mMemsetValue, size_bytes, mStream->get()));
         return ptr;
     }
 
@@ -1313,6 +1317,7 @@ void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
         if (should_be_deterministic && !mIsLongTest)
         {
             auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
+            mMemsetValue = ~mMemsetValue; // Also check it doesn't depend on uninitialised memory
             runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k);
             auto second_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
             ASSERT_TRUE(std::equal(first_iter.begin(), first_iter.end(), second_iter.begin()))
@@ -1552,6 +1557,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                     if (should_be_deterministic && !mIsLongTest)
                     {
                         auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
+                        mMemsetValue = ~mMemsetValue; // Also check it doesn't depend on uninitialised memory
                         runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k,
                             MOEParallelismConfig{tp_size, i, ep_size, j});
                         auto second_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
@@ -1842,6 +1848,43 @@ TYPED_TEST(LargeMixtureOfExpertsTest, PermuteVeryLongSequence)
     this->compareFinal(token_selected_experts, token_final_scales, unquant_states);
 }
 
+TYPED_TEST(LargeMixtureOfExpertsTest, RunProfiler)
+{
+    constexpr bool is_half = std::is_same<typename TypeParam::DataType, half>::value;
+    ASSERT_TRUE(this->FP8 || is_half) << "Unimplemented data type for profiler test";
+    auto test_func = [this](GemmProfilerBackend::GemmToProfile gemm_to_profile)
+    {
+        int64_t num_experts = 4;
+        int64_t k = 2;
+
+        GemmProfilerBackend backend;
+        backend.init(this->mMoERunner, gemm_to_profile,
+            this->FP8 ? nvinfer1::DataType::kFP8 : nvinfer1::DataType::kHALF,
+            this->FP8 ? nvinfer1::DataType::kFP8 : nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k,
+            this->DEFAULT_HIDDEN_SIZE, this->DEFAULT_HIDDEN_SIZE * 4, this->mGroupSize,
+            tensorrt_llm::ActivationType::Geglu, false, this->mUseLora, false, MOEParallelismConfig{});
+
+        auto ws_size = backend.getWorkspaceSize(128);
+
+        auto workspace = this->template allocBuffer<char>(ws_size);
+
+        for (int64_t num_tokens : {1, 128})
+        {
+            backend.prepare(num_tokens, workspace, this->mStream->get());
+            for (auto const& tactic : this->getAllTileConfigsToTest())
+            {
+                backend.runProfiler(num_tokens,
+                    gemm_to_profile == GemmProfilerBackend::GemmToProfile::GEMM_1 ? tactic.first : tactic.second,
+                    workspace, this->mStream->get());
+            }
+        }
+        ASSERT_EQ(cudaStreamSynchronize(this->mStream->get()), cudaSuccess);
+        ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    };
+    ASSERT_NO_THROW(test_func(GemmProfilerBackend::GemmToProfile::GEMM_1)) << "Failed to profile GEMM_1";
+    ASSERT_NO_THROW(test_func(GemmProfilerBackend::GemmToProfile::GEMM_2)) << "Failed to profile GEMM_2";
+}
+
 using MixtureOfExpertsProfilerTest = MixtureOfExpertsTest<WeightParams<half, half>>;
 
 TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
@@ -1864,28 +1907,30 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
 
             auto ws_size = backend.getWorkspaceSize(num_tokens);
             auto workspace = this->allocBuffer<char>(ws_size);
-
             int64_t num_experts_per_node = num_experts / ep;
 
             backend.prepare(num_tokens, workspace, mStream->get());
 
-            auto getNext = backend.getWorkspacePointerGenerator(
-                workspace, num_tokens, getSMVersion() >= 90 && getSMVersion() < 120);
-            auto const* expert_first_token_offset_size = reinterpret_cast<int64_t*>(getNext());
-            auto const* source_to_dest_map = reinterpret_cast<int*>(getNext());
-            auto const* dest_to_source_map = reinterpret_cast<int*>(getNext());
-            auto const* token_selected_experts = reinterpret_cast<int*>(getNext());
+            auto workspaces = backend.getProfilerWorkspaces(num_tokens, getSMVersion() >= 90 && getSMVersion() < 120);
+#define GET_WS_PTR(type, name) auto* name = reinterpret_cast<type>(workspace + workspaces.at(#name).second)
+
+            GET_WS_PTR(int64_t*, expert_first_token_offset);
+            GET_WS_PTR(int*, source_to_dest);
+            GET_WS_PTR(int*, dest_to_source);
+            GET_WS_PTR(int*, unpermuted_selected_experts);
+
+#undef GET_WS_PTR
 
             for (int sample = 0; sample < backend.NUM_ROUTING_SAMPLES; sample++)
             {
                 auto host_expert_first_token_offset_size = getDataFromDevice(
-                    expert_first_token_offset_size + sample * (num_experts_per_node + 1), num_experts_per_node + 1);
+                    expert_first_token_offset + sample * (num_experts_per_node + 1), num_experts_per_node + 1);
                 auto host_source_to_dest_map
-                    = getDataFromDevice(source_to_dest_map + sample * expanded_num_tokens, expanded_num_tokens);
+                    = getDataFromDevice(source_to_dest + sample * expanded_num_tokens, expanded_num_tokens);
                 auto host_dest_to_source_map
-                    = getDataFromDevice(dest_to_source_map + sample * expanded_num_tokens, expanded_num_tokens);
-                auto host_token_selected_experts
-                    = getDataFromDevice(token_selected_experts + sample * expanded_num_tokens, expanded_num_tokens);
+                    = getDataFromDevice(dest_to_source + sample * expanded_num_tokens, expanded_num_tokens);
+                auto host_token_selected_experts = getDataFromDevice(
+                    unpermuted_selected_experts + sample * expanded_num_tokens, expanded_num_tokens);
 
                 std::vector<int64_t> calculated_routing_values(num_experts_per_node + 1, 0);
                 int skipped = 0;
