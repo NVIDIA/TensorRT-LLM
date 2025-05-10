@@ -7,6 +7,7 @@ import itertools
 import math
 import os
 import traceback
+import weakref
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from typing import Any, Dict, Optional, Tuple
@@ -866,7 +867,7 @@ class PyTorchModelEngine(ModelEngine):
                 with MetaInitMode():
                     model = AutoModelForCausalLM.from_config(config)
 
-                memo = dict()
+                memo = weakref.WeakValueDictionary()
 
                 def init_meta_tensor(t: torch.Tensor):
                     if t.device != torch.device('meta'):
