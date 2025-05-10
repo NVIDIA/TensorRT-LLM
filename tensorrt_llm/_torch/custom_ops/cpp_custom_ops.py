@@ -103,71 +103,6 @@ def _register_fake():
         ret = mat1.new_empty(shape, dtype=out_dtype)
         return ret
 
-    @torch.library.register_fake("trtllm::attention")
-    def _(
-        q,
-        k,
-        v,
-        out_dtype,
-        workspace,
-        sequence_length,
-        host_past_key_value_lengths,
-        context_lengths,
-        host_context_lengths,
-        host_request_types,
-        kv_cache_block_offsets,
-        host_kv_cache_block_offsets,
-        host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping,
-        cache_indirection,
-        kv_scale_orig_quant,
-        kv_scale_quant_orig,
-        out_scale,
-        rotary_inv_freq,
-        rotary_cos_sin,
-        latent_cache,
-        q_pe,
-        block_ids_per_seq,
-        is_fused_qkv,
-        update_kv_cache,
-        predicted_tokens_per_seq,
-        layer_idx,
-        num_heads,
-        num_kv_heads,
-        head_size,
-        tokens_per_block,
-        max_num_requests,
-        max_context_length,
-        attention_window_size,
-        sink_token_length,
-        beam_width,
-        mask_type,
-        quant_mode,
-        q_scaling,
-        position_embedding_type,
-        rotary_embedding_dim,
-        rotary_embedding_base,
-        rotary_embedding_scale_type,
-        rotary_embedding_scale,
-        rotary_embedding_short_m_scale,
-        rotary_embedding_long_m_scale,
-        rotary_embedding_max_positions,
-        rotary_embedding_original_max_positions,
-        use_paged_context_fmha,
-        attention_input_type,
-        is_mla_enable,
-        q_lora_rank,
-        kv_lora_rank,
-        qk_nope_head_dim,
-        qk_rope_head_dim,
-        v_head_dim,
-        mrope_rotary_cos_sin,
-        mrope_position_deltas,
-    ):
-        output_shape = (q.shape[0], num_heads *
-                        v_head_dim if is_mla_enable else num_heads * head_size)
-        return q.new_empty(output_shape, dtype=out_dtype or q.dtype)
-
     @torch.library.register_fake("trtllm::noaux_tc_op")
     def _(scores, scores_with_bias, n_group, topk_group, topk,
           routed_scaling_factor):
@@ -191,43 +126,6 @@ def _register_fake():
         "tensorrt_llm::static_quantize_e4m3_per_tensor")
     def _(input: torch.Tensor, scale: torch.Tensor):
         return torch.empty_like(input).to(torch.float8_e4m3fn), scale
-
-    @torch.library.register_fake("trtllm::deepseek_allreduce_fusion")
-    def _(
-        input,
-        workspace,
-        reduce_fusion_inputs,
-        rank,
-        nranks,
-        eps,
-        fusion_op,
-    ):
-        from tensorrt_llm.functional import AllReduceFusionOp
-        residual = reduce_fusion_inputs[0]
-        if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4 or fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
-            sf_vec_size = 16
-            quant_shape, scale_shape = fp4_utils.get_fp4_shape(
-                input.shape, sf_vec_size)
-            if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
-                return [
-                    input.new_empty(quant_shape, dtype=torch.uint8),
-                    input.new_empty(scale_shape, dtype=torch.uint8),
-                    torch.empty_like(residual)
-                ]
-            else:
-                return [
-                    torch.empty_like(input),
-                    input.new_empty(quant_shape, dtype=torch.uint8),
-                    input.new_empty(scale_shape, dtype=torch.uint8),
-                    torch.empty_like(residual)
-                ]
-
-        elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
-            return [torch.empty_like(input), torch.empty_like(residual)]
-        elif fusion_op == AllReduceFusionOp.MOE_ALLREDUCE_RESIDUAL_RMS_NORM:
-            return [torch.empty_like(residual), torch.empty_like(residual)]
-        else:
-            raise ValueError(f"Unsupported fusion op: {fusion_op}")
 
     @torch.library.register_fake("trtllm::logits_bitmask")
     def _(logits: List[torch.Tensor], bitmask: List[torch.Tensor]):

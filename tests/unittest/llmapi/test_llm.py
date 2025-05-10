@@ -1329,6 +1329,7 @@ def test_executor_lookahead_decoding_config():
 
 
 def llama_v2_13b_lora_test_harness(**llm_kwargs):
+    # Shahar- perhaps disable build config
     hf_model_dir = get_model_path("llama-models-v2/llama-v2-13b-hf")
     hf_lora_dir = get_model_path("llama-models-v2/chinese-llama-2-lora-13b")
 

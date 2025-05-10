@@ -38,9 +38,6 @@ class TestResourceManager(unittest.TestCase):
         """
         Setup the lora test data resources
         """
-        # TODO smor- this should be ported to a different place, ideally run once
-        # in a similar way to the cpp tests fixutres.
-
         cpp_script_dir = os.path.join(cls.CPP_RESOURCES_DIR, "scripts")
 
         generate_lora_data_args_tp1 = [
@@ -258,7 +255,6 @@ class TestResourceManager(unittest.TestCase):
         Returns:
             tuple: (weights tensor, config tensor) formatted correctly for the C++ implementation.
         """
-        # TODO smor- change from custom path configuration to relative path
         lora_weights = np.load(self.TP1_WEIGHTS_PATH).astype(np.float16)
         lora_weights = np.expand_dims(lora_weights, axis=0)
         lora_config = np.load(self.TP1_CONFIG_PATH)

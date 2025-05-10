@@ -853,6 +853,7 @@ class TensorWrapper:
         dtype: Union[torch.dtype, str, np.dtype, trt.DataType],
         shape: Sequence[int],
     ):
+        assert isinstance(data_ptr, int)
         self._data_ptr = data_ptr
         self.dtype = dtype
         self.shape = shape
