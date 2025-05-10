@@ -14,7 +14,7 @@ from ..utils.logger import ad_logger
 from ._graph import canonicalize_graph, move_to_device
 from .export import torch_export_to_gm
 from .library import (
-    check_in_out_nodes,
+    bmm_shard,
     column_row_shard,
     eliminate_redundant_transposes,
     ep_shard,
@@ -33,6 +33,7 @@ from .library import (
     match_rope_v2,
     quantize,
     resize_kv_cache,
+    update_in_out_nodes,
 )
 
 
@@ -85,9 +86,7 @@ class InferenceOptimizer:
         ############################################################################################
 
         cm.info._set_example_sequence()
-        egm = torch_export_to_gm(
-            model, args=cm.args_original, dynamic_shapes=cm.original_dynamic_shapes
-        )
+        egm = torch_export_to_gm(model, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
         del model
         ad_logger.debug("original graph: " + str(egm))
         local_rank, world_size = dist_ad.get_rank_world_size()
@@ -135,6 +134,9 @@ class InferenceOptimizer:
 
         # run EP sharding across ranks
         egm = ep_shard(egm, local_rank, world_size)
+
+        # run BMM sharding across ranks
+        egm = bmm_shard(egm, local_rank, world_size)
 
         # let's run a shape propagation pass to update the graph with correct meta values for
         # subsequent optimization passes
@@ -184,13 +186,11 @@ class InferenceOptimizer:
         # HANDLE CACHES
         ############################################################################################
 
-        input_nodes = check_in_out_nodes(egm)
+        egm = update_in_out_nodes(egm, cm)
 
         # detect attention op and replace with cache-aware op
         for attn_descriptor in [self.attention_op, self.mla_op]:
-            egm = insert_cached_attention(
-                egm, cm, attn_descriptor, self.factory.get_cache_config(), input_nodes
-            )
+            egm = insert_cached_attention(egm, cm, attn_descriptor, self.factory.get_cache_config())
 
         # initialize cache on correct device
         cm.initialize_caches()

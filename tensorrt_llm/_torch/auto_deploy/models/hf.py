@@ -12,7 +12,13 @@ from accelerate import init_empty_weights
 from huggingface_hub import snapshot_download
 from huggingface_hub.utils import HFValidationError, validate_repo_id
 from torch._prims_common import DeviceLikeType
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoTokenizer,
+    PretrainedConfig,
+)
 from transformers.modeling_utils import load_sharded_checkpoint, load_state_dict
 
 from ..custom_ops.attention_interface import CacheConfig
@@ -59,8 +65,8 @@ def _to_maybe_empty(model: nn.Module, device: DeviceLikeType):
     )
 
 
-@ModelFactoryRegistry.register("hf")
-class HFFactory(ModelFactory):
+@ModelFactoryRegistry.register("AutoModelForCausalLM")
+class AutoModelForCausalLMFactory(ModelFactory):
     def __init__(
         self,
         model_kwargs: Optional[Dict[str, Any]] = None,
@@ -70,9 +76,11 @@ class HFFactory(ModelFactory):
         super().__init__(**kwargs)
 
         self.model_kwargs = model_kwargs or {}
-        self.model_kwargs["use_cache"] = False
         self.tokenizer_kwargs = tokenizer_kwargs or {}
         self._quant_config = None
+
+        # heuristic to disable use_cache
+        self.model_kwargs["use_cache"] = False
 
         # prefetch the model+checkpoint
         self.prefetch_checkpoint()
@@ -100,15 +108,46 @@ class HFFactory(ModelFactory):
         """
         return type(model).forward(model, input_ids=input_ids, position_ids=position_ids)
 
+    def _recursive_update_config(self, config: PretrainedConfig, update_dict: Dict[str, Any]):
+        """
+        Recursively update a PretrainedConfig object with values from update_dict.
+
+        Args:
+            config: PretrainedConfig object to update
+            update_dict: Dictionary with values to update in the config
+
+        Returns:
+            The updated PretrainedConfig object
+        """
+        for key, value_new in update_dict.items():
+            # Check if the key exists in config
+            if not hasattr(config, key):
+                continue
+
+            target_value = getattr(config, key)
+
+            # Handle nested PretrainedConfig objects...
+            if isinstance(value_new, dict) and isinstance(target_value, PretrainedConfig):
+                # Recursively update nested configs
+                updated_value = self._recursive_update_config(target_value, value_new)
+                setattr(config, key, updated_value)
+            else:
+                # Direct update for simple values
+                setattr(config, key, value_new)
+
+        return config
+
     def build_model(self, device: DeviceLikeType) -> nn.Module:
         """Build the model on the desired device."""
         # We only support fp16 to fp4 conversion.
         if self._quant_config and self._quant_config.get("quant_algo", None) == "NVFP4":
             self.model_kwargs["torch_dtype"] = torch.half
 
-        model_config = self.autoconfig_from_pretrained(
-            self.model, trust_remote_code=True, **self.model_kwargs
-        )
+        # NOTE (lucaslie): HF doesn't recursively update nested PreTrainedConfig objects. Instead,
+        # the entire subconfig will be overwritten.
+        # we want to recursively update model_config from model_kwargs here.
+        model_config = self.autoconfig_from_pretrained(self.model, trust_remote_code=True)
+        model_config = self._recursive_update_config(model_config, self.model_kwargs)
 
         with (init_empty_weights if device == "meta" else nullcontext)():
             default_dtype = torch.get_default_dtype()
@@ -226,3 +265,21 @@ class HFFactory(ModelFactory):
                 # We do not quantize lm_head.
                 if "exclude_modules" not in self._quant_config:
                     self._quant_config["exclude_modules"] = ["lm_head"]
+
+
+@ModelFactoryRegistry.register("AutoModelForImageTextToText")
+class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # additional heuristic to disable use_cache
+        self.model_kwargs["text_config"] = self.model_kwargs.get("text_config", {})
+        self.model_kwargs["text_config"]["use_cache"] = False
+
+        self.model_kwargs["text_config"]["max_position_embeddings"] = self.model_kwargs[
+            "max_position_embeddings"
+        ]
+
+    @property
+    def automodel_from_config(self):
+        return AutoModelForImageTextToText.from_config
