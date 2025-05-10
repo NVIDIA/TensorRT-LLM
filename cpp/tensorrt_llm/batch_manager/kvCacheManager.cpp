@@ -130,7 +130,6 @@ KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx)
     , mRefCount(0)
     , mSchedulingRefCount(0)
     , mPrevBlock(nullptr)
-    , mFreeBlockIterator(std::nullopt)
     , mIsFull{false}
     , mPriority{executor::KvCacheRetentionConfig::kDefaultRetentionPriority}
     , mDurationMs{std::nullopt}
@@ -778,6 +777,10 @@ BlockPtr WindowBlockManager::getFreeBlock(
     ++mAllocTotalBlocks;
     if (!block->getUniqueTokens().empty() && canOffload && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0)
     {
+        // Since `claimBlock` resets link between parentBlock and block
+        // we need to save origin parent block.
+        const auto parentBlock = block.getPrevBlock(); 
+
         // If we're swapping a block to secondary memory, maintain the prior priority values.
         mEvictionPolicy->claimBlock(block);
         // Offload block in primary memory before repurposing
@@ -791,6 +794,11 @@ BlockPtr WindowBlockManager::getFreeBlock(
             mEventManager->enqueueUpdatedEvent(
                 tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel));
         }
+
+        // Restores the link between the parent and the block (which is offloaded).
+        mEvictionPolicy->processAddChild(parentBlock);
+        parentBlock->addNextBlock(block->getBlockKey(), block);
+
         mEvictionPolicy->releaseBlock(block); // append offload block to mFreeSecondaryBlocks queue
         block = offloadBlock;
     }
@@ -1267,6 +1275,8 @@ void WindowBlockManager::storeBlocks(
             block->setPrevBlock(searchRoot);
             block->setPrevBlockInSeq(searchRoot);
             searchRoot->addNextBlock(blockKey, block);
+            // Update evection data structure.
+            mEvictionPolicy->processAddChild(searchRoot);
 
             // Sanity check. The list of stored blocks should be connected.
             TLLM_CHECK(storedBlocks.empty() || block->getPrevBlock() == storedBlocks.back());
