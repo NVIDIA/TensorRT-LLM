@@ -24,6 +24,7 @@
 #include <ifaddrs.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <nixl_types.h>
 #include <unistd.h>
 
 namespace tensorrt_llm::executor::kv_cache
@@ -243,6 +244,14 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, AgentDesc const
         name == remoteName, "loadRemoteAgent gets error agent name: %s != %s", name.c_str(), remoteName.c_str());
 }
 
+AgentDesc NixlTransferAgent::getLocalAgentDesc()
+{
+    nixl_blob_t desc;
+    nixl_status_t status = mRawAgent->getLocalMD(desc);
+    TLLM_CHECK(status == NIXL_SUCCESS);
+    return AgentDesc{desc};
+}
+
 void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 {
     mRawAgent->invalidateRemoteMD(name);
@@ -267,12 +276,12 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     // UCX AM with desc list is faster than listener thread can recv/load MD with sockets
     // Will be deprecated with ETCD or callbacks
 
-    do
-    {
-        status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()),
-            NixlHelper::convertXferDist(request.getSrcDescs()), NixlHelper::convertXferDist(request.getDstDescs()),
-            request.getRemoteName(), handle, &mExtraParams);
-    } while (status == NIXL_ERR_NOT_FOUND);
+    // do
+    // {
+    status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()),
+        NixlHelper::convertXferDist(request.getSrcDescs()), NixlHelper::convertXferDist(request.getDstDescs()),
+        request.getRemoteName(), handle, &mExtraParams);
+    // } while (status == NIXL_ERR_NOT_FOUND);
 
     TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS, " rank: %d createXferReq failed with status: %s remoteAgent name: %s",
         mpi::MpiComm::world().getRank(), nixlEnumStrings::statusStr(status).c_str(), request.getRemoteName().c_str());
@@ -316,9 +325,9 @@ void NixlTransferAgent::connectRemoteAgent(std::string const& name, ConnectionIn
     auto status = mRawAgent->fetchRemoteMD(name, &md_extra_params);
     TLLM_CHECK_WITH_INFO(
         status == NIXL_SUCCESS, "fetchRemoteMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
-    status = mRawAgent->sendLocalMD(&md_extra_params);
-    TLLM_CHECK_WITH_INFO(
-        status == NIXL_SUCCESS, "sendLocalMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+    // status = mRawAgent->sendLocalMD(&md_extra_params);
+    // TLLM_CHECK_WITH_INFO(
+    //     status == NIXL_SUCCESS, "sendLocalMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
 
     status = NIXL_ERR_NOT_FOUND;
     nixl_xfer_dlist_t descs{DRAM_SEG};

@@ -60,6 +60,8 @@ public:
 
     void loadRemoteAgent(std::string const& name, AgentDesc const& agentDesc) override;
 
+    AgentDesc getLocalAgentDesc() override;
+
     void invalidateRemoteAgent(std::string const& name) override;
 
     [[nodiscard]] std::unique_ptr<TransferStatus> submitTransferRequests(TransferRequest const& request) override;

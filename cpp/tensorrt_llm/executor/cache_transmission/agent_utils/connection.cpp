@@ -40,6 +40,7 @@ AgentConnection::AgentConnection(
     , mRemoteAgentName(mRemoteAgentName)
     , mAgentConnectionManager(mAgentConnectionManager)
     , mCacheTransBufferManager(mAgentConnectionManager->getCacheTransBufferManager())
+    , mNeedSendMetadata(true)
 {
     TLLM_CHECK(mAgentConnectionManager != nullptr);
     TLLM_CHECK(mCacheTransBufferManager != nullptr);
@@ -56,7 +57,6 @@ void MemoryDesc::serialize(MemoryDesc const& memoryDesc, std::ostream& os)
     su::serialize(memoryDesc.mAddr, os);
     su::serialize(memoryDesc.mLen, os);
     su::serialize(memoryDesc.mDeviceId, os);
-    // su::serialize(memoryDesc.mType, os);
 }
 
 MemoryDesc MemoryDesc::deserialize(std::istream& is)
@@ -119,7 +119,16 @@ void AgentConnection::sendRequestAndBufferInfo(
     MemoryDesc bufferDesc(
         reinterpret_cast<uintptr_t>(preAllocateBuffer->data()), preAllocateBuffer->getSize(), deviceId);
     std::string address = mAgentConnectionManager->getAgent()->getConnectionInfo();
-    RequestAndBufferInfo requestAndBufferInfo{mAgentName, address, requestInfo, bufferDesc, validConnectionIdx};
+    std::optional<std::string> metadataOpt = std::nullopt;
+    if (mNeedSendMetadata)
+    {
+        auto metadata = mAgentConnectionManager->getAgent()->getLocalAgentDesc().getBackendAgentDesc();
+        metadataOpt = metadata;
+        mNeedSendMetadata = false;
+    }
+
+    RequestAndBufferInfo requestAndBufferInfo{
+        mAgentName, address, requestInfo, bufferDesc, metadataOpt, validConnectionIdx};
     std::stringstream ss;
     NotificationInfo notificationInfo{requestAndBufferInfo};
     NotificationInfo::serialize(notificationInfo, ss);
@@ -233,10 +242,11 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
                     requestInfo = requestAndBufferInfo.mRequestInfo;
                     auto address = requestAndBufferInfo.mAddress;
                     auto bufferDesc = requestAndBufferInfo.mBufferDesc;
+                    auto metadataOpt = requestAndBufferInfo.mMetadata;
                     auto validConnectionIdx = requestAndBufferInfo.mValidConnectionIdx;
                     auto remoteAgentName = requestAndBufferInfo.mAgentName;
                     TLLM_LOG_DEBUG(" recv Address:%s", address.c_str());
-                    auto connection = connect(remoteAgentName, address);
+                    auto connection = connect(remoteAgentName, address, metadataOpt);
                     connection->setSenderState(bufferDesc, validConnectionIdx);
                     it2 = notifs.erase(it2);
                     if (notifs.empty())
@@ -304,17 +314,27 @@ batch_manager::kv_cache_manager::CacheTransBufferManager* AgentConnectionManager
     return mCacheTransBufferManager;
 }
 
-AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentName, std::string const& connecitonInfo)
+AgentConnection* AgentConnectionManager::connect(
+    std::string const& remoteAgentName, std::string const& connecitonInfo, std::optional<std::string> metadata)
 {
 
     std::scoped_lock lock(mConnectionsMutex);
     auto it = mConnections.find(remoteAgentName);
     if (it != mConnections.end())
     {
+        TLLM_CHECK_WITH_INFO(!metadata.has_value(), "should not send metadata twice");
         return it->second.get();
     }
+    if (metadata.has_value())
+    {
 
-    m_Agent->connectRemoteAgent(remoteAgentName, connecitonInfo);
+        m_Agent->loadRemoteAgent(remoteAgentName, AgentDesc{metadata.value()});
+    }
+    else
+    {
+        m_Agent->connectRemoteAgent(remoteAgentName, connecitonInfo);
+    }
+
     auto connection = std::make_shared<AgentConnection>(mAgentName, remoteAgentName, this);
     mConnections[remoteAgentName] = connection;
     return connection.get();
@@ -399,12 +419,12 @@ std::string const& AgentConnectionManager::getAgentName() const
 
 AgentConnectionManager::~AgentConnectionManager()
 {
-    // TLLM_LOG_INFO("AgentConnectionManager::~AgentConnectionManager: agentName: %s", mAgentName.c_str());
+
+    m_Agent->deregisterMemory(mRegMemDescs);
+
     // for (auto& [agent, connection] : mConnections)
     // {
-    //     TLLM_LOG_INFO("AgentConnectionManager::~AgentConnectionManager: invalidateremoteAgentName: %s",
-    //     agent.c_str()); m_Agent->invalidateRemoteAgent(agent);
+    //     m_Agent->invalidateRemoteAgent(agent);
     // }
-    m_Agent->deregisterMemory(mRegMemDescs);
 }
 } // namespace tensorrt_llm::executor::kv_cache

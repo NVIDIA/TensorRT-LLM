@@ -34,6 +34,7 @@ struct RequestAndBufferInfo
     std::string mAddress;
     batch_manager::RequestInfo mRequestInfo;
     MemoryDesc mBufferDesc;
+    std::optional<std::string> mMetadata;
     int mValidConnectionIdx;
 
     static void serialize(RequestAndBufferInfo const& requestAndBufferInfo, std::ostream& os)
@@ -43,6 +44,7 @@ struct RequestAndBufferInfo
         su::serialize(requestAndBufferInfo.mAddress, os);
         batch_manager::RequestInfo::serialize(requestAndBufferInfo.mRequestInfo, os);
         MemoryDesc::serialize(requestAndBufferInfo.mBufferDesc, os);
+        su::serialize(requestAndBufferInfo.mMetadata, os);
         su::serialize(requestAndBufferInfo.mValidConnectionIdx, os);
     }
 
@@ -53,8 +55,9 @@ struct RequestAndBufferInfo
         auto address = su::deserialize<decltype(mAddress)>(is);
         auto requestInfo = batch_manager::RequestInfo::deserialize(is);
         auto bufferDesc = MemoryDesc::deserialize(is);
+        auto metadata = su::deserialize<decltype(mMetadata)>(is);
         auto validConnectionIdx = su::deserialize<decltype(mValidConnectionIdx)>(is);
-        return RequestAndBufferInfo{agentName, address, requestInfo, bufferDesc, validConnectionIdx};
+        return RequestAndBufferInfo{agentName, address, requestInfo, bufferDesc, metadata, validConnectionIdx};
     }
 
     static size_t serializedSize(RequestAndBufferInfo const& requestAndBufferInfo)
@@ -63,6 +66,7 @@ struct RequestAndBufferInfo
         return su::serializedSize(requestAndBufferInfo.mAgentName) + su::serializedSize(requestAndBufferInfo.mAddress)
             + batch_manager::RequestInfo::serializedSize(requestAndBufferInfo.mRequestInfo)
             + MemoryDesc::serializedSize(requestAndBufferInfo.mBufferDesc)
+            + su::serializedSize(requestAndBufferInfo.mMetadata)
             + su::serializedSize(requestAndBufferInfo.mValidConnectionIdx);
     }
 };
@@ -190,6 +194,7 @@ private:
     batch_manager::kv_cache_manager::CacheTransBufferManager* mCacheTransBufferManager;
     std::optional<size_t> mCacheBufferId;
     SenderState mSenderState;
+    bool mNeedSendMetadata{true};
 };
 
 class AgentConnectionManager : public ConnectionManager
@@ -204,7 +209,8 @@ public:
     [[nodiscard]] batch_manager::kv_cache_manager::CacheTransBufferManager* getCacheTransBufferManager();
     void updateUnhandledNotifications();
     [[nodiscard]] BaseTransferAgent* getAgent() const;
-    AgentConnection* connect(std::string const& remoteAgentName, std::string const& address);
+    AgentConnection* connect(std::string const& remoteAgentName, std::string const& address,
+        std::optional<std::string> metadata = std::nullopt);
     int getDeviceId() const;
     [[nodiscard]] std::string const& getAgentName() const;
     void waitForSyncInfo(std::string const& remoteAgentName, NotificationSyncInfo const& syncInfo);

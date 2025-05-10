@@ -207,6 +207,7 @@ public:
     virtual void deregisterMemory(RegisterDescs const& descs) = 0;
 
     virtual void loadRemoteAgent(std::string const& name, AgentDesc const& agentDesc) = 0;
+    virtual AgentDesc getLocalAgentDesc() = 0;
 
     virtual void invalidateRemoteAgent(std::string const& name) = 0;
 
