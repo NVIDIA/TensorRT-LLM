@@ -58,6 +58,67 @@ class RMSNorm(nn.Module):
             return hidden_states, residual
 
 
+class GroupRMSNorm(nn.Module):
+    """A quick drop-in replacement for the RMSNorm Op.
+    With optimization, the pure functions should be good for production.
+    However, the modeling.py queries the weight and variance_epsilon.
+    Therefore, copy the original RMSNorm Op for now.
+
+    Notes:
+        - Replace flashinfer_rmsnorm with group_rms_norm.
+        - Reuse flashinfer_fused_add_rmsnorm since not supported in group_rms_norm.
+        - Any query to weights could be removed/further optimized since they are just torch.ones_like(input), but keep it to minimize the modeling.py changes for now.
+    """
+
+    def __init__(self,
+                 *,
+                 hidden_size: int,
+                 eps: float,
+                 dtype: Optional[torch.dtype] = None,
+                 device: Optional[torch.device] = None,
+                 has_weights: bool = True):
+        super().__init__()
+        if has_weights:
+            self.weight = nn.Parameter(
+                torch.ones(hidden_size, dtype=dtype, device=device))
+        else:
+            self.register_buffer('weight',
+                                 torch.ones(hidden_size,
+                                            dtype=dtype,
+                                            device=device),
+                                 persistent=False)
+        self.variance_epsilon = eps
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor] = ...,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if IS_FLASHINFER_AVAILABLE:
+            from ..custom_ops import flashinfer_fused_add_rmsnorm
+            if isinstance(residual, torch.Tensor):
+                flashinfer_fused_add_rmsnorm(hidden_states, residual,
+                                             self.weight, self.variance_epsilon)
+            else:
+                hidden_states = group_rms_norm([hidden_states],
+                                               eps=self.variance_epsilon)[0]
+        else:
+            input_dtype = hidden_states.dtype
+            hidden_states = hidden_states.to(torch.float32)
+            if isinstance(residual, torch.Tensor):
+                hidden_states = hidden_states + residual.to(torch.float32)
+                residual = hidden_states.to(input_dtype)
+            variance = hidden_states.pow(2).mean(-1, keepdim=True)
+            hidden_states = hidden_states * torch.rsqrt(variance +
+                                                        self.variance_epsilon)
+            hidden_states = self.weight * hidden_states.to(input_dtype)
+
+        if residual is ...:
+            return hidden_states
+        else:
+            return hidden_states, residual
+
+
 def group_rms_norm(
         inputs: list[torch.Tensor],
         weights: Optional[list[torch.Tensor]] = [],
