@@ -191,7 +191,34 @@ class ModelConfig(Generic[TConfig]):
             data_type=torch_dtype_to_binding(
                 self.pretrained_config.torch_dtype))
 
-        mlp_hidden_size = self.pretrained_config.intermediate_size // self.mapping.tp_size
+        if self.pretrained_config.intermediate_size is not None:
+            mlp_hidden_size = self.pretrained_config.intermediate_size // self.mapping.tp_size
+        else:
+            try:
+                architectures = self.pretrained_config.architectures
+                if len(architectures
+                       ) == 1 and architectures[0] == "DeciLMForCausalLM":
+                    # TODO smor: this is a hack to support Nemotron-Super-49B-v1 with LoRA (https://jirasw.nvidia.com/browse/TRTLLM-5045)
+                    # Nemotron-NAS has variable ffn_mult for each layer, we need to find the maximum
+                    # so that we don't set a too small mlp_hidden_size. This solution leads to a memory
+                    # consumption that is higher than required.
+                    biggest_ffn_mult = max([
+                        x.ffn.ffn_mult
+                        for x in self.pretrained_config.block_configs
+                    ])
+
+                    from tensorrt_llm._torch.models.modeling_nemotron_nas import \
+                        _ffn_mult_to_intermediate_size
+                    mlp_hidden_size = _ffn_mult_to_intermediate_size(
+                        biggest_ffn_mult, self.pretrained_config.hidden_size)
+                else:
+                    raise ValueError(
+                        f"Inferring mlp hidden size for model architecture: {architectures} isn't supported yet"
+                    )
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to infer mlp hidden size because: {e}") from e
+
         if "head_size" in self.pretrained_config:
             head_size = self.pretrained_config.head_size
         else:

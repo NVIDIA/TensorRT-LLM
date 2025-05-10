@@ -772,14 +772,18 @@ class LlamaModel(DecoderModel):
 
         vocab_size = config.vocab_size
         # TODO smor- we load manually only if there is a single lora dir, need to come up with a better solution
+        has_custom_embed_tokens = False
         if hasattr(
                 model_config,
                 'lora_config') and model_config.lora_config is not None and len(
                     model_config.lora_config.lora_dir) == 1:
             from tensorrt_llm.lora_manager import HfLoraLoader
             lora_loader = HfLoraLoader(model_config.lora_config.lora_dir)
-            weight = lora_loader.embed_tokens
-            vocab_size = lora_loader.vocab_size
+            if lora_loader.vocab_size != 0:
+                vocab_size = lora_loader.vocab_size
+            if lora_loader.embed_tokens is not None:
+                weight = lora_loader.embed_tokens
+                has_custom_embed_tokens = True
 
         self.embed_tokens = Embedding(
             vocab_size,
@@ -790,10 +794,7 @@ class LlamaModel(DecoderModel):
             gather_output=True,
         )
 
-        if hasattr(
-                model_config,
-                'lora_config') and model_config.lora_config is not None and len(
-                    model_config.lora_config.lora_dir) == 1:
+        if has_custom_embed_tokens:
             with torch.no_grad():
                 if model_config.mapping.tp_size > 1:
                     weight = split_matrix_tp(
