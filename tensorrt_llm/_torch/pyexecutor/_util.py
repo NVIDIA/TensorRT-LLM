@@ -95,7 +95,8 @@ def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
         draft_model_config, mapping) if draft_model_config is not None else 0
     kv_size_per_token = model_kv_size_per_token + draft_kv_size_per_token
 
-    available_kv_mem = total_gpu_memory * fraction - peak_memory + alloc_kv_tokens * kv_size_per_token
+    available_kv_mem = (total_gpu_memory - peak_memory +
+                        alloc_kv_tokens * kv_size_per_token) * fraction
     logger.info(
         f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
         f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
