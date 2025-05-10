@@ -74,7 +74,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                  world_config: WorldConfig,
                  use_kv_cache: bool,
                  lora_manager: Optional[LoraManager] = None) -> None:
-        self.session = executor
+        self.executor = executor
         self.max_batch_size = max_batch_size
         self.max_input_len = max_input_len
         self.max_seq_len = max_seq_len
@@ -611,7 +611,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 'Disabled KV cache is intended for context phase only now.')
 
         # If we are in a multi-gpu scenario, only rank 0 continues
-        if not self.session.can_enqueue_requests():
+        if not self.executor.can_enqueue_requests():
             return []
 
         # Convert tensor input to plain lists
@@ -784,7 +784,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                      language_adapter_uids, sampling_config_list))
         ]
 
-        request_ids = self.session.enqueue_requests(requests)
+        request_ids = self.executor.enqueue_requests(requests)
         if not streaming:
             return self._initialize_and_fill_output(
                 request_ids=request_ids,
@@ -928,10 +928,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
         output_ids = [[[] for _ in range(num_sequences)]
                       for _ in range(len(request_ids))]
 
-        multi_responses = self.session.await_responses(request_ids)
-        responses = [
-            response for responses in multi_responses for response in responses
-        ]
+        responses = []
+        while len(responses) < len(request_ids) * num_sequences:
+            responses.extend(self.executor.await_responses())
 
         return self._fill_output(
             responses=responses,
@@ -977,7 +976,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
         finished_request_ids = set()
         while finished_request_ids != set(request_ids):
-            responses = self.session.await_responses()
+            responses = self.executor.await_responses()
             for response in responses:
                 if response.result.is_final:
                     finished_request_ids.add(response.request_id)
