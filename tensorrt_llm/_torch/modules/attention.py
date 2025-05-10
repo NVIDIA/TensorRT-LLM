@@ -127,6 +127,9 @@ class Attention(nn.Module):
             skip_create_weights=config.skip_create_weights,
             use_llama4_qkv=is_llama4,
         )
+        # o_proj is not feasible for trtllm-gen kernel because tileK in the kernel is 512.
+        # The kernel requires K to be multiple of 512.
+        # hidden_size is 5120, with TP8 we have local in_features (K) = 640.
         self.o_proj = Linear(
             self.hidden_size,
             self.hidden_size,

@@ -94,8 +94,9 @@ class GatedMLP(nn.Module):
             # In llama4, the custom kernel (triggered by use_llama4_fc_swiglu_kernel)
             # is outputing fp8. The current setting is assuming bf16 out, so we need
             # to provide the inv_input_scale of this layer to it to offset the un-needed
-                # quantization.
+            # quantization.
             previous_gate_up_proj=self.gate_up_proj,
+            use_llama4_trtllm_gen=is_llama4,
         )
 
         # These two modules are mutually exclusive - either splitted_gate_up_lora or fused_gate_up_lora will be used,
