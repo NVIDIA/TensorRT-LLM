@@ -386,6 +386,7 @@ class FusedMoE(nn.Module):
 
         if self.is_trtllm():
             # trtllm_gen backend only support min-latency mode now
+            assert not self.apply_router_weight_on_input, "TRTLLM backend does not support applying router weight on input yet."
             assert not self.reduce_results
             assert self.quant_config and (
                 self.quant_config.quant_mode.has_nvfp4()
@@ -691,9 +692,19 @@ class FusedMoE(nn.Module):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         cutlass_min_latency_mode: bool = False,
+        llama4_tp8ep1_min_latency_mode: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens=None,
     ) -> torch.Tensor:
+        # When running tp8ep1 on fp8 128 experts llama4, we use min latency gemv kernels to run moe.
+        if llama4_tp8ep1_min_latency_mode:
+            x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                x, self.fc31_input_dequant)
+            outputs = torch.ops.trtllm.fused_moe_llama4_tp8ep1_min_latency(
+                x, router_logits, self.w3_w1_weight, self.w2_weight,
+                self.quant_scales)
+            return outputs
+
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
             output_dtype = output_dtype
@@ -713,6 +724,7 @@ class FusedMoE(nn.Module):
         assert token_selected_experts.dtype == torch.int32
 
         if self.apply_router_weight_on_input:
+            assert x.dtype != torch.float8_e4m3fn, "Current workaround for apply_router_weight_on_input does not support fp8 input"
             x = x * token_final_scales.to(x.dtype)
             # TODO: remove this once we have correct fusedmoe kernel ready
             token_final_scales = None
@@ -836,6 +848,7 @@ class FusedMoE(nn.Module):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         cutlass_min_latency_mode: bool = False,
+        llama4_tp8ep1_min_latency_mode: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
@@ -844,8 +857,9 @@ class FusedMoE(nn.Module):
         """
         if self.is_cutlass():
             return self.forward_cutlass(x, router_logits,
-                                        cutlass_min_latency_mode, output_dtype,
-                                        all_rank_num_tokens)
+                                        cutlass_min_latency_mode,
+                                        llama4_tp8ep1_min_latency_mode,
+                                        output_dtype, all_rank_num_tokens)
         elif self.is_trtllm():
             return self.forward_trtllmgen(x, router_logits)
         else:
@@ -858,11 +872,11 @@ class FusedMoE(nn.Module):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         cutlass_min_latency_mode: bool = False,
+        llama4_tp8ep1_min_latency_mode: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
         assert self.is_cutlass()
-
         max_chunk_size = self.moe_max_num_tokens
         if self.use_dp:
             assert all_rank_num_tokens is not None
@@ -883,6 +897,7 @@ class FusedMoE(nn.Module):
                 x,
                 router_logits,
                 cutlass_min_latency_mode,
+                llama4_tp8ep1_min_latency_mode,
                 output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens)
             outputs = self.reducescatter_or_allreduce(outputs)

@@ -401,6 +401,14 @@ class Linear(nn.Module):
             assert all_reduce_params is None or all_reduce_params.enable_allreduce is False, "Cannot fuse norm/residual/bias ops into allreduce op since we do not call allreduce op when tp_size is 1."
             return False
 
+    def llama4_router_forward(self, input: torch.Tensor):
+        # This magic number 4 is empircal choice, and can be changed later.
+        if input.shape[0] <= 4:
+            return torch.ops.trtllm.llama4_router_gemm(
+                input, torch.transpose(self.weight, 0, 1))
+        else:
+            return self.forward(input)
+
     def forward(
         self,
         input: Union[torch.Tensor, Fp4QuantizedTensor],

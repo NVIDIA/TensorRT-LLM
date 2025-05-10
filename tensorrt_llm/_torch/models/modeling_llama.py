@@ -57,8 +57,10 @@ class Llama4Attention(Attention):
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         self.use_rope = not nope_layer
+        self.attn_temperature_tuning = nope_layer and attn_temperature_tuning
         self.use_qk_norm = use_qk_norm and not nope_layer
-        if self.use_rope and not self.use_qk_norm:
+        if self.use_rope and not self.use_qk_norm and not self.attn_temperature_tuning and model_config.fuse_pos_embd:
+            # We can fuse pos embed only when: is_rope=True, is_qk_norm=False and fuse_pos_embd=True
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gptj,
                 rope=RopeParams.from_config(config),
@@ -95,7 +97,6 @@ class Llama4Attention(Attention):
         else:
             self.qk_norm = None
 
-        self.attn_temperature_tuning = attn_temperature_tuning and nope_layer
         self.floor_scale = getattr(config, "floor_scale", 8192.0)
         self.attn_scale = getattr(config, "attn_scale", 0.1)
 
@@ -265,6 +266,16 @@ class Llama4MoE(nn.Module):
         config = model_config.pretrained_config
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.top_k = top_k
+
+        self.shared_expert = GatedMLP(
+            hidden_size=hidden_size,
+            intermediate_size=shared_expert_intermediate_size,
+            bias=False,
+            dtype=dtype,
+            config=model_config,
+            overridden_tp_size=1 if self.enable_attention_dp else None,
+            reduce_output=False)
+
         self.experts = FusedMoE(
             routing_method=Llama4RenormalizeMoeRoutingMethod(top_k),
             num_experts=num_experts,
@@ -276,15 +287,6 @@ class Llama4MoE(nn.Module):
             weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             model_config=model_config,
             apply_router_weight_on_input=True)
-
-        self.shared_expert = GatedMLP(
-            hidden_size=hidden_size,
-            intermediate_size=shared_expert_intermediate_size,
-            bias=False,
-            dtype=dtype,
-            config=model_config,
-            overridden_tp_size=1 if self.enable_attention_dp else None,
-            reduce_output=False)
 
         self.router = Linear(hidden_size,
                              num_experts,
@@ -298,17 +300,19 @@ class Llama4MoE(nn.Module):
         self.aux_stream = aux_stream
 
     def compute_routed_output(self, hidden_states, all_rank_num_tokens,
-                              cutlass_min_latency_mode):
+                              cutlass_min_latency_mode,
+                              llama4_tp8ep1_min_latency_mode):
         if self.enable_attention_dp and self.mapping.tp_size > 1:
             max_num_token_across_dp_ranks = max(all_rank_num_tokens)
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
                 (0, 0, 0,
                  max_num_token_across_dp_ranks - hidden_states.shape[0]))
-        router_logits = self.router(hidden_states)
+        router_logits = self.router.llama4_router_forward(hidden_states)
         routed_output = self.experts(hidden_states,
                                      router_logits,
                                      cutlass_min_latency_mode,
+                                     llama4_tp8ep1_min_latency_mode,
                                      all_rank_num_tokens=all_rank_num_tokens)
         return routed_output
 
@@ -318,12 +322,14 @@ class Llama4MoE(nn.Module):
         all_rank_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         cutlass_min_latency_mode: Optional[bool] = False,
+        llama4_tp8ep1_min_latency_mode: Optional[bool] = False,
     ) -> torch.Tensor:
         # Only enable multi-stream for cuda graph since switch stream has extra host overhead
         # This design is mainly for low latency use case. Need to improve for max throughput use case.
         fn0 = lambda: self.shared_expert(hidden_states)
         fn1 = lambda: self.compute_routed_output(
-            hidden_states, all_rank_num_tokens, cutlass_min_latency_mode)
+            hidden_states, all_rank_num_tokens, cutlass_min_latency_mode,
+            llama4_tp8ep1_min_latency_mode)
         shared_output, routed_output = maybe_execute_in_parallel(
             fn0, fn1, self.moe_event[0], self.moe_event[1], self.aux_stream)
         if cutlass_min_latency_mode:
@@ -352,14 +358,21 @@ class Llama4DecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
         self.is_quanted = model_config.quant_config and model_config.quant_config.quant_mode.has_any_quant(
         )
+        self.is_fp8_quant = self.is_quanted and model_config.quant_config.quant_mode.has_fp8_qdq(
+        )
+        self.is_nvfp4 = self.is_quanted and model_config.quant_config.quant_mode.has_nvfp4(
+        )
+        self.tp_size = model_config.mapping.moe_tp_size
+        self.ep_size = model_config.mapping.moe_ep_size
+        self.num_experts = model_config.pretrained_config.num_local_experts
+        self.topk = model_config.pretrained_config.num_experts_per_tok
+        self.hidden_size = model_config.pretrained_config.hidden_size
+        self.intermediate_size = model_config.pretrained_config.intermediate_size
+
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
 
         self.fusion_config = EagerFusionConfig()
-        # self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp(
-        # )
-        # TODO: re-enable these fusions
-        self.fusion_config.PRE_MOE_FUSION = False
-        self.fusion_config.POST_MLP_FUSION = False
+        self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp()
 
         self.self_attn = Llama4Attention(
             model_config,
@@ -383,8 +396,8 @@ class Llama4DecoderLayer(DecoderLayer):
                 layer_idx=layer_idx,
             )
 
-            # self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp(
-            # )
+            self.fusion_config.PRE_MLP_FUSION = model_config.mapping.has_tp()
+            self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp()
         else:
             self.feed_forward = Llama4MoE(
                 num_experts=config.num_local_experts,
@@ -396,8 +409,8 @@ class Llama4DecoderLayer(DecoderLayer):
                 aux_stream=aux_stream,
                 dtype=config.torch_dtype)
 
-            # self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp(
-            # )
+            self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp()
+            self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp()
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -424,12 +437,13 @@ class Llama4DecoderLayer(DecoderLayer):
     ) -> torch.Tensor:
         # Only enable min-latency mode on Blackwell
         # TODO: Remove it after we fix crash on Hopper
-        # major, minor = torch.cuda.get_device_capability()
-        # is_blackwell = (major * 10 + minor) >= 100
+        major, minor = torch.cuda.get_device_capability()
+        is_blackwell = (major * 10 + minor) >= 100
+        num_tokens = hidden_states.size(0)
+        llama4_tp8ep1_min_latency_mode = True if is_blackwell and self.is_fp8_quant and self.tp_size == 8 and self.ep_size == 1 and self.num_experts == 128 and self.topk == 1 and num_tokens <= 4 and self.hidden_size == 5120 and self.intermediate_size == 8192 else False
         # cutlass_min_latency_mode = hidden_states.size(
         #     0
         # ) <= 128 and self.fusion_config.POST_MOE_FUSION and is_blackwell and self.is_quanted
-
         # Temporarily disable min-latency mode for Llama4
         cutlass_min_latency_mode = False
 
@@ -462,15 +476,27 @@ class Llama4DecoderLayer(DecoderLayer):
             hidden_states, residual = unpack_hidden_states(
                 self.post_attention_layernorm(hidden_states, residual))
 
-        hidden_states = self.feed_forward(
-            hidden_states,
-            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-            final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.POST_MOE_FUSION
-                or self.fusion_config.POST_MLP_FUSION
-                or self.mapping.tp_size == 1 or self.enable_attention_dp)),
-            cutlass_min_latency_mode=cutlass_min_latency_mode,
-        )
+        if self.is_mlp_layer:
+            hidden_states = self.feed_forward(
+                hidden_states,
+                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                final_all_reduce_params=AllReduceParams(enable_allreduce=not (
+                    self.fusion_config.POST_MOE_FUSION
+                    or self.fusion_config.POST_MLP_FUSION
+                    or self.mapping.tp_size == 1 or self.enable_attention_dp)),
+            )
+        else:
+            hidden_states = self.feed_forward(
+                hidden_states,
+                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                final_all_reduce_params=AllReduceParams(enable_allreduce=not (
+                    self.fusion_config.POST_MOE_FUSION
+                    or self.fusion_config.POST_MLP_FUSION
+                    or self.mapping.tp_size == 1 or self.enable_attention_dp)),
+                cutlass_min_latency_mode=cutlass_min_latency_mode,
+                llama4_tp8ep1_min_latency_mode=llama4_tp8ep1_min_latency_mode,
+            )
+
         if spec_metadata is not None:
             # We save the hidden states in the spec metadata here. In _prepare_draft_tokens,
             # PyExecutor will extract these from the model engine's spec metadata.
@@ -628,10 +654,15 @@ class Eagle3LlamaDecoderLayer(DecoderLayer):
             layer_idx=layer_idx,
         )
 
+        if config.model_type == "llama4_text":
+            inter_size = config.intermediate_size_mlp
+        else:
+            inter_size = config.intermediate_size
+
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            bias=config.mlp_bias,
+            intermediate_size=inter_size,
+            bias=getattr(config, "mlp_bias", False),
             dtype=config.torch_dtype,
             config=model_config,
         )
@@ -1040,7 +1071,7 @@ class Eagle3LlamaDraftModel(DecoderModel):
 
         self.fc = Linear(self.hidden_size_in * 3,
                          config.hidden_size,
-                         bias=False,
+                         bias=getattr(config, "bias", False),
                          dtype=config.torch_dtype)
 
         self.midlayer = Eagle3LlamaDecoderLayer(model_config, 0)
@@ -1049,9 +1080,10 @@ class Eagle3LlamaDraftModel(DecoderModel):
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
 
-        self.d2t = nn.Parameter(torch.empty((config.draft_vocab_size, ),
-                                            dtype=torch.int64),
-                                requires_grad=False)
+        if config.vocab_size != config.draft_vocab_size:
+            self.d2t = nn.Parameter(torch.empty((config.draft_vocab_size, ),
+                                                dtype=torch.int64),
+                                    requires_grad=False)
 
         if self.hidden_size_in != config.hidden_size:
             self.embed_tokens = Embedding(
