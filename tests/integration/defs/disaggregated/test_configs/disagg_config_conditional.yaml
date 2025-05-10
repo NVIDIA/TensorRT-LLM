@@ -1,8 +1,10 @@
+model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 hostname: localhost
 port: 8000
-model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
-free_gpu_memory_fraction: 0.15
 backend: "pytorch"
+free_gpu_memory_fraction: 0.15
+condition:
+  max_local_prefill_length: 100
 pytorch_backend_config:
   use_cuda_graph: False
   enable_overlap_scheduler: False
@@ -15,6 +17,7 @@ context_servers:
     enable_block_reuse: True
     enable_partial_reuse: True
     event_buffer_max_size: 1024
+    free_gpu_memory_fraction: 0.15
   urls:
       - "localhost:8001"
 generation_servers:
@@ -27,6 +30,6 @@ generation_servers:
     enable_block_reuse: True
     enable_partial_reuse: True
     event_buffer_max_size: 1024
-    free_gpu_memory_fraction: 0.05
+    free_gpu_memory_fraction: 0.15
   urls:
       - "localhost:8002"
