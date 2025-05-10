@@ -70,15 +70,18 @@ set(XQA_SOURCES
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 set(XQA_SOURCES_H ${CMAKE_CURRENT_BINARY_DIR}/xqa_sources.h)
-add_custom_command(
-  OUTPUT ${XQA_SOURCES_H}
-  COMMAND ${Python3_EXECUTABLE} gen_cpp_header.py -o ${XQA_SOURCES_H}
-          --cuda_root ${CUDAToolkit_LIBRARY_ROOT}
-  COMMENT "Generating xqa_sources.h for XQAJIT..."
-  DEPENDS gen_cpp_header.py ${XQA_SOURCES}
+
+# Generate the file during configuration
+message(STATUS "Generating xqa_sources.h for XQAJIT at config time...")
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/gen_cpp_header.py -o
+          ${XQA_SOURCES_H} --cuda_root ${CUDAToolkit_LIBRARY_ROOT}
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-  VERBATIM)
-add_custom_target(xqa_sources_h DEPENDS ${XQA_SOURCES_H})
+  RESULT_VARIABLE GEN_RESULT)
+
+if(NOT GEN_RESULT EQUAL 0)
+  message(FATAL_ERROR "Failed to generate xqa_sources.h header at config time")
+endif()
 
 if(BUILD_XQA_TESTS)
   # GoogleTest Preparation - Code block copied from

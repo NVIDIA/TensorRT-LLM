@@ -29,7 +29,7 @@
 #define CHECK_NVRTC_ERROR(content)                                                                                     \
     do                                                                                                                 \
     {                                                                                                                  \
-        nvrtcResult status_ = content;                                                                                 \
+        nvrtcResult const status_ = content;                                                                           \
         if (status_ != NVRTC_SUCCESS)                                                                                  \
         {                                                                                                              \
             setErrorString("NVRTC Internal Error");                                                                    \
@@ -40,7 +40,7 @@
 #define CHECK_TLLM_XQA_JIT_ERROR(content)                                                                              \
     do                                                                                                                 \
     {                                                                                                                  \
-        tllmXqaJitStatus status_ = content;                                                                            \
+        tllmXqaJitStatus const status_ = content;                                                                      \
         if (status_ != TLLM_XQA_JIT_SUCCESS)                                                                           \
         {                                                                                                              \
             return status_;                                                                                            \
@@ -83,9 +83,9 @@ tllmXqaJitStatus getMacroFlags(tllmXqaJitContext const* context, std::vector<std
     // Macro name -> Macro value.
     std::unordered_map<std::string, std::string> macros;
 
-    unsigned int head_size = context->head_size;
-    unsigned int num_q_heads = context->num_q_heads;
-    unsigned int num_kv_heads = context->num_kv_heads;
+    unsigned int const head_size = context->head_size;
+    unsigned int const num_q_heads = context->num_q_heads;
+    unsigned int const num_kv_heads = context->num_kv_heads;
     if (num_q_heads % num_kv_heads != 0)
     {
         std::ostringstream oss;
@@ -93,8 +93,8 @@ tllmXqaJitStatus getMacroFlags(tllmXqaJitContext const* context, std::vector<std
         setErrorString(oss.str());
         return TLLM_XQA_JIT_INVALID_INPUT;
     }
-    unsigned int num_q_heads_over_kv = num_q_heads / num_kv_heads;
-    unsigned int beam_width = context->beam_width;
+    unsigned int const num_q_heads_over_kv = num_q_heads / num_kv_heads;
+    unsigned int const beam_width = context->beam_width;
     if (context->multi_query_tokens)
     {
         macros["SPEC_DEC"] = "1";
@@ -201,9 +201,9 @@ tllmXqaJitStatus getMacroFlags(tllmXqaJitContext const* context, std::vector<std
 tllmXqaJitStatus getBuildOptions(_tllmXqaJitProgram const* prog, std::vector<std::string>* result)
 {
     // Common flags
-    result->push_back("-dw");
-    result->push_back("--use_fast_math");
-    result->push_back("-default-device");
+    result->emplace_back("-dw");
+    result->emplace_back("--use_fast_math");
+    result->emplace_back("-default-device");
 
     // Arch
     result->push_back(getSMFlag(prog->context->sm));
@@ -227,11 +227,16 @@ tllmXqaJitStatus createProgram(tllmXqaJitProgram* prog, tllmXqaJitContext const*
     char const* src_content = context->kernel_type == TLLM_XQA_JIT_QGMMA ? tensorrt_llm::kernels::mha_sm90_cu_content
                                                                          : tensorrt_llm::kernels::mha_cu_content;
 
-    std::vector<char const*> headers_content, headers_name;
-    for (auto x : tensorrt_llm::kernels::xqa_headers_content)
+    std::vector<char const*> headers_content;
+    std::vector<char const*> headers_name;
+    for (auto const* x : tensorrt_llm::kernels::xqa_headers_content)
+    {
         headers_content.push_back(x);
-    for (auto x : tensorrt_llm::kernels::xqa_headers_name)
+    }
+    for (auto const* x : tensorrt_llm::kernels::xqa_headers_name)
+    {
         headers_name.push_back(x);
+    }
 
     CHECK_NVRTC_ERROR(nvrtcCreateProgram(&(*prog)->program, src_content, /*name=*/nullptr, headers_content.size(),
         headers_content.data(), headers_name.data()));
@@ -244,6 +249,7 @@ tllmXqaJitStatus compileProgram(tllmXqaJitProgram prog)
     std::vector<std::string> options;
     CHECK_TLLM_XQA_JIT_ERROR(getBuildOptions(prog, &options));
     std::vector<char const*> options_cstr;
+    options_cstr.reserve(options.size());
     for (auto const& option : options)
     {
         options_cstr.push_back(option.c_str());
