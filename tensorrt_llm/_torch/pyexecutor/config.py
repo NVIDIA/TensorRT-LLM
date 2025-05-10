@@ -61,6 +61,7 @@ class PyTorchConfig:
     kv_cache_dtype: str = "auto"
     use_kv_cache: bool = True
     enable_iter_perf_stats: bool = False
+    iter_perf_latest_stats_size: Optional[int] = None
     print_iter_log: bool = False
 
     torch_compile_enabled: bool = False
