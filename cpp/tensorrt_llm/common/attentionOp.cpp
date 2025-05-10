@@ -187,8 +187,8 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.paged_kv_cache = mPagedKVCache;
     xqaParams.tokens_per_block = mTokensPerBlock;
     xqaParams.kv_cache_quant_mode = mKVCacheQuantMode;
-    xqaParams.tp_size = mTpSize;
-    xqaParams.tp_rank = mTpRank;
+    xqaParams.tp_size = mAttnTpSize;
+    xqaParams.tp_rank = mAttnTpRank;
     xqaParams.qkv_bias_enabled = mQKVBiasEnabled;
     xqaParams.cross_attention = mCrossAttention;
     xqaParams.max_distance = mMaxDistance;
@@ -223,6 +223,15 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.host_context_lengths = generationsParams.host_context_lengths;
     xqaParams.semaphores = generationsParams.semaphores;
     xqaParams.workspaces = generationsParams.workspace;
+    if (mCpSize > 1)
+    {
+        size_t const batch_beam = generationsParams.beam_width * generationsParams.num_requests;
+        size_t const cpMaxPaddedSequenceLength = (batch_beam + mCpSize - 1) / mCpSize * mCpSize;
+        size_t const cpWorkspaceSize
+            = 2 * sizeof(T) * cpMaxPaddedSequenceLength * (mNumHeads + 2 * mNumKVHeads) * mHeadSize;
+        xqaParams.workspaces
+            = reinterpret_cast<void*>(reinterpret_cast<int8_t*>(xqaParams.workspaces) + cpWorkspaceSize);
+    }
     xqaParams.batch_size = generationsParams.num_requests;
     xqaParams.beam_width = generationsParams.beam_width;
     // Speculative decoding mode has generation input_length > 1.
@@ -254,7 +263,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.mrope_position_deltas = generationsParams.mrope_position_deltas;
 
     xqaParams.logn_scaling_ptr = generationsParams.logn_scaling_ptr;
-    xqaParams.total_num_input_tokens = generationsParams.num_tokens;
+    xqaParams.total_num_input_tokens = mCpSize > 1 ? generationsParams.num_requests : generationsParams.num_tokens;
     xqaParams.is_fp8_output = mFP8ContextFMHA;
     xqaParams.fp8_out_scale = (mFP8ContextFMHA ? generationsParams.attention_output_orig_quant : nullptr);
     // Parameters required for FP4 output.
