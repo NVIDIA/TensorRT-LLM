@@ -55,7 +55,7 @@ def add_llm_args(parser):
     parser.add_argument('--enable_attention_dp',
                         default=False,
                         action='store_true')
-    parser.add_argument('--enable_trtllm_decoder',
+    parser.add_argument('--enable_trtllm_sampler',
                         default=False,
                         action='store_true')
     parser.add_argument('--tp_size', type=int, default=1)
@@ -133,7 +133,7 @@ def setup_llm(args):
         torch_compile_enabled=args.use_torch_compile,
         torch_compile_piecewise_cuda_graph=args.use_piecewise_cuda_graph,
         moe_backend=args.moe_backend,
-        enable_trtllm_decoder=args.enable_trtllm_decoder)
+        enable_trtllm_sampler=args.enable_trtllm_sampler)
 
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=not args.disable_kv_cache_reuse,
