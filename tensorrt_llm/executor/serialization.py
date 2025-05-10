@@ -29,10 +29,15 @@ BASE_ZMQ_CLASSES = {
         "CancellingRequest", "GenerationRequest", "LoRARequest",
         "PromptAdapterRequest"
     ],
-    "tensorrt_llm.executor.result": ["CompletionOutput", "Logprob"],
+    "tensorrt_llm.executor.result": [
+        "CompletionOutput", "DetokenizedGenerationResultBase",
+        "GenerationResult", "GenerationResultBase", "IterationResult",
+        "Logprob", "LogProbsResult", "ResponseWrapper"
+    ],
     "tensorrt_llm.executor.utils": ["ErrorResponse"],
     "tensorrt_llm.llmapi._perf_evaluator": ["perform_faked_oai_postprocess"],
     "tensorrt_llm.llmapi.llm_args": ["LookaheadDecodingConfig"],
+    "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
     "tensorrt_llm.sampling_params":
     ["SamplingParams", "GuidedDecodingParams", "GreedyDecodingParams"],
     "tensorrt_llm.serve.postprocess_handlers": [
