@@ -2018,6 +2018,28 @@ def pytest_collection_modifyitems(session, config, items):
         # This is needed for reporting to correctly process the test name in order to bucket
         # it into the appropriate test suite.
         for item in items:
+            if item.nodeid.startswith("test_unittests.py::test_unittests_v2"):
+                if hasattr(item, "callspec"):
+                    # Refactor the parameter
+                    params = item.callspec.params
+                    for key, value in params.items():
+                        if isinstance(
+                                value,
+                                str) and 'case' in key and "TIMEOUT" in value:
+                            # Match the pattern 'TIMEOUT (number)'
+                            match = re.search(r"TIMEOUT \((\d+)\)", value)
+                            if match:
+                                # Remove 'TIMEOUT (number)' and strip spaces
+                                new_value = value.replace(match.group(0),
+                                                          "").strip()
+                                params[key] = new_value
+                                print_info(
+                                    f"Refactored parameter for {key}: {new_value}"
+                                )
+                    # Manually update the nodeid to reflect the updated parameters
+                    param_str = "-".join(f"{value}"
+                                         for value in params.values())
+                    item._nodeid = f"{item.nodeid.split('[')[0]}[{param_str}]"
             item._nodeid = "{}/{}".format(test_prefix, item._nodeid)
 
     regexp = config.getoption("--regexp")
