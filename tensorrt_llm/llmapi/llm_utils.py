@@ -32,9 +32,7 @@ from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
 from .llm_args import (CalibConfig, EagleDecodingConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig,
                        MTPDecodingConfig, _ModelFormatKind, _ModelWrapper,
-                       _ParallelConfig, get_model_format,
-                       update_llm_args_with_extra_dict,
-                       update_llm_args_with_extra_options)
+                       _ParallelConfig, get_model_format)
 from .mpi_session import MPINodeState, MpiSession
 from .tokenizer import TransformersTokenizer, load_hf_tokenizer
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
@@ -869,6 +867,5 @@ __all__ = [
     'KvCacheConfig',
     'CachedModelLoader',
     'EagleDecodingConfig',
-    'update_llm_args_with_extra_dict',
     'update_llm_args_with_extra_options',
 ]

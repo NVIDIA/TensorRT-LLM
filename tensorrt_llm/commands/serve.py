@@ -14,7 +14,7 @@ from tensorrt_llm.llmapi import (LLM, BuildConfig, CapacitySchedulerPolicy,
                                  SchedulerConfig)
 from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
                                               parse_disagg_config_file)
-from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
+from tensorrt_llm.llmapi.llm_args import LlmArgs
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
@@ -61,23 +61,25 @@ def get_llm_args(model: str,
         dynamic_batch_config=dynamic_batch_config,
     )
 
-    llm_args = {
-        "model": model,
-        "scheduler_config": scheduler_config,
-        "tokenizer": tokenizer,
-        "tensor_parallel_size": tensor_parallel_size,
-        "pipeline_parallel_size": pipeline_parallel_size,
-        "moe_expert_parallel_size": moe_expert_parallel_size,
-        "gpus_per_node": gpus_per_node,
-        "trust_remote_code": trust_remote_code,
-        "build_config": build_config,
-        "kv_cache_config": kv_cache_config,
-        "backend": backend if backend == "pytorch" else None,
-        "pytorch_backend_config": pytorch_backend_config,
-        "_num_postprocess_workers": num_postprocess_workers,
-        "_postprocess_tokenizer_dir": tokenizer or model,
-        "_reasoning_parser": reasoning_parser,
-    }
+    llm_args = LlmArgs(
+        model=model,
+        scheduler_config=scheduler_config,
+        tokenizer=tokenizer,
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        moe_expert_parallel_size=moe_expert_parallel_size,
+        gpus_per_node=gpus_per_node,
+        trust_remote_code=trust_remote_code,
+        build_config=build_config,
+        kv_cache_config=kv_cache_config,
+        backend=backend if backend == "pytorch" else None,
+        pytorch_backend_config=pytorch_backend_config,
+        num_postprocess_workers=num_postprocess_workers,
+        postprocess_tokenizer_dir=tokenizer or model,
+        reasoning_parser=reasoning_parser,
+    )
+
+    llm_args.update(**llm_args_dict)
 
     return llm_args, llm_args_extra_dict
 
