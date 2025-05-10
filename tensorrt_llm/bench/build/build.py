@@ -158,6 +158,12 @@ def apply_build_mode_settings(params):
     type=click.IntRange(min=1),
     help="Maximum total length of one request, including prompt and outputs.",
 )
+@optgroup.option(
+    "--no_weights_loading",
+    type=bool,
+    default=False,
+    help=
+    "Do not load the weights from the checkpoint. Use dummy weights instead.")
 @optgroup.group(
     "Build Engine with Dataset Information",
     cls=AllOptionGroup,
@@ -231,6 +237,7 @@ def build_command(
     target_input_len: int = params.get("target_input_len")
     target_output_len: int = params.get("target_output_len")
 
+    load_format = "dummy" if params.get("no_weights_loading") else "auto"
     model_name = bench_env.model
     checkpoint_path = bench_env.checkpoint_path or model_name
     model_config = get_model_config(model_name, bench_env.checkpoint_path)
@@ -307,7 +314,8 @@ def build_command(
               pipeline_parallel_size=pp_size,
               build_config=build_config,
               quant_config=quant_config,
-              workspace=str(bench_env.workspace))
+              workspace=str(bench_env.workspace),
+              load_format=load_format)
     # Save the engine.
     llm.save(engine_dir)
     llm.shutdown()
