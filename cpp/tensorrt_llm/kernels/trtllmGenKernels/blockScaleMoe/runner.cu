@@ -184,7 +184,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(trtllm::gen:
         .eltType = tensorrt_llm::kernels::Dtype(dtypeElt),
         .outputType = tensorrt_llm::kernels::Dtype(dtypeElt),
         .deepSeekFp8 = false,
-        .fusedAct = true,
+        .fusedAct = !useDeepSeekFp8,
         .routeAct = true,
         .staticBatch = false,
         .transposeMmaOutput = true,
@@ -200,25 +200,25 @@ Runner::Runner(trtllm::gen::Dtype dtypeElt)
 
 int32_t Runner::getMaxNumCtasInBatchDim(int32_t numTokens, int32_t topK, int32_t numExperts)
 {
-    // // Get maximum number of CTAs in batch dim per expert.
-    // auto maxCtasInBatchDimPerExpert = (numTokens + mTileTokensDim - 1) / mTileTokensDim;
-    // // Get maximum enabled experts.
-    // auto maxEnabledExperts = std::min(numTokens * topK, numExperts);
-    // // Get maximum number of CTAs in batch dim.
-    // auto maxNumCtasInBatchDim = maxEnabledExperts * maxCtasInBatchDimPerExpert;
+    // Get maximum number of CTAs in batch dim per expert.
+    auto maxCtasInBatchDimPerExpert = (numTokens + mTileTokensDim - 1) / mTileTokensDim;
+    // Get maximum enabled experts.
+    auto maxEnabledExperts = std::min(numTokens * topK, numExperts);
+    // Get maximum number of CTAs in batch dim.
+    auto maxNumCtasInBatchDim = maxEnabledExperts * maxCtasInBatchDimPerExpert;
 
-    // // For large token counts, the above bound can be pessimistic since not all the tokens can
-    // // be routed to all the enabled experts. Instead we can essentially bound the number of CTAs
-    // // by permuted buffer size. However, this method will be overly pessimistic for low-token
-    // // counts Get the number of "full" tiles by truncating
-    // auto fullTiles = numTokens * topK / mTileTokensDim;
-    // // Get the number of CTAs required to handle any partial tiles
-    // auto partialTiles = numExperts;
+    // For large token counts, the above bound can be pessimistic since not all the tokens can
+    // be routed to all the enabled experts. Instead we can essentially bound the number of CTAs
+    // by permuted buffer size. However, this method will be overly pessimistic for low-token
+    // counts Get the number of "full" tiles by truncating
+    auto fullTiles = numTokens * topK / mTileTokensDim;
+    // Get the number of CTAs required to handle any partial tiles
+    auto partialTiles = numExperts;
 
-    // // Set maxNumCtasInBatchDim to be the minimum of the two methods
-    // maxNumCtasInBatchDim = std::min(maxNumCtasInBatchDim, fullTiles + partialTiles);
+    // Set maxNumCtasInBatchDim to be the minimum of the two methods
+    maxNumCtasInBatchDim = std::min(maxNumCtasInBatchDim, fullTiles + partialTiles);
 
-    // return maxNumCtasInBatchDim;
+    return maxNumCtasInBatchDim;
 }
 
 void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void* weightsScale, void* expertWeights,
@@ -228,23 +228,23 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
     int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
     bool useDeepSeekFp8, int device, cudaStream_t stream)
 {
-    // auto maxNumCtasInBatchDim = getMaxNumCtasInBatchDim(numTokens, topK, numExperts);
-    // auto options = getOptions(mDtypeElt, mTileTokensDim, useDeepSeekFp8);
+    auto maxNumCtasInBatchDim = getMaxNumCtasInBatchDim(numTokens, topK, numExperts);
+    auto options = getOptions(mDtypeElt, mTileTokensDim, useDeepSeekFp8);
 
-    // tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner runner(options);
-    // runner.run(2 * intermediateSize, numTokens, hiddenSize, {}, numTokens, numExperts, maxNumCtasInBatchDim, weights, weightsScale,
-    //     hiddenState, hiddenStateScale, outputScalesScalar, outputScalesGateScalar, output, outputScale, 
-    //     permutedIdxToTokenIdx, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx, 
-    //     ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm1Workspace, stream, device);
+    tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner runner(options);
+    runner.run(2 * intermediateSize, numTokens, hiddenSize, {}, numTokens, numExperts, maxNumCtasInBatchDim, weights, weightsScale,
+        hiddenState, hiddenStateScale, outputScalesScalar, outputScalesGateScalar, output, outputScale, 
+        permutedIdxToTokenIdx, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx, 
+        ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm1Workspace, stream, device);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens, bool useDeepSeekFp8)
 {
-    // auto maxNumCtasInBatchDim = getMaxNumCtasInBatchDim(numTokens, topK, numExperts);
-    // auto options = getOptions(mDtypeElt, mTileTokensDim, useDeepSeekFp8);
+    auto maxNumCtasInBatchDim = getMaxNumCtasInBatchDim(numTokens, topK, numExperts);
+    auto options = getOptions(mDtypeElt, mTileTokensDim, useDeepSeekFp8);
 
-    // tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner runner(options);
-    // return runner.getWorkspaceSizeInBytes(2 * intermediateSize, numTokens, hiddenSize, {}, numTokens, numExperts, maxNumCtasInBatchDim);
+    tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner runner(options);
+    return runner.getWorkspaceSizeInBytes(2 * intermediateSize, numTokens, hiddenSize, {}, numTokens, numExperts, maxNumCtasInBatchDim);
 }
 } // namespace PermuteGemm1
 
