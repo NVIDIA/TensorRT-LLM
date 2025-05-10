@@ -80,6 +80,8 @@ class OpenAIServer:
         self.register_routes()
 
     async def await_disconnected(self, raw_request: Request, promise):
+        if raw_request is None:
+            return
         while not await raw_request.is_disconnected():
             await asyncio.sleep(1)
         if not promise.finished:
@@ -116,6 +118,7 @@ class OpenAIServer:
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_chat,
                                methods=["POST"])
+        self.app.add_api_route("/health_generate", self.health_generate, methods=["GET"])
 
     async def health(self) -> Response:
         return Response(status_code=200)
@@ -144,6 +147,40 @@ class OpenAIServer:
             pass
         return JSONResponse(content=events)
 
+    async def health_generate(self) -> Response:
+        """Health check that performs a minimal generation."""
+        try:
+            # Create a minimal chat request
+            health_request = ChatCompletionRequest(
+                messages=[{"role": "user", "content": "hi"}], # Minimal prompt (often > 1 token after tokenization)
+                model=self.model,
+                max_completion_tokens=1, # Request only 1 token out
+                stream=False,
+                temperature=0.0 # Deterministic output
+            )
+
+            mock_request = None
+
+            # Call the chat completion logic
+            response = await self.openai_chat(health_request, mock_request)
+
+            # Check if the response indicates success (status code 200)
+            if response.status_code == 200:
+                return Response(status_code=200, content="Generation health check OK")
+            else:
+                logger.error(f"Health generate check failed with status code: {response.status_code}")
+                try:
+                    # Attempt to get body for more details if possible
+                    body = response.body if hasattr(response, 'body') else await response.body()
+                    logger.error(f"Health generate check response body: {body}")
+                except Exception:
+                    pass # Ignore errors trying to get body details
+                return Response(status_code=500, content="Generation health check failed")
+
+        except Exception as e:
+            logger.error(f"Health generate check encountered exception: {e}", exc_info=True)
+            return Response(status_code=500, content=f"Generation health check failed: {str(e)}")
+
     async def openai_chat(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
 
         def get_role() -> str:
@@ -161,7 +198,7 @@ class OpenAIServer:
                 pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
                 for pp_res in pp_results:
                     yield pp_res
-            yield f"data: [DONE]\n\n"
+            yield "data: [DONE]\n\n"
             nvtx_mark("generation ends")
 
         async def create_chat_response(
@@ -281,7 +318,7 @@ class OpenAIServer:
                     pp_result = request_output.outputs[0]._postprocess_result
                 for pp_res in pp_result:
                     yield pp_res
-            yield f"data: [DONE]\n\n"
+            yield "data: [DONE]\n\n"
 
         async def create_completion_response(
                 generator: AsyncIterator[Tuple[RequestOutput, Optional[PostprocParams]]]) -> CompletionResponse:
