@@ -339,7 +339,9 @@ class LLM:
                 multimodal_embedding = extra_processed_inputs.get(
                     'mm_embedding')
                 mrope_config = extra_processed_inputs.get('mrope_config')
-                multimodal_input = extra_processed_inputs.get('multimodal_input') if 'multimodal_input' in extra_processed_inputs else None
+                multimodal_input = extra_processed_inputs.get(
+                    'multimodal_input'
+                ) if 'multimodal_input' in extra_processed_inputs else None
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
