@@ -127,6 +127,7 @@ class Attention(nn.Module):
             skip_create_weights=config.skip_create_weights,
             use_llama4_qkv=is_llama4,
         )
+        # Current problem size doesn't suit gemv kernel. We possibly want to switch this to trtllm-gen kernel.
         self.o_proj = Linear(
             self.hidden_size,
             self.hidden_size,
