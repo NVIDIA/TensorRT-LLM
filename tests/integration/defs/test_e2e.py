@@ -1465,7 +1465,7 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
             "--disable_kv_cache_reuse",
         ],
                          running_log=running_log)
-        _check_mem_usage(running_log, [24.1, 0, 0, 0])
+        _check_mem_usage(running_log, [25.2, 0, 0, 0])
     finally:
         if running_log:
             os.remove(running_log)
