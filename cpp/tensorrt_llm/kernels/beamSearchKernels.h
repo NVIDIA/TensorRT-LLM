@@ -156,7 +156,7 @@ void printLogProbs(float const* x, int const nBS, int const nBMIn, int const nBM
     }
 
 // Host function
-#define PRINT_HOST(x, nRow, nCol, nColPadded)                                                                          \
+#define PRINT_HOST(x, nRow, nCol)                                                                                      \
     {                                                                                                                  \
         if (x == nullptr)                                                                                              \
         {                                                                                                              \
@@ -164,15 +164,14 @@ void printLogProbs(float const* x, int const nBS, int const nBMIn, int const nBM
         }                                                                                                              \
         else                                                                                                           \
         {                                                                                                              \
-            printf(#x "=\n");                                                                                          \
-            printMatrix(x, nRow, nCol, nColPadded);                                                                    \
+            printMatrix(#x, x, nRow, nCol);                                                                            \
         }                                                                                                              \
     }
-#define PH2(x, nCol) PRINT_HOST(x, 1, nCol, nCol)
-#define PH3(x, nElement, nCol) PRINT_HOST(x, ((nElement) / (nCol)), nCol, nCol)
+#define PH2(x, nCol) PRINT_HOST(x, 1, nCol)
+#define PH3(x, nElement, nCol) PRINT_HOST(x, ((nElement) / (nCol)), nCol)
 
 // Device function
-#define PRINT_DEVICE(x, nRow, nCol, nColPadded)                                                                        \
+#define PRINT_DEVICE(x, nRow, nCol)                                                                                    \
     {                                                                                                                  \
         if (x == nullptr)                                                                                              \
         {                                                                                                              \
@@ -180,12 +179,11 @@ void printLogProbs(float const* x, int const nBS, int const nBMIn, int const nBM
         }                                                                                                              \
         else                                                                                                           \
         {                                                                                                              \
-            printf(#x "=\n");                                                                                          \
-            printMatrixDevice(x, nRow, nCol, nColPadded);                                                              \
+            printMatrixDevice(#x, x, nRow, nCol);                                                                      \
         }                                                                                                              \
     }
-#define PD2(x, nCol) PRINT_DEVICE(x, 1, nCol, nCol)
-#define PD3(x, nElement, nCol) PRINT_DEVICE(x, ((nElement) / (nCol)), nCol, nCol)
+#define PD2(x, nCol) PRINT_DEVICE(x, 1, nCol)
+#define PD3(x, nElement, nCol) PRINT_DEVICE(x, ((nElement) / (nCol)), nCol)
 
 // Device function
 #define WITH(blockIdxx, bSync, code)                                                                                   \

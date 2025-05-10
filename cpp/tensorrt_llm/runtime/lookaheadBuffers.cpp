@@ -20,18 +20,22 @@
 
 namespace tensorrt_llm::runtime
 {
+static nvinfer1::DataType const kINT32 = nvinfer1::DataType::kINT32;
 
 LookaheadDecodingBuffers::LookaheadDecodingBuffers(
     SizeType32 maxNumSequences, SizeType32 maxTokensPerStep, BufferManager const& bufferManager)
-    : generationLengths(bufferManager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32))
-    , positionOffsets(
-          bufferManager.gpu(ITensor::makeShape({maxNumSequences, maxTokensPerStep}), nvinfer1::DataType::kINT32))
-    , packedMasks(bufferManager.gpu(ITensor::makeShape({maxNumSequences, maxTokensPerStep,
-                                        static_cast<ITensor::DimType64>(common::divUp(maxTokensPerStep, 32))}),
-          nvinfer1::DataType::kINT32))
-    , positionIds(
-          bufferManager.gpu(ITensor::makeShape({maxNumSequences, maxTokensPerStep}), nvinfer1::DataType::kINT32))
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto const packedMasksShape = ITensor::makeShape(
+        {maxNumSequences, maxTokensPerStep, static_cast<ITensor::DimType64>(common::divUp(maxTokensPerStep, 32))});
+    auto const shape2D = ITensor::makeShape({maxNumSequences, maxTokensPerStep});
+    packedMasks = bufferManager.gpu(packedMasksShape, kINT32);
+    generationLengths = bufferManager.gpu(ITensor::makeShape({maxNumSequences}), kINT32);
+    positionOffsets = bufferManager.gpu(shape2D, kINT32);
+    positionIds = bufferManager.gpu(shape2D, kINT32);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 LookaheadRuntimeBuffers::LookaheadRuntimeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
@@ -40,32 +44,30 @@ LookaheadRuntimeBuffers::LookaheadRuntimeBuffers(SizeType32 maxBatchSize, SizeTy
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    TLLM_CHECK_WITH_INFO(maxBeamWidth == 1, "Lookahead decoding does not support beam search");
+    TLLM_CHECK_WITH_INFO(maxBeamWidth == 1, "Beam search is not supported in Lookahead decoding.");
 
     auto const tokensPerStep = modelConfig.getMaxDecodingTokens();
     auto const numPackedMasks = static_cast<ITensor::DimType64>(tensorrt_llm::common::divUp(tokensPerStep, 32));
 
-    cumSumLength = manager.pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    cumSumLength = manager.pinned(ITensor::makeShape({1}), kINT32);
 
-    packedMasksDevice
-        = manager.gpu(ITensor::makeShape({maxBatchSize * tokensPerStep, numPackedMasks}), nvinfer1::DataType::kINT32);
-    positionOffsetsDevice = manager.gpu(ITensor::makeShape({maxBatchSize, tokensPerStep}), nvinfer1::DataType::kINT32);
-    generationLengthsDevice = manager.gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
-    positionIdsDevice = manager.gpu(ITensor::makeShape({maxBatchSize, tokensPerStep}), nvinfer1::DataType::kINT32);
+    packedMasksDevice = manager.gpu(ITensor::makeShape({maxBatchSize * tokensPerStep, numPackedMasks}), kINT32);
+    generationLengthsDevice = manager.gpu(ITensor::makeShape({maxBatchSize}), kINT32);
+    positionOffsetsDevice = manager.gpu(ITensor::makeShape({maxBatchSize, tokensPerStep}), kINT32);
+    positionIdsDevice = manager.gpu(ITensor::makeShape({maxBatchSize, tokensPerStep}), kINT32);
 
-    packedMaskHost = manager.cpu(packedMasksDevice->getShape(), nvinfer1::DataType::kINT32);
-    positionOffsetsHost = manager.cpu(positionOffsetsDevice->getShape(), nvinfer1::DataType::kINT32);
-    generationLengthsHost = manager.cpu(generationLengthsDevice->getShape(), nvinfer1::DataType::kINT32);
-    positionIdsHost = manager.cpu(positionIdsDevice->getShape(), nvinfer1::DataType::kINT32);
+    packedMaskHost = manager.cpu(packedMasksDevice->getShape(), kINT32);
+    generationLengthsHost = manager.cpu(generationLengthsDevice->getShape(), kINT32);
+    positionOffsetsHost = manager.cpu(positionOffsetsDevice->getShape(), kINT32);
+    positionIdsHost = manager.cpu(positionIdsDevice->getShape(), kINT32);
 
-    packedMaskHostCopy = manager.cpu(packedMasksDevice->getShape(), nvinfer1::DataType::kINT32);
-    positionOffsetsHostCopy = manager.cpu(positionOffsetsDevice->getShape(), nvinfer1::DataType::kINT32);
-    generationLengthsHostCopy = manager.cpu(generationLengthsDevice->getShape(), nvinfer1::DataType::kINT32);
-    positionIdsHostCopy = manager.cpu(positionIdsDevice->getShape(), nvinfer1::DataType::kINT32);
+    packedMaskHostCopy = manager.cpu(packedMasksDevice->getShape(), kINT32);
+    generationLengthsHostCopy = manager.cpu(generationLengthsDevice->getShape(), kINT32);
+    positionOffsetsHostCopy = manager.cpu(positionOffsetsDevice->getShape(), kINT32);
+    positionIdsHostCopy = manager.cpu(positionIdsDevice->getShape(), kINT32);
 
-    batchSlotsHostCopy = manager.cpu(generationLengthsDevice->getShape(), nvinfer1::DataType::kINT32);
-
-    useSpecDecoding = manager.cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    batchSlotsHostCopy = manager.cpu(generationLengthsDevice->getShape(), kINT32);
+    useSpecDecoding = manager.cpu(ITensor::makeShape({1}), kINT32);
     bufferCast<SizeType32>(*useSpecDecoding)[0] = 1;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -153,25 +155,25 @@ void LookaheadRuntimeBuffers::reshape(SizeType32 numCtxSequences, SizeType32 num
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto const numSequences = numGenSequences;
+    // `numGenSequences` is 0 in context phase
 
     auto packedMaskShape = packedMasksDevice->getShape();
-    packedMaskShape.d[0] = numSequences * tokensPerStep;
+    packedMaskShape.d[0] = numGenSequences * tokensPerStep;
     packedMasksDevice->reshape(packedMaskShape);
     packedMaskHost->reshape(packedMaskShape);
 
     auto generationLengthsShape = generationLengthsDevice->getShape();
-    generationLengthsShape.d[0] = numSequences;
+    generationLengthsShape.d[0] = numGenSequences;
     generationLengthsDevice->reshape(generationLengthsShape);
     generationLengthsHost->reshape(generationLengthsShape);
 
     auto positionOffsetsShape = positionOffsetsDevice->getShape();
-    positionOffsetsShape.d[0] = numSequences;
+    positionOffsetsShape.d[0] = numGenSequences;
     positionOffsetsDevice->reshape(positionOffsetsShape);
     positionOffsetsHost->reshape(positionOffsetsShape);
 
     auto positionIdsShape = positionIdsDevice->getShape();
-    positionIdsShape.d[0] = numSequences;
+    positionIdsShape.d[0] = numGenSequences;
     positionIdsDevice->reshape(positionIdsShape);
     positionIdsHost->reshape(positionIdsShape);
 

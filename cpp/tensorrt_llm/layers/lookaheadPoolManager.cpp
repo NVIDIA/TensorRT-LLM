@@ -82,7 +82,7 @@ std::list<LookaheadPoolManager::TensorConstPtr> LookaheadPoolManager::guess(Key 
     if (search != mTokenMap.end())
     {
         auto ngrams = search->second;
-        if (ngrams.size() > static_cast<size_t>(guessSize))
+        if (ngrams.size() > static_cast<size_t>(guessSize)) // Always return the latest `guessSize` ngrams (MRU)
         {
             auto it = std::prev(ngrams.end(), guessSize);
             return std::list<TensorConstPtr>(it, ngrams.end());
@@ -113,6 +113,31 @@ void LookaheadPoolManager::update(TensorConstPtr const& keyTokens, TensorConstPt
         std::copy(sourceRange.begin(), sourceRange.end(), ngramRange.begin());
         insertOne(keyRange[wi], ngram);
     }
+}
+
+void LookaheadPoolManager::print(char const* functionName, int const lineNumber) const noexcept
+{
+    TLLM_LOG_TRACE("==== printPoolManager start @%s @L%d start", functionName, lineNumber);
+
+    TLLM_LOG_TRACE("Pool size=%zu", mTokenMap.size());
+    for (auto const& [key, list] : mTokenMap)
+    {
+        TLLM_LOG_TRACE("Key=%zu (size=%zu)", key, list.size());
+        for (auto const& value : list)
+        {
+            std::string info{"    ->("};
+            auto const& buffer = tensorrt_llm::runtime::bufferCast<runtime::TokenIdType>(*value);
+
+            for (auto j = 0; j < tensorrt_llm::runtime::ITensor::volume((*value).getShape()); ++j)
+            {
+                info += std::to_string(buffer[j]) + ",";
+            }
+            info += ")";
+            TLLM_LOG_TRACE(info.c_str());
+        }
+    }
+
+    TLLM_LOG_TRACE("==== printPoolManager stop @%s @L%d start", functionName, lineNumber);
 }
 
 } // namespace tensorrt_llm::layers
