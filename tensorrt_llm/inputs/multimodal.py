@@ -1,6 +1,5 @@
 """Multimodal utilities for handling images and other media types in TensorRT-LLM."""
 
-import pickle
 from dataclasses import dataclass
 from typing import List
 
@@ -83,7 +82,7 @@ def serialize_item(obj: object) -> bytes:
     if isinstance(obj, np.ndarray):
         return obj.tobytes()
 
-    return pickle.dumps(obj)
+    raise ValueError(f"Unsupported object type: {type(obj)}")
 
 
 def apply_mm_hashes(mm_data, hash_lib=default_hasher):
