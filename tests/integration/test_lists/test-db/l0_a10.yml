@@ -105,6 +105,9 @@ l0_a10:
   - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph] # 5 mins
   - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph-chunked_context] # 5 mins
   - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph-typical_acceptance] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[cuda_graph] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[cuda_graph-chunked_context] # 5 mins
   - accuracy/test_cli_flow.py::TestLlama2_7B::test_auto_dtype
   - examples/test_chatglm.py::test_llm_glm_4_9b_single_gpu_summary[glm-4-9b-disable_weight_only]
   - unittest/trt/attention/test_gpt_attention_IFB.py
