@@ -274,7 +274,6 @@ class FluxAttention(Module):
 
         if default_net().plugin_config.bert_attention_plugin:
             # TRT plugin mode
-            assert self.cp_size == 1
             seq_len = shape(query, 1)
             qkv = concat([query, key, value], dim=-1)
             input_lengths = expand(
@@ -289,7 +288,10 @@ class FluxAttention(Module):
                                            relative_attention=False,
                                            max_distance=self.max_distance,
                                            relative_attention_bias=None,
-                                           max_input_length=max_input_length)
+                                           max_input_length=max_input_length,
+                                           cp_group=self.cp_group,
+                                           cp_rank=self.cp_rank,
+                                           cp_size=self.cp_size)
         else:
             # plain TRT mode
             def transpose_for_scores(x):
@@ -479,6 +481,7 @@ class FluxSingleTransformerBlock(Module):
 
         self.cp_size = mapping.cp_size
         self.cp_group = mapping.cp_group
+        self.cp_rank = mapping.cp_rank
         self.tp_group = mapping.tp_group
         self.tp_size = mapping.tp_size
         self.tp_rank = mapping.tp_rank
