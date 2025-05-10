@@ -672,6 +672,34 @@ class Attention(Module):
                               is_buffer=True))
                 model_cls.short_mscale = short_mscale
                 model_cls.long_mscale = long_mscale
+        elif rotary_embedding_scale_type == RotaryScalingType.yarn:
+            beta_fast = rotary_embedding_scaling.get("beta_fast", 32.0)
+            beta_slow = rotary_embedding_scaling.get("beta_slow", 1.0)
+            mscale = rotary_embedding_scaling.get("mscale", 1.0)
+            mscale_all_dim = rotary_embedding_scaling.get("mscale_all_dim", 0.0)
+            original_max_position_embeddings = rotary_embedding_scaling.get(
+                "original_max_position_embeddings", 4096)
+            rotary_inv_freq, embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+                max_position_embeddings, rotary_embedding_dim,
+                rotary_embedding_base, rotary_embedding_scale,
+                original_max_position_embeddings, beta_fast, beta_slow, mscale,
+                mscale_all_dim, False)
+
+            embed_positions = RopeEmbeddingUtils.create_sinusoidal_positions(
+                max_position_embeddings,
+                rotary_embedding_dim,
+            )
+            model_cls.register_parameter(
+                'embed_positions',
+                Parameter(embed_positions, dtype='float32', is_buffer=True))
+            model_cls.register_parameter(
+                'rotary_inv_freq',
+                Parameter(rotary_inv_freq, dtype='float32', is_buffer=True))
+            model_cls.register_parameter(
+                'embed_positions_for_gpt_attention',
+                Parameter(embed_positions_for_gpt_attention,
+                          dtype='float32',
+                          is_buffer=True))
         else:
 
             def register_rope_params(rotary_base, names_to_register):
@@ -2052,7 +2080,7 @@ class DeepseekV2Attention(Attention):
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 self.q_scaling = 1.0 / (mscale * mscale)
 
-        embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+        _, embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
             self.max_position_embeddings, self.qk_rope_head_dim,
             self.rotary_embedding_base, self.rotary_scaling["factor"],
             rotary_embedding_origin_max_position, rotary_embedding_beta_fast,
