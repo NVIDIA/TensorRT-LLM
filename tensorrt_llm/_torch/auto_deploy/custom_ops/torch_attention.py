@@ -138,92 +138,6 @@ def bsnd_grouped_sdpa_fake(
     return torch.empty_like(query.contiguous())
 
 
-# Function to apply rotary positional embeddings (RoPE)
-def apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    seq_len: int,
-    head_dim: int,
-    rope_theta: Optional[float] = None,
-    rope_scale: Optional[float] = None,
-):
-    """
-    Apply rotary positional embeddings to query and key tensors.
-    Args:
-        q: Query tensor of shape [batch, n_heads, seq_len, head_dim]
-        k: Key tensor of shape [batch, n_kv_heads, seq_len, head_dim]
-        seq_len: Sequence length
-        head_dim: Dimension of each head
-        rope_theta: Base value for RoPE (default 10000.0)
-        rope_scale: Scaling factor for positions (default 1.0)
-    Returns:
-        Tuple of transformed query and key tensors
-    """
-    device = q.device
-    original_dtype = q.dtype
-
-    # Apply default values if None
-    theta = 10000.0 if rope_theta is None else rope_theta
-    scale = 1.0 if rope_scale is None else rope_scale
-
-    # Generate position indices
-    position = torch.arange(seq_len, device=device).float()
-    # Apply scaling factor to positions if provided
-    if scale != 1.0:
-        position = position / scale
-
-    # Create the frequency matrix - ensure stable computation in float32
-    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
-    # Compute the product of positions and frequencies
-    # Shape: [seq_len, head_dim/2]
-    freqs = torch.outer(position, inv_freq)
-
-    # Compute the rotation matrix elements: cos and sin
-    # Shape: [seq_len, head_dim/2]
-    emb = torch.cat((freqs, freqs), dim=-1)
-    # Ensure stable computation of sin/cos in float32
-    cos = torch.cos(emb).to(dtype=torch.float32)
-    sin = torch.sin(emb).to(dtype=torch.float32)
-
-    # Reshape for broadcasting
-    # Shape: [1, 1, seq_len, head_dim]
-    cos = cos.view(1, 1, seq_len, head_dim)
-    sin = sin.view(1, 1, seq_len, head_dim)
-
-    # Always compute in float32 for numerical stability
-    q_float = q.to(dtype=torch.float32)
-    k_float = k.to(dtype=torch.float32)
-
-    # For the even indices of the dimension
-    q_embed_even = q_float[..., 0::2]
-    q_embed_odd = q_float[..., 1::2]
-    k_embed_even = k_float[..., 0::2]
-    k_embed_odd = k_float[..., 1::2]
-
-    # Apply the rotation using the identities:
-    # q' = q * cos + rotate(q) * sin
-    # k' = k * cos + rotate(k) * sin
-    # where rotate(x) swaps the even and odd dimensions and negates the odd dimensions
-    q_rotated = torch.cat(
-        [
-            q_embed_even * cos[..., 0::2] - q_embed_odd * sin[..., 0::2],
-            q_embed_odd * cos[..., 1::2] + q_embed_even * sin[..., 1::2],
-        ],
-        dim=-1,
-    )
-
-    k_rotated = torch.cat(
-        [
-            k_embed_even * cos[..., 0::2] - k_embed_odd * sin[..., 0::2],
-            k_embed_odd * cos[..., 1::2] + k_embed_even * sin[..., 1::2],
-        ],
-        dim=-1,
-    )
-
-    # Convert back to the original dtype
-    return q_rotated.to(dtype=original_dtype), k_rotated.to(dtype=original_dtype)
-
-
 def update_kv_cache(
     key_states: torch.Tensor,
     value_states: torch.Tensor,
@@ -246,46 +160,6 @@ def update_kv_cache(
         v_cache[cache_loc[idx], input_pos[idx] : input_pos[idx] + seq_len[idx], :, :] = (
             value_states[seq_start[idx] : seq_start[idx] + seq_len[idx], ...]
         )
-
-
-# Copied from transformers.models.llama.modeling_llama.rotate_half
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-# Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
-@torch.inference_mode()
-def apply_rotary_pos_emb_ds(q, k, cos, sin, position_ids, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-
-    q = q.unflatten(-1, (-1, 2)).transpose(-1, -2).reshape_as(q)
-    k = k.unflatten(-1, (-1, 2)).transpose(-1, -2).reshape_as(k)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
 
 
 @torch.library.custom_op("attention::fused_mla_ref", mutates_args=())
@@ -325,22 +199,32 @@ def fused_mla_ref(
     value_states = value_states.transpose(1, 2).view(*bs_view, -1, v_head_dim).contiguous()
 
     if freqs_cis is not None:
-        cos = freqs_cis[0, ...]
-        sin = freqs_cis[1, ...]
-        for idx in range(seq_len.shape[0]):
-            (
-                q_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
-                k_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
-            ) = apply_rotary_pos_emb_ds(
-                q_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
-                k_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
+        cos_base = freqs_cis[0, ...]
+        sin_base = freqs_cis[1, ...]
+        for i in range(seq_len.shape[0]):
+            start = seq_start[i]
+            length = seq_len[i]
+            if q_len == 1:
+                idx = (input_pos[i] + length - 1).item()
+                pos_ids = torch.tensor(idx, device=cos_base.device)
+            else:
+                pos_ids = torch.arange(input_pos[i], input_pos[i] + length, device=cos_base.device)
+
+            cos = cos_base[pos_ids]  # [..., 1, head_dim]
+            sin = sin_base[pos_ids]
+            q_slice = q_pe[start : start + length]
+            k_slice = k_pe[start : start + length]
+
+            q_rot, k_rot = torch.ops.rope.torch_apply_rope_with_qk_interleaving(
+                q_slice,
+                k_slice,
                 cos,
                 sin,
-                torch.arange(input_pos[idx] + seq_len[idx])[-1]
-                if q_len == 1
-                else torch.arange(input_pos[idx] + seq_len[idx]),
                 -2,
             )
+
+            q_pe[start : start + length] = q_rot
+            k_pe[start : start + length] = k_rot
 
     query_states = k_pe.new_empty(*bs_view, num_heads, q_head_dim)  # [b*s,n,d]
     query_states[..., :qk_nope_head_dim] = q_nope
@@ -454,7 +338,9 @@ def fused_mla(
     k_nope, value_states = torch.split(kv, [qk_nope_head_dim, v_head_dim], dim=-1)
     kv_seq_len = value_states.shape[-2]
 
-    q_pe, k_pe = apply_rotary_pos_emb_ds(q_pe, k_pe, cos, sin, position_ids)
+    cos = cos[position_ids]
+    sin = sin[position_ids]
+    q_pe, k_pe = torch.ops.rope.torch_apply_rope_with_qk_interleaving(q_pe, k_pe, cos, sin)
 
     query_states = k_pe.new_empty(bs, num_heads, q_len, q_head_dim)
     query_states[:, :, :, :qk_nope_head_dim] = q_nope
