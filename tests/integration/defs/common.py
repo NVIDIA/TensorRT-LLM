@@ -24,13 +24,13 @@ from packaging import version
 from .trt_test_alternative import check_call, check_output, exists, is_windows
 
 
-def venv_check_call(venv, cmd, env=None):
+def venv_check_call(venv, cmd, running_log=None, env=None):
 
     def _war_check_call(*args, **kwargs):
         kwargs["cwd"] = venv.get_working_directory()
         return check_call(*args, **kwargs)
 
-    venv.run_cmd(cmd, caller=_war_check_call, env=env)
+    venv.run_cmd(cmd, caller=_war_check_call, running_log=running_log, env=env)
 
 
 def venv_check_output(venv, cmd):
