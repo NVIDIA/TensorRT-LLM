@@ -486,7 +486,7 @@ void EncoderBuffers::setBufferSizes(RequestVector const& contextRequests, Reques
 
     for (auto const& llmReq : genRequests)
     {
-        auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
+        auto const reqBeamWidth = llmReq->getBeamWidthByIter();
         numRequests += reqBeamWidth; // tile by beam width
         maxInputLengthInBatch = std::max(maxInputLengthInBatch, llmReq->getEncoderInputLen());
     }
@@ -532,7 +532,7 @@ void EncoderBuffers::fill(
             }
             else
             {
-                auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
+                auto const reqBeamWidth = llmReq->getBeamWidthByIter();
                 std::fill_n(std::back_inserter(inputLengthsAll), reqBeamWidth,
                     llmReq->getEncoderOutputLen()); // although encoder output is not needed, gen phase still needs the
                                                     // encoder length info for cross kv cache. Also tile by beam width

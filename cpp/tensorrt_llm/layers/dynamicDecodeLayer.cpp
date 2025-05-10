@@ -218,8 +218,8 @@ void DynamicDecodeLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> co
 
     // Copy nextIds and transpose logits when needed
     prepareOutputData(baseOutputs, workspace->getDeviceBatchSlots(), localDecoderDomain.getBatchSize(),
-        mDecoderDomain.getBatchSize(), localDecoderDomain.getBeamWidth(), maxSeqLen,
-        mDecoderDomain.getMaxDecodingTokens(), mOutputLogProbs, getStream());
+        mDecoderDomain.getBatchSize(), baseOutputs->beamWidth, maxSeqLen, mDecoderDomain.getMaxDecodingTokens(),
+        mOutputLogProbs, getStream());
 
     mCyclicStep += 1;
 

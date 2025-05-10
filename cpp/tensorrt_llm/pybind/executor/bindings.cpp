@@ -83,6 +83,7 @@ void initBindings(pybind11::module_& m)
         .def("isLookahead", &tle::DecodingMode::isLookahead)
         .def("isExplicitDraftTokens", &tle::DecodingMode::isExplicitDraftTokens)
         .def("isEagle", &tle::DecodingMode::isEagle)
+        .def("useVariableBeamWidthSearch", &tle::DecodingMode::useVariableBeamWidthSearch)
         .def_property_readonly("name", &tle::DecodingMode::getName)
         .def(py::pickle(decodingModeGetstate, decodingModeSetstate));
 

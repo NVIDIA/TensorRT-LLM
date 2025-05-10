@@ -19,8 +19,8 @@
 namespace tensorrt_llm::runtime
 {
 
-void PromptTuningParams::fillTasksTensor(TensorPtr tasksHost, const SizeType32 batchSize,
-    const SizeType32 numContextRequests, std::vector<SizeType32> const& reqBeamWidths,
+void PromptTuningParams::fillTasksTensor(TensorPtr tasksHost, SizeType32 const batchSize,
+    SizeType32 const numContextRequests, std::vector<SizeType32> const& reqBeamWidths,
     std::vector<SizeType32> const& reqPromptLengths, BufferManager const& manager, bool packedInput)
 {
     auto const& tasksHostShape = tasksHost->getShape();

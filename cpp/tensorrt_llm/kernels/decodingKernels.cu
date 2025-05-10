@@ -521,15 +521,11 @@ __global__ void finalizeKernel(BeamHypotheses bh)
 
 void invokeFinalize(BeamHypotheses& bh, cudaStream_t stream)
 {
-    TLLM_LOG_TRACE("%s %s start", __FILE__, __PRETTY_FUNCTION__);
-
     int const nBM = bh.nBeamWidth;
     int const nThread = min(roundUp(nBM * 2, 32), 1024);
     size_t const nByteSharedMemory = (sizeof(int) + sizeof(float)) * nBM * 2;
     finalizeKernel<<<bh.nBatchSize, nThread, nByteSharedMemory, stream>>>(bh);
     sync_check_cuda_error(stream);
-
-    TLLM_LOG_TRACE("%s %s stop", __FILE__, __PRETTY_FUNCTION__);
 }
 
 __global__ void copyBeamHypotheses(CopyBeamHypothesesStruct copyStruct)

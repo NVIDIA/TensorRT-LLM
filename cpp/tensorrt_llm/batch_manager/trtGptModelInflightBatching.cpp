@@ -1310,14 +1310,15 @@ executor::DecodingMode getDecodingMode(SpeculativeDecodingMode specDecodingMode,
         {
             return decodingModeOpt.value();
         }
-        if (beamWidth == 1)
-        {
-            return executor::DecodingMode::TopKTopP();
-        }
-        return executor::DecodingMode::BeamSearch();
+        return (beamWidth == 1) ? executor::DecodingMode::TopKTopP() : executor::DecodingMode::BeamSearch();
     };
 
     auto decodingMode = getDefaultDecodingMode(decodingModeOpt);
+    // Variable-Beam-Width-Search (special mode of Beam-Search) is enabled.
+    if (decodingMode.isBeamSearch() && decodingMode.isUseVariableBeamWidthSearch())
+    {
+        TLLM_LOG_INFO("Variable-Beam-Width-Search is enabled");
+    }
     // Overwrite decoding mode when beam width is one.
     if (beamWidth == 1 && decodingMode.isBeamSearch())
     {
@@ -1401,6 +1402,7 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
 
         auto const decodingMode
             = getDecodingMode(mModelConfig.getSpeculativeDecodingMode(), decodingModeOpt, mOperatingBeamWidth);
+
         if (decodingMode.isExplicitDraftTokens())
         {
             // There are no logits in Explicit draft tokens model.
@@ -1412,6 +1414,7 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
                 decoderType = nvinfer1::DataType::kHALF;
             }
         }
+
         mDecoder = std::make_shared<runtime::GptDecoderBatched>(
             mRuntime->getStreamPtr(), mModelConfig.getSpeculativeDecodingMode(), decoderType);
         mDecoder->setup(decodingMode, getMaxNumSequences(), mOperatingBeamWidth, getMaxAttentionWindow(),
@@ -1422,11 +1425,11 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
         {
             mDecoder->getDecoderState().setupExplicitDraftTokens(mDecoderBuffers->explicitDraftTokensBuffers);
         }
-        if (decodingMode.isLookahead())
+        else if (decodingMode.isLookahead())
         {
             mDecoder->getDecoderState().setupLookahead(mDecoderBuffers->lookaheadBuffers.value());
         }
-        if (decodingMode.isEagle())
+        else if (decodingMode.isEagle())
         {
             mDecoder->getDecoderState().setupEagle(mDecoderBuffers->eagleBuffers);
         }
@@ -1646,6 +1649,10 @@ TrtGptModelInflightBatching::prepareBuffers(
         mCrossKvCacheManager.get(), mRnnStateManager.get(), mPeftTables[bufferId], *mRuntime, mModelConfig,
         mWorldConfig, getGatherGenerationLogits(), isTrtOverlap(), allNewTokens);
 
+    // For Variable-Beam-Width-Search
+    mRuntime->setCurrentBeamWidths(
+        tensorrt_llm::batch_manager::utils::getRequestBeamWidths(contextRequests, generationRequests));
+
     mRuntime->setInputTensors(optProfileId, inputMap);
     mRuntime->setOutputTensors(optProfileId, outputMap);
 
@@ -1794,7 +1801,7 @@ void TrtGptModelInflightBatching::postProcessRequest(
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const seqSlot = llmReq.mSeqSlot.value();
-    auto const reqBeamWidth = llmReq.mSamplingConfig.beamWidth;
+    auto const reqBeamWidth = llmReq.getBeamWidthByIter(true);
     auto const& bufferManager = getBufferManager();
 
     if (llmReq.getReturnGenerationLogits() && !llmReq.getGenerationLogitsFragments().empty())
@@ -2042,7 +2049,7 @@ void TrtGptModelInflightBatching::copyCacheIndirectionFromOutputsToInputs(
     {
         for (auto const& llmReq : requests)
         {
-            auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
+            auto const reqBeamWidth = llmReq->getBeamWidthByIter();
             auto const seqSlot = llmReq->mSeqSlot.value();
             auto const copySize = static_cast<SizeType64>(cacheIndirShape.d[2]) * reqBeamWidth;
             srcOffsetsPtr[batchIdx] = seqSlot * copySize;
@@ -2153,13 +2160,13 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
         {
             continue;
         }
-        auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
+        auto const reqBeamWidth = llmReq->getBeamWidthByIter(true);
         auto const seqSlot = llmReq->mSeqSlot.value();
         auto const numGeneratedTokens = llmReq->getNumDraftTokens() + 1;
         auto const currentNumOfTokens = llmReq->getMaxBeamNumTokens();
 
         // Save the accepted token logits from target model
-        if (llmReq->getReturnGenerationLogits() && mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal()
+        if (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal() && llmReq->getReturnGenerationLogits()
             && llmReq->hasDraftTokens())
         {
             TLLM_CHECK_WITH_INFO(reqBeamWidth == 1, "Speculative decoding only works for beam width == 1");

@@ -49,7 +49,7 @@ void invokeTopkBeamSearch(T const* logProbs, T const* bias, void* workspace, Bea
         case 4: CASE_K(4)
         case 8: CASE_K(8)
         case 16: CASE_K(16)
-#ifndef FAST_BUILD // Skip beam_width larger than 16
+#ifndef FAST_BUILD // Skip beam width > 16
         case 32: CASE_K(32)
         case 64: CASE_K(64)
         case 128: CASE_K(128)
@@ -234,70 +234,67 @@ __global__ void gatherId(int const* __restrict pStage1Id, int* __restrict pStage
     return;
 }
 
-void printBH(BeamHypotheses const& bh)
+void BeamHypotheses::print()
 {
 #if BEAM_SEARCH_DEBUG
     cudaDeviceSynchronize();
+    printf("================ print BeamHypotheses start\n");
 
-    printf("printBH ================================================================\n");
-    PRINT(bh.bReturnNormedScore);
-    PRINT(bh.bVBWS);
-    PRINT(bh.nMaxBatchSize);
-    PRINT(bh.nBatchSize);
-    PRINT(bh.nBeamWidth);
-    PRINT(bh.nBeamWidthIn);
-    PRINT(bh.nBeamWidthOut);
-    PRINT(bh.nMaxSeqLen);
-    PRINT(bh.nVocabSize);
-    PRINT(bh.nVPart);
-    PRINT(bh.nByteMaxSharedMemoryPerBlock);
-    PRINT(bh.nByteSharedMemoryStage1);
-    PRINT(bh.nByteSharedMemoryStage3);
-    size_t const mbs = bh.nMaxBatchSize;
-    size_t const nbs = bh.nBatchSize;
-    size_t const nbm = bh.nBeamWidth;
-    size_t const nbmo = bh.nBeamWidthOut;
-    size_t const msl = bh.nMaxSeqLen;
+    PRINT(this->bReturnNormedScore);
+    PRINT(this->bVBWS);
+    PRINT(this->nMaxBatchSize);
+    PRINT(this->nBatchSize);
+    PRINT(this->nBeamWidth);
+    PRINT(this->nBeamWidthIn);
+    PRINT(this->nBeamWidthOut);
+    PRINT(this->nMaxSeqLen);
+    PRINT(this->nVocabSize);
+    PRINT(this->nVPart);
+    PRINT(this->nByteMaxSharedMemoryPerBlock);
+    PRINT(this->nByteSharedMemoryStage1);
+    PRINT(this->nByteSharedMemoryStage3);
+    size_t const mbs = this->nMaxBatchSize;
+    size_t const nbs = this->nBatchSize;
+    size_t const nbm = this->nBeamWidth;
+    size_t const nbmo = this->nBeamWidthOut;
+    size_t const msl = this->nMaxSeqLen;
 
-    PH2(bh.diversityRates, nbs);
-    PH2(bh.lengthPenalties, nbs);
-    PH2(bh.earlyStoppings, nbs);
-    PH3(bh.beamWidthArraysHost, nbs * kMaxBeamWidthArrayLength, kMaxBeamWidthArrayLength);
-    PH3(bh.beamWidthArraysDevice, nbs * kMaxBeamWidthArrayLength, kMaxBeamWidthArrayLength);
-    PH2(bh.nBeamWidthInHost, nbs);
-    PH2(bh.nBeamWidthOutHost, nbs);
-    PH2(bh.nBeamWidthInDevice, nbs);
-    PH2(bh.nBeamWidthOutDevice, nbs);
+    PH2(this->diversityRates, nbs);
+    PH2(this->lengthPenalties, nbs);
+    PH2(this->earlyStoppings, nbs);
+    PH3(this->beamWidthArraysHost, nbs * kMaxBeamWidthArrayLength, kMaxBeamWidthArrayLength);
+    PH2(this->nBeamWidthInHost, nbs);
+    PH2(this->nBeamWidthOutHost, nbs);
 
-    PH2(bh.inputLengths, nbs * nbm);
-    PH2(bh.endIds, nbs);
-    PH2(bh.batchSlots, nbs);
+    PH2(this->inputLengths, nbs * nbm);
+    PH2(this->endIds, nbs);
+    PH2(this->batchSlots, nbs);
 
-    PH3(bh.outputIds, nbs * nbm * msl, msl);
-    PH3(bh.logProbs, nbs * nbm * msl, msl);
-    PH3(bh.sequenceLengths, nbs * nbm, nbm);
-    PH3(bh.cumLogProbs, nbs * nbm, nbm);
+    PH3(this->outputIds, nbs * nbm * msl, msl);
+    PH3(this->logProbs, nbs * nbm * msl, msl);
+    PH3(this->sequenceLengths, nbs * nbm, nbm);
+    PH3(this->cumLogProbs, nbs * nbm, nbm);
 
-    PH3(bh.outputIdsCBA, mbs * nbmo * 2 * msl, msl);
-    PH3(bh.logProbsCBA, mbs * nbmo * 2 * msl, msl);
-    PH3(bh.sequenceLengthsCBA, mbs * nbmo * 2, nbmo * 2);
-    PH3(bh.cumLogProbsCBA, mbs * nbmo * 2, nbmo * 2);
-    PH3(bh.normedScoresCBA, mbs * nbmo * 2, nbmo * 2);
-    PH2(bh.numBeamsCBA, mbs);
-    PH2(bh.minNormedScoresCBA, mbs);
+    PH3(this->outputIdsCBA, mbs * nbmo * 2 * msl, msl);
+    PH3(this->logProbsCBA, mbs * nbmo * 2 * msl, msl);
+    PH3(this->sequenceLengthsCBA, mbs * nbmo * 2, nbmo * 2);
+    PH3(this->cumLogProbsCBA, mbs * nbmo * 2, nbmo * 2);
+    PH3(this->normedScoresCBA, mbs * nbmo * 2, nbmo * 2);
+    PH2(this->numBeamsCBA, mbs);
+    PH2(this->minNormedScoresCBA, mbs);
 
-    PH2(bh.batchDones, nbs);
-    uint8_t* finished = reinterpret_cast<uint8_t*>(bh.finished);
+    // PH2(this->batchDones, nbs);
+    uint8_t* finished = reinterpret_cast<uint8_t*>(this->finished);
     PH2(finished, nbs * nbm);
 
     std::vector<runtime::SizeType32> batchSlots(nbs, 0);
-    cudaMemcpy(batchSlots.data(), bh.batchSlots, sizeof(runtime::SizeType32) * nbs, cudaMemcpyDeviceToHost);
+    cudaMemcpy(batchSlots.data(), this->batchSlots, sizeof(runtime::SizeType32) * nbs, cudaMemcpyDeviceToHost);
 
     std::vector<int*> outputIdsPtr(nbs, 0);
-    cudaMemcpy(outputIdsPtr.data(), bh.outputIdsPtr, sizeof(int*) * nbs, cudaMemcpyDeviceToHost);
+    cudaMemcpy(outputIdsPtr.data(), this->outputIdsPtr, sizeof(int*) * nbs, cudaMemcpyDeviceToHost);
 
     std::vector<int*> parentIdsPtr(nbs, 0);
-    cudaMemcpy(parentIdsPtr.data(), bh.parentIdsPtr, sizeof(int*) * nbs, cudaMemcpyDeviceToHost);
+    cudaMemcpy(parentIdsPtr.data(), this->parentIdsPtr, sizeof(int*) * nbs, cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
 
     for (int i = 0; i < nbs; ++i)
@@ -316,8 +313,10 @@ void printBH(BeamHypotheses const& bh)
     }
 
     // May not available in some context
-    // PH3(bh.outputIdsUnfinish, nbs * nbm * msl, msl);
-    // PH3(bh.parentIdsUnfinish, nbs * nbm * msl, msl);
+    // PH3(this->outputIdsUnfinish, nbs * nbm * msl, msl);
+    // PH3(this->parentIdsUnfinish, nbs * nbm * msl, msl);
+
+    printf("================ print BeamHypotheses stop\n");
 #endif
 }
 

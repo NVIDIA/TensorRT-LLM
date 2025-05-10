@@ -194,7 +194,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
     int const slot = bh.batchSlots[bid];
     size_t const nMBS{bh.nMaxBatchSize}; // Only for bh.logProbsTiled
     size_t const nBM{bh.nBeamWidth};
-    size_t const nBMIn{bh.bVBWS ? bh.nBeamWidthIn : bh.nBeamWidth};
+    // size_t const nBMIn{bh.bVBWS ? bh.nBeamWidthIn : bh.nBeamWidth};
     size_t const nBMOut{bh.bVBWS ? bh.nBeamWidthOut : bh.nBeamWidth};
     size_t const nMSL{bh.nMaxSeqLen};
     size_t const nV{bh.nVocabSize};
@@ -475,7 +475,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
     }
     __syncthreads();
 
-    if (tid < nBMIn)
+    if (tid < nBMOut)
     {
         int const indexBatchBeam = slot * nBM + tid;
         int const step = smemSeqLen[tid];

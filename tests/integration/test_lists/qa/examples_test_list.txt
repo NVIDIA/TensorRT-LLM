@@ -286,6 +286,7 @@ accuracy/test_cli_flow.py::TestGpt2::test_smooth_quant[]
 accuracy/test_cli_flow.py::TestGpt2::test_smooth_quant[per_token-per_channel]
 accuracy/test_cli_flow.py::TestGpt2::test_beam_search
 accuracy/test_cli_flow.py::TestGpt2::test_beam_search_large
+accuracy/test_cli_flow.py::TestGpt2::test_variable_beam_width_search
 accuracy/test_cli_flow.py::TestGpt2::test_weight_streaming_ootb
 accuracy/test_cli_flow.py::TestGpt2::test_weight_streaming_plugin
 accuracy/test_cli_flow.py::TestGpt2::test_cuda_graph

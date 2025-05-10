@@ -85,6 +85,14 @@ class TestGpt2(CliFlowAccuracyTestHarness):
                  extra_build_args=["--max_beam_width=256"],
                  extra_summarize_args=["--num_beams=256"])
 
+    def test_variable_beam_width_search(self, mocker):
+        mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 1)
+        self.run(extra_acc_spec="beam_width=8;beam_width_array=[2,3,4,5]",
+                 extra_build_args=["--max_beam_width=8"],
+                 extra_summarize_args=[
+                     "--num_beams=5", "--beam_width_array=[2,3,4,5]"
+                 ])
+
     def test_weight_streaming_ootb(self):
         self.run(extra_build_args=[
             "--gpt_attention_plugin=disable", "--weight_streaming",
