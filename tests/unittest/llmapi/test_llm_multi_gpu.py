@@ -506,6 +506,13 @@ def test_llm_abort_request_tp2(llm_for_sampling_params_tp2: LLM,
                           sampling_params=sampling_params)
 
 
+def test_llm_with_less_devices():
+    with pytest.raises(RuntimeError):
+        llm = LLM(model=llama_model_path,
+                  tensor_parallel_size=16,
+                  kv_cache_config=global_kv_cache_config)
+
+
 if __name__ == '__main__':
 
     #test_llm_capture_request_error()
