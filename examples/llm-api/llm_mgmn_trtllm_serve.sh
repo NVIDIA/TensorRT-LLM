@@ -33,7 +33,6 @@
 #      not supported in Slurm mode, you need to download the model and put it in
 #      the LOCAL_MODEL directory.
 
-
 echo "Starting trtllm-serve..."
 # Just launch trtllm-serve job with trtllm-llmapi-launch command.
 srun -l \
@@ -51,5 +50,6 @@ srun -l \
          trtllm-serve $LOCAL_MODEL \
             --tp_size 16 \
             --backend pytorch \
+            --host 0.0.0.0 \
             ${ADDITIONAL_OPTIONS}
     "
