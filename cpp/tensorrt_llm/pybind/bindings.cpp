@@ -301,11 +301,13 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def(py::self != py::self);
 
     py::class_<tr::ModelConfig>(m, "ModelConfig")
-        .def(py::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, nvinfer1::DataType>(),
+        .def(py::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, nvinfer1::DataType,
+                 std::optional<std::vector<SizeType32>>>(),
             py::arg("vocab_size"), py::arg("num_layers"), py::arg("num_attention_layers"), py::arg("num_rnn_layers"),
-            py::arg("num_heads"), py::arg("hidden_size"), py::arg("data_type"))
+            py::arg("num_heads"), py::arg("hidden_size"), py::arg("data_type"), py::arg("vocab_sizes") = py::none())
         .def_property_readonly("vocab_size", &tr::ModelConfig::getVocabSize)
-        .def("vocab_size_padded", &tr::ModelConfig::getVocabSizePadded, py::arg("world_size"))
+        .def(
+            "vocab_size_padded", &tr::ModelConfig::getVocabSizePadded, py::arg("world_size"), py::arg("vocab_size") = 0)
         .def("num_layers", &tr::ModelConfig::getNbLayers, py::arg("pipeline_parallelism") = 1)
         .def("num_attention_layers", &tr::ModelConfig::getNbAttentionLayers, py::arg("pipeline_parallelism") = 1,
             py::arg("pipeline_parallelism_rank") = 0)
@@ -317,6 +319,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("hidden_size", &tr::ModelConfig::getHiddenSize)
         .def_property_readonly("size_per_head", &tr::ModelConfig::getSizePerHead)
         .def_property_readonly("data_type", &tr::ModelConfig::getDataType)
+        .def_property_readonly("num_vocabs", &tr::ModelConfig::getNumVocabs)
+        .def_property_readonly("vocab_sizes", &tr::ModelConfig::getVocabSizes)
         .def_property("head_size", &tr::ModelConfig::getSizePerHead, &tr::ModelConfig::setSizePerHead)
         .def_property(
             "num_kv_heads_per_layer", &tr::ModelConfig::getNumKvHeadsPerLayer, &tr::ModelConfig::setNumKvHeadsPerLayer)

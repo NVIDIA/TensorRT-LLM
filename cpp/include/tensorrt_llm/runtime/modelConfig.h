@@ -100,7 +100,8 @@ public:
     };
 
     explicit ModelConfig(SizeType32 vocabSize, SizeType32 nbLayers, SizeType32 nbAttentionLayers,
-        SizeType32 nbRnnLayers, SizeType32 nbHeads, SizeType32 hiddenSize, nvinfer1::DataType dtype)
+        SizeType32 nbRnnLayers, SizeType32 nbHeads, SizeType32 hiddenSize, nvinfer1::DataType dtype,
+        std::optional<std::vector<SizeType32>> vocabSizes = std::nullopt)
         : mVocabSize(vocabSize)
         , mNbLayers(nbLayers)
         , mNbAttentionLayers(nbAttentionLayers)
@@ -141,10 +142,17 @@ public:
         , mManageWeightsType(ManageWeightsType::kDisabled)
         , mSkipCrossAttnBlocks(false)
         , mNumLanguages(0)
+        , mVocabSizes{vocabSizes}
     {
         TLLM_CHECK_WITH_INFO(mNbLayers >= mNbAttentionLayers + mNbRnnLayers,
             "Number of layers (%d) expected to be >= number of attention (%d) + number of rnn layers (%d)", mNbLayers,
             mNbAttentionLayers, mNbRnnLayers);
+        if (mVocabSizes)
+        {
+            SizeType32 const sizesSum = std::accumulate(mVocabSizes.value().cbegin(), mVocabSizes.value().cend(), 0);
+            TLLM_CHECK_WITH_INFO(
+                sizesSum == vocabSize, "Sum of all vocab sizes (%d) must equal to vocabSize (%d)", sizesSum, vocabSize);
+        }
         setNbKvHeads(mNbHeads);
     }
 
@@ -158,9 +166,23 @@ public:
         return mVocabSize;
     }
 
-    [[nodiscard]] SizeType32 constexpr getVocabSizePadded(SizeType32 worldSize) const noexcept
+    [[nodiscard]] SizeType32 getNumVocabs() const
     {
-        return (mVocabSize + worldSize - 1) / worldSize * worldSize;
+        return mVocabSizes ? mVocabSizes.value().size() : 1;
+    }
+
+    [[nodiscard]] std::vector<SizeType32> getVocabSizes() const
+    {
+        return mVocabSizes ? *mVocabSizes : std::vector<SizeType32>{mVocabSize};
+    }
+
+    [[nodiscard]] SizeType32 constexpr getVocabSizePadded(SizeType32 worldSize, SizeType32 vocabSize = 0) const noexcept
+    {
+        if (vocabSize == 0)
+        {
+            vocabSize = mVocabSize;
+        }
+        return (vocabSize + worldSize - 1) / worldSize * worldSize;
     }
 
     [[nodiscard]] SizeType32 countLocalLayers(
@@ -934,6 +956,9 @@ private:
 
     // Language adapter info
     std::optional<SizeType32> mNumLanguages;
+
+    // Size of each vocab if there are multiple vocabs
+    std::optional<std::vector<SizeType32>> mVocabSizes;
 };
 
 } // namespace tensorrt_llm::runtime

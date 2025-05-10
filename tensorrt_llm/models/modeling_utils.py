@@ -873,7 +873,10 @@ class PretrainedModel(Module,
             streamingllm=streamingllm,
             opt_batch_size=opt_batch_size,
             pp_reduce_scatter=pp_reduce_scatter,
-            mrope_rotary_cos_sin_size=mrope_rotary_cos_sin_size)
+            mrope_rotary_cos_sin_size=mrope_rotary_cos_sin_size,
+            num_vocabs=len(self.config.vocab_sizes) if
+            (hasattr(self.config, 'vocab_sizes')
+             and self.config.vocab_sizes) else 1)
 
         result = {
             'input_ids':

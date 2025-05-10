@@ -51,13 +51,13 @@ void PromptTuningParams::fillTasksTensor(TensorPtr tasksHost, const SizeType32 b
             if (bid < numContextRequests)
             {
                 totalInputSize += reqPromptLengths[bid];
-                promptTasksHost.insert(promptTasksHost.end(), reqPromptLengths[bid], taskId);
+                promptTasksHost.insert(promptTasksHost.end(), reqPromptLengths[bid] * numVocabs, taskId);
             }
             else
             {
                 for (SizeType32 beam = 0; beam < reqBeamWidths[bid]; ++beam)
                 {
-                    promptTasksHost.insert(promptTasksHost.end(), 1, taskId);
+                    promptTasksHost.insert(promptTasksHost.end(), numVocabs, taskId);
                     totalInputSize++;
                 }
             }
@@ -79,8 +79,9 @@ void PromptTuningParams::fillTasksTensor(TensorPtr tasksHost, const SizeType32 b
 
     if (packedInput)
     {
+        // TODO: hardcode for now
         tasks = manager.copyFrom(
-            promptTasksHost, runtime::ITensor::makeShape({totalInputSize}), runtime::MemoryType::kGPU);
+            promptTasksHost, runtime::ITensor::makeShape({totalInputSize * numVocabs}), runtime::MemoryType::kGPU);
     }
     else
     {

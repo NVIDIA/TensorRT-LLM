@@ -16,7 +16,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 from ...layers import MoeConfig
 from ...mapping import Mapping
@@ -40,6 +40,7 @@ class LLaMAConfig(PretrainedConfig):
                  attention_multiplier: float = 1.0,
                  residual_multiplier: float = 1.0,
                  output_multiplier_scale: float = 1.0,
+                 vocab_sizes: Optional[List[int]] = None,
                  **kwargs):
         self.mlp_bias = mlp_bias
         self.attn_bias = attn_bias
@@ -68,6 +69,7 @@ class LLaMAConfig(PretrainedConfig):
         self.attention_multiplier = attention_multiplier
         self.residual_multiplier = residual_multiplier
         self.output_multiplier_scale = output_multiplier_scale
+        self.vocab_sizes = vocab_sizes
         self.has_partial_lora_mask = False
 
         super().__init__(**kwargs)
@@ -88,6 +90,7 @@ class LLaMAConfig(PretrainedConfig):
         output['use_last_layernorm'] = self.use_last_layernorm
         output['layer_idx_offset'] = self.layer_idx_offset
         output['moe'] = self.moe.to_dict()
+        output['vocab_sizes'] = self.vocab_sizes
         return output
 
     @classmethod
@@ -185,6 +188,8 @@ class LLaMAConfig(PretrainedConfig):
         dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
         tie_word_embeddings = getattr(hf_config, 'tie_word_embeddings', False)
 
+        vocab_sizes = getattr(hf_config, 'vocab_sizes', None)
+
         return cls(
             architecture=hf_config.architectures[0],
             dtype=dtype,
@@ -214,6 +219,7 @@ class LLaMAConfig(PretrainedConfig):
             attention_multiplier=attention_multiplier,
             residual_multiplier=residual_multiplier,
             output_multiplier_scale=output_multiplier_scale,
+            vocab_sizes=vocab_sizes,
             **kwargs)
 
     @classmethod

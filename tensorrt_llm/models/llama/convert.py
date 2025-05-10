@@ -1056,6 +1056,7 @@ def load_weights_from_hf_model(hf_model,
     vocab_embedding = get_weight(
         model_params, f'{model_prefix}.{param_name_map["vocab_embedding"]}',
         dtype)
+    # TODO: update if there are multiple vocabs
 
     if mapping.is_first_pp_rank():
         if config.use_parallel_embedding:
@@ -1074,6 +1075,7 @@ def load_weights_from_hf_model(hf_model,
         else:
             lm_head_weights = get_weight(model_params,
                                          param_name_map["lm_head"], dtype)
+            # TODO: update if there are multiple vocabs
 
         if config.vocab_size % mapping.tp_size != 0:
             # padding
@@ -1616,9 +1618,10 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
                 weights[target.replace("weight", "bias")] = bias
 
     if mapping.is_first_pp_rank():
-        weights['transformer.vocab_embedding.weight'] = load(
-            param_name_map["vocab_embedding"], config.embedding_sharding_dim
-            if config.use_parallel_embedding else -1)  # vocab_embedding
+        v = load(param_name_map["vocab_embedding"],
+                 config.embedding_sharding_dim
+                 if config.use_parallel_embedding else -1)  # vocab_embedding
+        weights['transformer.vocab_embedding.weight'] = v
 
     if mapping.is_last_pp_rank():
         v = load(param_name_map["lm_head"], -1, 1) if pad_vocab else load(

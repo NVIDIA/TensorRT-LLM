@@ -383,7 +383,7 @@ void initBindings(pybind11::module_& m)
         .def("setup", &tr::GptDecoderBatched::setup, py::arg("mode"), py::arg("max_batch_size"),
             py::arg("max_beam_width"), py::arg("max_attention_window"), py::arg("sink_token_length"),
             py::arg("max_sequence_length"), py::arg("max_tokens_per_step"), py::arg("dtype"), py::arg("model_config"),
-            py::arg("world_config"))
+            py::arg("world_config"), py::arg("vocab_size") = 0)
         .def("forward_async", &tr::GptDecoderBatched::forwardAsync, py::arg("output"), py::arg("input"))
         .def("underlying_decoder", &tr::GptDecoderBatched::getUnderlyingDecoder, py::return_value_policy::reference)
         .def_property_readonly("stream_ptr", &tr::GptDecoderBatched::getDecoderStream)

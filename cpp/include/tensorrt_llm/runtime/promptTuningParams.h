@@ -50,6 +50,7 @@ public:
 
     std::vector<bool>
         promptTuningEnabled; // [batchSize] vector of bool that indicates which requests in a batch have ptuning enabled
+    SizeType32 numVocabs;
 };
 
 class PromptTuningParams : public GenericPromptTuningParams<ITensor::SharedPtr>
