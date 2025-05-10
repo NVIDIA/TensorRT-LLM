@@ -203,6 +203,7 @@ class Linear(nn.Module):
         self.use_custom_cublas_mm = use_custom_cublas_mm
         self.lora = lora
         self.input_quantizer = None
+        self._do_linear = None
 
         if not skip_create_weights_in_init:
             self.create_weights()
@@ -234,6 +235,7 @@ class Linear(nn.Module):
                                                            dtype=torch.float32,
                                                            device=device),
                                               requires_grad=False)
+                self._do_linear = self._apply_linear_fp8_qdq
             elif qc.layer_quant_mode.has_fp8_block_scales():
                 self.has_fp8_block_scales = True
                 self.weight = Parameter(torch.empty(weight_shape,
@@ -246,6 +248,7 @@ class Linear(nn.Module):
                                                           dtype=torch.float32,
                                                           device=device),
                                               requires_grad=False)
+                self._do_linear = self._apply_linear_fp8_block_scale
             elif qc.layer_quant_mode.has_nvfp4():
                 self.has_nvfp4 = True
                 self.scaling_vector_size = self.input_quantizer.scaling_vector_size
@@ -268,6 +271,7 @@ class Linear(nn.Module):
                     dtype=fp4_utils.float4_sf_dtype,
                     device=device),
                                               requires_grad=False)
+                self._do_linear = self._apply_linear_nvfp4
             else:
                 # TODO(zhenhuanc): support other quant mode
                 raise ValueError(f'unsupported quant mode: {qc.quant_mode}')
@@ -276,6 +280,7 @@ class Linear(nn.Module):
                                                 dtype=self.dtype,
                                                 device=device),
                                     requires_grad=False)
+            self._do_linear = self._apply_linear
 
         if self.has_bias:
             self.bias = Parameter(torch.empty((self.out_features, ),
@@ -286,56 +291,63 @@ class Linear(nn.Module):
             self.register_parameter("bias", None)
         self._weights_created = True
 
+    def _apply_linear_fp8_qdq(self, input, input_scale, bias):
+        # This op does not support bias now.
+        output = torch.ops.trtllm.cublas_scaled_mm(
+            input,
+            self.weight.t(),
+            scale_a=input_scale,
+            scale_b=self.weight_scale,
+            bias=None,
+            out_dtype=self.dtype or input.dtype,
+        )
+        if bias is not None:
+            output = output + bias
+        return output
+
+    def _apply_linear_fp8_block_scale(self, act_input, input_scale, bias):
+        output = torch.ops.trtllm.fp8_block_scaling_gemm(
+            act_input, self.weight, input_scale, self.weight_scale)
+        if bias is not None:
+            output = output + bias
+        return output
+
+    def _apply_linear_nvfp4(self, act_input, input_scale, bias):
+        output = torch.ops.trtllm.nvfp4_gemm(act_input, self.weight,
+                                             input_scale, self.weight_scale,
+                                             self.alpha, False, self.dtype)
+        if bias is not None:
+            output = output + bias
+
+        return output
+
+    def _apply_linear_not_supported_quant(self, act_input, input_scale, bias):
+        # TODO(zhenhuanc): support other quant mode
+        raise ValueError(
+            f'unsupported quant mode: {self.quant_config.quant_mode}')
+
+    def _apply_linear(self, act_input, input_scale, bias):
+        if self.use_custom_cublas_mm:
+            output = torch.ops.trtllm.cublas_mm(input,
+                                                self.weight.t(),
+                                                bias,
+                                                out_dtype=None)
+        else:
+            output = F.linear(input, self.weight, bias)
+        return output
+
     def apply_linear(self,
                      input,
-                     weight,
                      bias,
                      lora_params: Optional[dict] | None = None,
                      layer_idx: Optional[int] | None = None):
         if self._has_any_quant():
-            qc = self.quant_config
             act_input = input
             input_scale = None
             if self.input_quantizer is not None:
                 act_input, input_scale = self.input_quantizer(input)
 
-            if self.has_fp8_qdq:
-                # This op does not support bias now.
-                output = torch.ops.trtllm.cublas_scaled_mm(
-                    act_input,
-                    weight.t(),
-                    scale_a=input_scale,
-                    scale_b=self.weight_scale,
-                    bias=None,
-                    out_dtype=self.dtype or input.dtype,
-                )
-                if bias is not None:
-                    output = output + bias
-            elif self.has_fp8_block_scales:
-                output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                    act_input, self.weight, input_scale, self.weight_scale)
-                if bias is not None:
-                    output = output + bias
-            elif self.has_nvfp4:
-                output = torch.ops.trtllm.nvfp4_gemm(act_input, self.weight,
-                                                     input_scale,
-                                                     self.weight_scale,
-                                                     self.alpha, False,
-                                                     self.dtype)
-                if bias is not None:
-                    output = output + bias
-            else:
-                # TODO(zhenhuanc): support other quant mode
-                raise ValueError(f'unsupported quant mode: {qc.quant_mode}')
-        else:
-            # TODO: remove custom cublas_mm when default heuristics is good enough
-            if self.use_custom_cublas_mm:
-                output = torch.ops.trtllm.cublas_mm(input,
-                                                    self.weight.t(),
-                                                    bias,
-                                                    out_dtype=None)
-            else:
-                output = F.linear(input, self.weight, bias)
+        output = self._do_linear(act_input, input_scale, bias)
 
         if self.lora is not None and bool(lora_params):
             lora_result = self.lora(input, lora_params, layer_idx)
