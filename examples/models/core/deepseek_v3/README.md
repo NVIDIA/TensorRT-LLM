@@ -32,6 +32,7 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
     - [DeepGEMM](#deepgemm)
     - [FlashMLA](#flashmla)
     - [FP8 KV Cache and MLA](#fp8-kv-cache-and-mla)
+    - [KV Cache Reuse](#kv-cache-reuse)
   - [Notes and Troubleshooting](#notes-and-troubleshooting)
 
 
@@ -565,6 +566,9 @@ pytorch_backend_config:
   kv_cache_dtype: fp8
   # ...
 ```
+
+### KV Cache Reuse
+KV cache reuse is supported for MLA on SM90 and SM100. It is enabled by default and does not support FP8 KV cache right now. Due to extra operations like memcpy and GEMMs, GPU memory consumption may be higher and the E2E performance may have regression in some cases. Users could pass `KvCacheConfig(enable_block_reuse=False)` to LLM API to disable it.
 
 ## Notes and Troubleshooting
 

@@ -372,7 +372,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_fp8_block_scales(self, mtp_nextn, fp8kv, attention_dp, cuda_graph,
                               overlap_scheduler):
         # OOM on H100 with default free_gpu_memory_fraction=0.9
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        enable_block_reuse=not fp8kv)
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)
@@ -424,7 +425,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                     fp8kv, attention_dp, cuda_graph,
                                     overlap_scheduler):
         # OOM on H100 with default free_gpu_memory_fraction=0.9
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        enable_block_reuse=not fp8kv)
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)
@@ -471,6 +473,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (False, False, False, True),
                            (True, True, True, True)])
     def test_nvfp4(self, fp8kv, attention_dp, cuda_graph, overlap_scheduler):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
+                                        enable_block_reuse=not fp8kv)
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)
@@ -482,6 +486,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytorch_config.kv_cache_dtype = "fp8"
 
         llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only",
+                  kv_cache_config=kv_cache_config,
                   pytorch_backend_config=pytorch_config,
                   quant_config=quant_config,
                   enable_attention_dp=attention_dp)
@@ -512,6 +517,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
     def test_nvfp4_4gpus(self, fp8kv, attention_dp, cuda_graph,
                          overlap_scheduler, tp_size, pp_size, ep_size):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
+                                        enable_block_reuse=not fp8kv)
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)
@@ -526,6 +533,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   tensor_parallel_size=tp_size,
                   pipeline_parallel_size=pp_size,
                   moe_expert_parallel_size=ep_size,
+                  kv_cache_config=kv_cache_config,
                   pytorch_backend_config=pytorch_config,
                   quant_config=quant_config,
                   enable_attention_dp=attention_dp)
@@ -540,6 +548,39 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 task = MMLU(self.MODEL_NAME)
                 task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
+                          [(False, False, False), (True, False, False),
+                           (False, True, False), (False, False, True),
+                           (True, True, True)])
+    @parametrize_with_ids("quant_dtype", [
+        pytest.param(None, marks=skip_pre_hopper),
+        pytest.param("fp8", marks=skip_pre_hopper),
+        pytest.param("nvfp4", marks=skip_pre_blackwell)
+    ])
+    def test_no_kv_cache_reuse(self, quant_dtype, attention_dp, cuda_graph,
+                               overlap_scheduler):
+        model_path = self.MODEL_PATH
+        if quant_dtype == "fp8":
+            model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/fp8"
+        elif quant_dtype == "nvfp4":
+            model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only"
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        enable_block_reuse=False)
+        pytorch_config = PyTorchConfig(
+            enable_overlap_scheduler=overlap_scheduler,
+            use_cuda_graph=cuda_graph)
+
+        llm = LLM(model_path,
+                  kv_cache_config=kv_cache_config,
+                  pytorch_backend_config=pytorch_config,
+                  enable_attention_dp=attention_dp)
+        with llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
 
@@ -559,7 +600,8 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                              ids=["tp8", "tp8ep4", "tp8ep8"])
     def test_nvfp4_8gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                          attention_dp, cuda_graph, overlap_scheduler):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                        enable_block_reuse=not fp8kv)
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)

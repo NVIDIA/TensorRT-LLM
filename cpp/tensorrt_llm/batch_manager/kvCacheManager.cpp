@@ -557,7 +557,7 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
                 mLayerToPoolIndex[layerIdx] = poolIndex;
             }
         }
-        mPools.emplace_back(numLayers, numKvHeads, sizePerHead, tokensPerBlock, 1);
+        mPools.emplace_back(numLayers, mKVFactor, numKvHeads, sizePerHead, tokensPerBlock, 1);
         ++poolIndex;
     }
 
@@ -649,8 +649,8 @@ void WindowBlockManager::createBlockScalePools(SizeType32 quantBlockSize)
         TLLM_CHECK_WITH_INFO(kv_pool.blockSize % quantBlockSize == 0,
             "Cannot use FP4 quantization since kv_pool.blockSize is not divisible by FP4 quantBlockSize.");
 
-        mPools.emplace_back(kv_pool.numLayers, kv_pool.numKvHeads, kv_pool.sizePerHead, kv_pool.tokensPerBlock,
-            quantBlockSize,
+        mPools.emplace_back(kv_pool.numLayers, kv_pool.kvFactor, kv_pool.numKvHeads, kv_pool.sizePerHead,
+            kv_pool.tokensPerBlock, quantBlockSize,
             /*primaryPool=*/nullptr,
             /*secondaryPool=*/nullptr,
             /*containsBlockScales=*/true);
