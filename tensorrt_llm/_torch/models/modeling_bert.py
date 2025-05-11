@@ -4,7 +4,6 @@ import torch
 from torch import nn
 from transformers import BertConfig
 
-from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm.llmapi.utils import print_colored_debug
 from tensorrt_llm.logger import logger
 
@@ -14,6 +13,7 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
+from ..modules.linear import Linear
 from .modeling_utils import register_auto_model
 
 
@@ -81,7 +81,6 @@ class BertAttention(Attention):
                  layer_idx: Optional[int] = None):
         config = model_config.pretrained_config
         pos_embd_params = None
-        rotary_emb = None
         bias = True
         super().__init__(
             hidden_size=config.hidden_size,
@@ -89,7 +88,6 @@ class BertAttention(Attention):
             num_key_value_heads=config.num_attention_heads,
             max_position_embeddings=config.max_position_embeddings,
             bias=bias,
-            rotary_emb=rotary_emb,
             pos_embd_params=pos_embd_params,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,

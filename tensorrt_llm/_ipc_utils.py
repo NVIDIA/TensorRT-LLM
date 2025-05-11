@@ -25,14 +25,13 @@ from .logger import logger
 from .mapping import Mapping
 
 
-def _raise_if_error(error: cudaError_t):
-    if error != cudaError_t.cudaSuccess:
-        raise RuntimeError(error)
-
-
-def _raise_if_error(error: cuda.CUresult):
-    if error != cuda.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(error)
+def _raise_if_error(error: cudaError_t | cuda.CUresult):
+    if isinstance(error, cudaError_t):
+        if error != cudaError_t.cudaSuccess:
+            raise RuntimeError(f"CUDA Runtime API error: {repr(error)}")
+    if isinstance(error, cuda.CUresult):
+        if error != cuda.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"CUDA Driver API error: {repr(error)}")
 
 
 def can_access_peer(mapping: Mapping) -> bool:
@@ -99,14 +98,23 @@ class IpcMemory():
         Returns a list of buffer pointers, buffers[i] is a handle to the corresponding buffer residing on GPU #i.
         Call close_ipc_handle with the *buffer*.
         """
+
+        def align_size(size, alignment):
+            if (size % alignment) != 0:
+                size += alignment - (size % alignment)
+            return size
+
         comm = mpi_comm().Split(
             mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
             mapping.tp_rank)
 
-        error, local_ptr = cudart.cudaMalloc(size)
+        # see allocateIpcMemory in cpp/tensorrt_llm/runtime/ipcUtils.cpp for alignment reason
+        # 1 << 21 is 2MB
+        aligned_size = align_size(size, 1 << 21)
+        error, local_ptr = cudart.cudaMalloc(aligned_size)
         _raise_if_error(error)
         if set_to_zero:
-            _raise_if_error(cudart.cudaMemset(local_ptr, 0, size)[0])
+            _raise_if_error(cudart.cudaMemset(local_ptr, 0, aligned_size)[0])
         error, local_handle = cudart.cudaIpcGetMemHandle(local_ptr)
         _raise_if_error(error)
 

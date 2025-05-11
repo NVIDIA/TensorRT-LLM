@@ -54,20 +54,6 @@ class StatsKeeper:
         record.num_input_tokens = num_tokens
         record.start_timestamp = timestamp
 
-    def register_response(self, request_id: int, timestamp: int, final: bool,
-                          error: bool, decode_iter: int, tokens: List[int],
-                          time_on_first_token: int) -> None:
-        """
-        Register a response from a new request.
-
-        DEPRECATED after switching to LLM API.
-        """
-        record = self.requests[request_id]
-        record.register_event(error, final, timestamp, decode_iter, tokens,
-                              time_on_first_token)
-        if final:
-            self.num_complete = self.num_complete + 1
-
     def register_request_perf_item(self, request_perf_item: PerfItemTuple):
         """
         Register request perf items, used exclusively with LLM API.
@@ -98,6 +84,8 @@ class StatsKeeper:
         request_latencies = []
         generation_latencies = []
         generation_throughputs = []
+        output_throughput_per_user = []
+
         intertoken_avg_latencies = []
         output_tokens = []
         request_acceptance = []
@@ -119,6 +107,7 @@ class StatsKeeper:
             ttft_times.append(entry.time_to_first_token)
             intertoken_avg_latencies.append(entry.intertoken_latency)
             request_acceptance.append(request_ar)
+            output_throughput_per_user.append(entry.output_token_throughput)
             total_decoding_iterations += entry.decode_iteration + 1
 
             output_tokens.append(entry.num_total_output_tokens)
@@ -139,6 +128,8 @@ class StatsKeeper:
                 request_latencies),
             tpot_percentiles=PercentileStats.from_iterable(
                 intertoken_avg_latencies),
+            output_throughput_percentiles=PercentileStats.from_iterable(
+                output_throughput_per_user),
             ttft_percentiles=PercentileStats.from_iterable(ttft_times),
             generation_tp_percentiles=PercentileStats.from_iterable(
                 generation_throughputs),
@@ -171,6 +162,7 @@ class ReportUtility:
             logger (Logger): A logger for logging.
             streaming (bool, optional): Streaming benchmark used. Defaults to False.
         """
+        self.raw_statistics = statistics
         self.statistics = statistics.generate_statistics_summary()
         self.dataset_metadata = dataset_metadata
         self.rt_cfg = rt_cfg
@@ -194,19 +186,39 @@ class ReportUtility:
         return rate * 1.0e9
 
     @property
-    def total_latency_s(self) -> float:
-        """Total latency in seconds."""
-        return self.convert_to_s(self.statistics.total_latency_ns)
-
-    @property
     def request_throughput_req_s(self) -> float:
         """Request throughput in requests per second."""
-        return self.statistics.num_requests / self.total_latency_s
+        return self.convert_rate_to_s(self.statistics.request_throughput_ns)
 
     @property
     def output_throughput_tok_s(self) -> float:
         """Output throughput in tokens per second."""
-        return self.statistics.total_output_tokens / self.total_latency_s
+        return self.convert_rate_to_s(self.statistics.output_throughput_tok_ns)
+
+    @property
+    def total_token_throughput_tok_s(self) -> float:
+        """Total token throughput in tokens per second."""
+        return self.convert_rate_to_s(
+            self.statistics.total_token_throughput_tok_ns)
+
+    @property
+    def per_user_generation_token_throughput_s(self) -> float:
+        """Output throughput per user in tokens per second."""
+        return self.convert_rate_to_s(
+            self.statistics.per_user_generation_token_throughput_ns)
+
+    @property
+    def per_user_output_throughput_tok_s(self) -> float:
+        """Output throughput per user in tokens per second."""
+        return self.convert_rate_to_s(
+            self.statistics.output_throughput_tok_ns_per_user)
+
+    def get_output_tokens(self, tokenizer) -> Dict[int, List[str]]:
+        retval = {}
+        for req_id, request in self.raw_statistics.requests.items():
+            output_str = tokenizer.decode(request.tokens)
+            retval[req_id] = output_str
+        return dict(sorted(retval.items()))
 
     def get_statistics_dict(self) -> Dict[str, Any]:
         """Get statistics as a dictionary.
@@ -224,7 +236,7 @@ class ReportUtility:
         }
 
         # Engine/Backend details
-        if self.rt_cfg.backend != 'pytorch':
+        if self.rt_cfg.backend not in ('pytorch', 'autodeploy'):
             config_path = self.rt_cfg.engine_dir / "config.json"
             with open(config_path, "r") as config:
                 engine_config = json.load(config)
@@ -260,7 +272,9 @@ class ReportUtility:
                 "backend":
                 "Pytorch",
                 "dtype":
-                torch_dtype_to_str(model_config.pretrained_config.torch_dtype),
+                torch_dtype_to_str(
+                    model_config.pretrained_config.torch_dtype
+                    or model_config.pretrained_config.text_config.torch_dtype),
                 "kv_cache_dtype":
                 model_config.quant_config.kv_cache_quant_algo,
                 "quantization":
@@ -269,24 +283,16 @@ class ReportUtility:
 
         # World and runtime info
         stats_dict["world_info"] = {
-            "tp_size":
-            self.rt_cfg.world_config.tp_size,
-            "pp_size":
-            self.rt_cfg.world_config.pp_size,
-            "ep_size":
-            self.rt_cfg.world_config.ep_size,
-            "world_size":
-            self.rt_cfg.world_config.world_size,
-            "max_batch_size":
-            self.rt_cfg.settings_config.max_batch_size,
-            "max_num_tokens":
-            self.rt_cfg.settings_config.max_num_tokens,
-            "scheduling_policy":
-            self.rt_cfg.settings_config.scheduler_policy.values[1],
+            "tp_size": self.rt_cfg.world_config.tp_size,
+            "pp_size": self.rt_cfg.world_config.pp_size,
+            "ep_size": self.rt_cfg.world_config.ep_size,
+            "world_size": self.rt_cfg.world_config.world_size,
+            "max_batch_size": self.rt_cfg.settings_config.max_batch_size,
+            "max_num_tokens": self.rt_cfg.settings_config.max_num_tokens,
+            "scheduling_policy": self.rt_cfg.settings_config.scheduler_policy,
             "kv_cache_percentage":
             self.rt_cfg.settings_config.kv_cache_percent * 100.0,
-            "issue_rate":
-            self.convert_rate_to_s(self.statistics.issue_rate_ns)
+            "issue_rate": self.convert_rate_to_s(self.statistics.issue_rate_ns)
         }
 
         # Request details
@@ -315,10 +321,11 @@ class ReportUtility:
             # Output throughput (total output (OSL) tokens / end-to-end latency)
             "system_output_throughput_tok_s":
             self.output_throughput_tok_s,
-            # Output throughput per user (average per request total tokens / avg request latency)
+            # Output throughput per user (average per request output throughput)
+            "system_total_throughput_tok_s":
+            self.total_token_throughput_tok_s,
             "output_throughput_per_user_tok_s":
-            self.statistics.token_percentiles.average / self.convert_to_s(
-                self.statistics.request_latency_percentiles.average),
+            self.per_user_output_throughput_tok_s,
             # Output throughput per GPU (total throughput / world size)
             "output_throughput_per_gpu_tok_s":
             self.output_throughput_tok_s / self.rt_cfg.world_config.world_size,
@@ -333,19 +340,21 @@ class ReportUtility:
         }
 
         if self.streaming:
+            avg_tpot = self.convert_to_ms(
+                self.statistics.per_user_time_per_output_token_ns)
+
             stats_dict["streaming_metrics"] = {
-                # Token output speed (1 / time-per-output-token)
-                # NOTE: Excludes TTFT by nature of using TPOT.
+                # NOTE: Excludes TTFT by nature as this is a genphase calculation.
                 "token_output_speed_tok_s":
-                self.convert_rate_to_s(
-                    1.0 / self.statistics.tpot_percentiles.average),
+                self.per_user_generation_token_throughput_s,
                 # Average per request time-to-first-token (TTFT)
                 "avg_ttft_ms":
-                self.convert_to_ms(self.statistics.ttft_percentiles.average),
-                # Average per request time-per-output-token (TPOT)
+                self.convert_to_ms(
+                    self.statistics.per_user_time_to_first_token_ns),
+                # Average per request token time-per-output-token (TPOT)
                 "avg_tpot_ms":
-                self.convert_to_ms(self.statistics.tpot_percentiles.average),
-                # Per request Time-per-output-token percentiles (TPOT)
+                avg_tpot,
+                # Average per request Time-per-output-token percentiles (TPOT)
                 "tpot_percentiles":
                 self.statistics.tpot_percentiles.model_dump(
                     exclude_none=True, by_alias=True, mode='json') | {
@@ -360,15 +369,32 @@ class ReportUtility:
                         k: self.convert_to_ms(v)
                         for k, v in
                         self.statistics.ttft_percentiles.model_dump().items()
-                    }
+                    },
+                "gen_tps_percentiles":
+                self.statistics.generation_tp_percentiles.model_dump(
+                    exclude_none=True, by_alias=True, mode='json') | {
+                        k: self.convert_rate_to_s(v)
+                        for k, v in self.statistics.generation_tp_percentiles.
+                        model_dump().items()
+                    },
             }
 
+        spec_decoding, decoding_mode = False, None
         if (self.rt_cfg.decoding_config
                 and self.rt_cfg.decoding_config.decoding_mode
                 != SpeculativeDecodingMode.NONE):
+            # cpp decoding
+            spec_decoding = True
+            decoding_mode = self.rt_cfg.decoding_config.decoding_mode.values[1]
+        elif ("speculative_config" in self.kwargs
+              and self.kwargs["speculative_config"] is not None):
+            # pytorch speculative decoding
+            spec_decoding = True
+            decoding_mode = self.kwargs["speculative_config"].decoding_type
+        if (spec_decoding):
             stats_dict["decoding_stats"] = {
                 "mode":
-                self.rt_cfg.decoding_config.decoding_mode.values[1],
+                decoding_mode,
                 "acceptance_percentiles":
                 self.statistics.acceptance_percentiles.model_dump(
                     exclude_none=True, by_alias=True, mode='json')
@@ -394,7 +420,7 @@ class ReportUtility:
         decoding = stats_dict.get("decoding_stats", None)
 
         backend_info = ""
-        if self.rt_cfg.backend != "pytorch":
+        if self.rt_cfg.backend not in ('pytorch', 'autodeploy'):
             config_path = self.rt_cfg.engine_dir / "config.json"
             with open(config_path, "r") as config:
                 engine_config = json.load(config)
@@ -467,10 +493,12 @@ class ReportUtility:
         perf_stats = (
             f"Request Throughput (req/sec):                     {perf['request_throughput_req_s']:.4f}\n"
             f"Total Output Throughput (tokens/sec):             {perf['system_output_throughput_tok_s']:.4f}\n"
-            f"Per User Output Throughput (tokens/sec/user):     {perf['output_throughput_per_user_tok_s']:.4f}\n"
-            f"Per GPU Output Throughput (tokens/sec/gpu):       {perf['output_throughput_per_gpu_tok_s']:.4f}\n"
+            f"Total Token Throughput (tokens/sec):              {perf['system_total_throughput_tok_s']:.4f}\n"
             f"Total Latency (ms):                               {perf['total_latency_ms']:.4f}\n"
             f"Average request latency (ms):                     {perf['avg_request_latency_ms']:.4f}\n"
+            # Output Throughput includes context/first token.
+            f"Per User Output Throughput [w/ ctx] (tps/user):   {perf['output_throughput_per_user_tok_s']:.4f}\n"
+            f"Per GPU Output Throughput (tps/gpu):              {perf['output_throughput_per_gpu_tok_s']:.4f}\n"
         )
 
         if streaming:
@@ -486,14 +514,21 @@ class ReportUtility:
                 f"[TTFT] {key.upper():<7}: {ttft[key]:.4f}" for key in
                 ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
 
+            gen_tps_stats = "\n".join(
+                f"[GTPS] {key.upper():<7}: {streaming['gen_tps_percentiles'][key]:.4f}"
+                for key in
+                ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
+
             perf_stats += (
-                f"Per User Output Speed [1/TPOT] (tokens/sec/user): {streaming['token_output_speed_tok_s']:.4f}\n"
-                f"Average time-to-first-token [TTFT] (ms):          {streaming['avg_ttft_ms']:.4f}\n"
-                f"Average time-per-output-token [TPOT] (ms):        {streaming['avg_tpot_ms']:.4f}\n"
-                "\n-- Time-per-Output-Token [TPOT] Breakdown (ms) ----------\n\n"
+                f"Average time-to-first-token [TTFT] (ms):   {streaming['avg_ttft_ms']:.4f}\n"
+                f"Average time-per-output-token [TPOT] (ms): {streaming['avg_tpot_ms']:.4f}\n"
+                f"Per User Output Speed (tps/user):          {streaming['token_output_speed_tok_s']:.4f}\n"
+                "\n-- Per-Request Time-per-Output-Token [TPOT] Breakdown (ms)\n\n"
                 f"{tpot_stats}\n"
-                "\n-- Time-to-First-Token [TTFT] Breakdown (ms) ------------\n\n"
-                f"{ttft_stats}\n")
+                "\n-- Per-Request Time-to-First-Token [TTFT] Breakdown (ms) \n\n"
+                f"{ttft_stats}\n"
+                "\n-- Per-Request Generation Throughput [GTPS] Breakdown (tps/user)\n\n"
+                f"{gen_tps_stats}\n")
 
         perf_stats += (
             "\n-- Request Latency Breakdown (ms) -----------------------\n\n"

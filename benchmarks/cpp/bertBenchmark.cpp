@@ -74,15 +74,17 @@ std::string engineFilename(
 }
 
 void benchmarkBert(std::string const& modelName, std::filesystem::path const& dataPath,
-    std::vector<int> const& batchSizes, std::vector<int> const& inLens, std::vector<float> const& gpuWeightsPercents,
-    std::shared_ptr<nvinfer1::ILogger> const& logger, int warmUp, int numRuns, int duration)
+    std::vector<int> const& batchSizes, std::vector<int> const& inLens, bool useGpuDirectStorage,
+    std::vector<float> const& gpuWeightsPercents, std::shared_ptr<nvinfer1::ILogger> const& logger, int warmUp,
+    int numRuns, int duration)
 {
     auto const worldConfig = WorldConfig::mpi();
     auto const enginePath = dataPath / engineFilename(dataPath, worldConfig, modelName);
 
     for (float gpuWeightsPercent : gpuWeightsPercents)
     {
-        auto rt = std::make_shared<TllmRuntime>(RawEngine(enginePath), logger.get(), gpuWeightsPercent);
+        auto rt = std::make_shared<TllmRuntime>(
+            RawEngine(enginePath), logger.get(), useGpuDirectStorage, gpuWeightsPercent);
         rt->addContext(0);
         for (auto inLen : inLens)
         {
@@ -174,6 +176,8 @@ int main(int argc, char* argv[])
         "by \";\", "
         "example: \"0.0;0.5;1.0\".",
         cxxopts::value<std::string>()->default_value("1.0"));
+    options.add_options()("use_gpu_direct_storage", "Enable GPUDirect Storage (GDS) for loading engine.",
+        cxxopts::value<bool>()->default_value("false"));
 
     auto result = options.parse(argc, argv);
 
@@ -258,8 +262,8 @@ int main(int argc, char* argv[])
     try
     {
         benchmarkBert(result["model"].as<std::string>(), result["engine_dir"].as<std::string>(), batchSizes, inLens,
-            gpuWeightsPercents, logger, result["warm_up"].as<int>(), result["num_runs"].as<int>(),
-            result["duration"].as<int>());
+            result["use_gpu_direct_storage"].as<bool>(), gpuWeightsPercents, logger, result["warm_up"].as<int>(),
+            result["num_runs"].as<int>(), result["duration"].as<int>());
     }
     catch (std::exception const& e)
     {

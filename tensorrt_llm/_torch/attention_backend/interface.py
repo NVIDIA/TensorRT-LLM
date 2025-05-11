@@ -1,7 +1,8 @@
 import copy
-import enum
+import weakref
+from collections import namedtuple
 from dataclasses import dataclass, field
-from functools import lru_cache
+from enum import Enum, IntEnum
 from typing import (Generic, List, Optional, Protocol, Tuple, Type, TypeVar,
                     Union)
 
@@ -15,12 +16,22 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..metadata import KVCacheParams
 from ..pyexecutor.resource_manager import KVCacheManager
+from ..utils import get_model_extra_attrs
 
 
 @dataclass
 class AttentionRuntimeFeatures:
     chunked_prefill: bool = False
     cache_reuse: bool = False
+    has_speculative_draft_tokens: bool = False
+
+
+# The type of requests in qkv passed to attention
+# Please keep sync with AttentionInputType in cpp/tensorrt_llm/thop/attentionOp.cpp
+class AttentionInputType(IntEnum):
+    mixed = 0  # contains both context and generation
+    context_only = 1
+    generation_only = 2
 
 
 @dataclass(kw_only=True)
@@ -37,6 +48,7 @@ class AttentionMetadata:
     kv_cache_manager: KVCacheManager
     mapping: Optional[Mapping] = None
 
+    enable_flash_mla: bool = False
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
 
@@ -45,12 +57,16 @@ class AttentionMetadata:
     # For sub metadata of cross attention, it's automatically
     # initialized to seq_lens of parent metadata.
     seq_lens: Optional[torch.Tensor]  # Implemented using property
+
+    # The number of context-phase sequences in the batch.
+    num_contexts: int  # Implemented using property
+
     # The position of each token in each sequence.
     # May be None if positional embedding is applied outside the backend.
     position_ids: Optional[torch.Tensor] = None
 
     # The number of context-phase sequences in the batch.
-    num_contexts: int = 0
+    _num_contexts: int = field(init=False, default=0, repr=False)
     # The parameters for the KV cache.
     kv_cache_params: Optional[KVCacheParams] = None
 
@@ -102,6 +118,13 @@ class AttentionMetadata:
 
     all_rank_num_tokens: Optional[List[int]] = None
 
+    # These fields are set when changing seq_lens and _num_contexts to avoid computation
+    # during execution. If the calculation happens during execution, torch compile treats it
+    # as DDS and fails to compile.
+    _num_generations: int = field(init=False, default=0, repr=False)
+    _num_ctx_tokens: int = field(init=False, default=0, repr=False)
+    _num_tokens: int = field(init=False, default=0, repr=False)
+
     def __post_init__(self) -> None:
         if self.is_cross:
             assert self.cross is None or self.cross is self, "Cross attention metadata should not have sub metadata"
@@ -112,6 +135,18 @@ class AttentionMetadata:
             self.cross
         ), "Top level and cross attention sub metadata type mismatched"
 
+    def on_update(self):
+        if (self._seq_lens is not None
+                and self._seq_lens.shape[0] >= self.num_contexts
+                and self.num_contexts >= 0):
+            self._num_ctx_tokens = self._seq_lens[:self.num_contexts].sum(
+            ).item()
+            self._num_generations = self._seq_lens.shape[0] - self.num_contexts
+        if self._seq_lens_kv is not None:
+            self._num_tokens = int(self._seq_lens_kv.sum())
+        elif self._seq_lens is not None:
+            self._num_tokens = int(self._seq_lens.sum())
+
     @property
     def seq_lens(self) -> Optional[torch.Tensor]:
         return self._seq_lens
@@ -121,13 +156,44 @@ class AttentionMetadata:
         # If value not explicitly given, dataclass tries to initialize using class attribute
         value = value if value is not AttentionMetadata.seq_lens else None
         self._seq_lens = value
+        self.on_update()
+
         # The model executor sets seq_lens to None initially.
         if self._seq_lens is not None:
             self._seq_lens = self._seq_lens.pin_memory()
-            self._seq_lens_cuda = self._seq_lens.cuda(non_blocking=True)
+
+            if self.is_cuda_graph and self._seq_lens_cuda is not None:
+                # Very important: do not reallocate if we are using CUDA graphs.
+                # This copy is safe because the batch size is guaranteed to not
+                # change in the CUDA graph case. The seqlens can change if we
+                # are doing spec decode.
+                self._seq_lens_cuda.copy_(self._seq_lens, non_blocking=True)
+            else:
+                self._seq_lens_cuda = self._seq_lens.cuda(non_blocking=True)
+
         if self.has_cross_sub_metadata:
             self.cross._seq_lens = self._seq_lens
             self.cross._seq_lens_cuda = self._seq_lens_cuda
+
+    @property
+    def num_contexts(self) -> int:
+        return self._num_contexts
+
+    @num_contexts.setter
+    def num_contexts(self, value: int):
+        value = value if value is not AttentionMetadata.num_contexts else 0
+        self._num_contexts = value
+        self.on_update()
+
+    @property
+    def num_generations(self) -> int:
+        return self._num_generations
+
+    @num_generations.setter
+    def num_generations(self, value: int):
+        value = value if value is not AttentionMetadata.num_generations else 0
+        self._num_generations = value
+        self.on_update()
 
     @property
     def seq_lens_cuda(self):
@@ -141,6 +207,7 @@ class AttentionMetadata:
     def seq_lens_kv(self, value: Optional[torch.Tensor]):
         value = value if value is not AttentionMetadata.seq_lens_kv else None
         self._seq_lens_kv = value
+        self.on_update()
         # The model executor sets seqlens to None initially.
         if self._seq_lens_kv is not None:
             self._seq_lens_kv = self._seq_lens_kv.pin_memory()
@@ -159,32 +226,11 @@ class AttentionMetadata:
         return self.seq_lens[:self.num_contexts]
 
     @property
-    def num_generations(self) -> int:
-        """
-        The number of generation-phase sequences in the batch.
-        """
-        return self.num_seqs - self.num_contexts
-
-    @property
     def num_seqs(self) -> int:
         """
         The number of sequences in the batch.
         """
         return self.seq_lens.shape[0]
-
-    @property
-    def num_ctx_tokens(self) -> int:
-        """
-        Number of tokens in query sequences in the context phase.
-        """
-        return int(self.context_lens.sum())
-
-    @property
-    def num_tokens(self) -> int:
-        """
-        Number of key and value tokens in the batch (to be appended into kv cache)
-        """
-        return int(self.seq_lens_kv.sum())
 
     @property
     def is_cross(self) -> bool:
@@ -196,6 +242,14 @@ class AttentionMetadata:
     @property
     def has_cross_sub_metadata(self) -> bool:
         return self.cross is not None and self.cross is not self
+
+    @property
+    def num_ctx_tokens(self) -> int:
+        return self._num_ctx_tokens
+
+    @property
+    def num_tokens(self) -> int:
+        return self._num_tokens
 
     def prepare(self):
         """
@@ -221,11 +275,25 @@ class AttentionMetadata:
             cuda_graph_metadata.cross = cuda_graph_metadata.cross.create_cuda_graph_metadata(
                 max_batch_size, True)
         if not sub_cross_metadata:
+            # Set to None to force the cuda graph metadata to allocate a tensor
+            # with the correct batch size. See seq_lens setter for how this works.
+            cuda_graph_metadata._seq_lens_cuda = None
             cuda_graph_metadata.seq_lens = torch.ones(
                 (max_batch_size, ), dtype=torch.int) * (1 + max_draft_tokens)
         if self.is_cross:
             cuda_graph_metadata.seq_lens_kv = torch.zeros((max_batch_size, ),
                                                           dtype=torch.int)
+        if self.enable_flash_mla:
+            if self.kv_cache_manager is not None:
+                cuda_graph_metadata.block_ids_per_seq = torch.zeros(
+                    [
+                        self.kv_cache_manager.max_batch_size,
+                        self.kv_cache_manager.max_blocks_per_seq
+                    ],
+                    dtype=torch.int32,
+                    device='cuda',
+                )
+
         cuda_graph_metadata.num_contexts = 0
         cuda_graph_metadata.max_num_requests = max_batch_size
         cuda_graph_metadata.max_num_tokens = max_batch_size * (1 +
@@ -279,6 +347,7 @@ class RopeParams:
         # rotary embedding dim.
         rope_params.dim = (getattr(config, 'rotary_dim', None)
                            or getattr(config, 'rotary_emb_base', None)
+                           or getattr(config, 'qk_rope_head_dim', None)
                            or int(head_dim * rope_percentage))
         # rotary scaling.
         rope_params.scale_type = RotaryScalingType.none
@@ -299,36 +368,79 @@ class RopeParams:
             rope_params.beta_slow = rope_scaling.get("beta_slow", 1)
             rope_params.mscale = rope_scaling.get("mscale", 1.0)
             rope_params.mscale_all_dim = rope_scaling.get("mscale_all_dim", 0.0)
+        # Workaround for DeepSeek V3 Lite since its rope_scaling is null in config.json.
+        elif config.model_type == "deepseek_v3":
+            rope_params.scale_type = RotaryScalingType.yarn
 
         return rope_params
 
-    @lru_cache(maxsize=1)
-    def create_rope_const_params(self):
+    def create_rope_const_params(self, interleave: bool = True):
         if self.dim == 0:
             return None, None
-        assert self.scale_type != RotaryScalingType.longrope, "Long RoPE is not yet supported."
-        rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
-            self.max_positions,
-            self.dim,
-            self.theta,
-            self.scale,
-            self.scale_type,
-            rope_scaling_config={
-                "factor": self.scale,
-                "low_freq_factor": self.low_freq_factor,
-                "high_freq_factor": self.high_freq_factor,
-                "original_max_position_embeddings": self.original_max_positions,
-            })
-        rope_inv_freq = torch.torch.tensor(
-            rope_inv_freq,
-            dtype=torch.float32,
-            device='cuda',
-        )
+
+        RopeConstParams = namedtuple("RopeConstParams", ["inv_freq", "cos_sin"])
+        extra_attrs = get_model_extra_attrs()
+        if extra_attrs is not None:
+            cache = extra_attrs.setdefault("rope_const_params", {})
+            rope_const_params = cache.get((self, interleave), None)
+            if rope_const_params is not None and rope_const_params.cos_sin(
+            ) is not None:
+                return (
+                    rope_const_params.inv_freq()
+                    if rope_const_params.inv_freq is not None else None,
+                    rope_const_params.cos_sin(),
+                )
+
+        if self.scale_type == RotaryScalingType.yarn:
+            rope_inv_freq = None
+            rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+                self.max_positions,
+                self.dim,
+                self.theta,
+                self.scale,
+                self.original_max_positions,
+                self.beta_fast,
+                self.beta_slow,
+                self.mscale,
+                self.mscale_all_dim,
+            )
+        elif self.scale_type == RotaryScalingType.longrope:
+            raise NotImplementedError("Long RoPE is not supported.")
+        else:
+            rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+                self.max_positions,
+                self.dim,
+                self.theta,
+                self.scale,
+                self.scale_type,
+                rope_scaling_config={
+                    "factor": self.scale,
+                    "low_freq_factor": self.low_freq_factor,
+                    "high_freq_factor": self.high_freq_factor,
+                    "original_max_position_embeddings":
+                    self.original_max_positions,
+                })
+        if rope_inv_freq is not None:
+            rope_inv_freq = torch.torch.tensor(
+                rope_inv_freq,
+                dtype=torch.float32,
+                device='cuda',
+            )
+        if not interleave:
+            rope_cos_sin = rope_cos_sin.reshape(
+                self.max_positions, -1,
+                2)[:, :self.dim // 2, :].transpose(0, 2, 1).reshape(1, -1)
         rope_cos_sin = torch.torch.tensor(
             rope_cos_sin,
             dtype=torch.float32,
             device='cuda',
         )
+        if extra_attrs is not None:
+            cache[(self, interleave)] = RopeConstParams(
+                weakref.ref(rope_inv_freq)
+                if rope_inv_freq is not None else None,
+                weakref.ref(rope_cos_sin),
+            )
         return rope_inv_freq, rope_cos_sin
 
 
@@ -339,6 +451,7 @@ class PositionalEmbeddingParams:
 
     # RoPE params
     rope: Optional[RopeParams] = None
+    is_neox: bool = True
 
     def __post_init__(self) -> None:
         if self.type.is_deferred():
@@ -353,7 +466,7 @@ class PositionalEmbeddingParams:
 TMetadata = TypeVar("TMetadata", bound=AttentionMetadata)
 
 
-class PredefinedAttentionMask(str, enum.Enum):
+class PredefinedAttentionMask(str, Enum):
     """
     Predefined attention mask types
 
@@ -382,6 +495,8 @@ class AttentionBackend(Generic[TMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        skip_create_weights_in_init: bool = False,
+        **kwargs,
     ):
         """
         Initialize the backend.
@@ -397,6 +512,14 @@ class AttentionBackend(Generic[TMetadata]):
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads or self.num_heads
         self.quant_config = quant_config
+
+    def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
+        """
+        To support mixed quantization mode, self.quant_config can be modified after __init__ is called.
+        Any states or set up related to self.quant_config must be moved to this function, which is called
+        after self.quant_config is reset.
+        """
+        self.quant_config = new_quant_config
 
     def forward(self,
                 q: torch.Tensor,
@@ -423,6 +546,18 @@ class AttentionBackend(Generic[TMetadata]):
         """
         raise NotImplementedError
 
+    @classmethod
+    def support_fused_rope(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_fused_qkv(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_mla(cls) -> bool:
+        return False
+
 
 @dataclass(kw_only=True, unsafe_hash=True)
 class MLAParams:
@@ -431,3 +566,4 @@ class MLAParams:
     qk_rope_head_dim: int = 0
     qk_nope_head_dim: int = 0
     v_head_dim: int = 0
+    predicted_tokens_per_seq: int = 1

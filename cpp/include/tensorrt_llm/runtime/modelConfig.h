@@ -666,7 +666,7 @@ public:
         resetSpeculativeDecodingModule();
     }
 
-    [[nodiscard]] nvinfer1::DataType getKvDataType() const noexcept
+    [[nodiscard]] nvinfer1::DataType getKvDataType() const
     {
         if (getQuantMode().hasFp8KvCache())
         {
@@ -766,7 +766,7 @@ public:
         return mManageWeightsType;
     }
 
-    void setManageWeightsType(const ManageWeightsType manageWeightType) noexcept
+    void setManageWeightsType(ManageWeightsType const manageWeightType) noexcept
     {
         mManageWeightsType = manageWeightType;
     }

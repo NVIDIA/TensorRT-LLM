@@ -87,10 +87,10 @@ th::Tensor gatherTree(                                    // BS: batch_size, BM:
         bh.parentIdsUnfinish = get_ptr<int32_t>(parent_ids);
 
         tk::invokeInsertUnfinishedPath(bh, stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         tk::invokeFinalize(bh, stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
     else if (!use_beam_hyps && beam_width > 1)
     {
@@ -122,13 +122,13 @@ th::Tensor gatherTree(                                    // BS: batch_size, BM:
 
         // NOTE: need to remove all prompt virtual tokens
         tk::invokeGatherTree(param);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
     else
     {
         cudaMemcpyAsync(get_ptr<int32_t>(final_output_ids), get_ptr<int32_t>(output_ids),
             sizeof(int) * batch_size * beam_width * max_seq_len, cudaMemcpyDeviceToDevice, stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
     return final_output_ids;
 }

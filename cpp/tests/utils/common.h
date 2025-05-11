@@ -45,7 +45,7 @@ auto const TEST_RESOURCE_PATH = fs::path{TOP_LEVEL_DIR} / "cpp/tests/resources";
 
 auto const ENGINE_PATH = TEST_RESOURCE_PATH / "models/rt_engine";
 auto const GPT_MODEL_PATH = ENGINE_PATH / "gpt2";
-auto const LLAMA_MODEL_PATH = ENGINE_PATH / "llama-7b-hf";
+auto const LLAMA_MODEL_PATH = ENGINE_PATH / "Llama-3.2-1B";
 auto const MEDUSA_MODEL_PATH = ENGINE_PATH / "vicuna-7b-medusa";
 auto const CHATGLM_MODEL_PATH = ENGINE_PATH / "chatglm-6b";
 auto const CHATGLM2_MODEL_PATH = ENGINE_PATH / "chatglm2-6b";
@@ -56,7 +56,7 @@ auto const ENC_DEC_ENGINE_BASE = TEST_RESOURCE_PATH / "models/enc_dec/trt_engine
 auto const DATA_PATH = TEST_RESOURCE_PATH / "data";
 auto const GPT_DATA_PATH = DATA_PATH / "gpt2";
 auto const GPT_XGRAMMAR_TOKENIZER_INFO_PATH = GPT_DATA_PATH / "xgrammar_tokenizer_info.json";
-auto const LLAMA_DATA_PATH = DATA_PATH / "llama-7b-hf";
+auto const LLAMA_DATA_PATH = DATA_PATH / "Llama-3.2-1B";
 auto const LLAMA_XGRAMMAR_TOKENIZER_INFO_PATH = LLAMA_DATA_PATH / "xgrammar_tokenizer_info.json";
 auto const MEDUSA_DATA_PATH = DATA_PATH / "vicuna-7b-medusa";
 auto const CHATGLM_DATA_PATH = DATA_PATH / "chatglm-6b";

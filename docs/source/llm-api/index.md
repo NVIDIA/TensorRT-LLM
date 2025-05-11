@@ -61,7 +61,7 @@ Using this model is subject to a [particular](https://ai.meta.com/resources/mode
 There are two ways to build a TensorRT-LLM engine:
 
 1. You can build the TensorRT-LLM engine from the Hugging Face model directly with the [`trtllm-build`](../commands/trtllm-build.rst) tool and then save the engine to disk for later use.
-Refer to the [README](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama) in the [`examples/llama`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama) repository on GitHub.
+Refer to the [README](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama) in the [`examples/models/core/llama`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama) repository on GitHub.
 
    After the engine building is finished, we can load the model:
 

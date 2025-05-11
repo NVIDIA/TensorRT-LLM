@@ -873,7 +873,7 @@ def preprocess_weights_for_mixed_gemm(tensor: torch.Tensor,
         tensor = tensor.unsqueeze(0)
     elif sm_ >= 90:
         sm_ = 80
-    if sm_ == 120:
+    if sm_ >= 120:
         sm_ = 80
 
     permutation_map = {
@@ -1190,10 +1190,11 @@ def postprocess_fp8_rowwise(tllm_key, weights, **kwargs):
             tllm_key.replace("weight", "per_channel_scale"): scales
         }
     else:
+        x = torch.cat(weights, dim=0).to(torch.float32)
         clamp_val = config.quantization.clamp_val
-        weights = torch.cat(weights, dim=0)
-        # activation range bound.
-        x = weights.to(torch.float32).clamp(clamp_val[0], clamp_val[1])
+        if clamp_val is not None:
+            # activation range bound.
+            x = x.clamp(clamp_val[0], clamp_val[1])
         xmax = x.abs().max(-1, keepdim=True).values
         # minimum scaling factor.
         torch_weight_scales = (xmax / 448.0).clamp(min=1.0 / (448.0 * 512.0))

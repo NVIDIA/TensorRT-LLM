@@ -20,10 +20,10 @@
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/fmhaDispatcher.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/kernels/xqaDispatcher.h"
@@ -211,6 +211,15 @@ public:
     int mlaGeneration(
         kernels::MlaParams<T>& params, EnqueueGenerationParams<T> const& generation_params, cudaStream_t stream);
 
+    int getFlashMlaNumSmParts(int s_q, int num_heads, int num_kv_heads, int head_size_v) const
+    {
+        static constexpr int block_size_m = 64;
+        int num_heads_per_head_k = s_q * num_heads / num_kv_heads;
+        int sm_cnt = mMultiProcessorCount;
+        int num_sm_parts = sm_cnt / num_kv_heads / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
+        return num_sm_parts;
+    }
+
     // Called in configurePlugin().
     template <typename T, typename KVCacheBuffer>
     void prepareEnqueueGeneration(EnqueueGenerationParams<T> const& params);
@@ -220,10 +229,18 @@ public:
         EnqueueGenerationParams<T> const& generationsParams, bool forConfigurePlugin);
 
     template <typename T>
-    int ulyssesGenerationPreprocess(int32_t batch_beam, T* mhaInput, T* mhaOutput, T*& input, cudaStream_t stream);
+    int ulyssesContextPreprocess(T const* input, T* output, T* buffer, EnqueueContextParams<T> const& params,
+        int const* cu_q_seqlens, int const* cu_cp_partial_seqlens, cudaStream_t stream);
 
     template <typename T>
-    int ulyssesGenerationPostprocess(int32_t batch_beam, T* mhaInput, T* mhaOutput, void* output, cudaStream_t stream);
+    int ulyssesContextPostprocess(T* input, T* output, T* buffer, EnqueueContextParams<T> const& params,
+        int const* cu_q_seqlens, int const* cu_cp_partial_seqlens, cudaStream_t stream);
+
+    template <typename T>
+    int ulyssesGenerationPreprocess(T const* input, T* output, T* buffer, int32_t batch_beam, cudaStream_t stream);
+
+    template <typename T>
+    int ulyssesGenerationPostprocess(T* input, T* output, T* buffer, int32_t batch_beam, cudaStream_t stream);
 
     [[nodiscard]] bool isRelativePosition() const
     {
@@ -246,6 +263,7 @@ public:
         return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPTJ
             || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPT_NEOX
             || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kLONG_ROPE
+            || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kYARN
             || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_M;
     }
 
@@ -353,6 +371,7 @@ public:
     bool mPosShiftEnabled = false;
     bool mPagedContextFMHA = false;
     bool mFP8ContextFMHA = false;
+    bool mFP8GenerationMLA = false;
     bool mDenseContextFMHA = false;
     bool mHasFullAttentionMask = false;
     bool mIsSpecDecodingEnabled = false;
@@ -360,10 +379,22 @@ public:
     bool mSpecDecodingIsGenerationLengthVariable = false;
     int32_t mSpecDecodingMaxGenerationLength = 1;
     bool mIsMLAEnabled = false;
+    bool mIsGenerationMLA = false;
+    bool mUseGenFlashMLA = false;
     tensorrt_llm::kernels::MlaMetaParams mMLAParams;
     int mCpSize = 1;
     int mCpRank = 0;
     std::set<int32_t> mCpGroup = {};
+    // These parameters are used to specifically configure the attention attributes when cp/tp_size are different
+    // between Attention and FFN(such as Ulysses)
+    int mNumAttnHeads = -1;
+    int mNumAttnKVHeads = -1;
+    int mNumKVHeadsOrigin = -1;
+    int mAttnTpSize = -1;
+    int mAttnTpRank = 0;
+    int mAttnCpSize = -1;
+    int mAttnCpRank = 0;
+    int mUlyssesMQABroadcast = 1;
 
     // fmha runner (enabled by default)
     // flag: disabled = 0, enabled = 1, enabled with fp32 accumulation = 2
@@ -392,16 +423,17 @@ public:
             mUnfuseQkvGemm, (int32_t) mType, mMaxContextLength, mQKVBiasEnabled, mCrossAttention, mMaxDistance,
             mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mDenseContextFMHA, mHasFullAttentionMask,
             mIsSpecDecodingEnabled, mUseSpecDecoding, mSpecDecodingIsGenerationLengthVariable,
-            mSpecDecodingMaxGenerationLength, mIsMLAEnabled, mMLAParams.data(), mCpSize, mCpRank, mCpGroup,
-            mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant,
-            mNbMultiBlockSemaphores);
+            mSpecDecodingMaxGenerationLength, mIsMLAEnabled, mIsGenerationMLA, mUseGenFlashMLA, mMLAParams.data(),
+            mCpSize, mCpRank, mCpGroup, mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank,
+            mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode,
+            mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant, mNbMultiBlockSemaphores);
     };
 
 private:
     static constexpr int kReservedMaxSeqLenTilePerSeq = 64;
 
     int mSM = tensorrt_llm::common::getSMVersion();
-    bool mUseTllmGen = (mSM >= 100);
+    bool mUseTllmGen = (mSM >= 100) && (mSM != 120);
     bool mForceMultiBlockWarned = false;
     int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
     int mMaxSharedMemoryPerBlockOptin = tensorrt_llm::common::getMaxSharedMemoryPerBlockOptin();

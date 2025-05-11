@@ -140,7 +140,7 @@ int CumsumLastDimPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
     invokeCumsumLastDim<T>(
         batchSize, inputLength, inputs[getInputTensorIdx()], outputs[0], wp, mTempStorageBytes, stream);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     return 0;
 }
 

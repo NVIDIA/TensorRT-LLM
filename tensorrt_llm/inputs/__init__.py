@@ -1,10 +1,15 @@
 from .data import PromptInputs, TextPrompt, TokensPrompt, prompt_inputs
 from .registry import (ExtraProcessedInputs, InputProcessor,
                        create_input_processor, register_input_processor)
-from .utils import get_hf_image_processor, load_image, load_video
+from .utils import (INPUT_FORMATTER_MAP, default_image_loader,
+                    default_video_loader, format_generic_input,
+                    format_qwen2_vl_input, format_vila_input, load_image,
+                    load_video)
 
 __all__ = [
     "PromptInputs", "prompt_inputs", "TextPrompt", "TokensPrompt",
     "InputProcessor", "create_input_processor", "register_input_processor",
-    "ExtraProcessedInputs", "get_hf_image_processor", "load_image", "load_video"
+    "ExtraProcessedInputs", "load_image", "load_video", "INPUT_FORMATTER_MAP",
+    "default_image_loader", "default_video_loader", "format_vila_input",
+    "format_generic_input", "format_qwen2_vl_input"
 ]

@@ -19,7 +19,7 @@ from .attention import (Attention, AttentionMaskParams, AttentionMaskType,
                         KeyValueCacheParams, MropeParams, PositionEmbeddingType,
                         SpecDecodingParams)
 from .cast import Cast
-from .conv import Conv1d, Conv2d, ConvTranspose2d
+from .conv import Conv1d, Conv2d, Conv3d, ConvTranspose2d
 from .embedding import Embedding, PromptTuningEmbedding
 from .language_adapter import LanguageAdapter, LanguageAdapterConfig
 from .linear import ColumnLinear, Linear, RowLinear
@@ -49,6 +49,7 @@ __all__ = [
     'Conv2d',
     'ConvTranspose2d',
     'Conv1d',
+    'Conv3d',
     'AvgPool2d',
     'Mish',
     'MLP',

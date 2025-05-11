@@ -1,6 +1,6 @@
 -c ../constraints.txt
 tensorrt_llm>=0.0.0.dev0
-datasets>=2.14.4
+datasets==3.1.0
 nemo-toolkit[all]==2.0.0rc1
 rouge_score
 transformers_stream_generator==0.0.4

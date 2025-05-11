@@ -14,14 +14,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #include "tensorrt_llm/common/opUtils.h"
+#include "tensorrt_llm/runtime/utils/mpiTags.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include "cuda.h"
-#include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -30,9 +32,17 @@
 
 std::unordered_map<nvinfer1::DataType, ncclDataType_t>* getDtypeMap()
 {
-    static std::unordered_map<nvinfer1::DataType, ncclDataType_t> dtypeMap
-        = {{nvinfer1::DataType::kFLOAT, ncclFloat32}, {nvinfer1::DataType::kHALF, ncclFloat16},
-            {nvinfer1::DataType::kBF16, ncclBfloat16}, {nvinfer1::DataType::kFP8, ncclInt8}};
+    static std::unordered_map<nvinfer1::DataType, ncclDataType_t> dtypeMap = {
+        {nvinfer1::DataType::kFLOAT, ncclFloat32},
+        {nvinfer1::DataType::kHALF, ncclFloat16},
+        {nvinfer1::DataType::kBF16, ncclBfloat16},
+        {nvinfer1::DataType::kFP8, ncclInt8},
+        {nvinfer1::DataType::kBOOL, ncclInt8},
+        {nvinfer1::DataType::kINT32, ncclInt32},
+        {nvinfer1::DataType::kINT64, ncclInt64},
+        {nvinfer1::DataType::kUINT8, ncclUint8},
+        {nvinfer1::DataType::kINT8, ncclInt8},
+    };
     return &dtypeMap;
 }
 
@@ -50,12 +60,12 @@ ncclUniqueId getUniqueId(std::set<int> const& group) noexcept
         NCCLCHECK(ncclGetUniqueId(&id));
         for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
         {
-            COMM_SESSION.sendValue(id, *it, 0);
+            COMM_SESSION.sendValue(id, *it, tensorrt_llm::mpi::MpiTag::kDefault);
         }
     }
     else
     {
-        COMM_SESSION.recvValue(id, *group.begin(), 0);
+        COMM_SESSION.recvValue(id, *group.begin(), tensorrt_llm::mpi::MpiTag::kDefault);
     }
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
     return id;
@@ -177,7 +187,7 @@ public:
         std::shared_ptr<T> result = mObservers[key].lock();
         if (result == nullptr)
         {
-            TLLM_LOG_TRACE("creating singleton instance for CUDA context %d and thread %d", ctx, thread);
+            TLLM_LOG_TRACE("creating singleton instance for CUDA context %lu and thread %lu", ctx, thread);
             // Create the resource and register with an observer.
             result = std::shared_ptr<T>{mCreator().release(),
                 [this, key](T* obj)

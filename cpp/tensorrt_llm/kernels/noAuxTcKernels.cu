@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/noAuxTcKernels.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -49,9 +50,20 @@ constexpr __host__ __device__ bool isPowerOf2(T v)
 }
 
 template <bool greater, typename T>
-__device__ bool is_better_than(T val, T baseline)
+__forceinline__ __device__ bool is_better_than(T val, T baseline)
 {
     return (val > baseline && greater) || (val < baseline && !greater);
+}
+
+template <bool greater, typename T, typename idxT>
+__forceinline__ __device__ bool is_better_than(T val, T baseline, idxT index, idxT baseline_index)
+{
+    bool res = (val > baseline && greater) || (val < baseline && !greater);
+    if (val == baseline)
+    {
+        res = (index < baseline_index && greater) || (index < baseline_index && !greater);
+    }
+    return res;
 }
 
 template <typename T, typename idxT>
@@ -62,7 +74,7 @@ int calc_smem_size_for_block_wide(int num_of_warp, int64_t k)
     return max(cache_topk, round_up_to_multiple_of<256>(n * sizeof(T)) + n * sizeof(idxT));
 }
 
-template <int size, bool ascending, typename T, typename idxT>
+template <int size, bool ascending, bool reverse, typename T, typename idxT, bool is_stable>
 struct BitonicMerge
 {
     // input should be a bitonic sequence, and sort it to be a monotonic sequence
@@ -78,7 +90,17 @@ struct BitonicMerge
             int const other_i = i + stride;
             T& val = val_arr[i];
             T& other_val = val_arr[other_i];
-            if ((val > other_val && ascending) || (val < other_val && !ascending))
+            bool is_better;
+            if constexpr (is_stable)
+            {
+                is_better = is_better_than<ascending>(val, other_val, idx_arr[i], idx_arr[other_i]);
+            }
+            else
+            {
+                is_better = is_better_than<ascending>(val, other_val);
+            }
+
+            if (is_better)
             {
                 T tmp = val;
                 val = other_val;
@@ -90,12 +112,13 @@ struct BitonicMerge
             }
         }
 
-        BitonicMerge<size / 2, ascending, T, idxT>::merge(val_arr, idx_arr);
-        BitonicMerge<size / 2, ascending, T, idxT>::merge(val_arr + arr_len / 2, idx_arr + arr_len / 2);
+        BitonicMerge<size / 2, ascending, reverse, T, idxT, is_stable>::merge(val_arr, idx_arr);
+        BitonicMerge<size / 2, ascending, reverse, T, idxT, is_stable>::merge(
+            val_arr + arr_len / 2, idx_arr + arr_len / 2);
     }
 };
 
-template <int size, bool ascending, typename T, typename idxT>
+template <int size, bool ascending, typename T, typename idxT, bool is_stable>
 struct BitonicSort
 {
     __device__ static void sort(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
@@ -104,14 +127,14 @@ struct BitonicSort
         static_assert(size >= 2 * WARP_SIZE);
         constexpr int arr_len = size / WARP_SIZE;
 
-        BitonicSort<size / 2, true, T, idxT>::sort(val_arr, idx_arr);
-        BitonicSort<size / 2, false, T, idxT>::sort(val_arr + arr_len / 2, idx_arr + arr_len / 2);
-        BitonicMerge<size, ascending, T, idxT>::merge(val_arr, idx_arr);
+        BitonicSort<size / 2, true, T, idxT, is_stable>::sort(val_arr, idx_arr);
+        BitonicSort<size / 2, false, T, idxT, is_stable>::sort(val_arr + arr_len / 2, idx_arr + arr_len / 2);
+        BitonicMerge<size, ascending, ascending, T, idxT, is_stable>::merge(val_arr, idx_arr);
     }
 };
 
-template <bool ascending, typename T, typename idxT>
-struct BitonicSort<32, ascending, T, idxT>
+template <bool ascending, typename T, typename idxT, bool is_stable>
+struct BitonicSort<32, ascending, T, idxT, is_stable>
 {
     __device__ static void sort(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
     {
@@ -127,7 +150,27 @@ struct BitonicSort<32, ascending, T, idxT>
 
                 T other = __shfl_xor_sync(FULL_WARP_MASK, *val_arr, stride);
                 idxT other_idx = __shfl_xor_sync(FULL_WARP_MASK, *idx_arr, stride);
-                if (*val_arr != other && (*val_arr > other) != (reverse != is_second))
+
+                bool is_better;
+                if constexpr (is_stable)
+                {
+                    if constexpr (ascending)
+                    {
+                        is_better = ((*val_arr > other) || ((*val_arr == other) && (*idx_arr < other_idx)))
+                            != (reverse != is_second);
+                    }
+                    else
+                    {
+                        is_better = ((*val_arr > other) || ((*val_arr == other) && (*idx_arr > other_idx)))
+                            != (reverse != is_second);
+                    }
+                }
+                else
+                {
+                    // is_better = (*val_arr != other) && is_better_than(*val_arr, other, (reverse == is_second));
+                    is_better = (*val_arr != other && (*val_arr > other) != (reverse != is_second));
+                }
+                if (is_better)
                 {
                     *val_arr = other;
                     *idx_arr = other_idx;
@@ -135,12 +178,12 @@ struct BitonicSort<32, ascending, T, idxT>
             }
         }
 
-        BitonicMerge<32, ascending, T, idxT>::merge(val_arr, idx_arr);
+        BitonicMerge<32, ascending, ascending, T, idxT, is_stable>::merge(val_arr, idx_arr);
     }
 };
 
-template <bool ascending, typename T, typename idxT>
-struct BitonicMerge<32, ascending, T, idxT>
+template <bool ascending, bool reverse, typename T, typename idxT, bool is_stable>
+struct BitonicMerge<32, ascending, reverse, T, idxT, is_stable>
 {
     __device__ static void merge(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
     {
@@ -152,7 +195,28 @@ struct BitonicMerge<32, ascending, T, idxT>
             T other = __shfl_xor_sync(FULL_WARP_MASK, val, stride);
             idxT& idx = *idx_arr;
             idxT other_idx = __shfl_xor_sync(FULL_WARP_MASK, idx, stride);
-            if (val != other && ((val > other) == (ascending != is_second)))
+
+            bool is_better;
+            if constexpr (is_stable)
+            {
+                if constexpr (ascending)
+                {
+                    is_better = ((*val_arr > other) || ((*val_arr == other) && (*idx_arr < other_idx)))
+                        == (reverse != is_second); // for min
+                }
+                else
+                {
+                    is_better = ((*val_arr > other) || ((*val_arr == other) && (*idx_arr > other_idx)))
+                        == (reverse != is_second); // for max
+                }
+            }
+            else
+            {
+                // is_better = (val != other) && (is_better_than(val, other, (reverse != is_second)));
+                is_better = (val != other && ((val > other) == (ascending != is_second)));
+            }
+
+            if (is_better)
             {
                 val = other;
                 idx = other_idx;
@@ -161,7 +225,7 @@ struct BitonicMerge<32, ascending, T, idxT>
     }
 };
 
-template <int capacity, bool greater, typename T, typename idxT>
+template <int capacity, bool greater, typename T, typename idxT, bool is_stable>
 class WarpSort
 {
 public:
@@ -188,7 +252,16 @@ public:
             if (idx < start + k_)
             {
                 T t = in[idx];
-                if (is_better_than<greater>(t, val_arr_[i]))
+                bool is_better;
+                if constexpr (is_stable)
+                {
+                    is_better = is_better_than<greater>(t, val_arr_[i], in_idx[idx], idx_arr_[i]);
+                }
+                else
+                {
+                    is_better = is_better_than<greater>(t, val_arr_[i]);
+                }
+                if (is_better)
                 {
                     val_arr_[i] = t;
                     idx_arr_[i] = in_idx[idx];
@@ -196,7 +269,7 @@ public:
             }
         }
 
-        BitonicMerge<capacity, !greater, T, idxT>::merge(val_arr_, idx_arr_);
+        BitonicMerge<capacity, greater, !greater, T, idxT, is_stable>::merge(val_arr_, idx_arr_);
     }
 
     __device__ void dump(T* __restrict__ out, idxT* __restrict__ out_idx) const
@@ -236,12 +309,12 @@ protected:
 
 }; // end class WarpSort
 
-template <int capacity, bool greater, typename T, typename idxT>
-class WarpSelect : public WarpSort<capacity, greater, T, idxT>
+template <int capacity, bool greater, typename T, typename idxT, bool is_stable>
+class WarpSelect : public WarpSort<capacity, greater, T, idxT, is_stable>
 {
 public:
     __device__ WarpSelect(idxT k, T dummy)
-        : WarpSort<capacity, greater, T, idxT>(k, dummy)
+        : WarpSort<capacity, greater, T, idxT, is_stable>(k, dummy)
         , k_th_(dummy)
         , k_th_lane_((k - 1) % WARP_SIZE)
     {
@@ -269,7 +342,16 @@ public:
 
     __device__ void add(T val, idxT idx)
     {
-        bool do_add = is_better_than<greater>(val, k_th_);
+        bool do_add;
+        if constexpr (is_stable)
+        {
+            do_add = is_better_than<greater>(val, k_th_, idx, k_th_idx_);
+        }
+        else
+        {
+            do_add = is_better_than<greater>(val, k_th_);
+        }
+
         uint32_t mask = __ballot_sync(FULL_WARP_MASK, do_add);
         if (mask == 0)
         {
@@ -316,36 +398,52 @@ private:
     __device__ void set_k_th_()
     {
         k_th_ = __shfl_sync(FULL_WARP_MASK, val_arr_[max_arr_len_ - 1], k_th_lane_);
+        if constexpr (is_stable)
+        {
+            k_th_idx_ = __shfl_sync(FULL_WARP_MASK, idx_arr_[max_arr_len_ - 1], k_th_lane_);
+        }
     }
 
     __device__ void merge_buf_(T val, idxT idx)
     {
-        BitonicSort<WARP_SIZE, greater, T, idxT>::sort(&val, &idx);
+        BitonicSort<WARP_SIZE, greater, T, idxT, is_stable>::sort(&val, &idx);
 
         T& old = val_arr_[max_arr_len_ - 1];
-        if (is_better_than<greater>(val, old))
+
+        bool is_better;
+        if constexpr (is_stable)
+        {
+            is_better = is_better_than<greater>(val, old, idx, idx_arr_[max_arr_len_ - 1]);
+        }
+        else
+        {
+            is_better = is_better_than<greater>(val, old);
+        }
+
+        if (is_better)
         {
             old = val;
             idx_arr_[max_arr_len_ - 1] = idx;
         }
 
-        BitonicMerge<capacity, !greater, T, idxT>::merge(val_arr_, idx_arr_);
+        BitonicMerge<capacity, greater, !greater, T, idxT, is_stable>::merge(val_arr_, idx_arr_);
 
         set_k_th_();
     }
 
-    using WarpSort<capacity, greater, T, idxT>::max_arr_len_;
-    using WarpSort<capacity, greater, T, idxT>::val_arr_;
-    using WarpSort<capacity, greater, T, idxT>::idx_arr_;
-    using WarpSort<capacity, greater, T, idxT>::lane_;
-    using WarpSort<capacity, greater, T, idxT>::k_;
-    using WarpSort<capacity, greater, T, idxT>::dummy_;
+    using WarpSort<capacity, greater, T, idxT, is_stable>::max_arr_len_;
+    using WarpSort<capacity, greater, T, idxT, is_stable>::val_arr_;
+    using WarpSort<capacity, greater, T, idxT, is_stable>::idx_arr_;
+    using WarpSort<capacity, greater, T, idxT, is_stable>::lane_;
+    using WarpSort<capacity, greater, T, idxT, is_stable>::k_;
+    using WarpSort<capacity, greater, T, idxT, is_stable>::dummy_;
 
     T* val_smem_;
     idxT* idx_smem_;
     int smem_buf_len_ = 0;
 
     T k_th_;
+    idxT k_th_idx_;
     int const k_th_lane_;
 }; // end class WarpSelect
 } // namespace warp_topk
@@ -420,13 +518,19 @@ __global__ void topk_with_k2_kernel(T* output, T* input, int64_t const num_token
         cg::thread_block block = cg::this_thread_block();
         cg::thread_block_tile<32> tile = cg::tiled_partition<32>(block);
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        asm volatile("griddepcontrol.wait;");
+#endif
         topk_with_k2(output, input, tile, lane_id, num_experts_per_group);
     }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
-template <typename T>
-__global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, T* scores_with_bias,
-    int64_t const num_tokens, int64_t const n_group, int64_t const topk_group, int64_t const topk,
+template <typename T, typename IdxT>
+__global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, T* topk_values, IdxT* topk_indices,
+    T* scores_with_bias, int64_t const num_tokens, int64_t const n_group, int64_t const topk_group, int64_t const topk,
     int64_t const num_experts, int64_t const num_experts_per_group, double routed_scaling_factor)
 {
     int32_t warp_id = threadIdx.x / WARP_SIZE;
@@ -435,6 +539,9 @@ __global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, 
     scores_with_bias += case_id * num_experts;
     scores += case_id * num_experts;
     group_scores += case_id * n_group;
+    topk_values += case_id * topk;
+    topk_indices += case_id * topk;
+
     int32_t align_num_experts_per_group = warp_topk::round_up_to_multiple_of<WARP_SIZE>(num_experts_per_group);
 
     cg::thread_block block = cg::this_thread_block();
@@ -448,6 +555,10 @@ __global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, 
     T value = cuda::std::numeric_limits<T>::min();
     T topk_group_value = cuda::std::numeric_limits<T>::min();
     int32_t num_equalto_topkth_group;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;"); // I think all prolog can be put before acqbulk because it's ptr arithmetic
+#endif
 
     if (case_id < num_tokens)
     {
@@ -478,7 +589,8 @@ __global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, 
     }
     __syncthreads();
 
-    warp_topk::WarpSelect</*capability*/ WARP_SIZE, /*greater*/ true, T, int32_t> queue((int32_t) topk, -INFINITY);
+    warp_topk::WarpSelect</*capability*/ WARP_SIZE, /*greater*/ true, T, int32_t, /* is_stable */ true> queue(
+        (int32_t) topk, -INFINITY);
 
     int count_equalto_topkth_group = 0;
     bool if_proceed_next_topk = (topk_group_value != cuda::std::numeric_limits<T>::min());
@@ -534,60 +646,75 @@ __global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, 
     {
         if (if_proceed_next_topk)
         {
-            if (case_id < num_tokens)
-            {
-                for (int i = lane_id; i < num_experts; i += WARP_SIZE)
-                {
-                    scores[i] = 0;
-                }
-            }
-            __threadfence();
-            __syncthreads();
             for (int i = lane_id; i < topk; i += WARP_SIZE)
             {
                 float value = cuda_cast<float, T>(s_topk_value[i]) / topk_sum * routed_scaling_factor;
-                scores[s_topk_idx[i]] = cuda_cast<T, float>(value);
+                topk_indices[i] = s_topk_idx[i];
+                topk_values[i] = cuda_cast<T, float>(value);
             }
         }
         else
         {
-            for (int i = lane_id; i < num_experts; i += WARP_SIZE)
+            for (int i = lane_id; i < topk; i += WARP_SIZE)
             {
-                scores[i] = i < topk ? cuda_cast<T, float>(1.0f / topk) : cuda_cast<T, float>(0.0f);
+                topk_indices[i] = i;
+                topk_values[i] = cuda_cast<T, float>(1.0f / topk);
             }
         }
         // Note: when if_proceed_next_topk==false, choose the first 8 experts as the default result.
         //@TODO: check if this default strategy is acceptable. Might need to leave it as nan array.
     }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
-template <typename T>
-void invokeNoAuxTc(T* scores, T* group_scores, T* scores_with_bias, int64_t const num_tokens, int64_t const num_experts,
-    int64_t const n_group, int64_t const topk_group, int64_t const topk, double const routed_scaling_factor,
-    cudaStream_t const stream)
+template <typename T, typename IdxT>
+void invokeNoAuxTc(T* scores, T* group_scores, T* topk_values, IdxT* topk_indices, T* scores_with_bias,
+    int64_t const num_tokens, int64_t const num_experts, int64_t const n_group, int64_t const topk_group,
+    int64_t const topk, double const routed_scaling_factor, cudaStream_t const stream)
 {
     int64_t num_cases = num_tokens * n_group;
     int64_t topk_with_k2_num_blocks = (num_cases - 1) / NUM_WARPS_PER_BLOCK + 1;
-    topk_with_k2_kernel<T><<<topk_with_k2_num_blocks, BLOCK_SIZE, 0, stream>>>(
-        group_scores, scores_with_bias, num_tokens, num_cases, n_group, num_experts / n_group);
-    sync_check_cuda_error();
+    auto* kernel_instance1 = &topk_with_k2_kernel<T>;
+    cudaLaunchConfig_t config;
+    config.gridDim = topk_with_k2_num_blocks;
+    config.blockDim = BLOCK_SIZE;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(&config, kernel_instance1, group_scores, scores_with_bias, num_tokens, num_cases, n_group,
+        num_experts / n_group);
+    sync_check_cuda_error(stream);
+
     int64_t topk_with_k_group_num_blocks = (num_tokens - 1) / NUM_WARPS_PER_BLOCK + 1;
     size_t dynamic_smem_in_bytes = warp_topk::calc_smem_size_for_block_wide<T, int32_t>(NUM_WARPS_PER_BLOCK, topk);
-
-    group_idx_and_topk_idx_kernel<T><<<topk_with_k_group_num_blocks, BLOCK_SIZE, dynamic_smem_in_bytes, stream>>>(
-        scores, group_scores, scores_with_bias, num_tokens, n_group, topk_group, topk, num_experts,
-        num_experts / n_group, routed_scaling_factor);
-    sync_check_cuda_error();
+    auto* kernel_instance2 = &group_idx_and_topk_idx_kernel<T, IdxT>;
+    config.gridDim = topk_with_k_group_num_blocks;
+    config.blockDim = BLOCK_SIZE;
+    config.dynamicSmemBytes = dynamic_smem_in_bytes;
+    config.stream = stream;
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(&config, kernel_instance2, scores, group_scores, topk_values, topk_indices, scores_with_bias,
+        num_tokens, n_group, topk_group, topk, num_experts, num_experts / n_group, routed_scaling_factor);
+    sync_check_cuda_error(stream);
 }
 
-#define INSTANTIATE_NOAUX_TC(T)                                                                                        \
-    template void invokeNoAuxTc<T>(T * scores, T * group_scores, T * scores_with_bias, int64_t const num_tokens,       \
-        int64_t const num_experts, int64_t const n_group, int64_t const topk_group, int64_t const topk,                \
-        double const routed_scaling_factor, cudaStream_t const stream);
+#define INSTANTIATE_NOAUX_TC(T, IdxT)                                                                                  \
+    template void invokeNoAuxTc<T, IdxT>(T * scores, T * group_scores, T * topk_values, IdxT * topk_indices,           \
+        T * scores_with_bias, int64_t const num_tokens, int64_t const num_experts, int64_t const n_group,              \
+        int64_t const topk_group, int64_t const topk, double const routed_scaling_factor, cudaStream_t const stream);
 
-INSTANTIATE_NOAUX_TC(float);
-INSTANTIATE_NOAUX_TC(half);
+INSTANTIATE_NOAUX_TC(float, int32_t);
+INSTANTIATE_NOAUX_TC(half, int32_t);
 #ifdef ENABLE_BF16
-INSTANTIATE_NOAUX_TC(__nv_bfloat16);
+INSTANTIATE_NOAUX_TC(__nv_bfloat16, int32_t);
 #endif
 } // namespace tensorrt_llm::kernels

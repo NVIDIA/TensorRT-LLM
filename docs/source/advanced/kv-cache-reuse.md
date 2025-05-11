@@ -33,12 +33,6 @@ parameters: {
 
 If you are writing your own application using Executor API, you can enable kv cache reuse by including `enableBlockReuse=true` when you create the `KvCacheConfig` object. Note that this is the default, if you wish to disable kv cache reuse, pass `enableBlockReuse=false` instead.
 
-GptManager API has been deprecated, but if you have an old application that is using GptManager API, you can enable or disable kv cache reuse with an optional parameter:
-
-* `TrtGptModelOptionalParams` class encapsulates the following fields:
-  - `kvCacheConfig`
-    - `enableBlockReuse` (default: `true`) allow reuse of previously computed KV cache blocks across requests. This is expected to optimize memory use and computation.
-
 GptSession is scheduled to be obsoleted and does not support kv cache reuse.
 
 ### Enable kv cache reuse for p-tuning
@@ -100,11 +94,5 @@ parameters: {
 ```
 
 If you are writing your own application using Executor API, you can enable offloading to host by including `hostCacheSize=45000000000` when you create the `KvCacheConfig` object. This will create a 45 GiB offloading buffer in host memory.
-
-GptManager API has been deprecated, but if you have an existing application that is using GptManager API, you can enable offloading with an optional parameter:
-
-* `TrtGptModelOptionalParams` class encapsulates the following fields:
-  - `kvCacheConfig`
-    - `hostCacheSize` (default: `0`) size in bytes of host buffer used to offload kv cache pages upon eviction from gpu memory.
 
 GptSession is scheduled to be obsoleted and does not support kv cache block offloading.

@@ -17,6 +17,7 @@
 #include "kernelRunner.h"
 #include "kernelList.h"
 #include "kernelParams.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include <iostream>
 
 namespace tensorrt_llm
@@ -69,11 +70,13 @@ struct TrtllmGenBlockScaleGemmOptions
     bool mTransposeMmaOutput{false};
     TrtllmGenBlockScaleGemmKernelParams::AllReduceAlgo mAllReduceAlgo{
         TrtllmGenBlockScaleGemmKernelParams::AllReduceAlgo::None};
+    bool mSliceK{false};
 };
 
 void TrtllmGenBlockScaleGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, float const* aScale,
     void const* b, float const* bScale, void* c, float* cScale, CUstream stream)
 {
+
     TrtllmGenBlockScaleGemmOptions options;
     options.mM = m;
     options.mN = n;
@@ -93,12 +96,13 @@ void TrtllmGenBlockScaleGemmRunner::run(int32_t m, int32_t n, int32_t k, void co
     options.mDtypeAcc = mKernelInfo->dtypeAcc;
     options.mTransposeMmaOutput = mKernelInfo->transposeMmaOutput;
     options.mAllReduceAlgo = TrtllmGenBlockScaleGemmKernelParams::AllReduceAlgo::None;
+    options.mSliceK = mKernelInfo->sliceK;
 
     auto params = TrtllmGenBlockScaleGemmKernelParams::setKernelParams(options, a, aScale, b, bScale, c,
-        nullptr /* multimemC */, cScale, nullptr /* ptrPartialSumsForSplitK */,
-        nullptr /* multimemPartialSumsForSplitK */, nullptr /* ptrTileBars */, nullptr /* multimemTileBars */,
-        nullptr /* ptrCompletionBars */, nullptr /* multimemCompletionBars */, nullptr /* ptrSplitKCompletionBars */, 0,
-        1);
+        nullptr /* ptrSfc */, nullptr /* multimemC */, cScale /* ptrScaleC */, nullptr /* ptrPartialSumsForSplitK */,
+        nullptr /* ptrTileBars */, nullptr /* multimemTileBars */, nullptr /* ptrCompletionBars */,
+        nullptr /* multimemCompletionBars */, nullptr /* ptrSplitKCompletionBars */, 0, 1);
+    TLLM_CHECK_WITH_INFO(sizeof(params) == 832, "Size of mismatch between trtllm-gen and trtllm");
 
     CUlaunchConfig launch_config;
     launch_config.blockDimX = mKernelInfo->threadsPerCTA;
@@ -109,15 +113,17 @@ void TrtllmGenBlockScaleGemmRunner::run(int32_t m, int32_t n, int32_t k, void co
     launch_config.gridDimZ = options.mNumSlicesForSplitK;
     launch_config.hStream = stream;
     launch_config.sharedMemBytes = mKernelInfo->sharedMemSize;
-    CUlaunchAttribute launch_attribute[2];
+    CUlaunchAttribute launch_attribute[3];
     launch_attribute[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
     launch_attribute[0].value.clusterDim.x = 1;
     launch_attribute[0].value.clusterDim.y = 1;
     launch_attribute[0].value.clusterDim.z = 1;
     launch_attribute[1].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE;
     launch_attribute[1].value.clusterSchedulingPolicyPreference = CU_CLUSTER_SCHEDULING_POLICY_DEFAULT;
+    launch_attribute[2].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+    launch_attribute[2].value.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     launch_config.attrs = launch_attribute;
-    launch_config.numAttrs = 2;
+    launch_config.numAttrs = 3;
     void* kernelParamsList[] = {&params};
     TLLM_CU_CHECK(mDriver->cuLaunchKernelEx(&launch_config, mFunction, kernelParamsList, nullptr));
 }

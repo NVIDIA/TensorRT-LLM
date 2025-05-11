@@ -22,7 +22,7 @@ import os
 import re
 import warnings
 from enum import Enum, auto
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -30,9 +30,8 @@ from einops import rearrange
 from huggingface_hub import repo_exists, snapshot_download
 from huggingface_hub.utils import HFValidationError
 from PIL import Image
-from transformers import AutoConfig, AutoModel
-from transformers import AutoModelForCausalLM as HFAutoModelForCausalLM
-from transformers import (AutoTokenizer, LlavaConfig, PretrainedConfig,
+from transformers import (AutoConfig, AutoImageProcessor, AutoModel,
+                          AutoTokenizer, LlavaConfig, PretrainedConfig,
                           PreTrainedModel)
 
 from ..._utils import nvtx_range
@@ -42,13 +41,13 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_encoder import (CLIPVisionTower, CLIPVisionTowerS2,
-                                          SiglipVisionTower,
-                                          SiglipVisionTowerDynamicS2,
-                                          SiglipVisionTowerS2)
-from .modeling_multimodal_utils import (fuse_input_embeds, merge_chessboard,
+from .modeling_multimodal_encoder import (VisionTower, VisionTowerDynamicS2,
+                                          VisionTowerS2)
+from .modeling_multimodal_utils import (dynamic_preprocess_dispatch,
+                                        dynamic_s2_preprocess_dispatch,
+                                        fuse_input_embeds, merge_chessboard,
                                         merge_features_for_dynamic_s2,
-                                        split_chessboard)
+                                        preprocess_dispatch, split_chessboard)
 from .modeling_utils import ModelConfig, register_auto_model
 
 SENTINEL_TOKEN = "<vila/sentinel>"  # nosec B105
@@ -117,176 +116,32 @@ def _get_model_paths(config):
     return paths
 
 
-"""
-VILA vision tower processing utilities
-based on: https://github.com/NVlabs/VILA/llava/mm_utils.py
-"""
-
-
-def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height,
-                              image_size):
-    best_ratio_diff = float("inf")
-    best_ratio = (1, 1)
-    area = width * height
-    for ratio in target_ratios:
-        target_aspect_ratio = ratio[0] / ratio[1]
-        ratio_diff = abs(aspect_ratio - target_aspect_ratio)
-        if ratio_diff < best_ratio_diff:
-            best_ratio_diff = ratio_diff
-            best_ratio = ratio
-        elif ratio_diff == best_ratio_diff:
-            if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
-                best_ratio = ratio
-    return best_ratio
-
-
-def dynamic_preprocess(image,
-                       min_num=1,
-                       max_num=12,
-                       image_size=384,
-                       use_thumbnail=True):
-    orig_width, orig_height = image.size
-    aspect_ratio = orig_width / orig_height
-
-    # calculate the existing image aspect ratio
-    target_ratios = {(i, j)
-                     for n in range(min_num, max_num + 1)
-                     for i in range(1, n + 1)
-                     for j in range(1, n + 1)
-                     if i * j <= max_num and i * j >= min_num}
-    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
-
-    # find the closest aspect ratio to the target
-    target_aspect_ratio = find_closest_aspect_ratio(aspect_ratio, target_ratios,
-                                                    orig_width, orig_height,
-                                                    image_size)
-
-    # calculate the target width and height
-    target_width = image_size * target_aspect_ratio[0]
-    target_height = image_size * target_aspect_ratio[1]
-    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
-
-    # resize the image
-    resized_img = image.resize((target_width, target_height))
-    processed_images = []
-    for i in range(blocks):
-        box = (
-            (i % (target_width // image_size)) * image_size,
-            (i // (target_width // image_size)) * image_size,
-            ((i % (target_width // image_size)) + 1) * image_size,
-            ((i // (target_width // image_size)) + 1) * image_size,
-        )
-        # split the image
-        split_img = resized_img.crop(box)
-        processed_images.append(split_img)
-    assert len(processed_images) == blocks
-    if use_thumbnail and len(processed_images) != 1:
-        thumbnail_img = image.resize((image_size, image_size))
-        processed_images.append(thumbnail_img)
-    return processed_images
-
-
-def dynamic_s2_preprocess(image,
-                          s2_scales=[384, 768, 1152],
-                          max_num=12,
-                          image_size=384):
-    orig_width, orig_height = image.size
-    aspect_ratio = orig_width / orig_height
-    min_num = (
-        s2_scales[-1] //
-        s2_scales[0])**2  # at least use number of tiles as the largest scale
-
-    processed_images = []
-
-    ##########################################################################################
-    ############# Add tiles for all but the last scale using fixed square ratio ##############
-    ##########################################################################################
-
-    for scale in s2_scales[:-1]:
-        target_width = image_size * (scale // s2_scales[0])
-        target_height = image_size * (scale // s2_scales[0])
-        blocks = (scale // s2_scales[0])**2
-
-        # resize the image
-        resized_img = image.resize((target_width, target_height))
-        for i in range(blocks):
-            box = (
-                (i % (target_width // image_size)) * image_size,
-                (i // (target_width // image_size)) * image_size,
-                ((i % (target_width // image_size)) + 1) * image_size,
-                ((i // (target_width // image_size)) + 1) * image_size,
-            )
-            # split the image
-            split_img = resized_img.crop(box)
-            processed_images.append(split_img)
-
-    ##########################################################################################
-    ################ Add tiles for the last scale using dynamic aspect ratio #################
-    ##########################################################################################
-
-    # calculate the existing image aspect ratio
-    target_ratios = {(i, j)
-                     for n in range(min_num, max_num + 1)
-                     for i in range(1, n + 1)
-                     for j in range(1, n + 1)
-                     if i * j <= max_num and i * j >= min_num}
-    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
-
-    # find the closest aspect ratio to the target
-    target_aspect_ratio = find_closest_aspect_ratio(aspect_ratio, target_ratios,
-                                                    orig_width, orig_height,
-                                                    image_size)
-
-    # calculate the target width and height
-    target_width = image_size * target_aspect_ratio[0]
-    target_height = image_size * target_aspect_ratio[1]
-    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
-
-    # resize the image
-    resized_img = image.resize((target_width, target_height))
-    for i in range(blocks):
-        box = (
-            (i % (target_width // image_size)) * image_size,
-            (i // (target_width // image_size)) * image_size,
-            ((i % (target_width // image_size)) + 1) * image_size,
-            ((i // (target_width // image_size)) + 1) * image_size,
-        )
-        # split the image
-        split_img = resized_img.crop(box)
-        processed_images.append(split_img)
-
-    return processed_images, (target_aspect_ratio[1], target_aspect_ratio[0])
-
-
-def process_image(image_file,
+def process_image(image: Union[Image.Image, torch.Tensor],
                   image_processor,
                   model_config,
                   enable_dynamic_res=False,
-                  enable_dynamic_s2=False):
-    assert isinstance(
-        image_file,
-        Image.Image), "image_file must be an instance of PIL.Image.Image"
-    image = image_file.convert("RGB")
-    image_aspect_ratio = model_config.image_aspect_ratio
+                  enable_dynamic_s2=False,
+                  use_fast: bool = True,
+                  device=None,
+                  dtype=None):
 
-    if hasattr(image_processor, "crop_size"):
-        crop_size = image_processor.crop_size  # CLIP vision tower
-    elif hasattr(image_processor, "size"):
+    image_aspect_ratio = model_config.image_aspect_ratio
+    if hasattr(image_processor, "size"):
         crop_size = image_processor.size  # SIGLIP vision tower
+    elif hasattr(image_processor, "crop_size"):
+        crop_size = image_processor.crop_size  # CLIP vision tower
 
     if image_aspect_ratio == "dynamic" and enable_dynamic_res:
         # VILA 2.0
         assert crop_size["height"] == crop_size["width"]
-        images = dynamic_preprocess(image,
-                                    min_num=model_config.min_tiles,
-                                    max_num=model_config.max_tiles,
-                                    image_size=crop_size["height"])
-        images = [
-            image_processor.preprocess(
-                image, return_tensors="pt")["pixel_values"][0].to('cuda')
-            for image in images
-        ]
-        return torch.stack(images)
+        return dynamic_preprocess_dispatch(image,
+                                           image_processor,
+                                           min_num=model_config.min_tiles,
+                                           max_num=model_config.max_tiles,
+                                           image_size=crop_size["height"],
+                                           use_fast=use_fast,
+                                           device=device,
+                                           dtype=dtype)
 
     if image_aspect_ratio == "dynamic_s2" and enable_dynamic_s2:
         # VILA 2.0
@@ -295,17 +150,14 @@ def process_image(image_file,
             s2_scales = list(map(int, model_config.s2_scales.split(",")))
         else:
             s2_scales = model_config.s2_scales
-        images, block_size = dynamic_s2_preprocess(
-            image,
-            s2_scales=s2_scales,
-            max_num=model_config.max_tiles,
-            image_size=crop_size["height"])
-        images = [
-            image_processor.preprocess(
-                image, return_tensors="pt")["pixel_values"][0].to('cuda')
-            for image in images
-        ]
-        return torch.stack(images), block_size
+        return dynamic_s2_preprocess_dispatch(image,
+                                              image_processor,
+                                              s2_scales=s2_scales,
+                                              max_num=model_config.max_tiles,
+                                              image_size=crop_size["height"],
+                                              use_fast=use_fast,
+                                              device=device,
+                                              dtype=dtype)
 
     if image_aspect_ratio == "resize":
         # VILA 1.0
@@ -331,19 +183,33 @@ def process_image(image_file,
         image = expand2square(
             image, tuple(int(x * 255) for x in image_processor.image_mean))
 
-    image = image_processor.preprocess(
-        image, return_tensors="pt")["pixel_values"][0].to('cuda')
+    image = preprocess_dispatch(image,
+                                image_processor,
+                                use_fast=use_fast,
+                                device=device,
+                                dtype=dtype)
+
     return image
 
 
-def process_images(image_files,
+def process_images(images: Union[List[Image.Image], List[torch.Tensor]],
                    image_processor,
                    model_config,
                    enable_dynamic_res=False,
-                   enable_dynamic_s2=False):
+                   enable_dynamic_s2=False,
+                   use_fast: bool = True,
+                   device=None,
+                   dtype=None):
+    if isinstance(images[0], torch.Tensor) and not use_fast:
+        use_fast = True
+        logger.warning(
+            "Images are given as Pytorch tensors. Automatically turn on use_fast=True because PIL operations don't apply to Pytorch format."
+        )
+
     images = [
         process_image(image, image_processor, model_config, enable_dynamic_res,
-                      enable_dynamic_s2) for image in image_files
+                      enable_dynamic_s2, use_fast, device, dtype)
+        for image in images
     ]
 
     block_sizes = None
@@ -366,7 +232,6 @@ def process_images(image_files,
     return images, block_sizes
 
 
-"""End of vision processing utilities"""
 """
 VILA multimodal projector module
 """
@@ -646,47 +511,33 @@ def init_tokenizer(llm_path: str):
 
 def init_vision_tower(model_name_or_path: str,
                       config: PretrainedConfig) -> PreTrainedModel:
-    if model_name_or_path is None:
-        return None
-
-    vision_tower_arch = None
-    if config.resume_path and "radio" not in model_name_or_path:
-        assert os.path.exists(
-            model_name_or_path
-        ), f"Pretrained vision tower path {model_name_or_path} does not exist!"
-        vision_tower_cfg = AutoConfig.from_pretrained(model_name_or_path,
-                                                      trust_remote_code=True)
-        vision_tower_arch = vision_tower_cfg.architectures[0].lower()
-    vision_tower_name = vision_tower_arch if vision_tower_arch is not None else model_name_or_path
 
     use_s2 = getattr(config, "s2", False)
     use_dynamic_s2 = getattr(config, "dynamic_s2", False)
 
-    if "intern" in vision_tower_name.lower():
-        raise NotImplementedError("Intern vision tower is not Implemented yet")
-    elif "radio" in vision_tower_name:
-        raise NotImplementedError("Radio vision tower is not Implemented yet")
-    elif "clip" in vision_tower_name:
-        if use_s2:
-            vision_tower = CLIPVisionTowerS2(model_name_or_path, config)
-        else:
-            vision_tower = CLIPVisionTower(model_name_or_path, config)
-    elif "siglip" in vision_tower_name:
-        if use_dynamic_s2:
-            vision_tower = SiglipVisionTowerDynamicS2(model_name_or_path,
-                                                      config)
-        elif use_s2:
-            vision_tower = SiglipVisionTowerS2(model_name_or_path, config)
-        else:
-            vision_tower = SiglipVisionTower(model_name_or_path, config)
+    image_processor = AutoImageProcessor.from_pretrained(model_name_or_path,
+                                                         use_fast=True)
+    if use_dynamic_s2:
+        vision_tower = VisionTowerDynamicS2(model_name_or_path, config)
+        image_processor.size["height"] = image_processor.size[
+            "width"] = vision_tower.scales[0]
+    elif use_s2:
+        vision_tower = VisionTowerS2(model_name_or_path, config)
+        if "clip" in vision_tower.name:
+            image_processor.size["shortest_edge"] = vision_tower.scales[-1]
+            image_processor.crop_size["height"] = image_processor.crop_size[
+                "width"] = vision_tower.scales[-1]
+        elif "siglip" in vision_tower.name:
+            image_processor.size["height"] = image_processor.size[
+                "width"] = vision_tower.scales[-1]
     else:
-        raise ValueError(f"Unknown vision tower: {model_name_or_path}")
+        vision_tower = VisionTower(model_name_or_path, config)
 
     config.mm_hidden_size = (vision_tower.config.hidden_size
                              if not (use_s2 or use_dynamic_s2) else
                              vision_tower.hidden_size)
 
-    return vision_tower
+    return vision_tower, image_processor
 
 
 def init_mm_projector(model_type_or_path: str,
@@ -708,6 +559,63 @@ def init_mm_projector(model_type_or_path: str,
         return mm_projector
 
 
+def _resize_embeds(old_embeddings, new_num_tokens):
+    # build new embeddings
+    old_num_tokens, old_embedding_dim = old_embeddings.weight.size()
+    new_embeddings = nn.Embedding(
+        new_num_tokens,
+        old_embedding_dim,
+        device=old_embeddings.weight.device,
+        dtype=old_embeddings.weight.dtype,
+    )
+
+    # copy weights
+    num_tokens_to_copy = min(old_num_tokens, new_num_tokens)
+    new_embeddings.weight.data[:
+                               num_tokens_to_copy, :] = old_embeddings.weight.data[:
+                                                                                   num_tokens_to_copy, :]
+    old_embeddings.weight.data = new_embeddings.weight.data
+    old_embeddings.num_embeddings = new_embeddings.weight.data.shape[0]
+    if hasattr(old_embeddings,
+               "padding_idx") and old_embeddings.padding_idx is not None:
+        if (new_num_tokens - 1) < old_embeddings.padding_idx:
+            old_embeddings.padding_idx = None
+    return old_embeddings
+
+
+def _resize_lm_head(old_lm_head, new_num_tokens):
+    # build new lm head
+    old_num_tokens, old_lm_head_dim = old_lm_head.weight.size()
+    new_lm_head_shape = (old_lm_head_dim, new_num_tokens)
+    has_new_lm_head_bias = old_lm_head.bias is not None
+    new_lm_head = nn.Linear(
+        *new_lm_head_shape,
+        bias=has_new_lm_head_bias,
+        device=old_lm_head.weight.device,
+        dtype=old_lm_head.weight.dtype,
+    )
+
+    # copy weights and bias
+    num_tokens_to_copy = min(old_num_tokens, new_num_tokens)
+    new_lm_head.weight.data[:
+                            num_tokens_to_copy, :] = old_lm_head.weight.data[:
+                                                                             num_tokens_to_copy, :]
+    old_lm_head.weight.data = new_lm_head.weight.data
+
+    if has_new_lm_head_bias:
+        new_lm_head.bias.data[:
+                              num_tokens_to_copy] = old_lm_head.bias.data[:
+                                                                          num_tokens_to_copy]
+        old_lm_head.bias.data = new_lm_head.bias.data
+    return old_lm_head
+
+
+def _resize_token_embeddings(llm, new_num_tokens: int):
+    _resize_embeds(llm.model.embed_tokens, new_num_tokens)
+    if hasattr(llm, "lm_head"):
+        _resize_lm_head(llm.lm_head, new_num_tokens)
+
+
 def init_llm(
     llm_path: str,
     model_config: ModelConfig[PretrainedConfig],
@@ -716,30 +624,9 @@ def init_llm(
     *args,
     **kwargs,
 ) -> PreTrainedModel:
-    # Pre-run to resize vocab embedding (see: https://github.com/NVlabs/VILA/blob/86e009759a14eee045c669421128d703227da362/llava/model/builder.py#L137)
     llm_cfg = AutoConfig.from_pretrained(llm_path)
     tokenizer = init_tokenizer(llm_path)
-    if llm_cfg.vocab_size != len(tokenizer):
-        warnings.warn(
-            "LLM's vocab size does not match tokenizer's vocab size! It is likely this multimodal model has extended the vocabulary with extra special tokens, and have used resize_token_embeddings() (https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings) in the PyTorch implementation. Here, the only way is to refresh the word embedding weight and re-save the checkpoint and update vocab size. This is a one-off operation for a given model. Tokenzier is not re-saved, just the LLM checkpoint."
-        )
-        warnings.warn(
-            "Please be patient when the checkpoint is being updated...")
-        model_hf = HFAutoModelForCausalLM.from_pretrained(llm_path,
-                                                          torch_dtype="auto")
-        model_hf.resize_token_embeddings(len(tokenizer))
-        warnings.warn(f"Saving to {llm_path} by overwriting...")
-        try:
-            model_hf.save_pretrained(llm_path)
-        except (OSError, PermissionError):
-            import tempfile
-            llm_path = os.path.join(tempfile.gettempdir(), "vila")
-            warnings.warn(
-                f"Current checkpoint directory is read-only. Saving to {llm_path} instead."
-            )
-            model_hf.save_pretrained(llm_path)
 
-    # Real run
     llm_cfg = AutoConfig.from_pretrained(llm_path)
     llm_cfg._attn_implementation = attn_implementation
     llm_cfg.model_max_length = model_max_length
@@ -755,6 +642,10 @@ def init_llm(
     llm_model_config = copy.deepcopy(model_config)
     llm_model_config.pretrained_config = llm_cfg
     llm = AutoModelForCausalLM.from_config(llm_model_config)
+    if llm_cfg.vocab_size != len(tokenizer):
+        warnings.warn(
+            "LLM have a different vocab size than tokenizer. Consider update the LLM checkpoint with the tokenizer's vocab size with resize_token_embeddings()."
+        )
 
     model_config.pretrained_config.hidden_size = llm.config.hidden_size
     return tokenizer, llm, llm_path, llm_cfg.vocab_size
@@ -987,18 +878,20 @@ class VilaInputProcessor(InputProcessor):
 
         self.tokenizer = init_tokenizer(
             llm_path) if tokenizer is None else tokenizer
-        self.vision_tower = init_vision_tower(
-            vision_tower_path,
-            self.model_config).to(device=self.device,
-                                  dtype=torch.float16)  # must be fp16
-        self.mm_projector = init_mm_projector(
-            mm_projector_path,
-            self.model_config).to(device=self.device,
-                                  dtype=torch.float16)  # must be fp16
+        self.vision_tower, self.image_processor = init_vision_tower(
+            vision_tower_path, self.model_config)
+        self.mm_projector = init_mm_projector(mm_projector_path,
+                                              self.model_config)
+
+        # must be fp16
+        self.vision_tower.to(device=self.device, dtype=torch.float16)
+        self.mm_projector.to(device=self.device, dtype=torch.float16)
 
     @nvtx_range("[Vision] preprocess")
-    def _preprocess(self, mm_data: dict[str, any],
-                    processor_kwargs) -> Tuple[torch.Tensor, List[int]]:
+    def _preprocess(self,
+                    mm_data: dict[str, any],
+                    processor_kwargs,
+                    use_fast: bool = True) -> Tuple[torch.Tensor, List[int]]:
         """Preprocess multimodal data, e.g. resize, patchify, etc., into torch.Tensor"""
 
         assert isinstance(
@@ -1008,10 +901,13 @@ class VilaInputProcessor(InputProcessor):
         if "image" in mm_data and len(mm_data["image"]) > 0:
             images = mm_data["image"]
             return process_images(images,
-                                  self.vision_tower.image_processor,
+                                  self.image_processor,
                                   self.model_config,
                                   enable_dynamic_res=True,
-                                  enable_dynamic_s2=True)
+                                  enable_dynamic_s2=True,
+                                  use_fast=use_fast,
+                                  device='cuda',
+                                  dtype=self.vision_tower.dtype)
         elif "video" in mm_data and len(mm_data["video"]) > 0:
             videos = mm_data["video"]
             mm_tensors = []
@@ -1019,10 +915,13 @@ class VilaInputProcessor(InputProcessor):
             for video in videos:
                 mm_tensor, block_sizes = process_images(
                     video,
-                    self.vision_tower.image_processor,
+                    self.image_processor,
                     self.model_config,
                     enable_dynamic_res=False,
-                    enable_dynamic_s2=False)
+                    enable_dynamic_s2=False,
+                    use_fast=use_fast,
+                    device='cuda',
+                    dtype=self.vision_tower.dtype)
                 mm_tensors.append(mm_tensor)
             return torch.cat(mm_tensors, dim=0), block_sizes
         else:
@@ -1194,8 +1093,8 @@ class VilaInputProcessor(InputProcessor):
         (3) passed input_ids and mm_embed via LlmRequest's prompt_token_ids and prompt_embedding_table fields respectively. LlmRequests can be inflight batched, and the mm_embed is passed to LLM model as `multi_modal_data` which is List[torch.Tensor] for batched requests.
         """
 
-        text_prompt = inputs["prompt"]
-        mm_data = inputs["multi_modal_data"]
+        text_prompt, mm_data = inputs.get("prompt"), inputs.get(
+            "multi_modal_data", {})
         mm_processor_kwargs = inputs.get("mm_processor_kwargs", {})
 
         text_prompt = _apply_chat_template(text_prompt, self.conv_mode,
@@ -1203,11 +1102,13 @@ class VilaInputProcessor(InputProcessor):
         input_ids = self.tokenizer(
             text_prompt, return_tensors="pt").input_ids[0].to(self.device)
 
-        mm_tensor, block_sizes = self._preprocess(mm_data, mm_processor_kwargs)
+        mm_tensor, block_sizes = self._preprocess(
+            mm_data, mm_processor_kwargs, use_fast=True
+        )  # use_fast uses Pytorch GPU preprocessing, otherwise uses PIL CPU preprocessing
         mm_features = self._process(mm_tensor, block_sizes)
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
         return fused_input_ids.to(torch.int32).tolist(), {
-            "prompt_tuning_config": [mm_features, None, None]
+            "mm_embedding": mm_features
         }
 
 
@@ -1244,7 +1145,6 @@ class VilaModel(PreTrainedModel):
         self.llm.to(device=device, dtype=self.model_dtype)
 
         self.post_config()
-        self.is_loaded = True
 
     @torch.inference_mode()
     def forward(
@@ -1267,9 +1167,13 @@ class VilaModel(PreTrainedModel):
             mm_embed
         ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
 
-        input_ids, inputs_embeds = fuse_input_embeds(self, input_ids, mm_embed)
-        logits = self.llm.forward(attn_metadata, input_ids, position_ids,
-                                  inputs_embeds, return_context_logits)
+        input_ids, inputs_embeds = fuse_input_embeds(
+            self.llm.model.embed_tokens, input_ids, mm_embed)
+        logits = self.llm.forward(attn_metadata=attn_metadata,
+                                  input_ids=input_ids,
+                                  position_ids=position_ids,
+                                  inputs_embeds=inputs_embeds,
+                                  return_context_logits=return_context_logits)
         return logits
 
     def get_llm(self):
@@ -1285,6 +1189,10 @@ class VilaModel(PreTrainedModel):
 
     def load_weights(self, weights):
         self.llm.load_weights(weights)
+        # resize token embeddings if vocab size mismatch after loading weights
+        if self.vocab_size != len(self.tokenizer):
+            _resize_token_embeddings(self.llm, len(self.tokenizer))
+            self.vocab_size = len(self.tokenizer)
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()

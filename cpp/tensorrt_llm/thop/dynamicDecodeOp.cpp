@@ -66,13 +66,12 @@ namespace
 template <typename T>
 void safeInsert(th::optional<th::Tensor>& tensor, std::optional<std::vector<T>>& arg)
 {
-    using valueType = T;
     if (tensor.has_value())
     {
-        auto ptr = get_ptr<valueType>(tensor.value());
         auto shape = convert_shape(tensor.value());
         size_t const size = tensorrt_llm::runtime::ITensor::volume(shape);
-        arg = std::vector<valueType>(ptr, ptr + size);
+        auto ptr = get_ptr<T>(tensor.value());
+        arg = std::vector<T>(ptr, ptr + size);
     }
 }
 
@@ -139,9 +138,7 @@ void FtDynamicDecode<T>::setup(size_t const batch_size, size_t const beam_width,
     safeInsert(presence_penalty_opt, penaltyParams->presencePenalty);
     safeInsert(frequency_penalty_opt, penaltyParams->frequencyPenalty);
     safeInsert(min_length_opt, penaltyParams->minLength);
-
     safeInsert(no_repeat_ngram_size_opt, banWordsParams->noRepeatNgramSize);
-
     if (beam_width == 1)
     {
         auto decodingParams = std::make_shared<tl::SamplingSetupParams>();
@@ -349,12 +346,12 @@ void DynamicDecodeOp::setup(int64_t const batchSize, int64_t const beamWidth, th
     CHECK_OPTIONAL_CPU_INPUT(minLengthOpt, torch::kInt32);
     CHECK_OPTIONAL_CPU_INPUT(lengthPenaltyOpt, torch::kFloat);
     CHECK_OPTIONAL_CPU_INPUT(earlyStoppingOpt, torch::kInt32);
-    CHECK_OPTIONAL_CPU_INPUT(noRepeatNgramSizeOpt, torch::kInt32);
     CHECK_OPTIONAL_CPU_INPUT(beamSearchDiversityRateOpt, torch::kFloat);
     CHECK_OPTIONAL_CPU_INPUT(randomSeedOpt, torch::kInt64);
     CHECK_OPTIONAL_INPUT(topPDecayOpt, torch::kFloat);
     CHECK_OPTIONAL_INPUT(topPMinOpt, torch::kFloat);
     CHECK_OPTIONAL_INPUT(topPResetIdsOpt, torch::kInt32);
+    CHECK_OPTIONAL_CPU_INPUT(noRepeatNgramSizeOpt, torch::kInt32);
     CHECK_OPTIONAL_CPU_INPUT(minPOpt, torch::kFloat);
 
     dynamicDecode_->setup(static_cast<tr::SizeType32>(batchSize), static_cast<tr::SizeType32>(beamWidth),

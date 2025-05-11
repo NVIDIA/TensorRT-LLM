@@ -46,6 +46,13 @@ struct TrtllmGenBlockScaleGemmKernelParams
     float const* ptrDqSfsA;
     // The scaling factors to dequantize B. It is used when the DeepSeek Fp8 recipe is enabled.
     float const* ptrDqSfsB;
+    // The scaling factors calculated when quantizing C, for MxFp{4,8} and NvFp4 formats.
+    void* ptrSfC;
+
+    // TMA descriptor for the block scale factors of A, for MxFp{4,8} and NvFp4 formats.
+    CUtensorMap tmaSfA;
+    // TMA descriptor for the block scale factors of B, for MxFp{4,8} and NvFp4 formats.
+    CUtensorMap tmaSfB;
 
     // The device output scale for FP8 quantization. It can either be a static value passed to the
     // kernel or it can be computed by the kernel. TensorRT-LLM fp8 kernels expect a single scaling
@@ -75,10 +82,6 @@ struct TrtllmGenBlockScaleGemmKernelParams
     void* multimemC;
     // Pointer for partial sums for split-k computation.
     void* ptrPartialSumsForSplitK;
-    // Pointer for partial sums for split-k data with multicast mapping.
-    // It is used by the "reduce" op (LDGMC.ADD)
-    // of the two-shot reduce-scatter phase with numSlicesForSplitK > 1.
-    void* multimemPartialSumsForSplitK;
 
     // The barriers in global memory.
     //
@@ -141,20 +144,51 @@ struct TrtllmGenBlockScaleGemmKernelParams
         // 1, so swap the first two dimension so that the hiddenSize dimension comes first.
         auto shape = std::vector<uint64_t>{static_cast<uint64_t>(hiddenSize), static_cast<uint64_t>(numTokens)};
 
-        // Assemble the stride (strideTensor, strideTokens, 1).
+        // Assemble the stride (strideTokens, 1).
         // Swap the first two dimension as mentioned before.
         auto stride = std::vector<uint64_t>{1, static_cast<uint64_t>(hiddenSize)};
-        if (options.mNumSlicesForSplitK > 1)
+
+        return std::make_tuple(shape, stride);
+    }
+
+    // Create the TMA shape/stride for A/B block scale factors.
+    template <class GemmOptions>
+    static auto makeTmaShapeStrideSfAb(GemmOptions const& options, MatrixType matrixType)
+    {
+        // Note: the scale factor tensor packs 128x4 tiles into contiguous 512B blocks.
+        // The 512B block maps to a 32x16B (32x128b) block in TMEM.
+        // See https://nvbugspro.nvidia.com/bug/4165523
+        //
+        // Additionally, we have to meet constraints of TMA that the box dimensions are less
+        // than 256 and boxDim[0] is a multiple of 16B.
+        //
+        // The "logical" tensor is:      [outer,        inner / numEltsPerSf]
+        // The aforementioned format is: [outer / 128,  inner / numEltsPerSf / 4,    512]
+        // The shape we use for TMA is:  [outer / 128,  inner / numEltsPerSf / 4, 2, 256]
+
+        // The outer dimension.
+        auto numTokens = matrixType == MatrixType::MatrixA ? options.mM : options.mN;
+        // The inner dimension.
+        auto hiddenSize = options.mK;
+
+        const int32_t numEltsPerSf = 16;
+
+        auto shape = std::vector<uint64_t>{
+            256, 2, static_cast<uint64_t>((hiddenSize / numEltsPerSf / 4)), static_cast<uint64_t>(numTokens / 128)};
+
+        std::vector<uint64_t> stride(shape.size());
+        stride[0] = 1;
+        for (size_t i = 1; i < shape.size(); i++)
         {
-            shape.push_back(static_cast<uint64_t>(options.mNumSlicesForSplitK));
-            stride.push_back(static_cast<uint64_t>(numTokens * hiddenSize));
+            stride[i] = shape[i - 1] * stride[i - 1];
         }
 
         return std::make_tuple(shape, stride);
     }
 
     static CUtensorMap buildNdTmaDescriptor(Data_type dtype, std::vector<uint64_t> const& shapes,
-        std::vector<uint64_t> const& strides, int32_t tileSizeMn, int32_t tileSizeK, void* gmemAddr)
+        std::vector<uint64_t> const& strides, int32_t tileSizeMn, int32_t tileSizeK, void* gmemAddr,
+        bool doSwizzle = true)
     {
         CUtensorMap desc{};
         // The data type.
@@ -186,24 +220,27 @@ struct TrtllmGenBlockScaleGemmKernelParams
         }
 
         // The swizzle type.
-        CUtensorMapSwizzle swizzleType;
+        CUtensorMapSwizzle swizzleType{CU_TENSOR_MAP_SWIZZLE_NONE};
         int32_t tileKSizeInBytes = (tileSizeK * get_size_in_bits(dtype)) / /* bits */ 8;
-        if ((tileKSizeInBytes % 128) == 0)
+        if (doSwizzle)
         {
-            swizzleType = CU_TENSOR_MAP_SWIZZLE_128B;
-        }
-        else if ((tileKSizeInBytes % 64) == 0)
-        {
-            swizzleType = CU_TENSOR_MAP_SWIZZLE_64B;
-        }
-        else if ((tileKSizeInBytes % 32) == 0)
-        {
-            swizzleType = CU_TENSOR_MAP_SWIZZLE_32B;
-        }
-        else
-        {
-            std::cerr << "Unexpected tileKSizeInBytes " << tileKSizeInBytes << std::endl;
-            TLLM_CHECK(false);
+            if ((tileKSizeInBytes % 128) == 0)
+            {
+                swizzleType = CU_TENSOR_MAP_SWIZZLE_128B;
+            }
+            else if ((tileKSizeInBytes % 64) == 0)
+            {
+                swizzleType = CU_TENSOR_MAP_SWIZZLE_64B;
+            }
+            else if ((tileKSizeInBytes % 32) == 0)
+            {
+                swizzleType = CU_TENSOR_MAP_SWIZZLE_32B;
+            }
+            else
+            {
+                std::cerr << "Unexpected tileKSizeInBytes " << tileKSizeInBytes << std::endl;
+                TLLM_CHECK(false);
+            }
         }
 
         // Check gmem address must be 16B-aligned
@@ -295,6 +332,107 @@ struct TrtllmGenBlockScaleGemmKernelParams
         return desc;
     }
 
+    static CUtensorMap buildSfTmaDescriptor(Data_type dtype, std::vector<uint64_t> const& shapes,
+        std::vector<uint64_t> const& strides, std::vector<uint32_t> const& tileShapes, void* gmemAddr)
+    {
+        CUtensorMap desc{};
+        CUtensorMapDataType tmaDataFormat;
+        if (dtype == Data_type::DATA_TYPE_E4M3)
+        {
+            tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_UINT8;
+        }
+        else
+        {
+            std::cerr << "Unexpected dtype " << static_cast<int32_t>(dtype) << std::endl;
+            TLLM_CHECK(false);
+        }
+
+        // No swizzle for scaling factors.
+        CUtensorMapSwizzle swizzleType = CU_TENSOR_MAP_SWIZZLE_NONE;
+
+        // Check gmem address must be 16B-aligned
+        TLLM_CHECK((reinterpret_cast<uint64_t>(gmemAddr) & 0b1111) == 0); //
+
+        // Check shape must be in range [1, 2^32]
+        int32_t dim = shapes.size();
+        // Check shape range.
+        for (int32_t ii = 0; ii < dim; ++ii)
+        {
+            TLLM_CHECK(shapes[ii] >= (uint64_t(1)));       // Size must be min 1
+            TLLM_CHECK(shapes[ii] <= (uint64_t(1) << 32)); // Size must be max 2^32
+        }
+
+        // TMA descriptor does not store the zeroth stride and assumes it is 1.
+        TLLM_CHECK(static_cast<int32_t>(strides.size()) == dim);
+        TLLM_CHECK(strides[0] == 1);
+
+        // Build strides in bytes.
+        // cuTensorMapEncodeTiled ignores the stride of the first dimension (implicitly 1).
+        std::vector<uint64_t> stridesInBytes(dim - 1);
+        for (int32_t ii = 0; ii < dim - 1; ++ii)
+        {
+            stridesInBytes[ii] = (strides[ii + 1] * get_size_in_bits(dtype)) / /* bits */ 8;
+        }
+
+        // Set tile strides to 1;
+        std::vector<uint32_t> tileStrides(dim, 1);
+
+        // Build the descriptor.
+        CUresult result = cuTensorMapEncodeTiled(/*tensorMap=*/&desc,
+            /*tensorDataType=*/tmaDataFormat,
+            /*tensorRank=*/dim,
+            /*globalAddress=*/gmemAddr,
+            /*globalDim=*/shapes.data(),
+            /*globalStrides=*/stridesInBytes.data(),
+            /*boxDim=*/tileShapes.data(),
+            /*elementStrides=*/tileStrides.data(),
+            /*interleave=*/CU_TENSOR_MAP_INTERLEAVE_NONE,
+            /*swizzle=*/swizzleType,
+            /*l2Promotion=*/CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+            /*oobFill=*/CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+
+        if (result != CUDA_SUCCESS)
+        {
+            std::cerr << "Error: Failed to initialize the TMA descriptor for SF " << result << std::endl;
+
+            std::cerr << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim << " gmem: " << gmemAddr
+                      << std::endl;
+
+            std::cerr << "shape:";
+            for (uint32_t shape_i : shapes)
+            {
+                std::cerr << " " << shape_i;
+            }
+            std::cerr << std::endl;
+
+            std::cerr << "stridesInBytes:";
+            for (uint32_t stride_i : stridesInBytes)
+            {
+                std::cerr << " " << stride_i;
+            }
+            std::cerr << std::endl;
+
+            std::cerr << "tileShapes:";
+            for (uint32_t tileShape_i : tileShapes)
+            {
+                std::cerr << " " << tileShape_i;
+            }
+            std::cerr << std::endl;
+
+            std::cerr << "tileStrides:";
+            for (uint32_t tileStride_i : tileStrides)
+            {
+                std::cerr << " " << tileStride_i;
+            }
+            std::cerr << std::endl;
+
+            std::cerr << "swizzleType: " << int(swizzleType) << std::endl;
+            TLLM_CHECK(false);
+        }
+
+        return desc;
+    }
+
     enum class AllReduceAlgo
     {
         None = 0,
@@ -305,12 +443,15 @@ struct TrtllmGenBlockScaleGemmKernelParams
     // Setup the kernel parameters.
     template <class GemmOptions_>
     static TrtllmGenBlockScaleGemmKernelParams setKernelParams(GemmOptions_ const& options, void const* ptrA,
-        float const* ptrDqSfsA, void const* ptrB, float const* ptrDqSfsB, void* ptrC, void* multimemC, float* ptrScaleC,
-        void* ptrPartialSumsForSplitK, void* multimemPartialSumsForSplitK, void* ptrTileBars, void* multimemTileBars,
+        void const* ptrSfA, void const* ptrB, void const* ptrSfB, void* ptrC, void* ptrSfC, void* multimemC,
+        float* ptrScaleC, void* ptrPartialSumsForSplitK, void* ptrTileBars, void* multimemTileBars,
         void* ptrCompletionBars, void* multimemCompletionBars, void* ptrSplitKCompletionBars, int rank, int tpGrpSize)
     {
+
         // Is one-shot all-reduce?
         bool const oneShotAr{options.mAllReduceAlgo == AllReduceAlgo::OneShot};
+        // Is two-shot all-reduce?
+        bool const twoShotAr{options.mAllReduceAlgo == AllReduceAlgo::TwoShot};
         // Are there peer devices?
         bool const multiDevice{tpGrpSize > 1};
 
@@ -326,8 +467,30 @@ struct TrtllmGenBlockScaleGemmKernelParams
         // Shape/stride for gmem tensor B.
         auto [shapeB, strideB] = makeTmaShapeStrideAb(options, MatrixType::MatrixB);
         // Build tma descriptor for B.
-        params.tmaB = buildNdTmaDescriptor(
-            options.mDtypeElt, shapeB, strideB, options.mTileN, options.mTileK, const_cast<void*>(ptrB));
+        params.tmaB = buildNdTmaDescriptor(options.mDtypeElt, shapeB, strideB, options.mTileN, options.mTileK,
+            const_cast<void*>(ptrB),
+            /* swizzle */ !options.mSliceK);
+
+        if (options.mDtypeElt == Data_type::DATA_TYPE_E2M1)
+        {
+            const Data_type dTypeSf = Data_type::DATA_TYPE_E4M3;
+
+            const int32_t numEltsPerSf = 16;
+
+            // Build TMA descriptor for gmem A block scale factors.
+            auto [shapeSfA, strideSfA] = makeTmaShapeStrideSfAb(options, MatrixType::MatrixA);
+            auto tileShapesSfA = std::vector<uint32_t>{256, 2, static_cast<uint32_t>(options.mTileK / numEltsPerSf / 4),
+                static_cast<uint32_t>(options.mTileM / 128)};
+            params.tmaSfA
+                = buildSfTmaDescriptor(dTypeSf, shapeSfA, strideSfA, tileShapesSfA, const_cast<void*>(ptrSfA));
+
+            // Build TMA descriptor for gmem B block scale factors.
+            auto [shapeSfB, strideSfB] = makeTmaShapeStrideSfAb(options, MatrixType::MatrixB);
+            auto tileShapesSfB = std::vector<uint32_t>{256, 2, static_cast<uint32_t>(options.mTileK / numEltsPerSf / 4),
+                static_cast<uint32_t>(options.mTileN / 128)};
+            params.tmaSfB
+                = buildSfTmaDescriptor(dTypeSf, shapeSfB, strideSfB, tileShapesSfB, const_cast<void*>(ptrSfB));
+        }
 
         if (options.mUseTmaStore)
         {
@@ -343,9 +506,10 @@ struct TrtllmGenBlockScaleGemmKernelParams
             // in the next phase.
             void* ptrTmaC{oneShotAr && multiDevice ? multimemC : ptrC};
             auto dtypeC{options.mDtypeC};
-            if (options.mNumSlicesForSplitK > 1)
+            // Regardless of output dtype, two-shot all-reduce store partial
+            // accumulation results to global memory in float32 precision.
+            if (twoShotAr && multiDevice)
             {
-                ptrTmaC = oneShotAr && multiDevice ? multimemPartialSumsForSplitK : ptrPartialSumsForSplitK;
                 dtypeC = options.mDtypeAcc;
             }
 
@@ -355,12 +519,16 @@ struct TrtllmGenBlockScaleGemmKernelParams
         }
 
         // Set the dequantization factors for A and B when DeepSeek FP8 recipe is used.
-        params.ptrDqSfsA = ptrDqSfsA;
-        params.ptrDqSfsB = ptrDqSfsB;
+        params.ptrDqSfsA = (float const*) ptrSfA;
+        params.ptrDqSfsB = (float const*) ptrSfB;
 
         // Also set ptrC (it may be used by the NCCL reduction code in "layers/Llama").
         params.ptrC = ptrC;
         params.ptrScaleC = ptrScaleC;
+
+        // The block scale factors of C for MxFp{4,8} and NvFp4 formats.
+        // (not to be confused with the tensor-level scale factor stored in ptrScaleC)
+        params.ptrSfC = ptrSfC;
 
         params.m = options.mM;
         params.n = options.mN;
@@ -371,7 +539,6 @@ struct TrtllmGenBlockScaleGemmKernelParams
 
         params.multimemC = multimemC;
         params.ptrPartialSumsForSplitK = ptrPartialSumsForSplitK;
-        params.multimemPartialSumsForSplitK = multimemPartialSumsForSplitK;
         params.ptrTileBars = ptrTileBars;
         params.multimemTileBars = multimemTileBars;
         params.ptrCompletionBars = ptrCompletionBars;

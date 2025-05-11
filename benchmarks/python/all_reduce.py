@@ -22,7 +22,7 @@ from cuda import cuda, cudart
 
 import tensorrt_llm as tllm
 from tensorrt_llm import Mapping, Tensor
-from tensorrt_llm._utils import OMPI_COMM_TYPE_HOST, mpi_comm
+from tensorrt_llm._utils import local_mpi_rank, local_mpi_size
 from tensorrt_llm.functional import (AllReduceParams, AllReduceStrategy,
                                      allreduce)
 from tensorrt_llm.plugin.plugin import (current_all_reduce_helper,
@@ -36,9 +36,8 @@ def allreduce_benchmark(dtype: str,
     tllm.logger.set_level('error')
     world_size = tllm.mpi_world_size()
     rank = tllm.mpi_rank()
-    local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
-    local_rank = local_comm.Get_rank()
-    gpus_per_node = local_comm.Get_size()
+    local_rank = local_mpi_rank()
+    gpus_per_node = local_mpi_size()
 
     torch.cuda.set_device(local_rank)
     cudart.cudaSetDevice(local_rank)

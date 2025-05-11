@@ -1,12 +1,16 @@
 import logging
 import random
 import re
+import tempfile
 from typing import Optional
 
 import click
 from datasets import load_dataset
+from PIL import Image
 from pydantic import BaseModel, model_validator
-from utils.utils import dataset_dump, get_norm_dist_lengths, print_dataset
+from utils.utils import (get_norm_dist_lengths, multimodal_dataset_dump,
+                         print_multimodal_dataset, print_text_dataset,
+                         text_dataset_dump)
 
 
 def validate_output_len_dist(ctx, param, value):
@@ -31,8 +35,10 @@ class DatasetConfig(BaseModel):
     """Split of the dataset. Typical values: train, validation, test. Setting to None will include all splits."""
     split: Optional[str]
     """The dataset dictionary used for the input sentence."""
-    input_key: str
+    input_key: Optional[str] = None
     """The dataset dictionary key used for the prompt of the input sentence. Must not be set when prompt is set."""
+    image_key: Optional[str] = None
+    """The dataset dictionary key used for the images."""
     prompt_key: Optional[str] = None
     """The prompt sentence to be added to the input sentence. Must not be set when prompt_key is set."""
     prompt: Optional[str] = None
@@ -75,6 +81,20 @@ class DatasetConfig(BaseModel):
             f"{req.keys()}")
         return req[self.input_key]
 
+    def get_images(self, req):
+        """Get the images from the given request."""
+        image_keys = [self.image_key
+                      ] + [f"{self.image_key}_{i}" for i in range(1, 8)]
+        assert any(key in req for key in image_keys), (
+            f"Dataset {self.name} does not have key '{self.image_key}'. "
+            "Please set --dataset-image-key to one of the available keys: "
+            f"{req.keys()}")
+        images = []
+        for key in image_keys:
+            if key in req and req[key] is not None:
+                images.append(req[key])
+        return images
+
     def get_output(self, req):
         """Get the output sentence from the given request."""
         if self.output_key is None:
@@ -105,7 +125,8 @@ def load_dataset_from_hf(dataset_config: DatasetConfig):
         dataset = iter(
             load_dataset(*dataset_config.query,
                          split=dataset_config.split,
-                         streaming=True))
+                         streaming=True,
+                         trust_remote_code=True))
     except ValueError as e:
         if "Config" in e:
             e += "\n Please add the config name to the dataset config yaml."
@@ -130,9 +151,12 @@ def load_dataset_from_hf(dataset_config: DatasetConfig):
               required=True,
               help=f"Split of the dataset to use.")
 @click.option("--dataset-input-key",
-              required=True,
               type=str,
               help=f"The dataset dictionary key for input.")
+@click.option("--dataset-image-key",
+              type=str,
+              default="image",
+              help=f"The dataset dictionary key for images.")
 @click.option("--dataset-prompt-key",
               type=str,
               default=None,
@@ -181,21 +205,54 @@ def dataset(root_args, **kwargs):
     output_lens = []
     task_ids = []
     req_cnt = 0
+    modality = None
+    multimodal_texts = []
+    multimodal_image_paths = []
     for req in load_dataset_from_hf(dataset_config):
-        # input
-        prompt = dataset_config.get_prompt(
-            req) + ' ' + dataset_config.get_input(req)
-        logging.debug(f"Input sequence: {prompt}")
-        line = root_args.tokenizer.encode(prompt)
-        if kwargs['max_input_len'] and len(line) > kwargs['max_input_len']:
-            continue
-        input_ids.append(line)
-        input_lens.append(len(line))
+        if any(key in req for key in ['image', 'image_1', 'video']):
+            # multimodal input
+            if 'video' in req and req['video'] is not None:
+                assert "Not supported yet"
+            assert kwargs['output_len_dist'] is not None, (
+                "Output length distribution must be set for multimodal requests."
+            )
+            modality = 'image'
+            text = dataset_config.get_prompt(req)
+            images = dataset_config.get_images(req)
+            image_paths = []
+            for image in images:
+                if image is not None:
+                    if isinstance(image, str):
+                        image_paths.append(image)
+                    elif isinstance(image, Image.Image):
+                        with tempfile.NamedTemporaryFile(
+                                suffix=".jpg", delete=False) as tmp_file:
+                            logging.debug(f"Saving image to {tmp_file.name}")
+                            image = image.convert("RGB")
+                            image.save(tmp_file, "JPEG")
+                            filepath = tmp_file.name
+                            image_paths.append(filepath)
+                    else:
+                        raise ValueError(f"Invalid image path: {image}")
+            multimodal_texts.append(text)
+            multimodal_image_paths.append(image_paths)
+        else:
+            # text input
+            prompt = dataset_config.get_prompt(
+                req) + ' ' + dataset_config.get_input(req)
+            logging.debug(f"Input sequence: {prompt}")
+            line = root_args.tokenizer.encode(prompt)
+            if kwargs['max_input_len'] and len(line) > kwargs['max_input_len']:
+                continue
+            input_ids.append(line)
+            input_lens.append(len(line))
 
-        # output if fetch from golden
-        if kwargs['output_len_dist'] is None:
-            output_lens.append(
-                len(root_args.tokenizer.encode(dataset_config.get_output(req))))
+            # output if fetch from golden
+            if kwargs['output_len_dist'] is None:
+                output_lens.append(
+                    len(
+                        root_args.tokenizer.encode(
+                            dataset_config.get_output(req))))
 
         # lora task id
         task_id = root_args.task_id
@@ -208,30 +265,53 @@ def dataset(root_args, **kwargs):
         if kwargs['num_requests'] and req_cnt >= kwargs['num_requests']:
             break
 
-    if kwargs['num_requests'] and len(input_ids) < kwargs['num_requests']:
+    if kwargs['num_requests'] and (len(input_ids) if modality is None else len(
+            multimodal_texts)) < kwargs['num_requests']:
         logging.warning(
-            "Number of requests is smaller than the num-requests user set.")
+            f"Number of requests={len(input_ids) if modality is None else len(multimodal_texts)} is"
+            f" smaller than the num-requests user set={kwargs['num_requests']}."
+        )
 
     # output if randomized
     if kwargs['output_len_dist'] is not None:
         osl_mean, osl_stdev = kwargs['output_len_dist']
-        output_lens = get_norm_dist_lengths(osl_mean, osl_stdev, len(input_ids),
-                                            root_args.random_seed)
-
+        output_lens = get_norm_dist_lengths(
+            osl_mean, osl_stdev,
+            len(input_ids) if modality is None else len(multimodal_texts),
+            root_args.random_seed)
     logging.debug(f"Input lengths: {[len(i) for i in input_ids]}")
     logging.debug(f"Output lengths: {output_lens}")
+    if modality is not None:
+        logging.debug(f"Modality: {modality}")
 
-    if not root_args.std_out:
-        dataset_dump(
-            input_lens, input_ids, output_lens, task_ids, {
-                "workload_type": "dataset",
-                "tokenizer": root_args.tokenizer.__class__.__name__,
-                "num_requests": len(input_ids),
-                "max_input_len": max(input_lens),
-                "max_output_len": max(output_lens)
-            }, root_args.output)
+    if modality is not None:
+        if not root_args.std_out:
+            multimodal_dataset_dump(
+                multimodal_texts, multimodal_image_paths, output_lens, task_ids,
+                {
+                    "workload_type": "dataset",
+                    "tokenizer": root_args.tokenizer.__class__.__name__,
+                    "num_requests": len(task_ids),
+                    "max_output_len": max(output_lens)
+                }, root_args.output)
+        else:
+            print_multimodal_dataset(
+                multimodal_texts,
+                multimodal_image_paths,
+                output_lens,
+            )
     else:
-        print_dataset(
-            input_ids,
-            output_lens,
-        )
+        if not root_args.std_out:
+            text_dataset_dump(
+                input_lens, input_ids, output_lens, task_ids, {
+                    "workload_type": "dataset",
+                    "tokenizer": root_args.tokenizer.__class__.__name__,
+                    "num_requests": len(input_ids),
+                    "max_input_len": max(input_lens),
+                    "max_output_len": max(output_lens)
+                }, root_args.output)
+        else:
+            print_text_dataset(
+                input_ids,
+                output_lens,
+            )

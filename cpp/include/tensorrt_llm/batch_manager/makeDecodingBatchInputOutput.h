@@ -19,6 +19,7 @@
 
 #include "common.h"
 #include "tensorrt_llm/common/algorithm.h"
+#include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iGptDecoderBatched.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
@@ -30,11 +31,19 @@ class DecoderBuffers;
 class RuntimeBuffers;
 } // namespace tensorrt_llm::batch_manager
 
+namespace tensorrt_llm::runtime::decoder
+{
+class DecoderState;
+} // namespace tensorrt_llm::runtime::decoder
+
 namespace tensorrt_llm::batch_manager
 {
 class MakeDecodingBatchInputOutput : Algorithm
 {
 public:
+    template <typename T>
+    using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
+
     constexpr static auto name{"MakeDecodingBatchInputOutput"};
 
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -44,9 +53,15 @@ public:
 
     std::tuple<std::unique_ptr<runtime::decoder_batch::Input>, std::unique_ptr<runtime::decoder_batch::Output>>
     operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
-        DecoderBuffers& decoderBuffers, RuntimeBuffers const& fusedRuntimeBuffers,
-        DecoderInputBuffers const& inputBuffers, runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences,
-        SizeType32 beamWidth, runtime::BufferManager const& manager, runtime::CudaStream const& stream) const;
+        DecoderBuffers& decoderBuffers, DecoderInputBuffers const& inputBuffers,
+        runtime::decoder::DecoderState& decoderState, runtime::ModelConfig const& modelConfig,
+        SizeType32 maxNumSequences, SizeType32 beamWidth, bool isTrtOverlap, runtime::BufferManager const& manager,
+        runtime::CudaStream const& stream, OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const;
+
+    [[nodiscard]] static std::unique_ptr<runtime::decoder_batch::Input> createDecoderBatchInputs(
+        std::vector<SizeType32> const& activeSlots, runtime::decoder::DecoderState const& decoderState,
+        std::vector<TensorPtr> const& logits, SizeType32 maxNumSequences, std::vector<TensorPtr> const& batchSlots,
+        TensorPtr const& cacheIndirectionInput);
 };
 
 } // namespace tensorrt_llm::batch_manager

@@ -21,6 +21,8 @@
 #include <cstddef>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
+#include <string>
 
 namespace tensorrt_llm::common
 {
@@ -46,6 +48,16 @@ std::optional<size_t> getUInt64Env(char const* name)
     size_t const val = std::stoull(env);
     return {val};
 };
+
+std::optional<std::string> getStrEnv(char const* name)
+{
+    char const* const env = std::getenv(name);
+    if (env == nullptr)
+    {
+        return std::nullopt;
+    }
+    return std::string(env);
+}
 
 // Returns true if the env variable exists and is set to "1"
 static bool getBoolEnv(char const* name)
@@ -217,6 +229,12 @@ int getEnvMmhaKernelBlockSize()
     return mmhaKernelBlockSize;
 }
 
+bool getEnvUseTileSizeKv64ForTrtllmGen()
+{
+    static bool const useTileSizeKv64 = getBoolEnv("TRTLLM_GEN_ENABLE_TILE_SIZE_KV64");
+    return useTileSizeKv64;
+}
+
 bool getEnvEnablePDL()
 {
     static std::once_flag flag;
@@ -275,10 +293,10 @@ bool getEnvParallelCacheSend()
     return parallelCacheSend;
 }
 
-bool getEnvRequestKVCacheSerial()
+bool getEnvRequestKVCacheConcurrent()
 {
-    static bool const requestKVCacheSerial = getBoolEnv("TRTLLM_REQUEST_KV_CACHE_SERIAL");
-    return requestKVCacheSerial;
+    static bool const requestKVCacheConcurrent = getBoolEnv("TRTLLM_REQUEST_KV_CACHE_CONCURRENT");
+    return requestKVCacheConcurrent;
 }
 
 bool getEnvDisableKVCacheTransferOverlap()
@@ -287,10 +305,10 @@ bool getEnvDisableKVCacheTransferOverlap()
     return disableKVCacheTransferOverlap;
 }
 
-bool getEnvDisableReceiveKVCacheParallel()
+bool getEnvEnableReceiveKVCacheParallel()
 {
-    static bool const disableReceiveParallel = getBoolEnv("TRTLLM_DISABLE_KVCACHE_RECEIVE_PARALLEL");
-    return disableReceiveParallel;
+    static bool const enableReceiveParallel = getBoolEnv("TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL");
+    return enableReceiveParallel;
 }
 
 bool getEnvTryZCopyForKVCacheTransfer()
@@ -331,6 +349,12 @@ size_t getEnvAllReduceWorkspaceSize()
     return workspaceSize;
 }
 
+std::string getEnvKVCacheTransferOutputPath()
+{
+    static std::string outputPath = getStrEnv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH").value_or("");
+    return outputPath;
+}
+
 bool getEnvKVCacheTransferUseAsyncBuffer()
 {
 
@@ -341,8 +365,14 @@ bool getEnvKVCacheTransferUseAsyncBuffer()
 size_t getEnvKVCacheSendMaxConcurrenceNum()
 {
 
-    static size_t const maxConcurrenceNum = getUInt64Env("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM").value_or(4);
+    static size_t const maxConcurrenceNum = getUInt64Env("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM").value_or(2);
     return maxConcurrenceNum;
+}
+
+size_t getEnvKVCacheRecvBufferCount()
+{
+    static size_t const recvBufferCount = getUInt64Env("TRTLLM_KVCACHE_RECV_BUFFER_COUNT").value_or(2);
+    return recvBufferCount;
 }
 
 size_t getEnvMemSizeForKVCacheTransferBuffer()
@@ -357,6 +387,10 @@ size_t getEnvMemSizeForKVCacheTransferBuffer()
             if (memSizeForKVCacheTransferBufferEnv)
             {
                 memSizeForKVCacheTransferBuffer = parseMemorySize(memSizeForKVCacheTransferBufferEnv);
+            }
+            else
+            {
+                memSizeForKVCacheTransferBuffer = parseMemorySize("512MB");
             }
         });
 

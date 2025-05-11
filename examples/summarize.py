@@ -24,8 +24,8 @@ import torch
 from datasets import load_dataset
 from transformers import (AutoModel, AutoModelForCausalLM,
                           AutoModelForSeq2SeqLM, GenerationConfig)
-from utils import (DEFAULT_HF_MODEL_DIRS, add_common_args, load_tokenizer,
-                   read_model_name, supports_inflight_batching)
+from utils import (DEFAULT_HF_MODEL_DIRS, add_common_args, get_beam_width_array,
+                   load_tokenizer, read_model_name, supports_inflight_batching)
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
@@ -42,12 +42,23 @@ from prompt_lookup.run_dtm_pld import run_dtm_pld
 
 
 def main(args):
+    is_integration_test = os.getenv('INTEGRATION_TEST', '0') == '1'
+    if is_integration_test:
+        logger.info(
+            "Running in integration test mode - will only run one batch and skip accuracy checks"
+        )
+        logger.info(
+            "Setting max_ite=1 and check_accuracy=False for integration test")
+        args.max_ite = 1
+        args.check_accuracy = False
+
     runtime_rank = tensorrt_llm.mpi_rank()
     logger.set_level(args.log_level)
 
     test_hf = args.test_hf and runtime_rank == 0  # only run hf on rank 0
     test_trt_llm = args.test_trt_llm
-    model_name, model_version = read_model_name(args.engine_dir)
+    model_name, model_version = read_model_name(
+        args.engine_dir if not test_hf else args.hf_model_dir, test_hf)
     if args.hf_model_dir is None:
         logger.warning(
             "hf_model_dir is not specified. Try to infer from model_name, but this may be incorrect."
@@ -110,7 +121,9 @@ def main(args):
     dataset = load_dataset(dataset_name,
                            dataset_revision,
                            cache_dir=args.dataset_cache_dir,
-                           split=dataset_split)
+                           split=dataset_split,
+                           trust_remote_code=True)
+    dataset = dataset.shuffle(args.random_seed)
 
     max_batch_size = args.batch_size
 
@@ -142,6 +155,11 @@ def main(args):
         bad_words_list = tensorrt_llm.runtime.decode_words_list(
             args.bad_words, tokenizer)
 
+    if args.beam_width_array is not None:
+        logger.info("Use Variable-Beam-Width-Search")
+        args.beam_width_array, args.num_beams = get_beam_width_array(
+            args.beam_width_array)
+
     num_beams = args.num_beams
     num_return_sequences = args.num_return_sequences
     num_sequences = args.num_return_sequences or num_beams
@@ -150,6 +168,7 @@ def main(args):
     temperature = args.temperature
     length_penalty = args.length_penalty
     early_stopping = args.early_stopping
+    beam_width_array = args.beam_width_array
     repetition_penalty = args.repetition_penalty
     presence_penalty = args.presence_penalty
     frequency_penalty = args.frequency_penalty
@@ -168,7 +187,6 @@ def main(args):
                 f.write(f'Model path: {args.hf_model_dir}\n')
                 f.write(f'Tokenizer path: {args.tokenizer_dir}\n')
 
-    # TODO: Add random_seed flag in gptj
     rouge_dir = args.rouge_dir if args.rouge_dir and os.path.exists(
         args.rouge_dir) else "rouge"
     metric_tensorrt_llm = [
@@ -280,6 +298,7 @@ def main(args):
                     num_return_sequences=num_return_sequences,
                     length_penalty=length_penalty,
                     early_stopping=early_stopping,
+                    beam_width_array=beam_width_array,
                     repetition_penalty=repetition_penalty,
                     presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty,
@@ -528,7 +547,8 @@ def main(args):
                 enable_chunked_context=args.enable_chunked_context,
                 multi_block_mode=args.multi_block_mode,
                 cuda_graph_mode=args.cuda_graph_mode,
-                gather_generation_logits=args.eval_ppl)
+                gather_generation_logits=args.eval_ppl,
+                use_gpu_direct_storage=args.use_gpu_direct_storage)
         runner_kwargs.update(
             enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
         if args.prompt_lookup_config is not None:
@@ -549,10 +569,10 @@ def main(args):
         if runtime_rank == 0 and args.eval_task != "eval_context_ppl":
             logger.info(
                 "---------------------------------------------------------")
-            logger.info("TensorRT-LLM Generated : ")
-            logger.info(f" Input : {datapoint[dataset_input_key]}")
-            logger.info(f"\n Reference : {datapoint[dataset_output_key]}")
-            logger.info(f"\n Output : {output}")
+            logger.info("TensorRT-LLM Generated: ")
+            logger.info(f" Input: {datapoint[dataset_input_key]}")
+            logger.info(f"\n Reference: {datapoint[dataset_output_key]}")
+            logger.info(f"\n Output: {output}")
             logger.info(
                 "---------------------------------------------------------")
 
@@ -609,9 +629,9 @@ def main(args):
                                 )
 
                 logger.debug('-' * 100)
-                logger.debug(f"Input : {datapoint[dataset_input_key]}")
+                logger.debug(f"Input: {datapoint[dataset_input_key]}")
                 logger.debug(f'TensorRT-LLM Output: {output_tensorrt_llm}')
-                logger.debug(f"Reference : {datapoint[dataset_output_key]}")
+                logger.debug(f"Reference: {datapoint[dataset_output_key]}")
 
             data_point_idx += max_batch_size
             ite_count += 1
@@ -666,10 +686,10 @@ def main(args):
         if runtime_rank == 0 and args.eval_task != "eval_context_ppl":
             logger.info(
                 "---------------------------------------------------------")
-            logger.info("HF Generated : ")
-            logger.info(f" Input : {datapoint[dataset_input_key]}")
-            logger.info(f"\n Reference : {datapoint[dataset_output_key]}")
-            logger.info(f"\n Output : {output}")
+            logger.info("HF Generated: ")
+            logger.info(f" Input: {datapoint[dataset_input_key]}")
+            logger.info(f"\n Reference: {datapoint[dataset_output_key]}")
+            logger.info(f"\n Output: {output}")
             logger.info(
                 "---------------------------------------------------------")
 
@@ -722,9 +742,9 @@ def main(args):
                                 )
 
                 logger.debug('-' * 100)
-                logger.debug(f"Input : {datapoint[dataset_input_key]}")
+                logger.debug(f"Input: {datapoint[dataset_input_key]}")
                 logger.debug(f'HF Output: {output_hf}')
-                logger.debug(f"Reference : {datapoint[dataset_output_key]}")
+                logger.debug(f"Reference: {datapoint[dataset_output_key]}")
 
             data_point_idx += max_batch_size
             ite_count += 1
@@ -746,12 +766,30 @@ def main(args):
             for beam_idx in range(num_sequences):
                 logger.info(f"TensorRT-LLM beam {beam_idx} result")
                 if args.eval_task != "eval_context_ppl":
-                    computed_metrics_tensorrt_llm = metric_tensorrt_llm[
-                        beam_idx].compute()
-                    for key in computed_metrics_tensorrt_llm.keys():
-                        logger.info(
-                            f'  {key} : {computed_metrics_tensorrt_llm[key]*100}'
-                        )
+                    if args.estimate_accuracy_std_dev:
+                        computed_metrics_tensorrt_llm = metric_tensorrt_llm[
+                            beam_idx].compute(use_aggregator=False)
+                        computed_std_dev_tensorrt_llm = {
+                            key: np.std(scores)
+                            for key, scores in
+                            computed_metrics_tensorrt_llm.items()
+                        }
+                        computed_metrics_tensorrt_llm = {
+                            key: np.mean(scores)
+                            for key, scores in
+                            computed_metrics_tensorrt_llm.items()
+                        }
+                        for key in computed_metrics_tensorrt_llm.keys():
+                            logger.info(
+                                f"  {key}: {computed_metrics_tensorrt_llm[key]*100} ({computed_std_dev_tensorrt_llm[key]*100})"
+                            )
+                    else:
+                        computed_metrics_tensorrt_llm = metric_tensorrt_llm[
+                            beam_idx].compute()
+                        for key in computed_metrics_tensorrt_llm.keys():
+                            logger.info(
+                                f"  {key}: {computed_metrics_tensorrt_llm[key]*100}"
+                            )
                     if args.check_accuracy and beam_idx == 0:
                         rouge1 = computed_metrics_tensorrt_llm['rouge1'] * 100
                         assert rouge1 > args.tensorrt_llm_rouge1_threshold, f"[FAILED] rouge1 ({rouge1}) is smaller than threshold ({args.tensorrt_llm_rouge1_threshold})."
@@ -779,7 +817,7 @@ def main(args):
                 computed_metrics_hf = metric_hf[beam_idx].compute()
                 if args.eval_task != "eval_context_ppl":
                     for key in computed_metrics_hf.keys():
-                        logger.info(f'  {key} : {computed_metrics_hf[key]*100}')
+                        logger.info(f'  {key}: {computed_metrics_hf[key]*100}')
                 if args.eval_ppl and args.batch_size == 1:
                     logger.info(
                         f"  Per-token perplexity: {np.mean(ppls_hf[beam_idx])}")
@@ -798,6 +836,7 @@ if __name__ == '__main__':
                             'eval_context_ppl'
                         ])
     parser.add_argument('--check_accuracy', action='store_true')
+    parser.add_argument('--estimate_accuracy_std_dev', action='store_true')
     parser.add_argument('--tensorrt_llm_rouge1_threshold',
                         type=float,
                         default=15.0)
@@ -840,6 +879,10 @@ if __name__ == '__main__':
         help=
         "evaluate.load('rouge') will attempt to pull rouge package from HF. Use cached rouge can avoid network outage of host or HF."
     )
+    parser.add_argument("--use_gpu_direct_storage",
+                        default=False,
+                        action="store_true",
+                        help="Use GPUDirect Storage (GDS) to load the engine")
     parser = add_common_args(parser)
     args = parser.parse_args()
 

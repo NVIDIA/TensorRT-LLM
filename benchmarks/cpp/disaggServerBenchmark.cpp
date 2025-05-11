@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/batch_manager/GptManager.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/disaggServerUtil.h"
@@ -23,6 +22,7 @@
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/generationConfig.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -83,6 +83,7 @@ public:
         mContextReqQueuingLatency.mDataTimes.clear();
         mGenReqQueuingLatency.mDataTimes.clear();
         mGenReqKvCacheTransferLatency.mDataTimes.clear();
+        mKvCacheThroughput.mDataTps.clear();
     }
 
     void finalize()
@@ -106,6 +107,11 @@ public:
     {
         mGenReqKvCacheTransferLatency.mDataTimes.insert(
             mGenReqKvCacheTransferLatency.mDataTimes.end(), latencies.begin(), latencies.end());
+    }
+
+    void recordKvCacheThroughput(std::vector<float> const& throughputs)
+    {
+        mKvCacheThroughput.mDataTps.insert(mKvCacheThroughput.mDataTps.end(), throughputs.begin(), throughputs.end());
     }
 
     void recordContextStart(SizeType32 inputLength, SizeType32 maxNewTokens, uint64_t requestId,
@@ -334,6 +340,7 @@ public:
         if (mCalculateKVCacheTransferTime)
         {
             mGenReqKvCacheTransferLatency.calculate();
+            mKvCacheThroughput.calculate();
         }
     }
 
@@ -369,6 +376,7 @@ public:
         if (mCalculateKVCacheTransferTime)
         {
             mGenReqKvCacheTransferLatency.report();
+            mKvCacheThroughput.report();
         }
     }
 
@@ -405,6 +413,9 @@ public:
                 auto genReqKVCacheTransferHeader = mGenReqKvCacheTransferLatency.genHeaders();
                 headers.insert(headers.end(), std::make_move_iterator(genReqKVCacheTransferHeader.begin()),
                     std::make_move_iterator(genReqKVCacheTransferHeader.end()));
+                auto kvCacheTpHeader = mKvCacheThroughput.genHeaders();
+                headers.insert(headers.end(), std::make_move_iterator(kvCacheTpHeader.begin()),
+                    std::make_move_iterator(kvCacheTpHeader.end()));
             }
 
             std::ofstream outputFile(mOpCsvFile);
@@ -428,7 +439,7 @@ public:
                 }
                 if (mCalculateKVCacheTransferTime)
                 {
-                    outputFile << "," << mGenReqKvCacheTransferLatency;
+                    outputFile << "," << mGenReqKvCacheTransferLatency << "," << mKvCacheThroughput;
                 }
 
                 outputFile << "\n";
@@ -491,6 +502,8 @@ private:
     RecordTimeMetric mGenReqQueuingLatency{"gen_req_queueing_latency"};
     RecordTimeMetric mGenReqKvCacheTransferLatency{"gen_req_kv_cache_transfer_latency"};
 
+    RecordBwMetric mKvCacheThroughput{"gen_req_kv_cache_transfer_throughput"};
+
     float mTokenThroughput{};
     float mAcceptanceRate{};
 
@@ -522,6 +535,7 @@ texec::Request makeExecutorContextRequest(Sample const& sample, SizeType32 const
             std::nullopt,    // embeddingBias
             std::nullopt,    // speculativeDecoding
             std::nullopt,    // pTuning
+            std::nullopt,    // multimodalEmbedding
             std::nullopt,    // mRopeConfig
             loraConfig,      // loraConfig
             lookaheadConfig, // lookaheadConfig
@@ -860,24 +874,31 @@ public:
 
             if (mEnableCollectKvCacheTransferTime)
             {
-
                 for (std::size_t i = 0; i < generationRequestStatsPerIteration.size(); i++)
                 {
                     auto const& stats = generationRequestStatsPerIteration.at(i);
                     for (auto const& stat : stats)
                     {
                         std::vector<float> kvCacheTransferMs;
+                        std::vector<float> kvCacheThroughput;
                         for (auto const& requestStat : stat.requestStats)
                         {
                             if (requestStat.stage == tensorrt_llm::executor::RequestStage::kGENERATION_COMPLETE)
                             {
                                 kvCacheTransferMs.push_back(
                                     static_cast<float>(requestStat.disServingStats->kvCacheTransferMS));
+                                kvCacheThroughput.push_back(static_cast<float>(requestStat.disServingStats->kvCacheSize)
+                                    * 8 / (static_cast<float>(requestStat.disServingStats->kvCacheTransferMS) / 1000)
+                                    / 1e9f);
                             }
                         }
                         if (kvCacheTransferMs.size() > 0)
                         {
                             mRecorder->recordKvCacheTransferLatency(kvCacheTransferMs);
+                        }
+                        if (kvCacheThroughput.size() > 0)
+                        {
+                            mRecorder->recordKvCacheThroughput(kvCacheThroughput);
                         }
                         if (mLogIterationData)
                         {

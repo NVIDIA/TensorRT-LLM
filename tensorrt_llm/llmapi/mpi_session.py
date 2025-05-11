@@ -1,12 +1,22 @@
 import abc
+import itertools
+import os
 import socket
 import sys
+import threading
 import time
+import traceback
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import List, Optional, TypeVar
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
+
+import zmq
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.logger import logger
+
+from .._utils import global_mpi_rank, mpi_barrier, mpi_rank
+from .utils import print_colored, print_colored_debug
 
 if ENABLE_MULTI_DEVICE:
     import mpi4py
@@ -49,9 +59,9 @@ def external_mpi_comm_available(model_world_size: int) -> bool:
     e.g. mpirun -np 4 python script.py
     '''
     if ENABLE_MULTI_DEVICE:
-        return (mpi_world_size() == model_world_size
+        return (get_mpi_world_size() == model_world_size
                 and model_world_size > 1) or (global_mpi_size()
-                                              > mpi_world_size())
+                                              > get_mpi_world_size())
     else:
         return False
 
@@ -59,7 +69,7 @@ def external_mpi_comm_available(model_world_size: int) -> bool:
 def need_spawn_mpi_workers(model_world_size: int) -> bool:
     ''' Check if the current process needs to spawn MPI workers. '''
     if ENABLE_MULTI_DEVICE:
-        return mpi_world_size() == 1 and model_world_size > 1
+        return get_mpi_world_size() == 1 and model_world_size > 1
     else:
         return False
 
@@ -83,8 +93,40 @@ class MpiSession(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def shutdown(self):
+    def shutdown(self, wait=True):
         raise NotImplementedError()
+
+    @abc.abstractmethod
+    def abort(self):
+        raise NotImplementedError()
+
+    def is_comm_session(self) -> bool:
+        return isinstance(self, (MpiCommSession, RemoteMpiCommSessionClient))
+
+    def _abort_on_timeout(self, fut: Future, timeout: float, reason=None):
+        try:
+            fut.result(timeout=timeout)
+        except TimeoutError:
+            logger.critical("MpiSession shutdown timeout, aborting...")
+            if reason is not None:
+                logger.info(f"Reason to shutdown: {repr(reason)}")
+            self.abort()
+
+    def shutdown_abort(self, grace: float = 60, reason=None):
+        if sys.is_finalizing():
+            # cannot start thread at interpreter shutdown
+            # simply don't wait to avoid hang
+            return self.shutdown(wait=False)
+
+        fut = Future()
+        killer = threading.Thread(group=None,
+                                  target=self._abort_on_timeout,
+                                  name="MpiSessionTimeoutKiller",
+                                  args=(fut, grace, reason))
+        killer.start()
+        self.shutdown()
+        fut.set_result(None)
+        killer.join()
 
 
 class MpiPoolSession(MpiSession):
@@ -113,10 +155,13 @@ class MpiPoolSession(MpiSession):
         ]
         return [future.result() for future in futures]
 
-    def shutdown(self):
+    def shutdown(self, wait=True):
         if self.mpi_pool is not None:
-            self.mpi_pool.shutdown(wait=False)
+            self.mpi_pool.shutdown(wait=wait)
             self.mpi_pool = None
+
+    def abort(self):
+        self.get_comm().Abort(1)
 
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
@@ -125,7 +170,7 @@ class MpiPoolSession(MpiSession):
                                         path=sys.path)
 
     def __del__(self):
-        self.shutdown()
+        self.shutdown_abort()
 
     def __reduce__(self):
         raise TypeError('cannot pickle MPI session')
@@ -134,7 +179,13 @@ class MpiPoolSession(MpiSession):
 class MpiCommSession(MpiSession):
 
     def __init__(self, comm=None, n_workers: int = 1):
+        if not external_mpi_comm_available(n_workers):
+            raise RuntimeError('The LLM instance should be launched by mpirun.')
+
         self.comm = comm
+        self.n_workers = n_workers
+        self.thread_pool: Optional[ThreadPoolExecutor] = None
+        self.mpi_pool: Optional[MPIPoolExecutor] = None
 
         if n_workers <= 0:
             raise ValueError(
@@ -151,63 +202,46 @@ class MpiCommSession(MpiSession):
 
             if self.comm.Get_size() != n_workers:
                 raise ValueError(
-                    f'n_workers must be equal to the number of processes , got {n_workers} vs {mpi_world_size()}'
+                    f'n_workers must be equal to the number of processes in MPI, got {n_workers} vs {get_mpi_world_size()}'
                 )
 
-        self.n_workers = n_workers
-        self.thread_pool: Optional[ThreadPoolExecutor] = None
-        self.mpi_pool: Optional[MPIPoolExecutor] = None
-
         self._start_mpi_pool()
-
-        if not external_mpi_comm_available(n_workers):
-            raise RuntimeError('The LLM instance should be launched by mpirun.')
 
     def get_comm(self):
         return self.comm
 
-    def submit(self,
-               task: (...),
-               rank0_extra_kwargs: Optional[dict] = None,
-               *args,
-               **kwargs) -> List[Future]:
+    def submit(self, task: Callable[..., T], *args,
+               **kwargs) -> List[Future[T]]:
         ''' Submit a task to MPI workers.
 
         Args:
             task: The task to be submitted.
-            rank0_extra_kwargs: Extra keyword arguments for rank0 task.
             args: Positional arguments for the task.
             kwargs: Keyword arguments for the task.
         '''
         assert self.mpi_pool is not None, 'MPI session not started'
-        # Trick: The MPICommExecutor excludes rank0 from workers, thus an extra
-        # task dispatching to rank0 is needed
-        rank0_extra_kwargs = rank0_extra_kwargs or {}
-
-        rank0_params = kwargs.copy()
-        if rank0_extra_kwargs:
-            rank0_params.update(rank0_extra_kwargs)
-
         worker_futures = [
             self.mpi_pool.submit(task, *args, **kwargs)
             for i in range(self.n_workers - 1)
         ]
 
-        # A trick to wait for rank0 to be ready, or the collective tasks will hang
-        # TODO[chunweiy]: Remove this trick
-        time.sleep(10)
-
-        rank0_future = self.thread_pool.submit(task, *args, **rank0_params)
+        rank0_future = self.thread_pool.submit(task, *args, **kwargs)
         return [rank0_future] + worker_futures
 
     def submit_sync(self, task: Callable[..., T], *args, **kwargs) -> List[T]:
         futures = self.submit(task, *args, **kwargs)
         return [future.result() for future in futures]
 
-    def shutdown(self):
+    def shutdown(self, wait=True):
         if self.mpi_pool is not None:
-            self.mpi_pool.shutdown(wait=False)
+            self.mpi_pool.shutdown(wait=wait)
             self.mpi_pool = None
+        if self.thread_pool is not None:
+            self.thread_pool.shutdown(wait=wait)
+            self.thread_pool = None
+
+    def abort(self):
+        self.get_comm().Abort(1)
 
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
@@ -217,13 +251,262 @@ class MpiCommSession(MpiSession):
         self.mpi_pool = comm_executor.__enter__()
 
     def __del__(self):
-        self.shutdown()
+        self.shutdown_abort()
 
     def __reduce__(self):
         raise TypeError('cannot pickle MPI session')
+
+
+class RemoteTask(NamedTuple):
+    task: Callable[..., T]
+    args: Tuple[Any, ...]
+    kwargs: Dict[str, Any]
+    sync: bool = False  # if True, the result will be sent back to the client
+
+
+class RemoteMpiCommSessionClient(MpiSession):
+    '''
+    RemoteMpiCommSessionClient is a variant of MpiCommSession that is used to connect to a remote MPI pool.
+    '''
+
+    def __init__(self, addr: str, hmac_key: Optional[bytes] = None):
+        # FIXME: this is a hack to avoid circular import, resolve later
+        from tensorrt_llm.executor.ipc import ZeroMqQueue
+        self.addr = addr
+        print_colored_debug(
+            f"RemoteMpiCommSessionClient connecting to {addr}\n", "yellow")
+        self.queue = ZeroMqQueue((addr, hmac_key),
+                                 is_server=False,
+                                 use_hmac_encryption=bool(hmac_key))
+        self._is_shutdown = False
+
+    def submit(self,
+               task: Callable[..., T],
+               *args,
+               sync: bool = False,
+               **kwargs) -> list:
+        ''' Submit a task to the remote MPI pool. '''
+        if self._is_shutdown:
+            print_colored_debug(
+                "RemoteMpiCommSessionClient is already shut down\n", "yellow")
+            return []
+        print_colored_debug(
+            f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] sending task {task} to {self.addr}\n",
+            "yellow")
+        self.queue.put(RemoteTask(task, args, kwargs, sync=sync))
+        return []
+
+    SYNC_IDLE_INTERVAL = 8
+
+    def submit_sync(self, task, *args, **kwargs) -> List[T]:
+        ''' Submit a task to the remote MPI pool and wait for task completion. '''
+        self.submit(task, *args, sync=True, **kwargs)
+
+        while not ((res := self.poll()) or self._is_shutdown):
+            print_colored_debug(f"Waiting for task completion... {res}\n",
+                                "grey")
+            time.sleep(self.SYNC_IDLE_INTERVAL)
+
+        print_colored_debug(
+            f"rank{global_mpi_rank()} RemoteMpiCommSessionClient.send_sync received results: {res}\n",
+            "green")
+
+        if not res:
+            raise RuntimeError(
+                "RemoteMpiCommSessionClient received unexpected response")
+        return res
+
+    def poll(self) -> bool:
+        ''' Poll the queue for a response.
+        Returns:
+            True if a response is received, False otherwise.
+        '''
+        if self._is_shutdown:
+            return False
+        response = self.queue.poll(0.1)
+        if response:
+            return self.queue.get()  # should get a True if success
+        return False
+
+    def shutdown(self, wait=True):
+        if self._is_shutdown:
+            return
+
+        try:
+            print_colored_debug(
+                f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] send shutdown signal to server\n",
+                "green")
+            self.queue.put(None)  # ask RemoteMpiCommSessionServer to shutdown
+        except zmq.error.ZMQError as e:
+            print_colored_debug(
+                f"Error during RemoteMpiCommSessionClient shutdown: {e}\n",
+                "red")
+        finally:
+            self._is_shutdown = True
+
+    def abort(self):
+        self.shutdown()
+
+
+class RemoteMpiCommSessionServer():
+    '''
+    RemoteMpiCommSessionServer is a variant of MpiCommSession that is used to create a remote MPI pool.
+    '''
+
+    def __init__(self,
+                 n_workers: int = 0,
+                 addr: str = f'tcp://127.0.0.1:*',
+                 hmac_key: Optional[bytes] = None,
+                 comm=None,
+                 is_comm: bool = False):
+        # FIXME: this is a hack to avoid circular import, resolve later
+        from tensorrt_llm.executor.ipc import ZeroMqQueue
+        self.addr = addr
+        self.queue = ZeroMqQueue((addr, hmac_key),
+                                 is_server=True,
+                                 use_hmac_encryption=bool(hmac_key))
+        self.comm = comm
+        self.results = []  # the results may arrive in any order
+
+        if self.comm is not None:
+            self.session = MpiCommSession(n_workers=self.comm.Get_size(),
+                                          comm=self.comm)
+        else:
+            self.session = MpiCommSession(
+                n_workers=n_workers) if is_comm else MpiPoolSession(
+                    n_workers=n_workers)
+
+    @staticmethod
+    def task_wrapper(task: Callable[..., T], *args, **kwargs) -> T:
+        print_colored_debug(
+            f"MpiCommSession rank{mpi_rank()} with world_size {mpi_world_size()}\n",
+            "green")
+        print_colored_debug(
+            f"MpiCommSession rank{mpi_rank()} start task [{task}] with args: {args} and kwargs: {kwargs}\n",
+            "green")
+
+        # wait for all ranks to start the task
+        mpi_barrier()
+
+        try:
+            return task(*args, **kwargs)
+        except Exception as e:
+            print_colored(
+                f"MpiCommSession rank{mpi_rank()} task [{task}] failed with exception: {e}\n",
+                "red")
+            traceback.print_exc()
+            raise e
+        finally:
+            print_colored_debug(
+                f"MpiCommSession rank{mpi_rank()} task [{task}] finished\n",
+                "green")
+            mpi_barrier()
+
+    def serve(self):
+        print_colored_debug(
+            f"RemoteMpiCommSessionServer listening on {self.addr}\n", "yellow")
+        while True:
+            message: Optional[RemoteTask] = self.queue.get()
+            if message is None:
+                print_colored_debug(
+                    f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received shutdown signal\n",
+                    "green")
+                self.session.shutdown()
+                break
+            else:
+                print_colored_debug(
+                    f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received task [{message.task}] from {self.addr}\n",
+                    "green")
+                futures = self.session.submit(
+                    RemoteMpiCommSessionServer.task_wrapper, message.task,
+                    *message.args, **message.kwargs)
+                self.num_results = self.session.n_workers
+                assert len(futures) == self.num_results == mpi_world_size()
+                if message.sync:
+                    for future in futures:
+                        future.add_done_callback(self.mpi_future_callback)
+
+    def mpi_future_callback(self, future):
+        print_colored_debug(f"rank{global_mpi_rank()} got future: {future}\n",
+                            "red")
+        if future.exception() is not None:
+            print_colored_debug(
+                f"mpi_future got exception: {future.exception()}, quitting\n",
+                "red")
+            self.queue.put(future.exception())
+            return
+
+        result = future.result()
+        self.results.append(result)
+        print_colored_debug(
+            f"RemoteMpiCommSessionServer working status: {len(self.results)}/{self.num_results}\n",
+            "grey")
+        if len(self.results) == self.num_results:
+            print_colored_debug(
+                f"RemoteMpiCommSessionServer received all results, sending to client\n",
+                "green")
+            self.queue.put(self.results)
+            print_colored_debug(
+                f"RemoteMpiCommSessionServer sent results to client\n", "green")
+            self.results.clear()
 
 
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('', 0))
         return s.getsockname()[1]
+
+
+def get_mpi_world_size() -> int:
+    # avoid cyclic import
+    from ..executor.utils import get_spawn_proxy_process_env
+
+    # If the proxy process is spawned, the MPI-related env will be cleaned in the proxy process, thus we made another env for the mpi_world_size
+    if get_spawn_proxy_process_env():
+        return int(os.getenv("tllm_mpi_size") or 1)
+    else:
+        return mpi_world_size()
+
+
+def split_mpi_env(mpi_env_keys: List[str] | None = None) -> Tuple[dict, dict]:
+    '''
+    Splits the environment variables into MPI-related and non-MPI-related dictionaries.
+
+    Args:
+        mpi_env_keys: Additional environment variables to be considered as MPI-related.
+
+    Returns:
+        Tuple[dict, dict]: (non_mpi_env, mpi_env)
+            - non_mpi_env: Environment dictionary without MPI-related variables
+            - mpi_env: Environment dictionary containing only MPI-related variables
+    '''
+    current_env = os.environ.copy()
+
+    # Identify MPI-related variables
+    mpi_vars = set(
+        itertools.chain([
+            var for var in current_env if var.startswith((
+                'MPI_',
+                'OMPI_',
+                'PMIX_',
+                'PMI_',
+                'OMPI_',
+                'PMIX_',
+                'PMI_',
+                'SLURM_',
+                'MPI_',
+                'UCX_',
+                'I_MPI_',
+                'HYDRA_',
+                'KMP_',
+                'MPICH_',
+                'MV2_',
+                'CRAY_',
+            ))
+        ], mpi_env_keys or []))
+
+    # Split into two dictionaries
+    non_mpi_env = {k: v for k, v in current_env.items() if k not in mpi_vars}
+    mpi_env = {k: v for k, v in current_env.items() if k in mpi_vars}
+
+    return non_mpi_env, mpi_env

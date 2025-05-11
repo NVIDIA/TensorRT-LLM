@@ -27,8 +27,6 @@ Welcome to TensorRT-LLM's Documentation!
 
    installation/linux.md
    installation/build-from-source-linux.md
-   installation/windows.md
-   installation/build-from-source-windows.md
    installation/grace-hopper.md
 
 
@@ -43,12 +41,13 @@ Welcome to TensorRT-LLM's Documentation!
 
 .. toctree::
    :maxdepth: 2
-   :caption: LLM API Examples
+   :caption: Examples
    :hidden:
 
-   llm-api-examples/index.rst
-   llm-api-examples/customization.md
-   llm-api-examples/llm_api_examples
+   examples/index.rst
+   examples/customization.md
+   examples/llm_api_examples
+   examples/trtllm_serve_examples
 
 
 .. toctree::
@@ -78,8 +77,8 @@ Welcome to TensorRT-LLM's Documentation!
    :caption: Command-Line Reference
    :hidden:
 
-   commands/trtllm-build.rst
-   commands/trtllm-serve.rst
+   commands/trtllm-build
+   commands/trtllm-serve
 
 
 .. toctree::

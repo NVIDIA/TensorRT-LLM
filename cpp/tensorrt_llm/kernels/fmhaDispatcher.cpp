@@ -57,8 +57,12 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     {
         TLLM_CHECK_WITH_INFO(mFixedParams.dataType == mFixedParams.dataTypeKv,
             "KV cache data type should be the same as input data type.");
-        TLLM_CHECK_WITH_INFO(mFixedParams.dataType == mFixedParams.dataTypeOut,
-            "Output data type should be the same as input data type.");
+
+        // For FP8 MLA generation, the output type is BF16, which could be different from the input type.
+        // So we shouldn't do this check anymore.
+        // TLLM_CHECK_WITH_INFO(mFixedParams.dataType == mFixedParams.dataTypeOut,
+        //     "Output data type should be the same as input data type.");
+
         mFMHARunner.reset(new FusedMHARunnerV2(fixedParams));
     }
 }
@@ -92,7 +96,7 @@ bool FmhaDispatcher::isSupported()
         TllmGenFmhaRunnerParams tllmRunnerParams;
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
         tllmRunnerParams.mQkvLayout = qkvLayout;
-        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
+        tllmRunnerParams.setAttentionMaskType(static_cast<std::int8_t>(mFixedParams.attentionMaskType));
         tllmRunnerParams.mKernelType = FmhaKernelType::Context;
         tllmRunnerParams.mTileScheduler = TileScheduler::Persistent;
         tllmRunnerParams.mMultiCtasKvMode = false;
@@ -122,6 +126,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
     if (mUseTllmGen)
     {
         TLLM_LOG_DEBUG("Running TRTLLM-GEN context FMHA kernel.");
+        TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
         // Convert from MHAFixedParams + MHARunnerParams to TllmGenFmhaRunnerParams
         void const* kvPoolPtr = nullptr;
         void const* kvPageIdxPtr = nullptr;
@@ -143,7 +148,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
 
         // Parameters to select kernels.
         tllmRunnerParams.mQkvLayout = qkvLayout;
-        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
+        tllmRunnerParams.setAttentionMaskType(static_cast<std::int8_t>(mFixedParams.attentionMaskType));
         tllmRunnerParams.mKernelType = FmhaKernelType::Context;
         // Always use persistent scheduler for better performance.
         tllmRunnerParams.mTileScheduler = TileScheduler::Persistent;
@@ -185,10 +190,9 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.mScaleQ = mFixedParams.qScaling;
         if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_PAGED_KV)
         {
-            auto const [freeMemory, totalMemory] = tensorrt_llm::common::getDeviceMemoryInfo(false);
             // The kv cache should be based on the maximum headDim of K and V due to paddings.
             int maxHeadDimKv = std::max(tllmRunnerParams.mHeadDimQk, tllmRunnerParams.mHeadDimV);
-            tllmRunnerParams.mNumPagesInMemPool = totalMemory
+            tllmRunnerParams.mNumPagesInMemPool = mTllmGenFMHARunner->getTotalDeviceMemory()
                 / (tllmRunnerParams.mNumHeadsKv * tllmRunnerParams.mNumTokensPerPage * maxHeadDimKv
                     * get_size_in_bytes(mFixedParams.dataType));
         }

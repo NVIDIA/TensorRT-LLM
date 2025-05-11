@@ -190,7 +190,7 @@ void invokeMTPPrepareDrafterInputs(MTPPrepareDrafterInputsParam& params, cudaStr
         reinterpret_cast<T*>(params.previousLayerHiddenStates), params.previousLayerDraftTokens, params.returnInputIds,
         reinterpret_cast<T*>(params.returnHiddenStates));
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 template void invokeMTPPrepareDrafterInputs<float>(MTPPrepareDrafterInputsParam& params, cudaStream_t stream);
@@ -341,12 +341,12 @@ void invokeMTPSampleAndAcceptDraftTokens(MTPSampleAndAcceptDraftTokensParam& par
 
     mtpGreedySampling<T, BLOCK_SIZE><<<numLogits, greedyBlockSize, 0, stream>>>(params.numMTPModules, params.batchSize,
         params.numContextRequest, params.vocabSize, reinterpret_cast<T*>(params.logits), params.targetTokens);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     mtpAcceptDraftToken<<<divUp(params.batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(params.numMTPModules,
         params.batchSize, params.numContextRequest, params.draftTokens, reinterpret_cast<int*>(params.targetTokens),
         params.acceptedTokens, params.numAcceptedTokens);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 template void invokeMTPSampleAndAcceptDraftTokens<float>(
@@ -464,13 +464,125 @@ void invokeMTPUpdateHiddenStates(MTPUpdateHiddenStatesParam& params, cudaStream_
         params.numContextRequest, params.hiddenSize, params.inputIds, params.seqLens,
         reinterpret_cast<T*>(params.targetModelHiddenStates), reinterpret_cast<T**>(params.mtpPastHiddenStatesPtrs),
         params.mtpPastTokensPtrs, params.numAcceptedTokens, params.acceptedTokens);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 template void invokeMTPUpdateHiddenStates<float>(MTPUpdateHiddenStatesParam& params, cudaStream_t stream);
 template void invokeMTPUpdateHiddenStates<half>(MTPUpdateHiddenStatesParam& params, cudaStream_t stream);
 #ifdef ENABLE_BF16
 template void invokeMTPUpdateHiddenStates<__nv_bfloat16>(MTPUpdateHiddenStatesParam& params, cudaStream_t stream);
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+template <typename T>
+__global__ void mtpRelaxedAcceptanceKernel(int const numMTPModules, int const batchSize, int const numContextRequest,
+    int* const reqSlotIds, int const relaxedTopK, float const relaxedDelta, int const beginThinkingTokens,
+    int const endThinkingTokens, T* topKValue, int64_t* topKIndices, int const* draftTokens, float* mtpRelaxedDelta,
+    int* numAcceptedTokens, int* acceptedTokens)
+{
+    /*
+        In a batch of request: context request (at the beginning) + generation requests
+        numGenerationRequest = batchSize - numContextRequest
+
+        topKValue: [numGenerationRequest, numMTPModules+1, relaxedTopK]
+        topKIndices: [numGenerationRequest, numMTPModules+1, relaxedTopK]
+        draftTokens: [numGenerationRequest * numMTPModules]
+        mtpRelaxedDelta: [batchSize]
+        numAcceptedTokens: [batchSize]
+        acceptedTokens: [batchSize][numMTPModules + 1], flatten
+    */
+
+    // Each thread is responsible for a request.
+    int const bid = static_cast<int>(blockIdx.x);
+    int const tid = static_cast<int>(bid * blockDim.x + threadIdx.x);
+
+    if (tid >= numContextRequest && tid < batchSize)
+    {
+        int const genIdx = tid - numContextRequest;
+        int const slotIdx = reqSlotIds[tid];
+        T* curTopKValuePtr = topKValue + genIdx * (numMTPModules + 1) * relaxedTopK;
+        int64_t* curTopKIndicesPtr = topKIndices + genIdx * (numMTPModules + 1) * relaxedTopK;
+        auto curDraftTokensPtr = draftTokens + genIdx * (numMTPModules);
+        float curMTPRelaxedDelta = mtpRelaxedDelta[slotIdx];
+
+        int acceptedNum = 0;
+        while (acceptedNum < numMTPModules)
+        {
+            auto curDraftTokenId = curDraftTokensPtr[acceptedNum];
+            bool accept_flag = false;
+            float threshold = (float) curTopKValuePtr[acceptedNum * (relaxedTopK) + 0] - curMTPRelaxedDelta;
+            for (int jj = 0; jj < relaxedTopK; jj++)
+            {
+                if (jj > 0 && (threshold > (float) (curTopKValuePtr[acceptedNum * (relaxedTopK) + jj])))
+                {
+                    break;
+                }
+                if (curDraftTokenId == (int) (curTopKIndicesPtr[acceptedNum * (relaxedTopK) + jj]))
+                {
+                    acceptedNum++;
+                    accept_flag = true;
+                    break; // break the relaxedTopK comparison
+                }
+            }
+
+            if (!accept_flag) // Not accepted, break the draft tokens comparison
+            {
+                break;
+            }
+        }
+
+        // Write back to accepted tokens
+        auto curAcceptedTokensPtr = acceptedTokens + tid * (numMTPModules + 1);
+        for (int jj = 0; jj < acceptedNum; jj++)
+        {
+            curAcceptedTokensPtr[jj] = curDraftTokensPtr[jj];
+        }
+        // Add one more golden token
+        curAcceptedTokensPtr[acceptedNum] = (int) curTopKIndicesPtr[acceptedNum * (relaxedTopK) + 0];
+
+        // Update numAcceptedTokens
+        numAcceptedTokens[tid] = acceptedNum + 1;
+    }
+
+    // Check whether need to flip thinking phase
+    if (tid < batchSize)
+    {
+        auto slotIdx = reqSlotIds[tid];
+        auto curAcceptedNum = numAcceptedTokens[tid];
+        auto curAcceptedTokensPtr = acceptedTokens + tid * (numMTPModules + 1);
+        for (int jj = 0; jj < curAcceptedNum; jj++)
+        {
+            auto curAcceptedTokenId = curAcceptedTokensPtr[jj];
+            if (curAcceptedTokenId == beginThinkingTokens)
+            {
+                // mtpRelaxedDelta[tid] = relaxedDelta; // Start thinking
+                mtpRelaxedDelta[slotIdx] = relaxedDelta; // Start thinking
+            }
+            if (curAcceptedTokenId == endThinkingTokens)
+            {
+                // mtpRelaxedDelta[tid] = 0; // End thinking, use greedy
+                mtpRelaxedDelta[slotIdx] = 0; // End thinking, use greedy
+            }
+        }
+    }
+}
+
+template <typename T>
+void invokeMTPRelaxedAcceptance(MTPRelaxedAcceptanceParam& params, cudaStream_t const stream)
+{
+    int constexpr BLOCK_SIZE = 512;
+    mtpRelaxedAcceptanceKernel<T><<<divUp(params.batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(params.numMTPModules,
+        params.batchSize, params.numContextRequest, params.reqSlotIds, params.relaxedTopK, params.relaxedDelta,
+        params.beginThinkingTokens, params.endThinkingTokens, reinterpret_cast<T*>(params.topKValue),
+        params.topKIndices, params.draftTokens, params.mtpRelaxedDelta, params.numAcceptedTokens,
+        params.acceptedTokens);
+    sync_check_cuda_error(stream);
+}
+
+template void invokeMTPRelaxedAcceptance<float>(MTPRelaxedAcceptanceParam& params, cudaStream_t stream);
+template void invokeMTPRelaxedAcceptance<half>(MTPRelaxedAcceptanceParam& params, cudaStream_t stream);
+#ifdef ENABLE_BF16
+template void invokeMTPRelaxedAcceptance<__nv_bfloat16>(MTPRelaxedAcceptanceParam& params, cudaStream_t stream);
 #endif
 
 } // namespace kernels

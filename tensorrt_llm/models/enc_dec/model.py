@@ -994,13 +994,10 @@ class EncoderModel(PretrainedModel):
         if self.language_adapter_config:
             language_adapter_routings = Tensor(
                 name="language_adapter_routings",
-                dtype=trt.float32,
-                shape=[-1, self.language_adapter_config.num_languages],
-                dim_range=OrderedDict([
-                    ('num_tokens', [num_tokens_range]),
-                    ('num_languages',
-                     [self.language_adapter_config.num_languages])
-                ]),
+                dtype=trt.int32,
+                shape=[-1, 1],
+                dim_range=OrderedDict([('num_tokens', [num_tokens_range]),
+                                       ('routing_dim', [1])]),
             )
 
         result = {
@@ -1620,7 +1617,7 @@ class DecoderModel(PretrainedModel):
                 shape=[-1, -1, -1],
                 dim_range=OrderedDict([
                     ('batch_size_beam_width', [bb_range]),
-                    ('query_len', [1]),
+                    ('query_len', [inlen_range]),
                     ('encoder_input_len_2', [encoder_input_len_range]),
                 ]),
             )
@@ -1632,7 +1629,7 @@ class DecoderModel(PretrainedModel):
                 dim_range=OrderedDict([
                     ('decoder_num_tokens_2',
                      [decoder_num_tokens_range
-                      ]),  # TODO (bhsueh) should use same name as input_ids
+                      ]),  # TODO should use same name as input_ids
                     ('encoder_input_len_2', [encoder_input_len_range]),
                 ]),
             )
@@ -1992,13 +1989,11 @@ class DecoderModel(PretrainedModel):
         if self.language_adapter_config:
             language_adapter_routings = Tensor(
                 name="language_adapter_routings",
-                dtype=trt.float32,
-                shape=[-1, self.language_adapter_config.num_languages],
-                dim_range=OrderedDict([
-                    ('decoder_num_tokens_range', [decoder_num_tokens_range]),
-                    ('num_languages',
-                     [self.language_adapter_config.num_languages])
-                ]),
+                dtype=trt.int32,
+                shape=[-1, 1],
+                dim_range=OrderedDict([('decoder_num_tokens_range',
+                                        [decoder_num_tokens_range]),
+                                       ('routing_dim', [1])]),
             )
 
         result = {

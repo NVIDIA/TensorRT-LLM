@@ -37,6 +37,11 @@ def parse_requirements(filename: os.PathLike):
             # handle -i and --extra-index-url options
             if "-i " in line or "--extra-index-url" in line:
                 extra_URLs.append(extract_url(line))
+            # handle URLs such as git+https://github.com/flashinfer-ai/flashinfer.git@e3853dd#egg=flashinfer-python
+            elif line.startswith("git+https"):
+                idx = line.find("egg=")
+                dep = line[idx + 4:]
+                deps.append(dep)
             else:
                 deps.append(line)
     return deps, extra_URLs
@@ -49,7 +54,7 @@ def sanity_check():
         raise ImportError(
             'The `bindings` module does not exist. Please check the package integrity. '
             'If you are attempting to use the pip development mode (editable installation), '
-            'please execute `build_wheels.py` first, and then run `pip install -e .`.'
+            'please execute `scripts/build_wheel.py` first, and then run `pip install -e .`.'
         )
 
 
@@ -86,25 +91,21 @@ devel_deps, _ = parse_requirements(
 if on_windows:
     package_data = [
         'libs/th_common.dll', 'libs/tensorrt_llm.dll',
-        'libs/nvinfer_plugin_tensorrt_llm.dll',
-        'libs/tensorrt_llm_nvrtc_wrapper.dll', 'bindings.*.pyd'
+        'libs/nvinfer_plugin_tensorrt_llm.dll', 'bindings.*.pyd', "include/**/*"
     ]
 else:
     package_data = [
-        'bin/executorWorker',
-        'libs/libtensorrt_llm.so',
-        'libs/libth_common.so',
+        'bin/executorWorker', 'libs/libtensorrt_llm.so', 'libs/libth_common.so',
         'libs/libnvinfer_plugin_tensorrt_llm.so',
-        'libs/libtensorrt_llm_nvrtc_wrapper.so',
-        'libs/libtensorrt_llm_ucx_wrapper.so',
-        'libs/libdecoder_attention_0.so',
-        'libs/libdecoder_attention_1.so',
-        'bindings.*.so',
+        'libs/libtensorrt_llm_ucx_wrapper.so', 'libs/libdecoder_attention_0.so',
+        'libs/libdecoder_attention_1.so', 'bindings.*.so', "include/**/*"
     ]
 
 package_data += [
-    'bindings/*.pyi', 'tools/plugin_gen/templates/*',
-    'bench/build/benchmark_config.yml'
+    'bindings/*.pyi',
+    'tools/plugin_gen/templates/*',
+    'bench/build/benchmark_config.yml',
+    'evaluate/lm_eval_tasks/**/*',
 ]
 
 
@@ -235,15 +236,12 @@ setup(
             'trtllm-refit=tensorrt_llm.commands.refit:main',
             'trtllm-bench=tensorrt_llm.commands.bench:main',
             'trtllm-serve=tensorrt_llm.commands.serve:main',
+            'trtllm-eval=tensorrt_llm.commands.eval:main'
         ],
     },
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps,
-        "benchmarking": [
-            "click",
-            "pydantic",
-        ]
     },
     zip_safe=True,
     install_requires=required_deps,

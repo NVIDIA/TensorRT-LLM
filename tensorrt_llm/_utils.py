@@ -16,18 +16,21 @@ import copy
 import gc
 import inspect
 import json
+import linecache
 import math
+import os
 import struct
+import trace
 import weakref
 from contextlib import contextmanager
 from dataclasses import asdict
 from enum import EnumMeta
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
-from cuda import cuda
+import nvtx
 from mpi4py import MPI
 from packaging import version
 
@@ -38,6 +41,7 @@ import tensorrt as trt
 
 from tensorrt_llm.bindings import DataType, GptJsonConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.logger import logger
 
 # numpy doesn't know bfloat16, define abstract binary type instead
 np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
@@ -111,29 +115,6 @@ def copy_torch_to_numpy(x: torch.Tensor, ndarray: np.array):
     else:
         torch.from_numpy(ndarray).copy_(x)
     return ndarray
-
-
-# ref: https://github.com/NVIDIA/cuda-python/blob/main/examples/extra/jit_program_test.py
-def get_sm_version():
-    # Init
-    err, = cuda.cuInit(0)
-    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
-
-    # Device
-    err, cuDevice = cuda.cuDeviceGet(0)
-    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
-
-    # Get target architecture
-    err, sm_major = cuda.cuDeviceGetAttribute(
-        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-        cuDevice)
-    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
-    err, sm_minor = cuda.cuDeviceGetAttribute(
-        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-        cuDevice)
-    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
-
-    return sm_major * 10 + sm_minor
 
 
 def trt_version():
@@ -383,6 +364,25 @@ def torch_dtype_to_trt(dtype):
     return ret
 
 
+_torch_to_binding_dtype_dict = {
+    torch.float16: DataType.HALF,
+    torch.float32: DataType.FLOAT,
+    torch.int64: DataType.INT64,
+    torch.int32: DataType.INT32,
+    torch.int8: DataType.INT8,
+    torch.float8_e4m3fn: DataType.FP8,
+    torch.qint8: DataType.INT8,
+    torch.bool: DataType.BOOL,
+    torch.bfloat16: DataType.BF16
+}
+
+
+def torch_dtype_to_binding(dtype):
+    ret = _torch_to_binding_dtype_dict.get(dtype)
+    assert ret is not None, f'Unsupported dtype: {dtype}'
+    return ret
+
+
 _torch_dtype_to_np_typestr_dict = {
     torch.float16: "<f2",
     torch.float32: "<f4",
@@ -451,6 +451,9 @@ def mpi_comm():
     return comm
 
 
+local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
+
+
 def mpi_rank():
     return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
 
@@ -467,6 +470,23 @@ def mpi_world_size():
     return mpi_comm().Get_size() if ENABLE_MULTI_DEVICE else 1
 
 
+def local_mpi_rank():
+    return local_comm.Get_rank() if ENABLE_MULTI_DEVICE else 0
+
+
+def local_mpi_size():
+    return local_comm.Get_size() if ENABLE_MULTI_DEVICE else 1
+
+
+def default_gpus_per_node():
+    num_gpus = torch.cuda.device_count()
+    num_ranks = local_mpi_size()
+    assert num_gpus > 0, "No GPU found on the node"
+    if num_ranks > num_gpus:
+        logger.warning(f"{num_ranks} MPI ranks will share {num_gpus} GPUs.")
+    return min(num_ranks, num_gpus)
+
+
 def mpi_barrier():
     if ENABLE_MULTI_DEVICE:
         mpi_comm().Barrier()
@@ -478,6 +498,29 @@ def mpi_broadcast(obj, root=0):
 
 def mpi_allgather(obj):
     return mpi_comm().allgather(obj) if ENABLE_MULTI_DEVICE else obj
+
+
+def mpi_isend(buf, dest, tag=0):
+    # isend in buf-like objects (e.g. numpy array)
+    # return request handle if ENABLE_MULTI_DEVICE
+    if ENABLE_MULTI_DEVICE:
+        return mpi_comm().Isend(buf, dest, tag=tag)
+    return None
+
+
+def mpi_send(buf, dest, tag=0):
+    # send in buf-like objects (e.g. numpy array)
+    # return request handle if ENABLE_MULTI_DEVICE
+    if ENABLE_MULTI_DEVICE:
+        mpi_comm().Send(buf, dest, tag=tag)
+    return None
+
+
+def mpi_recv(buf, source, tag):
+    # recv in buf-like object (e.g. numpy array)
+    if ENABLE_MULTI_DEVICE:
+        return mpi_comm().Recv(buf, source, tag=tag)
+    return None
 
 
 def pad_vocab_size(vocab_size, tp_size):
@@ -589,6 +632,62 @@ def get_sm_version():
     return prop.major * 10 + prop.minor
 
 
+def is_trace_enabled(env_var: str):
+    value = os.environ.get(env_var, "-1")
+    if value == "ALL":
+        return True
+    try:
+        return int(value) == global_mpi_rank()
+    except ValueError:
+        return False
+
+
+def trace_func(func):
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        import dill  # nosec B403
+
+        def globaltrace(frame, why, arg):
+            if why == "call":
+                code = frame.f_code
+                filename = frame.f_globals.get('__file__', None)
+                if filename:
+                    modulename = trace._modname(filename)
+                    if modulename is not None:
+                        ignore_it = tracer.ignore.names(filename, modulename)
+                        if not ignore_it:
+                            print(
+                                f"[rank{rank}] --- path: {filename}, funcname: {code.co_name}"
+                            )
+                            return localtrace
+                else:
+                    return None
+
+        def localtrace(frame, why, arg):
+            if why == "line":
+                filename = frame.f_code.co_filename
+                lineno = frame.f_lineno
+                bname = os.path.basename(filename)
+                print(
+                    f"[rank{rank}] {bname}:{lineno}: {linecache.getline(filename, lineno)}",
+                    end="")
+            return localtrace
+
+        ignoredirs = [
+            os.path.dirname(package.__file__)
+            for package in [os, torch, trace, dill]
+        ]
+        tracer = trace.Trace(trace=1, count=0, ignoredirs=ignoredirs)
+        rank = global_mpi_rank()
+        tracer.globaltrace = globaltrace
+        tracer.localtrace = localtrace
+        result = tracer.runfunc(func, *args, **kwargs)
+        return result
+
+    return wrapper
+
+
 class DictConversion:
 
     @classmethod
@@ -667,12 +766,76 @@ class QuantModeWrapper:
 
 
 @contextmanager
-def nvtx_range(msg):
-    torch.cuda.nvtx.range_push(msg)
-    try:
-        yield
-    finally:
-        torch.cuda.nvtx.range_pop()
+def _null_context_manager():
+    yield
+
+
+def nvtx_range(msg: str,
+               color: str = "grey",
+               domain: str = "TensorRT-LLM",
+               category: Optional[str] = None):
+    """
+    Creates an NVTX range annotation for profiling.
+
+    This function returns a context manager that marks the beginning and end of a
+    range in NVIDIA Tools Extension (NVTX) profiling tools like Nsight Systems.
+
+    Args:
+        msg (str): The message/name for the NVTX range.
+        color (str, optional): The color to use for the range in the profiler. Defaults to "grey".
+        domain (str, optional): The domain name for the range. Defaults to "TensorRT-LLM".
+        category (str, optional): The category for the range. Defaults to None.
+
+    Returns:
+        contextmanager: A context manager that marks the NVTX range.
+    """
+    return nvtx.annotate(msg, color=color, domain=domain, category=category)
+
+
+def nvtx_range_debug(msg: str,
+                     color: str = "grey",
+                     domain: str = "TensorRT-LLM",
+                     category: Optional[str] = None):
+    """
+    Creates an NVTX range annotation for debugging purposes.
+
+    Similar to nvtx_range, but only creates the range if specific environment
+    variables are set, making it suitable for debug profiling.
+
+    Args:
+        msg (str): The message/name for the NVTX range.
+        color (str, optional): The color to use for the range in the profiler. Defaults to "grey".
+        domain (str, optional): The domain name for the range. Defaults to "TensorRT-LLM".
+        category (str, optional): The category for the range. Defaults to None.
+
+    Returns:
+        contextmanager: A context manager that either marks the NVTX range if enabled,
+                        or a null context manager that does nothing if disabled.
+    """
+    if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
+            os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
+        return nvtx_range(msg, color=color, domain=domain, category=category)
+    else:
+        return _null_context_manager()
+
+
+def nvtx_mark(msg: str,
+              color: str = "grey",
+              domain: str = "TensorRT-LLM",
+              category: Optional[str] = None):
+    """
+    Creates an NVTX marker for profiling.
+
+    This function places a single marker point in NVIDIA Tools Extension (NVTX)
+    profiling tools like Nsight Systems, useful for marking specific events.
+
+    Args:
+        msg (str): The message/name for the NVTX marker.
+        color (str, optional): The color to use for the marker in the profiler. Defaults to "grey".
+        domain (str, optional): The domain name for the marker. Defaults to "TensorRT-LLM".
+        category (str, optional): The category for the marker. Defaults to None.
+    """
+    nvtx.mark(msg, color=color, category=category, domain=domain)
 
 
 def volume(d: Sequence[int]):
@@ -690,6 +853,7 @@ class TensorWrapper:
         dtype: Union[torch.dtype, str, np.dtype, trt.DataType],
         shape: Sequence[int],
     ):
+        assert isinstance(data_ptr, int)
         self._data_ptr = data_ptr
         self.dtype = dtype
         self.shape = shape
@@ -754,3 +918,112 @@ def convert_to_torch_tensor(
         raise RuntimeError(
             "Data pointer mismatch after converting to torch.Tensor")
     return new_tensor
+
+
+class KVCacheEventSerializer:
+
+    @classmethod
+    def get_event_serialize_func(cls, event_type):
+        return {
+            "KVCacheCreatedData": cls._created_to_json,
+            "KVCacheStoredData": cls._stored_to_json,
+            "KVCacheStoredBlockData": cls._stored_block_to_json,
+            "KVCacheRemovedData": cls._removed_to_json,
+            "KVCacheUpdatedData": cls._updated_to_json,
+        }.get(event_type, None)
+
+    @classmethod
+    def serialize(cls, events):
+        if events is None:
+            return None
+
+        if not isinstance(events, list):
+            return cls.to_json_str(events)
+
+        return [cls.to_json_str(event) for event in events]
+
+    @classmethod
+    def to_json_str(cls, event):
+        if event is None:
+            return {}
+
+        event_type = type(event.data).__name__
+        event_serialize_func = cls.get_event_serialize_func(event_type)
+        if event_serialize_func is None:
+            raise ValueError(f"Unknown KVCache event data type: {event_type}")
+
+        return {
+            "event_id": event.event_id,
+            "data": event_serialize_func(event.data),
+        }
+
+    @staticmethod
+    def _created_to_json(data):
+        return {
+            "type": "created",
+            "num_blocks_per_cache_level": data.num_blocks_per_cache_level
+        }
+
+    @staticmethod
+    def _stored_to_json(data):
+        return {
+            "type":
+            "stored",
+            "parent_hash":
+            data.parent_hash,
+            "blocks": [
+                KVCacheEventSerializer._stored_block_to_json(block)
+                for block in data.blocks
+            ]
+        }
+
+    @staticmethod
+    def _stored_block_to_json(data):
+        return {
+            "type":
+            "stored_block",
+            "block_hash":
+            data.block_hash,
+            "tokens": [
+                KVCacheEventSerializer._unique_tokens_to_json(token)
+                for token in data.tokens
+            ],
+            # "lora_id": data.lora_id, # TODO (shreyasm): enable serialization of lora_id
+            "cache_level":
+            data.cache_level,
+            "priority":
+            data.priority
+        }
+
+    @staticmethod
+    def _removed_to_json(data):
+        return {"type": "removed", "block_hashes": data.block_hashes}
+
+    @staticmethod
+    def _updated_to_json(data):
+        return {
+            "type":
+            "updated",
+            "block_hash":
+            data.block_hash,
+            "cache_level":
+            KVCacheEventSerializer._event_diff_to_json(data.cache_level),
+            "priority":
+            KVCacheEventSerializer._event_diff_to_json(data.priority)
+        }
+
+    @staticmethod
+    def _event_diff_to_json(data):
+        return {
+            "type": "event_diff",
+            "new_value": data.new_value,
+            "old_value": data.old_value
+        }
+
+    @staticmethod
+    def _unique_tokens_to_json(data):
+        return {
+            "type": "unique_token",
+            "token_id": data.token_id,
+            "token_extra_id": data.token_extra_id
+        }

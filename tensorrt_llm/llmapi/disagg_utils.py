@@ -29,6 +29,8 @@ class DisaggServerConfig():
     server_configs: List[CtxGenServerConfig]
     hostname: str = "localhost"
     port: int = 8000
+    ctx_router_type: str = "round_robin"
+    gen_router_type: str = "round_robin"
 
 
 def parse_disagg_config_file(yaml_config_file: str):
@@ -68,7 +70,11 @@ def extract_disagg_cfg(hostname: str = 'localhost',
         type="ctx", **context_servers) + extract_ctx_gen_cfgs(
             type="gen", **generation_servers)
 
-    return DisaggServerConfig(server_configs, hostname, port)
+    ctx_router_type = context_servers.get("router_type", "round_robin")
+    gen_router_type = generation_servers.get("router_type", "round_robin")
+
+    return DisaggServerConfig(server_configs, hostname, port, ctx_router_type,
+                              gen_router_type)
 
 
 def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
@@ -114,25 +120,51 @@ def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
     return cfgs
 
 
+def get_server_configs_dict(
+        server_configs: List[CtxGenServerConfig]) -> Tuple[int, dict]:
+
+    num_workers = 0
+    server_dict = {}
+
+    # check for duplicate server configs
+    for cfg in server_configs:
+        url = (cfg.hostname, cfg.port)
+        if url in server_dict:
+            cfg_prev = server_dict[url]
+            if cfg_prev.type == cfg.type:
+                raise ValueError(
+                    f"Duplicated {cfg.type} server config for {url}")
+            # mixed server, config should be the same
+            if cfg_prev.other_args != cfg.other_args:
+                raise ValueError(
+                    f"Server config for {url} has different args:\n{cfg_prev.other_args}\n{cfg.other_args}"
+                )
+        else:
+            server_dict[url] = cfg
+            num_workers += cfg.instance_num_ranks
+
+    return num_workers, server_dict
+
+
 def split_world_comm(
         server_configs: List[CtxGenServerConfig]) -> Tuple[bool, int, Comm]:
 
-    # Check that MPI_COMM_WORLD size is equal to the number of workers
+    # Check that MPI_COMM_WORLD size is compatible with the number of workers
     global_size = global_mpi_size()
-    num_workers = sum(cfg.instance_num_ranks for cfg in server_configs)
+    global_rank = global_mpi_rank()
 
-    if (global_size != num_workers):
-        raise ValueError(
-            f"global_size ({global_size}) should be equal to the number of workers ({num_workers})"
-        )
+    [num_workers, server_dict] = get_server_configs_dict(server_configs)
+    assert global_size == num_workers, f"global_size ({global_size}) should be equal to the number of distinct workers ({num_workers})"
 
     # Identify the leader ranks and the instance idx for each rank
-    global_rank = global_mpi_rank()
     is_leader = False
     offset = 0
     instance_idx = 0
     instance_sub_rank = 0
     for idx, cfg in enumerate(server_configs):
+        if (cfg.hostname, cfg.port) not in server_dict:
+            continue
+        server_dict.pop((cfg.hostname, cfg.port))
         if global_rank >= offset and global_rank < offset + cfg.instance_num_ranks:
             instance_idx = idx
             instance_sub_rank = global_rank - offset

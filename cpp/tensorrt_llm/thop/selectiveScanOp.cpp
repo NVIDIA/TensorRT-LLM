@@ -204,7 +204,7 @@ std::tuple<th::Tensor, th::Tensor> run_selective_scan(th::Tensor const& input, t
         tk::invokeSelectiveScanUpdate<T, float>(params, stream);
     }
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     return std::make_tuple(out, state);
 }

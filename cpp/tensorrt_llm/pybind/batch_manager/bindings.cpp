@@ -19,7 +19,9 @@
 
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
+#include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
+#include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
@@ -48,6 +50,34 @@ namespace tensorrt_llm::pybind::batch_manager
 void initBindings(pybind11::module_& m)
 {
     using GenLlmReq = tb::GenericLlmRequest<runtime::ITensor::SharedPtr>;
+
+    // Create and register exceptions in module scope
+    static PyObject* peft_exc = PyErr_NewException(
+        "tensorrt_llm.bindings.internal.batch_manager.PeftTaskNotCachedException", nullptr, nullptr);
+    static PyObject* lora_exc
+        = PyErr_NewException("tensorrt_llm.bindings.internal.batch_manager.LoraCacheFullException", nullptr, nullptr);
+
+    m.add_object("PeftTaskNotCachedException", py::handle(peft_exc));
+    m.add_object("LoraCacheFullException", py::handle(lora_exc));
+
+    // Register with no captures
+    py::register_exception_translator(
+        [](std::exception_ptr p)
+        {
+            try
+            {
+                if (p)
+                    std::rethrow_exception(p);
+            }
+            catch (const tb::PeftTaskNotCachedException& e)
+            {
+                PyErr_SetString(peft_exc, e.what());
+            }
+            catch (const tr::LoraCacheFullException& e)
+            {
+                PyErr_SetString(lora_exc, e.what());
+            }
+        });
 
     PybindUtils::bindSet<tb::ReqIdsSet>(m, "ReqIdsSet");
 
@@ -90,6 +120,28 @@ void initBindings(pybind11::module_& m)
                 }
                 return value;
             })
+        .def("multimodal_embedding",
+            [](GenLlmReq& self)
+            {
+                std::optional<at::Tensor> value{std::nullopt};
+                auto tensor = self.getMultimodalEmbedding();
+                if (tensor)
+                {
+                    value = tr::Torch::tensor(*tensor);
+                }
+                return value;
+            })
+        .def("get_mrope_rotary_cos_sin",
+            [](GenLlmReq& self)
+            {
+                std::optional<at::Tensor> value{std::nullopt};
+                auto tensor = self.getMropeRotaryCosSin();
+                if (tensor)
+                {
+                    value = tr::Torch::tensor(*tensor);
+                }
+                return value;
+            })
         .def("bad_words_list",
             [](GenLlmReq& self)
             {
@@ -126,7 +178,8 @@ void initBindings(pybind11::module_& m)
                 }
                 return value;
             })
-        .def("lora_config",
+        .def_property(
+            "lora_config",
             [](GenLlmReq& self)
             {
                 std::optional<at::Tensor> value{std::nullopt};
@@ -136,8 +189,11 @@ void initBindings(pybind11::module_& m)
                     value = tr::Torch::tensor(*tensor);
                 }
                 return value;
-            })
-        .def("lora_weights",
+            },
+            [](GenLlmReq& self, at::Tensor& loraConfig)
+            { self.setLoraConfig(static_cast<GenLlmReq::TensorPtr>(tr::TorchView::of(loraConfig))); })
+        .def_property(
+            "lora_weights",
             [](GenLlmReq& self)
             {
                 std::optional<at::Tensor> value{std::nullopt};
@@ -147,7 +203,9 @@ void initBindings(pybind11::module_& m)
                     value = tr::Torch::tensor(*tensor);
                 }
                 return value;
-            })
+            },
+            [](GenLlmReq& self, at::Tensor& loraWeights)
+            { self.setLoraWeights(static_cast<GenLlmReq::TensorPtr>(tr::TorchView::of(loraWeights))); })
         .def("stop_words_list",
             [](GenLlmReq& self)
             {
@@ -160,10 +218,9 @@ void initBindings(pybind11::module_& m)
                 return value;
             })
         .def_property_readonly("prompt_vocab_size", &GenLlmReq::getPromptVocabSize)
+        .def_property_readonly("mrope_position_deltas", &GenLlmReq::getMropePositionDeltas)
         .def_property_readonly("lora_task_id", &GenLlmReq::getLoraTaskId)
         .def_property_readonly("lookahead_config", &GenLlmReq::getLookaheadConfig)
-        .def_property_readonly(
-            "context_current_position", py::overload_cast<>(&GenLlmReq::getContextCurrentPosition, py::const_))
         .def_property("context_chunk_size", &GenLlmReq::getContextChunkSize, &GenLlmReq::setContextChunkSize)
         .def_property("decoding_iter", &GenLlmReq::getDecodingIter, &GenLlmReq::setDecodingIter)
         .def_readwrite("request_id", &GenLlmReq::mRequestId)
@@ -187,6 +244,8 @@ void initBindings(pybind11::module_& m)
         .def("set_priority", py::overload_cast<tle::PriorityType>(&GenLlmReq::setPriority))
         .def_property_readonly("cum_log_probs", &GenLlmReq::getCumLogProbs)
         .def("set_cum_log_prob", &GenLlmReq::setCumLogProb, py::arg("cum_log_prob"), py::arg("beam"))
+        .def("update_num_tokens_per_iteration", &GenLlmReq::updateNumTokensPerIteration,
+            py::arg("num_tokens_per_iteration"), py::arg("model_config"))
         .def_property_readonly("orig_prompt_len", &GenLlmReq::getOrigPromptLen)
         .def("has_draft_tokens", &GenLlmReq::hasDraftTokens)
         .def("move_to_next_context_chunk", &GenLlmReq::moveToNextContextChunk)
@@ -195,18 +254,26 @@ void initBindings(pybind11::module_& m)
         .def("is_first_context_chunk", py::overload_cast<>(&GenLlmReq::isFirstContextChunk, py::const_))
         .def("get_context_remaining_length", py::overload_cast<>(&GenLlmReq::getContextRemainingLength, py::const_))
         .def("set_finished_reason", &GenLlmReq::setFinishedReason, py::arg("finish_reason"), py::arg("beam"))
+        .def_property_readonly("is_finished", &GenLlmReq::isFinished)
         .def_property(
             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
+        .def_property_readonly("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)
+        .def_property(
+            "guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
         .def_property_readonly("context_phase_params", &GenLlmReq::getContextPhaseParams)
         .def_property_readonly("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
+        .def_property_readonly("is_generation_only_request", &GenLlmReq::isGenerationOnlyRequest)
         .def_property_readonly("is_context_finished", &GenLlmReq::isContextFinished)
         .def_property_readonly("is_disagg_generation_init_state", &GenLlmReq::isDisaggGenerationInitState)
         .def_property_readonly(
             "is_disagg_generation_transmission_complete", &GenLlmReq::isDisaggGenerationTransmissionComplete)
         .def_property_readonly(
             "is_disagg_generation_transmission_in_progress", &GenLlmReq::isDisaggGenerationTransmissionInProgress)
+        .def_property_readonly("is_context_init_state", &GenLlmReq::isContextInitState)
+        .def_property_readonly("is_generation_in_progress_state", &GenLlmReq::isGenerationInProgressState)
         .def_property_readonly("is_disagg_context_transmission_state", &GenLlmReq::isDisaggContextTransmissionState)
         .def_property_readonly("is_disagg_context_complete_state", &GenLlmReq::isDisaggContextCompleteState)
+        .def_property_readonly("llm_request_type", &GenLlmReq::getLlmRequestType)
         .def_property_readonly("position_ids",
             [](GenLlmReq& self)
             {
@@ -222,7 +289,7 @@ void initBindings(pybind11::module_& m)
             [](GenLlmReq& self)
             {
                 std::optional<GenLlmReq::VecTokens> draftTokens = std::nullopt;
-                if (self.getDraftTokens())
+                if (self.hasDraftTokens())
                 {
                     draftTokens = *self.getDraftTokens();
                 }
@@ -259,7 +326,7 @@ void initBindings(pybind11::module_& m)
                      std::optional<std::vector<tb::LlmRequest::SizeType32>> position_ids,
                      std::optional<at::Tensor> prompt_embedding_table,
                      std::optional<tb::LlmRequest::SizeType32> prompt_vocab_size,
-                     std::optional<at::Tensor> mrope_rotary_cos_sin,
+                     std::optional<at::Tensor> multimodal_embedding, std::optional<at::Tensor> mrope_rotary_cos_sin,
                      std::optional<tb::LlmRequest::SizeType32> mrope_position_deltas,
                      std::optional<LoraTaskIdType> lora_task_id, std::optional<at::Tensor> lora_weights,
                      std::optional<at::Tensor> lora_config,
@@ -283,20 +350,25 @@ void initBindings(pybind11::module_& m)
                      std::optional<tb::LlmRequest::MillisecondsType> allotted_time_ms,
                      std::optional<executor::ContextPhaseParams> context_phase_params)
                  {
-                     auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor)
+                     auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor, bool unsqueeze = false)
                      {
                          std::optional<tb::LlmRequest::TensorPtr> tensorPtr = std::nullopt;
                          if (atTensor)
                          {
                              tensorPtr = tr::TorchView::of(atTensor.value());
+                             if (unsqueeze)
+                             {
+                                 (*tensorPtr)->unsqueeze(0);
+                             }
                          }
                          return tensorPtr;
                      };
 
-                     auto embedding_bias_tensor_ptr = makeOptionalTensor(embedding_bias);
-                     auto bad_words_list_tensor_ptr = makeOptionalTensor(bad_words_list);
-                     auto stop_words_list_tensor_ptr = makeOptionalTensor(stop_words_list);
+                     auto embedding_bias_tensor_ptr = makeOptionalTensor(embedding_bias, true);
+                     auto bad_words_list_tensor_ptr = makeOptionalTensor(bad_words_list, true);
+                     auto stop_words_list_tensor_ptr = makeOptionalTensor(stop_words_list, true);
                      auto prompt_embedding_table_tensor_ptr = makeOptionalTensor(prompt_embedding_table);
+                     auto multimodal_embedding_tensor_ptr = makeOptionalTensor(multimodal_embedding);
                      auto lora_weights_tensor_ptr = makeOptionalTensor(lora_weights);
                      auto mrope_rotary_cos_sin_tensor_ptr = makeOptionalTensor(mrope_rotary_cos_sin);
                      auto lora_config_tensor_ptr = makeOptionalTensor(lora_config);
@@ -305,17 +377,18 @@ void initBindings(pybind11::module_& m)
                      auto cross_attention_mask_tensor_ptr = makeOptionalTensor(cross_attention_mask);
                      auto skip_cross_attn_blocks_tensor_ptr = makeOptionalTensor(skip_cross_attn_blocks);
 
+                     // 46 parameters
                      return tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
                          end_id, pad_id, embedding_bias_tensor_ptr, bad_words_list_tensor_ptr,
                          stop_words_list_tensor_ptr, position_ids, prompt_embedding_table_tensor_ptr, prompt_vocab_size,
-                         mrope_rotary_cos_sin_tensor_ptr, mrope_position_deltas, lora_task_id, lora_weights_tensor_ptr,
-                         lora_config_tensor_ptr, lookahead_config, kv_cache_retention_config, return_log_probs,
-                         return_context_logits, return_generation_logits, draft_tokens, draft_logits_tensor_ptr,
-                         exclude_input_from_output, logits_post_processor, apply_logits_post_processor_batched,
-                         encoder_input_tokens, return_encoder_output, client_id, priority,
-                         encoder_input_features_tensor_ptr, encoder_output_length, cross_attention_mask_tensor_ptr,
-                         llm_request_type, input_token_extra_ids, num_return_sequences, eagle_config,
-                         skip_cross_attn_blocks_tensor_ptr, return_perf_metrics, guided_decoding_params,
+                         multimodal_embedding_tensor_ptr, mrope_rotary_cos_sin_tensor_ptr, mrope_position_deltas,
+                         lora_task_id, lora_weights_tensor_ptr, lora_config_tensor_ptr, lookahead_config,
+                         kv_cache_retention_config, return_log_probs, return_context_logits, return_generation_logits,
+                         draft_tokens, draft_logits_tensor_ptr, exclude_input_from_output, logits_post_processor,
+                         apply_logits_post_processor_batched, encoder_input_tokens, return_encoder_output, client_id,
+                         priority, encoder_input_features_tensor_ptr, encoder_output_length,
+                         cross_attention_mask_tensor_ptr, llm_request_type, input_token_extra_ids, num_return_sequences,
+                         eagle_config, skip_cross_attn_blocks_tensor_ptr, return_perf_metrics, guided_decoding_params,
                          language_adapter_uid, allotted_time_ms, context_phase_params};
                  }),
             py::arg("request_id"), py::arg("max_new_tokens"), py::arg("input_tokens"), py::arg("sampling_config"),
@@ -323,17 +396,18 @@ void initBindings(pybind11::module_& m)
             py::arg("embedding_bias") = std::nullopt, py::arg("bad_words_list") = std::nullopt,
             py::arg("stop_words_list") = std::nullopt, py::arg("position_ids") = std::nullopt,
             py::arg("prompt_embedding_table") = std::nullopt, py::arg("prompt_vocab_size") = std::nullopt,
-            py::arg("mrope_rotary_cos_sin") = std::nullopt, py::arg("mrope_position_deltas") = std::nullopt,
-            py::arg("lora_task_id") = std::nullopt, py::arg("lora_weights") = std::nullopt,
-            py::arg("lora_config") = std::nullopt, py::arg("lookahead_config") = std::nullopt,
-            py::arg("kv_cache_retention_config") = std::nullopt, py::arg("return_log_probs") = false,
-            py::arg("return_context_logits") = false, py::arg("return_generation_logits") = false,
-            py::arg("draft_tokens") = std::nullopt, py::arg("draft_logits") = std::nullopt,
-            py::arg("exclude_input_from_output") = false, py::arg("logits_post_processor") = std::nullopt,
-            py::arg("apply_logits_post_processor_batched") = false, py::arg("encoder_input_tokens") = std::nullopt,
-            py::arg("return_encoder_output") = false, py::arg("client_id") = std::nullopt,
-            py::arg("priority") = executor::Request::kDefaultPriority, py::arg("encoder_input_features") = std::nullopt,
-            py::arg("encoder_output_len") = std::nullopt, py::arg("cross_attention_mask") = std::nullopt,
+            py::arg("multimodal_embedding") = std::nullopt, py::arg("mrope_rotary_cos_sin") = std::nullopt,
+            py::arg("mrope_position_deltas") = std::nullopt, py::arg("lora_task_id") = std::nullopt,
+            py::arg("lora_weights") = std::nullopt, py::arg("lora_config") = std::nullopt,
+            py::arg("lookahead_config") = std::nullopt, py::arg("kv_cache_retention_config") = std::nullopt,
+            py::arg("return_log_probs") = false, py::arg("return_context_logits") = false,
+            py::arg("return_generation_logits") = false, py::arg("draft_tokens") = std::nullopt,
+            py::arg("draft_logits") = std::nullopt, py::arg("exclude_input_from_output") = false,
+            py::arg("logits_post_processor") = std::nullopt, py::arg("apply_logits_post_processor_batched") = false,
+            py::arg("encoder_input_tokens") = std::nullopt, py::arg("return_encoder_output") = false,
+            py::arg("client_id") = std::nullopt, py::arg("priority") = executor::Request::kDefaultPriority,
+            py::arg("encoder_input_features") = std::nullopt, py::arg("encoder_output_len") = std::nullopt,
+            py::arg("cross_attention_mask") = std::nullopt,
             py::arg_v("llm_request_type", tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
                 "LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION"),
             py::arg("input_token_extra_ids") = std::nullopt, py::arg("num_return_sequences") = 1,
@@ -343,16 +417,12 @@ void initBindings(pybind11::module_& m)
             py::arg("context_phase_params") = std::nullopt)
         .def("validate", &tb::LlmRequest::validate, py::arg("max_input_len"), py::arg("max_seq_len"),
             py::arg("max_draft_len"), py::arg("vocab_size_padded"), py::arg("max_endocer_input_len") = std::nullopt,
-            py::arg("enable_kv_cache_reuse") = false, py::arg("gather_context_outputs") = false)
+            py::arg("enable_kv_cache_reuse") = false)
         .def("create_response", &tb::LlmRequest::createResponse, py::arg("use_fast_logits") = false,
             py::arg("mpi_world_rank") = 0)
         .def("move_prompt_embedding_table_to_gpu", &tb::LlmRequest::movePromptEmbeddingTableToGpu, py::arg("manager"))
         .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, py::arg("manager"))
         .def("finish_by_reason", &tb::LlmRequest::finishByReason, py::arg("finish_reason"));
-
-    py::bind_vector<tb::RequestVector>(m, "RequestVector");
-    // Note: Making an opaque binding out of RequestList would impact any std::vector<unsigned> conversion
-    // PybindUtils::bindList<tb::RequestList>(m, "RequestList");
 
     py::classh<tb::SequenceSlotManager>(m, "SequenceSlotManager")
         .def(py::init<tb::SequenceSlotManager::SlotIdType, uint64_t>(), py::arg("max_num_slots"),
@@ -378,6 +448,15 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("inputs_ids", &tb::DecoderInputBuffers::inputsIds)
         .def_readwrite("forward_batch_slots", &tb::DecoderInputBuffers::forwardBatchSlots);
 
+    py::class_<tb::DecoderOutputBuffers>(m, "DecoderOutputBuffers")
+        .def_readwrite("sequence_lengths_host", &tb::DecoderOutputBuffers::sequenceLengthsHost)
+        .def_readwrite("finished_sum_host", &tb::DecoderOutputBuffers::finishedSumHost)
+        .def_property_readonly("new_output_tokens_host",
+            [](tb::DecoderOutputBuffers& self) { return tr::Torch::tensor(self.newOutputTokensHost); })
+        .def_readwrite("cum_log_probs_host", &tb::DecoderOutputBuffers::cumLogProbsHost)
+        .def_readwrite("log_probs_host", &tb::DecoderOutputBuffers::logProbsHost)
+        .def_readwrite("finish_reasons_host", &tb::DecoderOutputBuffers::finishReasonsHost);
+
     py::class_<tb::DecoderBuffers::DraftBuffers>(m, "DraftBuffers")
         .def(py::init())
         .def_readwrite("next_draft_tokens_device", &tb::DecoderBuffers::DraftBuffers::nextDraftTokensDevice)
@@ -397,31 +476,17 @@ void initBindings(pybind11::module_& m)
 
     py::classh<tb::DecoderBuffers>(m, "DecoderBuffers")
         .def(py::init<runtime::SizeType32, runtime::SizeType32, runtime::SizeType32, runtime::SizeType32,
-                 runtime::SizeType32, runtime::TllmRuntime const&, runtime::ModelConfig const&,
-                 runtime::WorldConfig const&>(),
+                 runtime::BufferManager const&, runtime::ModelConfig const&, runtime::WorldConfig const&>(),
             py::arg("max_num_sequences"), py::arg("max_beam_width"), py::arg("max_attention_window"),
-            py::arg("max_seq_len"), py::arg("max_tokens_per_step"), py::arg("runtime"), py::arg("model_config"),
-            py::arg("world_config"))
+            py::arg("max_tokens_per_step"), py::arg("buffer_manager"), py::arg("model_config"), py::arg("world_config"))
         .def_readwrite("logits", &tb::DecoderBuffers::logits)
-        .def_readwrite("slot_output_ids", &tb::DecoderBuffers::slotOutputIds)
-        .def_readwrite("slot_output_ids_host", &tb::DecoderBuffers::slotOutputIdsHost)
         .def_readwrite("cache_indirection_input", &tb::DecoderBuffers::cacheIndirectionInput)
         .def_readwrite("cache_indirection_output", &tb::DecoderBuffers::cacheIndirectionOutput)
-        .def_readwrite("sequence_lengths", &tb::DecoderBuffers::sequenceLengths)
-        .def_readwrite("sequence_lengths_host", &tb::DecoderBuffers::sequenceLengthsHost)
-        .def_readwrite("finished_sum_host", &tb::DecoderBuffers::finishedSumHost)
-        .def_readwrite("new_output_tokens", &tb::DecoderBuffers::newOutputTokens)
-        .def_readwrite("new_output_tokens_host", &tb::DecoderBuffers::newOutputTokensHost)
-        .def_readwrite("cum_log_probs", &tb::DecoderBuffers::cumLogProbs)
-        .def_readwrite("cum_log_probs_host", &tb::DecoderBuffers::cumLogProbsHost)
-        .def_readwrite("log_probs", &tb::DecoderBuffers::logProbs)
-        .def_readwrite("log_probs_host", &tb::DecoderBuffers::logProbsHost)
-        .def_readwrite("finish_reasons_host", &tb::DecoderBuffers::finishReasonsHost)
         .def_readwrite("draft_buffers", &tb::DecoderBuffers::draftBuffers);
 
     py::class_<tb::SlotDecoderBuffers>(m, "SlotDecoderBuffers")
-        .def(py::init<runtime::SizeType32, runtime::SizeType32, runtime::TllmRuntime const&>(),
-            py::arg("max_beam_width"), py::arg("max_seq_len"), py::arg("runtime"))
+        .def(py::init<runtime::SizeType32, runtime::SizeType32, runtime::BufferManager const&>(),
+            py::arg("max_beam_width"), py::arg("max_seq_len"), py::arg("buffer_manager"))
         .def_readwrite("output_ids", &tb::SlotDecoderBuffers::outputIds)
         .def_readwrite("output_ids_host", &tb::SlotDecoderBuffers::outputIdsHost)
         .def_readwrite("sequence_lengths_host", &tb::SlotDecoderBuffers::sequenceLengthsHost)
@@ -430,6 +495,13 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("log_probs", &tb::SlotDecoderBuffers::logProbs)
         .def_readwrite("log_probs_host", &tb::SlotDecoderBuffers::logProbsHost)
         .def_readwrite("finish_reasons_host", &tb::SlotDecoderBuffers::finishReasonsHost);
+
+    py::class_<tb::MedusaBuffers>(m, "MedusaBuffers")
+        .def(py::init<runtime::SizeType32, runtime::SizeType32, runtime::BufferManager const&,
+                 runtime::ModelConfig const&, runtime::WorldConfig const&, executor::DecodingConfig const&,
+                 runtime::TllmRuntime const&>(),
+            py::arg("max_beam_width"), py::arg("max_seq_len"), py::arg("buffer_manager"), py::arg("model_config"),
+            py::arg("world_config"), py::arg("decoding_config"), py::arg("runtime"));
 }
 
 } // namespace tensorrt_llm::pybind::batch_manager

@@ -322,14 +322,21 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
             splitkGroupedGemm(problem_sizes, ptrA, ptrB, ptrC, ptrD, groupGemmParamsWorkSpace,
                 groupGemmParamsWorkSpaceSize, gemmWorkSpace, GemmWorkSpaceSize, true, mType, mSplitKSlices, minKN,
                 stream);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
             groupedGemm(problem_sizes_2, ptrA_2, ptrB_2, ptrC_2, ptrD_2, groupGemmParamsWorkSpace,
                 groupGemmParamsWorkSpaceSize, gemmWorkSpace, GemmWorkSpaceSize, false, mType, minKN, stream);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
         }
     }
 
     return 0;
+}
+
+int Lora_run(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* input, int32_t const* loraRanks,
+    void const* const* loraWeightsPtr, int weightIndex, void* const* outputs, void* workspace, cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(impl != nullptr, "Attempt to run an empty LoraImpl");
+    return impl->run(numTokens, numReqs, input, loraRanks, loraWeightsPtr, weightIndex, outputs, workspace, stream);
 }
 
 } // namespace tensorrt_llm::kernels

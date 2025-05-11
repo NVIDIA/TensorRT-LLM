@@ -15,7 +15,7 @@
 import math
 import weakref
 from collections import OrderedDict
-from enum import IntEnum, IntFlag, auto
+from enum import IntEnum
 from functools import partial
 from typing import List, Optional, Sequence, Tuple, Union
 
@@ -518,6 +518,12 @@ class Tensor(object):
         '''
         return unbind(self, dim)
 
+    def repeat(self, sizes):
+        '''
+        See functional.repeat
+        '''
+        return repeat(self, sizes)
+
     def is_dynamic(self, dim=None):
         '''
         If the argument 'dim' is None, that function returns a boolean that
@@ -584,6 +590,15 @@ class Tensor(object):
 
     def __repr__(self):
         return f"TensorRT-LLM Tensor: {self.name=} {self.dtype=} {self.shape=}"
+
+    def __xor__(self, b):
+        '''
+        Maps to functional.gt or functional.eq.
+        '''
+        print(f"self.shape: {self.shape}, b.shape: {b.shape}")
+        a, b = broadcast_helper(self, b)
+        print(f"a.shape: {a.shape}, b.shape: {b.shape}")
+        return op_xor(a, b)
 
 
 def _create_tensor(trt_tensor: trt.ITensor, producer: trt.ILayer) -> Tensor:
@@ -3009,6 +3024,7 @@ eq = partial(elementwise_binary, op=trt.ElementWiseOperation.EQUAL)
 minimum = partial(elementwise_binary, op=trt.ElementWiseOperation.MIN)
 maximum = partial(elementwise_binary, op=trt.ElementWiseOperation.MAX)
 pow = partial(elementwise_binary, op=trt.ElementWiseOperation.POW)
+op_xor = partial(elementwise_binary, op=trt.ElementWiseOperation.XOR)
 
 
 def modulo(x: Tensor, y: Union[Tensor, int]) -> Tensor:
@@ -3625,6 +3641,59 @@ def conv2d(input: Tensor,
     return output
 
 
+def conv3d(input: Tensor,
+           weight: Tensor,
+           bias: Optional[Tensor] = None,
+           stride: Union[int, Tuple[int, int]] = (1, 1, 1),
+           padding: Union[int, Tuple[int, int]] = (0, 0, 0),
+           dilation: Union[int, Tuple[int, int]] = (1, 1, 1),
+           groups: int = 1) -> Tensor:
+    ##
+    ## TODO: Document this function!
+    ##
+
+    ndim = input.ndim()
+    # TRT requires the input of Conv3D layer to be 5-dimentional tensor.
+    if ndim == 4:
+        input = expand_dims(input, 0)
+    assert input.ndim() == 5
+
+    if isinstance(stride, int):
+        stride = tuple([stride] * 3)
+    if isinstance(padding, int):
+        padding = tuple([padding] * 3)
+    if isinstance(dilation, int):
+        dilation = tuple([dilation] * 3)
+
+    noutput = weight.size()[0]
+    kernel_size = (weight.size()[-3], weight.size()[-2], weight.size()[-1])
+
+    is_weight_constant = (weight.producer is not None
+                          and weight.producer.type == trt.LayerType.CONSTANT)
+    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+
+    if bias is not None:
+        is_bias_constant = (bias.producer is not None
+                            and bias.producer.type == trt.LayerType.CONSTANT)
+        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+
+    layer = default_trtnet().add_convolution_nd(input.trt_tensor, noutput,
+                                                kernel_size, weight, bias)
+    layer.stride_nd = stride
+    layer.padding_nd = padding
+    layer.dilation_nd = dilation
+    layer.num_groups = groups
+    layer.dilation_nd = dilation
+
+    if not is_weight_constant:
+        layer.set_input(1, weight.trt_tensor)
+    if bias is not None and not is_bias_constant:
+        layer.set_input(2, bias.trt_tensor)
+
+    output = _create_tensor(layer.get_output(0), layer)
+    return output
+
+
 def conv_transpose2d(input: Tensor,
                      weight: Tensor,
                      bias: Optional[Tensor] = None,
@@ -3804,44 +3873,30 @@ def unbind(input: Tensor, dim: int = 0):
 
 
 class AllReduceStrategy(IntEnum):
-    """
-    Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h
-             they must be kept in sync
-    """
     NCCL = 0
-    ONESHOT = 1
-    TWOSHOT = 2
-    UB = 3
-    AUTO = 4
+    MIN_LATENCY = 1
+    UB = 2
+    AUTO = 3
+    ONESHOT = 4
+    TWOSHOT = 5
 
 
-class AllReduceConfig(IntFlag):
-    """
-    Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h
-             they must be kept in sync
-    """
-    USE_MEMCPY = auto()
-    PUSH_MODE = auto()
-
-
-class AllReduceFusionOp(IntFlag):
-    """
-    Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h
-             they must be kept in sync
-    """
+class AllReduceFusionOp(IntEnum):
     NONE = 0
     RESIDUAL_RMS_NORM = 1
     LAST_PROCESS_FOR_UB = 2
     RESIDUAL_RMS_PREPOST_NORM = 3
     RESIDUAL_RMS_NORM_QUANT_FP8 = 4
     RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5
+    RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6
+    RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7
+    MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
 
 
 class AllReduceParams():
 
     def __init__(self,
                  strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
-                 config: AllReduceConfig = AllReduceConfig(0),
                  fusion_op: AllReduceFusionOp = AllReduceFusionOp.NONE,
                  bias: Optional[Tensor] = None,
                  residual: Optional[Tensor] = None,
@@ -3851,7 +3906,6 @@ class AllReduceParams():
                  eps: float = 1e-06,
                  enable_allreduce: bool = True):
         self.strategy = strategy
-        self.config = config
         self.fusion_op = fusion_op
         self.bias = bias
         self.residual = residual
@@ -3861,7 +3915,8 @@ class AllReduceParams():
         self.eps = eps
         # For torch path only, has no effect on TRT path
         self.enable_allreduce = enable_allreduce
-        assert fusion_op == AllReduceFusionOp.NONE or (residual is not None)
+        assert fusion_op == AllReduceFusionOp.NONE.value or (residual
+                                                             is not None)
 
     def has_affine(self):
         return 1 if self.norm_weight is not None else 0
@@ -3898,10 +3953,6 @@ def create_allreduce_plugin(
         "strategy", np.array([int(all_reduce_params.strategy)], np.int8),
         trt.PluginFieldType.INT8)
     pfc.append(p_strategy)
-    p_config = trt.PluginField(
-        "config", np.array([int(all_reduce_params.config)], np.int8),
-        trt.PluginFieldType.INT8)
-    pfc.append(p_config)
     p_fusion_op = trt.PluginField(
         "fusion_op", np.array([int(all_reduce_params.fusion_op)], np.int8),
         trt.PluginFieldType.INT8)
@@ -3910,7 +3961,6 @@ def create_allreduce_plugin(
         "eps", np.array([float(all_reduce_params.eps)], np.float32),
         trt.PluginFieldType.FLOAT32)
     pfc.append(p_eps)
-
     p_affine = trt.PluginField(
         "affine", np.array([int(all_reduce_params.has_affine())], np.int8),
         trt.PluginFieldType.INT8)
@@ -4399,7 +4449,10 @@ def bert_attention(tensor: Tensor,
                    sage_attn: bool = False,
                    sage_attn_q_block_size: int = 0,
                    sage_attn_k_block_size: int = 0,
-                   sage_attn_v_block_size: int = 0) -> Tuple[Tensor]:
+                   sage_attn_v_block_size: int = 0,
+                   cp_group: list[int] = None,
+                   cp_size: int = 1,
+                   cp_rank: int = 0) -> Tuple[Tensor]:
     '''
     Add an operation that performs the multi-head attention in BERT.
 
@@ -4466,6 +4519,15 @@ def bert_attention(tensor: Tensor,
         sage_attn_v_quant_size: int = 0
             dynamic quant block size along sequence dimension of v tensor. Each quant block will share one scale.
 
+        cp_group: list[int] = None
+            The communication group for context parallel
+
+        cp_size: int = 1
+            The communication size for context parallel
+
+        cp_rank: int = 0
+            The communication rank for context parallel
+
     Returns:
         The tensor produced by that layer.
     '''
@@ -4520,10 +4582,31 @@ def bert_attention(tensor: Tensor,
         np.array(sage_attn_v_block_size, dtype=np.int32),
         trt.PluginFieldType.INT32)
 
+    if cp_size > 1:
+        # transpose q,k,v inside qkv to make kv contiguous, which is required by ring attention
+        # (b, s, 3d)
+        query, key, value = chunk(tensor, 3, dim=-1)
+        bs = shape(query, 0)
+        seq_len = shape(query, 1)
+        # (b, s, d) -> (b, s, 2d) -> (2b, s, d)
+        kv = concat([key, value],
+                    dim=-1).view(concat((2 * bs, seq_len, query.shape[-1])))
+        tensor = concat((query, kv),
+                        dim=0).view(concat((bs, seq_len, query.shape[-1] * 3)))
+
+    cp_size = trt.PluginField("cp_size", np.array(cp_size, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_rank = trt.PluginField("cp_rank", np.array(cp_rank, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_group = cp_group or [0]
+    cp_group = np.array(cp_group, dtype=np.int32)
+    cp_group = trt.PluginField("cp_group", cp_group, trt.PluginFieldType.INT32)
+
     pfc = trt.PluginFieldCollection([
         nheads, head_size, q_scaling, context_fmha_type, pf_type,
         do_relative_attention, max_distance, remove_padding, sage_attn,
-        sage_attn_q_block_size, sage_attn_k_block_size, sage_attn_v_block_size
+        sage_attn_q_block_size, sage_attn_k_block_size, sage_attn_v_block_size,
+        cp_size, cp_rank, cp_group
     ])
 
     attn_plug = attn_plg_creator.create_plugin("padding_attn", pfc)
@@ -4712,7 +4795,7 @@ class RopeEmbeddingUtils:
         return np.random.rand(dim).astype(dtype)
 
     @staticmethod
-    def create_sinusoidal_positions_for_deepseek_attention_plugin(
+    def create_sinusoidal_positions_yarn(
             num_pos: int,
             dim: int,
             base: int = 10000,
@@ -5144,6 +5227,7 @@ def gpt_attention(
     cp_group: List[int] = [0],
     cp_size: int = 1,
     cp_rank: int = 0,
+    num_kv_heads_origin: int = -1,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     '''
     Add an operation that performs the multi-head attention in GPT-like models.
@@ -5405,6 +5489,9 @@ def gpt_attention(
         skip_attn: Tensor = None,
             A bool tensor on CPU. If it is true, don't run attention plugin, returning directly.
 
+        num_kv_heads_origin: int
+            The origin number of KV heads, without the process of TP
+
     Returns:
         The tensor produced by that layer.
     '''
@@ -5436,6 +5523,9 @@ def gpt_attention(
     else:
         use_logn_scaling = 0
 
+    if num_kv_heads_origin < 1:
+        num_kv_heads_origin = num_kv_heads
+
     unfuse_qkv_gemm = trt.PluginField(
         "unfuse_qkv_gemm", np.array(np.int8(is_unfuse_qkv_gemm), dtype=np.int8),
         trt.PluginFieldType.INT8)
@@ -5454,6 +5544,9 @@ def gpt_attention(
     num_kv_heads = trt.PluginField("num_kv_heads",
                                    np.array(num_kv_heads, dtype=np.int32),
                                    trt.PluginFieldType.INT32)
+    num_kv_heads_origin = trt.PluginField(
+        "num_kv_heads_origin", np.array(num_kv_heads_origin, dtype=np.int32),
+        trt.PluginFieldType.INT32)
     head_size = trt.PluginField("head_size",
                                 np.array(hidden_size_per_head, dtype=np.int32),
                                 trt.PluginFieldType.INT32)
@@ -5645,9 +5738,10 @@ def gpt_attention(
         trt.PluginFieldType.INT8)
 
     pfc = trt.PluginFieldCollection([
-        layer_idx, nheads, vision_start, vision_length, num_kv_heads, head_size,
-        unidirectional, q_scaling, attn_logit_softcapping_scale,
-        position_embedding_type, rotary_embedding_dim, rotary_embedding_base,
+        layer_idx, nheads, vision_start, vision_length, num_kv_heads,
+        num_kv_heads_origin, head_size, unidirectional, q_scaling,
+        attn_logit_softcapping_scale, position_embedding_type,
+        rotary_embedding_dim, rotary_embedding_base,
         rotary_embedding_scale_type, rotary_embedding_scale,
         rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
         rotary_embedding_max_positions, rotary_embedding_original_max_positions,
@@ -5959,6 +6053,152 @@ def rms_norm(input: Tensor,
     return y
 
 
+def rearrange(inputs: Union[Tensor, Sequence[Tensor]], expression: str,
+              **kwargs) -> Tensor:
+    '''
+    Add a rearrange operation on a tensor.
+
+    This operation is a reader-friendly smart element reordering for multidimensional tensors,
+    including functionality of transpose (axes permutation), reshape (view), squeeze, unsqueeze,
+    stack, concatenate and other operations. Please see: https://einops.rocks/api/rearrange/
+
+    For example, if the shape of input tensor is [32, 30, 40, 3], and run:
+        `rearrange(x, 'b (h h1) (w w1) c -> b h w 1 (c h1 w1) 1', h1=2, w1=2)`
+    it would produce a tensor with shape as [32, 15, 20, 1, 12, 1].
+
+    Parameters:
+        input: Union[Tensor, Sequence[Tensor]]
+            If it is a tensor, it will directly operate on it.
+            Otherwise, if it is a sequence, it will concat it to a tensor and then
+            operates on it.
+
+        expression : str
+            The expression about how to reorder the tensor in a reader-friendly way.
+
+        kwargs:
+            Keyword arguments to set some identifiers with specific values.
+
+    Returns:
+        The output tensor of this operation.
+    '''
+    import re
+
+    def _init_expression(expr):
+        expr_items = expr.split(" ")
+        tmp_name_index = 0
+        for idx, item in enumerate(expr_items):
+            values = re.findall(r'\b\d+\b', item)
+            if len(values) > 0:
+                prefix = "(" if "(" in item else ""
+                subfix = ")" if ")" in item else ""
+                expr_items[
+                    idx] = f"{prefix}NumericId{tmp_name_index}Val{values[0]}{subfix}"
+                tmp_name_index += 1
+        return " ".join(expr_items)
+
+    def _get_all_identifier(expr):
+        return re.findall(r'\b[a-zA-Z_]+\d*\b', expr)
+
+    def _get_all_symbols(expr):
+        return re.findall(r'\b\w+\b', expr)
+
+    def _get_dim_expr(expr):
+        return [
+            _get_all_symbols(match.group())
+            for match in re.finditer(r'\b\w+\b|\(.*?\)', expr)
+        ]
+
+    src_shape_expr, _, dst_shape_expr = expression.partition("->")
+    unknown_identifiers = re.findall(r'[^a-zA-Z0-9_\(\)]',
+                                     src_shape_expr + dst_shape_expr)
+    assert len(
+        unknown_identifiers) > 0, f"Unknown identifiers: {unknown_identifiers}"
+    src_identifiers = _get_all_identifier(src_shape_expr)
+    dst_identifiers = _get_all_identifier(dst_shape_expr)
+    assert (len(src_identifiers) == len(set(src_identifiers))
+            and len(dst_identifiers) == len(set(dst_identifiers))
+            ), "Indexing expression contains duplicate dimension."
+    assert (set(src_identifiers) == set(dst_identifiers)
+            ), "Identifiers only on one side of expression (should be on both)."
+
+    new_expression = _init_expression(expression)
+    src_shape_expr, _, dst_shape_expr = new_expression.partition("->")
+
+    # concat if inputs are sequence of tensors
+    if isinstance(inputs, Sequence):
+        inputs = concat([unsqueeze(t, 0) for t in inputs], dim=0)
+    assert (
+        inputs.ndim() == len(_get_dim_expr(src_shape_expr))
+    ), f"inputs.ndim() is {inputs.ndim()} while indexing expression has {len(_get_dim_expr(src_shape_expr))}"
+
+    src_symbols = _get_all_symbols(src_shape_expr)
+    dst_symbols = _get_all_symbols(dst_shape_expr)
+
+    # find all the symbols-values mapping and store them in symbol_map
+    symbol_map = {
+        symbol: {
+            "updated": False,
+            "value": None
+        }
+        for symbol in set(src_symbols + dst_symbols)
+    }
+    for symbol in symbol_map:
+        if "NumericId" in symbol:
+            symbol_map[symbol]["value"] = int(symbol.partition("Val")[-1])
+            symbol_map[symbol]["updated"] = True
+    for symbol, value in kwargs.items():
+        symbol_map[symbol]["value"] = value
+        symbol_map[symbol]["updated"] = True
+
+    for idx, dim_expr in enumerate(_get_dim_expr(src_shape_expr)):
+        if len(dim_expr) == 1:
+            symbol = dim_expr[0]
+            if not symbol_map[symbol]["updated"]:
+                symbol_map[symbol]["value"] = shape(inputs, idx)
+                symbol_map[symbol]["updated"] = True
+        else:
+            divisors = []
+            unknown_symbol = None
+            for symbol in dim_expr:
+                if not symbol_map[symbol]["updated"]:
+                    unknown_symbol = symbol
+                else:
+                    divisors.append(symbol_map[symbol]["value"])
+            if unknown_symbol is not None:
+                assert len(divisors) > 0
+                divisor = prod(cast(concat(divisors), "int64"), dim=-1)
+                symbol_map[unknown_symbol]["value"] = shape(inputs,
+                                                            idx) / divisor
+                symbol_map[unknown_symbol]["updated"] = True
+
+    for symbol, item in symbol_map.items():
+        assert (item["updated"]
+                ), f"{symbol} cannot be inferred, please set it manually"
+
+    dst_dims = []
+    for dim_expr in _get_dim_expr(dst_shape_expr):
+        if len(dim_expr) == 1:
+            dst_dims.append(symbol_map[dim_expr[0]]["value"])
+        else:
+            accumulator = prod(cast(
+                concat([symbol_map[symbol]["value"] for symbol in dim_expr]),
+                "int64"),
+                               dim=-1)
+            dst_dims.append(accumulator)
+    dst_dims = cast(concat(dst_dims, dim=-1), "int64")
+
+    src_indices = {symbol: idx for idx, symbol in enumerate(src_identifiers)}
+    permute_dims = [src_indices[symbol] for symbol in dst_identifiers]
+
+    symbol_shape = cast(
+        concat([symbol_map[symbol]["value"] for symbol in src_identifiers],
+               dim=-1), "int64")
+    tensor = inputs.view(symbol_shape)
+    tensor = permute(tensor, permute_dims)
+    tensor = tensor.view(dst_dims)
+    return tensor
+
+
 def repeat(input: Tensor, sizes: Sequence[int]) -> Tensor:
     '''
     Repeats the tensor along the specified dimensions.
@@ -5973,6 +6213,8 @@ def repeat(input: Tensor, sizes: Sequence[int]) -> Tensor:
         A tensor except for repeated input tensors along specified dim.
 
     '''
+    assert input.ndim() <= len(sizes), \
+        "Number of dimensions of repeat dims can not be smaller than number of dimensions of tensor"
     repeated_tensor = input
     for k in range(-1, -len(sizes) - 1, -1):
         repeated_tensor = concat([repeated_tensor] * sizes[k], dim=k)
@@ -6268,6 +6510,7 @@ ACT2FN = {
     'swiglu': swiglu,
     'fast-swiglu': swiglu,
     'sigmoid': sigmoid,
+    'quick_gelu': quick_gelu,
 }
 
 GATED_ACT_2_ACT = {

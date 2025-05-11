@@ -1,0 +1,14 @@
+methods:
+  __init__:
+    parameters: {}
+    return_annotation: None
+  abort:
+    parameters: {}
+    return_annotation: None
+  aborted:
+    parameters: {}
+    return_annotation: bool
+  clear_logprob_params:
+    parameters: {}
+    return_annotation: None
+properties: {}

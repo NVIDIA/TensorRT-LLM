@@ -1,26 +1,30 @@
+import atexit
 import concurrent.futures
+import threading
 import time
-import traceback
 import weakref
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
+import torch
 import zmq
 import zmq.asyncio
 
 from tensorrt_llm.logger import logger
 
-from .._utils import mpi_world_size
-from ..llmapi.mpi_session import MpiCommSession, MpiPoolSession, MpiSession
+from .._utils import mpi_rank
+from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
+                                  RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
-                            enable_llm_debug, print_colored)
+                            print_colored, print_colored_debug)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
-from .result import GenerationResult
-from .utils import (IntraProcessQueue, ProcessPoolExecutorSession,
-                    WorkerCommIpcAddrs, WorkerCommQueues)
+from .result import GenerationResult, IterationResult
+from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
+                    create_mpi_comm_session, get_spawn_proxy_process_env,
+                    is_llm_response)
 from .worker import ExecutorBindingsWorker, worker_main
 
 __all__ = [
@@ -52,33 +56,38 @@ class ExecutorBindingsProxy(GenerationExecutor):
         )
 
         self.workers_started = False
+        self.doing_pre_shutdown = False
         self.worker_cls = worker_cls
 
+        mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
+
         if mpi_session is None:
-            if model_world_size == mpi_world_size() and model_world_size > 1:
-                self.mpi_session = MpiCommSession(n_workers=model_world_size)
+            if mpi_process_pre_spawned:
+                print_colored_debug('create comm session ...\n', "yellow")
+                self.mpi_session = create_mpi_comm_session(model_world_size)
             else:
+                print_colored_debug('create pool session ...\n', "yellow")
                 self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
+            print_colored_debug('using external mpi session ...\n', "yellow")
             self.mpi_session = mpi_session
 
-        if isinstance(self.mpi_session, MpiCommSession):
+        if isinstance(self.mpi_session,
+                      (MpiCommSession, RemoteMpiCommSessionClient)):
             print_colored(
-                "Using MpiCommSession to bind to external MPI processes\n",
+                f"rank {mpi_rank()} using MpiCommSession to bind to external MPI processes\n",
                 "yellow")
         else:
-            print_colored("Using MpiPoolSession to spawn MPI processes\n",
-                          "yellow")
+            print_colored(
+                f"rank {mpi_rank()} using MpiPoolSession to spawn MPI processes\n",
+                "yellow")
 
         self._results: Dict[int, GenerationResult] = {}
 
         self.model_world_size = model_world_size
 
-        intra_node = isinstance(self.mpi_session,
-                                (MpiPoolSession, ProcessPoolExecutorSession))
-
         worker_kwargs = dict(**worker_kwargs,
-                             worker_queues=self._setup_queues(intra_node),
+                             worker_queues=self._setup_queues(),
                              postproc_worker_config=postproc_worker_config,
                              is_llm_executor=False)
 
@@ -87,72 +96,47 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         self.dispatch_result_thread: Optional[ManagedThread] = None
         self.dispatch_stats_thread: Optional[ManagedThread] = None
-
+        self.dispatch_kv_cache_events_thread: Optional[ManagedThread] = None
         self._start_executor_workers(worker_kwargs)
 
-    def _setup_queues(
-            self, intra_node: bool) -> WorkerCommIpcAddrs | WorkerCommQueues:
-        # For intra-node communication, we use IPC queues. While for inter-node
-        # communication, we use Queue instead as the MPI process is the Python
-        # main process in rank 0.
-        # TODO: In inter-node mode, it may necessary to spawn a separate process
-        # for the MPI process for higher streaming generation performance.
-        # TODO: Support postproc in the inter-node mode, since the postproc
-        # workers need IPC queues.
+        # MPI registers its joiner using threading._register_atexit if possible.
+        # These functions run before atexit.register, so to avoid deadlock,
+        # we have to notify workers to exit before MPI starts to wait them.
+        try:
+            threading._register_atexit(  # type: ignore[attr-defined]
+                self.pre_shutdown)
+        except AttributeError:
+            atexit.register(self.pre_shutdown)
 
-        if intra_node:
-            self.request_queue = IpcQueue(is_server=True,
-                                          name="proxy_request_queue")
-            self.request_error_queue = IpcQueue(
-                is_server=True, name="proxy_request_error_queue")
-            # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
-            # Use PULL mode when enable_postprocess_parallel as there are
-            # multiple senders from multiple processes.
-            self.result_queue = FusedIpcQueue(
-                is_server=True,
-                fuse_message=False,
-                socket_type=zmq.PULL
-                if self.enable_postprocess_parallel else zmq.PAIR,
-                name="proxy_result_queue")
-            self.mp_stats_queue = FusedIpcQueue(is_server=True,
-                                                fuse_message=False,
-                                                name="proxy_stats_queue")
-            return WorkerCommIpcAddrs(
-                request_queue_addr=self.request_queue.address,
-                request_error_queue_addr=self.request_error_queue.address,
-                result_queue_addr=self.result_queue.address,
-                stats_queue_addr=self.mp_stats_queue.address,
-            )
-        else:
-            self.request_queue = IntraProcessQueue()
-            self.request_error_queue = IntraProcessQueue()
-            self.mp_stats_queue = IntraProcessQueue()
+    def _setup_queues(self) -> WorkerCommIpcAddrs:
 
-            if self.enable_postprocess_parallel:
-                self.result_queue = FusedIpcQueue(
-                    is_server=True,
-                    fuse_message=False,
-                    socket_type=zmq.PULL
-                    if self.enable_postprocess_parallel else zmq.PAIR,
-                    name="proxy_result_queue")
-
-                res = WorkerCommQueues(
-                    request_queue=self.request_queue,
-                    request_error_queue=self.request_error_queue,
-                    result_queue=self.result_queue.address,
-                    stats_queue=self.mp_stats_queue,
-                )
-
-            else:
-                self.result_queue = IntraProcessQueue()
-                res = WorkerCommQueues(
-                    request_queue=self.request_queue,
-                    request_error_queue=self.request_error_queue,
-                    result_queue=self.result_queue,
-                    stats_queue=self.mp_stats_queue,
-                )
-
-            return res
+        self.request_queue = IpcQueue(is_server=True,
+                                      name="proxy_request_queue")
+        self.request_error_queue = IpcQueue(is_server=True,
+                                            name="proxy_request_error_queue")
+        # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
+        # Use PULL mode when enable_postprocess_parallel as there are
+        # multiple senders from multiple processes.
+        self.result_queue = FusedIpcQueue(
+            is_server=True,
+            fuse_message=False,
+            socket_type=zmq.PULL
+            if self.enable_postprocess_parallel else zmq.PAIR,
+            name="proxy_result_queue")
+        self.mp_stats_queue = FusedIpcQueue(is_server=True,
+                                            fuse_message=False,
+                                            name="proxy_stats_queue")
+        self.kv_cache_events_queue = FusedIpcQueue(
+            is_server=True,
+            fuse_message=False,
+            name="proxy_kv_cache_events_queue")
+        return WorkerCommIpcAddrs(
+            request_queue_addr=self.request_queue.address,
+            request_error_queue_addr=self.request_error_queue.address,
+            result_queue_addr=self.result_queue.address,
+            stats_queue_addr=self.mp_stats_queue.address,
+            kv_cache_events_queue_addr=self.kv_cache_events_queue.address,
+        )
 
     def abort_request(self, request_id: int) -> None:
         ''' Abort a request by sending a cancelling request to the request queue.
@@ -188,7 +172,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
             else:
                 queue.put(res)
 
-            if res.is_final:
+            if (is_llm_response(res) and res.result.is_final) or isinstance(
+                    res, ErrorResponse):
                 self._results.pop(client_id)
 
         res = res if isinstance(res, list) else [res]
@@ -204,49 +189,63 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         return True  # success
 
-    def dispatch_stats_task(self) -> bool:
-        # get-stats is not urgent, so we can sleep a bit
-
-        time.sleep(0.1)
+    def _iteration_result_task(self, queue: Union[FusedIpcQueue,
+                                                  IntraProcessQueue],
+                               result_singleton: IterationResult) -> bool:
+        # iteration result is not urgent, so we can sleep a bit
+        time.sleep(0.2)
 
         try:
-            stats = self.mp_stats_queue.get()
+            data = queue.get()
         except:
+            logger.debug(
+                "proxy.py: Error in _iteration_result_task: queue.get()")
             return False
 
-        if stats is None:
+        if data is None:
+            logger.debug("proxy.py: _iteration_result_task: data is None")
             return False  # shutdown the thread
 
-        stats = stats if isinstance(stats, list) else [stats]
-        queue = self._iter_stats_result.queue
+        data = data if isinstance(data, list) else [data]
+        queue = result_singleton.queue
         async_queues = []
 
         while queue.full():
             queue.get()
 
         try:
-            for s in stats:
-                if s is None:
+            for d in data:
+                if d is None:
+                    logger.debug("proxy.py: _iteration_result_task: d is None")
                     return False
 
                 if isinstance(queue, _SyncQueue):
-                    queue.put_nowait(s)
+                    queue.put_nowait(d)
                     async_queues.append(queue)
                 else:
-                    queue.put(s)
+                    queue.put(d)
 
             if async_queues:
                 _SyncQueue.notify_many(queue.loop, async_queues)
 
         except AsyncQueue.EventLoopShutdownError:
-            # This happens in the last stats loop while the generate workflow is
+            # This happens in the last loop while the generate workflow is
             # stopped, or when get_stats() or aget_stats() are not called by users
             # and therefore event loop can already be closed.
-            return False
+            logger.debug("proxy.py: EventLoopShutdownError")
         except Exception as e:
+            logger.debug(f"proxy.py: Error in _iteration_result_task: {e}")
             raise e
 
         return True  # success
+
+    def dispatch_stats_task(self) -> bool:
+        return self._iteration_result_task(self.mp_stats_queue,
+                                           self._iter_stats_result)
+
+    def dispatch_kv_cache_events_task(self) -> bool:
+        return self._iteration_result_task(self.kv_cache_events_queue,
+                                           self._iter_kv_events_result)
 
     def _start_dispatch_threads(self):
         if self.dispatch_result_thread is None:
@@ -259,6 +258,10 @@ class ExecutorBindingsProxy(GenerationExecutor):
                 weakref.WeakMethod(self.dispatch_stats_task),
                 error_queue=self._error_queue,
                 name="proxy_dispatch_stats_thread")
+            self.dispatch_kv_cache_events_thread = ManagedThread(
+                weakref.WeakMethod(self.dispatch_kv_cache_events_task),
+                error_queue=self._error_queue,
+                name="proxy_dispatch_kv_cache_events_thread")
 
             self.dispatch_result_thread.start()
 
@@ -266,6 +269,9 @@ class ExecutorBindingsProxy(GenerationExecutor):
             # is via LLM API
             if self._iter_stats_result:
                 self.dispatch_stats_thread.start()
+
+            if self._iter_kv_events_result:
+                self.dispatch_kv_cache_events_thread.start()
 
         self._handle_background_error()
 
@@ -283,19 +289,13 @@ class ExecutorBindingsProxy(GenerationExecutor):
         tracer_init_kwargs = get_tracer().init_kwargs if enable_llm_tracer(
         ) else None
         from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
-
-        rank0_extra_kwargs = {}
-        if worker_queues := worker_kwargs["worker_queues"]:
-            if isinstance(worker_queues, WorkerCommQueues):
-                rank0_extra_kwargs = {"worker_queues": worker_queues}
-                worker_kwargs["worker_queues"] = None
+        torch.cuda.Stream()
         self.mpi_futures = self.mpi_session.submit(
             worker_main,
             **worker_kwargs,
             worker_cls=self.worker_cls,
             tracer_init_kwargs=tracer_init_kwargs,
             _torch_model_class_mapping=MODEL_CLASS_MAPPING,
-            rank0_extra_kwargs=rank0_extra_kwargs,
             ready_signal=ExecutorBindingsProxy.READY_SIGNAL,
         )
         for fut in self.mpi_futures:
@@ -303,37 +303,49 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         self.workers_started = True
 
-        while not self.request_error_queue.poll(1):
+        while True:
+            if self.request_error_queue.poll(1):
+                ready_signal = self.request_error_queue.get()
+                break
+            if any(fut.done() for fut in self.mpi_futures):
+                logger.error("Executor worker died during initialization.")
+                ready_signal = RuntimeError(
+                    "Executor worker died during initialization")
+                break
             self._handle_background_error()
 
-        ready_signal = self.request_error_queue.get()
         if ready_signal != ExecutorBindingsProxy.READY_SIGNAL:
+            self.mpi_session.shutdown_abort(reason=ready_signal)
             raise ready_signal
 
     def _abort_all_requests(self):
         for result in self._results.values():
             result.abort()
 
-    def shutdown(self):
-        if enable_llm_debug():
-            try:
-                print_colored('Proxy.shutdown...\n', "yellow")
-                print_colored(str(traceback.format_exc()) + "\n", "yellow")
-            except ValueError:
-                pass
+    def pre_shutdown(self):
         if not self.workers_started:
             return
+        print_colored_debug('Proxy.pre_shutdown...\n', "yellow")
 
-        if self.doing_shutdown:
+        if self.doing_pre_shutdown:
             return
         else:
-            self.doing_shutdown = True
+            self.doing_pre_shutdown = True
 
         self._abort_all_requests()
 
-        # step1: notify the workers to quit
+        # notify the workers to quit
         if all(not f.done() for f in self.mpi_futures):
             self.request_queue.put(None)
+
+    def shutdown(self):
+        if not self.workers_started:
+            return
+
+        if not self.doing_pre_shutdown:
+            self.pre_shutdown()
+
+        print_colored_debug('Proxy.shutdown...\n', "yellow")
 
         for f in self.mpi_futures:
             try:
@@ -352,6 +364,10 @@ class ExecutorBindingsProxy(GenerationExecutor):
         ):
             self.dispatch_stats_thread.stop()
             self.dispatch_stats_thread.join()
+        if self.dispatch_kv_cache_events_thread is not None and self.dispatch_kv_cache_events_thread.is_alive(
+        ):
+            self.dispatch_kv_cache_events_thread.stop()
+            self.dispatch_kv_cache_events_thread.join()
 
         # step3: finish all remaining work
 
@@ -360,6 +376,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self.request_error_queue.close()
         self.result_queue.close()
         self.mp_stats_queue.close()
+        self.kv_cache_events_queue.close()
 
         self.workers_started = False
         self.mpi_session.shutdown()
@@ -377,11 +394,14 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self._start_dispatch_threads()
 
         request.set_id(self._get_next_client_id())
+        logprob_params = self._get_logprob_params(request)
 
         result = GenerationResult(
             request,
             background_error_handler=self._handle_background_error,
-            executor=self)
+            executor=self,
+            disaggregated_params=request.disaggregated_params,
+            logprob_params=logprob_params)
         self._results[request.id] = result
 
         self.request_queue.put(request)

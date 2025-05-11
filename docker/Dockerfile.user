@@ -1,6 +1,6 @@
 ARG BASE_IMAGE_WITH_TAG
 
-FROM ${BASE_IMAGE_WITH_TAG} as base
+FROM ${BASE_IMAGE_WITH_TAG} AS base
 
 # Alternative user
 ARG USER_ID=0

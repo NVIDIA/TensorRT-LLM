@@ -125,8 +125,8 @@ void check(T ptr, char const* const func, char const* const file, int const line
 {
     if (ptr)
     {
-        throw TllmException(
-            file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)));
+        throw TllmException(file, line,
+            fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)).c_str());
     }
 }
 
@@ -136,8 +136,8 @@ void checkEx(
 {
     if (std::all_of(std::begin(validReturns), std::end(validReturns), [&ptr](T const& t) { return t != ptr; }))
     {
-        throw TllmException(
-            file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)));
+        throw TllmException(file, line,
+            fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)).c_str());
     }
 }
 
@@ -146,42 +146,43 @@ void checkEx(
 
 inline std::optional<bool> isCudaLaunchBlocking()
 {
-    static bool firstCall = true;
-    static std::optional<bool> ptr = std::nullopt;
-
-    if (firstCall)
+    thread_local bool firstCall = true;
+    thread_local std::optional<bool> result = std::nullopt;
+    if (!firstCall)
     {
         char const* env = std::getenv("CUDA_LAUNCH_BLOCKING");
         if (env != nullptr && std::string(env) == "1")
         {
-            ptr = true;
+            result = true;
         }
-        else if (env != nullptr && std::string(env) == "0")
+        else
         {
-            ptr = false;
+            result = false;
         }
         firstCall = false;
     }
-
-    return ptr;
+    return result;
 }
 
-inline bool isCapturing()
+inline bool isCapturing(cudaStream_t stream)
 {
     cudaStreamCaptureStatus status;
-    check_cuda_error(cudaStreamIsCapturing(cudaStreamPerThread, &status));
+    check_cuda_error(cudaStreamIsCapturing(stream, &status));
     return status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive;
 }
 
-inline bool doCheckError()
+inline bool doCheckError(cudaStream_t stream)
 {
     auto const cudaLaunchBlocking = isCudaLaunchBlocking();
     if (cudaLaunchBlocking.has_value() && cudaLaunchBlocking.value())
     {
-        return !isCapturing();
+        return !isCapturing(stream);
     }
+
 #ifndef NDEBUG
-    bool const checkError = cudaLaunchBlocking.value_or(!isCapturing());
+    // Debug builds will sync when we're not capturing unless explicitly
+    // disabled.
+    bool const checkError = cudaLaunchBlocking.value_or(!isCapturing(stream));
 #else
     bool const checkError = cudaLaunchBlocking.value_or(false);
 #endif
@@ -189,16 +190,16 @@ inline bool doCheckError()
     return checkError;
 }
 
-inline void syncAndCheck(char const* const file, int const line)
+inline void syncAndCheck(cudaStream_t stream, char const* const file, int const line)
 {
-    if (doCheckError())
+    if (doCheckError(stream))
     {
-        cudaDeviceSynchronize();
+        cudaStreamSynchronize(stream);
         check(cudaGetLastError(), "cudaGetLastError", file, line);
     }
 }
 
-#define sync_check_cuda_error() tensorrt_llm::common::syncAndCheck(__FILE__, __LINE__)
+#define sync_check_cuda_error(stream) tensorrt_llm::common::syncAndCheck(stream, __FILE__, __LINE__)
 
 #define PRINT_FUNC_NAME_()                                                                                             \
     do                                                                                                                 \
@@ -676,6 +677,7 @@ __host__ __device__ inline void print_elements(T const* ptr, int nRow, int nCol,
         }
         printf("\n");
     }
+    printf("\n");
 }
 
 template <typename T>
@@ -741,6 +743,19 @@ __device__ inline void printMatrixDevice(T const* ptr, int nRow, int nCol, int n
     printf("addr=%p, sizeof(T)=%lu, nRow=%d, nStride=%d, sizeInByte=%lu\n", ptr, sizeof(T), nRow, nStride, sizeInByte);
     print_elements(ptr, nRow, nCol, nStride);
 }
+
+template __device__ void printMatrixDevice(float const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(half const* ptr, int nRow, int nCol, int nStride);
+#ifdef ENABLE_BF16
+template __device__ void printMatrixDevice(__nv_bfloat16 const* ptr, int nRow, int nCol, int nStride);
+#endif
+#ifdef ENABLE_FP8
+template __device__ void printMatrixDevice(__nv_fp8_e4m3 const* ptr, int nRow, int nCol, int nStride);
+#endif
+template __device__ void printMatrixDevice(uint32_t const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(uint64_t const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(int const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(uint8_t const* ptr, int nRow, int nCol, int nStride);
 
 #ifndef CUDA_CALL
 #define CUDA_CALL(answer)                                                                                              \
@@ -1182,8 +1197,8 @@ __forceinline__ __device__ void stas(uint64_t* p_data, uint64_t* p_barrier, uint
 }
 
 template <bool barSetTxCnt = true>
-__forceinline__ __device__ void stas(uint64_t* p_data, uint64_t* p_barrier, uint32_t ctaid, const uint32_t wrdat0,
-    const uint32_t wrdat1, const uint32_t wrdat2, const uint32_t wrdat3)
+__forceinline__ __device__ void stas(uint64_t* p_data, uint64_t* p_barrier, uint32_t ctaid, uint32_t const wrdat0,
+    uint32_t const wrdat1, uint32_t const wrdat2, uint32_t const wrdat3)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
     if (barSetTxCnt)
@@ -1359,19 +1374,6 @@ DEFINE_MEMBER_CHECKER(bias)
 DEFINE_MEMBER_CHECKER(deq)
 DEFINE_MEMBER_CHECKER(qua)
 DEFINE_MEMBER_CHECKER(high_preciecion_normed_output)
-
-template __device__ void printMatrixDevice(float const* ptr, int nRow, int nCol, int nStride);
-template __device__ void printMatrixDevice(half const* ptr, int nRow, int nCol, int nStride);
-#ifdef ENABLE_BF16
-template __device__ void printMatrixDevice(__nv_bfloat16 const* ptr, int nRow, int nCol, int nStride);
-#endif
-#ifdef ENABLE_FP8
-template __device__ void printMatrixDevice(__nv_fp8_e4m3 const* ptr, int nRow, int nCol, int nStride);
-#endif
-template __device__ void printMatrixDevice(uint32_t const* ptr, int nRow, int nCol, int nStride);
-template __device__ void printMatrixDevice(uint64_t const* ptr, int nRow, int nCol, int nStride);
-template __device__ void printMatrixDevice(int const* ptr, int nRow, int nCol, int nStride);
-template __device__ void printMatrixDevice(uint8_t const* ptr, int nRow, int nCol, int nStride);
 
 } // namespace tensorrt_llm::common
 

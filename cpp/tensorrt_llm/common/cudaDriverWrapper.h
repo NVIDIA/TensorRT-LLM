@@ -17,11 +17,13 @@
 #ifndef CUDA_DRIVER_WRAPPER_H
 #define CUDA_DRIVER_WRAPPER_H
 
-#include "tensorrt_llm/common/assert.h"
-#include <cstdio>
+#include "tensorrt_llm/common/stringUtils.h"
+#include "tensorrt_llm/common/tllmException.h"
+
 #include <cuda.h>
+
+#include <cstdio>
 #include <memory>
-#include <mutex>
 
 namespace tensorrt_llm::common
 {
@@ -39,7 +41,7 @@ public:
 
     CUresult cuGetErrorName(CUresult error, char const** pStr) const;
 
-    CUresult cuGetErrorMessage(CUresult error, char const** pStr) const;
+    CUresult cuGetErrorString(CUresult error, char const** pStr) const;
 
     CUresult cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attrib, int value) const;
 
@@ -83,12 +85,14 @@ public:
 
     CUresult cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevice dev) const;
 
+    CUresult cuOccupancyMaxActiveClusters(int* maxActiveClusters, CUfunction f, CUlaunchConfig const* config) const;
+
 private:
     void* handle;
     CUDADriverWrapper();
 
     CUresult (*_cuGetErrorName)(CUresult, char const**);
-    CUresult (*_cuGetErrorMessage)(CUresult, char const**);
+    CUresult (*_cuGetErrorString)(CUresult, char const**);
     CUresult (*_cuFuncSetAttribute)(CUfunction, CUfunction_attribute, int);
     CUresult (*_cuLinkComplete)(CUlinkState, void**, size_t*);
     CUresult (*_cuModuleUnload)(CUmodule);
@@ -112,6 +116,7 @@ private:
         CUtensorMapSwizzle swizzle, CUtensorMapL2promotion l2Promotion, CUtensorMapFloatOOBfill oobFill);
     CUresult (*_cuMemcpyDtoH)(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount);
     CUresult (*_cuDeviceGetAttribute)(int*, CUdevice_attribute attrib, CUdevice dev);
+    CUresult (*_cuOccupancyMaxActiveClusters)(int*, CUfunction f, CUlaunchConfig const* config);
 };
 
 template <typename T>
@@ -121,11 +126,11 @@ void checkDriver(
     if (result)
     {
         char const* errorName = nullptr;
-        char const* errorMsg = nullptr;
+        char const* errorString = nullptr;
         wrap.cuGetErrorName(result, &errorName);
-        wrap.cuGetErrorMessage(result, &errorMsg);
-        throw TllmException(
-            file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA driver error in %s: %s: %s", func, errorName, errorMsg));
+        wrap.cuGetErrorString(result, &errorString);
+        throw TllmException(file, line,
+            fmtstr("[TensorRT-LLM][ERROR] CUDA driver error in %s: %s: %s.", func, errorName, errorString).c_str());
     }
 }
 

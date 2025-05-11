@@ -1,9 +1,12 @@
-from dataclasses import dataclass
-from typing import List, Literal, Optional, Union
+from dataclasses import dataclass, field
+from typing import List, Literal, Optional, Tuple, Union
 
+from .._utils import nvtx_range_debug
 from ..executor import (DetokenizedGenerationResultBase, GenerationResult,
                         GenerationResultBase)
 from ..executor.postproc_worker import PostprocArgs
+from ..llmapi.reasoning_parser import (BaseReasoningParser,
+                                       ReasoningParserFactory)
 from ..llmapi.tokenizer import TransformersTokenizer
 # yapf: disable
 from .openai_protocol import (ChatCompletionLogProbs,
@@ -18,7 +21,8 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               CompletionResponseChoice,
                               CompletionResponseStreamChoice,
                               CompletionStreamResponse, DeltaMessage,
-                              FunctionCall, StreamOptions, ToolCall, UsageInfo)
+                              FunctionCall, StreamOptions, ToolCall, UsageInfo,
+                              to_disaggregated_params)
 
 # yapf: enale
 
@@ -34,6 +38,9 @@ class ChatPostprocArgs(PostprocArgs):
     return_logprobs: bool = False
     stream_options: Optional[StreamOptions] = None
     last_message_content: Optional[str] = None
+    reasoning_parser: Optional[str] = None
+    reasoning_parser_dict: dict[int, BaseReasoningParser] = field(
+        default_factory=dict)
 
     @classmethod
     def from_request(cls, request: ChatCompletionRequest):
@@ -68,6 +75,28 @@ def create_logprobs(token_ids: List[int],
     return chat_logprobs
 
 
+def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str, streaming: bool) -> Tuple[bool, str, str]:
+    reasoning_parser = None
+    if args.reasoning_parser is not None:
+        if output_index not in args.reasoning_parser_dict:
+            args.reasoning_parser_dict[output_index] = ReasoningParserFactory.create_reasoning_parser(
+                args.reasoning_parser)
+        reasoning_parser = args.reasoning_parser_dict[output_index]
+
+    in_reasoning = False
+    if reasoning_parser is not None:
+        if not streaming:
+            result = reasoning_parser.parse(text)
+        else:
+            result = reasoning_parser.parse_delta(text)
+        in_reasoning, content, reasoning_content = result.in_reasoning, result.content, result.reasoning_content
+    else:
+        in_reasoning, content, reasoning_content = False, text, None
+
+    return in_reasoning, content, reasoning_content
+
+
+@nvtx_range_debug("chat_stream_post_processor")
 def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs) -> List[str]:
 
     def yield_first_chat(num_tokens: int,
@@ -85,7 +114,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs
             chunk.usage = UsageInfo(prompt_tokens=num_tokens,
                                     total_tokens=num_tokens,
                                     completion_tokens=0)
-        data = chunk.model_dump_json(exclude_unset=True)
+        data = chunk.model_dump_json(exclude_none=True)
         return data
 
     res: List[str] = []
@@ -111,6 +140,10 @@ def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs
             continue
 
         delta_text = output.text_diff
+
+        in_reasoning, delta_text, reasoning_delta_text = apply_reasoning_parser(
+            args, i, delta_text, True)
+
         if args.tool_choice and type(
                 args.tool_choice) is ChatCompletionNamedToolChoiceParam:
             delta_message = DeltaMessage(tool_calls=[
@@ -118,7 +151,12 @@ def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs
                     name=args.tool_choice.function.name, arguments=delta_text))
             ])
         else:
-            delta_message = DeltaMessage(content=delta_text)
+            if in_reasoning:
+                delta_message = DeltaMessage(
+                    reasoning_content=reasoning_delta_text)
+            else:
+                delta_message = DeltaMessage(
+                    content=delta_text, reasoning_content=reasoning_delta_text)
 
         choice = ChatCompletionResponseStreamChoice(index=i,
                                                     delta=delta_message,
@@ -136,7 +174,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs
             chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
                                     completion_tokens=output.length,
                                     total_tokens=output.length + prompt_tokens)
-        data = chunk.model_dump_json(exclude_unset=True)
+        data = chunk.model_dump_json(exclude_none=True)
         res.append(f"data: {data}\n\n")
 
     if include_usage and rsp._done:
@@ -155,10 +193,14 @@ def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs
     return res
 
 
+@nvtx_range_debug("chat_response_post_processor")
 def chat_response_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs) -> ChatCompletionResponse:
     choices: List[ChatCompletionResponseChoice] = []
     role = args.role
     for output in rsp.outputs:
+        _, text, reasoning_text = apply_reasoning_parser(
+            args, output.index, output.text, False)
+
         if args.tool_choice and isinstance(
                 args.tool_choice,
                 ChatCompletionNamedToolChoiceParam):
@@ -168,15 +210,20 @@ def chat_response_post_processor(rsp: GenerationResultBase, args: ChatPostprocAr
                 tool_calls=[
                     ToolCall(function=FunctionCall(
                         name=args.tool_choice.function.name,
-                        arguments=output.text))
+                        arguments=text))
                 ])
         else:
-            message = ChatMessage(role=role, content=output.text)
+            if text is None:
+                text = ""
+            message = ChatMessage(
+                role=role, content=text, reasoning_content=reasoning_text)
+        disaggregated_params = to_disaggregated_params(output.disaggregated_params)
         choice = ChatCompletionResponseChoice(
             index=output.index,
             message=message,
             finish_reason=output.finish_reason,
             stop_reason=output.stop_reason,
+            disaggregated_params=disaggregated_params,
         )
 
         if args.return_logprobs:
@@ -211,6 +258,7 @@ class CompletionPostprocArgs(PostprocArgs):
     num_choices: int = 1
     prompt_idx: int = 0
     prompt: Optional[str] = None
+    stream_options: Optional[StreamOptions] = None
 
     @classmethod
     def from_request(cls, request: CompletionRequest):
@@ -218,11 +266,21 @@ class CompletionPostprocArgs(PostprocArgs):
             echo=request.echo,
             model=request.model,
             num_choices=request.n if request.n else 1,
+            stream_options=request.stream_options,
         )
 
 
+@nvtx_range_debug("completion_stream_post_processor")
 def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase, args: CompletionPostprocArgs) -> List[str]:
     res: List[str] = []
+    prompt_tokens = args.num_prompt_tokens
+    if stream_option := args.stream_options:
+        include_usage = stream_option.include_usage
+        include_continuous_usage = include_usage and stream_option.continuous_usage_stats
+    else:
+        include_usage = False
+        include_continuous_usage = False
+
     for output in rsp.outputs:
         delta_text = output.text_diff
         if args.echo and args.first_iteration:
@@ -234,12 +292,31 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase, args:
             stop_reason = output.stop_reason,
         )
         chunk = CompletionStreamResponse(model=args.model, choices=[choice])
+        if include_continuous_usage:
+            chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
+                                    completion_tokens=output.length,
+                                    total_tokens=output.length + prompt_tokens)
         data = chunk.model_dump_json(exclude_unset=False)
         res.append(f"data: {data}\n\n")
+
+    if include_usage and rsp._done:
+        completion_tokens = sum(output.length
+                                for output in rsp.outputs)
+        final_usage = UsageInfo(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        )
+
+        final_usage_chunk = ChatCompletionStreamResponse(
+            choices=[], model=args.model, usage=final_usage)
+        final_usage_data = final_usage_chunk.model_dump_json()
+        res.append(f"data: {final_usage_data}\n\n")
     args.first_iteration = False
     return res
 
 
+@nvtx_range_debug("completion_response_post_processor")
 def completion_response_post_processor(rsp: GenerationResult, args: CompletionPostprocArgs) -> CompletionResponse:
     prompt_tokens = args.num_prompt_tokens
     completion_tokens = 0
@@ -248,12 +325,12 @@ def completion_response_post_processor(rsp: GenerationResult, args: CompletionPo
         text = output.text
         if args.echo:
             text = args.prompt + text
-        disaggregated_params = CompletionResponseChoice.to_disaggregated_params(
-            output.disaggregated_params)
+        disaggregated_params = to_disaggregated_params(output.disaggregated_params)
         choice = CompletionResponseChoice(
             text=text,
             index=args.prompt_idx * args.num_choices + output.index,
             disaggregated_params=disaggregated_params,
+            context_logits=None if rsp.context_logits is None else rsp.context_logits.tolist(),
             stop_reason=output.stop_reason,
             finish_reason=output.finish_reason,
         )

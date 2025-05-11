@@ -206,7 +206,7 @@ int LookupPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1:
                 output, input, weight, tokenNum, offset, localVocabSize, hidden, nullptr, stream);
         }
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     return 0;
 }

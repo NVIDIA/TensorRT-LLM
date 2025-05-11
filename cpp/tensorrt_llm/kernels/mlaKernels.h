@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include <assert.h>
+#include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -27,6 +28,8 @@ namespace tensorrt_llm
 namespace kernels
 {
 
+enum class KvCacheDataType;
+
 struct MlaMetaParams
 {
     int32_t q_lora_rank = 0;
@@ -34,18 +37,22 @@ struct MlaMetaParams
     int32_t qk_nope_head_dim = 0;
     int32_t qk_rope_head_dim = 0;
     int32_t v_head_dim = 0;
+    int32_t predicted_tokens_per_seq = 1;
+    int32_t num_layers = 0;
 
     auto data() const
     {
-        return std::make_tuple(q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim);
+        return std::make_tuple(q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim,
+            predicted_tokens_per_seq, num_layers);
     }
 };
 
 template <typename T>
 struct MlaParams
 {
-    T const* latent_cache;       // cKV + k_pe
-    T* attention_input_buf;      // [b, s, 3, h, d_h + r]
+    T const* latent_cache;  // cKV + k_pe
+    T* attention_input_buf; // [b, s, 3, h, d_h + r]
+    void* quant_attention_input_buf;
     T* context_buf;
     T* q_pe;                     // [b, h, d_r], strided
 
@@ -63,6 +70,17 @@ struct MlaParams
     int32_t q_pe_ld;
     int32_t q_pe_stride;
     MlaMetaParams meta;
+    int const* block_ids_per_seq;
+    KvCacheDataType cache_type;
+    // Scales for mla quantization
+    float* bmm1_scale;
+    float* bmm2_scale;
+    float const* quant_scale_o;
+    float const* quant_scale_q;
+    float const* quant_scale_kv;
+    float const* dequant_scale_q;
+    float const* dequant_scale_kv;
+    float host_bmm1_scale;
 };
 
 template <typename T, typename KVCacheBuffer>

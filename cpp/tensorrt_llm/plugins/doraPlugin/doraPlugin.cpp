@@ -303,7 +303,7 @@ int32_t DoraPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer
         tensorrt_llm::common::cudaAutoCpy((int8_t*) outputs[0], (int8_t*) inputTensor, numel * elemSize, stream);
     }
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     return 0;
 }
 

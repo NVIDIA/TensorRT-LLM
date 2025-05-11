@@ -1,0 +1,3 @@
+datasets==3.1.0
+evaluate~=0.4.1
+rouge_score~=0.1.2

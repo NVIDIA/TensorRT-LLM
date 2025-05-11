@@ -68,6 +68,7 @@ def main():
             print(
                 f"Prompt: {output.prompt!r}, Generated text: {output.outputs[0].text!r}"
             )
+        llm.shutdown()
 
     # Got output like
     # Prompt: 'Hello, my name is', Generated text: 'Jane Smith. I am a resident of the city. Can you tell me more about the public services provided in the area?'

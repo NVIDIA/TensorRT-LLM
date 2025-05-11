@@ -11,7 +11,7 @@ def main():
     ]
     sampling_params = SamplingParams(max_tokens=32)
 
-    llm = LLM(model='meta-llama/Llama-3.1-8B-Instruct')
+    llm = LLM(model='TinyLlama/TinyLlama-1.1B-Chat-v1.0')
     outputs = llm.generate(prompts, sampling_params)
 
     for i, output in enumerate(outputs):

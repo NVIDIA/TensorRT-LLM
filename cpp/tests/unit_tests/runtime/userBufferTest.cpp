@@ -38,8 +38,8 @@ TEST(UserBuffer, basic)
     tr::ub::ub_initialize(world_size);
     EXPECT_EQ(tr::ub::ub_is_initialized(), true);
     EXPECT_NE(tr::ub::ub_comm(), nullptr);
-    void* p0 = tr::ub::ub_allocate(0, 1024);
-    void* p1 = tr::ub::ub_allocate(1, 1024);
+    void* p0 = tr::ub::ub_allocate(1024).addr;
+    void* p1 = tr::ub::ub_allocate(1024).addr;
     EXPECT_NE(p0, nullptr);
     EXPECT_NE(p1, nullptr);
     EXPECT_EQ(tr::ub::ub_get(0).invalid(), false);

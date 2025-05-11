@@ -28,9 +28,25 @@ class CachedSequenceInterface:
         return (*self.info.args, *self._caches.values())
 
     @property
+    def args_original(self) -> Tuple[torch.Tensor, ...]:
+        """Return the original graph arguments expected by the model."""
+        return self.info.args_original
+
+    @property
     def dynamic_shapes(self) -> Tuple[Dict[int, Any], ...]:
         """Return the dynamic shapes of all graph arguments owned by this interface (all static)."""
         return self.info.dynamic_shapes + ({},) * len(self._caches)
+
+    @property
+    def original_dynamic_shapes(self) -> Tuple[Dict[int, Any], ...]:
+        """Return the dynamic shapes of the original graph arguments."""
+        return self.info.original_dynamic_shapes
+
+    def to(self, *args, **kwargs) -> None:
+        self.info.to(*args, **kwargs)
+        if self._caches:
+            for cache in self._caches.values():
+                cache.to(*args, **kwargs)
 
     def add_cache(self, name: str, get_cache: GetCacheCallable) -> None:
         """Add a cache initializer to the cache interface."""
@@ -45,12 +61,35 @@ class CachedSequenceInterface:
             name: get_cache(self.info) for name, get_cache in self._cache_initializers.items()
         }
 
+    def current_cache_size_bytes(self) -> int:
+        """Calculate and return the total size of all caches in bytes."""
+        total_size = 0
+        for name, cache in self._caches.items():
+            # this hack is needed since _caches also contains global buffers such as freqs_cis.
+            if "cache" in name:
+                total_size += cache.element_size() * cache.numel()
+        return total_size
+
+    def resize_cache(self, new_num_pages: int):
+        """Resize the cache to the new number of pages."""
+        # TODO: We should do some sanity check on the new number of pages.
+        self.info.num_pages = new_num_pages
+        for name, cache in self._caches.items():
+            # We assume cache is a tensor of shape (max_batch_size, page_size, n_heads, head_dim)
+            if "cache" in name:
+                current_shape = cache.shape
+                new_shape = (new_num_pages, *current_shape[1:])
+                cache.resize_(new_shape)
+
 
 GetInferenceModel = Callable[[CachedSequenceInterface], nn.Module]
 
 
 @dataclass
 class AutoDeployConfig(PyTorchConfig):
+    # model factory to choose from
+    model_factory: str = "hf"  # only 'hf' supported for "trtllm" runtime
+
     ### MODEL EXTRA KWARGS ###
     # Extra kwargs for the model config class to customize the model config. Those arguments will
     # take precedence over the default values or config values in the model config file in the HF
@@ -68,6 +107,7 @@ class AutoDeployConfig(PyTorchConfig):
 
     # attention backend to choose from
     attn_backend: str = "TritonWithFlattenedInputs"
+    mla_backend: str = "MultiHeadLatentAttention"
 
     # check if we should skip loading weights
     skip_loading_weights: bool = False

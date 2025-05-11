@@ -1,0 +1,10 @@
+-f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+-c ../../../constraints.txt
+tensorrt_llm>=0.0.0.dev0
+datasets==3.1.0
+evaluate
+rouge_score
+sentencepiece==0.2.0
+jax[cuda12-pip]==0.4.29
+jaxlib[cuda12-pip]==0.4.29
+dm_haiku==0.0.12

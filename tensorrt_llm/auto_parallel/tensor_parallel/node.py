@@ -205,7 +205,7 @@ class Node(ABC):
             strategies_vector.remove(strategy)
 
     def _post_process(self, strategies_vector):
-        # TODO:[KDuan] deal with transpose and dimension 1 problem in ClossalAI, which have been processed before
+        # TODO: deal with transpose and dimension 1 problem in ClossalAI, which have been processed before
         for i in range(len(strategies_vector) - 1, -1, -1):
             if strategies_vector[i] is None:
                 strategies_vector.pop(i)
@@ -221,7 +221,7 @@ class Node(ABC):
     def _model_sharding_cost_from_s_curve(self, strategy,
                                           device_mesh: LogicalDeviceMesh):
         '''
-        [ToDo][KDuan] preprofile the s_curve
+        [ToDo] preprofile the s_curve
         '''
         sharding_cost = 0.0
         return sharding_cost

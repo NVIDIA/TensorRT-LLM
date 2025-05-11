@@ -119,7 +119,7 @@ class Convert(RunCMDMixin):
     def command(self):
         args = self.args
         return [
-            f'python examples/enc_dec/convert_checkpoint.py',
+            f'python examples/models/core/enc_dec/convert_checkpoint.py',
             f'--model_type {args.model_type}',
             f'--model_dir {args.hf_models_dir}',
             f'--output_dir {args.trt_models_dir}',

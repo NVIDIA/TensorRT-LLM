@@ -27,11 +27,8 @@ def build_cpp_examples(build_dir: PathLike, trt_dir: PathLike,
     # Convert input paths to pathlib.Path objects
     build_dir = Path(build_dir)
     trt_dir = Path(trt_dir)
-    trt_include_dir = trt_dir / "include"
-    trt_lib_dir = trt_dir / "lib"
 
-    assert trt_include_dir.is_dir()
-    assert trt_lib_dir.is_dir()
+    assert trt_dir.is_dir()
 
     def cmake_parse(path: PathLike) -> str:
         return str(path).replace("\\", "/")
@@ -49,9 +46,12 @@ def build_cpp_examples(build_dir: PathLike, trt_dir: PathLike,
         # Run CMake with the specified TensorRT directories
         generator = ["-GNinja"] if platform.system() == "Windows" else []
         generate_command = [
-            'cmake', '-S', '..', '-B', '.',
-            f'-DTRT_LIB_DIR={cmake_parse(trt_lib_dir)}',
-            f'-DTRT_INCLUDE_DIR={cmake_parse(trt_include_dir)}'
+            'cmake',
+            '-S',
+            '..',
+            '-B',
+            '.',
+            f'-DTensorRT_ROOT={cmake_parse(trt_dir)}',
         ] + generator
         logging.info(f"Executing {generate_command}")
         subprocess.run(generate_command, check=True)

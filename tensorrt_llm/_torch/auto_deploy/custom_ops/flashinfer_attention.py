@@ -1,15 +1,20 @@
 from dataclasses import dataclass, fields
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import flashinfer
 import torch
+from torch._ops import OpOverloadPacket
+from torch._subclasses import FakeTensor
+from torch.fx import Node
 
 from ..utils.cuda_graph import cuda_graph_state
+from ..utils.logger import ad_logger
 from .attention_interface import (
     AttentionDescriptor,
-    AttentionInfo,
+    AttentionLayout,
     AttentionRegistry,
     BufferInitializerDict,
+    CacheConfig,
     CacheInitializerDict,
     Constant,
     MHACallable,
@@ -30,10 +35,8 @@ class PlanParams:
     page_size: int
     q_dtype: torch.dtype
     kv_dtype: torch.dtype
+    sm_scale: Optional[float] = None
 
-    pos_embd_mode: Literal["NONE", "ROPE_LLAMA", "ALIBI"] = "NONE"
-    rope_theta: Optional[float] = None
-    rope_scale: Optional[float] = None
     causal: bool = True
 
     def __hash__(self):
@@ -67,8 +70,13 @@ class _FlashInferPlanner:
         self.__init__()  # reset all state
 
         self.workspace_buffer = workspace_buffer
+        # NOTE (lucaslie): flashinfer fa3 backend has accuracy issue + illegal memory access issues
+        # on H100 PCIe, see https://github.com/NVIDIA/TensorRT-LLM/pull/3686 and
+        # https://github.com/flashinfer-ai/flashinfer/issues/924
         self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            self.workspace_buffer, "NHD"
+            self.workspace_buffer,
+            "NHD",
+            backend="fa2",
         )
         self.decode_wrapper = self._init_decode_wrapper()
 
@@ -96,10 +104,9 @@ class _FlashInferPlanner:
                 plan_params.n_kv_heads,
                 plan_params.head_dim,
                 plan_params.page_size,
-                pos_encoding_mode=plan_params.pos_embd_mode,
-                rope_theta=plan_params.rope_theta,
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
+                sm_scale=plan_params.sm_scale,
             )
 
         # we want to plan during warm-up of cuda graph capture to ensure we have the plan cached
@@ -133,10 +140,9 @@ class _FlashInferPlanner:
                     plan_params.head_dim,
                     plan_params.page_size,
                     causal=plan_params.causal,
-                    pos_encoding_mode=plan_params.pos_embd_mode,
-                    rope_theta=plan_params.rope_theta,
                     q_data_type=plan_params.q_dtype,
                     kv_data_type=plan_params.kv_dtype,
+                    sm_scale=plan_params.sm_scale,
                 )
             self.plan_params = plan_params
 
@@ -150,6 +156,7 @@ _GlobalFlashInferPlanner = _FlashInferPlanner()
 @torch.library.custom_op("attention::prepare_flashinfer_metadata", mutates_args=())
 def prepare_flashinfer_metadata(
     input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
@@ -184,21 +191,39 @@ def prepare_flashinfer_metadata(
 
     paged_kv_last_page_len = ((offsets + seq_len - 1) % page_size) + 1
 
+    # Compute batch_indices and positions so that they can be reused for kv cache appends
+    # for all the layers
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(paged_kv_indptr, paged_kv_last_page_len, page_size),
+        position_ids.numel(),
+    )
+
     # return metadata
-    return (qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, offsets)
+    return (
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        batch_indices,
+        positions,
+    )
 
 
 @prepare_flashinfer_metadata.register_fake
 def prepare_flashinfer_metadata_fake(
-    input_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
+    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
 ):
     qo_indptr = torch.empty(len(seq_len) + 1, dtype=seq_len.dtype, device=seq_len.device)
+    batch_indices = torch.empty_like(cache_loc)
+    positions = torch.empty_like(cache_loc)
     return (
         qo_indptr,  # qo_indptr
         torch.empty_like(qo_indptr),  # paged_kv_indptr
         torch.empty_like(cache_loc),  # paged_kv_indices
         torch.empty_like(seq_len),  # paged_kv_last_page_len
-        torch.empty_like(input_pos),  # offsets
+        batch_indices,  # batch_indices
+        positions,  # positions
     )
 
 
@@ -213,27 +238,29 @@ def flashinfer_mha_with_cache(
     paged_kv_indptr: torch.Tensor,
     paged_kv_indices: torch.Tensor,
     paged_kv_last_page_len: torch.Tensor,
-    offsets: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     # BUFFERS
     workspace_buffer: torch.Tensor,
     # CONSTANTS
-    fuse_rope: bool,
-    rope_theta: Optional[float],
+    scale: Optional[float],
     k_scale: float,
     v_scale: float,
 ) -> torch.Tensor:
-    b, s, d = q.shape
+    # reshape to standard [b*s, n_heads, head_dim] layout
     head_dim = k_cache.shape[-1]
-    n_heads = q.shape[2] // head_dim
-    n_kv_heads = k.shape[2] // head_dim
+    q_shape_og = q.shape
+    b, s = q_shape_og[:2]
 
-    bs_view = (b * s,)
-    q = q.view(*bs_view, n_heads, head_dim)
-    k = k.view(*bs_view, n_kv_heads, head_dim)
-    v = v.view(*bs_view, n_kv_heads, head_dim)
+    q = q.contiguous().view(b * s, -1, head_dim)
+    k = k.contiguous().view(b * s, -1, head_dim)
+    v = v.contiguous().view(b * s, -1, head_dim)
+
+    n_heads = q.shape[1]
+    n_kv_heads = k.shape[1]
 
     pp = PlanParams(
         n_heads=n_heads,
@@ -244,26 +271,14 @@ def flashinfer_mha_with_cache(
         page_size=k_cache.shape[1],
         q_dtype=q.dtype,
         kv_dtype=k_cache.dtype,
-        pos_embd_mode="ROPE_LLAMA" if fuse_rope else "NONE",
-        rope_theta=rope_theta,
+        sm_scale=scale,
     )
-
-    # TODO: Get flashinfer fuse_rope working with fp8 kv cache (https://github.com/flashinfer-ai/flashinfer/issues/661)
-    if rope_theta is not None:
-        q, k = flashinfer.apply_rope(q, k, qo_indptr, offsets, rope_theta=rope_theta)
 
     # Assuming k_scale = v_scale = 1.0, we just have to cast k and v to fp8 before appending to kv cache
     k_scale, v_scale = 1.0, 1.0
     if k_cache.dtype == torch.float8_e4m3fn:
         k = (k / k_scale).to(torch.float8_e4m3fn)
         v = (v / v_scale).to(torch.float8_e4m3fn)
-
-    # Append to kv cache
-    batch_indices, positions = flashinfer.get_batch_indices_positions(
-        qo_indptr,
-        flashinfer.get_seq_lens(paged_kv_indptr, paged_kv_last_page_len, pp.page_size),
-        bs_view[0],
-    )
 
     flashinfer.page.append_paged_kv_cache(
         k,
@@ -286,7 +301,7 @@ def flashinfer_mha_with_cache(
     )
     y = wrapper.run(q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale)
 
-    return y.view(b, s, d)  # [b,s,n*h_d]
+    return y.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
 
 
 @flashinfer_mha_with_cache.register_fake
@@ -300,15 +315,15 @@ def flashinfer_mha_with_cache_fake(
     paged_kv_indptr: torch.Tensor,
     paged_kv_indices: torch.Tensor,
     paged_kv_last_page_len: torch.Tensor,
-    offsets: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     # BUFFERS
     workspace_buffer: torch.Tensor,
     # CONSTANTS
-    fuse_rope: bool,
-    rope_theta: Optional[float],
+    scale: Optional[float],
     k_scale: float,
     v_scale: float,
 ) -> torch.Tensor:
@@ -318,46 +333,87 @@ def flashinfer_mha_with_cache_fake(
 @AttentionRegistry.register("FlashInfer")
 class FlashInferAttention(AttentionDescriptor):
     @classmethod
-    def is_paged(cls) -> bool:
+    def _get_planner(cls) -> _FlashInferPlanner:
+        return _GlobalFlashInferPlanner
+
+    @classmethod
+    def is_paged(cls):
         """Return if the attention op is paged or not."""
         return True
 
     @classmethod
-    def get_attention_op(cls) -> MHACallable:
+    def get_attention_layout(cls) -> AttentionLayout:
+        """Get the attention layout expected by the backend."""
+        return "bsnd"
+
+    @classmethod
+    def get_num_qkv_args(cls) -> int:
+        """Get the number of qkv arguments expected by the source op."""
+        return 3
+
+    @classmethod
+    def get_source_attention_op(cls) -> OpOverloadPacket:
+        """Get the source attention op that we target for replacement."""
+        return torch.ops.attention.bsnd_grouped_sdpa
+
+    @classmethod
+    def get_cached_attention_op(cls) -> MHACallable:
         return torch.ops.attention.flashinfer_mha_with_cache
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        return torch.ops.attention.prepare_flashinfer_metadata, 5
+        return torch.ops.attention.prepare_flashinfer_metadata, 6
 
     @classmethod
-    def get_cache_initializers(cls, attention_info: AttentionInfo) -> CacheInitializerDict:
+    def get_cache_initializers(
+        cls, source_attn_node: Node, cache_config: CacheConfig
+    ) -> CacheInitializerDict:
+        # source op is [bsnd] layout already
+        k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
+        num_kv_heads = k_fake.shape[2]
+        head_dim = k_fake.shape[3]
+
         def _get_cache(si: SequenceInfo):
             return torch.empty(
                 si.num_pages,
                 si.page_size,
-                attention_info.num_kv_heads,
-                attention_info.head_dim,
+                num_kv_heads,
+                head_dim,
                 device=si.device,
-                dtype=attention_info.cache_dtype or attention_info.dtype,
+                dtype=cache_config.dtype or k_fake.dtype,
             )
 
         return {"k_cache": _get_cache, "v_cache": _get_cache}
 
     @classmethod
-    def get_global_buffer_initializers(cls, attention_info) -> BufferInitializerDict:
+    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
         def _init_workspace(si: SequenceInfo) -> torch.Tensor:
-            buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=si.device)
-            _GlobalFlashInferPlanner.init_workspace(buffer)
+            # NOTE (lucaslie): avoid OOM for many cudagraphs,
+            # see https://github.com/NVIDIA/TensorRT-LLM/pull/3686
+            buffer = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device=si.device)
+            cls._get_planner().init_workspace(buffer)
             return buffer
 
         return {"workspace_buffer": _init_workspace}
 
     @classmethod
-    def get_constants(cls, attention_info) -> List[Constant]:
+    def get_constants(cls, source_attn_node: Node) -> List[Constant]:
+        # Double check other arguments
+        attn_mask, dropout_p, is_causal = source_attn_node.args[3:6]
+        if attn_mask is not None or dropout_p != 0.0 or not is_causal:
+            ad_logger.warning(
+                "Unsupported attention arguments for "
+                f"{source_attn_node=}: {attn_mask=}, {dropout_p=}, {is_causal=}"
+            )
+
+        # Get scale from args or kwargs
+        if len(source_attn_node.args) > 6:
+            scale = source_attn_node.args[6]
+        else:
+            scale = source_attn_node.kwargs.get("scale", None)
+
         return [
-            False,  # fuse_rope
-            attention_info.rope_theta,  # rope_theta
+            scale,  # softmax scale
             1.0,  # k_scale
             1.0,  # v_scale
         ]

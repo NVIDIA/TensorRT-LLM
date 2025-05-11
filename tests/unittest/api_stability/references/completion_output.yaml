@@ -1,0 +1,23 @@
+methods:
+  __init__:
+    parameters:
+      cumulative_logprob:
+        annotation: Optional[float]
+        default: null
+      disaggregated_params:
+        annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
+        default: null
+    return_annotation: None
+properties:
+  length:
+    annotation: int
+    default: inspect._empty
+  logprobs_diff:
+    annotation: List[float]
+    default: inspect._empty
+  text_diff:
+    annotation: str
+    default: inspect._empty
+  token_ids_diff:
+    annotation: List[int]
+    default: inspect._empty

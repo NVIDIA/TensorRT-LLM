@@ -4,13 +4,15 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch._prims_common import DeviceLikeType
 
+from tensorrt_llm._utils import nvtx_range
+
 from ...._utils import mpi_rank, mpi_world_size
 from ....bindings.executor import ExecutorConfig
 from ....bindings.internal.batch_manager import CacheType
 from ....mapping import Mapping
+from ...distributed import MPIDist
 from ...pyexecutor.config import PyTorchConfig
 from ...pyexecutor.decoder import TorchDecoder
-from ...pyexecutor.distributed import MPIDist
 from ...pyexecutor.model_engine import ModelEngine
 from ...pyexecutor.py_executor import PyExecutor
 from ...pyexecutor.resource_manager import KVCacheManager, ResourceManager
@@ -47,7 +49,6 @@ class _CacheManagerWithFakePool(KVCacheManager):
             kv_cache_config=kv_cache_config,
             kv_cache_type=CacheType.SELF,
             num_layers=1,
-            num_heads=1,
             num_kv_heads=1,
             head_dim=0,
             tokens_per_block=tokens_per_block,
@@ -57,12 +58,13 @@ class _CacheManagerWithFakePool(KVCacheManager):
         )
 
     def calculate_max_num_blocks(
-        self, kv_cache_config, head_dim, tokens_per_block, mapping, dtype
+        self, kv_cache_config, head_dim, tokens_per_block, mapping, dtype, kv_factor
     ) -> Tuple[int, int]:
         """Calculate the maximum number of blocks needed for the cache."""
-        # TODO (lliebenwein): this is VERY hacky... Ideally, we want to compute the number of blocks
+        # TODO: this is VERY hacky... Ideally, we want to compute the number of blocks
         # just like in the original implementation. However, let's wait for the layer-wise attention
         # implementation before over-optimizing the function here
+        ad_logger.info("Using fake cache manager with head_dim=0 and num pages:", self.num_blocks)
         return self.num_blocks, 0
 
 
@@ -87,24 +89,17 @@ class ADEngine(ModelEngine):
         device: DeviceLikeType,
     ):
         """Build the ADEngine using the AutoDeployConfig that gets passed through from the LLM."""
+
         # construct model factory
         model_kwargs = {"max_position_embeddings": seq_info.max_seq_len, **ad_config.model_kwargs}
-        factory = ModelFactoryRegistry.get("hf")(
+        factory = ModelFactoryRegistry.get(ad_config.model_factory)(
             model=model,
             model_kwargs=model_kwargs,
             skip_loading_weights=ad_config.skip_loading_weights,
         )
 
         # construct inference optimizer
-        # TODO (lliebenwein): let's split up the compile backend to separately handle cuda graph
-        # and torch compile so we can follow the PyTorchConfig here and enable it separately.
-        if ad_config.use_cuda_graph or ad_config.torch_compile_enabled:
-            compile_backend = "torch-opt"
-        else:
-            compile_backend = "torch-simple"
-        build_and_optimize = InferenceOptimizer(
-            factory=factory, attn_backend=ad_config.attn_backend, compile_backend=compile_backend
-        )
+        build_and_optimize = InferenceOptimizer(factory=factory, ad_config=ad_config)
 
         # construct engine
         engine = cls(build_and_optimize, seq_info, device)
@@ -143,6 +138,7 @@ class ADEngine(ModelEngine):
         # start fresh with fixed seed
         torch.manual_seed(1234)
 
+    @nvtx_range("ad_prepare_inputs")
     def _prepare_inputs(
         self, scheduled_requests: ScheduledRequests, resource_manager: ResourceManager
     ) -> bool:
@@ -261,7 +257,8 @@ def create_autodeploy_executor(
     max_batch_size = executor_config.max_batch_size
     max_seq_len = executor_config.max_seq_len
     tokens_per_block = executor_config.tokens_per_block
-    ad_logger.info(f"{max_seq_len=}, {max_batch_size=}, {tokens_per_block=}")
+    max_num_tokens = executor_config.max_num_tokens
+    ad_logger.info(f"{max_seq_len=}, {max_batch_size=}, {tokens_per_block=}, {max_num_tokens=}")
 
     # initialize model engine
     engine = ADEngine.build_from_config(
@@ -271,6 +268,7 @@ def create_autodeploy_executor(
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
             page_size=tokens_per_block,
+            max_num_tokens=max_num_tokens,
         ),
         device="cuda",
     )
@@ -305,5 +303,10 @@ def create_autodeploy_executor(
         decoder=decoder,
         dist=mpi_dist,
         enable_overlap_scheduler=py_config.enable_overlap_scheduler,
+        max_input_len=executor_config.max_input_len,
+        max_batch_size=executor_config.max_batch_size,
+        max_draft_tokens=executor_config.speculative_config.max_draft_tokens
+        if executor_config.speculative_config is not None
+        else 0,
     )
     return py_executor

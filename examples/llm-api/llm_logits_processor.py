@@ -9,7 +9,7 @@ from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
 
 
 # The recommended way to create a customized logits processor:
-#     * Subclass this class and implement the processing logics in the __call__ method.
+#     * Subclass LogitsProcessor and implement the processing logics in the __call__ method.
 #     * Create an instance and pass to SamplingParams.
 # Alternatively, you can create any callable with the same signature with the __call__ method.
 # This simple callback will output a specific token at each step irrespective of prompt.
@@ -26,13 +26,15 @@ class MyLogitsProcessor(LogitsProcessor):
         mask = torch.full_like(logits, fill_value=float("-inf"), device="cpu")
         mask[:, :, self.allowed_token_id] = 0
 
-        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
+        stream = None if stream_ptr is None else torch.cuda.ExternalStream(
+            stream_ptr)
+        with torch.cuda.stream(stream):
             mask = mask.to(logits.device, non_blocking=True)
             logits += mask
 
 
 # The recommended way to create a customized batched logits processor:
-#     * Subclass this class and implement the processing logics in the __call__ method.
+#     * Subclass BatchedLogitsProcessor and implement the processing logics in the __call__ method.
 #     * Create an instance and pass to LLM.
 # Alternatively, you can create any callable with the same signature with the __call__ method.
 # A batched logits processor's arguments for all requests in a batch are made available as lists.
@@ -66,7 +68,8 @@ class MyBatchedLogitsProcessor(BatchedLogitsProcessor):
 
 def main():
 
-    # Batched logits processor should be specified when initializing LLM.
+    # Batched logits processor (only supported in TensorRT backend)
+    # should be specified when initializing LLM.
     llm = LLM(
         model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         batched_logits_processor=MyBatchedLogitsProcessor(allowed_token_id=42))

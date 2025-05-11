@@ -24,7 +24,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cute/tensor.hpp>
-#include <cutlass/cutlass.h>
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -88,6 +87,14 @@ struct KernelParams
     void* ptrPartialO;
     // The partial softmax max, and softmax sum for each CtaKv when the multiCtasKv mode is enabled.
     float *ptrPartialMax, *ptrPartialSum;
+    // The scaling factors for K.
+    float const* ptrSageAttnSfsK;
+    // The scaling factors for P.
+    float const* ptrSageAttnSfsP;
+    // The scaling factors for Q.
+    float const* ptrSageAttnSfsQ;
+    // The scaling factors for V.
+    float const* ptrSageAttnSfsV;
     // The device scaling factor for softmax (multiplied by log2 to use faster exp2). Only needed by
     // trt-llm fp8 kernels as the scales have to be on the device currently.
     float const* ptrScaleSoftmaxLog2;
@@ -101,26 +108,37 @@ struct KernelParams
 
     // The attention window size for sliding window attention.
     int32_t mAttentionWindowSize;
+    // The batch size
+    int32_t mBatchSize;
+    // The log of the Sage Attention block size for K.
+    int32_t mLogNumEltsPerSageAttnBlkK;
+    // The log of the Sage Attention block size for P.
+    int32_t mLogNumEltsPerSageAttnBlkP;
+    // The log of the Sage Attention block size for Q.
+    int32_t mLogNumEltsPerSageAttnBlkQ;
+    // The log of the Sage Attention block size for V.
+    int32_t mLogNumEltsPerSageAttnBlkV;
     // The sequence lengths for Q and K/V.
     int32_t mMaxSeqLenQ, mMaxSeqLenKv;
+    // The maximum number of CTAs for Q.
+    int32_t mMaxNumCtasQ;
+    // The maximum number of CTAs for K/V.
+    int32_t mMaxNumCtasKv;
     // The maximum number of pages per sequence for paged-kv buffer.
     int32_t mMaxNumPagesPerSeqKv;
-    // The number of MTP tokens per sequence. Assume that all requests have the same numMtpTokens without paddings.
+    // The number of heads for K/V.
+    int32_t mNumHeadsKv;
+    // The number of heads for Q.
+    int32_t mNumHeadsQ;
+    // The number of Q heads per K/V head (i.e. mNumHeadsQ / mNumHeadsKv).
+    int32_t mNumHeadsQPerKv;
+    // The hidden size of O.
+    int64_t mNumHiddenEltsO;
+    // The number of MTP tokens per sequence. Assume that all requests have the same numMtpTokens
+    // without paddings.
     int32_t mNumMtpTokens;
     // The total number of pages in the paged-kv memory pool.
     int32_t mNumPagesInMemPool;
-    // The sum of sequence lengths for Q and K/V.
-    int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
-    // The batch size
-    int32_t mBatchSize;
-    // The number of heads for Q.
-    int32_t mNumHeadsQ;
-    // The number of heads for K/V.
-    int32_t mNumHeadsKv;
-    // The number of Q heads per K/V head (i.e. mNumHeadsQ / mNumHeadsKv).
-    int32_t mNumHeadsQPerKv;
-    // The hidden size of Q.
-    int64_t mNumHiddenEltsQ;
     // The output scale for FP8 quantization.
     float mOutputScale;
     // The scaling factor for softmax (multiplied by log2 to use faster exp2).
@@ -129,9 +147,11 @@ struct KernelParams
     float mScaleSfKv;
     // The SF scale for O.
     float mScaleSfO;
-    // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase kernel when inflight
-    // batching is enabled in TRT-LLM.
+    // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase
+    // kernel when inflight batching is enabled in TRT-LLM.
     int32_t mStartTokenIdxSfO;
+    // The sum of sequence lengths for Q and K/V.
+    int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
 
     // Create the TMA shape/stride for Q.
     template <class FmhaOptions>
@@ -474,7 +494,7 @@ struct KernelParams
 
     // Build tma descriptors.
     template <class FmhaOptions>
-    static CUtensorMap buildNdTmaDescriptor(FmhaOptions const& options, Data_type dtypeElt, int32_t headDim,
+    static CUtensorMap buildNdTmaDescriptor(FmhaOptions const& options, Data_type dtypeElt,
         std::vector<uint64_t> const& shapes, std::vector<uint64_t> const& strides,
         std::vector<uint32_t> const& tileShapes, void* gmemAddr, bool swizzled = true)
     {
@@ -500,26 +520,26 @@ struct KernelParams
 
         // The swizzle type.
         CUtensorMapSwizzle swizzleType;
-        int32_t headSizeInBytes = headDim * get_size_in_bits(dtypeElt) / 8 /*bits*/;
+        int32_t numBytesInLeadingDim = tileShapes[0] * get_size_in_bits(dtypeElt) / 8 /*bits*/;
         if (!swizzled)
         {
             swizzleType = CU_TENSOR_MAP_SWIZZLE_NONE;
         }
-        else if ((headSizeInBytes % 128) == 0)
+        else if ((numBytesInLeadingDim % 128) == 0)
         {
             swizzleType = CU_TENSOR_MAP_SWIZZLE_128B;
         }
-        else if ((headSizeInBytes % 64) == 0)
+        else if ((numBytesInLeadingDim % 64) == 0)
         {
             swizzleType = CU_TENSOR_MAP_SWIZZLE_64B;
         }
-        else if ((headSizeInBytes % 32) == 0)
+        else if ((numBytesInLeadingDim % 32) == 0)
         {
             swizzleType = CU_TENSOR_MAP_SWIZZLE_32B;
         }
         else
         {
-            TLLM_CHECK_WITH_INFO(false, "Unexpected headSizeInBytes %d", headSizeInBytes);
+            TLLM_CHECK_WITH_INFO(false, "Unexpected numBytesInLeadingDim %d", numBytesInLeadingDim);
         }
 
         // Check gmem address must be 16B-aligned
@@ -561,7 +581,9 @@ struct KernelParams
 
         if (result != CUDA_SUCCESS)
         {
-            std::cerr << "Error: Failed to initialize the TMA descriptor " << result << std::endl;
+            char const* err_str;
+            cuGetErrorString(result, &err_str);
+            std::cerr << "Error: Failed to initialize the TMA descriptor due to " << err_str << std::endl;
             std::cerr << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim << " gmem: " << gmemAddr
                       << std::endl;
             std::cerr << "Shape: " << shapes[0] << " " << shapes[1] << " " << shapes[2] << " " << shapes[3] << " "
@@ -581,7 +603,8 @@ struct KernelParams
 
     // Setup the kernel parameters.
     template <class FmhaOptions_, class KernelMeta>
-    static KernelParams setKernelParams(FmhaOptions_ const& options, KernelMeta const& kernelMeta)
+    static KernelParams setKernelParams(
+        FmhaOptions_ const& options, KernelMeta const& kernelMeta, int32_t maxNumCtasQ, int32_t maxNumCtasKv)
     {
 
         // Create the return struct.
@@ -612,7 +635,7 @@ struct KernelParams
             = makeTmaShapeStrideQ(options, kernelMeta.mGroupsHeadsQ, kernelMeta.mTileSizeQ, numEltsInClampedHeadDimQ);
         // Build tma descriptor for Q.
         params.tmaQ_ = buildNdTmaDescriptor(
-            options, kernelMeta.mDataTypeQ, options.mHeadDimQk, shapeQ, strideQ, tileShapeQ, const_cast<void*>(qPtr));
+            options, kernelMeta.mDataTypeQ, shapeQ, strideQ, tileShapeQ, const_cast<void*>(qPtr));
 
         // The number of keys per tile.
         int32_t numKeysPerTile = isPagedKv(options.mQkvLayout)
@@ -636,11 +659,11 @@ struct KernelParams
         tileShapeKv[0] = numEltsInClampedHeadDimKv / numEltsDivisor;
         tileShapeKv[1] = numKeysPerTile;
         // Build tma descriptor for K.
-        params.tmaK_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, maxHeadDimKv, shapeK, strideK, tileShapeKv,
+        params.tmaK_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeK, strideK, tileShapeKv,
             const_cast<void*>(kPtr),
             /*swizzled = */ !transformsKv);
         // Build tma descriptor for V.
-        params.tmaV_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, maxHeadDimKv, shapeV, strideV, tileShapeKv,
+        params.tmaV_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeV, strideV, tileShapeKv,
             const_cast<void*>(vPtr),
             /*swizzled = */ !transformsKv);
 
@@ -661,13 +684,13 @@ struct KernelParams
             // The tile box is reshaped from (headDim / NumEltsPerSf, tileSizeKv) into (16, tileSizeKv *
             // headDim / NumEltsPerSf / 16). See makeTmaShapeStrideKvSf for details. Build tma descriptor
             // for K SF.
-            params.tmaKSf_ = buildNdTmaDescriptor(options, DATA_TYPE_E4M3, maxHeadDimKv, shapeKvSf, strideKvSf,
-                tileShapeKvSf, const_cast<void*>(options.kSfBasePtr),
+            params.tmaKSf_ = buildNdTmaDescriptor(options, DATA_TYPE_E4M3, shapeKvSf, strideKvSf, tileShapeKvSf,
+                const_cast<void*>(options.kSfBasePtr),
                 /*swizzled = */ false);
 
             // Build tma descriptor for V SF.
-            params.tmaVSf_ = buildNdTmaDescriptor(options, DATA_TYPE_E4M3, maxHeadDimKv, shapeKvSf, strideKvSf,
-                tileShapeKvSf, const_cast<void*>(options.vSfBasePtr),
+            params.tmaVSf_ = buildNdTmaDescriptor(options, DATA_TYPE_E4M3, shapeKvSf, strideKvSf, tileShapeKvSf,
+                const_cast<void*>(options.vSfBasePtr),
                 /*swizzled = */ false);
         }
 
@@ -678,8 +701,8 @@ struct KernelParams
         tileShapeO[0] = numEltsInClampedHeadDimQ;
         tileShapeO[1] = kernelMeta.mTileSizeQ;
         // Build tma descriptor for O.
-        params.tmaO_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeQ, options.mHeadDimV, shapeO, strideO,
-            tileShapeO, const_cast<void*>(options.oPtr));
+        params.tmaO_ = buildNdTmaDescriptor(
+            options, kernelMeta.mDataTypeQ, shapeO, strideO, tileShapeO, const_cast<void*>(options.oPtr));
 
         // Set the other kernel parameters.
         params.ptrCumSeqLensQ = options.cumSeqLensQPtr;
@@ -719,6 +742,8 @@ struct KernelParams
         params.mAttentionWindowSize = options.mAttentionWindowSize;
         params.mMaxSeqLenQ = options.mMaxSeqLenQ;
         params.mMaxSeqLenKv = options.mMaxSeqLenKv;
+        params.mMaxNumCtasQ = maxNumCtasQ;
+        params.mMaxNumCtasKv = maxNumCtasKv;
         params.mMaxNumPagesPerSeqKv = options.mMaxNumPagesPerSeqKv;
         // TODO: just use mMaxSeqLenQ for number of MTP tokens.
         params.mNumMtpTokens = options.mMaxSeqLenQ;
@@ -728,7 +753,7 @@ struct KernelParams
         params.mNumHeadsQ = options.mNumHeadsQ;
         params.mNumHeadsKv = options.mNumHeadsKv;
         params.mNumHeadsQPerKv = options.mNumHeadsQPerKv;
-        params.mNumHiddenEltsQ = options.mNumHeadsQ * options.mHeadDimQk;
+        params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimQk;
         params.mOutputScale = 1.f;
         params.mScaleSoftmaxLog2 = (1.f / (std::sqrt((float) (options.mHeadDimQk)) * options.mScaleQ)) * M_LOG2E;
         params.mStartTokenIdxSfO = options.mSfStartTokenIdx;

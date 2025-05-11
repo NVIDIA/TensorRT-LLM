@@ -22,6 +22,8 @@ file(GLOB_RECURSE SRC_CU *.cu)
 # selectiveScan trtllmGenKernels folder
 list(FILTER SRC_CPP EXCLUDE REGEX "cutlass_kernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "cutlass_kernels/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "flashMLA/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "flashMLA/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "contextFusedMultiHeadAttention/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "contextFusedMultiHeadAttention/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "decoderMaskedMultiheadAttention/.*")
@@ -57,18 +59,25 @@ function(filter_cuda_archs ARCH SOURCES_VAR)
   endif()
 endfunction()
 
-if(ENABLE_MULTI_DEVICE EQUAL 0)
+if(NOT ENABLE_MULTI_DEVICE)
   list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")
 endif()
 
 add_library(kernels_src STATIC ${SRC_CPP} ${SRC_CU})
 set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+target_include_directories(
+  kernels_src
+  PUBLIC
+    $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
+)
 
 add_subdirectory(cutlass_kernels)
+add_subdirectory(flashMLA)
 add_subdirectory(contextFusedMultiHeadAttention)
 add_subdirectory(decoderMaskedMultiheadAttention)
 add_subdirectory(selectiveScan)
 add_subdirectory(userbuffers)
 add_subdirectory(trtllmGenKernels)
 add_subdirectory(fusedLayernormKernels)
+add_subdirectory(groupRmsNormKernels)

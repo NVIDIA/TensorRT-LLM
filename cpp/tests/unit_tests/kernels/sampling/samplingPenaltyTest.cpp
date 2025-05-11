@@ -1298,4 +1298,210 @@ TYPED_TEST(MinLengthPenaltyTest, BatchMaxSeqLen64TokensPerStep)
         MinLengthPenaltyTestParams().setBatchSize(16).setVocabSize(51200).setMaxSeqLength(64).setMaxTokensPerStep(4));
 }
 
+// When endId=-1 is not handled properly, minLength penalty kernel accesses out-of-bounds memory just
+// prior to mOutLogitsDevice. Input logits are laid out just before mOutLogitsDevice in memory in this test
+// to show that last input logit is corrupted when endId=-1 is not handled correctly.
+template <typename T>
+class MinLengthPenaltyOOBSafetyTest : public SamplingKernelTest<T>
+{
+protected:
+    // Set up test
+    int32_t mBatchSize;
+    int32_t mMaxBatchSize;
+    int32_t mVocabSize;
+    int32_t mVocabSizePadded;
+    int32_t mMaxInputLength;
+    int32_t mSequenceLength;
+    int32_t mMaxTokensPerStep;
+
+    using SamplingKernelTest<T>::mBufferManager;
+    using SamplingKernelTest<T>::mStream;
+    using SamplingKernelTest<T>::mLogitsHost;
+
+    TensorPtr mLogitsDevice;
+    TensorPtr mOutLogitsDevice;
+    TensorPtr mLogitsRefHost;
+    TensorPtr mLogitsPtrs;
+
+    TensorPtr mContextLengthHost;
+    TensorPtr mContextLengthDevice;
+
+    TensorPtr mSeqLengthHost;
+    TensorPtr mSeqLengthDevice;
+
+    TensorPtr mMinLengthHost;
+    TensorPtr mMinLengthDevice;
+
+    TensorPtr mEndIdsHost;
+    TensorPtr mEndIdsDevice;
+
+    TensorPtr mBatchSlots;
+
+    void subsetupMemorySafety()
+    {
+        auto const dataType = TRTDataType<T>::value;
+        auto const ptrType = TRTDataType<T*>::value;
+
+        mBatchSize = 1;
+        mMaxBatchSize = 1;
+        // Set vocabSize to be same as vocabSizePadded so that no mask value is set
+        // in output logits because of vocabSize < vocabSizePadded. This means outputs
+        // logits are set to input logits as is without any substitution.
+        mVocabSize = 16;
+        mVocabSizePadded = padVocabSize(mVocabSize);
+        mMaxInputLength = 5;
+        mSequenceLength = 10; // input + output
+        mMaxTokensPerStep = 1;
+
+        // Create a large chunk of memory which hosts both input and output logits contiguously.
+        // Goal is to show that last input logit is corrupted when endId=-1 is not handled correctly.
+        mLogitsDevice
+            = mBufferManager->gpu(ITensor::makeShape({2 * mBatchSize, mMaxTokensPerStep, mVocabSizePadded}), dataType);
+        trk::invokeFill(*mLogitsDevice, T{0.1f}, *mStream);
+        mOutLogitsDevice = ITensor::slice(mLogitsDevice, mBatchSize);
+        trk::invokeFill(*mOutLogitsDevice, T{0.2f}, *mStream);
+
+        mLogitsPtrs = BufferManager::pinned(ITensor::makeShape({mBatchSize}), ptrType);
+        auto logitsPtrs = BufferRange<T*>(*mLogitsPtrs);
+        for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
+        {
+            logitsPtrs[bi]
+                = bufferCast<T>(*mLogitsDevice) + (mBatchSize - bi - 1) * mMaxTokensPerStep * mVocabSizePadded;
+        }
+
+        // Defines currentStep.
+        mSeqLengthHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        initConstant<int>(bufferCast<int32_t>(*mSeqLengthHost), mMaxBatchSize, 3);
+        mSeqLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mBufferManager->copy(*mSeqLengthHost, *mSeqLengthDevice);
+
+        // Defines inputLength.
+        mContextLengthHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        initConstant<int>(bufferCast<int32_t>(*mContextLengthHost), mMaxBatchSize, 2);
+        mContextLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mBufferManager->copy(*mContextLengthHost, *mContextLengthDevice);
+
+        // Defines minLength.
+        mMinLengthHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        initConstant<int>(bufferCast<int32_t>(*mMinLengthHost), mMaxBatchSize, 10);
+        mMinLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mBufferManager->copy(*mMinLengthHost, *mMinLengthDevice);
+
+        // Defines endIds.
+        mEndIdsHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        initConstant<int>(bufferCast<int32_t>(*mEndIdsHost), mMaxBatchSize, -1);
+        mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mBufferManager->copy(*mEndIdsHost, *mEndIdsDevice);
+
+        mBatchSlots = BufferManager::pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
+        auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
+        for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
+        {
+            batchSlotsPtr[bi] = 2 * bi;
+        }
+    }
+
+public:
+    void runMemorySafetyTest()
+    {
+        subsetupMemorySafety();
+        InvokeBatchApplyPenaltyParams<T> penaltyParams{
+            /*inputLogits=*/reinterpret_cast<T**>(bufferCast<int64_t>(*mLogitsPtrs)),
+            /*outputLogits=*/bufferCast<T>(*mOutLogitsDevice),
+            /*biases=*/nullptr,
+            /*penaltyWorkspace=*/nullptr,
+            /*penaltyWorkspacePrev=*/nullptr,
+            /*temperatures=*/nullptr,
+            /*repetitionPenalties=*/nullptr,
+            /*presencePenalties=*/nullptr,
+            /*frequencyPenalties=*/nullptr,
+            /*batchSize=*/mBatchSize,
+            /*beamWidth=*/1,
+            /*maxSeqLen=*/mSequenceLength,
+            /*vocabSize=*/mVocabSize,
+            /*vocabSizePadded=*/mVocabSizePadded,
+            /*outputIdsPtr=*/nullptr,
+            /*parentIdsPtr=*/nullptr,
+            /*inputLengths=*/bufferCast<int32_t>(*mContextLengthDevice),
+            /*sequenceLengths=*/bufferCast<int32_t>(*mSeqLengthDevice),
+            /*minLengths=*/bufferCast<int32_t>(*mMinLengthDevice),
+            /*endIds=*/bufferCast<int32_t>(*mEndIdsDevice),
+            /*batchSlots=*/bufferCast<int32_t>(*mBatchSlots),
+            /*maxTokensPerStep=*/mMaxTokensPerStep,
+            /*tokensPerStep=*/nullptr,
+            /*finished=*/nullptr,
+            /*stream=*/mStream->get()};
+        tk::invokeBatchApplyPenalty(penaltyParams);
+        mStream->synchronize();
+
+        auto logitsOutHost = mBufferManager->copyFrom(*mOutLogitsDevice, MemoryType::kCPU);
+        auto logitsInHost = mBufferManager->copyFrom(*mLogitsDevice, MemoryType::kCPU);
+        auto minLengthsHost = mBufferManager->copyFrom(*mMinLengthDevice, MemoryType::kCPU);
+        auto inputLengthsHost = mBufferManager->copyFrom(*mContextLengthDevice, MemoryType::kCPU);
+        auto endIdsHost = mBufferManager->copyFrom(*mEndIdsDevice, MemoryType::kCPU);
+        auto seqLengthsHost = mBufferManager->copyFrom(*mSeqLengthDevice, MemoryType::kCPU);
+        mStream->synchronize();
+
+        // Verify that output logits were modified to input logits.
+        auto logitsOutPtr = bufferCast<T>(*logitsOutHost);
+        for (int32_t i = 0; i < mBatchSize * mMaxTokensPerStep * mVocabSizePadded; ++i)
+        {
+            // All output logits must be updated to be same as input logits.
+            // No mask value is set anywhere because vocabSize is same as vocabSizePadded.
+            EXPECT_EQ(static_cast<T>(logitsOutPtr[i]), T{0.1f})
+                << "Output logits were modified to unexpected value at index " << i;
+        }
+
+        // Verify that batch slots were not modified.
+        auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
+        for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
+        {
+            EXPECT_EQ(batchSlotsPtr[bi], 2 * bi) << "Batch slots were modified at index " << bi;
+        }
+
+        // Verify that inLogits were not modified.
+        auto logitsInPtr = bufferCast<T>(*logitsInHost);
+        for (int32_t i = 0; i < mBatchSize * mMaxTokensPerStep * mVocabSizePadded; ++i)
+        {
+            EXPECT_EQ(static_cast<T>(logitsInPtr[i]), T{0.1f})
+                << "Input logits were modified to unexpected value at index " << i;
+        }
+
+        // Verify that minLengths were not modified.
+        auto minLengthsPtr = bufferCast<int32_t>(*minLengthsHost);
+        for (int32_t i = 0; i < mMaxBatchSize; ++i)
+        {
+            EXPECT_EQ(minLengthsPtr[i], 10) << "MinLengths were modified at index " << i;
+        }
+
+        // Verify that inputLengths were not modified.
+        auto inputLengthsPtr = bufferCast<int32_t>(*inputLengthsHost);
+        for (int32_t i = 0; i < mMaxBatchSize; ++i)
+        {
+            EXPECT_EQ(inputLengthsPtr[i], 2) << "InputLengths were modified at index " << i;
+        }
+
+        // Verify that endIds were not modified.
+        auto endIdsPtr = bufferCast<int32_t>(*endIdsHost);
+        for (int32_t i = 0; i < mMaxBatchSize; ++i)
+        {
+            EXPECT_EQ(endIdsPtr[i], -1) << "EndIds were modified at index " << i;
+        }
+
+        // Verify that seqLengths were not modified.
+        auto seqLengthsPtr = bufferCast<int32_t>(*seqLengthsHost);
+        for (int32_t i = 0; i < mMaxBatchSize; ++i)
+        {
+            EXPECT_EQ(seqLengthsPtr[i], 3) << "SeqLengths were modified at index " << i;
+        }
+    }
+};
+
+TYPED_TEST_SUITE(MinLengthPenaltyOOBSafetyTest, FloatAndHalfTypes);
+
+TYPED_TEST(MinLengthPenaltyOOBSafetyTest, VerifyMemorySafetyForNegativeEndId)
+{
+    this->runMemorySafetyTest();
+}
+
 } // namespace

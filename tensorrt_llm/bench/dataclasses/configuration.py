@@ -9,8 +9,12 @@ from pydantic import (BaseModel, Field, PositiveFloat, field_validator,
                       model_validator)
 
 import tensorrt_llm.bindings.executor as trtllm
+from tensorrt_llm._torch.auto_deploy.shim import AutoDeployConfig
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm.bench.dataclasses.enums import IFBSchedulingPolicy
+from tensorrt_llm.llmapi import (BatchingType, CapacitySchedulerPolicy,
+                                 ContextChunkingPolicy, DynamicBatchConfig,
+                                 ExtendedRuntimePerfKnobConfig, KvCacheConfig,
+                                 SchedulerConfig)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
@@ -29,8 +33,9 @@ class RuntimeConfig(BaseModel):
     world_config: ExecutorWorldConfig
     decoding_config: Optional[DecodingConfig] = None
     performance_options: PerformanceOptions
-    backend: Literal["pytorch", None] = None
+    backend: Literal["pytorch", "autodeploy", None] = None
     extra_llm_api_options: Optional[str] = None
+    iteration_log: Optional[Path] = None
 
     def get_llm_args(self) -> Dict:
         model = self.engine_dir or self.model_path or self.model
@@ -50,6 +55,8 @@ class RuntimeConfig(BaseModel):
             self.world_config.gpus_per_node,
             "moe_expert_parallel_size":
             self.world_config.ep_size,
+            "moe_cluster_parallel_size":
+            self.world_config.cluster_size,
             "trust_remote_code":
             True,
             "kv_cache_config":
@@ -61,16 +68,21 @@ class RuntimeConfig(BaseModel):
             "decoding_config":
             self.decoding_config.get_decoding_config(),
             "batching_type":
-            trtllm.BatchingType.INFLIGHT,
+            BatchingType.INFLIGHT,
             "max_batch_size":
             self.settings_config.max_batch_size,
             "max_num_tokens":
             self.settings_config.max_num_tokens,
         }
 
-        if self.backend == "pytorch":
-            llm_args["pytorch_backend_config"] = \
-                self.performance_options.get_pytorch_perf_config()
+        backend_config_map = {
+            "pytorch": self.performance_options.get_pytorch_perf_config,
+            "autodeploy": self.performance_options.get_autodeploy_perf_config
+        }
+
+        if self.backend in backend_config_map:
+            llm_args["pytorch_backend_config"] = backend_config_map[
+                self.backend]()
 
         return update_llm_args_with_extra_options(llm_args,
                                                   self.extra_llm_api_options)
@@ -88,8 +100,8 @@ class PerformanceOptions:
     cuda_graph_cache_size: int = 1000
     pytorch_config: Dict[str, Any] = Field(default_factory=dict)
 
-    def get_perf_config(self) -> trtllm.ExtendedRuntimePerfKnobConfig:
-        config = trtllm.ExtendedRuntimePerfKnobConfig()
+    def get_perf_config(self) -> ExtendedRuntimePerfKnobConfig:
+        config = ExtendedRuntimePerfKnobConfig()
         config.cuda_graph_mode = self.cuda_graphs
         config.multi_block_mode = self.multi_block_mode
         config.cuda_graph_cache_size = self.cuda_graph_cache_size
@@ -98,6 +110,13 @@ class PerformanceOptions:
 
     def get_pytorch_perf_config(self) -> PyTorchConfig:
         return PyTorchConfig(**self.pytorch_config)
+
+    def get_autodeploy_perf_config(self) -> AutoDeployConfig:
+        ad_config = AutoDeployConfig(**self.pytorch_config)
+        ad_config.attn_backend = "FlashInfer"
+        ad_config.torch_compile_enabled = True
+        ad_config.skip_loading_weights = True
+        return ad_config
 
 
 class DecodingConfig(BaseModel):
@@ -133,13 +152,17 @@ class DecodingConfig(BaseModel):
 class ExecutorWorldConfig(BaseModel):
     pp_size: int = 1
     tp_size: int = 1
-    world_size: int = 1
-    gpus_per_node: int = 8
+    # None to make LLM-API deduce it with a rule.
+    gpus_per_node: Optional[int] = None
     leader_mode: bool = False
     ep_size: Optional[int] = None
+    cluster_size: Optional[int] = None
 
     @model_validator(mode="after")
     def validate_world_size(self) -> ExecutorWorldConfig:
+        if self.gpus_per_node is None:
+            return self
+
         parallel_world = self.pp_size * self.tp_size
         num_gpus = self.world_size * self.gpus_per_node
         valid_world = bool(num_gpus >= parallel_world)
@@ -179,7 +202,8 @@ class ExecutorWorldConfig(BaseModel):
 
 class ExecutorSettingsConfig(BaseModel):
     chunking: bool = True
-    scheduler_policy: IFBSchedulingPolicy = IFBSchedulingPolicy.MAX_UTILIZTION
+    scheduler_policy: CapacitySchedulerPolicy = Field(
+        default=CapacitySchedulerPolicy.MAX_UTILIZATION)
     max_batch_size: int
     max_num_tokens: int
     kv_cache_percent: PositiveFloat = Field(default=.90, le=1.0)
@@ -187,29 +211,29 @@ class ExecutorSettingsConfig(BaseModel):
     dynamic_max_batch_size: bool = True
     dynamic_max_num_tokens: bool = False  # Will enable after more validation.
 
-    def get_dynamic_config(self) -> trtllm.DynamicBatchConfig:
+    def get_dynamic_config(self) -> DynamicBatchConfig:
         window_size = 128 if self.dynamic_max_batch_size else 0
-        return trtllm.DynamicBatchConfig(
-            self.dynamic_max_batch_size,
-            self.dynamic_max_num_tokens,
-            window_size,
+        return DynamicBatchConfig(
+            enable_batch_size_tuning=self.dynamic_max_batch_size,
+            enable_max_num_tokens_tuning=self.dynamic_max_num_tokens,
+            dynamic_batch_moving_average_window=window_size,
         )
 
-    def get_kvcache_config(self) -> trtllm.KvCacheConfig:
-        return trtllm.KvCacheConfig(
+    def get_kvcache_config(self) -> KvCacheConfig:
+        return KvCacheConfig(
             free_gpu_memory_fraction=self.kv_cache_percent,
             enable_block_reuse=False,
         )
 
-    def get_scheduler_config(self) -> trtllm.SchedulerConfig:
+    def get_scheduler_config(self) -> SchedulerConfig:
         if self.chunking:
-            return trtllm.SchedulerConfig(
-                capacity_scheduler_policy=self.scheduler_policy.value,
-                context_chunking_policy=trtllm.ContextChunkingPolicy.
+            return SchedulerConfig(
+                capacity_scheduler_policy=self.scheduler_policy,
+                context_chunking_policy=ContextChunkingPolicy.
                 FIRST_COME_FIRST_SERVED,
                 dynamic_batch_config=self.get_dynamic_config(),
             )
         else:
-            return trtllm.SchedulerConfig(
-                capacity_scheduler_policy=self.scheduler_policy.value,
+            return SchedulerConfig(
+                capacity_scheduler_policy=self.scheduler_policy,
                 dynamic_batch_config=self.get_dynamic_config())

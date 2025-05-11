@@ -5,6 +5,32 @@
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
 
+## TensorRT-LLM Release 0.18.1
+
+### Key Features and Enhancements
+  - **The 0.18.x series of releases builds upon the 0.17.0 release, focusing exclusively on dependency updates without incorporating features from the previous 0.18.0.dev pre-releases. These features will be included in future stable releases**.
+
+### Infrastructure Changes
+  - The dependent `transformers` package version is updated to 4.48.3.
+
+
+## TensorRT-LLM Release 0.18.0
+
+### Key Features and Enhancements
+  - **Features that were previously available in the 0.18.0.dev pre-releases are not included in this release**.
+  - [BREAKING CHANGE] Windows platform support is deprecated as of v0.18.0. All Windows-related code and functionality will be completely removed in future releases.
+
+### Known Issues
+  - The PyTorch workflow on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) for optimal support on SBSA platforms.
+
+### Infrastructure Changes
+  - The base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:25.03-py3`.
+  - The base Docker image for TensorRT-LLM Backend is updated to `nvcr.io/nvidia/tritonserver:25.03-py3`.
+  - The dependent TensorRT version is updated to 10.9.
+  - The dependent CUDA version is updated to 12.8.1.
+  - The dependent NVIDIA ModelOpt version is updated to 0.25 for Linux platform.
+
+
 ## TensorRT-LLM Release 0.17.0
 
 ### Key Features and Enhancements

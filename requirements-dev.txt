@@ -1,9 +1,9 @@
 -r requirements.txt
-datasets==2.19.2
 einops
 graphviz
 mypy
 mako
+oyaml
 parameterized
 pre-commit
 pybind11
@@ -18,6 +18,7 @@ pytest-xdist
 pytest-timeout
 pytest-split
 pytest-mock
+pytest-threadleak
 rouge_score
 cloudpickle
 typing-extensions==4.12.2
@@ -27,5 +28,6 @@ jieba==0.42.1
 rouge==1.0.1
 pytest-rerunfailures
 ruff==0.9.4
-lm_eval[api]==0.4.5
+lm_eval[api]==0.4.8
 docstring_parser
+genai-perf

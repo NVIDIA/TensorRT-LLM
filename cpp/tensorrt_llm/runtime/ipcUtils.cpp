@@ -26,9 +26,6 @@
 namespace tensorrt_llm::runtime
 {
 
-namespace
-{
-
 bool canAccessPeer(WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -61,7 +58,6 @@ bool canAccessPeer(WorldConfig const& worldConfig)
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return true;
 }
-} // namespace
 
 IpcMemory::IpcMemory(std::size_t bufferSize, BufferManager const& manager, WorldConfig const& worldConfig, bool openIpc)
     : mTpRank(worldConfig.getTensorParallelRank())
@@ -78,7 +74,7 @@ void IpcMemory::allocateIpcMemory(std::size_t bufferSize, BufferManager const& m
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    // Note (jdebache): cudaIpcGet/OpenMemHandle does not work well with tiny allocations. The risk is that two small
+    // Note: cudaIpcGet/OpenMemHandle does not work well with tiny allocations. The risk is that two small
     // allocations will get 'packed' together, and that we will get the same IPC handle for both using
     // cudaIpcGetMemHandle. We then try to open this handle twice on the receiving end, resulting in an 'already mapped'
     // error. This manual alignment is a WAR for this behavior, until we move to using cuMemMap and OS handles to share

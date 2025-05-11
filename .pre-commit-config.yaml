@@ -1,10 +1,11 @@
+default_install_hook_types: [pre-commit, commit-msg]
 repos:
 -   repo: https://github.com/pycqa/isort
     rev: 5.12.0
     hooks:
     -   id: isort
 -   repo: https://github.com/Lucas-C/pre-commit-hooks.git
-    rev: v1.1.13
+    rev: v1.5.5
     hooks:
     -   id: remove-crlf
 -   repo: https://github.com/google/yapf
@@ -17,7 +18,7 @@ repos:
     hooks:
     -   id: check-added-large-files
         exclude: |
-            (?x)^(.*cubin.cpp)$
+            (?x)^(.*cubin.cpp | .*cubin.h)$
     -   id: check-merge-conflict
     -   id: check-symlinks
     -   id: detect-private-key
@@ -52,7 +53,7 @@ repos:
     -   id: clang-format
         types_or: [c++, c, cuda]
         exclude: |
-            (?x)^(.*cubin.cpp$ | .*fmha_cubin.h)$
+            (?x)^(.*cubin.cpp$ | .*_cubin.h)$
 -   repo: https://github.com/cheshirekow/cmake-format-precommit
     rev: v0.6.10
     hooks:
@@ -63,6 +64,8 @@ repos:
     -   id: codespell
         additional_dependencies:
         - tomli
+        # add ignore words list
+        args: ["-L", "Mor,ans,thirdparty"]
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
     hooks:
@@ -78,3 +81,10 @@ repos:
         additional_dependencies:
         - mdformat_frontmatter
         files: ".*/auto_deploy/.*"
+-   repo: local
+    hooks:
+    -   id: DCO check
+        name: Checks the commit message for a developer certificate of origin signature
+        entry: ./scripts/dco_check.py
+        language: script
+        stages: [commit-msg]

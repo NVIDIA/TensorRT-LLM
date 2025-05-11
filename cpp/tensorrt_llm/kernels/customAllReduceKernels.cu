@@ -229,11 +229,11 @@ inline __device__ int4 rms_norm(float denom, PackedStruct& vec, PackedStruct& we
         if constexpr (Affine)
         {
             float v2 = static_cast<float>(reinterpret_cast<T*>(weight.unpacked)[i]);
-            reinterpret_cast<T*>(ret.unpacked)[i] = static_cast<T>(__fdividef(v1, denom) * v2);
+            reinterpret_cast<T*>(ret.unpacked)[i] = static_cast<T>(v1 * denom * v2);
         }
         else
         {
-            reinterpret_cast<T*>(ret.unpacked)[i] = static_cast<T>(__fdividef(v1, denom));
+            reinterpret_cast<T*>(ret.unpacked)[i] = static_cast<T>(v1 * denom);
         }
     }
     return ret.packed;
@@ -266,7 +266,7 @@ __global__ void rms_norm_kernel(AllReduceParams params)
     local_final_output_buffer += block_offset;
     intermediate_buffer += block_offset;
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
     cudaGridDependencySynchronize();
 #endif
 
@@ -295,7 +295,7 @@ __global__ void rms_norm_kernel(AllReduceParams params)
         }
     }
     acc = block_reduce_sum(acc);
-    float denom = __fsqrt_rn(__fdividef(acc, params.fusion_params.hidden_size) + params.fusion_params.eps);
+    float denom = rsqrtf(acc / params.fusion_params.hidden_size + params.fusion_params.eps);
     for (int offset = thread_offset; offset < params.fusion_params.hidden_size; offset += blockDim.x * kPackedSize)
     {
         if constexpr (UseSmem)
@@ -309,7 +309,7 @@ __global__ void rms_norm_kernel(AllReduceParams params)
         inter_vec.packed = rms_norm<T, Affine>(denom, inter_vec, weight_vec);
         *reinterpret_cast<int4*>(&local_final_output_buffer[offset]) = inter_vec.packed;
     }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -340,7 +340,7 @@ __global__ void rms_pre_post_norm_kernel(AllReduceParams params) // for gemma2 p
     local_final_output_buffer += block_offset;
     intermediate_buffer += block_offset;
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
     cudaGridDependencySynchronize();
 #endif
 
@@ -363,8 +363,8 @@ __global__ void rms_pre_post_norm_kernel(AllReduceParams params) // for gemma2 p
         // pre-residual norm.
         acc_pre_residual_norm = accumulate<T>(acc_pre_residual_norm, inter_vec);
         acc_pre_residual_norm = block_reduce_sum(acc_pre_residual_norm);
-        float denom_pre_residual_norm = __fsqrt_rn(
-            __fdividef(acc_pre_residual_norm, params.fusion_params.hidden_size) + params.fusion_params.eps);
+        float denom_pre_residual_norm
+            = rsqrtf(acc_pre_residual_norm / params.fusion_params.hidden_size + params.fusion_params.eps);
 
         if constexpr (Affine)
         {
@@ -383,7 +383,7 @@ __global__ void rms_pre_post_norm_kernel(AllReduceParams params) // for gemma2 p
         acc = accumulate<T>(acc, inter_vec);
     }
     acc = block_reduce_sum(acc);
-    float denom = __fsqrt_rn(__fdividef(acc, params.fusion_params.hidden_size) + params.fusion_params.eps);
+    float denom = rsqrtf(acc / params.fusion_params.hidden_size + params.fusion_params.eps);
     for (int offset = thread_offset; offset < params.fusion_params.hidden_size; offset += blockDim.x * kPackedSize)
     {
         if constexpr (Affine)
@@ -393,7 +393,7 @@ __global__ void rms_pre_post_norm_kernel(AllReduceParams params) // for gemma2 p
         inter_vec.packed = rms_norm<T, Affine>(denom, inter_vec, weight_vec);
         *reinterpret_cast<int4*>(&local_final_output_buffer[offset]) = inter_vec.packed;
     }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -744,9 +744,9 @@ struct Reducer<T, RanksPerNode, false>
 template <int ClusterSize, typename T, int RanksPerNode, bool Bias = false, bool Affine = false, bool PushMode = true>
 static __global__ void lamport_style_one_shot_all_reduce_norm_kernel(AllReduceParams params)
 {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
     namespace cg = cooperative_groups;
-    static_assert(RanksPerNode <= 8);
+    static_assert(RanksPerNode <= MAX_RANKS_PER_NODE);
     static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
     using PackedStruct = typename PackedOn16Bytes<T>::Type;
 
@@ -824,7 +824,7 @@ static __global__ void lamport_style_one_shot_all_reduce_norm_kernel(AllReducePa
         cluster.sync();
     }
 
-    float denom = __fsqrt_rn(__fdividef(acc, params.fusion_params.hidden_size) + params.fusion_params.eps);
+    float denom = rsqrtf(acc / params.fusion_params.hidden_size + params.fusion_params.eps);
     sum_vec.packed = rms_norm<T, Affine>(denom, sum_vec, weight_vec);
     *reinterpret_cast<int4*>(local_final_output_buffer) = sum_vec.packed;
 
@@ -937,7 +937,7 @@ static __global__ void __launch_bounds__(1024, 1) one_shot_all_reduce_norm_kerne
         buffers[ii] = reinterpret_cast<T*>(params.peer_comm_buffer_ptrs[rank]);
     }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
     cudaGridDependencySynchronize();
 #endif
 
@@ -986,7 +986,7 @@ static __global__ void __launch_bounds__(1024, 1) one_shot_all_reduce_norm_kerne
             }
         }
         acc = block_reduce_sum(acc);
-        float denom = __fsqrt_rn(__fdividef(acc, params.fusion_params.hidden_size) + params.fusion_params.eps);
+        float denom = rsqrtf(acc / params.fusion_params.hidden_size + params.fusion_params.eps);
         for (int offset = thread_offset; offset < params.fusion_params.hidden_size; offset += blockDim.x * kPackedSize)
         {
             if constexpr (UseSmem)
@@ -1001,7 +1001,7 @@ static __global__ void __launch_bounds__(1024, 1) one_shot_all_reduce_norm_kerne
             *reinterpret_cast<int4*>(&local_final_output_buffer[norm_offset + offset]) = sum_vec.packed;
         }
     }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -1044,7 +1044,7 @@ static __global__ void __launch_bounds__(1024, 1) one_shot_prenorm_all_reduce_no
         buffers[ii] = reinterpret_cast<T*>(params.peer_comm_buffer_ptrs[rank]);
     }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
     cudaGridDependencySynchronize();
 #endif
 
@@ -1092,8 +1092,8 @@ static __global__ void __launch_bounds__(1024, 1) one_shot_prenorm_all_reduce_no
 
             acc_pre_residual_norm = block_reduce_sum(acc_pre_residual_norm);
 
-            float denom_pre_residual_norm = __fsqrt_rn(
-                __fdividef(acc_pre_residual_norm, params.fusion_params.hidden_size) + params.fusion_params.eps);
+            float denom_pre_residual_norm
+                = rsqrtf(acc_pre_residual_norm / params.fusion_params.hidden_size + params.fusion_params.eps);
             if constexpr (Affine)
             {
                 weight_vec_pre_residual_norm.packed
@@ -1106,7 +1106,7 @@ static __global__ void __launch_bounds__(1024, 1) one_shot_prenorm_all_reduce_no
             acc = accumulate<T>(acc, sum_vec);
         }
         acc = block_reduce_sum(acc);
-        float denom = __fsqrt_rn(__fdividef(acc, params.fusion_params.hidden_size) + params.fusion_params.eps);
+        float denom = rsqrtf(acc / params.fusion_params.hidden_size + params.fusion_params.eps);
         if constexpr (Affine)
         {
             weight_vec.packed = *reinterpret_cast<int4 const*>(weight_buffer + thread_offset);
@@ -1114,7 +1114,7 @@ static __global__ void __launch_bounds__(1024, 1) one_shot_prenorm_all_reduce_no
         sum_vec.packed = rms_norm<T, Affine>(denom, sum_vec, weight_vec);
         *reinterpret_cast<int4*>(&local_final_output_buffer[norm_offset + thread_offset]) = sum_vec.packed;
     }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -1128,7 +1128,7 @@ bool is_lamport_supported(int token_num, int hidden_size)
     if (disableLamportReduceNormFusion)
         return false;
     static int sm = tensorrt_llm::common::getSMVersion();
-    if (sm < 90)
+    if (sm < 90 || sm >= 120)
     {
         return false;
     }
@@ -1355,6 +1355,10 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams params)
         buffers[ii] = reinterpret_cast<T*>(params.peer_comm_buffer_ptrs[rank]);
     }
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+    cudaGridDependencySynchronize();
+#endif
+
     if constexpr (PUSH_MODE || COPY_INPUT)
     {
         // Copy from local buffer to shareable buffer
@@ -1419,6 +1423,10 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams params)
         // Store to the destination buffer.
         *reinterpret_cast<int4*>(&local_output_buffer[iter_offset]) = sums.packed;
     }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 template <typename T, int RANKS_PER_NODE, bool COPY_INPUT = true, bool PUSH_MODE = false, bool Bias = false,
@@ -1489,7 +1497,7 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
         buffers[ii] = reinterpret_cast<T*>(params.peer_comm_buffer_ptrs[rank]);
     }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
     cudaGridDependencySynchronize();
 #endif
 
@@ -1623,7 +1631,7 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
         }
     }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -1783,13 +1791,33 @@ void AllReduceDispatch(AllReduceStrategyType algo, AllReduceStrategyConfig confi
     }
     if (algo == AllReduceStrategyType::ONESHOT)
     {
-        oneShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE>
-            <<<blocks_per_grid, threads_per_block, 0, stream>>>(params);
+        auto* kernel_instance = &oneShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE>;
+        cudaLaunchConfig_t config;
+        config.gridDim = blocks_per_grid;
+        config.blockDim = threads_per_block;
+        config.dynamicSmemBytes = 0;
+        config.stream = stream;
+        cudaLaunchAttribute attribute[1];
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.attrs = attribute;
+        config.numAttrs = 1;
+        cudaLaunchKernelEx(&config, kernel_instance, params);
     }
     else
     {
-        twoShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE>
-            <<<blocks_per_grid, threads_per_block, 0, stream>>>(params);
+        auto* kernel_instance = &twoShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE>;
+        cudaLaunchConfig_t config;
+        config.gridDim = blocks_per_grid;
+        config.blockDim = threads_per_block;
+        config.dynamicSmemBytes = 0;
+        config.stream = stream;
+        cudaLaunchAttribute attribute[1];
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.attrs = attribute;
+        config.numAttrs = 1;
+        cudaLaunchKernelEx(&config, kernel_instance, params);
     }
 }
 
@@ -1849,7 +1877,8 @@ void AllReduceDispatchType(AllReduceParams& params, AllReduceStrategyType strat,
     case 4: AllReduceDispatchRanksPerNode<T, 4>(strat, config, fusionOp, params, stream); break;
     case 6: AllReduceDispatchRanksPerNode<T, 6>(strat, config, fusionOp, params, stream); break;
     case 8: AllReduceDispatchRanksPerNode<T, 8>(strat, config, fusionOp, params, stream); break;
-    default: TLLM_THROW("Custom all reduce only supported on {2, 4, 6, 8} GPUs per node.");
+    case 16: AllReduceDispatchRanksPerNode<T, 16>(strat, config, fusionOp, params, stream); break;
+    default: TLLM_THROW("Custom all reduce only supported on {2, 4, 6, 8, 16} GPUs per node.");
     }
 }
 
@@ -1904,7 +1933,7 @@ void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataTy
     TLLM_CHECK_WITH_INFO(configurationSupported(strat, params.elts_total, params.ranks_per_node, dataType),
         "Custom all-reduce configuration unsupported");
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     switch (dataType)
     {
@@ -1917,7 +1946,7 @@ void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataTy
 #endif
     default: TLLM_THROW("Unsupported dataType for customAllReduce");
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 template <typename T>
@@ -1944,7 +1973,7 @@ void launchResidualRmsNormKernel(kernels::AllReduceParams& params, cudaStream_t 
 void residualRmsNorm(
     kernels::AllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream, AllReduceFusionOp fusionOp)
 {
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     switch (dataType)
     {
     case nvinfer1::DataType::kFLOAT: launchResidualRmsNormKernel<float>(params, stream, fusionOp); break;
@@ -1954,12 +1983,16 @@ void residualRmsNorm(
 #endif
     default: TLLM_THROW("Unsupported dataType for customAllReduce");
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 void lamportInitialize(void* buffer, size_t size, nvinfer1::DataType dataType, cudaStream_t stream)
 {
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
+    if (size == 0)
+    {
+        return;
+    }
     switch (dataType)
     {
     case nvinfer1::DataType::kFLOAT:
@@ -1975,7 +2008,7 @@ void lamportInitialize(void* buffer, size_t size, nvinfer1::DataType dataType, c
 #endif
     default: TLLM_THROW("Unsupported dataType for customAllReduce");
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 } // namespace tensorrt_llm::kernels

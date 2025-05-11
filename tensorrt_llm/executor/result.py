@@ -3,17 +3,20 @@ import json
 import weakref
 from dataclasses import dataclass, field
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Union
+from typing import (TYPE_CHECKING, Any, Callable, List, Literal, NamedTuple,
+                    Optional, TypeAlias, Union)
 from weakref import WeakMethod
 
 import torch
+import torch.nn.functional as F
 
+from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue
-from ..sampling_params import SamplingParams
-from .utils import has_event_loop
+from ..sampling_params import LogprobParams, SamplingParams
+from .utils import ErrorResponse, has_event_loop, is_llm_response
 
 if TYPE_CHECKING:
     from .executor import GenerationExecutor
@@ -25,8 +28,40 @@ __all__ = [
     "GenerationResultBase",
     "DetokenizedGenerationResultBase",
     "GenerationResult",
-    "IterationStatsResult",
+    "IterationResult",
 ]
+
+
+@dataclass(slots=True)
+class Logprob:
+    """Holds logprob and vocab rank for a token."""
+    logprob: float
+    rank: Optional[int] = None
+
+
+# List of token_id_to_Logprob dict for prompt or generation texts
+TokenLogprobs: TypeAlias = list[dict[int, Logprob]]
+
+
+class LogProbsResult(NamedTuple):
+    """Optional log probability outputs computed post runtime."""
+    prompt: Optional[TokenLogprobs] = None
+    generation: Optional[TokenLogprobs] = None
+
+
+class ResponseWrapper:
+    """Wrapper of runtime response with optional outputs computed post runtime.
+    """
+
+    def __init__(self,
+                 response: Union["PostprocWorker.Output", tllm.Response],
+                 logprobs: Optional[LogProbsResult] = None):
+        self._response = response
+        self.logprobs = logprobs
+
+    def __getattr__(self, name):
+        response = object.__getattribute__(self, '_response')
+        return getattr(response, name)
 
 
 @dataclass(slots=True)
@@ -36,9 +71,10 @@ class CompletionOutput:
     Args:
         index (int): The index of the output in the request.
         text (str): The generated output text. Defaults to "".
-        token_ids (List[int], optional): The token ids of the generated output text. Defaults to None.
+        token_ids (List[int], optional): The token ids of the generated output text. Defaults to [].
         cumulative_logprob (float, optional): The cumulative log probability of the generated output text. Defaults to None.
-        logprobs (List[float], optional): The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to None.
+        logprobs (TokenLogprobs, optional): The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to None.
+        prompt_logprobs (TokenLogprobs, optional): The log probabilities per prompt token. Defaults to None.
         finish_reason (Literal['stop', 'length', 'timeout', 'cancelled'], optional): The reason why the sequence is finished. Defaults to None.
         stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.
         generation_logits (torch.Tensor, optional): The logits on the generated output token ids. Defaults to None.
@@ -52,9 +88,10 @@ class CompletionOutput:
     """
     index: int
     text: str = ""
-    token_ids: Optional[List[int]] = None
+    token_ids: Optional[List[int]] = field(default_factory=list)
     cumulative_logprob: Optional[float] = None
-    logprobs: Optional[List[float]] = None
+    logprobs: Optional[TokenLogprobs] = field(default_factory=list)
+    prompt_logprobs: Optional[TokenLogprobs] = field(default_factory=list)
     finish_reason: Optional[Literal['stop', 'length', 'timeout',
                                     'cancelled']] = None
     stop_reason: Optional[Union[int, str]] = None
@@ -70,12 +107,6 @@ class CompletionOutput:
                                                 repr=False)
     # the result of result_handler passed to postprocess workers
     _postprocess_result: Any = None
-
-    def __post_init__(self):
-        if self.token_ids is None:
-            self.token_ids = []
-        if self.logprobs is None:
-            self.logprobs = []
 
     @property
     def length(self) -> int:
@@ -105,6 +136,8 @@ class GenerationResultBase:
         self.id = id
         self.sampling_params = sampling_params
         self.postproc_params = postproc_params
+        self.disaggregated_params = None
+        self.decoding_iter = 0
         self._done = False
 
         if has_event_loop():
@@ -157,45 +190,56 @@ class GenerationResultBase:
     def context_logits(self) -> Optional[torch.Tensor]:
         return self._context_logits
 
-    def _handle_sequence(self, response: "GenerationExecutor.Response",
-                         sequence_index: int):
+    def _handle_sequence(self,
+                         finish_reasons,
+                         response_tensors,
+                         sequence_index,
+                         logprobs_result=None):
         """ Handle a single sequence in the response. """
 
-        tensors = response.tensors
-        assert tensors is not None
-
-        beam_search = self.sampling_params.use_beam_search
         seq_idx = sequence_index
-        src_idx = sequence_index if beam_search else 0
+        src_idx = sequence_index if self.sampling_params.use_beam_search else 0
 
         output = self._outputs[seq_idx]
-        output.disaggregated_params = response.disaggregated_params
-
+        output.disaggregated_params = self.disaggregated_params
         output._last_token_ids_len = len(output.token_ids)
-        output.token_ids.extend(tensors.output_token_ids[src_idx])
-        if tensors.cum_log_probs is not None:
-            output.cumulative_logprob = tensors.cum_log_probs[src_idx]
-        if tensors.log_probs is not None:
+        if self.sampling_params.use_beam_search:
+            # Beam search enforces returning all generated tokens
+            output.token_ids = response_tensors.output_token_ids[src_idx]
+        else:
+            output.token_ids.extend(response_tensors.output_token_ids[src_idx])
+
+        # In PD, the first token should be ignored in streaming mode, since it's already been returned by the context server
+        if self.disaggregated_params is not None and self.disaggregated_params.request_type == "generation_only" and self._streaming and self.decoding_iter == 2:
+            output._last_token_ids_len = 1
+
+        if response_tensors.cum_log_probs is not None:
+            output.cumulative_logprob = response_tensors.cum_log_probs[src_idx]
+
+        if logprobs_result:
+            output.prompt_logprobs = logprobs_result.prompt
+            output.logprobs = logprobs_result.generation
+
+        if response_tensors.log_probs is not None:
             output._last_logprobs_len = len(output.logprobs)
-            output.logprobs = tensors.log_probs[src_idx]
+            output.logprobs = response_tensors.log_probs[src_idx]
             # overcome some WAR in the cpp executor
-            if response.finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
+            if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
                 assert len(output.logprobs) == output.length
-        if tensors.generation_logits is not None:
-            output.generation_logits = tensors.generation_logits[
+        if response_tensors.generation_logits is not None:
+            output.generation_logits = response_tensors.generation_logits[
                 src_idx, :output.length]
 
         # when sampling_params.n > 1 and is cancelled, make sure all the outputs
         # be marked as cancelled.
-        if response.finish_reasons and response.finish_reasons[
+        if finish_reasons and finish_reasons[
                 src_idx] == tllm.FinishReason.CANCELLED:
             output.finish_reason = 'cancelled'
 
         if self._done:
-            if response.finish_reasons[src_idx] == tllm.FinishReason.END_ID:
+            if finish_reasons[src_idx] == tllm.FinishReason.END_ID:
                 output.finish_reason = 'stop'
-            elif response.finish_reasons[
-                    src_idx] == tllm.FinishReason.STOP_WORDS:
+            elif finish_reasons[src_idx] == tllm.FinishReason.STOP_WORDS:
                 output.finish_reason = 'stop'
                 for stop_reason, stop_ids in self.sampling_params._get_stop_reasons_and_words(
                 ):
@@ -204,24 +248,29 @@ class GenerationResultBase:
                         if not self.sampling_params.include_stop_str_in_output:
                             output.token_ids = output.token_ids[:-len(stop_ids)]
                         break
-            elif response.finish_reasons[src_idx] == tllm.FinishReason.LENGTH:
+            elif finish_reasons[src_idx] == tllm.FinishReason.LENGTH:
                 output.finish_reason = 'length'
-            elif response.finish_reasons[
-                    src_idx] == tllm.FinishReason.TIMED_OUT:
+            elif finish_reasons[src_idx] == tllm.FinishReason.TIMED_OUT:
                 output.finish_reason = 'timeout'
-            elif response.finish_reasons[
-                    src_idx] == tllm.FinishReason.CANCELLED:
+            elif finish_reasons[src_idx] == tllm.FinishReason.CANCELLED:
                 pass
             else:
                 raise ValueError(
-                    f"Unknown finish reason: {response.finish_reasons[src_idx]}"
-                )
+                    f"Unknown finish reason: {finish_reasons[src_idx]}")
 
-    def _handle_response(self, response: Union["GenerationExecutor.Response",
-                                               "PostprocWorker.Output"]):
+    @nvtx_range_debug("handle_response",
+                      color="red",
+                      category="GenerationResultBase")
+    def _handle_response(self,
+                         response: Union["PostprocWorker.Output", tllm.Response,
+                                         ResponseWrapper, ErrorResponse]):
+        if isinstance(response, ResponseWrapper):
+            logprobs_result = response.logprobs
+            response = response._response
+        else:
+            logprobs_result = None
 
-        is_postprocess_res = isinstance(response, PostprocWorker.Output)
-        if is_postprocess_res:
+        if isinstance(response, PostprocWorker.Output):
             self._done = response.is_final
             if isinstance(response.res, CompletionOutput):
                 # in streaming mode
@@ -229,32 +278,52 @@ class GenerationResultBase:
             else:
                 self._outputs[0]._postprocess_result = response.res
 
-        self._done = response.is_final
+            if response.error:
+                if self._background_error_handler is not None and (
+                        handler := self._background_error_handler()):
+                    handler(response.error)
+        elif is_llm_response(response):
+            if response.has_error():
+                if self._background_error_handler is not None and (
+                        handler := self._background_error_handler()):
+                    handler(response.error_msg)
 
-        if response.error:
+            response_result = response.result
+            self._done = response_result.is_final
+            context_phase_params = response_result.context_phase_params
+            self.decoding_iter = response_result.decoding_iter
+            if context_phase_params is not None:
+                self.disaggregated_params = DisaggregatedParams(
+                    request_type="context_only",
+                    first_gen_tokens=context_phase_params.first_gen_tokens,
+                    ctx_request_id=context_phase_params.req_id,
+                    opaque_state=context_phase_params.opaque_state,
+                    draft_tokens=context_phase_params.draft_tokens)
+
+            finish_reasons = response_result.finish_reasons
+            # output_token_ids = (beams, tokens)
+            if self.sampling_params.use_beam_search:
+                for beam_idx, _ in enumerate(response_result.output_token_ids):
+                    self._handle_sequence(finish_reasons, response_result,
+                                          beam_idx, logprobs_result)
+            else:
+                self._handle_sequence(finish_reasons, response_result,
+                                      response_result.sequence_index,
+                                      logprobs_result)
+
+            if response_result.context_logits is not None:
+                self._context_logits = response_result.context_logits
+
+            # Processing background errors here ASAF during generation.
+            if self._background_error_handler and (
+                    handler := self._background_error_handler()):
+                handler()
+        elif isinstance(response, ErrorResponse):
             if self._background_error_handler is not None and (
                     handler := self._background_error_handler()):
-                handler(response.error)
-
-        if is_postprocess_res: return
-
-        tensors = response.tensors
-        self.disaggregated_params = response.disaggregated_params
-
-        # output_token_ids = (beams, tokens)
-        if self.sampling_params.use_beam_search:
-            for beam_idx, _ in enumerate(tensors.output_token_ids):
-                self._handle_sequence(response, beam_idx)
+                handler(response.error_msg)
         else:
-            self._handle_sequence(response, response.sequence_index)
-
-        if tensors.context_logits is not None:
-            self._context_logits = tensors.context_logits
-
-        # Processing background errors here ASAF during generation.
-        if self._background_error_handler and (
-                handler := self._background_error_handler()):
-            handler()
+            raise ValueError(f"Unknown response type: {response}")
 
 
 class DetokenizedGenerationResultBase(GenerationResultBase):
@@ -278,6 +347,9 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         self.tokenizer = tokenizer
         self._streaming = streaming
 
+    @nvtx_range_debug("handle_response",
+                      color="red",
+                      category="DetokenizedGenerationResultBase")
     def _handle_response(self, response: "GenerationExecutor.Response"):
         GenerationResultBase._handle_response(self, response)
 
@@ -324,10 +396,14 @@ class GenerationResult(GenerationResultBase):
         executor (GenerationExecutor, optional): The executor that created this result. Defaults to None.
     '''
 
-    def __init__(self,
-                 generation_request: "GenerationRequest",
-                 background_error_handler: Optional[Callable] = None,
-                 executor: Optional["GenerationExecutor"] = None) -> None:
+    def __init__(
+        self,
+        generation_request: "GenerationRequest",
+        background_error_handler: Optional[Callable] = None,
+        executor: Optional["GenerationExecutor"] = None,
+        disaggregated_params: Optional[DisaggregatedParams] = None,
+        logprob_params: Optional[LogprobParams] = None,
+    ) -> None:
         super().__init__(
             generation_request.id,
             generation_request.sampling_params,
@@ -336,6 +412,9 @@ class GenerationResult(GenerationResultBase):
         )
         self._generation_request = generation_request
         self._streaming = generation_request.streaming
+        self.disaggregated_params = disaggregated_params
+        # minimal sampling params needed for logprob calculation
+        self._logprob_params = logprob_params
 
         # for aborting the request
         self._executor: Optional[weakref.ReferenceType[
@@ -368,6 +447,12 @@ class GenerationResult(GenerationResultBase):
     @property
     def finished(self) -> bool:
         return self._done
+
+    def clear_logprob_params(self) -> None:
+        # Remove temporary attribute used in executor
+        # for a cleaner external-facing output.
+        if hasattr(self, "_logprob_params"):
+            del self._logprob_params
 
     def _result_step(self, timeout: Optional[float] = None):
         response = self.queue.get(timeout=timeout)
@@ -453,9 +538,9 @@ class GenerationResult(GenerationResultBase):
         return hash(self.request_id)
 
 
-class IterationStatsResult:
+class IterationResult:
     """
-    Runtime statistics for all available iterations.
+    Runtime results for all available iterations.
     """
 
     def __init__(self):
@@ -478,13 +563,13 @@ class IterationStatsResult:
 
     def get_results(self) -> List[dict]:
         """
-        Return all runtime stats in the queue.
+        Return all runtime results in the queue.
         """
         results = []
         while not self._done:
             try:
-                stats = self.queue.get(timeout=self._timeout)
-                results.append(json.loads(stats))
+                data = self.queue.get(timeout=self._timeout)
+                results.append(json.loads(data))
             except Empty:
                 self._done = True
         return results
@@ -499,8 +584,65 @@ class IterationStatsResult:
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
 
         try:
-            stats = await self.aqueue.get(timeout=self._timeout)
-            return json.loads(stats)
+            data = await self.aqueue.get(timeout=self._timeout)
+            return json.loads(data)
         except asyncio.TimeoutError:
             self._done = True
             raise StopAsyncIteration
+
+
+def compute_logprobs(
+    k_prompt_logprobs: int,
+    k_logprobs: int,
+    context_logits: Optional[torch.Tensor],
+    generation_logits: Optional[torch.Tensor],
+    output_token_ids: Optional[list[int]],
+) -> LogProbsResult:
+    """
+    Compute top-K logprobs and ranks for each token position.
+
+    Returns:
+        LogProbsResult, a NamedTuple containing:
+            - prompt: Optional[List[Dict[token_id, Logprob]]] logprobs for prompt tokens.
+            - generation: Optional[List[Dict[token_id, Logprob]]] logprobs for generated tokens.
+    """
+
+    def _topk_logprobs(logits: torch.Tensor, top_k: int,
+                       tokens: Optional[list[int]]) -> TokenLogprobs:
+        if logits.dim() == 3:
+            # reshape from [1, T, V] to [T, V]
+            logits = logits.squeeze(0)
+
+        logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
+        topk_vals, topk_indices = torch.topk(logprobs, k=top_k, dim=-1)
+
+        results: TokenLogprobs = []
+        # for each token position
+        for t in range(logprobs.size(0)):
+            token_dict = {
+                idx.item(): Logprob(logprob=val.item(), rank=r + 1)
+                for r, (val,
+                        idx) in enumerate(zip(topk_vals[t], topk_indices[t]))
+            }
+
+            # If we have the sampled token list and it's not in top-k, add it
+            if tokens is not None:
+                token_id = tokens[t]
+                if token_id not in token_dict:
+                    token_logprob = logprobs[t, token_id].item()
+                    rank = (logprobs[t] > token_logprob).sum().item() + 1
+                    token_dict[token_id] = Logprob(logprob=token_logprob,
+                                                   rank=rank)
+
+            results.append(token_dict)
+        return results
+
+    prompt_logprobs = _topk_logprobs(
+        context_logits, k_prompt_logprobs,
+        None) if k_prompt_logprobs and context_logits is not None else None
+    generation_logprobs = _topk_logprobs(
+        generation_logits, k_logprobs, output_token_ids
+    ) if k_logprobs and generation_logits is not None else None
+
+    return LogProbsResult(prompt=prompt_logprobs,
+                          generation=generation_logprobs)

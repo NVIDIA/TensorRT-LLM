@@ -141,6 +141,38 @@ enum class TileScheduler
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+enum class MultiCtasKvMode
+{
+    // No multiCtasKvMode.
+    Disabled = 0,
+    // Do the reduction through the global memory and atomic counters.
+    GmemReduction,
+    // Do the reduction through the CGA remote shared memory.
+    CgaSmemReduction
+};
+
+// Helper function to check if the multiCtasKv is enabled.
+inline bool isMultiCtasKvEnabled(MultiCtasKvMode multiCtasKvMode)
+{
+    return multiCtasKvMode != MultiCtasKvMode::Disabled;
+}
+
+// Helper function to check the multiCtasKvMode type.
+
+#define MULTI_CTAS_KV_MODE_FUNCTION(Type)                                                                              \
+    inline bool is##Type(MultiCtasKvMode multiCtasKvMode)                                                              \
+    {                                                                                                                  \
+        return (multiCtasKvMode == MultiCtasKvMode::Type);                                                             \
+    }
+
+MULTI_CTAS_KV_MODE_FUNCTION(Disabled)
+MULTI_CTAS_KV_MODE_FUNCTION(GmemReduction)
+MULTI_CTAS_KV_MODE_FUNCTION(CgaSmemReduction)
+
+#undef MULTI_CTAS_KV_MODE_FUNCTION
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 struct TllmGenFmhaRunnerParams
 {
     // Input layout.
@@ -234,6 +266,32 @@ struct TllmGenFmhaRunnerParams
     float mScaleSfKv;
     // The cuda stream.
     cudaStream_t stream;
+
+    // set the attention mask type
+    TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType)
+    {
+        // maskType is the enum of tensorrt_llm::kernels::ContextAttentionMaskType
+        // convert ContextAttentionMaskType to TrtllmGenAttentionMaskType
+        switch (maskType)
+        {
+        case 0: // tensorrt_llm::kernels::ContextAttentionMaskType::PADDING
+            mMaskType = TrtllmGenAttentionMaskType::Dense;
+            break;
+        case 1: // tensorrt_llm::kernels::ContextAttentionMaskType::CAUSAL
+            mMaskType = TrtllmGenAttentionMaskType::Causal;
+            break;
+        case 2: // tensorrt_llm::kernels::ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL
+            mMaskType = TrtllmGenAttentionMaskType::SlidingWindowCausal;
+            break;
+        case 3: // tensorrt_llm::kernels::ContextAttentionMaskType::CUSTOM_MASK
+            mMaskType = TrtllmGenAttentionMaskType::Custom;
+            break;
+        default:
+            TLLM_THROW("ContextAttentionMaskType %d cannot be mapped to TrtllmGenAttentionMaskType",
+                static_cast<int>(maskType));
+        }
+        return *this;
+    }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -241,27 +299,37 @@ struct TllmGenFmhaRunnerParams
 // Parameters that might be updated when selecting kernels.
 struct TllmGenSelectKernelParams
 {
+    // The FMHA kernel type.
+    FmhaKernelType mKernelType;
     // The headDimV per CTA, which is only used by MLA generation kernels currently.
     int mHeadDimPerCtaV;
-    // The maximum number of headsQPerCta that will be processed in one CTA.
-    int mMaxNumHeadsQPerKvInCta;
-    // Enable the multiCtasKvMode or not.
-    bool mMultiCtasKvMode;
+    // The multiCtasKvMode.
+    MultiCtasKvMode mMultiCtasKvMode;
+    // Force using GmemRedution for the multiCtasKvMode.
+    bool mForceGmemReduction;
     // Reuse smemK for V or not (only work with MLA generation kernels).
     bool mReuseSmemKForV;
     // Do we need to select a new kernel as the parameters have been updated.
     bool mSelectNewKernel;
     // The tile scheduler.
     TileScheduler mTileScheduler;
+    // The tile size for Kv.
+    int mTileSizeKv;
+    // Use 2 CTA MMA or not.
+    bool mUses2CtaMma;
 
     // The constructor.
     TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
-        : mHeadDimPerCtaV(params.mHeadDimV)
-        , mMaxNumHeadsQPerKvInCta(1)
-        , mMultiCtasKvMode(params.mMultiCtasKvMode)
+        : mKernelType(params.mKernelType)
+        , mHeadDimPerCtaV(params.mHeadDimV)
+        // Note the CgaSmemReduction will be enabled based on the heuristic.
+        , mMultiCtasKvMode(params.mMultiCtasKvMode ? MultiCtasKvMode::GmemReduction : MultiCtasKvMode::Disabled)
+        , mForceGmemReduction(false)
         , mReuseSmemKForV(false)
         , mSelectNewKernel(false)
-        , mTileScheduler(params.mTileScheduler){};
+        , mTileScheduler(params.mTileScheduler)
+        , mTileSizeKv(128)
+        , mUses2CtaMma(false){};
 };
 
 } // namespace kernels

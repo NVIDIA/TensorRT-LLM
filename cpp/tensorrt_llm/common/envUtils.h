@@ -38,6 +38,9 @@ std::optional<bool> getEnvEnableXQAJIT();
 // 0 means to use heuristics.
 std::optional<int32_t> getEnvXqaBlocksPerSequence();
 
+// Whether use tileSizeKv64 for multiCtasKvMode of trtllm-gen kernels.
+bool getEnvUseTileSizeKv64ForTrtllmGen();
+
 // Tune the number of blocks per sequence for accuracy/performance purpose.
 bool getEnvMmhaMultiblockDebug();
 
@@ -58,11 +61,13 @@ bool getEnvDisaggLayerwise();
 
 bool getEnvParallelCacheSend();
 
-bool getEnvRequestKVCacheSerial();
+bool getEnvRequestKVCacheConcurrent();
 
 bool getEnvDisableKVCacheTransferOverlap();
 
-bool getEnvDisableReceiveKVCacheParallel();
+bool getEnvEnableReceiveKVCacheParallel();
+
+std::string getEnvKVCacheTransferOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
 
@@ -81,6 +86,8 @@ bool getEnvForceDeterministicAllReduce();
 // Return the workspace size for custom all reduce kernels.
 // This only works when force deterministic is enabled.
 size_t getEnvAllReduceWorkspaceSize();
+
+size_t getEnvKVCacheRecvBufferCount();
 
 bool getEnvKVCacheTransferUseAsyncBuffer();
 

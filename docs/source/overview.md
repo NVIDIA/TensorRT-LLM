@@ -35,7 +35,7 @@ Certain limitations might apply. Refer to the {ref}`support-matrix` for more inf
 
 ### Native Windows Support
 
-Application developers and AI enthusiasts can now benefit from accelerated LLMs running locally on PCs and Workstations powered by NVIDIA RTX and NVIDIA GeForce RTX GPUs. Refer to the {ref}`windows` section for more information.
+Windows platform support is deprecated as of v0.18.0. All Windows-related code and functionality will be completely removed in future releases.
 
 ## What Can You Do With TensorRT-LLM?
 

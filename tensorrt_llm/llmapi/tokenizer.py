@@ -28,6 +28,10 @@ class TransformersTokenizer(TokenizerBase):
     def pad_token_id(self) -> int:
         return self.tokenizer.pad_token_id
 
+    @property
+    def name_or_path(self) -> str:
+        return self.tokenizer.name_or_path
+
     def encode(self, text: str, *args, **kwargs) -> List[int]:
         return self.tokenizer.encode(text, *args, **kwargs)
 
@@ -51,6 +55,9 @@ class TransformersTokenizer(TokenizerBase):
         tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
                                                   **kwargs)
         return cls(tokenizer)
+
+    def save_pretrained(self, pretrained_model_dir: str, **kwargs):
+        self.tokenizer.save_pretrained(pretrained_model_dir, **kwargs)
 
     def clean_up_tokenization(self, out_string: str) -> str:
         return self.tokenizer.clean_up_tokenization(out_string)

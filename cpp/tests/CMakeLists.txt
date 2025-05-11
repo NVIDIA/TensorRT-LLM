@@ -18,20 +18,10 @@
 include(FetchContent)
 FetchContent_Declare(
   googletest
-  GIT_REPOSITORY
-    https://github.com/google/googletest.git
+  GIT_REPOSITORY https://github.com/google/googletest.git
   GIT_TAG v1.15.2)
 FetchContent_MakeAvailable(googletest)
 include(GoogleTest)
-
-# On Windows major version is appended to nvinfer libs.
-if(WIN32)
-  set(ONNX_PARSER_LIB_NAME nvonnxparser_10)
-else()
-  set(ONNX_PARSER_LIB_NAME nvonnxparser)
-endif()
-find_library_create_target(nvonnxparser ${ONNX_PARSER_LIB_NAME} SHARED
-                           ${TRT_OUT_DIR} ${TRT_LIB_DIR})
 
 include_directories(
   ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include
@@ -51,7 +41,7 @@ function(add_gtest test_name test_src)
                         ${ARGN})
   add_executable(${test_name} ${test_src})
 
-  target_link_libraries(${test_name} PUBLIC gmock_main nvonnxparser)
+  target_link_libraries(${test_name} PUBLIC gmock_main TensorRT::OnnxParser)
   if(NOT ARGS_NO_GTEST_MAIN)
     target_link_libraries(${test_name} PUBLIC gtest_main)
   endif()
@@ -83,13 +73,12 @@ add_subdirectory(unit_tests)
 
 add_gtest(mpiUtilsTest runtime/mpiUtilsTest.cpp)
 
-add_gtest(loraManagerTest runtime/loraManagerTest.cpp)
-add_gtest(loraCacheTest runtime/loraCacheTest.cpp)
 add_gtest(gptDecoderTest runtime/gptDecoderTest.cpp)
 add_gtest(gptDecoderBatchedTest runtime/gptDecoderBatchedTest.cpp)
 add_gtest(gptSessionTest runtime/gptSessionTest.cpp)
-target_link_libraries(gptSessionTest PRIVATE modelSpecStatic)
 add_gtest(medusaModuleTest runtime/medusaModuleTest.cpp)
+
+add_gtest(sanitizerTest runtime/sanitizerTest.cpp)
 
 add_gtest(eaglePackDataTest kernels/eaglePackDataTest.cpp)
 
@@ -99,14 +88,10 @@ add_gtest(eagleLayerTest layers/eagleLayerTest.cpp)
 
 add_subdirectory(utils)
 
-if(BUILD_BATCH_MANAGER)
-  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)
-    add_subdirectory(batch_manager)
-  endif()
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)
+  add_subdirectory(batch_manager)
 endif()
 
-if(BUILD_EXECUTOR)
-  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/executor)
-    add_subdirectory(executor)
-  endif()
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/executor)
+  add_subdirectory(executor)
 endif()

@@ -1,112 +1,70 @@
-"""Graph transformation to automatically add kv cache into MHA kernels."""
+"""Graph transformation to automatically add kv cache into fused MHA op."""
 
 import operator
-from collections import defaultdict
-from typing import Callable, Dict, List, Optional
+from typing import Dict, List
 
 import torch
-from torch._subclasses import FakeTensor
 from torch.fx import Graph, GraphModule, Node
 
-from ...custom_ops.attention_interface import AttentionDescriptor, AttentionInfo
+from ...custom_ops.attention_interface import AttentionDescriptor, CacheConfig
+from ...distributed.common import all_gather_object, get_world_size
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
-from ...utils.node_utils import get_all_input_output_nodes, is_dist_op, is_linear_op, is_op
+from ...utils.node_utils import get_all_input_output_nodes, is_op
 from .._graph import add_graph_input, canonicalize_graph
 
 
-def _is_dist_lin_op(node: Node, exclude: Optional[List[Node]] = None) -> bool:
-    return node not in (exclude or []) and (
-        is_linear_op(node, include_quantization=True)
-        or (is_dist_op(node) and is_linear_op(node.all_input_nodes[0], include_quantization=True))
-    )
-
-
-def _bfs(node: Node, target: Callable, attr_next: str = "users") -> Node:
-    queue = [node]
-    while queue:
-        cur_node = queue.pop(0)
-        if target(cur_node):
-            return cur_node
-        queue.extend(getattr(cur_node, attr_next))
-    raise RuntimeError(f"Could not find node with target condition {target}.")
-
-
-def insert_mha_with_kv_cache(
-    egm: GraphModule,
-    cm: CachedSequenceInterface,
-    attention_op: AttentionDescriptor,
-    rope_theta: Optional[float] = None,
-    kv_cache_dtype: Optional[torch.dtype] = None,
-) -> GraphModule:
-    """Perform insertion of kv-caches and attention kernel."""
-    # sanity check
-    if cm.info.is_paged:
-        assert attention_op.is_paged(), "Paged sequence info requires paged attention op."
-
-    graph: Graph = egm.graph
-
-    ad_logger.info(f"Inserting MHA with KV cache and AttentionOp as {attention_op.__name__}")
-    ad_logger.debug(f"Before inserting MHA with KV cache: {egm}")
-
-    # list of MHA kernels we would want to detect and replace
-    mha_ops = {
-        torch.ops.attention.scaled_dot_product_attention,
-    }
-
+def check_in_out_nodes(egm: GraphModule) -> List[Node]:
+    """Check for input and output nodes in the graph and return 1st input node."""
     # loop through nodes to get input, output, and get_attr nodes
-    input_nodes, output_nodes = get_all_input_output_nodes(graph)
+    input_nodes, output_nodes = get_all_input_output_nodes(egm.graph)
 
     # we only expect one input node
-    assert len(input_nodes) == 1, "Expected exactly one input node."
+    assert len(input_nodes) == 2, "Expected exactly two input nodes (input_ids, position_ids)."
 
     # NOTE: for now, we wanna make sure we *only* return the final output and no hidden states.
     # Later on, we can revisit how to support returning hidden states.
     assert len(output_nodes) == 1, "Expected exactly one output node!"
     assert len(output_nodes[0].all_input_nodes) == 1, "Expected to only return final tensor output!"
 
-    # get all mha nodes and their GEMMs as well as sanity checks and shape information
-    mha_gemms: Dict[Node, List[Node]] = defaultdict(list)
-    mha_info: Dict[Node, AttentionInfo] = {}
-    for mha_node in graph.nodes:
-        if mha_node.op != "call_function" or not is_op(mha_node, mha_ops):
-            continue
-        # do some sanity checks on the args of the node
-        assert mha_node.kwargs == {}, "We don't handle kwargs for mha nodes right now."
-        assert len(mha_node.args) >= 3, "MHA nodes should have at least 3 args: q, k, v."
-        args_other = mha_node.args[3:]
-        args_other_expected = (None, 0.0, True)[: len(args_other)]  # other args expected
-        if args_other != args_other_expected:
-            ad_logger.debug(f"Unexpected args for MHA node: {args_other}.")
+    return input_nodes
 
-        # from the sdpa node, identify q, k, v, and out GEMMs via BFS
-        for arg in mha_node.args[:3]:
-            mha_gemms[mha_node].append(
-                _bfs(arg, lambda n: _is_dist_lin_op(n, mha_gemms[mha_node]), "all_input_nodes")
-            )
-        mha_gemms[mha_node].append(_bfs(mha_node, _is_dist_lin_op, "users"))
 
-        # get fake q tensor that is an MHA input node to retrieve head_dim, num_heads, and dtype
-        # also retrieve fake tensor corresponding to output of k GEMM to infer number of kv heads
-        q_fake: FakeTensor = mha_node.args[0].meta["val"]
-        kv_gemm_fake: FakeTensor = mha_gemms[mha_node][1].meta["val"]
-        mha_info[mha_node] = AttentionInfo(
-            num_heads=q_fake.shape[1],
-            num_kv_heads=kv_gemm_fake.shape[-1] // q_fake.shape[3],
-            head_dim=q_fake.shape[3],
-            dtype=q_fake.dtype,
-            cache_dtype=kv_cache_dtype,
-            rope_theta=rope_theta,
-        )
+def insert_cached_attention(
+    egm: GraphModule,
+    cm: CachedSequenceInterface,
+    attn_descriptor: AttentionDescriptor,
+    cache_config: CacheConfig,
+    input_nodes: List[Node],
+) -> GraphModule:
+    """Replace uncached source attention node with corresponding cached attn node."""
+    # Get all attention nodes and their info objects
+    source_op = attn_descriptor.get_source_attention_op()
+
+    # pick up graph
+    graph: Graph = egm.graph
+
+    # look for relevant source attention nodes
+    source_attn_nodes = [n for n in graph.nodes if is_op(n, source_op)]
+
+    if not source_attn_nodes:
+        # If there are no nodes for kv cache insertion found, return current graph
+        return egm
+
+    # Sanity check
+    if cm.info.is_paged:
+        assert attn_descriptor.is_paged(), "Paged sequence info requires paged attention op."
+
+    ad_logger.info(f"Replacing attn op {source_op} with backend {attn_descriptor.__name__}")
+    ad_logger.debug(f"Before inserting {attn_descriptor=} with cache: {egm}")
 
     # insert metadata computation and extract each argument as a node
-    mha_0 = next(iter(mha_info.keys()))
-    get_metadata, num_metadata = attention_op.get_prepare_metadata_op()
-    with graph.inserting_before(mha_0):
+    get_metadata, num_metadata = attn_descriptor.get_prepare_metadata_op()
+    with graph.inserting_before(source_attn_nodes[0]):
         ret_node = graph.call_function(
             get_metadata,
             args=(
-                input_nodes[0],
+                *input_nodes,
                 *(add_graph_input(egm, name) for name in cm.info.extra_arg_names),
                 cm.info.page_size,
             ),
@@ -118,43 +76,88 @@ def insert_mha_with_kv_cache(
 
     buffer_in_lookup: Dict[str, Node] = {}
 
-    # replace SDPA with custom MHA kernel that takes q, k, v GEMMs directly and is fed to out GEMM
-    # all other nodes will be pruned during recompile below
-    for idx, (mha_node, gemms) in enumerate(mha_gemms.items()):
-        # retrieve some MHA GEMM info
-        qkv, out = gemms[:3], gemms[3]
+    # replace fused attention node with attention node that has kv cache
+    for idx, attn_node in enumerate(source_attn_nodes):
+        # pick out GEMMs
+        qkv = attn_node.args[: attn_descriptor.get_num_qkv_args()]
 
         # setup + store cache initializers and caches as input nodes
         cache_in_nodes = []
-        for k, fn in attention_op.get_cache_initializers(mha_info[mha_node]).items():
+        for k, get_cache in attn_descriptor.get_cache_initializers(attn_node, cache_config).items():
             k_indexed = f"{k}_{idx}"
-            cm.add_cache(k_indexed, fn)
+            cm.add_cache(k_indexed, get_cache)
             cache_in_nodes.append(add_graph_input(egm, k_indexed))
 
         # setup + store global buffer initializers and buffers as input nodes
         # NOTE: we have to check against existing keys to make sure nothing is registered twice...
         buffer_in_nodes = []
-        for k, fn in attention_op.get_global_buffer_initializers(mha_info[mha_node]).items():
+        for k, get_buffer in attn_descriptor.get_global_buffer_initializers(attn_node).items():
             if k not in buffer_in_lookup:
-                cm.add_cache(k, fn)
+                cm.add_cache(k, get_buffer)
                 buffer_in_lookup[k] = add_graph_input(egm, k)
             buffer_in_nodes.append(buffer_in_lookup[k])  # store buffer nodes for this op
 
         # retrieve constants for attention_op
-        constants = attention_op.get_constants(mha_info[mha_node])
+        constants = attn_descriptor.get_constants(attn_node)
 
-        # insert fused replacement op
-        with graph.inserting_before(mha_node):
-            mha_node_with_cache = graph.call_function(
-                attention_op.get_attention_op(),
+        # insert cached attention replacement op
+        with graph.inserting_before(attn_node):
+            cached_attn_node = graph.call_function(
+                attn_descriptor.get_cached_attention_op(),
                 args=(*qkv, *metadata_nodes, *cache_in_nodes, *buffer_in_nodes, *constants),
             )
-        mha_node.replace_all_uses_with(mha_node_with_cache)
-        graph.erase_node(mha_node)
+        attn_node.replace_all_uses_with(cached_attn_node)
+        graph.erase_node(attn_node)
 
-        # hook mha output directly to GEMM
-        out.args = (mha_node_with_cache, *out.args[1:])
+    egm = canonicalize_graph(egm)
+    ad_logger.debug(f"After inserting {attn_descriptor=} with cache: {egm}")
 
-    egm = canonicalize_graph(egm, shape_prop=False)
-    ad_logger.debug("After inserting MHA with KV cache: " + str(egm))
     return egm
+
+
+def resize_kv_cache(
+    egm: GraphModule,
+    cm: CachedSequenceInterface,
+    free_mem_ratio: float = 0.8,
+) -> None:
+    """Inflate the kv cache to occupy the available GPU memory.
+
+    free_mem_ratio specifies the fraction of available memory to occupy.
+    """
+    free_mem, total_mem = torch.cuda.mem_get_info()
+    ad_logger.info(f"Free memory: {free_mem}, Total memory: {total_mem}")
+    current_cache_size = cm.current_cache_size_bytes()
+    current_num_pages = cm.info.num_pages
+    ad_logger.info(
+        f"Current cache size: {current_cache_size}, Current num pages: {current_num_pages}"
+    )
+
+    try:
+        # Let's run a forward pass to get the memory usage
+        cm.info._set_max_num_tokens_sample()
+        free_mem_pre, _ = torch.cuda.mem_get_info()
+        ad_logger.info(f"Free memory before forward pass: {free_mem_pre}")
+        egm(*cm.args)
+        free_mem_post, _ = torch.cuda.mem_get_info()
+        ad_logger.info(f"Free memory after forward pass: {free_mem_post}")
+
+        memory_for_forward_pass = free_mem_pre - free_mem_post
+        ad_logger.info(f"Memory for forward pass: {memory_for_forward_pass}")
+
+        new_cache_size = free_mem_post * free_mem_ratio + current_cache_size
+        new_num_pages = int(new_cache_size // (current_cache_size // current_num_pages))
+
+        # Need to sync all the GPUs
+        gathered_num_pages = [None] * get_world_size()
+        all_gather_object(gathered_num_pages, new_num_pages)
+        new_num_pages = min(gathered_num_pages)
+        ad_logger.info(f"After all_gather - new_num_pages: {new_num_pages}")
+
+        cm.resize_cache(new_num_pages)
+    except Exception as e:
+        ad_logger.warning(
+            f"Error encountered while resizing kv cache: {e}.\nSkipping cache resize."
+        )
+
+    # Free memory
+    torch.cuda.empty_cache()

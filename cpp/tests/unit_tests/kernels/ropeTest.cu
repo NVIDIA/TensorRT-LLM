@@ -498,7 +498,7 @@ protected:
         if constexpr (std::is_same_v<KVCacheType, __nv_fp4_e2m1>)
         {
             // Quant helper functions will not work on lower SM versions.
-            return getSMVersion() < 100;
+            return getSMVersion() < 100 || getSMVersion() >= 120;
         }
 #endif
         return false;
@@ -664,7 +664,7 @@ protected:
 
         TLLM_LOG_DEBUG(decoderParams.toString());
         invokeBuildDecoderInfo(decoderParams, this->mStream->get());
-        sync_check_cuda_error();
+        sync_check_cuda_error(this->mStream->get());
     }
 
     void buildPreprocessingParams()
@@ -860,7 +860,7 @@ TYPED_TEST(RopeTest, RopeTestLLamaLinearCache)
 
     this->allocateBuffers();
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(this->mStream->get());
 
     this->buildDecoderParams();
     this->buildKVCaches();
