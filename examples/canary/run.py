@@ -419,16 +419,11 @@ class CanaryEncoder:
         self.session_conformer = Session.from_serialized_engine(engine_buffer)
         self.device = torch.device(
             "cuda:0") if torch.cuda.is_available() else "cpu"
-        if self.encoder_config.get('projection', False):
-            self.enc_dec_proj = torch.load(
-                os.path.join(engine_dir,
-                             'encoder/enc_dec_proj.pt')).to(self.device)
-        else:
-            self.enc_dec_proj = None
+
 
     @staticmethod
     def get_masked_emb(enc_outputs):
-        enc_emb = enc_outputs['outputs']
+        enc_emb = enc_outputs.get('outputs', enc_outputs.get('encoded_output'))
         enc_len = enc_outputs['encoded_lengths']
         batch_size = enc_len.shape[0]
         max_length = enc_emb.shape[2]
@@ -461,8 +456,7 @@ class CanaryEncoder:
         assert is_ok, "Runtime execution failed for Conformer Encoder session"
         stream.synchronize()
         enc_mask, emb_len = self.get_masked_emb(enc_outputs)
-        if self.enc_dec_proj is not None:
-            enc_mask = self.enc_dec_proj(enc_mask.to(dtype=torch.float32))
+
         emb_len = torch.clip(emb_len, max=enc_mask.shape[1])
         return enc_mask, emb_len
 

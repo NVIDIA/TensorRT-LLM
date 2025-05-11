@@ -17,11 +17,15 @@ import json
 import logging
 import os
 import time
+import shutil
 
 import nemo.collections.asr.models as nemo_asr
+import onnx
 import torch
+import numpy as np
 from omegaconf import OmegaConf
 from safetensors.torch import save_file
+import onnx_graphsurgeon as gs
 
 import tensorrt_llm
 from tensorrt_llm.functional import LayerNormPositionType, LayerNormType
@@ -176,17 +180,58 @@ class CanaryModel:
                                                dtype=torch.float32)
             with autocast, torch.no_grad(), torch.inference_mode():
                 logging.info(f"Exporting model {self.model.__class__.__name__}")
+                if os.path.exists(encoder_path):
+                    shutil.rmtree(encoder_path)
+
                 os.makedirs(encoder_path, exist_ok=True)
 
                 encoder_filename = 'encoder.onnx'
                 export_file = os.path.join(encoder_path, "encoder.onnx")
-                enc_dec_proj_file = os.path.join(encoder_path,
-                                                 "enc_dec_proj.pt")
-                #encoder=self.model.encoder
-                #encoder.to(dtype=TORCH[self.dtype])
-                #encoder.export(export_file, onnx_opset_version=17)
+
+                project_encoder_output=False
+                if isinstance(self.model.encoder_decoder_proj, torch.nn.Linear):
+                    project_encoder_output=True
+                    proj_w=self.model.encoder_decoder_proj.weight.data.clone()
+                    proj_b=self.model.encoder_decoder_proj.bias.data.clone()
+
+
+
 
                 self.model.encoder.export(export_file, onnx_opset_version=17)
+
+
+                if project_encoder_output:
+                    print(f"Loading encoder from {encoder_path} for GS")
+                    enc_graph = gs.import_onnx(onnx.load(export_file))
+                    enc_outputs = enc_graph.outputs[0]
+                    enc_len = enc_graph.outputs[1]
+                    print(f"{enc_graph.outputs=}")
+                    Y = gs.Variable(name='encoded_output', dtype=np.float32, shape=(None, None, 1024))
+
+                    x = gs.Variable(name='x')
+                    t_out=gs.Variable(name='t_out')
+                    w = gs.Constant(name='w', values=proj_w.transpose(1, 0).cpu().numpy())
+                    b = gs.Constant(name='b', values=proj_b.cpu().numpy())
+                    mul_out = gs.Variable(name="mul_out")
+                    enc_graph.nodes.append(
+                        gs.Node(op="Transpose", inputs=[enc_outputs], outputs=[x], attrs={"perm": [0, 2, 1]}))
+                    enc_graph.nodes.append(gs.Node(op="MatMul", inputs=[x, w], outputs=[mul_out]))
+                    enc_graph.nodes.append(gs.Node(op="Add", inputs=[mul_out, b], outputs=[t_out]))
+                    enc_graph.nodes.append(
+                        gs.Node(op="Transpose", inputs=[t_out], outputs=[Y], attrs={"perm": [0, 2, 1]}))
+
+
+                    enc_graph.outputs = [Y, enc_len]
+                    print(f"exporting encoder from  GS")
+
+                    model = onnx.shape_inference.infer_shapes(gs.export_onnx(enc_graph))
+                    print(f"Saving encoder from  GS")
+                    print(f"{enc_graph.outputs=}")
+                    print(f"{enc_graph.inputs=}")
+
+                    shutil.rmtree(encoder_path)
+                    os.makedirs(encoder_path, exist_ok=True)
+                    onnx.save(model,export_file)
 
                 with open(os.path.join(encoder_path, "config.json"),
                           'w') as encoder_config_file:
@@ -198,7 +243,6 @@ class CanaryModel:
                 torch.save(self.model.preprocessor.featurizer.filter_banks,
                            mel_basis_file)
 
-                torch.save(self.model.encoder_decoder_proj, enc_dec_proj_file)
 
                 with open(os.path.join(preprocessor_path, "config.json"),
                           'w') as feat_config:

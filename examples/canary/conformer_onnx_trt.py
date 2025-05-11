@@ -104,8 +104,11 @@ class ConformerTRT:
         nMaxBS = self.maxBS
 
         nOptBS = self.optBS
+
         input_feat = network.get_input(0)
         input_len = network.get_input(1)
+        print("input_feat=", input_feat)
+        print("input_len=", input_len)
         input_feat.shape = [nBS, self.feat_dim, nFeats]
         input_len.shape = [nBS]
         profile.set_shape(
@@ -131,12 +134,7 @@ class ConformerTRT:
 
         plan_file = os.path.join(plan_path, 'encoder.plan')
         config_file = os.path.join(plan_path, 'config.json')
-        proj_file = os.path.join(plan_path, 'enc_dec_proj.pt')
-        enc_dec_proj = torch.load(enc_dec_proj_file)
-        if type(enc_dec_proj) == torch.nn.modules.linear.Identity:
-            self.encoder_config['projection'] = False
-        else:
-            self.encoder_config['projection'] = True
+
 
         if engineString == None:
             print("Failed building %s" % plan_file)
@@ -146,8 +144,7 @@ class ConformerTRT:
                 f.write(engineString)
             with open(config_file, 'w') as jf:
                 json.dump(self.encoder_config, jf)
-            if self.encoder_config['projection']:
-                torch.save(enc_dec_proj, proj_file)
+
 
 
 @click.command()
