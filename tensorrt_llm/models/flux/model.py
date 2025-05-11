@@ -56,6 +56,7 @@ class FluxAttention(Module):
 
         self.cp_size = mapping.cp_size
         self.cp_group = mapping.cp_group
+        self.cp_rank = mapping.cp_rank
         self.tp_group = mapping.tp_group
         self.tp_size = mapping.tp_size
         self.tp_rank = mapping.tp_rank
