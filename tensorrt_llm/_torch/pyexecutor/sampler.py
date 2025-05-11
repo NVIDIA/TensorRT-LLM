@@ -654,6 +654,7 @@ class TRTLLMSampler(Sampler):
 
     def update_requests(self, state: SampleStateTRTLLM):
         scheduled_requests = state.scheduled_requests
+        assert scheduled_requests.batch_size > 0
         beam_width = self.beam_width(scheduled_requests)
         sampler_event = state.sampler_event
 
