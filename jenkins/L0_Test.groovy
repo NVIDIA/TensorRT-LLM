@@ -1073,11 +1073,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         if (perfMode) {
+            basePerfFilename = stageName.contains("PyTorch") ? "base_perf_pytorch.csv" : "base_perf.csv"
+            basePerfPath = "${llmSrc}/tests/integration/defs/perf/${basePerfFilename}"
             stage("Check perf result") {
                 sh """
                     python3 ${llmSrc}/tests/integration/defs/perf/sanity_perf_check.py \
                     ${stageName}/perf_script_test_results.csv \
-                    ${llmSrc}/tests/integration/defs/perf/base_perf.csv
+                    ${basePerfPath}
                 """
             }
             stage("Create perf report") {
@@ -1085,7 +1087,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     python3 ${llmSrc}/tests/integration/defs/perf/create_perf_comparison_report.py \
                     --output_path ${stageName}/report.pdf \
                     --files ${stageName}/perf_script_test_results.csv \
-                    ${llmSrc}/tests/integration/defs/perf/base_perf.csv
+                    ${basePerfPath}
                 """
             }
         }
