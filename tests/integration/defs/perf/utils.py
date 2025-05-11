@@ -425,14 +425,14 @@ class AbstractPerfScriptTestClass(abc.ABC):
                                 buf), self._gpu_clock_lock, tmpDir:
                             output = commands.run_cmd(cmd_idx, venv)
                             # Print the output log to buf.
-                            if not is_prepare_dataset_cmd:
-                                print(collect_and_clean_myelin_time(output))
+                            # if not is_prepare_dataset_cmd:
+                            print(collect_and_clean_myelin_time(output))
                     else:
                         with contextlib.redirect_stdout(buf), tmpDir:
                             output = commands.run_cmd(cmd_idx, venv)
                             # Print the output log to buf.
-                            if not is_prepare_dataset_cmd:
-                                print(collect_and_clean_myelin_time(output))
+                            # if not is_prepare_dataset_cmd:
+                            print(collect_and_clean_myelin_time(output))
 
                     # Print the output log to stdout and cache it.
                     if not is_prepare_dataset_cmd:
