@@ -558,17 +558,24 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
-                          [(False, False, False), (True, False, False),
-                           (False, True, False), (False, False, True),
-                           (True, True, True)])
+    @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
+                          [(False, False, False, False),
+                           (True, False, False, False),
+                           (False, True, False, False),
+                           (False, False, True, False),
+                           (False, False, False, True),
+                           (False, True, True, True), (True, True, True, True)])
+    @parametrize_with_ids("mtp_nextn", [0, 2])
     @parametrize_with_ids("quant_dtype", [
-        pytest.param(None, marks=skip_pre_hopper),
+        pytest.param("none", marks=skip_pre_hopper),
         pytest.param("fp8", marks=skip_pre_hopper),
         pytest.param("nvfp4", marks=skip_pre_blackwell)
     ])
-    def test_no_kv_cache_reuse(self, quant_dtype, attention_dp, cuda_graph,
-                               overlap_scheduler):
+    def test_no_kv_cache_reuse(self, quant_dtype, mtp_nextn, fp8kv,
+                               attention_dp, cuda_graph, overlap_scheduler):
+        if quant_dtype == "nvfp4" and mtp_nextn > 0:
+            pytest.skip("MTP is not supported for NVFP4")
+
         model_path = self.MODEL_PATH
         if quant_dtype == "fp8":
             model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/fp8"
@@ -580,15 +587,44 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+
+        if quant_dtype == "none":
+            assert not fp8kv
+            quant_config = None
+        else:
+            quant_config = QuantConfig()
+            if quant_dtype == "fp8":
+                quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+            elif quant_dtype == "nvfp4":
+                quant_config.quant_algo = QuantAlgo.NVFP4
+            if fp8kv:
+                quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+                pytorch_config.kv_cache_dtype = "fp8"
 
         llm = LLM(model_path,
                   kv_cache_config=kv_cache_config,
                   pytorch_backend_config=pytorch_config,
-                  enable_attention_dp=attention_dp)
+                  quant_config=quant_config,
+                  enable_attention_dp=attention_dp,
+                  speculative_config=mtp_config)
+
+        if quant_dtype == "fp8":
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+        elif quant_dtype == "nvfp4":
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+        if fp8kv:
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
         with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
+            # No need to run MMLU for fp8kv
+            if not fp8kv:
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
 
