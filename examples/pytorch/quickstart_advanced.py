@@ -177,6 +177,8 @@ def setup_llm(args):
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
+        return_generation_logits=True,
+        logprobs=1,
     )
     return llm, sampling_params
 

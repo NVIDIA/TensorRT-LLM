@@ -503,9 +503,11 @@ def instantiate_sampler(model_engine: PyTorchModelEngine,
         # NOTE: choose sampler based on model type
         sampler = EarlyStopSampler()
     else:
+        vocab_size = model_engine.model.model_config.pretrained_config.vocab_size
         sampler = TorchSampler(
             max_seq_len=model_engine.max_seq_len,
             executor_config=executor_config,
+            vocab_size=vocab_size,
             mixed_sampler=pytorch_backend_config.mixed_sampler)
     return sampler
 
