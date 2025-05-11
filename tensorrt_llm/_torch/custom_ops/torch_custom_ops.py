@@ -492,6 +492,8 @@ def _(
     v_head_dim: Optional[int],
     mrope_rotary_cos_sin: Optional[torch.Tensor],
     mrope_position_deltas: Optional[torch.Tensor],
+    mla_context_paged_kv: Optional[torch.Tensor],
+    mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
 ) -> torch.Tensor:
     num_tokens = q.size(0)
     attention_input_type = (AttentionInputType(attention_input_type)
