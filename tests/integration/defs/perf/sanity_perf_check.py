@@ -36,18 +36,20 @@ class SanityPerfCheck():
         print("=" * 40)
 
     def write_patch(self, old_lines: list[str], new_lines: list[str],
-                    output_path: str) -> None:
+                    output_path: str, base_perf_filename: str) -> None:
         with open(output_path, 'w') as f:
             for diff_line in difflib.unified_diff(
                     old_lines, new_lines,
-                    'a/tests/integration/defs/perf/base_perf.csv',
-                    'b/tests/integration/defs/perf/base_perf.csv'):
+                    f'a/tests/integration/defs/perf/{base_perf_filename}',
+                    f'b/tests/integration/defs/perf/{base_perf_filename}'):
                 f.write(diff_line)
 
     def __call__(self, *args, **kwargs):
         # Check if the base_perf_csv file exists
         if not self.base_perf_csv.exists():
-            print(f"base_perf.csv doesn't exist, skip check the perf result.")
+            print(
+                f"{self.base_perf_csv.name} doesn't exist, skip check the perf result."
+            )
             return 0
 
         base_perf = load_file(self.base_perf_csv.as_posix())
@@ -59,7 +61,7 @@ class SanityPerfCheck():
             output_patch = self.target_perf_csv.with_name(
                 'perf_patch.patch').as_posix()
             self.write_patch(get_csv_lines(base_perf), get_csv_lines(new_base),
-                             output_patch)
+                             output_patch, self.base_perf_csv.name)
             print(f"patch_file was written to {output_patch}")
             print(
                 "You can download the file and update base_perf.csv by `git apply <patch file>`"
