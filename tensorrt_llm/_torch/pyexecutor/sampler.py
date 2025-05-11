@@ -195,14 +195,9 @@ class TorchSampler(Sampler):
         new_tokens_device: torch.Tensor
         logits: torch.Tensor
 
-    def __init__(self,
-                 *,
-                 max_seq_len: int,
-                 max_draft_tokens: int,
-                 max_batch_size: int,
-                 max_beam_width: int,
-                 vocab_size: int,
-                 mixed_sampler: bool = False):
+    def __init__(self, *, max_seq_len: int, max_draft_tokens: int,
+                 max_batch_size: int, max_beam_width: int, vocab_size: int,
+                 mixed_sampler: bool):
         self.max_seq_len = max_seq_len
         self.mixed_sampler = mixed_sampler
 
