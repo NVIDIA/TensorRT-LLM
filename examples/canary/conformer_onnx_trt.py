@@ -107,8 +107,6 @@ class ConformerTRT:
 
         input_feat = network.get_input(0)
         input_len = network.get_input(1)
-        print("input_feat=", input_feat)
-        print("input_len=", input_len)
         input_feat.shape = [nBS, self.feat_dim, nFeats]
         input_len.shape = [nBS]
         profile.set_shape(

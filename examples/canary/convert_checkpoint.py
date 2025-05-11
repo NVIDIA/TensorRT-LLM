@@ -188,19 +188,11 @@ class CanaryModel:
                 encoder_filename = 'encoder.onnx'
                 export_file = os.path.join(encoder_path, "encoder.onnx")
 
-                project_encoder_output=False
-                if isinstance(self.model.encoder_decoder_proj, torch.nn.Linear):
-                    project_encoder_output=True
-                    proj_w=self.model.encoder_decoder_proj.weight.data.clone()
-                    proj_b=self.model.encoder_decoder_proj.bias.data.clone()
-
-
-
-
                 self.model.encoder.export(export_file, onnx_opset_version=17)
 
-
-                if project_encoder_output:
+                if isinstance(self.model.encoder_decoder_proj, torch.nn.Linear):
+                    proj_w=self.model.encoder_decoder_proj.weight.data.clone()
+                    proj_b=self.model.encoder_decoder_proj.bias.data.clone()
                     print(f"Loading encoder from {encoder_path} for GS")
                     enc_graph = gs.import_onnx(onnx.load(export_file))
                     enc_outputs = enc_graph.outputs[0]
