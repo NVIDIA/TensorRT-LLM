@@ -674,7 +674,6 @@ class TRTLLMSampler(Sampler):
             current_num_of_tokens = request.max_beam_num_tokens
 
             num_new_tokens = [0] * beam_width
-            num_dropped_tokens = [0] * beam_width
 
             for beam in range(beam_width):
                 seq_len = sequence_lengths_host_data[seq_slot * beam_width +
@@ -682,8 +681,6 @@ class TRTLLMSampler(Sampler):
                 num_new_tokens[beam] = min(
                     num_generated_tokens,
                     seq_len - request.get_num_tokens(beam))
-                num_dropped_tokens[
-                    beam] = num_generated_tokens - num_new_tokens[beam]
 
                 for step in range(num_new_tokens[beam]):
                     new_token = new_tokens_host[step][seq_slot][beam]
