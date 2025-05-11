@@ -409,7 +409,8 @@ class AbstractPerfScriptTestClass(abc.ABC):
         self._gpu_clock_lock = gpu_clock_lock
         tmpDir = temp_wd(self.get_working_dir())
 
-        is_prepare_dataset_cmd = self._config.runtime == 'bench' and cmd_idx == 0
+        is_prepare_dataset_cmd = 'prepare_dataset' in commands.get_cmd_str(
+            cmd_idx)
 
         # Start the timer.
         self._start_timestamp = datetime.utcnow()
