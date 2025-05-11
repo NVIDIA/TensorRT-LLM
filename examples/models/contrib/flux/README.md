@@ -67,6 +67,7 @@ Context parallel can be used to reduce latency since it has lower communication 
 python convert_checkpoint.py --model_dir ./FLUX.1-dev --cp_size 4
 trtllm-build --checkpoint_dir ./tllm_checkpoint/ \
                 --max_batch_size 1 \
+                --bert_attention_plugin disable \
                 --remove_input_padding disable
 # run
 mpirun -n 4 --allow-run-as-root python run.py
@@ -81,6 +82,7 @@ Tensor Parallel and Context Parallel can be used together to better balance late
 python convert_checkpoint.py --model_dir ./FLUX.1-dev --cp_size 2 --tp_size 2
 trtllm-build --checkpoint_dir ./tllm_checkpoint/ \
                 --max_batch_size 1 \
+                --bert_attention_plugin disable \
                 --remove_input_padding disable
 # run
 mpirun -n 4 --allow-run-as-root python run.py
