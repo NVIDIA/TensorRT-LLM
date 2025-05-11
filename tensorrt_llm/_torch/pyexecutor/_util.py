@@ -20,7 +20,7 @@ from .decoder import (EarlyStopDecoder, TorchDecoder, TorchStarAttentionDecoder,
                       TRTLLMDecoder)
 from .kv_cache_transceiver import (AttentionTypeCpp, CacheTransBufferManager,
                                    create_kv_cache_transceiver)
-from .model_engine import (KV_CACHE_MANAGER_KEY, PyTorchModelEngine)
+from .model_engine import KV_CACHE_MANAGER_KEY, PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
                                PeftCacheManager, ResourceManager)
