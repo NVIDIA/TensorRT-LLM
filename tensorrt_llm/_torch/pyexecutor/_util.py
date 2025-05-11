@@ -204,7 +204,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
         # NOTE: TRTLLMSampler requires origin_seq_len - 1 for requests.
         #       Spec decoders with overlap require origin_seq_len.
         seq_len = origin_seq_len - 1 if type(
-            py_executor.decoder) == TRTLLMSampler else origin_seq_len
+            py_executor.sampler) == TRTLLMSampler else origin_seq_len
         req = create_dummy_context_requests(max_num_tokens, seq_len, vocab_size)
         req_ids = py_executor.enqueue_requests(req)
     req_ids = py_executor.dist.broadcast(req_ids, root=0)
