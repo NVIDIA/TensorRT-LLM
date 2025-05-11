@@ -154,11 +154,11 @@ def create_py_executor(executor_config: ExecutorConfig,
         if 'cp_type' not in mapping.cp_config:
             executor_config.kv_cache_config.max_tokens = get_token_num_for_estimation(
                 executor_config, model_engine.model.model_config)
-        kv_cache_manager, executor_config = create_kv_cache_manager(
-            model_engine, mapping, executor_config)
+        kv_cache_manager = create_kv_cache_manager(model_engine, mapping,
+                                                   executor_config)
         draft_kv_cache_manager = create_kv_cache_manager(
             draft_model_engine, mapping,
-            executor_config)[0] if draft_model_engine is not None else None
+            executor_config) if draft_model_engine is not None else None
         resources[KV_CACHE_MANAGER_KEY] = kv_cache_manager
         resources[DRAFT_KV_CACHE_MANAGER_KEY] = draft_kv_cache_manager
 
@@ -183,8 +183,8 @@ def create_py_executor(executor_config: ExecutorConfig,
         if kv_cache_max_tokens is not None:
             executor_config.kv_cache_config.max_tokens = kv_cache_max_tokens
 
-            kv_cache_manager, executor_config = create_kv_cache_manager(
-                model_engine, mapping, executor_config)
+            kv_cache_manager = create_kv_cache_manager(model_engine, mapping,
+                                                       executor_config)
             resources[KV_CACHE_MANAGER_KEY] = kv_cache_manager
 
             if model_engine.attn_metadata is not None and kv_cache_manager is not None:
@@ -195,7 +195,7 @@ def create_py_executor(executor_config: ExecutorConfig,
 
             if draft_model_engine is not None:
                 draft_kv_cache_manager = create_kv_cache_manager(
-                    draft_model_engine, mapping, executor_config)[0]
+                    draft_model_engine, mapping, executor_config)
                 resources[DRAFT_KV_CACHE_MANAGER_KEY] = draft_kv_cache_manager
                 if draft_model_engine.attn_metadata is not None and draft_kv_cache_manager is not None:
                     if pytorch_backend_config.use_cuda_graph:

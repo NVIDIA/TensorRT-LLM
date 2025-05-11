@@ -20,7 +20,7 @@ from .decoder import (EarlyStopDecoder, TorchDecoder, TorchStarAttentionDecoder,
                       TRTLLMDecoder)
 from .kv_cache_transceiver import (AttentionTypeCpp, CacheTransBufferManager,
                                    create_kv_cache_transceiver)
-from .model_engine import KV_CACHE_MANAGER_KEY, PyTorchModelEngine
+from .model_engine import (KV_CACHE_MANAGER_KEY, PyTorchModelEngine)
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
                                PeftCacheManager, ResourceManager)
@@ -347,10 +347,11 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
                 num_extra_kv_tokens=0
                 if spec_config is None else spec_config.num_extra_kv_tokens,
             )
-        # KVCacheManager modifies the max_seq_len field, update it to executor_config
-        executor_config.max_seq_len = kv_cache_manager.max_seq_len
+        # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
+        if model_engine.kv_cache_manager_key == KV_CACHE_MANAGER_KEY:
+            executor_config.max_seq_len = kv_cache_manager.max_seq_len
 
-    return kv_cache_manager, executor_config
+    return kv_cache_manager
 
 
 def create_py_executor_instance(dist,
