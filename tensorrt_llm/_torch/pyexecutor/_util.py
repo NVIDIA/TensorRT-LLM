@@ -7,6 +7,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
+from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
 from tensorrt_llm.logger import logger
@@ -482,8 +483,10 @@ def create_py_executor_instance(dist,
                       start_worker=start_worker)
 
 
-def instantiate_sampler(model_engine, executor_config, pytorch_backend_config,
-                        mapping):
+def instantiate_sampler(model_engine: PyTorchModelEngine,
+                        executor_config: ExecutorConfig,
+                        pytorch_backend_config: PyTorchConfig,
+                        mapping: Mapping):
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         sampler = TorchStarAttentionSampler(
