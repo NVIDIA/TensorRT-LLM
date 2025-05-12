@@ -3268,19 +3268,21 @@ TEST_F(GptExecutorTest, ExecutorKVCacheManager)
                         auto events = kvCacheManager->getLatestEvents(std::chrono::milliseconds(100));
                         if (req == 0)
                         {
-                            EXPECT_EQ(events.size(), 2);
+                            EXPECT_EQ(events.size(), 3);
 
                             // Store the first context block
                             EXPECT_EQ(std::get<KVCacheStoredData>(events.front().data).parentHash, std::nullopt);
                             EXPECT_EQ(std::get<KVCacheStoredData>(events.front().data).blocks.size(), 1);
+                            events.pop_front();
                             // Store the second (now completed) context block and the partial decode block.
-                            EXPECT_EQ(std::get<KVCacheStoredData>(events.back().data).blocks.size(), 2);
+                            EXPECT_EQ(std::get<KVCacheStoredData>(events.front().data).blocks.size(), 1);
+                            EXPECT_EQ(std::get<KVCacheStoredData>(events.back().data).blocks.size(), 1);
                             EXPECT_EQ(std::get<KVCacheStoredData>(events.front().data).blocks[0].blockHash,
                                 std::get<KVCacheStoredData>(events.back().data).parentHash);
                         }
                         else
                         {
-                            EXPECT_EQ(events.size(), 4);
+                            EXPECT_EQ(events.size(), 5);
 
                             // Remove a block to make room for the second context block. On the second request, we need
                             // to remove 2 blocks.
@@ -3293,7 +3295,9 @@ TEST_F(GptExecutorTest, ExecutorKVCacheManager)
                             EXPECT_EQ(std::get<KVCacheRemovedData>(events.front().data).blockHashes.size(), 1);
                             events.pop_front();
                             // Store the final context block and the decode block
-                            EXPECT_EQ(std::get<KVCacheStoredData>(events.front().data).blocks.size(), 2);
+                            EXPECT_EQ(std::get<KVCacheStoredData>(events.front().data).blocks.size(), 1);
+                            events.pop_front();
+                            EXPECT_EQ(std::get<KVCacheStoredData>(events.front().data).blocks.size(), 1);
                         }
                     }
                 }
