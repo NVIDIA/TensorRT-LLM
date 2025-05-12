@@ -16,7 +16,7 @@ import torch
 from tensorrt_llm.logger import logger, set_level
 from tensorrt_llm.lora_manager import LoraConfig
 
-from .._utils import mpi_world_size
+from .._utils import global_mpi_rank, mpi_world_size
 from ..bindings import executor as tllm
 from ..builder import Engine
 from ..disaggregated_params import DisaggregatedParams
@@ -368,6 +368,14 @@ class GenerationExecutor(ABC):
             print_colored_debug(
                 f"Using {postproc_worker_config.num_postprocess_workers} postprocess parallel processes.\n",
                 "green")
+
+        # If mpi_session is provided (in dis serving for example), we need to set executor_config parallel_config participantIds
+        if mpi_session:
+            # Get the list of world ranks for the current MPI session
+            global_rank = global_mpi_rank()
+            comm_ranks = mpi_session.get_comm().allgather(global_rank)
+            executor_config.parallel_config = tllm.ParallelConfig(
+                participant_ids=comm_ranks)
 
         worker_kwargs = {
             "engine": engine,

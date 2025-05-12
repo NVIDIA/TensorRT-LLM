@@ -168,10 +168,6 @@ class OpenAIDisaggServer:
             return None
 
         try:
-            if request_type == "chat":
-                ctx_req.max_completion_tokens = 1
-            elif request_type == "completion":
-                ctx_req.max_tokens = 1
             ctx_req.disaggregated_params = DisaggregatedParams(request_type="context_only")
             ctx_req.stream = False
             ctx_req.stream_options = None
