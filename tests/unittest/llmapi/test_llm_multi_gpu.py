@@ -77,6 +77,7 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
 @pytest.mark.part0
 def test_llm_loading_from_ckpt_for_tp2(
         engine_from_checkpoint: tempfile.TemporaryDirectory):
+    pytest.skip(reason="https://nvbugspro.nvidia.com/bug/5273941")
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     llm_test_harness(engine_from_checkpoint.name,
                      prompts, ["D E F G H I J K"],
@@ -341,7 +342,7 @@ def test_executor_results_cleanup():
     llm = LLM(model=llama_model_path,
               kv_cache_config=global_kv_cache_config,
               tensor_parallel_size=2)
-    sampling_params = SamplingParams(max_new_tokens=6)
+    sampling_params = SamplingParams(max_tokens=6)
     for i in range(20):
         llm.generate(prompts, sampling_params=sampling_params)
 

@@ -500,16 +500,6 @@ public:
         return mTokens.at(beam).size() - mNumPreDecodedTokens[beam];
     }
 
-    /// @brief Get number of return sequences for this req.
-    /// @return  The number of sequences to return.
-    [[nodiscard]] SizeType32 getNumReturnSequences() const
-    {
-        TLLM_LOG_WARNING(
-            "mNumReturnSequences in the LlmRequest class is deprecated. Please use numReturnSequences in "
-            "SamplingConfig directly.");
-        return mNumReturnSequences;
-    }
-
     /// @brief Get the number of subrequests, the expected number of responses under non-streaming mode. In sampling
     /// mode, it will be equal to mSamplingConfig.numReturnSequences, while it will be equal to 1 in beam search.
     /// @return  The number of subrequests in total  request size.

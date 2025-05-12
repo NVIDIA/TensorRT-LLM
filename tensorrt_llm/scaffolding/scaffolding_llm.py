@@ -110,12 +110,9 @@ class ScaffoldingLlm:
 
         async def handle_parallel_process(request: ParallelProcess):
             async_tasks = []
-            for controller, tasks, kwargs in zip(request.controllers,
-                                                 request.tasks_list,
-                                                 request.kwargs_list):
-                gen = controller.process(tasks, **kwargs)
+            for sub_gen in request.sub_gens:
                 async_task = asyncio.create_task(
-                    handle_controller_generator(gen))
+                    handle_controller_generator(sub_gen))
                 async_tasks.append(async_task)
             await asyncio.gather(*async_tasks)
 
@@ -215,7 +212,7 @@ class ScaffoldingLlm:
 
         return scaffolding_results[0] if unbatched else scaffolding_results
 
-    def shutdown(self, shutdown_wokers=False):
+    def shutdown(self, shutdown_workers=False):
 
         def shutdown_workers():
             for worker in self.workers.values():
@@ -236,5 +233,5 @@ class ScaffoldingLlm:
             # will not submit new tasks to workers.
             self.shutdown_event.set()
 
-        if shutdown_wokers:
+        if shutdown_workers:
             shutdown_workers()

@@ -59,7 +59,7 @@ def test_trtllm_decoder(model_path, test_case):
     stop_words = test_case["stop_words"]
 
     sampling_config = SamplingParams(max_tokens=max_new_tokens,
-                                     beam_width=1,
+                                     n=1,
                                      stop=stop_words,
                                      temperature=temperature,
                                      top_p=top_p)

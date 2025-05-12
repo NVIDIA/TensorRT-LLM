@@ -1,5 +1,4 @@
 import math
-import os
 import random
 from collections.abc import Iterable
 
@@ -10,14 +9,15 @@ import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_manager import LoraConfig, load_torch_hf_lora
+from tensorrt_llm.lora_manager import (LoraConfig,
+                                       get_default_trtllm_modules_to_hf_modules,
+                                       load_torch_hf_lora)
 from tensorrt_llm.mapping import Mapping
 
 from ..speculative import get_num_spec_layers, get_spec_decoder
 from .decoder import (EarlyStopDecoder, TorchDecoder, TorchStarAttentionDecoder,
                       TRTLLMDecoder)
-from .kv_cache_transceiver import (AttentionTypeCpp, CacheTransBufferManager,
-                                   create_kv_cache_transceiver)
+from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .model_engine import KV_CACHE_MANAGER_KEY, PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
@@ -149,29 +149,6 @@ def get_token_num_for_estimation(executor_config, model_config):
         return None
 
 
-def get_cache_transceiver_prealloc_size(executor_config: ExecutorConfig,
-                                        model_config: PyTorchModelEngine,
-                                        mapping: Mapping):
-    if (os.getenv("TRTLLM_USE_MPI_KVCACHE")
-            or os.getenv("TRTLLM_USE_UCX_KVCACHE")):
-        kv_size_per_token = int(get_cache_size_per_token(model_config, mapping))
-        logger.info(
-            f"get_cache_transceiver_prealloc_size kv_size_per_token: {kv_size_per_token} , executor_config.cache_transceiver_config: {executor_config.cache_transceiver_config}"
-        )
-        if executor_config.cache_transceiver_config is not None:
-            logger.info(
-                f"get_cache_transceiver_prealloc_size executor_config.cache_transceiver_config.max_num_tokens: {executor_config.cache_transceiver_config.max_num_tokens}"
-            )
-            return CacheTransBufferManager.pre_alloc_buffer_size(
-                executor_config.cache_transceiver_config.max_num_tokens,
-                kv_size_per_token)
-        else:
-            return CacheTransBufferManager.pre_alloc_buffer_size(
-                None, kv_size_per_token)
-    else:
-        return 0
-
-
 def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
                                  model_engine: PyTorchModelEngine,
                                  executor_config: ExecutorConfig,
@@ -219,12 +196,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     total_used_bytes = total_gpu_memory - end
     activation_bytes = torch_peak_memory - model_bytes
     extra_cost = max(total_used_bytes - torch_used_bytes, 0)
-    kv_cache_transceiver_prealloc_size = get_cache_transceiver_prealloc_size(
-        executor_config, model_engine.model.model_config, mapping)
-    logger.info(
-        f"kv_cache_transceiver_prealloc_size: {kv_cache_transceiver_prealloc_size}"
-    )
-    peak_memory = torch_peak_memory + extra_cost + kv_cache_transceiver_prealloc_size
+    peak_memory = torch_peak_memory + extra_cost
     logger.info(
         f"Memory dynamically allocated during inference (inside torch) in memory usage profiling: {activation_bytes / (GB):.2f} GiB"
     )
@@ -380,7 +352,16 @@ def create_py_executor_instance(dist,
 
     if lora_config is not None:
         from tensorrt_llm.bindings import LoraModule
-        load_torch_hf_lora(lora_config)
+
+        if len(lora_config.lora_dir) == 1:
+            load_torch_hf_lora(lora_config)
+        else:
+            assert len(lora_config.lora_target_modules
+                       ) >= 1, "Expecting at least one lora target module"
+            if not bool(lora_config.trtllm_modules_to_hf_modules):
+                lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules(
+                )
+
         model_binding_config = model_engine.model.model_config.get_bindings_model_config(
         )
         lora_modules = LoraModule.create_lora_modules(
@@ -406,9 +387,19 @@ def create_py_executor_instance(dist,
             max_cpu_loras,
         )
 
+        from tensorrt_llm.bindings import WorldConfig
+        world_config = WorldConfig(
+            tensor_parallelism=mapping.tp_size,
+            pipeline_parallelism=mapping.pp_size,
+            context_parallelism=mapping.cp_size,
+            rank=dist.mapping.rank,
+            gpus_per_node=dist.mapping.gpus_per_node,
+        )
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=executor_config.peft_cache_config,
-            model_config=model_binding_config)
+            model_config=model_binding_config,
+            world_config=world_config,
+        )
         resources["peft_cache_manager"] = peft_cache_manager
         model_engine.set_lora_model_config(
             lora_config.lora_target_modules,
