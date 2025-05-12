@@ -16,4 +16,13 @@ wget --no-verbose ${RELEASE_URL_CMAKE} -P /tmp
 tar -xf /tmp/${CMAKE_FILE_NAME}.tar.gz -C /usr/local/
 ln -s /usr/local/${CMAKE_FILE_NAME} /usr/local/cmake
 
+# Clean up temporary files
+rm -rf /tmp/${CMAKE_FILE_NAME}.tar.gz
+rm -rf /usr/local/${CMAKE_FILE_NAME}/doc
+rm -rf /usr/local/${CMAKE_FILE_NAME}/man
+rm -rf /usr/local/${CMAKE_FILE_NAME}/share/aclocal
+rm -rf /usr/local/${CMAKE_FILE_NAME}/share/bash-completion
+rm -rf /usr/local/${CMAKE_FILE_NAME}/share/emacs
+rm -rf /usr/local/${CMAKE_FILE_NAME}/share/vim
+
 echo 'export PATH=/usr/local/cmake/bin:$PATH' >> "${ENV}"

@@ -98,7 +98,7 @@ def createKubernetesPodConfig(type)
 
 def buildImage(target, action="build", torchInstallType="skip", args="", custom_tag="", post_tag="")
 {
-    def tag = "x86_64-${target}-torch_${torchInstallType}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}${post_tag}"
+    def tag = "x86_64-${target}-torch_${torchInstallType}${post_tag}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
     // Step 1: cloning tekit source code
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
@@ -251,7 +251,7 @@ pipeline {
                     }
                     steps
                     {
-                        buildImage("devel", params.action, "skip")
+                        buildImage("tritondevel", params.action, "skip")
                     }
                 }
                 stage("Build x86_64-pre_cxx11_abi") {
@@ -278,7 +278,7 @@ pipeline {
                     }
                     steps
                     {
-                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.10.12", "", "-py310")
+                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.10.12 STAGE=tritondevel", "", "-py310")
                     }
                 }
                 stage("Build rockylinux8 x86_64-skip-py3.12") {
@@ -287,7 +287,7 @@ pipeline {
                     }
                     steps
                     {
-                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.12.3", "", "-py312")
+                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.12.3 STAGE=tritondevel", "", "-py312")
                     }
                 }
                 stage("Build SBSA-skip") {

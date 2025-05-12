@@ -43,7 +43,7 @@ def create_llm(model_dir, enable_overlap_scheduler, enable_trtllm_decoder):
     )
 
 
-@pytest.mark.parametrize("enable_trtllm_decoder", [False])
+@pytest.mark.parametrize("enable_trtllm_decoder", [False, True])
 def test_overlap_scheduler_consistency(model_path, test_case,
                                        enable_trtllm_decoder):
     # Test configuration
@@ -54,10 +54,11 @@ def test_overlap_scheduler_consistency(model_path, test_case,
     stop_words = test_case["stop_words"] if enable_trtllm_decoder else None
 
     sampling_config = SamplingParams(max_tokens=max_new_tokens,
-                                     beam_width=1,
                                      stop=stop_words,
                                      temperature=temperature,
-                                     top_p=top_p)
+                                     top_p=top_p,
+                                     n=1,
+                                     use_beam_search=True)
 
     # Test with overlap scheduler enabled
     llm = create_llm(model_path,

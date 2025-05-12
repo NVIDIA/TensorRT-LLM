@@ -9,11 +9,19 @@ fi
 
 MPI4PY_VERSION="3.1.5"
 RELEASE_URL="${GITHUB_URL}/mpi4py/mpi4py/archive/refs/tags/${MPI4PY_VERSION}.tar.gz"
-curl -L ${RELEASE_URL} | tar -zx -C /tmp
+
+# Create and use a temporary directory
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+# Download and extract in one step
+curl -L ${RELEASE_URL} | tar -zx -C "$TMP_DIR"
+
 # Bypassing compatibility issues with higher versions (>= 69) of setuptools.
-sed -i 's/>= 40\.9\.0/>= 40.9.0, < 69/g' /tmp/mpi4py-${MPI4PY_VERSION}/pyproject.toml
-OLDPWD=$(pwd)
-cd /tmp/mpi4py-${MPI4PY_VERSION}
+sed -i 's/>= 40\.9\.0/>= 40.9.0, < 69/g' "$TMP_DIR/mpi4py-${MPI4PY_VERSION}/pyproject.toml"
+
+# Apply the patch
+cd "$TMP_DIR/mpi4py-${MPI4PY_VERSION}"
 git apply <<EOF
 diff --git a/src/mpi4py/futures/_lib.py b/src/mpi4py/futures/_lib.py
 index f14934d1..eebfb8fc 100644
@@ -62,6 +70,9 @@ index f14934d1..eebfb8fc 100644
 
 EOF
 
-cd ${OLDPWD}
-pip3 install /tmp/mpi4py-${MPI4PY_VERSION}
-rm -rf /tmp/mpi4py*
+# Install with pip and clean up cache
+pip3 install --no-cache-dir "$TMP_DIR/mpi4py-${MPI4PY_VERSION}"
+
+# Clean up
+rm -rf "$TMP_DIR"
+rm -rf ~/.cache/pip

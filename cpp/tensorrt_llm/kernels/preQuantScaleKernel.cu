@@ -45,8 +45,8 @@ __global__ void apply_per_channel_scale(
 {
     static constexpr int kElems = sizeof(AccessType) / sizeof(T_in);
     T_in scale[kElems], act_vec[kElems];
-    int col_offset = blockIdx.x * blockDim.x + threadIdx.x;
-    int row_offset = blockIdx.y;
+    int col_offset = blockIdx.y * blockDim.x + threadIdx.x;
+    int row_offset = blockIdx.x;
     if (col_offset * kElems >= cols || row_offset * kProcessRows >= rows)
         return;
     act += row_offset * kProcessRows * cols;
@@ -100,7 +100,7 @@ void apply_per_channel_scale_kernel_launcher_(
 {
     static constexpr int kElems = sizeof(AccessType) / sizeof(T_in);
     dim3 block(128);
-    dim3 grid((cols / kElems + block.x - 1) / block.x, (rows + kProcessRows - 1) / kProcessRows);
+    dim3 grid((rows + kProcessRows - 1) / kProcessRows, (cols / kElems + block.x - 1) / block.x);
     apply_per_channel_scale<T_in, T_out, kProcessRows, AccessType>
         <<<grid, block, 0, stream>>>(smoothed_act, act, per_channel_scale, rows, cols);
 }
@@ -109,7 +109,7 @@ template <typename T_in, typename T_out>
 void apply_per_channel_scale_kernel_launcher(
     T_out* smoothed_act, T_in const* act, T_in const* per_channel_scale, int rows, int cols, cudaStream_t stream)
 {
-    int elems = rows * cols;
+    uint64_t elems = static_cast<uint64_t>(rows) * static_cast<uint64_t>(cols);
     if (elems < 2048 * 2048)
     {
         apply_per_channel_scale_kernel_launcher_<T_in, T_out, 1, float4>(

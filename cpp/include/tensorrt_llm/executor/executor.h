@@ -88,10 +88,8 @@ public:
     [[nodiscard]] std::optional<SizeType32> getTopPResetIds() const;
     [[nodiscard]] std::optional<FloatType> getTopPDecay() const;
     [[nodiscard]] std::optional<RandomSeedType> getSeed() const;
-    [[nodiscard]] std::optional<RandomSeedType> getRandomSeed() const;
     [[nodiscard]] std::optional<FloatType> getTemperature() const;
     [[nodiscard]] std::optional<SizeType32> getMinTokens() const;
-    [[nodiscard]] std::optional<SizeType32> getMinLength() const;
     [[nodiscard]] std::optional<FloatType> getBeamSearchDiversityRate() const;
     [[nodiscard]] std::optional<FloatType> getRepetitionPenalty() const;
     [[nodiscard]] std::optional<FloatType> getPresencePenalty() const;
@@ -110,10 +108,8 @@ public:
     void setTopPResetIds(std::optional<TokenIdType> const& topPResetIds);
     void setTopPDecay(std::optional<FloatType> const& topPDecay);
     void setSeed(std::optional<RandomSeedType> const& seed);
-    void setRandomSeed(std::optional<RandomSeedType> const& randomSeed);
     void setTemperature(std::optional<FloatType> const& temperature);
     void setMinTokens(std::optional<SizeType32> const& minTokens);
-    void setMinLength(std::optional<SizeType32> const& minLength);
     void setBeamSearchDiversityRate(std::optional<FloatType> const& beamSearchDiversityRate);
     void setRepetitionPenalty(std::optional<FloatType> const& repetitionPenalty);
     void setPresencePenalty(std::optional<FloatType> const& presencePenalty);
@@ -205,6 +201,8 @@ class AdditionalModelOutput
 {
 public:
     explicit AdditionalModelOutput(std::string name, bool gatherContext = false);
+
+    bool operator==(AdditionalModelOutput const& other) const;
 
     std::string name;
     bool gatherContext{false};
@@ -485,6 +483,9 @@ public:
         /// @brief The generated text is amenable to the user-specified extended Backus-Naur form (EBNF) grammar.
         /// EBNF grammar is widely-used to express context-free grammars.
         kEBNF_GRAMMAR = 3,
+
+        /// @brief The generated text is amenable to the XGrammar structural tag.
+        kSTRUCTURAL_TAG = 4,
     };
 
     explicit GuidedDecodingParams(GuideType guideType, std::optional<std::string> guide = std::nullopt);
@@ -679,7 +680,6 @@ public:
 
     [[nodiscard]] VecTokens getInputTokenIds() const;
     [[nodiscard]] SizeType32 getMaxTokens() const;
-    [[nodiscard]] SizeType32 getMaxNewTokens() const;
     [[nodiscard]] bool getStreaming() const;
     [[nodiscard]] SamplingConfig getSamplingConfig() const;
     [[nodiscard]] OutputConfig getOutputConfig() const;
@@ -707,7 +707,6 @@ public:
     [[nodiscard]] std::optional<SizeType32> getEncoderOutputLength() const;
     [[nodiscard]] std::optional<Tensor> getCrossAttentionMask() const;
     [[nodiscard]] RequestType getRequestType() const;
-    [[nodiscard]] SizeType32 getNumReturnSequences() const;
     [[nodiscard]] std::optional<EagleConfig> getEagleConfig() const;
     [[nodiscard]] std::optional<Tensor> getSkipCrossAttnBlocks() const;
     [[nodiscard]] std::optional<GuidedDecodingParams> getGuidedDecodingParams() const;
@@ -742,7 +741,6 @@ public:
     void setEncoderInputFeatures(Tensor encoderInputFeatures);
     void setEncoderOutputLength(SizeType32 encoderOutputLength);
     void setCrossAttentionMask(Tensor crossAttentionMask);
-    void setNumReturnSequences(SizeType32 numReturnSequences);
     void setEagleConfig(std::optional<EagleConfig> const& eagleConfig);
     void setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks);
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
@@ -804,8 +802,8 @@ struct Result
     /// @brief The context logits. Size [promptLen, vocabSizePadded]
     std::optional<Tensor> contextLogits;
 
-    /// @brief The generation logits. Size [beamSize, maxNewTokens, vocabSizePadded] (non-streaming)
-    /// or [maxNewTokens, beamSize, vocabSizePadded] (streaming and allGeneratedTokens)
+    /// @brief The generation logits. Size [beamSize, maxTokens, vocabSizePadded] (non-streaming)
+    /// or [maxTokens, beamSize, vocabSizePadded] (streaming and allGeneratedTokens)
     /// or [1, beamSize, vocabSizePadded] (streaming and non-allGeneratedTokens)
     std::optional<Tensor> generationLogits;
 
@@ -1390,6 +1388,8 @@ class CacheTransceiverConfig
 public:
     explicit CacheTransceiverConfig(std::optional<size_t> maxNumTokens = std::nullopt);
 
+    bool operator==(CacheTransceiverConfig const& other) const;
+
     [[nodiscard]] std::optional<size_t> getMaxNumTokens() const;
     void setMaxNumTokens(size_t maxNumTokens);
 
@@ -1430,7 +1430,7 @@ public:
         std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
         std::optional<CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
         bool gatherGenerationLogits = false, bool useVariableBeamWidthSearch = false,
-        bool promptTableOffloading = false);
+        bool promptTableOffloading = false, bool enableTrtOverlap = false);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -1465,6 +1465,7 @@ public:
     [[nodiscard]] bool getUseVariableBeamWidthSearch() const;
     [[nodiscard]] bool getPromptTableOffloading() const;
     [[nodiscard]] std::optional<CacheTransceiverConfig> getCacheTransceiverConfig() const;
+    [[nodiscard]] bool getEnableTrtOverlap() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
@@ -1494,6 +1495,7 @@ public:
     void setUseVariableBeamWidthSearch(bool useVariableBeamWidthSearch);
     void setPromptTableOffloading(bool promptTableOffloading);
     void setCacheTransceiverConfig(CacheTransceiverConfig const& cacheTransceiverConfig);
+    void setEnableTrtOverlap(bool enableTrtOverlap);
 
 private:
     friend class Serialization;
@@ -1507,7 +1509,7 @@ private:
     /// @brief The KV cache configuration.
     KvCacheConfig mKvCacheConfig;
 
-    /// @brief The KV cache configuration.
+    /// @brief Controls whether context is allowed to be chunked.
     bool mEnableChunkedContext;
 
     /// @brief Controls if log probabilities should be normalized or not.
@@ -1580,6 +1582,9 @@ private:
 
     /// @brief Controls if prompt table offloading is enabled.
     bool mPromptTableOffloading{false};
+
+    /// @brief Controls whether preparation and TRT engine execution should be overlapped.
+    bool mEnableTrtOverlap{false};
 };
 
 struct KVCacheCreatedData

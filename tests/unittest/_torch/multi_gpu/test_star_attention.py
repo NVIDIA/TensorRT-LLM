@@ -77,19 +77,20 @@ def test_model(backend, model_name, quant, sp_size, sa_block_size,
               max_seq_len=MAX_SEQ_LEN,
               max_num_tokens=(sa_block_size + sa_anchor_size) * max_batch_size)
 
-    contexts, queries, references = [], [], []
+    inputs, references = [], []
     current_file = os.path.abspath(__file__)
     current_dir = os.path.dirname(current_file)
     with open(f'{current_dir}/test_star_attention_input.jsonl', 'r') as f:
         for line in f:
-            prompt = json.loads(line)
-            contexts.append(prompt['input_context'])
-            queries.append(prompt['input_query'])
-            references.append(prompt['outputs'][0])
+            sample = json.loads(line)
+            inputs.append({
+                'prompt': sample['input_context'],
+                'query': sample['input_query']
+            })
+            references.append(sample['outputs'][0])
     with llm:
         outputs = llm.generate(
-            contexts,
-            queries=queries,
+            inputs,
             use_tqdm=True,
             sampling_params=SamplingParams(
                 max_tokens=max_output_tokens,

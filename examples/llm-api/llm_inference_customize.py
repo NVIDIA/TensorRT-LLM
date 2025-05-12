@@ -35,7 +35,10 @@ def main():
     ]
 
     # With SamplingParams, you can customize the sampling strategy, such as beam search, temperature, and so on.
-    sampling_params = SamplingParams(temperature=0.8, top_p=0.95, beam_width=4)
+    sampling_params = SamplingParams(temperature=0.8,
+                                     top_p=0.95,
+                                     n=4,
+                                     use_beam_search=True)
 
     for output in llm.generate(prompts, sampling_params):
         print(

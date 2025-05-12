@@ -2416,7 +2416,10 @@ int AttentionOp::initialize() noexcept
         fmhaParams.numTokensPerBlock = mTokensPerBlock;
         fmhaParams.headSize = mHeadSize;
         fmhaParams.headSizeV = mHeadSize;
-        if (mIsMLAEnabled && !mIsGenerationMLA)
+
+        // mFmhaDispatcher is not used for generation MLA, but we still need to modify these values to avoid selecting
+        // the wrong kernel, no matter mIsGenerationMLA is true or false
+        if (mIsMLAEnabled)
         {
             // Context attention of MLA is different
             fmhaParams.numKvHeads = mNumHeads;
