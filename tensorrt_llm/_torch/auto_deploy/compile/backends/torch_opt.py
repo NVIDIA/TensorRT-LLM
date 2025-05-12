@@ -1,4 +1,4 @@
-"""Mixed backend with torch + Cudagraph."""
+"""Mixed backend with torch.compile + Cudagraph."""
 
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 

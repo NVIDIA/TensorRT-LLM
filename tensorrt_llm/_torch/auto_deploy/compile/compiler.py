@@ -1,6 +1,9 @@
-"""Transformation to apply torch.compile, CUDAGraph, and other torch.compile-like optimizations.
+"""Transformation to apply torch.compile and other optimizations as a final step.
 
-This is useful as final optimization step for in-framework deployment of our inference models.
+This module handles the final optimization phase where torch.compile and other optimizations
+are applied after all graph transformations have been completed. This is particularly useful
+for in-framework deployment of inference models where we want to apply torch.compile as the
+last optimization step.
 """
 
 import time
@@ -83,6 +86,11 @@ def compile_and_capture(
     """Compile or capture graph for single-token generation."""
     elapsed_time = -time.time()
     ad_logger.info("Fusion before compiling...")
+
+    # Try to get the requested backend, fall back to torch-simple if not found
+    if not BackendRegistry.has(backend):
+        ad_logger.warning(f"Backend '{backend}' not found. Falling back to 'torch-simple' backend.")
+        backend = "torch-simple"
 
     ad_logger.info(f"Compiling for {backend} backend...")
 

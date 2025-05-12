@@ -22,6 +22,7 @@ from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export_
     "backend_cls",
     [
         ("torch-simple"),
+        ("torch-compile"),
         ("torch-opt"),
     ],
 )
