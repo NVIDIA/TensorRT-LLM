@@ -84,7 +84,6 @@ def compile_and_capture(
     elapsed_time = -time.time()
     ad_logger.info("Fusion before compiling...")
 
-    print(f"backend: {backend}")
     # Try to get the requested backend, fall back to torch-simple if not found
     if not BackendRegistry.has(backend):
         ad_logger.warning(f"Backend '{backend}' not found. Falling back to 'torch-simple' backend.")

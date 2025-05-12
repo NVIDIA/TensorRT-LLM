@@ -47,8 +47,7 @@ class InferenceOptimizer:
         self.factory = factory
         self.attn_backend = ad_config.attn_backend
         self.mla_backend = ad_config.mla_backend
-        # TODO (lliebenwein): let's split up the compile backend to separately handle cuda graph
-        # and torch compile so we can follow the PyTorchConfig here and enable it separately.
+
         self.ad_config = ad_config
         if ad_config.torch_compile_enabled:
             compile_backend = "torch-compile"
