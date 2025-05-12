@@ -318,6 +318,7 @@ class TorchSampler(Sampler):
     def _mixed_sample(self, scheduled_requests: ScheduledRequests,
                       model_outputs) -> SampleState:
         logits = model_outputs["logits"]
+        beam = self.BEAM
         log_probs = []
         new_tokens_device_array = []
 
@@ -328,8 +329,9 @@ class TorchSampler(Sampler):
             token_logits = logits[idx:idx + 1, :]
             new_token, probs = decode_single_request(request, token_logits)
             new_tokens_device_array.append(new_token)
-            probs = [probs.tolist()] if request.py_return_log_probs else None
-            log_probs.append(probs)  # Currently always beam_width=1
+            if request.py_return_log_probs:
+                assert beam == 0, "The following call relies on beam_width to be 1 - hence the list with a single element"
+                log_probs.append([probs.tolist()])
             idx += 1
 
         for request in scheduled_requests.generation_requests:
@@ -339,8 +341,9 @@ class TorchSampler(Sampler):
             token_logits = logits[idx:idx + 1, :]
             new_token, probs = decode_single_request(request, token_logits)
             new_tokens_device_array.append(new_token)
-            probs = [probs.tolist()] if request.py_return_log_probs else None
-            log_probs.append(probs)  # Currently always beam_width=1
+            if request.py_return_log_probs:
+                assert beam == 0, "The following call relies on beam_width to be 1 - hence the list with a single element"
+                log_probs.append([probs.tolist()])
             idx += 1
 
         new_tokens_device = torch.cat(new_tokens_device_array)
@@ -350,11 +353,9 @@ class TorchSampler(Sampler):
 
         return SampleState(
             scheduled_requests=scheduled_requests,
-            logits=logits,
             device=SampleStateTensors(new_tokens=new_tokens_device),
             host=SampleStateTensors(new_tokens=new_tokens_host),
-            sampler_event=sampler_event,
-            log_probs=log_probs)
+            sampler_event=sampler_event)
 
     def _batch_sample(self, scheduled_requests: ScheduledRequests,
                       model_outputs) -> SampleState:
@@ -509,13 +510,6 @@ class TRTLLMSampler(Sampler):
             "decoder_input_buffers":
             DecoderInputBuffers(self.executor_config.max_batch_size,
                                 self.MAX_DECODING_TOKENS, buffer_manager),
-            "new_tokens_device_tensor":
-            torch.empty((
-                self.executor_config.max_batch_size,
-                self.executor_config.max_beam_width,
-            ),
-                        dtype=torch.int,
-                        device='cuda'),
             "sequence_lengths_host":
             torch.empty((
                 self.executor_config.max_batch_size,
@@ -610,19 +604,14 @@ class TRTLLMSampler(Sampler):
 
         self.algs.decoder.forward_async(self.decoding_output, decoding_input)
 
-        # NOTE: The following code prepares a new_tokens_device_tensor in accordance with the
-        #       current implementation of model_engine.
-        # TODO: When we support speculative decoding:
-        # new_tokens_device_tensor should be, for speculative decoding cases: [batch, 1 + draft_len], others: [batch]
-        new_tokens_device_tensor = self.store[
-            "new_tokens_device_tensor"][:batch_size, :beam_width]
-        seq_slots = [
-            request.seq_slot for request in scheduled_requests.all_requests
-        ]
-        new_tokens_device_tensor.copy_(
-            self.algs.decoder.decoder_state.all_new_tokens[0][seq_slots],
-            non_blocking=True)
-        new_tokens_device_tensor = new_tokens_device_tensor.view(-1)
+        # NOTE: If we overwrite seq lens on every iteration then overlap scheduling seemingly works.
+        #       This could be a race condition.
+        self.store["sequence_lengths_host"].copy_(
+            self.algs.decoder.decoder_state.sequence_lengths, non_blocking=True)
+
+        # TODO: We should instead copy on every iteration, however this doesn't work for overlap scheduling atm.
+        #       It's still not understood why.
+        # sequence_lengths = self.store["decoder_buffers"].sequence_lengths.to('cpu', non_blocking=True)
 
         new_output_tokens = self.algs.decoder.decoder_state.all_new_tokens.to(
             'cpu', non_blocking=True)
@@ -633,7 +622,8 @@ class TRTLLMSampler(Sampler):
         sequence_lengths = self.algs.decoder.decoder_state.sequence_lengths.to(
             'cpu', non_blocking=True)
 
-        device = SampleStateTensors(new_tokens=new_tokens_device_tensor)
+        device = SampleStateTensors(
+            new_tokens=self.algs.decoder.decoder_state.all_new_tokens)
 
         host = SampleStateTensorsHostTRTLLM(new_tokens=new_output_tokens,
                                             finished_sum=finished_sum,
@@ -644,7 +634,6 @@ class TRTLLMSampler(Sampler):
         sampler_event.record()
 
         return SampleStateTRTLLM(scheduled_requests=scheduled_requests,
-                                 logits=logits,
                                  device=device,
                                  host=host,
                                  sampler_event=sampler_event)
@@ -683,8 +672,7 @@ class TRTLLMSampler(Sampler):
                     seq_len - request.get_num_tokens(beam))
 
                 for step in range(num_new_tokens[beam]):
-                    new_token = new_tokens_host[step][seq_slot][beam]
-                    request.add_new_token(new_token, beam)
+                    add_token(request, new_tokens_host, beam, step=step)
 
                 finish_reason = finish_reasons_host[seq_slot * beam_width +
                                                     beam].item()
