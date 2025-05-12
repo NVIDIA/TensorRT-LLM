@@ -7,7 +7,7 @@ from tensorrt_llm.scaffolding import (NativeGenerationController,
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    # .e.g. /home/scratch.trt_llm_data/llm-models/DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B
+    # .e.g. DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B
     parser.add_argument(
         '--model_dir',
         type=str,
@@ -19,7 +19,8 @@ def parse_arguments():
 
 
 def test_sync(prompts, proposer_worker):
-    prototype_controller = NativeGenerationController()
+    prototype_controller = NativeGenerationController(
+        sampling_params={"temperature": 0.9})
 
     llm = ScaffoldingLlm(
         prototype_controller,
@@ -38,7 +39,8 @@ def test_sync(prompts, proposer_worker):
 def test_async(prompt, proposer_worker):
 
     async def test_async_func(prompt, proposer_worker):
-        prototype_controller = NativeGenerationController()
+        prototype_controller = NativeGenerationController(
+            sampling_params={"temperature": 0.9})
         llm = ScaffoldingLlm(
             prototype_controller,
             {NativeGenerationController.WorkerTag.GENERATION: proposer_worker},
@@ -67,11 +69,12 @@ def main():
         "Find the largest possible real part of \\[(75+117i)z+\\frac{96+144i}{z}\\]where $z$ is a complex number with $|z|=4$.",
     ]
 
-    llm_worker = TRTLLMWorker.init_with_new_llm(args.model_dir,
-                                                backend="pytorch",
-                                                max_batch_size=32,
-                                                max_num_tokens=4096,
-                                                temperature=0.9)
+    llm_worker = TRTLLMWorker.init_with_new_llm(
+        args.model_dir,
+        backend="pytorch",
+        max_batch_size=32,
+        max_num_tokens=4096,
+    )
 
     if args.run_async:
         test_async(prompts[0], llm_worker)

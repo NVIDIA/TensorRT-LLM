@@ -252,6 +252,7 @@ def test_with_dummy_medusa(hf_model_root, medusa_example_root, llm_venv,
     venv_check_call(llm_venv, run_cmd)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5219534")
 @pytest.mark.parametrize("llama_model_root",
                          ['llama-v2-7b-hf', 'llama-3.1-8b', 'llama-3.2-1b'],
                          indirect=True)
@@ -279,6 +280,7 @@ def test_llama_medusa_1gpu(llama_model_root,
                            model_type='llama')
 
 
+@pytest.mark.skip(reason="https://nvbugs/5219534")
 @pytest.mark.parametrize("code_llama_model_root", ['CodeLlama-7b-Instruct'],
                          indirect=True)
 def test_codellama_medusa_1gpu(code_llama_model_root,

@@ -11,8 +11,9 @@ if [ ! -d ${UCX_INSTALL_PATH} ]; then
   cd ucx
   ./autogen.sh
   ./contrib/configure-release --prefix=${UCX_INSTALL_PATH}
-  make install -j
+  make install -j$(nproc)
   cd ..
+  rm -rf ucx  # Remove UCX source to save space
   echo "export LD_LIBRARY_PATH=${UCX_INSTALL_PATH}/lib:\$LD_LIBRARY_PATH" >> "${ENV}"
 fi
 
@@ -25,10 +26,12 @@ if [ "$(uname -m)" != "amd64" ] && [ "$(uname -m)" != "x86_64" ]; then
   EXTRA_NIXL_ARGS="-Ddisable_gds_backend=true"
 fi
 
-pip3 install meson ninja pybind11
+pip3 install --no-cache-dir meson ninja pybind11
 git clone --depth 1 -b ${NIXL_VERSION} ${NIXL_REPO}
 cd nixl
 meson setup builddir -Ducx_path=${UCX_INSTALL_PATH} ${EXTRA_NIXL_ARGS}
 cd builddir && ninja install
+cd ../..
+rm -rf nixl  # Remove NIXL source tree to save space
 
 echo "export LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib/${ARCH_NAME}:/opt/nvidia/nvda_nixl/lib64:\$LD_LIBRARY_PATH" >> "${ENV}"

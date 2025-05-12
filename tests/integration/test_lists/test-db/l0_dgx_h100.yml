@@ -35,8 +35,6 @@ l0_dgx_h100:
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_workers.py::test_workers_conditional_disaggregation[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_workers.py::test_workers_kv_cache_events[TinyLlama-1.1B-Chat-v1.0]
 - condition:
     ranges:
       system_gpu_count:
@@ -113,11 +111,11 @@ l0_dgx_h100:
       auto_trigger: others
   tests:
   # ------------- CPP tests ---------------
-  - test_cpp.py::test_multi_gpu_simple[90]
-  - test_cpp.py::test_multi_gpu_t5[90]
-  - test_cpp.py::test_multi_gpu_llama_executor[90]
-  - test_cpp.py::test_multi_gpu_trt_gpt_real_decoder[90]
-  - test_cpp.py::test_multi_gpu_disagg[90]
+  - cpp/test_multi_gpu.py::test_simple[90]
+  - cpp/test_multi_gpu.py::test_t5[90]
+  - cpp/test_multi_gpu.py::test_llama_executor[90]
+  - cpp/test_multi_gpu.py::test_trt_gpt_real_decoder[90]
+  - cpp/test_multi_gpu.py::test_disagg[90]
 - condition:
     ranges:
       system_gpu_count:

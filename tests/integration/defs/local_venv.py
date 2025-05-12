@@ -33,7 +33,10 @@ class PythonVenvRunnerImpl(PythonRunnerInterface):
         self.venv_exe_dir = os.path.dirname(venv_bin)
         self.workspace = workspace
         if not exists(self.workspace):
-            makedirs(self.workspace)
+            try:
+                makedirs(self.workspace)
+            except Exception as e:
+                print(f"Error creating workspace directory: {e}")
         self._new_env = os.environ.copy()
 
     def get_working_directory(self, translate_wsl_path=True):

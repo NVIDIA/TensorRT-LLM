@@ -372,8 +372,8 @@ private:
         int totalNumCtas = numCtasX * numCtasZ * numCtasY;
 
         // Then split the headDimV into multiple CTAs if there are still unused SMs.
-        if (isMlaGenKernel(params) && isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType)
-            && !selectKernelParams.mReuseSmemKForV && !selectKernelParams.mSelectNewKernel)
+        if (isMlaGenKernel(params) && !selectKernelParams.mReuseSmemKForV && !selectKernelParams.mSelectNewKernel
+            && !selectKernelParams.mUses2CtaMma)
         {
             // Split the headDimV into multiple CTAs if the utilization is not full.
             // It doesn't work with reuseSmemKForV currently.
@@ -384,19 +384,6 @@ private:
                 selectKernelParams.mHeadDimPerCtaV = totalNumCtas * 4 <= params.mMultiProcessorCount ? 128 : 256;
                 // Need to select a different kernel.
                 selectKernelParams.mSelectNewKernel = true;
-            }
-            // TODO: find better heuristic of enabling reuseSmemKForV.
-            else if (selectKernelParams.mHeadDimPerCtaV == 512 && numCtasForAllHeadsQ == 1)
-            {
-                // It seems that enabling reuseSmemKForV has worse perf when there are multiple CTAs for different
-                // headsQ.
-                // Fp16/bf16 MLA generation kernels don't support 128 tileSizeKv + reuseSmemKForV.
-                if (!(mDtypeQ == DATA_TYPE_FP16 || mDtypeQ == DATA_TYPE_BF16) || selectKernelParams.mTileSizeKv == 64)
-                {
-                    selectKernelParams.mReuseSmemKForV = true;
-                    // Need to select a different kernel.
-                    selectKernelParams.mSelectNewKernel = true;
-                }
             }
         }
 
@@ -415,19 +402,25 @@ private:
             // We use the low-latency kernel (SwapsMmaAbForGeneration with tileSizeQ = 16) when any of the following
             // conditions are met:
             // 1. The number of headsQPerKv is <= 32.
-            // 2. BatchSize x seqLenQ (numMtpTokens) x ceil(headsQPerKv, 16) <= the number of multiprocessors.
+            // 2. BatchSize x seqLenQ (numMtpTokens) x ceil(headsQPerKv, 16) * 2 <= the number of multiprocessors.
+            //    The "2" is the factor that is used to finetune the heuristic based on the benchmark results.
             if (params.mNumHeadsQPerKv <= 32
                 || static_cast<int32_t>(params.mBatchSize * params.mMaxSeqLenQ * tc::divUp(params.mNumHeadsQPerKv, 16))
+                        * 2
                     <= params.mMultiProcessorCount)
             {
                 kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
             }
             else
             {
-                // Otherwise, we use the high-throughput kernel (KeepsMmaAbForGeneration with tileSizeQ = 64).
+                // Otherwise, we use the high-throughput kernel.
                 kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
-                // Uses 2 CTA MMA if numHeadsQPerKv is 128.
-                if (params.mNumHeadsQPerKv == 128)
+                // The 2CTA keepsMmaAbForGeneration kernel is used when the following conditions (based on the benchmark
+                // results) are met:
+                if (params.mNumHeadsQPerKv == 128
+                    && (mDtypeQ != DATA_TYPE_E4M3
+                        || (static_cast<int32_t>(params.mBatchSize * params.mMaxSeqLenQ * 2) * 2
+                            > params.mMultiProcessorCount)))
                 {
                     selectKernelParams.mUses2CtaMma = true;
                     // Each Cta only handles 256 headDimV.
