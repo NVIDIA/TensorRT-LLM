@@ -88,8 +88,7 @@ class ConformerTRT:
         #config.flags = config.flags
         parser = trt.OnnxParser(network, logger)
         onnx_file = os.path.join(self.checkpoint_dir, 'encoder/encoder.onnx')
-        enc_dec_proj_file = os.path.join(self.checkpoint_dir,
-                                         'encoder/enc_dec_proj.pt')
+
         with open(onnx_file, "rb") as model:
             if not parser.parse(model.read(), "/".join(onnx_file.split("/"))):
                 print("Failed parsing %s" % onnx_file)

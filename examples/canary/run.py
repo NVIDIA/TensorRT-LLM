@@ -423,14 +423,14 @@ class CanaryEncoder:
 
     @staticmethod
     def get_masked_emb(enc_outputs):
-        enc_emb = enc_outputs.get('outputs', enc_outputs.get('encoded_output'))
+        enc_emb = enc_outputs.get('encoded_outputs', enc_outputs.get('outputs'))
         enc_len = enc_outputs['encoded_lengths']
         batch_size = enc_len.shape[0]
-        max_length = enc_emb.shape[2]
+        max_length = enc_emb.shape[1]
 
         mask = torch.arange(max_length, device='cuda').unsqueeze(0).expand(
             batch_size, max_length) < enc_len.unsqueeze(1)
-        enc_mask = torch.where(mask.unsqueeze(1), enc_emb, 0.0).permute(0, 2, 1)
+        enc_mask = torch.where(mask.unsqueeze(2), enc_emb, 0.0)
 
         return enc_mask, enc_len
 
