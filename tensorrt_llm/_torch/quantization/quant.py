@@ -38,7 +38,7 @@ class LinearBaseQuant:
                         ...], "The scale should be same for all the weights"
         return scale
 
-    def load_weight(self, weights, tensor_names):
+    def load_weight(self, weights, tensor_name):
         raise "load_weight is not implemented."
 
     def _copy(dst: Parameter, src: torch.Tensor):
@@ -135,23 +135,19 @@ class LinearNVFP4(LinearBaseQuant):
         self.inv_scale.data = self.scale / E2M1_MAX
 
 
-class LinearQuant(LinearBaseQuant):
+class LinearQuant:
 
-    def __init__(self, quant_config, device):
-        super().__init__()
-        self.quant_config = quant_config
-        quant_mode = self.quant_config.quant_mode if self.quant_config else None
+    @staticmethod
+    def create_quantizer(quant_config, device):
+        quant_mode = quant_config.layer_quant_mode if quant_config else None
+        quant = None
         # TODO: need to make src/target dtype to be parameters.
         if quant_mode:
             if quant_mode.has_fp8_qdq():
-                self._quant = LinearQDQ(self.quant_config, device)
+                LinearQDQ(quant_config, device)
             elif quant_mode.has_nvfp4():
-                self._quant = LinearNVFP4(self.quant_config, device)
+                LinearNVFP4(quant_config, device)
             elif quant_mode.has_fp8_block_scales():
-                self._quant = LinearBlockScalesQuant(self.quant_config, device)
+                LinearBlockScalesQuant(quant_config, device)
 
-    def __call__(self, input):
-        return self._quant(input)
-
-    def load_weight(self, weights):
-        self._quant.load_weight(weights)
+        return quant

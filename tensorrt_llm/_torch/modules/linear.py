@@ -220,7 +220,8 @@ class Linear(nn.Module):
         self.has_fp8_block_scales = False
         self.has_nvfp4 = False
 
-        self.input_quantizer = LinearQuant(self.quant_config, device)
+        self.input_quantizer = LinearQuant.create_quantizer(
+            self.quant_config, device)
 
         if self.quant_config and self.quant_config.layer_quant_mode.has_any_quant(
                 exclude_kv_cache=True):
@@ -328,12 +329,12 @@ class Linear(nn.Module):
 
     def _apply_linear(self, act_input, input_scale, bias):
         if self.use_custom_cublas_mm:
-            output = torch.ops.trtllm.cublas_mm(input,
+            output = torch.ops.trtllm.cublas_mm(act_input,
                                                 self.weight.t(),
                                                 bias,
                                                 out_dtype=None)
         else:
-            output = F.linear(input, self.weight, bias)
+            output = F.linear(act_input, self.weight, bias)
         return output
 
     def apply_linear(self,
@@ -341,9 +342,9 @@ class Linear(nn.Module):
                      bias,
                      lora_params: Optional[dict] | None = None,
                      layer_idx: Optional[int] | None = None):
+        act_input = input
+        input_scale = None
         if self._has_any_quant():
-            act_input = input
-            input_scale = None
             if self.input_quantizer is not None:
                 act_input, input_scale = self.input_quantizer(input)
 
@@ -389,23 +390,19 @@ class Linear(nn.Module):
                 fuse_bias = self._maybe_fuse_bias_into_allreduce(
                     bias, all_reduce_params)
                 bias = None if fuse_bias else bias
-                output = self.apply_linear(input, self.weight, bias,
-                                           lora_params, layer_idx)
+                output = self.apply_linear(input, bias, lora_params, layer_idx)
                 output = self.all_reduce(
                     output,
                     all_reduce_params=all_reduce_params,
                 )
             else:
-                output = self.apply_linear(input, self.weight, bias,
-                                           lora_params, layer_idx)
+                output = self.apply_linear(input, bias, lora_params, layer_idx)
         elif self.tp_mode == TensorParallelMode.COLUMN:
-            output = self.apply_linear(input, self.weight, self.bias,
-                                       lora_params, layer_idx)
+            output = self.apply_linear(input, self.bias, lora_params, layer_idx)
             if self.gather_output:
                 output = allgather(output, self.mapping)
         else:
-            output = self.apply_linear(input, self.weight, self.bias,
-                                       lora_params, layer_idx)
+            output = self.apply_linear(input, self.bias, lora_params, layer_idx)
 
         return output
 
@@ -421,8 +418,9 @@ class Linear(nn.Module):
 
         weight_mode = self.weights_loading_config.weight_mode
         quant_mode = self.quant_config.quant_mode if self.quant_config else None
-        self.input_quantizer.load_weight(weights, INPUT_SCALE_NAME)
-        self.inv_input_scale = self.input_quantizer.inv_scale
+        if self.input_quantizer:
+            self.input_quantizer.load_weight(weights, INPUT_SCALE_NAME)
+            self.inv_input_scale = self.input_quantizer.inv_scale
 
         # load weight shard onto GPU to speed up operations on the shards
         device = torch.device('cuda')
