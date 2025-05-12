@@ -77,7 +77,7 @@ def run_simple_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
                      timeout=600)
 
 
-def run_llama_executor_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
+def run_llama_executor_leader_tests(build_dir: _pl.Path, timeout=1500):
     tests_dir = build_dir / "tests"
     cpp_env = {**_os.environ}
 
@@ -94,12 +94,16 @@ def run_llama_executor_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
             "--gtest_filter=*LlamaExecutorTest*LeaderMode*:*LlamaMultiExecutorTest*LeaderMode*"
         ],
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-    # https://nvbugspro.nvidia.com/bug/5026255 disable below tests for now.
-    if False:
-        _cpp.run_command(trt_model_test,
-                         cwd=tests_dir,
-                         env=mgpu_env,
-                         timeout=1500)
+
+    _cpp.run_command(trt_model_test, cwd=tests_dir, env=mgpu_env, timeout=1500)
+
+
+def run_llama_executor_orchestrator_tests(build_dir: _pl.Path, timeout=1500):
+    tests_dir = build_dir / "tests"
+    cpp_env = {**_os.environ}
+
+    mgpu_env = copy.copy(cpp_env)
+    mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
 
     #Executor test in orchestrator mode
     xml_output_file = build_dir / "results-multi-gpu-llama-exec-orch-mode.xml"
@@ -110,18 +114,25 @@ def run_llama_executor_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     ]
     _cpp.run_command(trt_model_test, cwd=tests_dir, env=mgpu_env, timeout=1500)
 
-    #Logits processor and guided decoding test in leader mode
+
+def run_llama_executor_logits_proc_tests(build_dir: _pl.Path, timeout=1500):
+    tests_dir = build_dir / "tests"
+    cpp_env = {**_os.environ}
+
+    mgpu_env = copy.copy(cpp_env)
+    mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
+
+    #Logits processor test in leader mode
     xml_output_file = build_dir / "results-multi-gpu-logits-proc.xml"
+
     tp_pp_sizes = [(4, 1), (2, 2), (1, 4)]
     gtest_filter = [
         f"LlamaExecutorTest/LogitsProcParamsTest*tp{tp}_pp{pp}*"
         for tp, pp in tp_pp_sizes
     ]
-    gtest_filter.extend([
-        f"LlamaExecutorGuidedDecodingTest/GuidedDecodingParamsTest*tp{tp}_pp{pp}*"
-        for tp, pp in tp_pp_sizes
-    ])
+
     gtest_filter = ":".join(gtest_filter)
+
     trt_model_test = _cpp.produce_mpirun_command(
         global_commands=["mpirun", "--allow-run-as-root"],
         nranks=4,
@@ -129,10 +140,40 @@ def run_llama_executor_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
             "executor/executorTest", f"--gtest_filter={gtest_filter}"
         ],
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+
     _cpp.run_command(trt_model_test, cwd=tests_dir, env=mgpu_env, timeout=1500)
 
 
-def run_t5_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
+def run_llama_executor_guided_decoding_tests(build_dir: _pl.Path, timeout=1500):
+    tests_dir = build_dir / "tests"
+    cpp_env = {**_os.environ}
+
+    mgpu_env = copy.copy(cpp_env)
+    mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
+
+    #Guided decoding test in leader mode
+    xml_output_file = build_dir / "results-multi-gpu-guided-decoding.xml"
+
+    tp_pp_sizes = [(4, 1), (2, 2), (1, 4)]
+    gtest_filter = [
+        f"LlamaExecutorGuidedDecodingTest/GuidedDecodingParamsTest*tp{tp}_pp{pp}*"
+        for tp, pp in tp_pp_sizes
+    ]
+
+    gtest_filter = ":".join(gtest_filter)
+
+    trt_model_test = _cpp.produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=4,
+        local_commands=[
+            "executor/executorTest", f"--gtest_filter={gtest_filter}"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+
+    _cpp.run_command(trt_model_test, cwd=tests_dir, env=mgpu_env, timeout=1500)
+
+
+def run_enc_dec_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     tests_dir = build_dir / "tests"
     cpp_env = {**_os.environ}
 
@@ -399,6 +440,17 @@ def prepare_model_multi_gpu(python_exe, root_dir, cpp_resources_dir,
     return _prepare
 
 
+# Use indirect parameterization to ensure that the model is built
+# only once per pytest session
+@pytest.fixture(scope="session")
+def multi_gpu_model(request, prepare_model_multi_gpu):
+
+    model_name = request.param
+    prepare_model_multi_gpu(model_name)
+
+    return model_name
+
+
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
 def test_simple(build_google_tests, build_dir):
@@ -411,46 +463,80 @@ def test_simple(build_google_tests, build_dir):
 
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
-def test_t5(build_google_tests, prepare_model_multi_gpu, build_dir):
+@pytest.mark.parametrize("multi_gpu_model", ["t5"], indirect=True)
+def test_enc_dec(build_google_tests, multi_gpu_model, build_dir):
 
     if platform.system() != "Windows":
-        prepare_model_multi_gpu("t5")
-        run_t5_multi_gpu_tests(build_dir=build_dir,
-                               timeout=_cpp.default_test_timeout)
+        run_enc_dec_multi_gpu_tests(build_dir=build_dir,
+                                    timeout=_cpp.default_test_timeout)
 
 
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
-def test_llama_executor(build_google_tests, prepare_model_multi_gpu, lora_setup,
+@pytest.mark.parametrize("mode", [
+    "orchestrator",
+    pytest.param(
+        "leader",
+        marks=pytest.mark.skip("https://nvbugspro.nvidia.com/bug/5026255"))
+])
+@pytest.mark.parametrize("multi_gpu_model", ["llama"], indirect=True)
+def test_llama_executor(build_google_tests, multi_gpu_model, mode, lora_setup,
                         build_dir):
 
-    if platform.system() != "Windows":
-        prepare_model_multi_gpu("llama")
-        run_llama_executor_multi_gpu_tests(build_dir=build_dir,
-                                           timeout=_cpp.default_test_timeout)
+    if platform.system() == "Windows":
+        return
+
+    if mode == "orchestrator":
+        run_llama_executor_orchestrator_tests(build_dir=build_dir,
+                                              timeout=_cpp.default_test_timeout)
+    elif mode == "leader":
+        run_llama_executor_leader_tests(build_dir=build_dir,
+                                        timeout=_cpp.default_test_timeout)
 
 
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
-def test_trt_gpt_real_decoder(build_google_tests, prepare_model_multi_gpu,
-                              lora_setup, build_dir):
+@pytest.mark.parametrize("multi_gpu_model", ["llama"], indirect=True)
+def test_llama_executor_logits_proc(build_google_tests, multi_gpu_model,
+                                    lora_setup, build_dir):
 
     if platform.system() != "Windows":
-        prepare_model_multi_gpu("llama")
+        run_llama_executor_logits_proc_tests(build_dir=build_dir,
+                                             timeout=_cpp.default_test_timeout)
+
+
+@pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
+                         indirect=True)
+@pytest.mark.parametrize("multi_gpu_model", ["llama"], indirect=True)
+def test_llama_executor_guided_decoding(build_google_tests, multi_gpu_model,
+                                        lora_setup, build_dir):
+
+    if platform.system() != "Windows":
+        run_llama_executor_guided_decoding_tests(
+            build_dir=build_dir, timeout=_cpp.default_test_timeout)
+
+
+@pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
+                         indirect=True)
+@pytest.mark.parametrize("multi_gpu_model", ["llama"], indirect=True)
+def test_trt_gpt_real_decoder(build_google_tests, multi_gpu_model, lora_setup,
+                              build_dir):
+
+    if platform.system() != "Windows":
         run_trt_gpt_model_real_decoder_multi_gpu_tests(
             build_dir=build_dir, timeout=_cpp.default_test_timeout)
 
 
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
-def test_disagg(prepare_model, prepare_model_multi_gpu, build_google_tests,
-                build_dir):
+@pytest.mark.parametrize("multi_gpu_model", ["llama"], indirect=True)
+def test_disagg(prepare_model, multi_gpu_model, build_google_tests, build_dir):
 
     if platform.system() != "Windows":
         # Disagg tests need single + multi GPU llama models.
-        prepare_model("llama")
-        prepare_model_multi_gpu("llama")
+        # Disagg tests need only single GPU gpt model.
 
+        prepare_model("llama")
         prepare_model("gpt")
 
         run_disagg_multi_gpu_tests(build_dir=build_dir)
