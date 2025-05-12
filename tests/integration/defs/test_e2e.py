@@ -1253,6 +1253,25 @@ def test_ptp_quickstart(llm_root, llm_venv):
 
 
 @pytest.mark.parametrize("model_name,model_path", [
+    pytest.param('Llama3.1-8B-FP8',
+                 'llama-3.1-model/Llama-3.1-8B-Instruct-FP8',
+                 marks=skip_pre_hopper),
+])
+def test_ptp_quickstart_advanced_llm_decoder(llm_root, llm_venv, model_name,
+                                             model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--max_batch_size=4",
+        "--enable_trtllm_decoder",
+        "--temperature=0.8",
+        "--top_p=0.95",
+        f"{llm_models_root()}/{model_path}",
+    ])
+
+
+@pytest.mark.parametrize("model_name,model_path", [
     ("Llama3.1-8B-BF16", "llama-3.1-model/Meta-Llama-3.1-8B"),
     ("Llama3.2-11B-BF16", "llama-3.2-models/Llama-3.2-11B-Vision"),
     ("Nemotron4_4B-BF16", "nemotron/Minitron-4B-Base"),
