@@ -42,8 +42,13 @@ def get_test_config(test_desc, example_dir, test_root):
     test_configs_root = f"{test_root}/test_configs"
     config_map = {
         "2_ranks": (2, f"{example_dir}/disagg_config.yaml"),
+        "2_ranks_trt_backend":
+        (2, f"{test_configs_root}/disagg_config_trt_backend.yaml"),
         "gen_only": (2, f"{test_configs_root}/disagg_config_gen_only.yaml"),
         "4_ranks": (4, f"{test_configs_root}/disagg_config_ctxtp2_gentp1.yaml"),
+        "4_ranks_trt_backend":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp1_trt_backend.yaml"),
         "cuda_graph":
         (2, f"{test_configs_root}/disagg_config_cuda_graph_padding.yaml"),
         "mixed": (2, f"{test_configs_root}/disagg_config_mixed.yaml"),
@@ -236,6 +241,26 @@ def test_disaggregated_single_gpu_with_mpirun(disaggregated_test_root,
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+def test_disaggregated_single_gpu_with_mpirun_trt_backend(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "2_ranks_trt_backend",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
 def test_disaggregated_benchmark_gen_only(disaggregated_test_root,
                                           disaggregated_example_root, llm_venv,
                                           llama_model_root):
@@ -273,6 +298,27 @@ def test_disaggregated_multi_gpu_with_mpirun(disaggregated_test_root,
 
     run_disaggregated_test(disaggregated_example_root,
                            "4_ranks",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(2)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_multi_gpu_with_mpirun_trt_backend(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "4_ranks_trt_backend",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
 

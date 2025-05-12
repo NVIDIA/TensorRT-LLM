@@ -95,4 +95,6 @@ size_t getEnvKVCacheSendMaxConcurrenceNum();
 
 size_t getEnvMemSizeForKVCacheTransferBuffer();
 
+bool getEnvDisaggBenchmarkGenOnly();
+
 } // namespace tensorrt_llm::common

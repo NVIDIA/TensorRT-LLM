@@ -92,6 +92,16 @@ class ExecutorBindingsWorker(GenerationExecutor):
             processor_batched=batched_logits_processor, replicate=False)
 
         def _create_engine():
+            device_id = self.global_rank % torch.cuda.device_count()
+            torch.cuda.set_device(device_id)
+
+            # Make sure C++ executor would use same devices/ranks as py_executor
+            global_rank = global_mpi_rank()
+            comm_ranks = mpi_comm().allgather(global_rank)
+            device_ids = mpi_comm().allgather(device_id)
+            executor_config.parallel_config = tllm.ParallelConfig(
+                participant_ids=comm_ranks, device_ids=device_ids)
+
             if isinstance(engine, Engine):
                 return tllm.Executor(engine.engine,
                                      json.dumps(engine.config.to_dict(),
@@ -121,8 +131,6 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 raise ValueError(
                     f"Unsupported backend config: {executor_config.backend}")
 
-            device_id = self.global_rank % torch.cuda.device_count()
-            torch.cuda.set_device(device_id)
             return create_executor(**args)
 
         self.engine = _create_engine()
