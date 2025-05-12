@@ -131,6 +131,8 @@ class LLaMAConfig(PretrainedConfig):
                     "architectures"][0]
                 hf_config.llm_cfg["dtype"] = hf_config.llm_cfg["torch_dtype"]
                 hf_config = PretrainedConfig.from_dict(hf_config.llm_cfg)
+            if hf_config.model_type == "NVLM_D":
+                hf_config = hf_config.llm_config
 
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
