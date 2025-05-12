@@ -424,6 +424,9 @@ void EagleBuffers::setFromInputs(RequestVector const& contextRequests, RequestVe
         {
             auto const batchSlot = params.batchSlots[batchIdx];
             setupEagleNetHostBuffers(batchIdx, batchSlot);
+
+            auto draftTokens = ITensor::slice(engineInputs.draftTokens, batchIdx, 1);
+            runtime::kernels::invokeFill(*draftTokens, -1, manager.getStream());
         }
         else
         {
