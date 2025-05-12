@@ -1264,7 +1264,7 @@ void run(Data const& data, void* stream)
 
     // Maximum number of tokens supported by the kernel using a cooperative launch.
     int const maxTokensCoop = (numBlocksCoop * NumThreads * 64) / data.mTopK;
-    LAUNCH_EXPW_ONLY(data,
+    LAUNCH_EXPW_ONLY_GROUPS(data,
         /*coopLaunch=*/false, routingMainKernel, numBlocks, NumThreads,
         /*smemSize=*/0, // No dynamic smem
         stream);
@@ -1273,14 +1273,14 @@ void run(Data const& data, void* stream)
     {
         if (useSingleCluster)
         {
-            LAUNCH_EXPW_ONLY(data,
+            LAUNCH_EXPW_ONLY_GROUPS(data,
                 /*coopLaunch=*/false, routingIndicesClusterKernel, NumBlocksPerCluster, NumThreads,
                 /*smemSize=*/0, // No dynamic smem
                 stream);
         }
         else if (data.mNumTokens <= maxTokensCoop)
         {
-            LAUNCH_EXPW_ONLY(data,
+            LAUNCH_EXPW_ONLY_GROUPS(data,
                 /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop, NumThreads,
                 /*smemSize=*/0, // No dynamic smem
                 stream);
@@ -1300,11 +1300,11 @@ void run(Data const& data, void* stream)
             int const numBlocksOffsets
                 = std::min((expandedIdxSize + offsetEltsPerBlock - 1) / offsetEltsPerBlock, maxNumBlocks);
 
-            LAUNCH_EXPW_ONLY(data,
+            LAUNCH_EXPW_ONLY_GROUPS(data,
                 /*coopLaunch=*/false, routingIndicesHistogramKernel, numBlocksHistogram, NumThreads,
                 /*smemSize=*/0, // No dynamic smem
                 stream);
-            LAUNCH_EXPW_ONLY(data,
+            LAUNCH_EXPW_ONLY_GROUPS(data,
                 /*coopLaunch=*/false, routingIndicesOffsetsKernel, numBlocksOffsets, NumThreads,
                 /*smemSize=*/0, // No dynamic smem
                 stream);

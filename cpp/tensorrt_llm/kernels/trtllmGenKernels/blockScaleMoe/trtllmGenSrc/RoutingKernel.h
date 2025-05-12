@@ -249,10 +249,9 @@ struct Data
     int32_t mNumLocalExperts;
 };
 
-template <typename Type_, typename TypeExpW_, bool UsePdl_>
+template <typename TypeExpW_, bool UsePdl_>
 struct KernelParams
 {
-    using Type = Type_;
     using TypeExpW = TypeExpW_;
     static constexpr bool UsePdl = UsePdl_;
 

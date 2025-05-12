@@ -116,6 +116,20 @@ namespace moe::dev
     }
 
 #define LAUNCH_EXPW_ONLY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream)                            \
+    if (data.mDtypeExpW == tg::Dtype::Fp32)                                                                            \
+    {                                                                                                                  \
+        LAUNCH_PDL(data, coopLaunch, float, kernel, numBlocks, numThreads, smemSize, stream);                          \
+    }                                                                                                                  \
+    else if (data.mDtypeExpW == tg::Dtype::Bfloat16)                                                                   \
+    {                                                                                                                  \
+        LAUNCH_PDL(data, coopLaunch, cutlass::bfloat16_t, kernel, numBlocks, numThreads, smemSize, stream);            \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        TLLM_LOG_ERROR("Unsupported dtypeExpW");                                                                       \
+    }
+
+#define LAUNCH_EXPW_ONLY_GROUPS(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream)                     \
     if (data.mDtypeExpW == tg::Dtype::Fp32 && data.mNumExpertGroups > 1)                                               \
     {                                                                                                                  \
         LAUNCH_PDL(data, coopLaunch, LAUCNCH_ESC(float, true), kernel, numBlocks, numThreads, smemSize, stream);       \
