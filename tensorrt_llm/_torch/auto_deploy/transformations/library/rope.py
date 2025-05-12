@@ -415,7 +415,7 @@ def _optimize_complex(
             )
         with graph.inserting_after(cos_sin_flash_3d):
             cos_sin_flash = graph.call_function(
-                torch.ops.aten.to, args=(cos_sin_flash, torch.float32)
+                torch.ops.aten.to, args=(cos_sin_flash_3d, torch.float32)
             )
         cache[inv_freq_node] = cos_sin_flash
 
@@ -821,9 +821,8 @@ def _get_position_ids(
     if isinstance(device, str):
         device = torch.device(device)
 
-    # Build positions: arange(sym_seq) -> view -> expand -> flatten.
     position_ids = graph.call_function(
-        torch.arange,  # torch.ops.aten.arange cannot take in symbolic arg as start/end
+        torch.arange,  # torch.ops.aten.arange cannot take in Fake Tensor as start/end
         args=(bs_seq,),
         kwargs={"dtype": torch.float32, "device": device, "pin_memory": False},
     )

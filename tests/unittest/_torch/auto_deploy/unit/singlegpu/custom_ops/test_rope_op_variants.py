@@ -45,6 +45,9 @@ def test_flashinfer_custom_op_and_hf_impl(dtype, atol, rtol, head_dim):
 
     # For direct FlashInfer call: non-interleaved cache [seq_len, head_dim] (concatenated).
     cos_sin_cache = torch.cat([cos_vals, sin_vals], dim=1)
+    cos_sin_cache_expand = (
+        cos_sin_cache.unsqueeze(0).expand(batch, -1, -1).contiguous()
+    )  # [batch, seq_len, head_dim]
     # For HF and the custom op: duplicated layout [seq_len, head_dim].
     cos_new = torch.cat([cos_vals, cos_vals], dim=-1)
     sin_new = torch.cat([sin_vals, sin_vals], dim=-1)
@@ -77,7 +80,10 @@ def test_flashinfer_custom_op_and_hf_impl(dtype, atol, rtol, head_dim):
     k_hf = k_hf.transpose(1, 2).to(dtype)
 
     # Custom op call
-    custom_q, custom_k = torch.ops.rope.flashinfer(query, key, positions, cos_sin_cache, True)
+    positions_flat = torch.arange(batch * seq_len, device=device)
+    custom_q, custom_k = torch.ops.rope.flashinfer(
+        query, key, positions_flat, cos_sin_cache_expand, True
+    )
 
     torch.testing.assert_close(q_hf, q_flash, rtol=rtol, atol=atol)
     torch.testing.assert_close(k_hf, k_flash, rtol=rtol, atol=atol)
@@ -123,10 +129,15 @@ def test_flashinfer_custom_op_and_complex_impl(dtype, atol, rtol, head_dim):
     cos_from_freqs = torch.real(freqs_cis)  # (B, seq, head_dim//2)
     sin_from_freqs = torch.imag(freqs_cis)  # (B, seq, head_dim//2)
     cos_sin_cache = torch.cat([cos_from_freqs, sin_from_freqs], dim=-1)[0]  # (seq, head_dim))
+    cos_sin_cache_expand = (
+        cos_sin_cache.unsqueeze(0).expand(batch, -1, -1).contiguous()
+    )  # [batch, seq_len, head_dim]
 
     # q/k of llama4 rope is interleaved
-    positions = torch.cat([torch.arange(seq_len, device=device) for _ in range(batch)])
-    custom_q, custom_k = torch.ops.rope.flashinfer(query, key, positions, cos_sin_cache, False)
+    positions_flat = torch.arange(batch * seq_len, device=device)
+    custom_q, custom_k = torch.ops.rope.flashinfer(
+        query, key, positions_flat, cos_sin_cache_expand, False
+    )
 
     torch.testing.assert_close(out_q_v2, custom_q, rtol=rtol, atol=atol)
     torch.testing.assert_close(out_k_v2, custom_k, rtol=rtol, atol=atol)
