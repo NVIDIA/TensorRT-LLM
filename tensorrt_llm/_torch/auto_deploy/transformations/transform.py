@@ -50,7 +50,9 @@ class InferenceOptimizer:
         # TODO (lliebenwein): let's split up the compile backend to separately handle cuda graph
         # and torch compile so we can follow the PyTorchConfig here and enable it separately.
         self.ad_config = ad_config
-        if ad_config.use_cuda_graph or ad_config.torch_compile_enabled:
+        if ad_config.torch_compile_enabled:
+            compile_backend = "torch-compile"
+        elif ad_config.use_cuda_graph:
             compile_backend = "torch-opt"
         else:
             compile_backend = "torch-simple"
