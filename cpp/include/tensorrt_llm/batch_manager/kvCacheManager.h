@@ -710,6 +710,12 @@ public:
     //! \param blockIds Id of each block.
     void storeBlocks(std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds);
 
+    //! \brief Store block in cached blocks.
+    //! \param blockKey Key of the block.
+    //! \param blockId Id of the block.
+    //! \param prevBlock prev block.
+    void storeBlock(BlockKey const& blockKey, KVCacheBlock::IdType blockId, BlockPtr const& prevBlock);
+
     void addBlockToHashMap(BlockPtr const& block);
 
     void removeBlockFromHashMap(BlockPtr const& block);
