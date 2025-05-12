@@ -40,6 +40,16 @@ struct MoeWeight
     size_t mHeight = 0;
     size_t mWidth = 0;
     size_t mPitch = 0;
+
+    int64_t getWeightPtr() const
+    {
+        return reinterpret_cast<int64_t>(mWeightPtr);
+    }
+
+    void setWeightPtr(int64_t weightPtr)
+    {
+        mWeightPtr = reinterpret_cast<void*>(weightPtr);
+    }
 };
 
 struct MoePlacementCpuInfo
@@ -111,20 +121,17 @@ public:
     ~SingleLayerMoeLoadBalancer();
 
     // interface for weights management
+    // should bind to python
     void addSingleWeightSlot(int slotId, std::string const& name, MoeWeight weightSlot);
+    // should bind to python
     void addSingleHostWeight(int expertId, std::string const& name, MoeWeight hostWeight);
 
     // set initial weight assignments for each slot
     // index is the global slot id, value is the expert id
+    // should bind to python
     void setInitialWeightAssignments(std::vector<int> const& initialWeightAssignments);
 
     cudaStream_t getStream() const;
-
-    // interfaces for tests
-    tensorrt_llm::kernels::MoeLoadBalanceStatisticInfo* getStatisticInfo()
-    {
-        return &mStatisticInfo;
-    }
 
     MoePlacementCpuInfo* getPlacementCpuInfo()
     {
@@ -134,6 +141,12 @@ public:
     tensorrt_llm::kernels::MoeLoadBalanceSingleLayerSignal* getSignal()
     {
         return mSingleLayerSignal;
+    }
+
+    // interfaces for tests
+    tensorrt_llm::kernels::MoeLoadBalanceStatisticInfo* getStatisticInfo()
+    {
+        return &mStatisticInfo;
     }
 
 private:
@@ -181,14 +194,20 @@ public:
 
     // Add a new layer to the load balancer
     // Should be called in order, and only once for each layer
+    // should bind to python
     std::shared_ptr<SingleLayerMoeLoadBalancer> AddLayer(int expertCount, int topK, int slotCountPerRank);
+    // should bind to python
     void finalizeModel();
 
+    // should bind to python
     void setWarmUpIterCount(int64_t iterCount);
 
+    // should bind to python
     void startIter(int64_t iterId, bool enableStatistic, bool enableUpdateWeights);
+    // should bind to python
     void endIter(int64_t iterId);
 
+    // should bind to python
     void shutdown();
 
 private:
