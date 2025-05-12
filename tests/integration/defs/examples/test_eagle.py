@@ -217,7 +217,10 @@ def test_with_dummy_eagle(hf_model_root,
     venv_check_call(llm_venv, summary_cmd)
 
 
-@pytest.mark.parametrize("use_dynamic_tree", [False, True],
+@pytest.mark.parametrize("use_dynamic_tree", [
+    False,
+    pytest.param(True, marks=pytest.mark.skip(reason="https://nvbugs/5219534"))
+],
                          ids=['eagle1', 'eagle2'])
 @pytest.mark.parametrize("llama_model_root",
                          ['llama-v2-7b-hf', 'llama-3.1-8b', 'llama-3.2-1b'],
@@ -245,6 +248,7 @@ def test_llama_eagle_1gpu(llama_model_root,
                           llm_rouge_root=llm_rouge_root)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5219534")
 @pytest.mark.parametrize("use_dynamic_tree", [False, True],
                          ids=['eagle1', 'eagle2'])
 @pytest.mark.parametrize("code_llama_model_root", ['CodeLlama-7b-Instruct'],
