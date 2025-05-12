@@ -1,0 +1,326 @@
+/*
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "virtualMemory.h"
+
+#include <pybind11/pytypes.h>
+
+namespace tensorrt_llm::runtime
+{
+
+namespace
+{
+
+template <typename T>
+struct ScopeGuard
+{
+    bool const& ok;
+    T t;
+
+    ~ScopeGuard() noexcept(noexcept(t()))
+    {
+        if (!ok)
+        {
+            t();
+        }
+    }
+};
+
+template <typename T>
+ScopeGuard(bool const&, T) -> ScopeGuard<T>;
+
+} // namespace
+
+void CUDAVirtualMemory::materialize()
+{
+    TLLM_CHECK_WITH_INFO(status() == RELEASED, "virtual memory not in RELEASED status, is: %d", status());
+    handle = creator->create();
+
+    // Track the number of configurators ran, so release can correctly teardown.
+    for (auto const& conf : configurators)
+    {
+        conf->setup(handle); // May throw
+        ++state;
+    }
+}
+
+template <typename Callable, typename... Args>
+static bool safe_invoke_helper(std::exception_ptr& ep, char const* msg, Callable&& f, Args&&... args) noexcept
+{
+    try
+    {
+        std::invoke(std::forward<Callable>(f), std::forward<Args>(args)...);
+        return true;
+    }
+    catch (...)
+    {
+        if (ep)
+        {
+            try
+            {
+                std::rethrow_exception(ep);
+            }
+            catch (std::exception& e)
+            {
+                TLLM_LOG_ERROR(msg, e.what());
+            }
+        }
+        ep = std::current_exception();
+        return false;
+    }
+}
+
+void CUDAVirtualMemory::release()
+{
+    TLLM_CHECK_WITH_INFO(status() == MATERIALIZED || (status() == ERRORED && state != INVALID_STATE),
+        "virtual memory not in MATERIALIZED status, is: %d", status());
+    size_t const count = configurators.size();
+    size_t const start = count - state;
+
+    // Revert materialize(). Only configurators that ran setup() successfully
+    // will have their teardown() been called.
+    // Never early returns on exceptions. The last exception will be rethrown, and
+    // previous ones will be logged.
+    std::exception_ptr ePtr{};
+    auto const* msg = "Multiple exceptions thrown during release. The previous exception is: %s";
+    for (size_t i = start; i < count; ++i)
+    {
+        safe_invoke_helper(ePtr, msg, &Configurator::teardown, configurators[count - i].get(), handle);
+    }
+    safe_invoke_helper(ePtr, msg, &Creator::release, creator.get(), handle);
+    handle = {};
+    state = 0;
+
+    if (ePtr != nullptr)
+    {
+        state = INVALID_STATE;
+        std::rethrow_exception(ePtr);
+    }
+}
+
+void CudaVirtualMemoryManager::add(uintptr_t handle, std::string mark, CUDAVirtualMemory&& memory)
+{
+    bool success = false;
+
+    auto [memIt, exist] = mMemories.try_emplace(handle, Entry{});
+    TLLM_CHECK_WITH_INFO(
+        !exist, "CudaVirtualMemoryManager: handle 0x%016zx already being used by another memory", handle);
+    ScopeGuard eraseMemIt{success, [&] { mMemories.erase(memIt); }};
+
+    auto entryIt = mEntries.emplace(std::move(mark), memIt);
+    entryIt->second->second.mEntryIt = entryIt;
+
+    memIt->second.mMemory = std::move(memory);
+    success = true;
+}
+
+void CudaVirtualMemoryManager::add(uintptr_t handle, std::string mark, CUDAVirtualMemory::CreatorPtr creator,
+    CUDAVirtualMemory::Configurators configurators)
+{
+    std::unique_lock lock(mMutex);
+    bool success = false;
+
+    auto [memIt, exist] = mMemories.try_emplace(handle,
+        Entry{
+            {std::move(creator), std::move(configurators)},
+        });
+    TLLM_CHECK_WITH_INFO(
+        !exist, "CudaVirtualMemoryManager: handle 0x%016zx already being used by another memory", handle);
+    ScopeGuard eraseMemIt{success, [&] { mMemories.erase(memIt); }};
+
+    auto const entryIt = mEntries.emplace(mark, memIt);
+    entryIt->second->second.mEntryIt = entryIt;
+    ScopeGuard eraseMarkIt{success, [&] { mEntries.erase(entryIt); }};
+
+    try
+    {
+        // Hopefully we don't need to hold the mutex guarding mMemories and mEntries anymore.
+        lock.unlock();
+        memIt->second.mMemory.materialize();
+        success = true;
+    }
+    catch (...)
+    {
+        // ...unless materialize() throws and we need to rollback.
+        lock.lock();
+        throw;
+    }
+}
+
+CUDAVirtualMemory CudaVirtualMemoryManager::remove(uintptr_t handle) noexcept
+{
+    std::unique_lock lock(mMutex);
+
+    return unsafeRemove(handle);
+}
+
+CUDAVirtualMemory CudaVirtualMemoryManager::unsafeRemove(uintptr_t handle) noexcept
+{
+    auto nodeHandle = mMemories.extract(handle);
+    if (!nodeHandle)
+    {
+        return {};
+    }
+    mEntries.erase(nodeHandle.mapped().mEntryIt);
+
+    return std::move(nodeHandle.mapped().mMemory);
+}
+
+void CudaVirtualMemoryManager::addBadHandle(uintptr_t handle) noexcept
+{
+    try
+    {
+        mBadHandles.push_back(handle);
+    }
+    catch (...)
+    {
+    }
+}
+
+std::vector<uintptr_t> CudaVirtualMemoryManager::retrieveBadHandles() noexcept
+{
+    return std::move(mBadHandles);
+}
+
+size_t CudaVirtualMemoryManager::releaseWithMark(std::string const& mark)
+{
+    std::unique_lock lock(mMutex);
+
+    std::exception_ptr ePtr{};
+    auto [begin, end] = mEntries.equal_range(mark);
+    size_t count = 0;
+    for (auto it = begin; it != end;)
+    {
+        auto handle = it->second->first;
+        auto& memory = it->second->second.mMemory;
+        ++it; // `it` will be invalidated by unsafeRemove(handle)
+        if (memory.status() == CUDAVirtualMemory::MATERIALIZED)
+        {
+            if (!safe_invoke_helper(ePtr,
+                    "Multiple exceptions thrown during releaseWithMark. The previous exception is: %s",
+                    &CUDAVirtualMemory::release, &memory))
+            {
+                addBadHandle(handle);
+                unsafeRemove(handle);
+            }
+            ++count;
+        }
+    }
+
+    if (ePtr != nullptr)
+    {
+        std::rethrow_exception(ePtr);
+    }
+
+    return count;
+}
+
+size_t CudaVirtualMemoryManager::materializeWithMark(std::string const& mark)
+{
+    std::unique_lock lock(mMutex);
+
+    auto [begin, end] = mEntries.equal_range(mark);
+    size_t count = 0;
+
+    decltype(begin) it = begin;
+
+    try
+    {
+        for (; it != end; ++it)
+        {
+            auto& memory = it->second->second.mMemory;
+            if (memory.status() == CUDAVirtualMemory::RELEASED)
+            {
+                memory.materialize();
+                ++count;
+            }
+        }
+    }
+    catch (...)
+    {
+        for (auto it2 = begin; it2 != it;)
+        {
+            auto handle = it2->second->first;
+            auto& memory = it2->second->second.mMemory;
+            ++it2;
+            try
+            {
+                memory.release();
+            }
+            catch (std::exception& e)
+            {
+                addBadHandle(handle);
+                unsafeRemove(handle);
+                TLLM_LOG_ERROR("Additional exception thrown during rollback of materializeWithMark: %s", e.what());
+            }
+        }
+
+        addBadHandle(it->second->first);
+        unsafeRemove(it->second->first);
+
+        throw;
+    }
+    return count;
+}
+
+void CudaVirtualAddressAllocator::allocateImpl(PointerType* ptr, std::size_t n) const
+{
+    CUdeviceptr address{};
+    std::size_t const pageAlignedSize = (n + mConfig->mPageSize - 1) & ~(mConfig->mPageSize - 1);
+    TLLM_CU_CHECK(cuMemAddressReserve(&address, pageAlignedSize, 0, {}, 0));
+
+    CUDAVirtualMemory::Configurators configurators;
+    configurators.push_back(std::make_unique<UnicastConfigurator>(address, n,
+        CUmemAccessDesc{{
+                            CU_MEM_LOCATION_TYPE_DEVICE,
+                            mConfig->mDevice,
+                        },
+            CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
+
+    switch (mConfig->mMode)
+    {
+    case NONE: break;
+    case MEMSET:
+        configurators.push_back(std::make_unique<MemsetConfigurator>(address, n, 0, mConfig->mBackStream->get()));
+        break;
+    case CPU:
+        configurators.push_back(
+            std::make_unique<BackedConfigurator>(address, n, MemoryType::kCPU, mConfig->mBackStream->get()));
+        break;
+    case PINNED:
+        configurators.push_back(
+            std::make_unique<BackedConfigurator>(address, n, MemoryType::kPINNED, mConfig->mBackStream->get()));
+        break;
+    }
+
+    mConfig->mManager.add(address, mConfig->mMark,
+        std::make_unique<LocalCreator<>>(CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
+                                             {
+                                                 CU_MEM_LOCATION_TYPE_DEVICE,
+                                                 mConfig->mDevice,
+                                             }},
+            n),
+        std::move(configurators));
+
+    *ptr = deviceptr_cast(address);
+}
+
+void CudaVirtualAddressAllocator::deallocateImpl(PointerType ptr, [[maybe_unused]] std::size_t n) const
+{
+    mConfig->mManager.remove(deviceptr_cast(ptr));
+}
+
+} // namespace tensorrt_llm::runtime

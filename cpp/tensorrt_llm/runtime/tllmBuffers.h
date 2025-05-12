@@ -508,17 +508,10 @@ using PinnedPoolAllocator = PoolAllocator<PinnedAllocator>;
 //! \details This templated RAII (Resource Acquisition Is Initialization) class handles the allocation,
 //!          deallocation, querying of buffers on both the device and the host.
 //!          It can handle data of arbitrary types because it stores byte buffers.
-//!          The template parameters AllocFunc and FreeFunc are used for the
-//!          allocation and deallocation of the buffer.
-//!          AllocFunc must be a functor that takes in (void** ptr, size_t size)
-//!          and returns bool. ptr is a pointer to where the allocated buffer address should be stored.
-//!          size is the amount of memory in bytes to allocate.
-//!          The boolean indicates whether or not the memory allocation was successful.
-//!          FreeFunc must be a functor that takes in (void* ptr) and returns void.
-//!          ptr is the allocated buffer address. It must work with nullptr input.
+//!          The template parameter TAllocator must inherit from BaseAllocator.
 //!
 template <typename TAllocator>
-class GenericBuffer : virtual public IBuffer
+class GenericBuffer : virtual public IBuffer, TAllocator // Inherit from TAllocator for EBO
 {
 public:
     using AllocatorType = TAllocator;
@@ -527,20 +520,27 @@ public:
     //! \brief Construct an empty buffer.
     //!
     explicit GenericBuffer(nvinfer1::DataType type, TAllocator allocator = {}) // NOLINT(*-pro-type-member-init)
-        : GenericBuffer{0, type, std::move(allocator)} {};
+        : GenericBuffer{0, type, std::move(allocator)}
+    {
+    }
 
     //!
     //! \brief Construct a buffer with the specified allocation size in number of elements.
     //!
     explicit GenericBuffer( // NOLINT(*-pro-type-member-init)
         std::size_t size, nvinfer1::DataType type, TAllocator allocator = {})
-        : GenericBuffer{size, size, type, std::move(allocator)} {};
+        : GenericBuffer{size, size, type, std::move(allocator)}
+    {
+    }
+
+    GenericBuffer(GenericBuffer const& other) = delete;
+    GenericBuffer& operator=(GenericBuffer const& buf) = delete;
 
     GenericBuffer(GenericBuffer&& buf) noexcept
-        : mSize{buf.mSize}
+        : TAllocator(static_cast<TAllocator&&>(buf))
+        , mSize{buf.mSize}
         , mCapacity{buf.mCapacity}
         , mType{buf.mType}
-        , mAllocator{std::move(buf.mAllocator)}
         , mBuffer{buf.mBuffer}
     {
         buf.mSize = 0;
@@ -552,11 +552,11 @@ public:
     {
         if (this != &buf)
         {
-            mAllocator.deallocate(mBuffer, toBytes(mCapacity));
+            this->TAllocator::deallocate(mBuffer, toBytes(mCapacity));
             mSize = buf.mSize;
             mCapacity = buf.mCapacity;
             mType = buf.mType;
-            mAllocator = std::move(buf.mAllocator);
+            *static_cast<TAllocator*>(this) = static_cast<TAllocator&&>(buf);
             mBuffer = buf.mBuffer;
             // Reset buf.
             buf.mSize = 0;
@@ -615,7 +615,7 @@ public:
     //!
     [[nodiscard]] MemoryType getMemoryType() const override
     {
-        return mAllocator.getMemoryType();
+        return this->TAllocator::getMemoryType();
     }
 
     //!
@@ -625,8 +625,8 @@ public:
     {
         if (mCapacity < newSize)
         {
-            mAllocator.deallocate(mBuffer, toBytes(mCapacity));
-            mBuffer = mAllocator.allocate(toBytes(newSize));
+            this->TAllocator::deallocate(mBuffer, toBytes(mCapacity));
+            mBuffer = this->TAllocator::allocate(toBytes(newSize));
             mCapacity = newSize;
         }
         mSize = newSize;
@@ -637,7 +637,7 @@ public:
     //!
     void release() override
     {
-        mAllocator.deallocate(mBuffer, toBytes(mCapacity));
+        this->TAllocator::deallocate(mBuffer, toBytes(mCapacity));
         mSize = 0;
         mCapacity = 0;
         mBuffer = nullptr;
@@ -647,7 +647,7 @@ public:
     {
         try
         {
-            mAllocator.deallocate(mBuffer, toBytes(mCapacity));
+            this->TAllocator::deallocate(mBuffer, toBytes(mCapacity));
         }
         catch (std::exception const& e)
         {
@@ -657,11 +657,11 @@ public:
 
 protected:
     explicit GenericBuffer(std::size_t size, std::size_t capacity, nvinfer1::DataType type, TAllocator allocator = {})
-        : mSize{size}
+        : TAllocator{std::move(allocator)}
+        , mSize{size}
         , mCapacity{capacity}
         , mType{type}
-        , mAllocator{std::move(allocator)}
-        , mBuffer{capacity > 0 ? mAllocator.allocate(toBytes(capacity)) : nullptr}
+        , mBuffer{capacity > 0 ? this->TAllocator::allocate(toBytes(capacity)) : nullptr}
     {
         TLLM_CHECK(size <= capacity);
         TLLM_CHECK(capacity == 0 || size > 0);
@@ -670,7 +670,6 @@ protected:
 private:
     std::size_t mSize{0}, mCapacity{0};
     nvinfer1::DataType mType;
-    TAllocator mAllocator;
     void* mBuffer;
 };
 
