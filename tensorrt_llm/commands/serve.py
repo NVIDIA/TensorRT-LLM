@@ -1,5 +1,8 @@
 import asyncio
+import enum
 import os
+import subprocess  # nosec B404
+import sys
 from typing import Any, List, Optional
 
 import click
@@ -8,12 +11,15 @@ import yaml
 from torch.cuda import device_count
 
 from tensorrt_llm._torch.llm import LLM as PyTorchLLM
+from tensorrt_llm._utils import mpi_rank
+from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.llmapi import (LLM, BuildConfig, CapacitySchedulerPolicy,
                                  DynamicBatchConfig, KvCacheConfig,
                                  SchedulerConfig)
 from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
                                               parse_disagg_config_file)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
+from tensorrt_llm.llmapi.mpi_session import find_free_port
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
@@ -81,7 +87,6 @@ def get_llm_args(model: str,
 
 
 def launch_server(host: str, port: int, llm_args: dict):
-
     backend = llm_args["backend"]
     model = llm_args["model"]
 
@@ -301,15 +306,31 @@ def set_cuda_device():
 def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     """Launching disaggregated MPI worker"""
 
-    set_cuda_device()
+    from tensorrt_llm._utils import mpi_rank
+    if os.environ.get(DistaggLauncherEnvs.
+                      TLLM_DISTAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
+        set_cuda_device()
     # Importing mpi4py after setting CUDA device. This is needed to war an issue with mpi4py and CUDA
     from mpi4py.futures import MPICommExecutor
 
     from tensorrt_llm._utils import global_mpi_rank, mpi_rank, set_mpi_comm
-    from tensorrt_llm.llmapi import MpiCommSession
     from tensorrt_llm.llmapi.disagg_utils import split_world_comm
 
     disagg_cfg = parse_disagg_config_file(config_file)
+
+    # Run a server with the underlying LLM invokes a RemoteMPISessionClient
+    if os.environ.get(DistaggLauncherEnvs.
+                      TLLM_DISTAGG_RUN_REMOTE_MPI_SESSION_CLIENT) == "1":
+        instance_idx = os.environ.get(
+            DistaggLauncherEnvs.TLLM_DISTAGG_INSTANCE_IDX)
+        server_cfg = disagg_cfg.server_configs[int(instance_idx)]
+
+        llm_args, llm_args_extra_dict = get_llm_args(**server_cfg.other_args)
+        llm_args = update_llm_args_with_extra_dict(llm_args,
+                                                   llm_args_extra_dict)
+
+        _launch_disaggregated_server(config_file, llm_args)
+        return
 
     is_leader, instance_idx, sub_comm = split_world_comm(
         disagg_cfg.server_configs)
@@ -322,27 +343,99 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     )
 
     # Leader ranks will start the trtllm-server using it's own server config
+    # and start a RemoteMPISessionServer to accept MPI tasks
     if is_leader:
+        os.environ[DistaggLauncherEnvs.TLLM_DISTAGG_INSTANCE_IDX] = str(
+            instance_idx)
         server_cfg = disagg_cfg.server_configs[instance_idx]
 
         llm_args, llm_args_extra_dict = get_llm_args(**server_cfg.other_args)
         llm_args = update_llm_args_with_extra_dict(llm_args,
                                                    llm_args_extra_dict)
 
-        mpi_session = MpiCommSession(
-            comm=sub_comm,
-            n_workers=sub_comm.Get_size()) if sub_comm is not None else None
+        _launch_disaggregated_leader(sub_comm, instance_idx, config_file,
+                                     log_level)
 
-        llm_args["_mpi_session"] = mpi_session
-
-        launch_server(host=server_cfg.hostname,
-                      port=server_cfg.port,
-                      llm_args=llm_args)
     else:
+        # Common workers
         with MPICommExecutor(sub_comm) as executor:
             if not is_leader and executor is not None:
                 raise RuntimeError(
                     f"rank{global_mpi_rank()} should not have executor")
+
+
+class DistaggLauncherEnvs(enum.StrEnum):
+    TLLM_DISTAGG_INSTANCE_IDX = "TLLM_DISTAGG_INSTANCE_IDX"
+    TLLM_DISTAGG_RUN_REMOTE_MPI_SESSION_CLIENT = "TLLM_DISTAGG_RUN_REMOTE_MPI_SESSION_CLIENT"
+
+
+def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
+    # Launching the server
+    instance_idx = os.environ.get(DistaggLauncherEnvs.TLLM_DISTAGG_INSTANCE_IDX)
+    assert instance_idx is not None, f"{DistaggLauncherEnvs.TLLM_DISTAGG_INSTANCE_IDX} should be set by the launcher"
+    disagg_config = parse_disagg_config_file(disagg_config_file)
+    server_cfg = disagg_config.server_configs[int(instance_idx)]
+
+    logger.info(
+        f"rank {mpi_rank()} for index {instance_idx} launch the distagg server")
+
+    launch_server(host=server_cfg.hostname,
+                  port=server_cfg.port,
+                  llm_args=llm_args)
+
+
+def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
+                                 log_level: str):
+    from tensorrt_llm.llmapi.mgmn_leader_node import \
+        launch_server_main as launch_remote_mpi_session_server
+    from tensorrt_llm.llmapi.mpi_session import split_mpi_env
+
+    # This mimics the behavior of trtllm-llmapi-launch
+    # TODO: Make the port allocation atomic
+    free_port = find_free_port()
+    os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS] = "1"
+    os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR.
+               value] = f"tcp://127.0.0.1:{free_port}"
+    os.environ[DistaggLauncherEnvs.TLLM_DISTAGG_RUN_REMOTE_MPI_SESSION_CLIENT.
+               value] = "1"
+    os.environ[DistaggLauncherEnvs.TLLM_DISTAGG_INSTANCE_IDX] = str(
+        instance_idx)
+
+    logger.debug(
+        f"proxy controller address: {os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR]}"
+    )
+
+    # The MPI-related environment variables will invoke duplicate MPI_Init in
+    # the forked process, so we need to remove them before launching the server
+    # process.
+    non_mpi_env, mpi_env = split_mpi_env()
+
+    assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS in non_mpi_env
+    assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR in non_mpi_env
+    assert DistaggLauncherEnvs.TLLM_DISTAGG_INSTANCE_IDX in non_mpi_env
+    assert DistaggLauncherEnvs.TLLM_DISTAGG_RUN_REMOTE_MPI_SESSION_CLIENT in non_mpi_env
+
+    # Two steps:
+    # 1. Run the LLM-API Proxy in a separate process for streaming performance.
+    #      The Proxy will create a RemoteMpiSessionClient as mpi_session in LLM
+    #      class.
+    logger.info(f"rank {mpi_rank()} step1: command: {sys.argv}")
+    command = [
+        "python3", sys.argv[0], "disaggregated_mpi_worker", "-c", config_file,
+        "--log_level", log_level
+    ]
+    subprocess.Popen(
+        command,
+        env=non_mpi_env,
+        stdout=sys.stdout,  # Redirect to parent's stdout
+        stderr=sys.stderr,  # Redirect to parent's stderr
+        start_new_session=True)
+
+    logger.info(f"rank {mpi_rank()} step2: start the mpi session server")
+    # 2. Run the RemoteMpiSessionServer to accept MPI tasks
+    assert sub_comm is not None
+    assert sub_comm.Get_rank() == 0
+    launch_remote_mpi_session_server(sub_comm)
 
 
 class DefaultGroup(click.Group):
