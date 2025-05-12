@@ -113,11 +113,11 @@ l0_dgx_h100:
       auto_trigger: others
   tests:
   # ------------- CPP tests ---------------
-  - test_cpp.py::test_multi_gpu_simple[90]
-  - test_cpp.py::test_multi_gpu_t5[90]
-  - test_cpp.py::test_multi_gpu_llama_executor[90]
-  - test_cpp.py::test_multi_gpu_trt_gpt_real_decoder[90]
-  - test_cpp.py::test_multi_gpu_disagg[90]
+  - cpp/test_multi_gpu.py::test_simple[90]
+  - cpp/test_multi_gpu.py::test_t5[90]
+  - cpp/test_multi_gpu.py::test_llama_executor[90]
+  - cpp/test_multi_gpu.py::test_trt_gpt_real_decoder[90]
+  - cpp/test_multi_gpu.py::test_disagg[90]
 - condition:
     ranges:
       system_gpu_count:
