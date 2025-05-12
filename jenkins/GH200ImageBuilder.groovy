@@ -18,7 +18,8 @@ def buildImage(action, type)
     def branch = env.gitlabBranch
     def branchTag = branch.replaceAll('/', '_')
     def buildNumber = env.hostBuildNumber ? env.hostBuildNumber : BUILD_NUMBER
-    def tag = "sbsa-devel-torch_${type}-${branchTag}-${buildNumber}"
+    def stage_docker = "tritondevel"
+    def tag = "sbsa-${stage_docker}-torch_${type}-${branchTag}-${buildNumber}"
 
     // Step 1: cloning tekit source code
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
@@ -72,7 +73,7 @@ def buildImage(action, type)
             stage ("Perform '${action}' action on image") {
                 retry(3)
                 {
-                    sh "cd ${LLM_ROOT} && make -C docker devel_${action} IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${tag} TORCH_INSTALL_TYPE=${type} BUILD_TRITON=1" +
+                    sh "cd ${LLM_ROOT} && make -C docker ${stage_docker}_${action} IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${tag} TORCH_INSTALL_TYPE=${type} BUILD_TRITON=1" +
                     " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
                 }
             }

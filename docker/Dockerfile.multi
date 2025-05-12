@@ -5,8 +5,6 @@ ARG BASE_TAG=25.03-py3
 ARG TRITON_BASE_TAG=25.03-py3
 ARG DEVEL_IMAGE=devel
 
-FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
-
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
 
 # Add NVIDIA EULA and AI Terms labels
@@ -57,15 +55,6 @@ RUN bash ./install_tensorrt.sh \
     --CUBLAS_VER=${CUBLAS_VER} && \
     rm install_tensorrt.sh
 
-ARG INSTALL_TRITON=0
-COPY --from=triton /opt/tritonserver/backends/python /opt/tritonserver/backends/python
-COPY --from=triton /opt/tritonserver/lib /opt/tritonserver/lib
-COPY --from=triton /opt/tritonserver/include /opt/tritonserver/include
-COPY --from=triton /opt/tritonserver/bin /opt/tritonserver/bin
-COPY --from=triton /opt/tritonserver/caches /opt/tritonserver/caches
-COPY docker/common/install_triton.sh install_triton.sh
-RUN bash ./install_triton.sh && rm install_triton.sh
-
 # Install latest Polygraphy
 COPY docker/common/install_polygraphy.sh install_polygraphy.sh
 RUN bash ./install_polygraphy.sh && rm install_polygraphy.sh
@@ -73,14 +62,6 @@ RUN bash ./install_polygraphy.sh && rm install_polygraphy.sh
 # Install mpi4py
 COPY docker/common/install_mpi4py.sh install_mpi4py.sh
 RUN bash ./install_mpi4py.sh && rm install_mpi4py.sh
-
-# Install NIXL
-COPY docker/common/install_nixl.sh install_nixl.sh
-RUN bash ./install_nixl.sh && rm install_nixl.sh
-
-# Install etcd
-COPY docker/common/install_etcd.sh install_etcd.sh
-RUN bash ./install_etcd.sh && rm install_etcd.sh
 
 # Install PyTorch
 ARG TORCH_INSTALL_TYPE="skip"
@@ -90,6 +71,28 @@ RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh
 # Install OpenCV with FFMPEG support
 RUN pip3 uninstall -y opencv && rm -rf /usr/local/lib/python3*/dist-packages/cv2/
 RUN pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir
+
+
+FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
+
+FROM devel AS tritondevel
+
+COPY --from=triton /opt/tritonserver/backends/python /opt/tritonserver/backends/python
+COPY --from=triton /opt/tritonserver/lib /opt/tritonserver/lib
+COPY --from=triton /opt/tritonserver/include /opt/tritonserver/include
+COPY --from=triton /opt/tritonserver/bin /opt/tritonserver/bin
+COPY --from=triton /opt/tritonserver/caches /opt/tritonserver/caches
+COPY docker/common/install_triton.sh install_triton.sh
+RUN bash ./install_triton.sh && rm install_triton.sh
+
+# Install NIXL
+COPY docker/common/install_nixl.sh install_nixl.sh
+RUN bash ./install_nixl.sh && rm install_nixl.sh
+
+# Install etcd
+COPY docker/common/install_etcd.sh install_etcd.sh
+RUN bash ./install_etcd.sh && rm install_etcd.sh
+
 
 FROM ${DEVEL_IMAGE} AS wheel
 WORKDIR /src/tensorrt_llm
