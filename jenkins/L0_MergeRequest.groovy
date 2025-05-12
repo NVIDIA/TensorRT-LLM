@@ -619,6 +619,8 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
         "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
         "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
         "tests/integration/defs/disaggregated/",
+        "examples/auto_deploy",
+        "examples/disaggregated",
         "examples/pytorch/",
         "examples/scaffolding/",
         "docs/"
