@@ -162,6 +162,8 @@ class Linear(nn.Module):
         use_custom_cublas_mm: bool = False,
         use_llama4_qkv: bool = False,
         use_llama4_fc_swiglu_kernel: bool = False,
+        use_llama4_gemv_for_fc_swiglu: bool = False,
+        use_llama4_trtllm_gen: bool = False,
         previous_gate_up_proj: nn.Module = None,
     ):
         from ..distributed import AllReduce
@@ -210,6 +212,13 @@ class Linear(nn.Module):
         # Llama4 FC13+SwiGLU kernel has hard requirement of hidden_size = 5120
         # and targets output_features = 2048 or 4096.
         self.use_llama4_fc_swiglu_kernel = use_llama4_fc_swiglu_kernel and self.in_features == 5120 and (self.out_features == 2048 or self.out_features == 4096)
+        # Currently we have logics inside apply_linear and forward that directs to either
+        # gemv or trtllm_gen kernel based on the token_length. This option here allows us
+        # to force using gemv kernel for FC SwiGLU.
+        self.use_llama4_gemv_for_fc_swiglu = use_llama4_gemv_for_fc_swiglu
+        # This knob is for Llama4 FC2 (down_proj in gated_mlp)
+        # local_in_features for FC2 is 1024, while global is 8192 (TP8)
+        self.use_llama4_trtllm_gen = use_llama4_trtllm_gen and (self.in_features % 512 == 0) and self.out_features == 5120
 
         self.combined_scale = torch.randn(1, dtype=torch.float32, device='cuda')
         if not skip_create_weights:
@@ -353,7 +362,7 @@ class Linear(nn.Module):
                         input, self.input_scale)
                 else:
                     qinput = input
-                if self.use_llama4_qkv and (qinput.shape[0] <= 8):
+                if self.use_llama4_qkv and (qinput.shape[0] <= 4):
                     # Kernel is only supported when M <= 8
                     output = torch.ops.trtllm.llama4_qkv_gemm(
                         qinput,
@@ -361,17 +370,37 @@ class Linear(nn.Module):
                         self.combined_scale,
                         position_ids,
                     )
-                elif self.use_llama4_fc_swiglu_kernel and qinput.shape[0] <= 4:
+                elif self.use_llama4_qkv and (4 < qinput.shape[0] <= 8):
+                    if position_ids is not None:
+                        # Kernel is only supported when M <= 8
+                        output = torch.ops.trtllm.llama4_qkv_gemm(
+                            qinput,
+                            weight.t(),
+                            self.combined_scale,
+                            position_ids,
+                        )
+                    else:
+                        output = torch.ops.trtllm.fp8_per_tensor_scaling_tllmg_gemm(
+                            qinput,
+                            weight,
+                            global_scale=self.combined_scale,
+                            out_dtype=torch.bfloat16,
+                            low_latency_kernel=True,
+                            gated_silu=False,
+                        )
+                elif (self.use_llama4_fc_swiglu_kernel and qinput.shape[0] < 4) or self.use_llama4_gemv_for_fc_swiglu:
                     # Outputing fp8 even though self.dtype is bfloat16
                     # That is why we need inv_input_scale from next linear layer to
                     # offset the quantization.
+                    if not hasattr(self, "next_gate_down_inv_input_scale"):
+                        raise ValueError('Expect next_gate_down_inv_input_scale to be set')
                     output = torch.ops.trtllm.llama4_fc_swiglu_tiled_fp8(
                         qinput,
                         weight.t(),
                         self.combined_scale,
                         self.next_gate_down_inv_input_scale,
                     )
-                elif self.use_llama4_fc_swiglu_kernel and (4 < qinput.shape[0] <= 16):
+                elif self.use_llama4_fc_swiglu_kernel and (4 <= qinput.shape[0] <= 16):
                     if not hasattr(self, "trtllm_gen_global_scale"):
                         raise ValueError('Expect trtllm_gen_global_scale to be set')
                     # Outputing fp8 even though self.dtype is bfloat16
@@ -386,6 +415,15 @@ class Linear(nn.Module):
                         out_dtype=torch.float8_e4m3fn,
                         low_latency_kernel=True,
                         gated_silu=True,
+                    )
+                elif self.use_llama4_trtllm_gen and input.shape[0] <= 8:
+                    output = torch.ops.trtllm.fp8_per_tensor_scaling_tllmg_gemm(
+                        qinput,
+                        weight,
+                        global_scale=self.combined_scale,
+                        out_dtype=torch.bfloat16,
+                        low_latency_kernel=True,
+                        gated_silu=False,
                     )
                 else:
                     # This op does not support bias now.
@@ -479,21 +517,36 @@ class Linear(nn.Module):
                         bias = None
                 else:
                     assert all_reduce_params is None or all_reduce_params.enable_allreduce is False, "Cannot fuse norm/residual/bias ops into allreduce op since we do not call allreduce op when tp_size is 1."
-                output = self.apply_linear(input, self.weight, bias)
+                if self.use_llama4_trtllm_gen and input.shape[0] <= 8 and bias is None:
+                    output = self.apply_linear(input, self.trtllm_gen_weight, bias)
+                else:
+                    output = self.apply_linear(input, self.weight, bias)
                 output = self.all_reduce(
                     output,
                     all_reduce_params=all_reduce_params,
                 )
             else:
-                output = self.apply_linear(input, self.weight, bias)
+                if self.use_llama4_trtllm_gen and input.shape[0] <= 8 and bias is None:
+                    output = self.apply_linear(input, self.trtllm_gen_weight, bias)
+                else:
+                    output = self.apply_linear(input, self.weight, bias)
         elif self.tp_mode == TensorParallelMode.COLUMN:
-            if self.use_llama4_qkv and position_ids is not None:
-                output = self.apply_linear(input,
-                                           self.weight,
-                                           self.bias,
-                                           position_ids=position_ids)
+            if self.use_llama4_qkv:
+                if input.shape[0] <= 8 and position_ids is not None:
+                    output = self.apply_linear(input,
+                                               self.weight,
+                                               self.bias,
+                                               position_ids=position_ids)
+                elif 4 < input.shape[0] <= 8 and position_ids is None:
+                    output = self.apply_linear(input,
+                                               self.trtllm_gen_weight,
+                                               self.bias)
+                else:
+                    output = self.apply_linear(input,
+                                               self.weight,
+                                               self.bias)
             elif self.use_llama4_fc_swiglu_kernel:
-                if 4 < input.shape[0] <= 16:
+                if 4 <= input.shape[0] <= 16 and not self.use_llama4_gemv_for_fc_swiglu:
                     output = self.apply_linear(input,
                                                self.trtllm_gen_weight,
                                                self.bias)
@@ -507,7 +560,7 @@ class Linear(nn.Module):
                 output = allgather(output, self.mapping)
         else:
             if self.use_llama4_fc_swiglu_kernel:
-                if 4 < input.shape[0] <= 16:
+                if 4 <= input.shape[0] <= 16 and not self.use_llama4_gemv_for_fc_swiglu:
                     output = self.apply_linear(input,
                                                self.trtllm_gen_weight,
                                                self.bias)
@@ -538,6 +591,11 @@ class Linear(nn.Module):
             weight = load_weight_shard(weights[0]['weight'], self.tp_size,
                                        self.tp_rank, self.tp_mode, device)
             copy(self.weight, weight)
+            if self.use_llama4_trtllm_gen:
+                # Shuffling is needed for low latency mode. Assuming always low latency mode for now.
+                # epilogue_tile_m is hardcoded as 128 for now.
+                epilogue_tile_m = 128
+                self.trtllm_gen_weight = shuffle_matrix_a(weight.view(torch.uint8), epilogue_tile_m).view(torch.float8_e4m3fn)
 
             if self.bias is not None:
                 bias = load_weight_shard(weights[0]['bias'], self.tp_size,
@@ -646,6 +704,11 @@ class Linear(nn.Module):
                     torch.float8_e4m3fn)
 
             copy(self.weight, fused_weight)
+            if self.use_llama4_qkv:
+                # Shuffling is needed for low latency mode. Assuming always low latency mode for now.
+                # epilogue_tile_m is hardcoded as 128 for now.
+                epilogue_tile_m = 128
+                self.trtllm_gen_weight = shuffle_matrix_a(fused_weight.view(torch.uint8), epilogue_tile_m).view(torch.float8_e4m3fn)
 
             if self.bias is not None:
                 q_bias = load_weight_shard(weights[0]['bias'], self.tp_size,
@@ -671,8 +734,7 @@ class Linear(nn.Module):
                     gate_weight = gate_weight.to(self.dtype) * weight_scale[0]
                     up_weight = up_weight.to(self.dtype) * weight_scale[1]
                     if hasattr(self, "next_gate_down_inv_input_scale"):
-                        self.combined_scale = self.input_scale * self.weight_scale
-                        self.trtllm_gen_global_scale = self.combined_scale * self.next_gate_down_inv_input_scale
+                        raise ValueError("Unexpected weight load sequence. Gate down proj should be loaded after gate up proj.")
                     else:
                         self.combined_scale = self.input_scale * self.weight_scale
 
