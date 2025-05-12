@@ -40,6 +40,7 @@
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/torchView.h"
+#include "tensorrt_llm/runtime/virtualMemory.h"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAStream.h>
@@ -116,6 +117,10 @@ void initBindings(nb::module_& m)
         .def_rw("weights_out_pointer", &tr::LoraCache::TaskLayerModuleConfig::weightsOutPointer)
         .def_rw("scaling_vec_pointer", &tr::LoraCache::TaskLayerModuleConfig::scalingVecPointer)
         .def(nb::self == nb::self);
+
+    nb::class_<tr::CudaVirtualMemoryManager>(m, "CudaVirtualMemoryManager")
+        .def("release_with_mark", &tr::CudaVirtualMemoryManager::releaseWithMark, nb::arg("mark"))
+        .def("materialize_with_mark", &tr::CudaVirtualMemoryManager::materializeWithMark, nb::arg("mark"));
 
     nb::class_<tr::BufferManager>(m, "BufferManager")
         .def(nb::init<tr::BufferManager::CudaStreamPtr, bool>(), nb::arg("stream"), nb::arg("trim_pool") = false)
@@ -331,6 +336,30 @@ void initBindings(nb::module_& m)
         "max_workspace_size_lowprecision",
         [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
         "Calculate the maximum workspace size needed for low precision all-reduce operations");
+
+    nb::enum_<tr::CudaVirtualMemoryAllocator::RestoreMode>(m, "CudaVirtualMemoryAllocatorRestoreMode")
+        .value("NONE", tr::CudaVirtualMemoryAllocator::RestoreMode::NONE)
+        .value("CPU", tr::CudaVirtualMemoryAllocator::RestoreMode::CPU)
+        .value("PINNED", tr::CudaVirtualMemoryAllocator::RestoreMode::PINNED)
+        .value("MEMSET", tr::CudaVirtualMemoryAllocator::RestoreMode::MEMSET);
+
+    m.def("get_virtual_memory_manager", &tr::getVirtualMemoryManager, "Get the virtual memory manager",
+        nb::rv_policy::reference);
+
+    m.def(
+        "push_virtual_memory_allocator",
+        [](std::string const& mark, tr::CudaVirtualMemoryAllocator::RestoreMode mode, uintptr_t stream)
+        {
+            tr::pushVirtualMemoryAllocator(mark, mode,
+                std::make_shared<tr::CudaStream>(
+                    reinterpret_cast<cudaStream_t>(stream), tensorrt_llm::common::getDevice(), false));
+        },
+        "Create a new virtual address allocator. Push it into the allocator stack to be used for subsequent "
+        "allocations");
+
+    m.def("pop_virtual_memory_allocator", &tr::popVirtualMemoryAllocator,
+        "Pop the current virtual address allocator from the allocator stack. Restore the active allocator for "
+        "subsequent allocations to be the previous one");
 
     nb::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
         .def(nb::init<size_t, uint32_t, uint32_t, at::Device, bool>())

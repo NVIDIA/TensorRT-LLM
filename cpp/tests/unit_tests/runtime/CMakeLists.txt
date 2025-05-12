@@ -28,6 +28,7 @@ add_gtest(tllmRuntimeTest tllmRuntimeTest.cpp)
 add_gtest(transposeKVKernelTest transposeKVKernelTest.cpp)
 add_gtest(userBufferTest userBufferTest.cpp)
 add_gtest(utilsTest utilsTest.cpp)
+add_gtest(virtualMemoryTest virtualMemoryTest.cpp)
 add_gtest(workerPoolTest workerPoolTest.cpp)
 add_gtest(worldConfigTest worldConfigTest.cpp)
 
