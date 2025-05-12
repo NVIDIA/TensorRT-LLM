@@ -722,6 +722,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                   update_kv_cache=not metadata.is_cross
                                   or k is not None,
                                   attention_mask=attention_mask)
+
+        # Set to None to reduce memory usage
+        self.wrapper.latent_cache = None
+        self.wrapper.q_pe = None
         return output
 
     @classmethod
