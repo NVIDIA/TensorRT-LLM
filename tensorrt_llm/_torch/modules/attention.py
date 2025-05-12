@@ -34,6 +34,7 @@ class Attention(nn.Module):
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
+        use_qk_norm: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -41,15 +42,13 @@ class Attention(nn.Module):
         config = config or ModelConfig()
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
-        if config:
-            self.head_dim = getattr(config.pretrained_config, "head_dim",
-                                    self.hidden_size // self.num_heads)
-        else:
-            self.head_dim = self.hidden_size // self.num_heads
+        self.head_dim = getattr(config.pretrained_config, "head_dim",
+                                self.hidden_size // self.num_heads)
         self.num_key_value_heads = num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = max_position_embeddings
         self.pos_embd_params = pos_embd_params
+        self.use_qk_norm = use_qk_norm
         self.dense_bias = dense_bias
 
         if dense_bias is None:
@@ -119,9 +118,6 @@ class Attention(nn.Module):
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
-        use_qk_norm = (config.pretrained_config and
-                       (config.pretrained_config.model_type == 'qwen3'
-                        or config.pretrained_config.model_type == 'qwen3_moe'))
         attn_cls = get_attention_backend(self.attn_backend)
         self.enable_rope_fusion = attn_cls.support_fused_rope(
         ) and not use_qk_norm
@@ -194,28 +190,8 @@ class Attention(nn.Module):
         if self.apply_rotary_emb and position_ids is not None:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
                                 dim=-1)
-            if hasattr(self, 'q_norm') and hasattr(self, 'k_norm'):
-                # Add qk-norm
-                if hasattr(self, 'ln_events'):
-                    q_l2norm = lambda: self.q_norm(q.reshape(-1, self.head_dim)
-                                                   ).reshape(-1, self.q_size)
-                    k_l2norm = lambda: self.k_norm(k.reshape(-1, self.head_dim)
-                                                   ).reshape(-1, self.kv_size)
-                    q, k = maybe_execute_in_parallel(
-                        q_l2norm,
-                        k_l2norm,
-                        self.ln_events[0],
-                        self.ln_events[1],
-                        self.aux_stream,
-                    )
-                else:
-                    q_by_head = q.reshape(-1, self.head_dim)
-                    q_by_head = self.q_norm(q_by_head)
-                    q = q_by_head.view(q.shape)
-                    k_by_head = k.reshape(-1, self.head_dim)
-                    k_by_head = self.k_norm(k_by_head)
-                    k = k_by_head.view(k.shape)
-
+            if self.use_qk_norm:
+                q, k = self.apply_qk_norm(q, k)
             q, k = self.rotary_emb(position_ids, [q, k])
         out_scale = None
 
@@ -236,6 +212,11 @@ class Attention(nn.Module):
                                   lora_params=lora_params,
                                   layer_idx=self.layer_idx)
         return attn_output
+
+    def apply_qk_norm(self, q, k):
+        raise NotImplementedError(
+            f"QK norm is not implemented for {self.__class__.__name__}."
+            "Please override the `apply_qk_norm` method in the subclass.")
 
 
 class MLA(nn.Module):
