@@ -1292,6 +1292,35 @@ void WindowBlockManager::storeBlocks(
     }
 }
 
+void WindowBlockManager::storeBlock(BlockKey const& blockKey, KVCacheBlock::IdType blockId, BlockPtr const& prevBlock)
+{
+    TLLM_CHECK(prevBlock != nullptr && prevBlock->getPrevBlock() != nullptr);
+    TLLM_LOG_DEBUG("%s::storeBlock - store block %d", mLogPrefix.c_str(), blockId);
+    auto& block = mAllBlocksById[blockId];
+    block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
+    block->setPrevBlock(prevBlock);
+    block->setPrevBlockInSeq(prevBlock);
+    prevBlock->addNextBlock(blockKey, block);
+
+    // Sanity check. The list of stored blocks should be connected.
+    TLLM_CHECK(block->getPrevBlockInSeq() == nullptr || block->getPrevBlockInSeq()->getHash() == prevBlock->getHash());
+    auto oldHash = block->getHash();
+    auto newHash = BlockKeyHasher()(blockKey, prevBlock->getHash());
+    if (oldHash != newHash)
+    {
+        TLLM_LOG_DEBUG("#%d block hash %zx -> %zx", block->getBlockId(), oldHash, newHash);
+        removeBlockFromHashMap(block);
+        block->setHash(newHash);
+        addBlockToHashMap(block);
+    }
+    if (mEventManager)
+    {
+        std::vector<BlockPtr> storedBlocks;
+        storedBlocks.push_back(block);
+        mEventManager->enqueueStoredEvent(storedBlocks);
+    }
+}
+
 void BlockManager::replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx)
 {
     mWindowBlockManagers.at(windowSize).replaceSharedBlock(sequence, blockIdx);
@@ -1449,6 +1478,11 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
     auto const& uniqueTokens = llmRequest->getUniqueTokens(beamIdx);
     auto const& cacheBlockIds = sequence.getCacheBlockIds(mWindowSize);
 
+    if (uniqueTokens.size() == 0)
+    {
+        return;
+    }
+
     // TODO: get the caller to mark tokens as filled / not filled, so that the kv-cache manager doesn't
     // have to guess. Only (length - 1) tokens of the sequence have their kv-state recorded in kv-cache. We assume
     // the last token's state is not filled yet.
@@ -1459,7 +1493,32 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
     }
     auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, true);
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
-    storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+    if (blockKeys.size() < 2 || cacheBlockIds[beamIdx].size() < blockKeys.size())
+    {
+        // No need to store the last block if it is the only one
+        TLLM_LOG_DEBUG("%s::storeNewBlock - No need to store the last block", mLogPrefix.c_str());
+        return;
+    }
+    {
+        // No need to store the last block if it is the only one
+        TLLM_LOG_DEBUG("%s::storeNewBlock - No need to store the last block", mLogPrefix.c_str());
+        return;
+    }
+    {
+        storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+        return;
+    }
+
+    auto prevBlock = mAllBlocksById.at(cacheBlockIds[beamIdx][blockKeys.size() - 2]);
+
+    // If the previous block is not in the radix tree, we need to store all blocks
+    if (prevBlock->getPrevBlock() == nullptr)
+    {
+        storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+        return;
+    }
+
+    storeBlock(blockKeys.back(), cacheBlockIds[beamIdx][blockKeys.size() - 1], prevBlock);
 }
 
 void WindowBlockManager::storeBlocksForReuse(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
@@ -2014,7 +2073,7 @@ void KVCacheManager::storeNewBlock(LlmRequest const& llmRequest)
     auto const requestId = llmRequest.mRequestId;
     auto& sequence = getSequence(requestId);
     bool const storeBlocksForReuse = sequence.getBeamWidth() == 1 && !sequence.isCyclic();
-    if (mEnableBlockReuse && storeBlocksForReuse && !sequence.isCyclic())
+    if (mEnableBlockReuse && storeBlocksForReuse)
     {
         mBlockManager.storeNewBlock(sequence, llmRequest);
     }
