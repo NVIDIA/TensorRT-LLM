@@ -51,7 +51,7 @@ struct Model
     float batch_size;
     // Number of warps to launch for the base kernel
     float base_warps;
-    // Ratio of the block_limit_warps for the large batch kernel vs the base kernel
+    // Ratio of the concurrent_block_per_sm for the large batch kernel vs the base kernel
     float scheduling_efficiency_ratio;
     // Intercept of the logistic regression model
     float intercept;
@@ -65,12 +65,12 @@ inline std::map<int, Model> gpu_models = {
 };
 
 template <int n>
-void GroupRMSNormBaseKernelLauncher(GroupRMSParams<n> params);
+void GroupRMSNormBaseKernelLauncher(GroupRMSParams<n>& params);
 
 template <int n>
-void GroupRMSNormKernelLargeBatchLauncher(GroupRMSParams<n> params);
+void GroupRMSNormKernelLargeBatchLauncher(GroupRMSParams<n>& params);
 
 template <int n>
-void GroupRMSNormKernelLauncherWithHeuristic(GroupRMSParams<n> params);
+void GroupRMSNormKernelLauncherWithHeuristic(GroupRMSParams<n>& params);
 
 } // namespace tensorrt_llm::kernels::group_rms_norm

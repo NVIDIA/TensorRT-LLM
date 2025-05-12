@@ -73,35 +73,35 @@ def group_rms_norm(
         kernel: GroupRMSNormKernelSelection = GroupRMSNormKernelSelection.
     heuristic,
         outputs: Optional[list[torch.Tensor]] = None) -> list[torch.Tensor]:
-    '''Group RMS Normalization for up to 2 inputs.
+    '''Group RMS Normalization optimized for up to 2 inputs.
 
-    This function applies RMS normalization to up to 2 inputs simultaneously,
-    which can be more efficient than normalizing each tensor using multi-stream.
-
-    Available kernel implementations:
-    - Base kernel: Allocates warps proportional to the sum of last dimension of inputs,
-      providing better SM occupancy for most cases.
-    - Large batch kernel: Allocates warps proportional to the maximum last dimension of inputs,
-      which can be more efficient for large batch sizes with 2 inputs.
-
-    The heuristic mode uses a logistic regression model to dynamically select the optimal
-    kernel based on batch size, input dimensions, and GPU architecture.
-    The selection model was trained on benchmark data from various configurations
-    and is optimized for Compute Capabilities 9.x and 10.x.
+    This function applies RMS normalization to multiple inputs simultaneously,
+    achieving better performance than normalizing each tensor separately with multi-stream.
 
     Args:
         inputs: List of input tensors to normalize
-        weights: Optional list of weight tensors for each input
+        weights: Optional list of weight tensors corresponding to each input
         eps: Small constant added to variance for numerical stability
-        weight_bias: Optional bias to apply to weights
-        heuristic: Kernel selection strategy:
-            - heuristic: Automatically select between base and large batch kernels
-            - base: Always use the base kernel
-            - large_batch: Always use the large batch kernel
-        outputs: Optional pre-allocated output tensors
+        weight_bias: Optional bias added to weights during normalization
+        kernel: Kernel selection strategy:
+            - heuristic: Automatically selects optimal kernel based on inputs and hardware
+            - base: Uses base kernel (optimal for most cases)
+            - large_batch: Uses large batch kernel (may be better for large batches)
+        outputs: Optional pre-allocated output tensors (created if None)
 
     Returns:
         List of normalized tensors with the same shapes as inputs
+
+    Technical Details:
+        Available kernel implementations:
+        - Base kernel: Allocates warps proportional to the sum of last dimensions,
+          providing better SM occupancy for most workloads.
+        - Large batch kernel: Allocates warps proportional to the maximum last dimension,
+          which can be more efficient for large batch sizes with 2 inputs.
+
+        The heuristic mode uses a logistic regression model trained on benchmark data
+        to dynamically select the optimal kernel based on batch size, input dimensions,
+        and GPU architecture. This selection is optimized for compute capabilities 9.x and 10.x.
     '''
     out = outputs
     if out is None:
