@@ -15,6 +15,9 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization.functional import \
+    preprocess_weights_for_mixed_gemm
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ...models.modeling_utils import QuantConfig
 from ..utils import Fp4QuantizedTensor
@@ -532,6 +535,24 @@ class NVFP4LinearMethod(LinearMethodBase):
         input_scale = None
         weight_scale_2 = None
         weight_scale = []
+
+def load_weight_scales_w4a16(weights):
+    q_weight_scale = weights[0]['weight_scale']
+    k_weight_scale = weights[1]['weight_scale']
+    v_weight_scale = weights[2]['weight_scale']
+    weight_scales = [q_weight_scale, k_weight_scale, v_weight_scale]
+
+    return weight_scales
+
+
+def load_weight_scales_nvfp4(weights: List[Dict],
+                             tp_size: int = 1,
+                             tp_rank: int = 0,
+                             tp_mode: Optional[TensorParallelMode] = None):
+    # For concatenated weights (qkv_proj / up_gate_proj), the global scaling factors and input scaling factors should be shared.
+    input_scale = None
+    weight_scale_2 = None
+    weight_scale = []
 
         device = torch.device("cuda")
 
