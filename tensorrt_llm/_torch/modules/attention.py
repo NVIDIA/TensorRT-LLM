@@ -119,13 +119,12 @@ class Attention(nn.Module):
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
-        self.use_qk_norm = (
-            config.pretrained_config
-            and (config.pretrained_config.model_type == 'qwen3'
-                 or config.pretrained_config.model_type == 'qwen3_moe'))
+        use_qk_norm = (config.pretrained_config and
+                       (config.pretrained_config.model_type == 'qwen3'
+                        or config.pretrained_config.model_type == 'qwen3_moe'))
         attn_cls = get_attention_backend(self.attn_backend)
         self.enable_rope_fusion = attn_cls.support_fused_rope(
-        ) and not self.use_qk_norm
+        ) and not use_qk_norm
         self.attn = create_attention(
             self.attn_backend,
             self.layer_idx,
