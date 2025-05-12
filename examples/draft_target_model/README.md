@@ -88,7 +88,6 @@ python3 examples/run.py \
     --max_output_len=256 \
     --kv_cache_enable_block_reuse \
     --kv_cache_free_gpu_memory_fraction=0.5 \
-    --output_generation_logits \
     --input_text="How does Draft-Sampling work?"
 ```
 

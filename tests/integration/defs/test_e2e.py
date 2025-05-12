@@ -30,9 +30,9 @@ from defs.trt_test_alternative import (check_call, check_call_negative_test,
 
 from .common import (PluginOptions, convert_weights, prune_checkpoint,
                      quantize_data, refit_model, venv_check_call)
-from .conftest import (llm_models_root, skip_nvlink_inactive, skip_pre_ada,
-                       skip_pre_blackwell, skip_pre_hopper, tests_path,
-                       unittest_path)
+from .conftest import (llm_models_root, skip_nvlink_inactive,
+                       skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
+                       skip_pre_hopper, tests_path, unittest_path)
 
 sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
 
@@ -1121,6 +1121,15 @@ def test_openai_chat_multimodal_example(llm_root, llm_venv):
          str(test_root / "_test_openai_chat_multimodal.py")])
 
 
+def test_openai_chat_structural_tag_example(llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_chat_structural_tag.py")
+    ])
+
+
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(40000)
 def test_openai_multi_chat_example(llm_root, llm_venv):
@@ -1310,6 +1319,7 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
     ])
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(110000)
 @pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("model_name,model_path", [

@@ -295,8 +295,9 @@ class LLM:
         inputs = prompt_inputs(inputs)
 
         if not inputs.get("prompt") and inputs.get(
-                "prompt_token_ids") and not isinstance(self.input_processor,
-                                                       DefaultInputProcessor):
+                "prompt_token_ids") and inputs.get(
+                    "multi_modal_data") and not isinstance(
+                        self.input_processor, DefaultInputProcessor):
             # VLMs need to process/tokenize the prompt in their own way
             prompt = self.tokenizer.decode(inputs['prompt_token_ids'])
             inputs = TextPrompt(

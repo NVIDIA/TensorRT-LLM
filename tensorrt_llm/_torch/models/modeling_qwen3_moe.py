@@ -5,17 +5,14 @@ from torch import nn
 from tqdm import tqdm
 from transformers import Qwen3MoeConfig
 
-from tensorrt_llm.functional import PositionEmbeddingType
-
 from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import FusedMoE, RenormalizeMoeRoutingMethod
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
+from .modeling_qwen3 import Qwen3Attention
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              duplicate_kv_weight, register_auto_model)
 
@@ -73,54 +70,12 @@ class Qwen3MoE(nn.Module):
                 hidden_states,
                 (0, 0, 0, max_num_token - hidden_states.shape[0]))
         router_logits = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states, router_logits,
-                                           all_rank_num_tokens)
+        final_hidden_states = self.experts(
+            hidden_states,
+            router_logits,
+            all_rank_num_tokens=all_rank_num_tokens)
 
         return final_hidden_states.view(orig_shape)
-
-
-class Qwen3MoEAttention(Attention):
-
-    def __init__(
-        self,
-        model_config: ModelConfig[Qwen3MoeConfig],
-        layer_idx: Optional[int] = None,
-    ):
-        config = model_config.pretrained_config
-        if getattr(config, "rope_scaling", None) is not None:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.from_string(
-                    config.rope_scaling["type"]),
-                rope=RopeParams.from_config(config),
-            )
-        else:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gpt_neox,
-                rope=RopeParams.from_config(config),
-            )
-        super().__init__(
-            hidden_size=config.hidden_size,
-            num_attention_heads=config.num_attention_heads,
-            num_key_value_heads=config.num_key_value_heads,
-            max_position_embeddings=config.max_position_embeddings,
-            bias=config.attention_bias,
-            pos_embd_params=pos_embd_params,
-            layer_idx=layer_idx,
-            dtype=config.torch_dtype,
-            dense_bias=config.attention_bias,
-            config=model_config,
-        )
-
-        self.q_norm = RMSNorm(hidden_size=self.head_dim,
-                              eps=1e-6,
-                              dtype=config.torch_dtype,
-                              has_weights=True)
-        self.k_norm = RMSNorm(hidden_size=self.head_dim,
-                              eps=1e-6,
-                              dtype=config.torch_dtype,
-                              has_weights=True)
-        self.aux_stream = torch.cuda.Stream()
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
 
 class Qwen3MoEDecoderLayer(DecoderLayer):
@@ -129,7 +84,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
                  layer_idx: int, aux_stream: torch.cuda.Stream):
         super().__init__()
         config = model_config.pretrained_config
-        self.self_attn = Qwen3MoEAttention(
+        self.self_attn = Qwen3Attention(
             model_config,
             layer_idx=layer_idx,
         )
@@ -183,14 +138,23 @@ class Qwen3MoEModel(DecoderModel):
         self.padding_idx = config.pretrained_config.pad_token_id
         self.aux_stream = torch.cuda.Stream()
 
-        self.embed_tokens = Embedding(
-            config.pretrained_config.vocab_size,
-            config.pretrained_config.hidden_size,
-            dtype=config.pretrained_config.torch_dtype,
-            mapping=config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            gather_output=True,
-        )
+        if model_config.mapping.enable_attention_dp:
+            # When attention_dp is enabled, we cannot do all_reduce since
+            # the problem size of different ranks are different.
+            # So, we don't do parallelism here.
+            self.embed_tokens = nn.Embedding(
+                config.pretrained_config.vocab_size,
+                config.pretrained_config.hidden_size,
+                dtype=config.pretrained_config.torch_dtype)
+        else:
+            self.embed_tokens = Embedding(
+                config.pretrained_config.vocab_size,
+                config.pretrained_config.hidden_size,
+                dtype=config.pretrained_config.torch_dtype,
+                mapping=config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=True,
+            )
         self.layers = nn.ModuleList([
             Qwen3MoEDecoderLayer(
                 model_config,
@@ -250,6 +214,8 @@ class Qwen3MoeForCausalLM(DecoderModelForCausalLM[Qwen3MoEModel,
 
     def load_weights(self, weights: Dict):
         tp_size = self.model_config.mapping.tp_size
+        enable_attention_dp = self.model_config.mapping.enable_attention_dp
+
         head_dim = getattr(
             self.config, "head_dim",
             self.config.hidden_size // self.config.num_attention_heads)
@@ -288,7 +254,8 @@ class Qwen3MoeForCausalLM(DecoderModelForCausalLM[Qwen3MoEModel,
                                 k: (duplicate_kv_weight(
                                     weight=v[:],
                                     head_dim=head_dim,
-                                    tensor_parallel_size=tp_size)
+                                    tensor_parallel_size=tp_size
+                                    if not enable_attention_dp else 1)
                                     if k in tensors_need_duplication else v)
                                 for k, v in fw.items()
                             }

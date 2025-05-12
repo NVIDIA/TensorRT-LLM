@@ -1,5 +1,6 @@
 import math
 import os
+import threading
 from enum import Enum
 from typing import Dict, List, NamedTuple, Optional, Union
 
@@ -903,14 +904,13 @@ class FusedMoE(nn.Module):
             if self.use_dp and self.enable_alltoall:
                 all_rank_chunk_size_list = []
                 for single_rank_num_tokens in all_rank_num_tokens:
-                    single_rank_num_chunks = (single_rank_num_tokens +
-                                              max_chunk_size -
-                                              1) // max_chunk_size
-                    assert single_rank_num_chunks == num_chunks,\
-                        "num_chunks should be the same for attention dp and ep"
-                    all_rank_chunk_size_list.append(
-                        split_chunk(single_rank_num_tokens,
-                                    single_rank_num_chunks))
+                    single_rank_num_chunks = num_chunks
+                    single_rank_chunk_size_list = split_chunk(
+                        single_rank_num_tokens, single_rank_num_chunks)
+                    single_rank_chunk_size_list = [
+                        1 if x == 0 else x for x in single_rank_chunk_size_list
+                    ]
+                    all_rank_chunk_size_list.append(single_rank_chunk_size_list)
 
                 for chunk_id in range(num_chunks):
                     chunk_all_rank_num_tokens = [
@@ -1168,6 +1168,12 @@ class FusedMoE(nn.Module):
                                                    epilogue_tile_m)
             dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype))
 
+        # Use multi-threading to load expert weights in parallel.
+        # Even though CPython has global interpreter lock (GIL),
+        # it's still faster to load weights in parallel because it can utilize
+        # CPU memory bandwidth better.
+        threads = []
+
         for expert_id in range(self.expert_start, self.expert_end):
             expert_idx = expert_id - self.expert_start
 
@@ -1188,11 +1194,23 @@ class FusedMoE(nn.Module):
 
             is_trtllm_nvfp4 = self.is_trtllm(
             ) and self.quant_config.quant_mode.has_nvfp4()
-            load_expert_w3_w1_weight(w1_weight, w3_weight,
-                                     self.w3_w1_weight.data[expert_idx],
-                                     is_trtllm_nvfp4)
-            load_expert_w2_weight(w2_weight, self.w2_weight.data[expert_idx],
-                                  is_trtllm_nvfp4)
+
+            thread = threading.Thread(target=load_expert_w3_w1_weight,
+                                      args=(w1_weight, w3_weight,
+                                            self.w3_w1_weight.data[expert_idx],
+                                            is_trtllm_nvfp4))
+            thread.start()
+            threads.append(thread)
+
+            thread = threading.Thread(target=load_expert_w2_weight,
+                                      args=(w2_weight,
+                                            self.w2_weight.data[expert_idx],
+                                            is_trtllm_nvfp4))
+            thread.start()
+            threads.append(thread)
+
+        for thread in threads:
+            thread.join()
 
         if self.quant_config and self.quant_config.quant_mode.has_any_quant(
                 exclude_kv_cache=True):

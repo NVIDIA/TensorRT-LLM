@@ -70,10 +70,6 @@ struct KernelParams
     int64_t const* ptrCustomMaskOffsets;
     // The debug output matrix O
     float* ptrDebugO;
-    // The debug output of softmax max matrix
-    float* ptrDebugSoftmaxMax;
-    // The debug output of output softmax sum matrix
-    float* ptrDebugSoftmaxSum;
     // The first sparseMask offsets in the Kv sequence dimension.
     int32_t const* ptrFirstSparseMaskOffsetsKv;
     // The counter for the multiCtasKv mode.
@@ -85,8 +81,8 @@ struct KernelParams
     int32_t const* ptrPageIdxKv;
     // The partial matrix O for each CtaKv when the multiCtasKv mode is enabled.
     void* ptrPartialO;
-    // The partial softmax max, and softmax sum for each CtaKv when the multiCtasKv mode is enabled.
-    float *ptrPartialMax, *ptrPartialSum;
+    // The partial softmax stats (max/sum)for each CtaKv when the multiCtasKv mode is enabled.
+    float2* ptrPartialStats;
     // The scaling factors for K.
     float const* ptrSageAttnSfsK;
     // The scaling factors for P.
@@ -105,6 +101,8 @@ struct KernelParams
     // The sequence lengths for K/V. Required by pagedKv kernels to avoid unnecessary computation
     // based on (ptrCumSeqLensKv[batchIdx + 1] - ptrCumSeqLensKv[batchIdx]).
     int32_t const* ptrSeqLensKv;
+    // The softmax stats buffer.
+    float2* ptrSoftmaxStats;
 
     // The attention window size for sliding window attention.
     int32_t mAttentionWindowSize;
@@ -729,15 +727,18 @@ struct KernelParams
         // The partial buffers' pointers when the multiCtasKv mode is enabled.
         int64_t partialStatsBufferSize = options.mMultiProcessorCount * kernelMeta.mStepQ;
         params.ptrMultiCtasKvCounter = options.multiCtasKvCounterPtr;
-        params.ptrPartialMax = reinterpret_cast<float*>(options.multiCtasKvScratchPtr);
-        params.ptrPartialSum = params.ptrPartialMax + partialStatsBufferSize;
-        params.ptrPartialO = params.ptrPartialSum + partialStatsBufferSize;
+        params.ptrPartialStats = reinterpret_cast<float2*>(options.multiCtasKvScratchPtr);
+        params.ptrPartialO = params.ptrPartialStats + partialStatsBufferSize;
 
         params.ptrPageIdxKv = options.kvPageIdxPtr;
         params.ptrScaleSoftmaxLog2 = options.scaleSoftmaxLog2Ptr;
 
         params.ptrScaleSfKv = options.kvSfScalePtr;
         params.ptrScaleSfO = options.oSfScalePtr;
+
+        // The softmax stats buffer with shape of [numTokensQ x numHeadsQ].
+        // The max/sum values are packed into float2.
+        params.ptrSoftmaxStats = options.softmaxStatsPtr;
 
         params.mAttentionWindowSize = options.mAttentionWindowSize;
         params.mMaxSeqLenQ = options.mMaxSeqLenQ;
