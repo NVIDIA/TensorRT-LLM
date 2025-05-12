@@ -11,7 +11,13 @@ from tensorrt_llm.scaffolding import (MajorityVoteController,
 def create_scaffolding_llm_with_native_generation_controller(
         deepseek_distill_7b_path):
     trtllm_worker = create_trtllm_worker(deepseek_distill_7b_path)
-    prototype_generation_controller = NativeGenerationController()
+    prototype_generation_controller = NativeGenerationController(
+        sampling_params={
+            "max_tokens": 8,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "top_k": 50
+        })
     return ScaffoldingLlm(
         prototype_generation_controller,
         {NativeGenerationController.WorkerTag.GENERATION: trtllm_worker},
