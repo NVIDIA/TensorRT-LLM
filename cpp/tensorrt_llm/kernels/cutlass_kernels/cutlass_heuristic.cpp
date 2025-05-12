@@ -356,7 +356,7 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm90(CutlassGemmConfig::Can
     // add cuda kernel profiler to tactics for weight-only plugins
     if (config & CutlassGemmConfig::WEIGHT_ONLY)
     {
-        if (tiles.size() > 0 && (!config & CutlassGemmConfig::GROUPED_GEMM))
+        if (tiles.size() > 0 && !(config & CutlassGemmConfig::GROUPED_GEMM))
         {
             CutlassGemmConfig CudaKernelConfig(
                 tiles[0], MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1);
