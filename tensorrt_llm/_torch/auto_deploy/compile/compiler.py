@@ -1,9 +1,6 @@
-"""Transformation to apply torch.compile and other optimizations as a final step.
+"""Transformation to apply torch.compile, CUDAGraph, and other torch.compile-like optimizations.
 
-This module handles the final optimization phase where torch.compile and other optimizations
-are applied after all graph transformations have been completed. This is particularly useful
-for in-framework deployment of inference models where we want to apply torch.compile as the
-last optimization step.
+This is useful as final optimization step for in-framework deployment of our inference models.
 """
 
 import time
