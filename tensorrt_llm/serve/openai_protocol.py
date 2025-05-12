@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import Annotated, Required, TypedDict
 
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import SamplingParams
+from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
 
 
 class OpenAIBaseModel(BaseModel):
@@ -44,9 +44,17 @@ class ModelList(OpenAIBaseModel):
     data: List[ModelCard] = Field(default_factory=list)
 
 
+class StructuralTag(OpenAIBaseModel):
+    begin: str
+    schema_: Optional[dict[str, Any]] = Field(alias="schema")
+    end: str
+
+
 class ResponseFormat(OpenAIBaseModel):
-    # type must be "json_object" or "text"
-    type: Literal["text", "json_object"]
+    # type must be "json_object" or "text" or "structural_tag"
+    type: Literal["text", "json_object", "structural_tag"]
+    structures: Optional[List[StructuralTag]] = None
+    triggers: Optional[List[str]] = None
 
 
 class DisaggregatedParams(OpenAIBaseModel):
@@ -121,6 +129,23 @@ class CompletionStreamResponse(OpenAIBaseModel):
     usage: Optional[UsageInfo] = Field(default=None)
 
 
+def _response_format_to_guided_decoding_params(
+    response_format: Optional[ResponseFormat]
+) -> Optional[GuidedDecodingParams]:
+    if response_format is None:
+        return None
+    elif response_format.type == "text":
+        return None
+    elif response_format.type == "json_object":
+        return GuidedDecodingParams(json_object=True)
+    elif response_format.type == "structural_tag":
+        return GuidedDecodingParams(
+            structural_tag=response_format.model_dump_json(by_alias=True,
+                                                           exclude_none=True))
+    else:
+        raise ValueError(f"Unsupported response format: {response_format.type}")
+
+
 class CompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
@@ -170,10 +195,10 @@ class CompletionRequest(OpenAIBaseModel):
     )
     response_format: Optional[ResponseFormat] = Field(
         default=None,
-        description=(
-            "Similar to chat completion, this parameter specifies the format of "
-            "output. Only {'type': 'json_object'} or {'type': 'text' } is "
-            "supported."),
+        description=
+        ("Similar to chat completion, this parameter specifies the format of "
+         "output. {'type': 'json_object'}, {'type': 'text' }, {'type': 'structural_tag'} are "
+         "supported."),
     )
 
     disaggregated_params: Optional[DisaggregatedParams] = Field(
@@ -211,6 +236,8 @@ class CompletionRequest(OpenAIBaseModel):
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             return_context_logits=self.return_context_logits,
+            guided_decoding=_response_format_to_guided_decoding_params(
+                self.response_format),
 
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
@@ -253,13 +280,6 @@ class CompletionRequest(OpenAIBaseModel):
         n = data.get("n")
         if best_of and n and best_of < n:
             raise ValueError("best_of should not be smaller than n")
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def check_response_format(cls, data):
-        if data.get("response_format"):
-            raise ValueError("response_format is not supported")
         return data
 
     @model_validator(mode="before")
@@ -520,6 +540,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             skip_special_tokens=self.skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
+            guided_decoding=_response_format_to_guided_decoding_params(
+                self.response_format),
 
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
@@ -580,13 +602,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
     def verify_logit_processor(cls, data):
         if data.get("logit_bias"):
             raise ValueError("logit bias is not supported")
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def check_response_format(cls, data):
-        if data.get("response_format"):
-            raise ValueError("response_format is not supported")
         return data
 
     @model_validator(mode="before")
