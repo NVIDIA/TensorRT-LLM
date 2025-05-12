@@ -12,6 +12,9 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization.functional import \
+    preprocess_weights_for_mixed_gemm
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ...models.modeling_utils import QuantConfig
 from ..utils import Fp4QuantizedTensor
@@ -98,6 +101,15 @@ def load_weight_scales_fp8_qdq(weights: List[Dict]):
         if "weight_scale" in w:
             weight_scale.append(w["weight_scale"][...].reshape([]))
     return input_scale, weight_scale
+
+
+def load_weight_scales_w4a16(weights):
+    q_weight_scale = weights[0]['weight_scale']
+    k_weight_scale = weights[1]['weight_scale']
+    v_weight_scale = weights[2]['weight_scale']
+    weight_scales = [q_weight_scale, k_weight_scale, v_weight_scale]
+
+    return weight_scales
 
 
 def load_weight_scales_nvfp4(weights: List[Dict],
@@ -212,6 +224,7 @@ class Linear(nn.Module):
         self.has_fp8_qdq = False
         self.has_fp8_block_scales = False
         self.has_nvfp4 = False
+        self.has_w4a16_awq = False
 
         if self.quant_config and self.quant_config.layer_quant_mode.has_any_quant(
                 exclude_kv_cache=True):
@@ -282,6 +295,29 @@ class Linear(nn.Module):
                 # (amax_input*amax_weight) / (448*6*448*6)
                 self.alpha = Parameter(torch.empty([1], dtype=torch.float32),
                                        requires_grad=False)
+            elif qc.layer_quant_mode.is_int4_weight_only_per_group(
+            ) and qc.quant_algo == QuantAlgo.W4A16_AWQ:
+                self.has_w4a16_awq = True
+
+                self.weight = Parameter(torch.empty(
+                    (self.in_features, self.out_features // 2),
+                    dtype=torch.int8,
+                ),
+                                        requires_grad=False)
+
+                group_size = qc.group_size
+                if self.in_features % group_size != 0:
+                    raise ValueError(
+                        f"in_features ({self.in_features}) must be divisible by group_size ({group_size}) "
+                        f"for INT4 per-group quantization scale dimensions.")
+
+                self.weight_scale = Parameter(torch.empty(
+                    (self.out_features, self.in_features // group_size),
+                    dtype=torch.float16),
+                                              requires_grad=False)
+                # NOTE: Not in all linear we have this tensor - pre_quant_scale is computed as an average and merged with the
+                # LayerNorm for QKV and Gate/Up projection layers when possible. we can see the tensor only for o_proj and down_proj
+                self.pre_quant_scale = None
             else:
                 # TODO(zhenhuanc): support other quant mode
                 raise ValueError(f'unsupported quant mode: {qc.quant_mode}')
@@ -356,6 +392,23 @@ class Linear(nn.Module):
                                                      self.dtype)
                 if bias is not None:
                     output = output + bias
+            elif self.has_w4a16_awq:
+                if self.pre_quant_scale is not None:
+                    pre_quant_scale = self.pre_quant_scale.repeat(
+                        input.shape[0], 1)
+                    input = torch.mul(input, pre_quant_scale)
+
+                bias = bias.contiguous() if bias is not None else None
+
+                output = torch.ops.trtllm.w4a16_gemm(
+                    input.contiguous(),
+                    self.weight,
+                    self.weight_scale.T.contiguous(
+                    ),  # TODO: needs to cast to fp16/bf16 in order to make the kernel run
+                    qc.group_size,
+                    qc.has_zero_point,
+                    bias,
+                    zeros=None)
             else:
                 # TODO(zhenhuanc): support other quant mode
                 raise ValueError(f'unsupported quant mode: {qc.quant_mode}')
@@ -448,6 +501,15 @@ class Linear(nn.Module):
 
             weight = load_weight_shard(weights[0]['weight'], self.tp_size,
                                        self.tp_rank, self.tp_mode, device)
+
+            if quant_mode and quant_mode.is_int4_weight_only_per_group(
+            ) and self.quant_config.quant_algo == QuantAlgo.W4A16_AWQ:
+                # NOTE: without the preprocess during the runtime, the gemm output nan's. in order to use the preprocess_weights_for_mixed_gemm
+                # we need to cast the weight to int8 first.
+                weight = preprocess_weights_for_mixed_gemm(
+                    weight.T.to(torch.int8).contiguous().cpu(), torch.quint4x2,
+                    torch.float16).cuda().contiguous()
+
             _copy(self.weight, weight)
 
             if self.bias is not None:
@@ -497,6 +559,22 @@ class Linear(nn.Module):
                     if "input_scale" in weights[0]:
                         _copy(self.input_scale, weights[0]["input_scale"])
                         self.inv_input_scale.data = 1.0 / self.input_scale
+
+                elif quant_mode.is_int4_weight_only_per_group(
+                ) and self.quant_config.quant_algo == QuantAlgo.W4A16_AWQ:
+                    pre_quant_scale = load_weight_shard(
+                        weights[0]['pre_quant_scale'], self.tp_size,
+                        self.tp_rank, self.tp_mode, device)
+                    self.pre_quant_scale = Parameter(
+                        torch.ones((self.in_features, ), dtype=torch.float16),
+                        requires_grad=False).to(device=device)
+
+                    weight_scale = load_weight_shard(weights[0]['weight_scale'],
+                                                     self.tp_size, self.tp_rank,
+                                                     self.tp_mode,
+                                                     device).to(torch.float16)
+                    _copy(self.pre_quant_scale, pre_quant_scale)
+                    _copy(self.weight_scale, weight_scale)
 
         elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
             assert len(weights) == 3
@@ -551,12 +629,25 @@ class Linear(nn.Module):
                     fused_fp8_block_scale = torch.cat(
                         (q_scale, k_scale, v_scale))
                     _copy(self.weight_scale, fused_fp8_block_scale)
+                elif quant_mode.is_int4_weight_only_per_group(
+                ) and self.quant_config.quant_algo == QuantAlgo.W4A16_AWQ:
+                    weight_scales = load_weight_scales_w4a16(weights)
+
+                    # Create concatenated weight scale tensor
+                    cat_weight_scale = torch.cat(weight_scales,
+                                                 dim=0).to(torch.float16)
+                    _copy(self.weight_scale, cat_weight_scale)
 
             fused_weight = torch.cat((q_weight, k_weight, v_weight))
 
             if quant_mode and quant_mode.has_fp8_qdq():
                 fused_weight = (fused_weight / self.weight_scale).to(
                     torch.float8_e4m3fn)
+
+            if quant_mode and quant_mode.is_int4_weight_only_per_group():
+                fused_weight = preprocess_weights_for_mixed_gemm(
+                    fused_weight.to(torch.int8).T.contiguous().cpu(),
+                    torch.quint4x2, torch.float16).cuda().contiguous()
 
             _copy(self.weight, fused_weight)
 
@@ -613,12 +704,31 @@ class Linear(nn.Module):
                                                     self.tp_mode, device)
                     fused_scale = torch.cat([left_scale, right_scale], dim=0)
                     _copy(self.weight_scale, fused_scale)
+                elif quant_mode.is_int4_weight_only_per_group(
+                ) and self.quant_config.quant_algo == QuantAlgo.W4A16_AWQ:
+                    left_scale = load_weight_shard(weights[0]['weight_scale'],
+                                                   self.tp_size, self.tp_rank,
+                                                   self.tp_mode,
+                                                   device).contiguous()
+                    right_scale = load_weight_shard(weights[0]['weight_scale'],
+                                                    self.tp_size, self.tp_rank,
+                                                    self.tp_mode,
+                                                    device).contiguous()
+                    fused_scale = torch.cat([left_scale, right_scale],
+                                            dim=0).to(torch.float16)
+                    _copy(self.weight_scale, fused_scale)
 
             fused_weight = torch.cat((gate_weight, up_weight))
 
             if quant_mode and quant_mode.has_fp8_qdq():
                 fused_weight = (fused_weight / self.weight_scale).to(
                     torch.float8_e4m3fn)
+
+            if quant_mode and quant_mode.is_int4_weight_only_per_group(
+            ) and self.quant_config.quant_algo == QuantAlgo.W4A16_AWQ:
+                fused_weight = preprocess_weights_for_mixed_gemm(
+                    fused_weight.to(torch.int8).T.contiguous().cpu(),
+                    torch.quint4x2, torch.float16).cuda().contiguous()
 
             _copy(self.weight, fused_weight)
 
