@@ -693,7 +693,7 @@ inline void printMatrix(char const* name, T const* ptr, int const nRow, int cons
     // `nCol` (<= nStride) is length for print per row
     if (ptr == nullptr)
     {
-        TLLM_LOG_WARNING("%s is nullptr, skip!\n", name);
+        TLLM_LOG_DEBUG("%s is nullptr, skip!\n", name);
         return;
     }
     cudaDeviceSynchronize();
@@ -702,7 +702,7 @@ inline void printMatrix(char const* name, T const* ptr, int const nRow, int cons
     bool const isDevicePtr = (getPtrCudaMemoryType(ptr) == cudaMemoryTypeDevice);
     nStride = (nStride == 0) ? nCol : nStride;
     size_t sizeInByte = sizeof(T) * nRow * nStride;
-    TLLM_LOG_TRACE("name=%s, addr=%p, location=%s, sizeof(T)=%lu, nRow=%d, nStride=%d, sizeInByte=%lu", name, ptr,
+    TLLM_LOG_DEBUG("name=%s, addr=%p, location=%s, sizeof(T)=%lu, nRow=%d, nStride=%d, sizeInByte=%lu", name, ptr,
         (isDevicePtr ? "Device" : "Host"), sizeof(T), nRow, nStride, sizeInByte);
     if (isDevicePtr)
     {

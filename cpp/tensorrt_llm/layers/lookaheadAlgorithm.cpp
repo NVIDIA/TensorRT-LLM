@@ -100,6 +100,9 @@ void LookaheadAlgorithm::accept(TensorConstPtr const& generatedTokens)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
+    PRINT_TOKEN(generatedTokens);
+    PRINT_TOKEN(mGoldenTokens);
+
     TLLM_CHECK(ITensor::volume(generatedTokens->getShape()) <= mN);
     BufferRange<TokenIdType const> generatedRange(*generatedTokens);
     BufferRange<TokenIdType> goldRange(*mGoldenTokens);
@@ -268,6 +271,7 @@ void LookaheadAlgorithm::posIdsToMask(TensorPtr const& mask, TensorConstPtr cons
 
 struct TreeValue;
 using TreeMap = std::unordered_map<TokenIdType, TreeValue>;
+using TreeNode = TreeMap::value_type; // std::pair<TokenIdType, TreeValue>;
 
 struct TreeValue
 {
@@ -281,15 +285,66 @@ struct TreeValue
     std::list<SizeType32> sources;
 };
 
-using TreeNode = TreeMap::value_type;
+void printTreeValue(TreeValue const& value, int const depth = 0)
+{
+    auto const space = std::string(depth * 2, ' ');
+    printf("%svalue(%p): nexts(%p)=[", space.c_str(), &value, value.nexts.get());
+    for (auto const& node : *value.nexts)
+    {
+        printf("%d, ", node.first);
+    }
+    printf("], sources=[");
+    for (auto const& source : value.sources)
+    {
+        printf("%d, ", source);
+    }
+    printf("]\n");
+}
+
+void printTreeNode(TreeNode const& node, int const depth = 0)
+{
+    auto const space = std::string(depth * 2, ' ');
+    printf("%snode(%p): id=%d, value=%p\n", space.c_str(), &node, node.first, &node.second);
+    printTreeValue(node.second, depth); // Only one value for one node
+    printf("\n");
+}
+
+void printTreeMap(TreeMap const& map, int const depth = 0)
+{
+    if (depth == 0)
+    {
+        printf("==== Tree start ====\n");
+    }
+    if (map.size() > 0)
+    {
+
+        auto const space = std::string(depth * 2, ' ');
+        printf("%smap(%p): ids=[", space.c_str(), &map);
+        for (auto const& node : map)
+        {
+            printf("%d, ", node.first);
+        }
+        printf("]\n");
+        for (auto const& node : map)
+        {
+            printTreeNode(node, depth + 1);
+            printTreeMap(*(node.second.nexts), depth + 1);
+        }
+    }
+    if (depth == 0)
+    {
+        printf("==== Tree stop ====\n");
+    }
+}
 
 template <typename BF, typename AF>
-void treeDFS(TreeNode& node, BF const& visitBefore, AF const& visitAfter)
+void treeDFS(TreeNode& node, BF const& visitBefore, AF const& visitAfter, int const depth = 0)
 {
+    printTreeNode(node, depth);
     visitBefore(node);
     for (auto& next : *(node.second.nexts))
     {
-        treeDFS(next, visitBefore, visitAfter);
+        treeDFS(next, visitBefore, visitAfter, depth + 1);
     }
     visitAfter(node);
 }
@@ -314,60 +369,99 @@ SizeType32 LookaheadAlgorithm::treeEncode(
     PRINT_TOKEN(encodeMap);
 
     auto branches = std::make_shared<TreeMap>();
-
+    int depth = 0;
+    // printTreeMap(*branches, 0);
     for (auto i = 0; i < len; i++)
     {
         auto nexts = branches;
+        depth = 0;
         for (auto j = 0; j <= i; j++)
         {
             if (maskLocation.at(i, j))
             {
+                printf("[%2d,%2d] head, nexts=%p\n", i, j, nexts.get());
                 auto tok = tokensRange[j];
                 auto found = nexts->find(tok);
+                printf("> tok=%d,found=%d\n", tok, (found != nexts->end()));
                 if (found != nexts->end())
                 {
+                    printf("  id=%d, value=%p\n", found->first, &found->second);
                     found->second.sources.push_back(j);
                     nexts = found->second.nexts;
+                    depth += 1;
                 }
                 else
                 {
+                    printf("  insert %d to list of %p\n", tok, nexts.get());
                     auto [inserted, ok] = nexts->insert({tok, TreeValue()});
                     inserted->second.sources.push_back(j);
                     nexts = inserted->second.nexts;
+                    depth += 1;
                 }
+                printf("[%2d,%2d]tail: nexts=%p\n", i, j, nexts.get());
+                // printTreeMap(*branches, 0);
             }
         }
     }
+
+    TLLM_LOG_TRACE("Before DFS  -- after building tree");
+    printTreeMap(*branches, 0);
 
     for (auto& item : maskLocation)
     {
         item = 0;
     }
     std::vector<std::pair<SizeType32, TokenIdType>> stack;
-    SizeType32 offset = 0;
     SizeType32 posId = posIdsRange.size() ? posIdsRange[0] : 0;
+    SizeType32 offset = 0;
 
     auto visitBefore
         = [&stack, &maskLocation, &tokensRange, &posIdsRange, &posId, &offset, &mapRange](TreeNode const& node)
     {
+        printf("(visitBefore)\n");
+        printf("stack=");
+        for (auto const& pair : stack)
+        {
+            printf("[%d,%d],", pair.first, pair.second);
+        }
+        printf("\n");
+        printf("newPair=[%d,%d]\n", offset, node.first);
+
         stack.push_back(std::make_pair(offset, node.first));
         for (auto const& source : node.second.sources)
         {
+            printf("source=%d, offset=%d\n", source, offset);
             mapRange[source] = offset;
         }
         for (auto const& prev : stack)
         {
+            printf("offset=%d, prev.first=%d\n", offset, prev.first);
+            printf("~~~~~~~~~~~~~~~~ mask[%d,%d]=1\n", offset, prev.first);
             maskLocation.at(offset, prev.first) = true;
         }
+        printf("offset=%d\n", offset);
+        printf("node.first=%d\n", node.first);
+        printf("posId=%d\n", posId);
         tokensRange[offset] = node.first;
         posIdsRange[offset] = posId;
-        offset++;
+        offset++; // Always increases during DFS
         posId++;
+        printf("offset=%d\n", offset);
+        printf("posId=%d\n", posId);
     };
     auto visitAfter = [&stack, &posId](TreeNode const& node)
     {
+        printf("(visitAfter)\n");
+        printf("stack=");
+        for (auto const& pair : stack)
+        {
+            printf("[%d,%d],", pair.first, pair.second);
+        }
+        printf("\n");
+        printf("posId=%d\n", posId);
         stack.pop_back();
         posId--;
+        printf("posId=%d\n", posId);
     };
 
     for (auto& next : *branches)
@@ -483,11 +577,22 @@ void LookaheadAlgorithm::verify(TensorPtr const& accepted, TensorPtr const& acce
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     TLLM_CHECK(ITensor::volume(goldenTokens->getShape()) == ITensor::volume(mDraftTokens->getShape()));
+    BufferRange<TokenIdType> acceptedRange(*accepted);
+    BufferRange<SizeType32> acceptedOffsetsRange(*acceptedOffsets);
     BufferRange<TokenIdType const> goldRange(*goldenTokens);
     BufferRange<TokenIdType> draftRange(*mDraftTokens);
     BufferLocation<bool const> maskLocation(*mAttentionMask);
     auto draftSize = ITensor::volume(mDraftTokens->getShape());
     auto end = *BufferRange<TokenIdType const>(*endToken).begin();
+
+    TLLM_LOG_TRACE("newLastToken=%d", newLastToken);
+    PRINT_TOKEN(accepted);
+    PRINT_TOKEN(acceptedOffsets);
+    PRINT_TOKEN(acceptedLength);
+    PRINT_TOKEN(goldenTokens);
+    PRINT_TOKEN(endToken);
+    PRINT_TOKEN(mDraftTokens);
+    PRINT_TOKEN(mAttentionMask);
 
     SizeType32 maxHit = 0, hitIdx = 0;
     for (SizeType32 i = 0; i < draftSize; i++)
@@ -519,8 +624,6 @@ void LookaheadAlgorithm::verify(TensorPtr const& accepted, TensorPtr const& acce
     maxHit = maxHit > mRuntimeMaxDraftPathLen ? mRuntimeMaxDraftPathLen : maxHit;
 
     SizeType32 acceptedIdx = 0;
-    BufferRange<TokenIdType> acceptedRange(*accepted);
-    BufferRange<SizeType32> acceptedOffsetsRange(*acceptedOffsets);
     acceptedRange[acceptedIdx] = newLastToken;
     for (SizeType32 j = 0; j < draftSize; j++)
     {
@@ -532,6 +635,10 @@ void LookaheadAlgorithm::verify(TensorPtr const& accepted, TensorPtr const& acce
     }
 
     *BufferRange<SizeType32>(*acceptedLength).begin() = maxHit + 1;
+
+    PRINT_TOKEN(accepted);
+    PRINT_TOKEN(acceptedOffsets);
+    PRINT_TOKEN(acceptedLength);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -582,27 +689,30 @@ void LookaheadAlgorithm::update(TensorPtr const& acceptedTokens, TensorPtr const
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     TLLM_CHECK(ITensor::volume(acceptedTokens->getShape()) >= mN);
-    BufferRange<TokenIdType const> zippedTokensRange(*sampledTokens);
-    BufferRange<TokenIdType const> sampledRange(*mSampledTokensMax);
-
+    BufferRange<TokenIdType const> sampledRange(*sampledTokens);
+    BufferRange<TokenIdType> sampledMaxRange(*mSampledTokensMax);
     BufferRange<SizeType32 const> mapRange(*mEncodeMap);
-    BufferRange<TokenIdType> unzipRange(*mSampledTokensMax);
     mSampledTokens = ITensor::slice(mSampledTokensMax, 0, mEncodeMap->getShape().d[0] + 1);
 
-    unzipRange[0] = zippedTokensRange[0];
+    sampledMaxRange[0] = sampledRange[0];
     for (size_t i = 0; i < mapRange.size(); i++)
     {
-        unzipRange[i + 1] = zippedTokensRange[mapRange[i] + 1];
+        sampledMaxRange[i + 1] = sampledRange[mapRange[i] + 1];
     }
+    PRINT_TOKEN(mEncodeMap);
+    PRINT_TOKEN(mSampledTokensMax);
 
     BufferRange<TokenIdType> keyRange(*mKeyTokens);
     BufferRange<TokenIdType> pastRange(*mPastTokens);
 
-    auto newLastToken = sampledRange[0];
+    PRINT_TOKEN(mKeyTokens);
+    PRINT_TOKEN(mPastTokens);
+
+    auto newLastToken = sampledMaxRange[0];
     SizeType32 prefill = mN - 2 - mFilling;
     for (SizeType32 i = 0; i < mW; i++)
     {
-        keyRange[i] = sampledRange[prefill + i * mFilling + mFilling];
+        keyRange[i] = sampledMaxRange[prefill + i * mFilling + mFilling];
     }
 
     if (mFilling < mN - 1)
@@ -627,12 +737,19 @@ void LookaheadAlgorithm::update(TensorPtr const& acceptedTokens, TensorPtr const
         mPoolManager.update(mKeyTokens, mPastTokens);
     }
 
+    PRINT_TOKEN(mKeyTokens);
+    PRINT_TOKEN(mPastTokens);
+
     auto guessSize = ITensor::volume(mGuessTokens->getShape());
-    auto outputSize = ITensor::volume(mSampledTokens->getShape());
     auto lookSize = 1 + (mN > 1 ? mN - 2 : 0) - mFilling + mFilling * mW;
+    auto outputSize = ITensor::volume(mSampledTokens->getShape());
     TLLM_CHECK(guessSize + lookSize == outputSize);
+    TLLM_LOG_TRACE("guessSize=%d", guessSize);
+    TLLM_LOG_TRACE("lookSize=%d", lookSize);
+    TLLM_LOG_TRACE("outputSize=%d", outputSize);
 
     TensorConstPtr goldenTokens = ITensor::slice(mSampledTokens, lookSize, guessSize);
+    PRINT_TOKEN(goldenTokens);
 
     verify(acceptedTokens, acceptedOffsets, acceptedLength, newLastToken, ITensor::slice(sampledTokens, 1), endToken);
 

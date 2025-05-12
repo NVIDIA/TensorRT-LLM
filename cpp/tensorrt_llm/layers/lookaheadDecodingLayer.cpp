@@ -126,12 +126,11 @@ void LookaheadDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth
     for (auto bi = 0; bi < batchSize; bi++)
     {
         auto const gbi{batchSlotsRange[bi]};
-        auto const prompt{setupParams->prompt[bi]}; // `bi` or `gbi`?
-        PRINT_SHAPE(prompt);
+        auto const prompt{setupParams->prompt[bi]};                                       // `bi` or `gbi`
+        mCpuAlgo->mPrompts[bi]->reshape(prompt->getShape());                              // `bi` or `gbi`
+        mBufferManager->copy(*prompt, *mCpuAlgo->mPrompts[bi]);                           // `bi` or `gbi`
+        auto [w, n, g] = lookaheadConfigs[(lookaheadConfigs.size() == 1) ? 0 : bi].get(); // `bi` or `gbi`
         PRINT_TOKEN(prompt);
-        mCpuAlgo->mPrompts[bi]->reshape(prompt->getShape());                              // `bi` or `gbi`?
-        mBufferManager->copy(*prompt, *mCpuAlgo->mPrompts[bi]);                           // `bi` or `gbi`?
-        auto [w, n, g] = lookaheadConfigs[(lookaheadConfigs.size() == 1) ? 0 : bi].get(); // `bi` or `gbi`?
         SizeType32 runtimeTokensPerStep = 0;
         std::tie(runtimeTokensPerStep, std::ignore, std::ignore, std::ignore)
             = executor::LookaheadDecodingConfig(w, n, g).calculateSpeculativeResource();
@@ -181,8 +180,6 @@ void LookaheadDecodingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    print(__FUNCTION__, __LINE__);
-
     NVTX3_SCOPED_RANGE(LookaheadDecodingLayer_forwardAsync);
 
     auto inputs = std::dynamic_pointer_cast<LookaheadDecodingInputs>(inputParams);
@@ -243,8 +240,6 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
     std::shared_ptr<LookaheadDecodingOutputs> const& outputs, std::shared_ptr<LookaheadDecodingInputs> const& inputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    TLLM_LOG_TRACE("Before LookaheadDecodingLayer<T>::forwardSyncCPU");
     print(__FUNCTION__, __LINE__);
 
     PRINT_TOKEN(outputs->generationLengths); // wili, debug
@@ -258,7 +253,7 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
 
     PRINT_TOKEN(outputs->numNewTokensCumSum);
     PRINT_TOKEN(outputs->pathsOffsets);
-    PRINT_TOKEN(outputs->packedMasks);
+    // PRINT_TOKEN(outputs->packedMasks);
 
     PRINT_TOKEN(outputs->outputIds);
 
@@ -366,8 +361,6 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
             offsetRange[i] = posIdsLocation[i] - posIdsLocation[0];
         }
 
-        print(__FUNCTION__, __LINE__);
-
         TensorPtr accepted = ITensor::slice(mCpuAlgo->mOutputIds, {gbi, 0}, numNewTokensRange[gbi]);
         TensorPtr draft = ITensor::slice(mCpuAlgo->mNextDraftTokens, {gbi, 0}, nextDraftLengthsRange[gbi]);
         TLLM_LOG_DEBUG("mGlobalSteps=%d, batchSize=%d, gbi=%d, sampledTokens=%s, accepted=%s, draft=%s", mGlobalSteps,
@@ -413,6 +406,7 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
 
     mBufferManager->getStream().synchronize();
 
+    print(__FUNCTION__, __LINE__);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
