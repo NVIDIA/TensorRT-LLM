@@ -8,20 +8,14 @@ import subprocess as _sp
 MERGE_REQUEST_GROOVY = "L0_MergeRequest.groovy"
 IMAGE_MAPPING = {
     "LLM_DOCKER_IMAGE":
-    "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/devel:x86_64-devel-torch_skip",
+    "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/__stage__:x86_64-__stage__-torch_skip",
     "LLM_SBSA_DOCKER_IMAGE":
-    "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/devel:sbsa-devel-torch_skip",
+    "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/__stage__:sbsa-__stage__-torch_skip",
     "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE":
-    "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/devel:x86_64-rockylinux8-torch_skip-py310",
+    "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/__stage__:x86_64-rockylinux8-torch_skip-py310",
     "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE":
-    "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/devel:x86_64-rockylinux8-torch_skip-py312",
+    "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/__stage__:x86_64-rockylinux8-torch_skip-py312",
 }
-
-BUILD_GROOVY = "Build.groovy"
-
-SRC_PATTERN = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/devel:x86_64-devel-torch_skip"
-# [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
-DST_IMAGE = "LLM_DOCKER_IMAGE"
 
 
 def parse_arguments() -> _ap.Namespace:
@@ -48,6 +42,14 @@ def parse_arguments() -> _ap.Namespace:
         type=str,
         required=False,
         help="The timestamp to use for the destination image name.")
+    parser.add_argument(
+        "--stage",
+        type=str,
+        required=False,
+        default="tritondevel",
+        help=
+        "The new stage part of the destination image name (default: tritondevel)."
+    )
     return parser.parse_args()
 
 
@@ -114,6 +116,36 @@ def image_prefix(full_image_name: str) -> str:
     return full_image_name[:second_last_index]
 
 
+def replace_text_between_dashes(input_string: str, dash_idx: int,
+                                replacement: str) -> str:
+    """
+    Replace the text between the third and second '-' from the back in a string.
+
+    Args:
+        input_string (str): Original string.
+        dash_idx (int): Index of the dash to start replacing (from the back).
+        replacement (str): Replacement text.
+
+    Returns:
+        str: Updated string with the replacement applied.
+
+    Raises:
+        ValueError: If the input string does not have at least three dashes.
+    """
+    dash_indices = [i for i, char in enumerate(input_string) if char == '-']
+    if len(dash_indices) < dash_idx:
+        raise ValueError(f"Input string must have at least {dash_idx} dashes.")
+
+    # Find the indices of third and second last dashes
+    start_dash_idx = dash_indices[-dash_idx]
+    stop_dash_idx = dash_indices[-dash_idx + 1]
+
+    # Replace the segment between the dashes
+    updated_string = (input_string[:start_dash_idx + 1] + replacement +
+                      input_string[stop_dash_idx:])
+    return updated_string
+
+
 def find_and_replace_in_files(directory, file_extension: str,
                               search_string: str, replace_string: str,
                               dry_run: bool) -> None:
@@ -147,6 +179,7 @@ def rename_images(*,
                   src_branch: str,
                   src_build_id: int,
                   dst_mr: int,
+                  stage: str,
                   timestamp: str | None = None,
                   dry_run: bool = False) -> None:
     print(
@@ -164,10 +197,13 @@ def rename_images(*,
 
     for dst_key, src_pattern in IMAGE_MAPPING.items():
         print(f"Processing {dst_key} ...")
-        src_image = f"{src_pattern}-{src_branch_sanitized}-{src_build_id}"
+        src_image = f"{src_pattern}-{src_branch_sanitized}-{src_build_id}".replace(
+            "__stage__", stage)
         dst_image_old = extract_line_after_prefix(mr_groovy,
                                                   dst_key + " = ").strip('"')
-        dst_image = f"{image_prefix(dst_image_old)}-{timestamp}-{dst_mr}"
+        dst_image = replace_text_between_dashes(
+            f"{image_prefix(dst_image_old)}-{timestamp}-{dst_mr}", 3, stage)
+
         run_shell_command(f"docker pull {src_image}", dry_run)
         run_shell_command(f"docker tag {src_image} {dst_image}", dry_run)
         run_shell_command(f"docker push {dst_image}", dry_run)

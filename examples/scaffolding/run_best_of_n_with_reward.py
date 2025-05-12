@@ -43,7 +43,7 @@ def main():
     workers[NativeGenerationController.WorkerTag.GENERATION] = gen_worker
     workers[QwenRewardController.WorkerTag.REWARD] = reward_worker
 
-    gen_controller = NativeGenerationController(custom_sampling_params={
+    gen_controller = NativeGenerationController(sampling_params={
         "max_tokens": 4096,
         "temperature": 0.6,
     })
