@@ -295,8 +295,6 @@ class MTPSampler(TorchSampler):
         next_draft_tokens_device = model_outputs['next_draft_tokens']
         next_new_tokens_device = model_outputs['next_new_tokens']
 
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
         device = SampleStateTensorsMTP(
             new_tokens=next_new_tokens_device,
             new_tokens_lens=new_tokens_lens_device,
@@ -308,6 +306,8 @@ class MTPSampler(TorchSampler):
             next_draft_tokens=next_draft_tokens_device.to('cpu',
                                                           non_blocking=True),
         )
+        sampler_event = torch.cuda.Event()
+        sampler_event.record()
         # add dummy draft tokens to context requests to prepare kv cache in advance
         # with the max draft token length
         for request in scheduled_requests.context_requests:
