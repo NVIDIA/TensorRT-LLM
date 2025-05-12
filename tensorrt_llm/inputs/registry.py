@@ -139,9 +139,9 @@ def create_input_processor_with_hash(
     def input_processor_wrapper(inputs, sampling_params):
         assert 'multi_modal_data' in inputs, "multi_modal_data must be provided for hashing support."
         mm_data = inputs['multi_modal_data']
-        mm_hashes = apply_mm_hashes(mm_data, hash_lib)
         num_mm_tokens = find_mm_token_lengths(mm_data, input_processor)
         if len(num_mm_tokens) > 0:
+            mm_hashes = apply_mm_hashes(mm_data, hash_lib)
             prompt_token_ids, extra_processed_inputs = input_processor(
                 inputs, sampling_params)
             start_positions = find_mm_token_positions(
