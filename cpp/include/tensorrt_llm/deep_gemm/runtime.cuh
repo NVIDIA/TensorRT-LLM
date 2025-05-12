@@ -114,7 +114,8 @@ public:
                 char const* kernelName;
                 CHECK_CUDA(cuKernelGetName(&kernelName, kernel));
                 std::string kernelNameStr(kernelName);
-                if (kernelNameStr.find("fp8_gemm_kernel") != std::string::npos)
+                if (kernelNameStr.find("fp8_gemm_kernel") != std::string::npos
+                    || kernelNameStr.find("fp8_gemm_kernel_swapAB") != std::string::npos)
                 {
                     kernel_ = kernel;
                     break;
@@ -123,7 +124,7 @@ public:
 
             if (!kernel_)
             {
-                throw std::runtime_error("Failed to find fp8_gemm_kernel");
+                throw std::runtime_error("Failed to find fp8_gemm_kernel or fp8_gemm_kernel_swapAB");
             }
         }
 

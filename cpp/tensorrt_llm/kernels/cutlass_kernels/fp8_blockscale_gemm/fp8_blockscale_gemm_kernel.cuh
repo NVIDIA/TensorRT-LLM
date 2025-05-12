@@ -1693,16 +1693,34 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
     }
 
     constexpr uint32_t block_k = 128;
-    auto [best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size]
-        = deep_gemm::jit::get_best_gemm_config(expected_m, shape_n, shape_k, num_problems, num_device_sms);
+    uint32_t m_per_expert_threshold = num_device_sms == 78 ? 64 : 32; // 64 for H20(sms=78), 32 for H100/H200
+    if (expected_m >= m_per_expert_threshold)
+    {
+        auto [best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size]
+            = deep_gemm::jit::get_best_gemm_config(expected_m, shape_n, shape_k, num_problems, num_device_sms);
 
-    auto runtime = deep_gemm::jit::getGlobalCompiler().build(shape_n, shape_k, best_block_m, best_block_n, block_k,
-        num_problems, best_num_stages, best_num_tma_multicast, deep_gemm::GemmType::GroupedWithOffset);
-    auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
-    deep_gemm::runGemm(kernel, mat_a, 0, mat_b, 0, mat_d, 0, scales_a, scales_b, max_shape_m, shape_n, shape_k,
-        best_block_m, best_block_n, block_k, num_problems, best_num_tma_multicast,
-        deep_gemm::GemmType::GroupedWithOffset, const_cast<int64_t*>(problem_m_offsets), problem_m_padded_offsets,
-        stream, num_device_sms, static_cast<uint32_t>(best_smem_size), max_shape_m_padded);
+        auto runtime = deep_gemm::jit::getGlobalCompiler().build(shape_n, shape_k, best_block_m, best_block_n, block_k,
+            num_problems, best_num_stages, best_num_tma_multicast, deep_gemm::GemmType::GroupedWithOffset);
+        auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
+        deep_gemm::runGemm(kernel, mat_a, 0, mat_b, 0, mat_d, 0, scales_a, scales_b, max_shape_m, shape_n, shape_k,
+            best_block_m, best_block_n, block_k, num_problems, best_num_tma_multicast,
+            deep_gemm::GemmType::GroupedWithOffset, const_cast<int64_t*>(problem_m_offsets), problem_m_padded_offsets,
+            stream, num_device_sms, static_cast<uint32_t>(best_smem_size), max_shape_m_padded);
+    }
+    else
+    {
+        auto [best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size]
+            = deep_gemm::jit::get_best_gemm_config(
+                shape_n, expected_m, shape_k, num_problems, num_device_sms, false, true);
+        auto runtime = deep_gemm::jit::getGlobalCompiler().build(shape_n, shape_k, best_block_m, best_block_n, block_k,
+            num_problems, best_num_stages, best_num_tma_multicast, deep_gemm::GemmType::GroupedWithOffset, true);
+        auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
+
+        deep_gemm::runGemmSwapAB(kernel, mat_b, 0, mat_a, 0, mat_d, 0, scales_b, scales_a, shape_n, max_shape_m,
+            shape_k, best_block_m, best_block_n, block_k, num_problems, best_num_tma_multicast,
+            deep_gemm::GemmType::GroupedWithOffset, const_cast<int64_t*>(problem_m_offsets), problem_m_padded_offsets,
+            stream, num_device_sms, static_cast<uint32_t>(best_smem_size), max_shape_m_padded);
+    }
 }
 
 void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, float* scales_a,
