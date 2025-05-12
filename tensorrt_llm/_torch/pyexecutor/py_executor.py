@@ -889,12 +889,11 @@ class PyExecutor:
                                                       batch_outputs)
 
                     self._update_request_states(scheduled_batch)
+                    self._update_requests(sample_state)
 
                     ctx_transmission_reqs = self._send_disagg_ctx_cache(
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
-
-                    self._update_requests(sample_state)
 
                     if num_dummy_request > 0:
                         self._finish_dummy_request(scheduled_batch)
