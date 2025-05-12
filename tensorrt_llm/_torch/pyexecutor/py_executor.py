@@ -735,9 +735,8 @@ class PyExecutor:
 
                     # Stage 1: Async forward (all ranks) and decoding pass (last rank only)
                     if not self.dist.is_last_pp_rank:
-                        with torch.cuda.nvtx.range("_forward_step_inter_pp"):
-                            decoder_state = self._forward_step_inter_pp(
-                                scheduled_batch)
+                        decoder_state = self._forward_step_inter_pp(
+                            scheduled_batch)
                     else:
                         with torch.cuda.nvtx.range("_forward_step_last_pp"):
                             batch_outputs = self._forward_step(scheduled_batch)
