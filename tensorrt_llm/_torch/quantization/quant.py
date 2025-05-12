@@ -24,7 +24,7 @@ class LinearBaseQuant:
         self.quant_config = quant_config
         self.device = device
 
-    def __call__(self):
+    def __call__(self, input):
         raise "__call__ is not implemented."
 
     def _load_weight_for_name(self, weights: List[Dict], tensor_name):
@@ -41,7 +41,7 @@ class LinearBaseQuant:
     def load_weight(self, weights, tensor_name):
         raise "load_weight is not implemented."
 
-    def _copy(dst: Parameter, src: torch.Tensor):
+    def _copy(self, dst: Parameter, src: torch.Tensor):
         # TODO check that is it a reasonable change or not
         if dst.dtype != src.dtype:
             src = src.to(dst.dtype)
@@ -64,7 +64,7 @@ class LinearQDQ(LinearBaseQuant):
                                                 device=device),
                                    requires_grad=False)
 
-    def __call__(self):
+    def __call__(self, input):
         if input.dtype != torch.float8_e4m3fn:
             qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                 input, self.scale)
@@ -74,7 +74,7 @@ class LinearQDQ(LinearBaseQuant):
 
     def load_weight(self, weights, tensor_name):
         scale = self._load_weight_for_name(weights, tensor_name)
-        self._copy(self.scale, scale[0])
+        self._copy(self.scale, scale)
         self.inv_scale.data = 1.0 / self.scale
 
 
@@ -100,7 +100,7 @@ class LinearBlockScalesQuant(LinearBaseQuant):
 
     def load_weight(self, weights, tensor_name):
         scale = self._load_weight_for_name(weights, tensor_name)
-        self._copy(self.scale, scale[0])
+        self._copy(self.scale, scale)
         self.inv_scale.data = 1.0 / self.scale
 
 
@@ -120,7 +120,7 @@ class LinearNVFP4(LinearBaseQuant):
                                                device=device),
                                    requires_grad=False)
 
-    def __call__(self):
+    def __call__(self, input):
         if isinstance(input, Fp4QuantizedTensor):
             return input.fp4_tensor, input.scaling_factor
         else:
@@ -144,10 +144,10 @@ class LinearQuant:
         # TODO: need to make src/target dtype to be parameters.
         if quant_mode:
             if quant_mode.has_fp8_qdq():
-                LinearQDQ(quant_config, device)
+                quant = LinearQDQ(quant_config, device)
             elif quant_mode.has_nvfp4():
-                LinearNVFP4(quant_config, device)
+                quant = LinearNVFP4(quant_config, device)
             elif quant_mode.has_fp8_block_scales():
-                LinearBlockScalesQuant(quant_config, device)
+                quant = LinearBlockScalesQuant(quant_config, device)
 
         return quant

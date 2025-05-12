@@ -204,6 +204,7 @@ class Linear(nn.Module):
         self.lora = lora
         self.input_quantizer = None
         self._do_linear = None
+        self.inv_input_scale = None
 
         if not skip_create_weights_in_init:
             self.create_weights()
@@ -272,6 +273,10 @@ class Linear(nn.Module):
                     dtype=fp4_utils.float4_sf_dtype,
                     device=device),
                                               requires_grad=False)
+                self.alpha = Parameter(torch.empty([1],
+                                                   dtype=torch.float32,
+                                                   device=device),
+                                       requires_grad=False)
                 self._do_linear = self._apply_linear_nvfp4
             else:
                 # TODO(zhenhuanc): support other quant mode
