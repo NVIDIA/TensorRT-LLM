@@ -94,6 +94,7 @@ l0_a10:
   - accuracy/test_cli_flow.py::TestGpt2::test_auto_dtype # 1 min
   - accuracy/test_cli_flow.py::TestGpt2::test_beam_search # 1 min
   - accuracy/test_cli_flow.py::TestGpt2::test_beam_search_large # 6 mins
+  - accuracy/test_cli_flow.py::TestGpt2::test_variable_beam_width_search # 1 mins
   - accuracy/test_cli_flow.py::TestGpt2::test_weight_streaming_ootb # 1.5 mins
   - accuracy/test_cli_flow.py::TestGpt2::test_cuda_graph # 1 min
   - accuracy/test_cli_flow.py::TestSantacoder::test_auto_dtype # 1.5 mins

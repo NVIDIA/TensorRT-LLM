@@ -15,6 +15,9 @@ gpt2:
   - extra_acc_spec: beam_width=256
     num_samples: 32
     accuracy: 29.422
+  - extra_acc_spec: beam_width=8;beam_width_array=[2,3,4,5]
+    num_samples: 32
+    accuracy: 26.994
 gpt2-medium:
   - accuracy: 22.730
   - quant_algo: FP8

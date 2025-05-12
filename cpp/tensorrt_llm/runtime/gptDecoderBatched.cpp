@@ -219,6 +219,7 @@ void GptDecoderBatched::prepareForward(
     {
         dInput.cacheIndirection = input.cacheIndirection;
         dOutput.cacheIndirection = output.cacheIndirection;
+        dInput.generationSteps = input.generationSteps; // For Variable-Beam-Width-Search
     }
 
     if (speculativeDecodingMode.isExplicitDraftTokens())
