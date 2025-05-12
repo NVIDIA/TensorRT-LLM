@@ -22,7 +22,7 @@ from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
+from ..modules.attention import Attention, QkNormType
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (FusedMoE, Llama4RenormalizeMoeRoutingMethod,
@@ -60,18 +60,21 @@ class Llama4Attention(Attention):
             is_neox=False,
         ) if self.use_rope else None
 
-        super().__init__(hidden_size=config.hidden_size,
-                         num_attention_heads=config.num_attention_heads,
-                         num_key_value_heads=config.num_key_value_heads,
-                         max_position_embeddings=config.max_position_embeddings,
-                         bias=config.attention_bias,
-                         pos_embd_params=pos_embd_params,
-                         layer_idx=layer_idx,
-                         dtype=config.torch_dtype,
-                         config=model_config,
-                         use_qk_norm=use_qk_norm)
+        super().__init__(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            max_position_embeddings=config.max_position_embeddings,
+            bias=config.attention_bias,
+            pos_embd_params=pos_embd_params,
+            layer_idx=layer_idx,
+            dtype=config.torch_dtype,
+            config=model_config,
+            qk_norm_type=QkNormType.post_rope
+            if use_qk_norm else QkNormType.none,
+        )
 
-        if self.use_rope and self.use_qk_norm:
+        if self.use_rope and use_qk_norm:
             self.head_dim = config.hidden_size // config.num_attention_heads
             self.qk_norm = RMSNorm(hidden_size=self.head_dim,
                                    eps=1e-6,
@@ -85,7 +88,7 @@ class Llama4Attention(Attention):
         self.attn_scale = getattr(config, "attn_scale", 0.1)
 
     def apply_qk_norm(self, q, k):
-        # TODO: make this more efficient.
+
         def q_l2norm():
             return self.qk_norm(q.reshape(-1, self.head_dim)).reshape(
                 -1, self.q_size)
@@ -127,7 +130,7 @@ class Llama4Attention(Attention):
         all_reduce_params: Optional[AllReduceParams] = None,
     ):
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = self.split_qkv(qkv)
         if self.attn_temperature_tuning:
             q = self._attention_scaling(q, position_ids)
         out_scale = None

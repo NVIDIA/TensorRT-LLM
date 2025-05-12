@@ -1,4 +1,5 @@
 import math
+from enum import IntEnum
 from typing import Optional
 
 import torch
@@ -19,6 +20,12 @@ from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
 
 
+class QkNormType(IntEnum):
+    none = 0
+    pre_rope = 1
+    post_rope = 2
+
+
 class Attention(nn.Module):
 
     def __init__(
@@ -34,7 +41,7 @@ class Attention(nn.Module):
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
-        use_qk_norm: bool = False,
+        qk_norm_type: QkNormType = QkNormType.none,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -48,7 +55,7 @@ class Attention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = max_position_embeddings
         self.pos_embd_params = pos_embd_params
-        self.use_qk_norm = use_qk_norm
+        self.qk_norm_type = qk_norm_type
         self.dense_bias = dense_bias
 
         if dense_bias is None:
@@ -120,7 +127,7 @@ class Attention(nn.Module):
 
         attn_cls = get_attention_backend(self.attn_backend)
         self.enable_rope_fusion = attn_cls.support_fused_rope(
-        ) and not use_qk_norm
+        ) and qk_norm_type != QkNormType.post_rope
         self.attn = create_attention(
             self.attn_backend,
             self.layer_idx,
@@ -153,9 +160,14 @@ class Attention(nn.Module):
         # which could be modified after __init__
         self.attn.update_quant_config(self.quant_config)
 
+    def split_qkv(self, q, k=None, v=None):
+        if k is None and v is None:
+            q, k, v = q.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        return q, k, v
+
     def convert_qkv(self, q, k, v):
         if k is None and v is None and not self.support_fused_qkv:
-            q, k, v = q.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k, v = self.split_qkv(q)
         elif k is not None and v is not None and self.support_fused_qkv:
             qkv = torch.concat([q, k, v], dim=-1)
             q, k, v = qkv, None, None
@@ -187,12 +199,14 @@ class Attention(nn.Module):
                 qkv = qkv + qkv_lora
 
         q, k, v = qkv, None, None
+        if self.qk_norm_type == QkNormType.pre_rope:
+            q, k, v = self.split_qkv(q, k, v)
+            q, k = self.apply_qk_norm(q, k)
         if self.apply_rotary_emb and position_ids is not None:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
-                                dim=-1)
-            if self.use_qk_norm:
-                q, k = self.apply_qk_norm(q, k)
+            q, k, v = self.split_qkv(q, k, v)
             q, k = self.rotary_emb(position_ids, [q, k])
+            if self.qk_norm_type == QkNormType.post_rope:
+                q, k = self.apply_qk_norm(q, k)
         out_scale = None
 
         if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
