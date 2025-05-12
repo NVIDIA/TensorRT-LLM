@@ -830,30 +830,6 @@ def test_sampling_config():
         assert getattr(config, k) is None
 
 
-def test_sampling_config_deprecated_args():
-    # random_seed -> seed
-    config = trtllm.SamplingConfig(seed=1)
-    assert config.seed == 1
-    assert config.random_seed == 1
-    config = trtllm.SamplingConfig(random_seed=2)
-    assert config.seed == 2
-    assert config.random_seed == 2
-    config = trtllm.SamplingConfig(seed=3, random_seed=4)
-    assert config.seed == 3
-    assert config.random_seed == 3
-
-    # min_length -> min_tokens
-    config = trtllm.SamplingConfig(min_tokens=1)
-    assert config.min_tokens == 1
-    assert config.min_length == 1
-    config = trtllm.SamplingConfig(min_length=2)
-    assert config.min_tokens == 2
-    assert config.min_length == 2
-    config = trtllm.SamplingConfig(min_tokens=3, min_length=4)
-    assert config.min_tokens == 3
-    assert config.min_length == 3
-
-
 def test_output_config():
     config = trtllm.OutputConfig()
     assert config.return_log_probs == False
@@ -1101,19 +1077,6 @@ def test_request():
     assert (request.prompt_tuning_config.embedding_table == torch.ones(
         100, 64)).all()
     assert isinstance(request.lora_config, trtllm.LoraConfig)
-
-
-def test_request_deprecated_args():
-    # max_new_tokens -> max_tokens
-    request = trtllm.Request([1, 2, 3], max_tokens=10)
-    assert request.max_tokens == 10
-    assert request.max_new_tokens == 10
-    request = trtllm.Request([1, 2, 3], max_new_tokens=20)
-    assert request.max_tokens == 20
-    assert request.max_new_tokens == 20
-    request = trtllm.Request([1, 2, 3], max_tokens=30, max_new_tokens=40)
-    assert request.max_tokens == 30
-    assert request.max_new_tokens == 30
 
 
 def test_spec_dec_fast_logits_info():
@@ -1590,6 +1553,8 @@ def test_executor_config():
     assert config.gather_generation_logits is False
     assert config.use_variable_beam_width_search is False
     assert config.use_gpu_direct_storage is False
+    assert config.mm_embedding_offloading is False
+    assert config.enable_trt_overlap is False
 
     kwargs = {
         "max_beam_width":
@@ -1641,7 +1606,11 @@ def test_executor_config():
         "use_variable_beam_width_search":
         True,
         "use_gpu_direct_storage":
-        True
+        True,
+        "mm_embedding_offloading":
+        True,
+        "enable_trt_overlap":
+        True,
     }
     config = trtllm.ExecutorConfig(**kwargs)
     for k, v in kwargs.items():
@@ -1666,6 +1635,8 @@ def test_executor_config():
     assert config.gather_generation_logits is True
     assert config.use_variable_beam_width_search is True
     assert config.use_gpu_direct_storage is True
+    assert config.mm_embedding_offloading is True
+    assert config.enable_trt_overlap is True
 
 
 def test_parallel_config():
@@ -2398,11 +2369,25 @@ def test_executor_config_pickle():
         "max_seq_idle_microseconds":
         240 * 1000 * 1000,
         "spec_dec_config":
-        trtllm.SpeculativeDecodingConfig(fast_logits=True)
+        trtllm.SpeculativeDecodingConfig(fast_logits=True),
+        "guided_decoding_config":
+        trtllm.GuidedDecodingConfig(
+            trtllm.GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
+            encoded_vocab=["eos", "a", "b", "c", "d"]),
+        "additional_model_outputs":
+        [trtllm.AdditionalModelOutput("topKLogits")],
+        "gather_generation_logits":
+        True,
+        "use_variable_beam_width_search":
+        False,
+        "mm_embedding_offloading":
+        True,
+        "enable_trt_overlap":
+        True,
     }
     config = trtllm.ExecutorConfig(**kwargs)
     for k, v in kwargs.items():
-        if "config" not in k:
+        if "config" not in k and k != "additional_model_outputs":
             assert getattr(config, k) == v
 
     config.backend = 'pytorch'
@@ -2428,6 +2413,21 @@ def test_executor_config_pickle():
     assert config.backend == config_copy.backend
     assert config.spec_dec_config.fast_logits == config_copy.spec_dec_config.fast_logits
     assert config.use_gpu_direct_storage == config_copy.use_gpu_direct_storage
+
+    assert config_copy.guided_decoding_config.backend == config.guided_decoding_config.backend
+    assert config_copy.guided_decoding_config.encoded_vocab == config.guided_decoding_config.encoded_vocab
+    assert config_copy.guided_decoding_config.tokenizer_str == config.guided_decoding_config.tokenizer_str
+    assert config_copy.guided_decoding_config.stop_token_ids == config.guided_decoding_config.stop_token_ids
+
+    assert config.additional_model_outputs[
+        0].name == config_copy.additional_model_outputs[0].name
+    assert config.additional_model_outputs[
+        0].gather_context == config_copy.additional_model_outputs[
+            0].gather_context
+    assert config.gather_generation_logits == config_copy.gather_generation_logits
+    assert config.use_variable_beam_width_search == config_copy.use_variable_beam_width_search
+    assert config.mm_embedding_offloading == config_copy.mm_embedding_offloading
+    assert config.enable_trt_overlap == config_copy.enable_trt_overlap
 
 
 def test_return_full_tokens():
@@ -2519,7 +2519,7 @@ def test_request_pickle():
     assert request.sampling_config.num_return_sequences == request_copy.sampling_config.num_return_sequences
     assert request.request_type == request_copy.request_type
     assert request.input_token_ids == request_copy.input_token_ids
-    assert request.max_new_tokens == request_copy.max_new_tokens
+    assert request.max_tokens == request_copy.max_tokens
     assert request.output_config.return_log_probs == request_copy.output_config.return_log_probs
     assert request.guided_decoding_params == request_copy.guided_decoding_params
     assert request.kv_cache_retention_config == request_copy.kv_cache_retention_config

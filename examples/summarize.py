@@ -42,6 +42,16 @@ from prompt_lookup.run_dtm_pld import run_dtm_pld
 
 
 def main(args):
+    is_integration_test = os.getenv('INTEGRATION_TEST', '0') == '1'
+    if is_integration_test:
+        logger.info(
+            "Running in integration test mode - will only run one batch and skip accuracy checks"
+        )
+        logger.info(
+            "Setting max_ite=1 and check_accuracy=False for integration test")
+        args.max_ite = 1
+        args.check_accuracy = False
+
     runtime_rank = tensorrt_llm.mpi_rank()
     logger.set_level(args.log_level)
 

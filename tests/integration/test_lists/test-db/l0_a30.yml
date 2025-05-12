@@ -39,17 +39,17 @@ l0_a30:
       backend: cpp
   tests:
   # ------------- CPP tests ---------------
-  - test_cpp.py::test_unit_tests[batch_manager-80]
-  - test_cpp.py::test_unit_tests[common-80]
-  - test_cpp.py::test_unit_tests[executor-80]
-  - test_cpp.py::test_unit_tests[kernels-80]
-  - test_cpp.py::test_unit_tests[layers-80]
-  - test_cpp.py::test_unit_tests[runtime-80]
-  - test_cpp.py::test_unit_tests[thop-80]
-  - test_cpp.py::test_unit_tests[utils-80]
-  - test_cpp.py::test_model[-gpt-80]
-  - test_cpp.py::test_model[-gpt_executor-80]
-  - test_cpp.py::test_model[-gpt_tests-80]
+  - cpp/test_unit_tests.py::test_unit_tests[batch_manager-80]
+  - cpp/test_unit_tests.py::test_unit_tests[common-80]
+  - cpp/test_unit_tests.py::test_unit_tests[executor-80]
+  - cpp/test_unit_tests.py::test_unit_tests[kernels-80]
+  - cpp/test_unit_tests.py::test_unit_tests[layers-80]
+  - cpp/test_unit_tests.py::test_unit_tests[runtime-80]
+  - cpp/test_unit_tests.py::test_unit_tests[thop-80]
+  - cpp/test_unit_tests.py::test_unit_tests[utils-80]
+  - cpp/test_e2e.py::test_model[-gpt-80]
+  - cpp/test_e2e.py::test_model[-gpt_executor-80]
+  - cpp/test_e2e.py::test_model[-gpt_tests-80]
 - condition:
     ranges:
       system_gpu_count:
@@ -139,7 +139,7 @@ l0_a30:
   - accuracy/test_cli_flow.py::TestLlama7B::test_manage_weights # 2 mins
   - accuracy/test_llm_api.py::TestQwen2_7BInstruct::test_weight_only
   - examples/test_llama.py::test_llm_llama_v2_1gpu_auto_parallel[llama-v2-7b-hf] # 15 mins
-  - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization] # 5 mins
+  - accuracy/test_cli_flow.py::TestMistral7B::test_beam_search # 5 mins
   - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization_long] # 6 mins
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:2-disable_fp8]
   - examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone_3.0_7.8b_instruct-float16-nb:1] # ? mins
@@ -163,5 +163,5 @@ l0_a30:
       stage: post_merge
       backend: cpp
   tests:
-  - test_cpp.py::test_model[-gpt_session-80]
-  - test_cpp.py::test_benchmarks[gpt-80]
+  - cpp/test_e2e.py::test_model[-gpt_session-80]
+  - cpp/test_e2e.py::test_benchmarks[gpt-80]

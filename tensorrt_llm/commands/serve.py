@@ -35,7 +35,7 @@ def get_llm_args(model: str,
                  num_postprocess_workers: int = 0,
                  trust_remote_code: bool = False,
                  reasoning_parser: Optional[str] = None,
-                 **llm_args_dict: Any):
+                 **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
         gpus_per_node = device_count()
@@ -79,9 +79,7 @@ def get_llm_args(model: str,
         "_reasoning_parser": reasoning_parser,
     }
 
-    llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_dict)
-
-    return llm_args
+    return llm_args, llm_args_extra_dict
 
 
 def launch_server(host: str, port: int, llm_args: dict):
@@ -201,12 +199,7 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
     """
     logger.set_level(log_level)
 
-    llm_args_dict = {}
-    if extra_llm_api_options is not None:
-        with open(extra_llm_api_options, 'r') as f:
-            llm_args_dict = yaml.safe_load(f)
-
-    llm_args = get_llm_args(
+    llm_args, _ = get_llm_args(
         model=model,
         tokenizer=tokenizer,
         backend=backend,
@@ -222,8 +215,13 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
         num_postprocess_workers=num_postprocess_workers,
         trust_remote_code=trust_remote_code,
-        reasoning_parser=reasoning_parser,
-        **llm_args_dict)
+        reasoning_parser=reasoning_parser)
+
+    llm_args_extra_dict = {}
+    if extra_llm_api_options is not None:
+        with open(extra_llm_api_options, 'r') as f:
+            llm_args_extra_dict = yaml.safe_load(f)
+    llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
 
     launch_server(host, port, llm_args)
 
@@ -327,7 +325,9 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     if is_leader:
         server_cfg = disagg_cfg.server_configs[instance_idx]
 
-        llm_args = get_llm_args(**server_cfg.other_args)
+        llm_args, llm_args_extra_dict = get_llm_args(**server_cfg.other_args)
+        llm_args = update_llm_args_with_extra_dict(llm_args,
+                                                   llm_args_extra_dict)
 
         mpi_session = MpiCommSession(
             comm=sub_comm,

@@ -41,6 +41,8 @@ TensorPtr collectRequestIds(RequestVector const& contextRequests, RequestVector 
 
 void sortByLoraId(ScheduledRequests& scheduledRequests)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     auto sortRequests = [](RequestVector& requests)
     {
         std::sort(requests.begin(), requests.end(),
@@ -48,6 +50,25 @@ void sortByLoraId(ScheduledRequests& scheduledRequests)
     };
     sortRequests(scheduledRequests.contextRequests);
     sortRequests(scheduledRequests.generationRequests);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void moveFinishedContextRequestsToGeneration(ScheduledRequests& scheduledRequests)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto& contextRequests = scheduledRequests.contextRequests;
+    auto& generationRequests = scheduledRequests.generationRequests;
+    auto firstFinished = std::find_if(
+        contextRequests.begin(), contextRequests.end(), [](auto const& llmReq) { return llmReq->isContextFinished(); });
+    TLLM_LOG_DEBUG(
+        "Moving %ld finished context requests to generation.", std::distance(firstFinished, contextRequests.end()));
+    generationRequests.insert(generationRequests.begin(), std::make_move_iterator(firstFinished),
+        std::make_move_iterator(contextRequests.end()));
+    contextRequests.erase(firstFinished, contextRequests.end());
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void copyGenerationLogits(RuntimeBuffers::GenerationLogitsCache& generationLogitsCache,

@@ -206,7 +206,7 @@ def run_dtm_pld(batch_input_ids,
                                     device_ids=target_device_list)
         target_runner = ModelRunnerCpp.from_dir(**target_runner_kwargs)
 
-    if is_dtm and (not use_logits) and \
+    if is_dtm and use_logits and \
         not (draft_runner.gather_generation_logits and target_runner.gather_generation_logits):
         assert False, "`--gather_generation_logits` must be specified while building draft/target models for using logits to accept"
 

@@ -88,7 +88,9 @@ def test_generation_bs2(llama_7b_bs2_path: Path):
             executor_config=tllm.ExecutorConfig(max_beam_width=2)) as executor:
         result = executor.generate(prompt_token_ids,
                                    sampling_params=SamplingParams(
-                                       max_tokens=max_tokens, beam_width=2))
+                                       max_tokens=max_tokens,
+                                       n=2,
+                                       use_beam_search=True))
         assert similar(tokenizer.decode(result.outputs[0].token_ids),
                        'E F G H I J K L')
         assert similar(tokenizer.decode(result.outputs[1].token_ids),
@@ -163,7 +165,7 @@ def test_invalid_sampling_params():
     with pytest.raises(ValueError):
         # n > beam_width is not possible because n exceeds the number of beam
         # search results
-        SamplingParams(max_tokens=4, n=4, beam_width=3)
+        SamplingParams(max_tokens=4, n=4, best_of=3, use_beam_search=True)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2 or WORLD_SIZE != 2,

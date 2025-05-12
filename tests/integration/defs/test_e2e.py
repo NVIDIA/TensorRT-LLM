@@ -30,9 +30,9 @@ from defs.trt_test_alternative import (check_call, check_call_negative_test,
 
 from .common import (PluginOptions, convert_weights, prune_checkpoint,
                      quantize_data, refit_model, venv_check_call)
-from .conftest import (llm_models_root, skip_nvlink_inactive, skip_pre_ada,
-                       skip_pre_blackwell, skip_pre_hopper, tests_path,
-                       unittest_path)
+from .conftest import (llm_models_root, skip_nvlink_inactive,
+                       skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
+                       skip_pre_hopper, tests_path, unittest_path)
 
 sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
 
@@ -1214,6 +1214,7 @@ def test_ptp_quickstart(llm_root, llm_venv):
     ("Llama3.1-8B-BF16", "llama-3.1-model/Meta-Llama-3.1-8B"),
     ("Llama3.2-11B-BF16", "llama-3.2-models/Llama-3.2-11B-Vision"),
     ("Nemotron4_4B-BF16", "nemotron/Minitron-4B-Base"),
+    ("Nemotron-H-8B", "Nemotron-H-8B-Base-8K"),
     pytest.param('Llama3.1-8B-NVFP4',
                  'nvfp4-quantized/Meta-Llama-3.1-8B',
                  marks=skip_pre_blackwell),
@@ -1224,13 +1225,22 @@ def test_ptp_quickstart(llm_root, llm_venv):
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
-    llm_venv.run_cmd([
-        str(example_root / "quickstart_advanced.py"),
-        "--enable_overlap_scheduler",
-        "--enable_chunked_prefill",
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
-    ])
+    if model_name == "Nemotron-H-8B":
+        llm_venv.run_cmd([
+            str(example_root / "quickstart_advanced.py"),
+            "--disable_kv_cache_reuse",
+            "--max_batch_size=8",
+            "--model_dir",
+            f"{llm_models_root()}/{model_path}",
+        ])
+    else:
+        llm_venv.run_cmd([
+            str(example_root / "quickstart_advanced.py"),
+            "--enable_overlap_scheduler",
+            "--enable_chunked_prefill",
+            "--model_dir",
+            f"{llm_models_root()}/{model_path}",
+        ])
 
 
 @pytest.mark.parametrize("model_name,model_path", [
@@ -1300,6 +1310,7 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
     ])
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(110000)
 @pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("model_name,model_path", [
