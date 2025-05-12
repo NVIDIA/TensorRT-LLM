@@ -43,6 +43,11 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
     NO_QUANT = auto()
 
 
+class W4A16QuantMode(IntFlag):
+    FINEGRAINED_SCALE_ONLY = 0  # Mode 0: Only per-group scale factors
+    FINEGRAINED_SCALE_AND_ZEROS = 1  # Mode 1: Per-group scale and zero points
+
+
 QUANT_ALGO_LIST = list(set(QuantAlgo) - {QuantAlgo.INT8})
 KV_CACHE_QUANT_ALGO_LIST = [QuantAlgo.FP8, QuantAlgo.INT8, QuantAlgo.NVFP4]
 W8A8_SQ_PLUGIN_LIST = [

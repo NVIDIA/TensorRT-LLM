@@ -1,0 +1,285 @@
+#include "w4a16_gemm_thop.h"
+
+#include "cutlass_extensions/gemm_configs.h"
+#include "cutlass_extensions/weight_only_quant_op.h"
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
+#include "tensorrt_llm/runtime/torchUtils.h"
+
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+#if defined(ENABLE_FP8) && defined(TRTLLM_CUDA_FP8_AVAILABLE)
+#include <cuda_fp8.h>
+#endif
+
+#include <algorithm>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <vector>
+
+namespace torch_ext
+{
+
+using GenericWeightPackedT = cutlass::uint4b_t;
+using GenericScaleZeroT = half; // Type for scales and zero points (if any)
+using GenericBiasT = half;      // Type for bias
+using GenericOutputT = half;    // Type for output C
+
+static tensorrt_llm::cutlass_extensions::CutlassGemmConfig selectDefaultW4A16Config(
+    std::vector<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> const& allConfigs)
+{
+    TORCH_CHECK(!allConfigs.empty(), "No GEMM configs available to select a default.");
+
+    auto gemm_config = allConfigs[0];
+
+    // For SM89+ (Hopper and newer), we need to avoid configurations with stages == 2
+    int current_sm = tensorrt_llm::common::getSMVersion();
+    if (current_sm >= 89 && gemm_config.stages == 2)
+    {
+        for (auto const& config : allConfigs)
+        {
+            if (config.stages != 2)
+            {
+                gemm_config = config;
+                break;
+            }
+        }
+    }
+
+    return gemm_config;
+}
+
+class W4A16GemmRunner : public torch::CustomClassHolder
+{
+public:
+    explicit W4A16GemmRunner(at::ScalarType activationDtype, int64_t quant_mode = 0)
+        : mActivationDtype(activationDtype)
+    {
+        if (quant_mode == 0)
+        {
+            if (activationDtype == at::ScalarType::Half)
+            {
+                mGemmRunner = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<half,
+                    GenericWeightPackedT, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, half, half, half>>();
+            }
+            else if (activationDtype == at::ScalarType::BFloat16)
+            {
+                mGemmRunner
+                    = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_bfloat16,
+                        GenericWeightPackedT, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, __nv_bfloat16,
+                        __nv_bfloat16, __nv_bfloat16>>();
+            }
+#if defined(ENABLE_FP8) && defined(TRTLLM_CUDA_FP8_AVAILABLE)
+            else if (activationDtype == at::ScalarType::Float8e4m3fn)
+            {
+                mGemmRunner
+                    = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_fp8_e4m3,
+                        GenericWeightPackedT, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, GenericScaleZeroT,
+                        GenericBiasT, GenericOutputT>>(); // todo change it
+            }
+#endif
+        }
+        else if (quant_mode == 1)
+        {
+            if (activationDtype == at::ScalarType::Half)
+            {
+                mGemmRunner = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<half,
+                    GenericWeightPackedT, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS, half, half, half>>();
+            }
+            else if (activationDtype == at::ScalarType::BFloat16)
+            {
+                mGemmRunner
+                    = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_bfloat16,
+                        GenericWeightPackedT, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS, __nv_bfloat16,
+                        __nv_bfloat16, __nv_bfloat16>>();
+            }
+#if defined(ENABLE_FP8) && defined(TRTLLM_CUDA_FP8_AVAILABLE)
+            else if (activationDtype == at::ScalarType::Float8e4m3fn)
+            {
+                mGemmRunner
+                    = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_fp8_e4m3,
+                        GenericWeightPackedT, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS,
+                        GenericScaleZeroT, GenericBiasT, GenericOutputT>>(); // todo change it
+            }
+#endif
+        }
+        else
+        {
+            TORCH_CHECK(false, "Unsupported quant mode for W4A16GemmRunner: ", quant_mode);
+        }
+
+        TORCH_CHECK(
+            mGemmRunner, "Failed to create W4A16 GEMM runner for activation type ", c10::toString(activationDtype));
+        mConfigs = mGemmRunner->getConfigs(); // Get configs via the interface
+        TORCH_CHECK(!mConfigs.empty(), "Failed to get CUTLASS configs for W4A16 GEMM with activation type ",
+            c10::toString(activationDtype));
+    }
+
+    at::Tensor runGemm(at::Tensor const& A, at::Tensor const& B_packed, at::Tensor const& scales, at::Tensor bias,
+        int64_t group_size_long, int64_t configIdx = -1, std::optional<at::Tensor> zeros = std::nullopt) const
+    {
+        TORCH_CHECK(A.is_cuda() && B_packed.is_cuda() && scales.is_cuda(), "All input tensors must be on CUDA");
+        TORCH_CHECK(A.scalar_type() == mActivationDtype, "Activation tensor A's dtype ", c10::toString(A.scalar_type()),
+            " does not match runner's expected dtype ", c10::toString(mActivationDtype));
+        TORCH_CHECK(B_packed.scalar_type() == torch::kQUInt4x2 || B_packed.scalar_type() == torch::kInt8
+                || B_packed.scalar_type() == torch::kUInt8,
+            "B_packed must be quint4x2, int8, or uint8 (view of quantized data)");
+        TORCH_CHECK(scales.scalar_type() == torch::kFloat16 || scales.scalar_type() == torch::kBFloat16,
+            "Scales must be FP16 or BF 16");
+        TORCH_CHECK(A.is_contiguous() && B_packed.is_contiguous() && scales.is_contiguous(),
+            "All input tensors (A, B_packed, scales) must be contiguous");
+
+        // Check zeros tensor if provided (non-empty)
+        void const* zeros_ptr = nullptr;
+        if (zeros.has_value())
+        {
+            TORCH_CHECK(zeros.value().is_cuda(), "Zeros tensor must be on CUDA");
+            TORCH_CHECK(
+                zeros.value().scalar_type() == torch::kFloat16 || zeros.value().scalar_type() == torch::kBFloat16,
+                "Zeros must be FP16 or BF16");
+            TORCH_CHECK(zeros.value().is_contiguous(), "Zeros tensor must be contiguous");
+            zeros_ptr = zeros.value().data_ptr();
+        }
+
+        int M = 0, K_act = 0;
+        // Logic to determine M and K_act from A_tensor dimensions
+        if (A.dim() == 2)
+        {
+            M = A.size(0);
+            K_act = A.size(1);
+        }
+        else
+        { // A.dim() >= 3
+            M = A.size(0);
+            for (int i = 1; i < A.dim() - 1; ++i)
+                M *= A.size(i);
+            K_act = A.size(A.dim() - 1);
+        }
+
+        // Assuming B_packed is [K_weights, N_packed_int4_pairs] or similar
+        // K_weights should match K_act. N_orig is 2 * N_packed_int4_pairs
+        int K_weights = B_packed.size(0);
+        int N_packed_int4 = B_packed.size(1); // This is number of uint8_t elements, each holding two int4
+        int N_orig = N_packed_int4 * 2;       // N_orig is the original N dimension
+
+        TORCH_CHECK(
+            K_act == K_weights, "K dimension mismatch: A.shape[-1]=", K_act, " vs B_packed.shape[0]=", K_weights);
+        int K = K_act;
+        int group_size = static_cast<int>(group_size_long);
+
+        std::vector<int64_t> output_shape_vec;
+        if (A.dim() == 2)
+        {
+            output_shape_vec = {static_cast<int64_t>(M), static_cast<int64_t>(N_orig)};
+        }
+        else
+        {
+            output_shape_vec.reserve(A.dim());
+            for (int i = 0; i < A.dim() - 1; ++i)
+                output_shape_vec.push_back(A.size(i));
+            output_shape_vec.push_back(N_orig);
+        }
+
+        // Set output dtype based on activation dtype
+        torch::ScalarType output_dtype;
+        if (mActivationDtype == at::ScalarType::Half)
+        {
+            output_dtype = torch::kFloat16;
+        }
+        else if (mActivationDtype == at::ScalarType::BFloat16)
+        {
+            output_dtype = torch::kBFloat16;
+        }
+#if defined(ENABLE_FP8) && defined(TRTLLM_CUDA_FP8_AVAILABLE)
+        else if (mActivationDtype == at::ScalarType::Float8e4m3fn)
+        {
+            // FP8 activation case - we've instantiated kernel to produce GenericOutputT which is half
+            output_dtype = torch::kFloat16;
+        }
+#endif
+        else
+        {
+            TORCH_CHECK(false, "Unsupported activation type for output dtype determination");
+        }
+
+        torch::Tensor C_tensor = torch::empty(output_shape_vec, A.options().dtype(output_dtype));
+
+        void const* A_ptr = A.data_ptr();
+        // B_packed is already preprocessed weight.  // todo is it?
+
+        torch::Tensor B_internal = B_packed;
+        if (B_packed.scalar_type() == torch::kQUInt4x2)
+        { // kernels often expect uint8 view
+            B_internal = B_packed.view(torch::kUInt8);
+        }
+        TORCH_CHECK(B_internal.is_contiguous(), "B_internal (potentially viewed B_packed) tensor must be contiguous");
+        void const* B_ptr = B_internal.data_ptr();
+
+        void const* scales_ptr = scales.data_ptr();
+        void const* bias_ptr = nullptr;
+        if (bias.numel() > 0)
+        {
+            TORCH_CHECK(bias.scalar_type() == torch::kFloat16 || bias.scalar_type() == torch::kBFloat16,
+                "Bias must be FP16 or BF16");
+            TORCH_CHECK(bias.is_contiguous(), "Bias tensor must be contiguous");
+            bias_ptr = bias.data_ptr();
+        }
+        void* C_ptr = C_tensor.data_ptr();
+
+        tensorrt_llm::cutlass_extensions::CutlassGemmConfig gemm_config_to_use;
+        if (configIdx >= 0 && configIdx < getNumConfigs())
+        {
+            gemm_config_to_use = mConfigs.at(configIdx);
+        }
+        else
+        {
+            gemm_config_to_use = selectDefaultW4A16Config(mConfigs); // todo needs to delete it when tuning is works
+        }
+
+        size_t workspace_bytes = mGemmRunner->getWorkspaceSize(M, N_orig, K);
+        torch::Tensor workspace_tensor = torch::empty(
+            {static_cast<int64_t>(workspace_bytes)}, torch::TensorOptions().dtype(torch::kUInt8).device(A.device()));
+        char* workspace_ptr = nullptr;
+        if (workspace_bytes > 0)
+        {
+            workspace_ptr = reinterpret_cast<char*>(workspace_tensor.data_ptr());
+        }
+
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.device().index());
+
+        mGemmRunner->gemm(A_ptr, B_ptr, scales_ptr, zeros_ptr, bias_ptr,
+            1.0f, // alpha
+            C_ptr, M, N_orig, K, group_size, gemm_config_to_use, workspace_ptr, workspace_bytes, stream);
+
+        return C_tensor;
+    }
+
+    int64_t getNumConfigs() const
+    {
+        TORCH_CHECK(mGemmRunner, "W4A16GemmRunner not initialized properly.");
+        return static_cast<int64_t>(mConfigs.size());
+    }
+
+private:
+    std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunnerInterface> mGemmRunner;
+    std::vector<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> mConfigs;
+    at::ScalarType mActivationDtype;
+};
+
+} // namespace torch_ext
+
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.class_<torch_ext::W4A16GemmRunner>("W4A16GemmRunner")
+        .def(torch::init<at::ScalarType, int64_t>())
+        .def("run_gemm", &torch_ext::W4A16GemmRunner::runGemm)
+        .def("get_num_configs", &torch_ext::W4A16GemmRunner::getNumConfigs);
+}
