@@ -22,7 +22,7 @@ from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
+from ..modules.attention import Attention, QkNormType
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (FusedMoE, Llama4RenormalizeMoeRoutingMethod,
@@ -32,7 +32,6 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..modules.rotary_embedding import RotaryEmbedding
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
@@ -53,86 +52,51 @@ class Llama4Attention(Attention):
         aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         config = model_config.pretrained_config
-        self.aux_stream = aux_stream
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         self.use_rope = not nope_layer
-        self.use_qk_norm = use_qk_norm and not nope_layer
-        if self.use_rope and not self.use_qk_norm:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gptj,
-                rope=RopeParams.from_config(config),
-                is_neox=False,
-            )
-        else:
-            pos_embd_params = None
+        pos_embd_params = PositionalEmbeddingParams(
+            type=PositionEmbeddingType.rope_gptj,
+            rope=RopeParams.from_config(config),
+            is_neox=False,
+        ) if self.use_rope else None
 
-        super().__init__(hidden_size=config.hidden_size,
-                         num_attention_heads=config.num_attention_heads,
-                         num_key_value_heads=config.num_key_value_heads,
-                         max_position_embeddings=config.max_position_embeddings,
-                         bias=config.attention_bias,
-                         pos_embd_params=pos_embd_params,
-                         layer_idx=layer_idx,
-                         dtype=config.torch_dtype,
-                         config=model_config)
+        super().__init__(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            max_position_embeddings=config.max_position_embeddings,
+            bias=config.attention_bias,
+            pos_embd_params=pos_embd_params,
+            layer_idx=layer_idx,
+            dtype=config.torch_dtype,
+            config=model_config,
+            qk_norm_type=QkNormType.post_rope
+            if use_qk_norm else QkNormType.none,
+        )
 
-        if self.use_rope and self.use_qk_norm:
-            # here we must disable rope fusion regardless of attn_backend
-            self.enable_rope_fusion = False
-            self.rotary_emb = RotaryEmbedding(
-                RopeParams.from_config(config),
-                head_dim=self.head_dim,
-                is_neox=False,
-            )
-
-        if self.use_qk_norm:
+        if self.use_rope and use_qk_norm:
             self.head_dim = config.hidden_size // config.num_attention_heads
             self.qk_norm = RMSNorm(hidden_size=self.head_dim,
                                    eps=1e-6,
                                    dtype=config.torch_dtype,
                                    has_weights=False)
-        else:
-            self.qk_norm = None
+            self.aux_stream = aux_stream
+            self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         self.attn_temperature_tuning = attn_temperature_tuning and nope_layer
         self.floor_scale = getattr(config, "floor_scale", 8192.0)
         self.attn_scale = getattr(config, "attn_scale", 0.1)
 
-    def _attn_qkv(
-            self,
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            attn_metadata: AttentionMetadata,
-            attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
-        CAUSAL,
-            mrope_config: Optional[dict] = None,
-            all_reduce_params: Optional[AllReduceParams] = None):
-        out_scale = None
-        if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
-            out_scale = self.o_proj.inv_input_scale
+    def apply_qk_norm(self, q, k):
 
-        q, k, v = self.convert_qkv(q, k, v)
-        attn_output = self.attn.forward(q,
-                                        k,
-                                        v,
-                                        attn_metadata,
-                                        out_scale=out_scale,
-                                        attention_mask=attention_mask,
-                                        mrope_config=mrope_config)
+        def q_l2norm():
+            return self.qk_norm(q.reshape(-1, self.head_dim)).reshape(
+                -1, self.q_size)
 
-        attn_output = self.o_proj(attn_output,
-                                  all_reduce_params=all_reduce_params)
+        def k_l2norm():
+            return self.qk_norm(k.reshape(-1, self.head_dim)).reshape(
+                -1, self.kv_size)
 
-        return attn_output
-
-    def _qk_norm(self, q, k):
-        # TODO: make this more efficient.
-        q_l2norm = lambda: self.qk_norm(q.reshape(-1, self.head_dim)).reshape(
-            -1, self.q_size)
-        k_l2norm = lambda: self.qk_norm(k.reshape(-1, self.head_dim)).reshape(
-            -1, self.kv_size)
         q, k = maybe_execute_in_parallel(
             q_l2norm,
             k_l2norm,
@@ -155,31 +119,6 @@ class Llama4Attention(Attention):
         q = (q * attn_scale).to(q.dtype)
         return q
 
-    def _forward_rope(
-        self,
-        position_ids: Optional[torch.LongTensor],
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
-        CAUSAL,
-        mrope_config: Optional[dict] = None,
-        all_reduce_params: Optional[AllReduceParams] = None,
-    ):
-        if self.use_qk_norm:
-            qkv = self.qkv_proj(hidden_states)
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
-                                dim=-1)
-            assert self.rotary_emb is not None and not self.enable_rope_fusion, "qk_norm requires attention rope fusion disabled"
-            q, k = self.rotary_emb(position_ids, [q, k])
-            q, k = self._qk_norm(q, k)
-            return self._attn_qkv(q, k, v, attn_metadata, attention_mask,
-                                  mrope_config, all_reduce_params)
-        else:
-            # When qk_norm is disabled, use the classic attention path that handles RoPE fusion
-            return super().forward(position_ids, hidden_states, attn_metadata,
-                                   attention_mask, mrope_config,
-                                   all_reduce_params)
-
     def _forward_nope(
         self,
         position_ids: Optional[torch.LongTensor],
@@ -191,11 +130,26 @@ class Llama4Attention(Attention):
         all_reduce_params: Optional[AllReduceParams] = None,
     ):
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = self.split_qkv(qkv)
         if self.attn_temperature_tuning:
             q = self._attention_scaling(q, position_ids)
-        return self._attn_qkv(q, k, v, attn_metadata, attention_mask,
-                              mrope_config, all_reduce_params)
+        out_scale = None
+        if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
+            out_scale = self.o_proj.inv_input_scale
+
+        q, k, v = self.convert_qkv(q, k, v)
+        attn_output = self.attn.forward(q,
+                                        k,
+                                        v,
+                                        attn_metadata,
+                                        out_scale=out_scale,
+                                        attention_mask=attention_mask,
+                                        mrope_config=mrope_config)
+
+        attn_output = self.o_proj(attn_output,
+                                  all_reduce_params=all_reduce_params)
+
+        return attn_output
 
     def forward(
         self,
@@ -211,9 +165,16 @@ class Llama4Attention(Attention):
     ) -> torch.Tensor:
         assert lora_params is None, "LORA is not supported for Llama4Attention"
         if self.use_rope:
-            return self._forward_rope(position_ids, hidden_states,
-                                      attn_metadata, attention_mask,
-                                      mrope_config, all_reduce_params)
+            return super().forward(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                attention_mask=attention_mask,
+                mrope_config=mrope_config,
+                all_reduce_params=all_reduce_params,
+                lora_params=lora_params,
+                **kwargs,
+            )
         else:
             return self._forward_nope(position_ids, hidden_states,
                                       attn_metadata, attention_mask,
