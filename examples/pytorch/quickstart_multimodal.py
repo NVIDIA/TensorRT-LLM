@@ -1,7 +1,8 @@
 import argparse
 import json
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Callable
+from functools import partial
 
 from quickstart_advanced import add_llm_args, setup_llm
 
@@ -29,23 +30,22 @@ example_video_prompts = [
 
 
 def prepare_multimodal_inputs(model_dir: str,
-                              model_type: str,
                               modality: str,
                               prompts: List[str],
                               media: List[str],
-                              image_data_format: str = "pt",
-                              num_frames: int = 8) -> List[Dict[str, Any]]:
+                              input_formatter: Callable,
+                              mm_loader: Callable,
+                              data_format: str = "pt",  # Options: "pt" or "pil"
+                              device: str = "cuda") -> List[Dict[str, Any]]:
 
     inputs = []
-    if modality == "image":
-        inputs = default_image_loader(prompts, media, image_data_format)
-    elif modality == "video":
-        inputs = default_video_loader(prompts, media, image_data_format,
-                                      num_frames)
+    if modality in ["image", "video"]:
+        assert mm_loader, "multimodal data loader is required for image/video modality"
+        inputs = mm_loader(prompts, media, data_format, device)
     else:
         raise ValueError(f"Unsupported modality: {modality}")
 
-    inputs = INPUT_FORMATTER_MAP[model_type](model_dir, inputs)
+    inputs = input_formatter(model_dir, inputs)
 
     return inputs
 
@@ -95,17 +95,23 @@ def main():
 
     llm, sampling_params = setup_llm(args)
 
-    image_format = "pt"  # ["pt", "pil"]
-    if args.model_type is not None:
-        model_type = args.model_type
-    else:
-        model_type = json.load(
-            open(os.path.join(llm._hf_model_dir, 'config.json')))['model_type']
+    # feel free to override the default formatter and loaders based on your applications
+    model_type = args.model_type if args.model_type else json.load(
+        open(os.path.join(llm._hf_model_dir, 'config.json')))['model_type']
     assert model_type in INPUT_FORMATTER_MAP, f"Unsupported model_type: {model_type}"
+    input_formatter = INPUT_FORMATTER_MAP[model_type]
+    mm_loader = None
+    if args.modality == "image":
+        mm_loader = default_image_loader
+    elif args.modality == "video":
+        mm_loader = partial(default_video_loader, num_frames=args.num_frames)
+    data_format = "pt"  # ["pt", "pil"]
+    device = "cuda"
 
-    inputs = prepare_multimodal_inputs(args.model_dir, model_type,
-                                       args.modality, args.prompt, args.media,
-                                       image_format, args.num_frames)
+    inputs = prepare_multimodal_inputs(args.model_dir, args.modality,
+                                       args.prompt, args.media,
+                                       input_formatter, mm_loader,
+                                       data_format, device)
 
     outputs = llm.generate(inputs, sampling_params)
 
