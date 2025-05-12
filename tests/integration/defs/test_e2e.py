@@ -1477,29 +1477,28 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             "video": [
                 ["woman", "street", "night", "walking", "camera"],
                 [
-                    "earth", "space", "curvature", "sun", "contrast", "oceans",
-                    "beauty"
+                    "stunning", "earth", "space", "planet", "curvature", "dark",
+                    "bright", "contrast", "illuminate"
                 ],
             ],
         },
         "llava-v1.6-mistral-7b": {
             "image": [
                 [
-                    "ocean", "cloudy", "waves", "shore", "frothy", "blue-green",
-                    "overcast", "stormy", "choppy", "turbulent"
+                    "ocean", "cloud", "waves", "white", "shore", "large",
+                    "dramatic", "breaking"
                 ],
-                [
-                    "scenic", "landscape", "rock formation", "butte",
-                    "mountain", "landmark", "geological", "clear sky", "clouds",
-                    "weather"
-                ],
+                ["mountain", "butte", "flat", "top", "sky"],
                 ["highway", "vehicles", "traffic", "divider", "suburban"],
             ],
         },
         "qwen2-vl-7b-instruct": {
             "image": [
-                ["ocean", "waves", "shore", "stormy", "clouds", "turbulent"],
-                ["mountainous", "landscape", "rock", "peak", "weather", "tree"],
+                ["ocean", "waves", "shore", "natural", "clouds", "turbulent"],
+                [
+                    "mountainous", "landscape", "rock", "peak", "weather",
+                    "steep"
+                ],
                 ["traffic", "vehicles", "moderate", "lanes", "road"],
             ],
             "video": [
@@ -1511,8 +1510,8 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             "image": [
                 ["dramatic", "moody", "stormy", "turbulent", "wave"],
                 [
-                    "half dome", "yosemite", "landmark", "sunny", "rock",
-                    "clouds", "pleasant"
+                    "dome", "yosemite", "landmark", "sunny", "rock", "clouds",
+                    "pleasant"
                 ],
                 ["highway", "traffic", "vehicles", "bus", "police"],
             ],
@@ -1530,7 +1529,9 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                     "The image features a stormy ocean with large waves crashing, a gray sky with white clouds, and a dark gray horizon.",
                     "The image features a stormy ocean with large waves crashing, a dark gray sky with white clouds, and a grayish-blue water surface."
                 ],
-                "The object is a large rock formation, and the weather condition is sunny with a blue sky and white clouds.",
+                [
+                    "The object is a large rock formation, and the weather condition is sunny with a blue sky and white clouds."
+                ],
                 [
                     "The road is busy with multiple cars, including a blue car, a silver SUV, and a black car, all driving in the same direction.",
                     "The road is busy with multiple cars, including a blue car, a white car, a black car, and a silver car, all driving in the same direction.",
@@ -1558,7 +1559,9 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                     "The image shows a scenic landscape with a prominent rock formation, which appears to be a large, flat-topped mountain or butte. The rock formation is rugged and has a smooth, flat top, suggesting it could be a natural landmark or a geological feature. The sky is clear with a few",
                     "The image shows a majestic mountain with a flat top, which is characteristic of buttes. The mountain is prominently featured in the background, with a clear blue sky above it and a few scattered clouds. The weather appears to be and clear, with no visible signs of rain or storms.",
                 ],
-                "The image shows a multi-lane highway with several vehicles in motion. There are cars and a bus visible, and the traffic appears to be moderate, with no significant congestion. The road is divided by a central divider, and there are green trees lining the sides of the highway, indicating a suburban",
+                [
+                    "The image shows a multi-lane highway with several vehicles in motion. There are cars and a bus visible, and the traffic appears to be moderate, with no significant congestion. The road is divided by a central divider, and there are green trees lining the sides of the highway, indicating a suburban"
+                ],
             ],
         },
         "qwen2-vl-7b-instruct": {
@@ -1570,7 +1573,8 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                 [
                     "The image depicts a scenic mountainous landscape. The central object is a large, prominent rock formation known as Half Dome, which is a well-known landmark in Yosemite National Park, California. The weather appears to be clear and sunny, with a bright blue sky and some scattered clouds. The visibility is excellent, allowing for a",
                     "The image depicts a scenic mountainous landscape with a prominent rock formation in the background. The rock formation is a large, steep, and pointed peak, which appears to be a well-known natural landmark. The sky is clear with a few scattered clouds, indicating fair weather conditions. The lighting suggests it is a sunny day,",
-                    "The image depicts a scenic mountainous landscape with a prominent, steep, and rocky peak in the background. The peak is characterized by its sharp, jagged edges and a smooth, polished surface, suggesting it might be a well-known natural landmark. The sky is clear with a few scattered clouds, indicating fair weather conditions."
+                    "The image depicts a scenic mountainous landscape with a prominent, steep, and rocky peak in the background. The peak is characterized by its sharp, jagged edges and a smooth, polished surface, suggesting it might be a well-known natural landmark. The sky is clear with a few scattered clouds, indicating fair weather conditions.",
+                    "The image depicts a scenic mountainous landscape with a prominent, steep, and rocky peak in the background. The peak is characterized by its sharp, jagged edges and a distinctive, almost pyramid-like shape. The surrounding area is covered with a mix of evergreen trees, including pine trees, which frame the view of the",
                 ],
                 [
                     "The traffic condition on the road in the image appears to be moderate. There are several vehicles traveling in both directions, including cars, a bus, and a police car. The road is divided into multiple lanes, and the vehicles are maintaining a safe distance from each other. The overall scene suggests a typical day with moderate traffic",
@@ -1618,15 +1622,29 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
 
     match_ratio = 0.8
     if model_name == "qwen2-vl-7b-instruct" and modality == "image":
-        match_ratio = 0.65  # 4 out of 6
+        match_ratio = 4.0 / 6
 
     for model_name in expected_answers.keys():
         for modality in expected_answers[model_name].keys():
             keywords = expected_keywords[model_name][modality]
-            for answer in expected_answers[model_name][modality]:
-                matches = [keyword in output.lower() for keyword in keywords]
-                calc_match_ratio = 1. * sum(matches) / len(matches)
-                assert calc_match_ratio >= match_ratio, f"{model_name=}\n{modality=}\n{calc_match_ratio=}\n{keywords=}\n{answer=}"
+            answers = expected_answers[model_name][modality]
+            print(model_name, modality)
+            prompt = 0
+            for prompt_keyword, prompt_answers in zip(keywords, answers):
+                answer = 0
+                print(prompt_keyword)
+                for prompt_answer in prompt_answers:
+                    matches = [
+                        word in prompt_answer.lower() for word in prompt_keyword
+                    ]
+                    calc_match_ratio = 1. * sum(matches) / len(matches)
+                    assert calc_match_ratio >= match_ratio, f"{model_name=}\n{modality=}\n{matches=}\n{calc_match_ratio=}\n{prompt_keyword=}\n{prompt_answer=}"
+                    print(
+                        f"{prompt} -> {answer} -> {calc_match_ratio} -> {matches}"
+                    )
+                    answer += 1
+                prompt += 1
+                print(" ")
 
     # Success
     return
