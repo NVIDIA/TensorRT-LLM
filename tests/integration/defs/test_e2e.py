@@ -1522,35 +1522,6 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         },
     }
 
-    match_ratio = 4.0 / 5
-    if model_name == "qwen2-vl-7b-instruct" and modality == "image":
-        match_ratio = 4.0 / 6
-
-    for model_name in expected_answers.keys():
-        for modality in expected_answers[model_name].keys():
-            keywords = expected_keywords[model_name][modality]
-            answers = expected_answers[model_name][modality]
-            print(model_name, modality)
-            prompt = 0
-            for prompt_keyword, prompt_answers in zip(keywords, answers):
-                answer = 0
-                print(prompt_keyword)
-                for prompt_answer in prompt_answers:
-                    matches = [
-                        word in prompt_answer.lower() for word in prompt_keyword
-                    ]
-                    calc_match_ratio = 1. * sum(matches) / len(matches)
-                    assert calc_match_ratio >= match_ratio, f"{model_name=}\n{modality=}\n{matches=}\n{calc_match_ratio=}\n{prompt_keyword=}\n{prompt_answer=}"
-                    print(
-                        f"{prompt} -> {answer} -> {calc_match_ratio} -> {matches}"
-                    )
-                    answer += 1
-                prompt += 1
-                print(" ")
-
-    # Success
-    return
-
     cmd = [
         str(example_root / "quickstart_multimodal.py"),
         "--model_dir",
@@ -1584,12 +1555,17 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                 item = item[end:]
         return results
 
-    for output, keywords in zip(parse_output(output),
-                                expected_keywords[model_name][modality]):
-        matches = [keyword in output.lower() for keyword in keywords]
-        calc_match_ratio = 1. * sum(matches) / len(matches)
-        calc_match_ratio = 0.0
-        assert calc_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{output}\"\nExpected keywords \"{keywords}\"\n Matched keywords: {matches}\n match ratio {calc_match_ratio} below threshold {match_ratio}"
+    match_ratio = 4.0 / 5
+    if model_name == "qwen2-vl-7b-instruct" and modality == "image":
+        match_ratio = 4.0 / 6
+
+    for prompt_output, prompt_keywords in zip(
+            parse_output(output), expected_keywords[model_name][modality]):
+        matches = [
+            keyword in prompt_output.lower() for keyword in prompt_keywords
+        ]
+        obs_match_ratio = 1. * sum(matches) / len(matches)
+        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}"
 
     print("All answers are correct!")
 
