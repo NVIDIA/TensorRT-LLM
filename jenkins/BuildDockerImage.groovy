@@ -17,7 +17,7 @@ LLM_BRANCH_TAG = LLM_BRANCH.replaceAll('/', '_')
 
 BUILD_JOBS = "32"
 
-def createKubernetesPodConfig(type)
+def createKubernetesPodConfig(type, arch = "amd64")
 {
     def targetCould = "kubernetes-cpu"
     def containerConfig = ""
@@ -75,6 +75,7 @@ def createKubernetesPodConfig(type)
                 nodeSelector:
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux
+                  kubernetes.io/arch: ${arch}
                 containers:
                   ${containerConfig}
                   - name: jnlp
@@ -96,9 +97,10 @@ def createKubernetesPodConfig(type)
 }
 
 
-def buildImage(target, action="build", torchInstallType="skip", args="", custom_tag="", post_tag="")
+def buildImage(target, action="build", torchInstallType="skip", args="", custom_tag="", post_tag="", is_sbsa=false)
 {
-    def tag = "x86_64-${target}-torch_${torchInstallType}${post_tag}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
+    def arch = is_sbsa ? "sbsa" : "x86_64"
+    def tag = "${arch}-${target}-torch_${torchInstallType}${post_tag}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
     // Step 1: cloning tekit source code
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
@@ -164,38 +166,6 @@ def buildImage(target, action="build", torchInstallType="skip", args="", custom_
             }
             if (containerGenFailure != null) {
                 throw containerGenFailure
-            }
-        }
-    }
-}
-
-
-def triggerSBSARemoteJob(action, type)
-{
-    script
-    {
-        def parameters = """
-            token=L1_Nightly_Token
-            hostJobName=${JOB_NAME}
-            hostBuildNumber=${BUILD_NUMBER}
-            gitlabBranch=${LLM_BRANCH}
-            action=${action}
-            type=${type}
-        """.stripIndent()
-
-        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE')
-        {
-            def handle = triggerRemoteJob(
-                job: "https://prod.blsm.nvidia.com/sw-tensorrt-static-1/job/LLM/job/helpers/job/gh200-BuildImage/",
-                auth: CredentialsAuth(credentials: "STATIC_1_TOKEN"),
-                parameters: parameters,
-                pollInterval: 60,
-                abortTriggeredJob: true,
-            )
-            def status = handle.getBuildResult().toString()
-
-            if (status != "SUCCESS") {
-                error "Downstream job did not succeed"
             }
         }
     }
@@ -290,11 +260,11 @@ pipeline {
                 }
                 stage("Build SBSA-skip") {
                     agent {
-                        kubernetes createKubernetesPodConfig("agent")
+                        kubernetes createKubernetesPodConfig("build", "arm64")
                     }
                     steps
                     {
-                        triggerSBSARemoteJob(params.action, "skip")
+                        buildImage("devel", params.action, "skip", "", "", "", true)
                     }
                 }
                 stage("Build SBSA-pre_cxx11_abi") {
