@@ -1292,6 +1292,38 @@ void WindowBlockManager::storeBlocks(
     }
 }
 
+void WindowBlockManager::storeBlock(BlockKey const& blockKey, KVCacheBlock::IdType blockId, BlockPtr const& prevBlock)
+{
+    TLLM_CHECK(prevBlock != nullptr && prevBlock->getPrevBlock() != nullptr);
+    TLLM_LOG_DEBUG("%s::storeBlock - store block %d", mLogPrefix.c_str(), blockId);
+    auto& block = mAllBlocksById[blockId];
+    block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
+    block->setPrevBlock(prevBlock);
+    block->setPrevBlockInSeq(prevBlock);
+    if (prevBlock != nullptr)
+    {
+        prevBlock->addNextBlock(blockKey, block);
+    }
+
+    // Sanity check. The list of stored blocks should be connected.
+    TLLM_CHECK(block->getPrevBlockInSeq() == nullptr || block->getPrevBlockInSeq()->getHash() == prevBlock->getHash());
+    auto oldHash = block->getHash();
+    auto newHash = BlockKeyHasher()(blockKey, prevBlock->getHash());
+    if (oldHash != newHash)
+    {
+        TLLM_LOG_DEBUG("#%d block hash %zx -> %zx", block->getBlockId(), oldHash, newHash);
+        removeBlockFromHashMap(block);
+        block->setHash(newHash);
+        addBlockToHashMap(block);
+    }
+    if (mEventManager)
+    {
+        std::vector<BlockPtr> storedBlocks;
+        storedBlocks.push_back(block);
+        mEventManager->enqueueStoredEvent(storedBlocks);
+    }
+}
+
 void BlockManager::replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx)
 {
     mWindowBlockManagers.at(windowSize).replaceSharedBlock(sequence, blockIdx);
@@ -1459,7 +1491,22 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
     }
     auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, true);
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
-    storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+    if (blockedUniqueTokens.size() < 2)
+    {
+        storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+        return;
+    }
+
+    auto prevBlock = mAllBlocksById.at(cacheBlockIds[beamIdx][cacheBlockIds[beamIdx].size() - 2]);
+
+    // If the previous block is not in the radix tree, we don't need to store the new block
+    if (prevBlock->getPrevBlock() == nullptr)
+    {
+        storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+        return;
+    }
+
+    storeBlock(blockKeys.back(), cacheBlockIds[beamIdx].back(), prevBlock);
 }
 
 void WindowBlockManager::storeBlocksForReuse(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
