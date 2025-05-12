@@ -18,7 +18,7 @@
 /tensorrt_llm/_torch/custom_ops @yizhang-nv
 /tensorrt_llm/_torch/distributed @yilin-void @yuxianq @hyukn @yizhang-nv @hlu1
 /tensorrt_llm/_torch/peft @byshiue @shaharmor98
-/tensorrt_llm/_torch/pyexecutor @dongxuy04 @funatiq @dcampora @HuiGao-NV
+/tensorrt_llm/_torch/pyexecutor @dongxuy04 @HuiGao-NV
 /tensorrt_llm/_torch/speculative @lfr-0531 @mikeiovine
 /tensorrt_llm/_torch/models/modeling_deepseekv3.py @hlu1 @zongfeijing
 /tensorrt_llm/_torch/models/modeling_llama.py @chang-l @mikeiovine
