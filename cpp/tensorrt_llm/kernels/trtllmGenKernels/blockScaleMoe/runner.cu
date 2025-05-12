@@ -55,7 +55,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t num_tokens, int
     int32_t* cta_idx_xy_to_batch_idx, int32_t* cta_idx_xy_to_mn_limit, int32_t* num_non_exiting_ctas,
     tg::Dtype dtypeElt, bool use_routing_scales_on_input, bool use_deep_seek_fp8, cudaStream_t stream)
 {
-    if (top_k == 8)
+    if (n_group > 0 && topk_group > 0 && topk_group <= 4 && top_k <= 8)
     {
         std::vector<int32_t> selectedIndex;
         for (size_t ii = 0; ii < PermuteGemm1::gemmList.size(); ii++)
@@ -110,7 +110,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t num_tokens, int
         routingData.mUseRoutingSoftmax = false;
         moe::dev::routing::run(routingData, stream);
     }
-    else if (top_k == 1)
+    else if (n_group <= 0 && topk_group <= 0 && top_k == 1)
     {
         std::vector<int32_t> selectedIndex;
         for (size_t ii = 0; ii < PermuteGemm1::gemmList.size(); ii++)
@@ -167,7 +167,11 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t num_tokens, int
     }
     else
     {
-        TLLM_CHECK_ERROR(false, "top_k can only be 1 or 8.");
+        // check for DeepSeek-style routing with groups
+        TLLM_CHECK_ERROR(
+            n_group > 0 && topk_group > 0, "For group-based routing, must have topk_group <= 4 && top_k <= 8.");
+        // here we are using Llama4-style routing without groups
+        TLLM_CHECK_ERROR(false, "For non-group-based routing, must have top_k == 1.");
     }
 }
 } // namespace Routing

@@ -853,31 +853,29 @@ def test_moe_fp4(num_tokens, expert_info, hidden_size, intermediate_size):
     getSMVersion(),
 )
 @pytest.mark.parametrize("num_tokens", [1, 2, 16, 64, 1024])
-@pytest.mark.parametrize("num_experts", [128])
+@pytest.mark.parametrize("expert_info", [(128, 0, 0, 1, True),
+                                         (128, 8, 4, 8, False)])
 @pytest.mark.parametrize("hidden_size", [2048])
 @pytest.mark.parametrize("intermediate_size", [2048])
-@pytest.mark.parametrize("use_routing_scales_on_input", [True, False])
-def test_moe_fp8_per_tensor_scale(num_tokens, num_experts, hidden_size,
-                                  intermediate_size,
-                                  use_routing_scales_on_input):
+def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
+                                  intermediate_size):
     torch.random.manual_seed(0)
 
     #
     # Data Generation
     #
-    top_k = 8 if not use_routing_scales_on_input else 1
+    num_experts, n_groups, top_k_groups, top_k, use_routing_scales_on_input = expert_info
+    # FIXME: set to TileN size
     padding = 8
-    n_groups = 8
-    top_k_groups = 4
     routed_scaling = 2.5
 
     assert top_k <= num_experts
     assert top_k <= 8
     assert top_k_groups <= 4
     assert num_experts > n_groups
-    assert num_experts % n_groups == 0
+    assert n_groups == 0 or num_experts % n_groups == 0
     assert num_experts % 4 == 0
-    assert top_k < (top_k_groups * num_experts / n_groups)
+    assert n_groups == 0 or top_k < (top_k_groups * num_experts / n_groups)
     assert hidden_size % 128 == 0
     assert intermediate_size % 128 == 0
 
