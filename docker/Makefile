@@ -29,8 +29,14 @@ DOCKER_BUILD_OPTS  ?= --pull --load
 DOCKER_BUILD_ARGS  ?=
 DOCKER_PROGRESS    ?= auto
 CUDA_ARCHS         ?=
+BUILD_ARCH         ?= $(shell uname -m)
+BUILD_ARCH_ARGS    ?=
+ifeq ($(BUILD_ARCH),aarch64)
+  BUILD_ARCH_ARGS = -a '90-real;100-real;120-real'
+endif
+
 BUILD_WHEEL_OPTS   ?=
-BUILD_WHEEL_ARGS   ?= $(shell grep 'ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))
+BUILD_WHEEL_ARGS   ?= $(shell grep 'ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))$(if $(BUILD_ARCH_ARGS), $(BUILD_ARCH_ARGS))
 TORCH_INSTALL_TYPE ?= skip
 CUDA_VERSION       ?=
 CUDNN_VERSION      ?=
@@ -81,6 +87,7 @@ endef
 		$(if $(GIT_COMMIT), --build-arg GIT_COMMIT="$(GIT_COMMIT)") \
 		$(if $(GITHUB_MIRROR), --build-arg GITHUB_MIRROR="$(GITHUB_MIRROR)") \
 		$(if $(PYTHON_VERSION), --build-arg PYTHON_VERSION="$(PYTHON_VERSION)") \
+		$(if $(BUILD_ARCH), --build-arg BUILD_ARCH="$(BUILD_ARCH)") \
 		$(if $(STAGE), --target $(STAGE)) \
 		--file Dockerfile.multi \
 		--tag $(IMAGE_WITH_TAG) \
@@ -179,6 +186,7 @@ ubuntu22_%: BASE_TAG = 12.9.0-devel-ubuntu22.04
 trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0
 trtllm_%: DEVEL_IMAGE = $(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
+trtllm_sbsa_%: DEVEL_IMAGE = $(shell grep 'LLM_SBSA_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 trtllm_%: IMAGE_NAME = $(shell grep 'IMAGE_NAME = ' ../jenkins/BuildDockerImage.groovy | grep -o '".*"' | tr -d '"')
 trtllm_%: IMAGE_TAG = $(shell git rev-parse --abbrev-ref HEAD | tr '/' '_')
 trtllm_run: WORK_DIR = /app/tensorrt_llm
