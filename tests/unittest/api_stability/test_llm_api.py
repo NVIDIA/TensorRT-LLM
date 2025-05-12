@@ -20,6 +20,7 @@ class TestSamplingParams(ApiStabilityTestHarness):
     def test_get_sampling_config(self):
         expected_fields = {
             "beam_width",
+            "beam_width_array",
             "top_k",
             "top_p",
             "top_p_min",
@@ -37,7 +38,6 @@ class TestSamplingParams(ApiStabilityTestHarness):
             "no_repeat_ngram_size",
             "num_return_sequences",
             "min_p",
-            "beam_width_array",
         }
         found_fields = {
             f
