@@ -1,0 +1,733 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Scheduler &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'torch/scheduler';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Scheduler</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="scheduler">
+<h1>Scheduler<a class="headerlink" href="#scheduler" title="Link to this heading">#</a></h1>
+<p>TensorRT-LLM PyTorch backend employs inflight batching, a mechanism where batching and scheduling occur dynamically at each LLM step.
+The scheduler is invoked to determine which requests are scheduled at the current step.</p>
+<section id="scheduler-introduction">
+<h2>Scheduler Introduction<a class="headerlink" href="#scheduler-introduction" title="Link to this heading">#</a></h2>
+<p>There are two kinds of schedulers:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">CapacityScheduler</span></code>: This scheduler decides if resources should be allocated for each active request.
+It considers the KV cache capacity and other resources, if applicable.
+The input to <code class="docutils literal notranslate"><span class="pre">CapacityScheduler</span></code> includes all active requests that need processing.
+The primary output is <code class="docutils literal notranslate"><span class="pre">fitting_requests</span></code>, representing the requests for which resources are reserved at the current step.
+Another output is <code class="docutils literal notranslate"><span class="pre">paused_requests</span></code>, which supports request pausing in the C++ runtime.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">MicroBatchScheduler</span></code>: This scheduler selects some requests from <code class="docutils literal notranslate"><span class="pre">fitting_requests</span></code> chosen by <code class="docutils literal notranslate"><span class="pre">CapacityScheduler</span></code>.
+Another input is <code class="docutils literal notranslate"><span class="pre">inflight_request_ids</span></code>, which supports pipeline parallelism or overlapped execution in the C++ runtime.
+Since PyTorch Flow does not support pipeline parallelism, <code class="docutils literal notranslate"><span class="pre">inflight_request_ids</span></code> is an empty set.
+The outputs are <code class="docutils literal notranslate"><span class="pre">context_requests</span></code> and <code class="docutils literal notranslate"><span class="pre">generation_requests</span></code>, which are the scheduled context and generation requests.
+Requests not in these lists are not selected for the model forward pass.</p></li>
+</ul>
+<p><code class="docutils literal notranslate"><span class="pre">SimpleScheduler</span></code> combines these two schedulers, first using <code class="docutils literal notranslate"><span class="pre">CapacityScheduler</span></code> and then <code class="docutils literal notranslate"><span class="pre">MicroBatchScheduler</span></code>, to get the final schedule result.
+The inputs to <code class="docutils literal notranslate"><span class="pre">SimpleScheduler</span></code> include <code class="docutils literal notranslate"><span class="pre">active_requests</span></code> and <code class="docutils literal notranslate"><span class="pre">inflight_request_ids</span></code>, and the outputs are <code class="docutils literal notranslate"><span class="pre">context_requests</span></code>, <code class="docutils literal notranslate"><span class="pre">generation_requests</span></code>, and <code class="docutils literal notranslate"><span class="pre">paused_requests</span></code>.</p>
+</section>
+<section id="customize-your-own-scheduler">
+<h2>Customize Your Own Scheduler<a class="headerlink" href="#customize-your-own-scheduler" title="Link to this heading">#</a></h2>
+<p>To customize the scheduler or batching mechanism, implement your own <code class="docutils literal notranslate"><span class="pre">CapacityScheduler</span></code> and <code class="docutils literal notranslate"><span class="pre">MicroBatchScheduler</span></code> by inheriting their respective classes.
+If two-step scheduling is unnecessary, inherit <code class="docutils literal notranslate"><span class="pre">RequestScheduler</span></code> and implement <code class="docutils literal notranslate"><span class="pre">schedule_request</span></code> directly.</p>
+<p>An example of a <code class="docutils literal notranslate"><span class="pre">CapacityScheduler</span></code> implementation is the <code class="docutils literal notranslate"><span class="pre">GuaranteedNoEvictScheduler</span></code> class, found in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/scheduler.py">scheduler.py</a>.
+This class was used before the C++ binding of <code class="docutils literal notranslate"><span class="pre">CapacityScheduler</span></code> and initially employed a Python-based scheduler.
+It inherits <code class="docutils literal notranslate"><span class="pre">CapacityScheduler</span></code> and implements its own <code class="docutils literal notranslate"><span class="pre">schedule_request</span></code> method.
+This method processes all <code class="docutils literal notranslate"><span class="pre">active_requests</span></code> and tries to schedule more requests that can fit in the KV cache.
+Resource estimation should align with resource allocation and deallocation in <code class="docutils literal notranslate"><span class="pre">kv_cache_manager</span></code>.</p>
+<p>Here is the code snippet:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">GuaranteedNoEvictScheduler</span><span class="p">(</span><span class="n">CapacityScheduler</span><span class="p">):</span>
+    <span class="c1"># only schedule requests has no_schedule_until_state &lt;= state &lt; no_schedule_after_state</span>
+    <span class="n">no_schedule_until_state</span> <span class="o">=</span> <span class="n">LlmRequestState</span><span class="o">.</span><span class="n">CONTEXT_INIT</span>
+    <span class="n">no_schedule_after_state</span> <span class="o">=</span> <span class="n">LlmRequestState</span><span class="o">.</span><span class="n">GENERATION_COMPLETE</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">max_num_requests</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">kv_cache_manager</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">(</span><span class="n">GuaranteedNoEvictScheduler</span><span class="p">,</span> <span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_num_requests</span> <span class="o">=</span> <span class="n">max_num_requests</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span> <span class="o">=</span> <span class="n">kv_cache_manager</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">schedule_request</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">active_requests</span><span class="p">:</span> <span class="n">RequestList</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="n">LlmRequest</span><span class="p">],</span> <span class="nb">list</span><span class="p">[</span><span class="n">LlmRequest</span><span class="p">]]:</span>
+        <span class="n">scheduled_requests</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">pending_requests</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">reserved_blocks</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="n">max_blocks</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">get_max_resource_count</span><span class="p">()</span>
+        <span class="k">for</span> <span class="n">request</span> <span class="ow">in</span> <span class="n">active_requests</span><span class="p">:</span>
+            <span class="n">req_state</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">state</span>
+            <span class="c1"># if request cannot be scheduled yet or request should no longer be scheduled, skip</span>
+            <span class="k">if</span> <span class="n">req_state</span><span class="o">.</span><span class="n">value</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">no_schedule_until_state</span><span class="o">.</span><span class="n">value</span> <span class="ow">or</span> <span class="n">req_state</span><span class="o">.</span><span class="n">value</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">no_schedule_after_state</span><span class="o">.</span><span class="n">value</span><span class="p">:</span>
+                <span class="k">continue</span>
+
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">scheduled_requests</span>
+                   <span class="p">)</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_requests</span> <span class="ow">or</span> <span class="n">reserved_blocks</span> <span class="o">&gt;=</span> <span class="n">max_blocks</span><span class="p">:</span>
+                <span class="k">break</span>
+            <span class="k">elif</span> <span class="n">req_state</span> <span class="o">==</span> <span class="n">LlmRequestState</span><span class="o">.</span><span class="n">GENERATION_IN_PROGRESS</span> <span class="ow">or</span> <span class="n">req_state</span> <span class="o">==</span> <span class="n">LlmRequestState</span><span class="o">.</span><span class="n">GENERATION_TO_COMPLETE</span><span class="p">:</span>
+                <span class="n">scheduled_requests</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
+                <span class="n">reserved_blocks</span> <span class="o">+=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">get_needed_resource_to_completion</span><span class="p">(</span>
+                    <span class="n">request</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">pending_requests</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
+
+        <span class="n">avaiable_blocks</span> <span class="o">=</span> <span class="n">max_blocks</span> <span class="o">-</span> <span class="n">reserved_blocks</span>
+        <span class="k">for</span> <span class="n">request</span> <span class="ow">in</span> <span class="n">pending_requests</span><span class="p">:</span>
+            <span class="n">req_state</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">state</span>
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">scheduled_requests</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_requests</span><span class="p">:</span>
+                <span class="k">break</span>
+            <span class="k">elif</span> <span class="n">req_state</span> <span class="o">==</span> <span class="n">LlmRequestState</span><span class="o">.</span><span class="n">CONTEXT_INIT</span><span class="p">:</span>
+                <span class="n">needed_blocks</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">get_needed_resource_to_completion</span><span class="p">(</span>
+                    <span class="n">request</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">needed_blocks</span> <span class="o">&lt;=</span> <span class="n">avaiable_blocks</span><span class="p">:</span>
+                    <span class="n">scheduled_requests</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
+                    <span class="n">avaiable_blocks</span> <span class="o">-=</span> <span class="n">needed_blocks</span>
+                <span class="k">elif</span> <span class="n">needed_blocks</span> <span class="o">&gt;</span> <span class="n">avaiable_blocks</span><span class="p">:</span>
+                    <span class="c1"># If one requests fails to be scheduled, break</span>
+                    <span class="k">break</span>
+
+        <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">scheduled_requests</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">,</span> <span class="p">(</span>
+            <span class="s2">&quot;no pending request can get enough resource to complete, &quot;</span>
+            <span class="s2">&quot;please increase KV cache pool size.&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">scheduled_requests</span><span class="p">,</span> <span class="p">[]</span>
+</pre></div>
+</div>
+<p>After implementing your own scheduler, integrate it into the PyExecutor.
+For the PyTorch backend, the code is in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py">py_executor_creator.py</a>.
+In the <code class="docutils literal notranslate"><span class="pre">create_pytorch_model_based_executor</span></code> function, there are two lines creating <code class="docutils literal notranslate"><span class="pre">CapacityScheduler</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span>    <span class="n">capacitor_scheduler</span> <span class="o">=</span> <span class="n">BindCapacityScheduler</span><span class="p">(</span><span class="n">max_num_requests</span><span class="p">,</span>
+                                                <span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">impl</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Similar adjustments can be made for <code class="docutils literal notranslate"><span class="pre">MicroBatchScheduler</span></code>. This allows the <code class="docutils literal notranslate"><span class="pre">PyExecutor</span></code> to execute with your customized scheduling logic.</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#scheduler-introduction">Scheduler Introduction</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#customize-your-own-scheduler">Customize Your Own Scheduler</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

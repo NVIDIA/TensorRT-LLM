@@ -1,0 +1,877 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Tuning Max Batch Size and Max Num Tokens &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Deciding Model Sharding Strategy" href="deciding-model-sharding-strategy.html" />
+    <link rel="prev" title="Useful Build-Time Flags" href="useful-build-time-flags.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 current active has-children"><a class="reference internal" href="index.html">Performance Tuning Guide</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    
+    <li class="breadcrumb-item"><a href="index.html" class="nav-link">Performance Tuning Guide</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Tuning Max Batch Size and Max Num Tokens</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="tuning-max-batch-size-and-max-num-tokens">
+<span id="id1"></span><h1>Tuning Max Batch Size and Max Num Tokens<a class="headerlink" href="#tuning-max-batch-size-and-max-num-tokens" title="Link to this heading">#</a></h1>
+<p>One of TensorRT-LLM’s key features is it’s inflight batching scheduler and runtime that handles simultaneously scheduling and executing requests in both context and generation phases. Max-Num tokens, in conjunction with Max-Batch size dictates how and when the scheduler schedules new and current requests, and understanding their role and how to tune them can provide significant performance benefits.</p>
+<blockquote>
+<div><p>Disclaimer: While performance numbers shown here are real, they are only for demonstration purposes. Differences in environment, SKU, interconnect, and workload can all significantly affect performance and lead to your results differing from what is shown here.</p>
+</div></blockquote>
+<section id="understanding-the-tensorrt-llm-scheduler">
+<h2>Understanding the TensorRT-LLM scheduler<a class="headerlink" href="#understanding-the-tensorrt-llm-scheduler" title="Link to this heading">#</a></h2>
+<p>This section visualizes how TensorRT-LLM schedules requests based on max-batch size and max-num tokens. The example starts out with a newly initialized engine as well as a few unscheduled requests that have come in. For the sake of this example, toy values are set to <code class="docutils literal notranslate"><span class="pre">max</span> <span class="pre">batch</span> <span class="pre">size</span> <span class="pre">=</span> <span class="pre">4</span></code> and <code class="docutils literal notranslate"><span class="pre">max</span> <span class="pre">num</span> <span class="pre">tokens</span> <span class="pre">=</span> <span class="pre">12</span></code>. Each square block represents a token, and its color represents which request it belongs to.</p>
+<p><img alt="TRT-LLM Scheduler Visualization 1" src="../../_images/TRTLLM_Scheduler_Vis_1.svg" /></p>
+<p>Now the scheduler takes the first two requests, Request 1 and Request 2, and schedules them to execute the context phase. However, it cannot schedule any more requests because the prompts of the first two requests had 5 tokens each, leaving a budget of 2 tokens due to the max num tokens limit. Since all remaining requests have more than 2 prompt tokens none of them can be scheduled (context chunking can help in this situation, see the paged context attention section below). The tokens are marked with a “C” on them to represent that they are prompt tokens that were processed in the context phase.</p>
+<blockquote>
+<div><p>Note: The tokens for different requests are shown on different rows simply for visualization purposes and are not representative of actual memory layouts</p>
+</div></blockquote>
+<p><img alt="TRT-LLM Scheduler Visualization 2" src="../../_images/TRTLLM_Scheduler_Vis_2.svg" /></p>
+<p>Now the engine runs an iteration of execution, completing the context phases for both of the scheduled requests. After it is done, the kv-cache of the prompts for both requests have been created and the first token has been generated. Tokens that were generated are marked with “G(n)” - for example a token marked “G1” represents that it is the first token generated for its request.</p>
+<p>TRT-LLM prioritizes scheduling requests in generation phase first so the two generated tokens are queued to be processed in the next iteration. Now, since the two previously scheduled requests have entered generation phase and only take up two tokens out of the max num token budget of 12, the scheduler is able to schedule two additional requests, Request 3 and Request 4. It cannot schedule the last request, Request 5, even though there is space for it in the max num tokens budget because of the max batch size limit of 4.</p>
+<p><img alt="TRT-LLM Scheduler Visualization 3" src="../../_images/TRTLLM_Scheduler_Vis_3.svg" /></p>
+<p>After the next iteration of execution, the second tokens for Requests 1 and 2 have been generated, and the first tokens for Request 3 and 4 have been generated. Lets say that G2 that was generated for Request 1 is the stop token, signifying that Request 1 is completed. In this case the scheduler would evict Request 1 before performing another execution iteration and prepare to return it to the user. This eviction puts the state of the engine below the max batch size limit and allows Request 5 to be scheduled.</p>
+<p>Another thing to note is that G1 that was generated for Request 2 has been added to the kv-cache for request 2, representing how kv-cache for a request grows as more and more tokens are generated.</p>
+<p><img alt="TRT-LLM Scheduler Visualization 4" src="../../_images/TRTLLM_Scheduler_Vis_4.svg" /></p>
+<p>Overall, the max batch size and max num tokens limits play a key part in deciding when requests are actually executed, and tuning them can have significant impacts on throughput numbers as well as how the engine balances previously scheduled requests in generation phase with context phase on new requests</p>
+<blockquote>
+<div><p>Note: This presents a simplified visualization of the scheduler to highlight how max batch size and max num tokens affect it. The scheduler also considers things like amount of free memory available to be used for kv-cache and has other configurable options that can affect its behavior. See the Runtime Flags of the Additional Options page for more on this.</p>
+</div></blockquote>
+</section>
+<section id="tuning-max-batch-size">
+<h2>Tuning Max Batch Size<a class="headerlink" href="#tuning-max-batch-size" title="Link to this heading">#</a></h2>
+<p>It is important to set the max batch size large enough that it doesn’t bottleneck the scheduling of new requests. Due to this it’s recommended to test additional values of max batch size for your workload. The default value is 2048. Powers of 2 are good initial values to sweep through.</p>
+<section id="how-to-change-max-batch-size">
+<h3>How to change Max Batch Size<a class="headerlink" href="#how-to-change-max-batch-size" title="Link to this heading">#</a></h3>
+<p>You can specify the max batch size in the build config.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">build_config</span> <span class="o">=</span> <span class="n">BuildConfig</span><span class="p">(</span>
+    <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">512</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>If you are using the <a class="reference internal" href="benchmarking-default-performance.html#building-and-saving-engines-via-cli"><span class="std std-ref">CLI flow for building engines</span></a> pass <code class="docutils literal notranslate"><span class="pre">--max_batch_size</span> <span class="pre">&lt;int&gt;</span></code> to <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> to tune max batch size.</p>
+</section>
+<section id="tuning-case-study">
+<h3>Tuning Case Study<a class="headerlink" href="#tuning-case-study" title="Link to this heading">#</a></h3>
+<p>Continuing with our case study of Llama-3.3-70B on 4 H100s, we pick up where left off in the previous section (building an engine with multiple profiles, gemm plugin, paged context attention, and reduce fusion enabled). Sweeping across max batch sizes of 64, 512, and the default 2048 produced the following results</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric</p></th>
+<th class="head"><p>Max Batch Size 64</p></th>
+<th class="head"><p>Max Batch Size 512</p></th>
+<th class="head"><p>Max Batch Size 2048</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Token Throughput (tokens/sec)</p></td>
+<td><p>1944.3031</p></td>
+<td><p>2466.7933</p></td>
+<td><p>2044.2628</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request Throughput (req/sec)</p></td>
+<td><p>0.9494</p></td>
+<td><p>1.2045</p></td>
+<td><p>0.9982</p></td>
+</tr>
+<tr class="row-even"><td><p>Average Time To First Token (ms)</p></td>
+<td><p>145.7607</p></td>
+<td><p>147.7876</p></td>
+<td><p>146.6628</p></td>
+</tr>
+<tr class="row-odd"><td><p>Average Inter-Token Latency (ms)</p></td>
+<td><p>14.6475</p></td>
+<td><p>14.6554</p></td>
+<td><p>14.4493</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>From this its clear a max batch size of 64 results in bottlenecking whereas a max batch size of 512 is the sweet spot, boosting throughput by almost 20% with negligible effect on latency.</p>
+</section>
+</section>
+<section id="tuning-max-num-tokens">
+<h2>Tuning Max Num Tokens<a class="headerlink" href="#tuning-max-num-tokens" title="Link to this heading">#</a></h2>
+<p>If max num tokens is too small it can bottleneck request scheduling. However if it is too large it can result in prompt tokens taking up too much memory (especially in long context workloads), not leaving enough for kv-cache and resulting in performance hits or even out of memory errors. The default value of max num tokens is is 8192. It’s recommended that you sweep across several values of max num tokens to identify the best number for your workload. Good values to try are powers of 2 &gt;= 1024. Since max num tokens and max batch size both affect scheduling, grid searching across combinations of them if possible is ideal.</p>
+<section id="how-to-change-max-num-tokens">
+<h3>How to change Max Num Tokens<a class="headerlink" href="#how-to-change-max-num-tokens" title="Link to this heading">#</a></h3>
+<p>Like Max Batch size, max num tokens is also specified in the build config.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">build_config</span> <span class="o">=</span> <span class="n">BuildConfig</span><span class="p">(</span>
+    <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">512</span>
+    <span class="n">max_num_tokens</span><span class="o">=</span><span class="mi">2048</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>If you are using the <a class="reference internal" href="benchmarking-default-performance.html#building-and-saving-engines-via-cli"><span class="std std-ref">CLI flow for building engines</span></a> pass <code class="docutils literal notranslate"><span class="pre">--max_num_tokens</span> <span class="pre">&lt;int&gt;</span></code> to <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> to tune max_num_tokens.</p>
+</section>
+<section id="id2">
+<h3>Tuning Case Study<a class="headerlink" href="#id2" title="Link to this heading">#</a></h3>
+<p>Sweeping across max num tokens values of 2048, 8192, and 16384 yielded the following performance numbers with max batch size set to 512.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric</p></th>
+<th class="head"><p>Max Num Tokens 2048</p></th>
+<th class="head"><p>Max Num Tokens 8192</p></th>
+<th class="head"><p>Max Num Tokens 16384</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Token Throughput (tokens/sec)</p></td>
+<td><p>2474.2581</p></td>
+<td><p>2466.7933</p></td>
+<td><p>2461.0165</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request Throughput (req/sec)</p></td>
+<td><p>1.2081</p></td>
+<td><p>1.2045</p></td>
+<td><p>1.2017</p></td>
+</tr>
+<tr class="row-even"><td><p>Average Time To First Token (ms)</p></td>
+<td><p>147.5742</p></td>
+<td><p>147.7876</p></td>
+<td><p>147.9623</p></td>
+</tr>
+<tr class="row-odd"><td><p>Average Inter-Token Latency (ms)</p></td>
+<td><p>14.6852</p></td>
+<td><p>14.6554</p></td>
+<td><p>14.6769</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>For this particular workload max num tokens of 2048 provides the best performance, but not by an extremely large margin. This reflects the reality that for any given workload tuning various flags can have varied impact. However it is important to check different values to ensure that you are not giving up large gains due to scheduling imbalances.</p>
+</section>
+</section>
+<section id="revisiting-paged-context-attention-and-context-chunking">
+<h2>Revisiting Paged Context Attention and Context Chunking<a class="headerlink" href="#revisiting-paged-context-attention-and-context-chunking" title="Link to this heading">#</a></h2>
+<p><a class="reference internal" href="useful-build-time-flags.html#paged-context-attention"><span class="std std-ref">Previously</span></a> we recommended enabling paged context attention even though in our case study it didn’t affect performance significantly. Having now understood the TensorRT-LLM scheduler we can now explain why this is beneficial. In short, we recommend enabling it because it enables context chunking, which allows the context phase of a request to be broken up into pieces and processed over several execution iterations, allowing the engine to provide a more stable balance of context and generation phase execution.</p>
+<p>The <a class="reference internal" href="#understanding-the-trt-llm-scheduler"><span class="xref myst">visualization</span></a> of the TensorRT-LLM scheduler showed that initially Request 3 couldn’t be scheduled because it would put the scheduler over the max-num tokens limit. However with context chunking, this is no longer the case, and the first chunk of Request 3 would be able to be scheduled.</p>
+<p><img alt="TRT-LLM Scheduler Visualization Chunked Context 1" src="../../_images/TRTLLM_Scheduler_Vis_Chunked_Context_1.svg" /></p>
+<p>This is extremely beneficial for several reasons. Firstly it eliminates the possibility of requests with large prompts relative to max num tokens being unable to be scheduled due to other requests that are already in-flight. In production workloads, this can help improve worst case TTFT numbers. Secondly it allows for setting smaller values of max num tokens since you no longer need max num tokens to be at least as large as the longest prompt you want to support. For long-context cases this is extremely important, because setting extremely large values of max-num tokens takes away from memory available to be used as kv-cache. Given that in the worst case scenario chunked context has minimal impact on performance but can significantly benefit it in many scenarios, it’s recommended that you always enable it.</p>
+</section>
+<section id="conclusion">
+<h2>Conclusion<a class="headerlink" href="#conclusion" title="Link to this heading">#</a></h2>
+<p>The TensorRT-LLM Scheduler plays a large role in performance, and properly tuning it can provide significant performance uplifts. In the case-study example, tuning max batch size and max num tokens provided the following boosts to performance when compared to the <a class="reference internal" href="useful-build-time-flags.html#conclusion"><span class="std std-ref">results from the previous page</span></a>:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric</p></th>
+<th class="head"><p>Build-Time Flags ON</p></th>
+<th class="head"><p>Tuned Max Batch Size and Max Num Tokens</p></th>
+<th class="head"><p>% Improvement</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Token Throughput (tokens/sec)</p></td>
+<td><p>2044.2628</p></td>
+<td><p>2474.2581</p></td>
+<td><p>21.03</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request Throughput (req/sec)</p></td>
+<td><p>0.9982</p></td>
+<td><p>1.2081</p></td>
+<td><p>21.03</p></td>
+</tr>
+<tr class="row-even"><td><p>Average Time To First Token (ms)</p></td>
+<td><p>146.6628</p></td>
+<td><p>147.5742</p></td>
+<td><p>-0.62</p></td>
+</tr>
+<tr class="row-odd"><td><p>Average Inter-Token Latency (ms)</p></td>
+<td><p>14.4493</p></td>
+<td><p>14.6852</p></td>
+<td><p>-1.63</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Interpreting these results, tuning max batch size and max num tokens significantly improved throughput and remained at par on latency (the slight drops are within run to run variance). Compared to the <a class="reference internal" href="benchmarking-default-performance.html#results"><span class="std std-ref">initial baseline</span></a> the tuned engine achieves the following uplifts:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric</p></th>
+<th class="head"><p>Baseline</p></th>
+<th class="head"><p>Build-Time Flags ON and Tuned Max Batch Size and Max Num Tokens</p></th>
+<th class="head"><p>% Improvement</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Token Throughput (tokens/sec)</p></td>
+<td><p>1564.3040</p></td>
+<td><p>2474.2581</p></td>
+<td><p>58.17</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request Throughput (req/sec)</p></td>
+<td><p>0.7638</p></td>
+<td><p>1.2081</p></td>
+<td><p>58.17</p></td>
+</tr>
+<tr class="row-even"><td><p>Average Time To First Token (ms)</p></td>
+<td><p>147.6976</p></td>
+<td><p>147.5742</p></td>
+<td><p>0.08</p></td>
+</tr>
+<tr class="row-odd"><td><p>Average Inter-Token Latency (ms)</p></td>
+<td><p>31.3276</p></td>
+<td><p>14.6852</p></td>
+<td><p>53.12</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="useful-build-time-flags.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Useful Build-Time Flags</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="deciding-model-sharding-strategy.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Deciding Model Sharding Strategy</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#understanding-the-tensorrt-llm-scheduler">Understanding the TensorRT-LLM scheduler</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tuning-max-batch-size">Tuning Max Batch Size</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#how-to-change-max-batch-size">How to change Max Batch Size</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tuning-case-study">Tuning Case Study</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tuning-max-num-tokens">Tuning Max Num Tokens</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#how-to-change-max-num-tokens">How to change Max Num Tokens</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id2">Tuning Case Study</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#revisiting-paged-context-attention-and-context-chunking">Revisiting Paged Context Attention and Context Chunking</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#conclusion">Conclusion</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

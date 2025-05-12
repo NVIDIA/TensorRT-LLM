@@ -1,0 +1,246 @@
+Runtime
+==========
+
+.. Here are files in the cpp/include/runtime
+.. We manually add subsection to enable detailed description in the future
+.. It is also doable to automatically generate this file and list all the modules in the conf.py
+bufferManager.h
+_______________
+
+.. doxygenfile:: bufferManager.h
+   :project: TensorRT-LLM
+
+common.h
+________
+
+.. doxygenfile:: common.h
+   :project: TensorRT-LLM
+
+cudaEvent.h
+___________
+
+.. doxygenfile:: cudaEvent.h
+   :project: TensorRT-LLM
+
+cudaStream.h
+____________
+
+.. doxygenfile:: cudaStream.h
+   :project: TensorRT-LLM
+
+decodingInput.h
+_______________
+
+.. doxygenfile:: decodingInput.h
+   :project: TensorRT-LLM
+
+decodingOutput.h
+________________
+
+.. doxygenfile:: decodingOutput.h
+   :project: TensorRT-LLM
+
+eagleBuffers.h
+______________
+
+.. doxygenfile:: eagleBuffers.h
+   :project: TensorRT-LLM
+
+explicitDraftTokensBuffers.h
+____________________________
+
+.. doxygenfile:: explicitDraftTokensBuffers.h
+   :project: TensorRT-LLM
+
+generationInput.h
+_________________
+
+.. doxygenfile:: generationInput.h
+   :project: TensorRT-LLM
+
+generationOutput.h
+__________________
+
+.. doxygenfile:: generationOutput.h
+   :project: TensorRT-LLM
+
+gptDecoderBatched.h
+___________________
+
+.. doxygenfile:: gptDecoderBatched.h
+   :project: TensorRT-LLM
+
+gptSession.h
+____________
+
+.. doxygenfile:: gptSession.h
+   :project: TensorRT-LLM
+
+gptDecoder.h
+____________
+
+.. doxygenfile:: gptDecoder.h
+   :project: TensorRT-LLM
+
+iGptDecoderBatched.h
+____________________
+
+.. doxygenfile:: iGptDecoderBatched.h
+   :project: TensorRT-LLM
+
+gptJsonConfig.h
+_______________
+
+.. doxygenfile:: gptJsonConfig.h
+   :project: TensorRT-LLM
+
+iStatefulGptDecoder.h
+_____________________
+
+.. doxygenfile:: iStatefulGptDecoder.h
+   :project: TensorRT-LLM
+
+iBuffer.h
+_________
+
+.. doxygenfile:: iBuffer.h
+   :project: TensorRT-LLM
+
+ipcUtils.h
+__________
+
+.. doxygenfile:: ipcUtils.h
+   :project: TensorRT-LLM
+
+lookaheadBuffers.h
+__________________
+
+.. doxygenfile:: lookaheadBuffers.h
+   :project: TensorRT-LLM
+
+iTensor.h
+_________
+
+.. doxygenfile:: iTensor.h
+   :project: TensorRT-LLM
+
+loraCache.h
+___________
+
+.. doxygenfile:: loraCache.h
+   :project: TensorRT-LLM
+
+loraModule.h
+____________
+
+.. doxygenfile:: loraModule.h
+   :project: TensorRT-LLM
+
+modelConfig.h
+_____________
+
+.. doxygenfile:: modelConfig.h
+   :project: TensorRT-LLM
+
+lookaheadModule.h
+_________________
+
+.. doxygenfile:: lookaheadModule.h
+   :project: TensorRT-LLM
+
+request.h
+_________
+
+.. doxygenfile:: request.h
+   :project: TensorRT-LLM
+
+loraCachePageManagerConfig.h
+____________________________
+
+.. doxygenfile:: loraCachePageManagerConfig.h
+   :project: TensorRT-LLM
+
+samplingConfig.h
+________________
+
+.. doxygenfile:: samplingConfig.h
+   :project: TensorRT-LLM
+
+medusaModule.h
+______________
+
+.. doxygenfile:: medusaModule.h
+   :project: TensorRT-LLM
+
+memoryCounters.h
+________________
+
+.. doxygenfile:: memoryCounters.h
+   :project: TensorRT-LLM
+
+worldConfig.h
+_____________
+
+.. doxygenfile:: worldConfig.h
+   :project: TensorRT-LLM
+
+promptTuningParams.h
+____________________
+
+.. doxygenfile:: promptTuningParams.h
+   :project: TensorRT-LLM
+
+rawEngine.h
+___________
+
+.. doxygenfile:: rawEngine.h
+   :project: TensorRT-LLM
+
+decoderState.h
+______________
+
+.. doxygenfile:: decoderState.h
+   :project: TensorRT-LLM
+
+runtimeDefaults.h
+_________________
+
+.. doxygenfile:: runtimeDefaults.h
+   :project: TensorRT-LLM
+
+eagleModule.h
+_____________
+
+.. doxygenfile:: eagleModule.h
+   :project: TensorRT-LLM
+
+speculativeDecodingMode.h
+_________________________
+
+.. doxygenfile:: speculativeDecodingMode.h
+   :project: TensorRT-LLM
+
+speculativeDecodingModule.h
+___________________________
+
+.. doxygenfile:: speculativeDecodingModule.h
+   :project: TensorRT-LLM
+
+ipcNvlsMemory.h
+_______________
+
+.. doxygenfile:: ipcNvlsMemory.h
+   :project: TensorRT-LLM
+
+tllmLogger.h
+____________
+
+.. doxygenfile:: tllmLogger.h
+   :project: TensorRT-LLM
+
+statefulGptDecoderBatched.h
+___________________________
+
+.. doxygenfile:: statefulGptDecoderBatched.h
+   :project: TensorRT-LLM
+

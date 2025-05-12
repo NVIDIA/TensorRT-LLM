@@ -1,0 +1,1158 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>tensorrt_llm.executor.result &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/executor/result';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../../../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../search.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    
+    <li class="breadcrumb-item"><a href="../../index.html" class="nav-link">Module code</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">tensorrt_llm.executor.result</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <h1>Source code for tensorrt_llm.executor.result</h1><div class="highlight"><pre>
+<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">weakref</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">queue</span><span class="w"> </span><span class="kn">import</span> <span class="n">Empty</span><span class="p">,</span> <span class="n">Queue</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Union</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">weakref</span><span class="w"> </span><span class="kn">import</span> <span class="n">WeakMethod</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">nvtx_range_debug</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">executor</span> <span class="k">as</span> <span class="n">tllm</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..disaggregated_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">DisaggregatedParams</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..llmapi.tracer</span><span class="w"> </span><span class="kn">import</span> <span class="n">global_tracer</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..llmapi.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">AsyncQueue</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">ErrorResponse</span><span class="p">,</span> <span class="n">has_event_loop</span>
+
+<span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">.executor</span><span class="w"> </span><span class="kn">import</span> <span class="n">GenerationExecutor</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">.postproc_worker</span><span class="w"> </span><span class="kn">import</span> <span class="n">PostprocParams</span><span class="p">,</span> <span class="n">PostprocWorker</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">.request</span><span class="w"> </span><span class="kn">import</span> <span class="n">GenerationRequest</span>
+
+<span class="n">__all__</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="s2">&quot;CompletionOutput&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;GenerationResultBase&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;DetokenizedGenerationResultBase&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;GenerationResult&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;IterationResult&quot;</span><span class="p">,</span>
+<span class="p">]</span>
+
+
+<div class="viewcode-block" id="CompletionOutput">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.CompletionOutput">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">slots</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">CompletionOutput</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;The output data of one completion output of a request.</span>
+
+<span class="sd">    Args:</span>
+<span class="sd">        index (int): The index of the output in the request.</span>
+<span class="sd">        text (str): The generated output text. Defaults to &quot;&quot;.</span>
+<span class="sd">        token_ids (List[int], optional): The token ids of the generated output text. Defaults to None.</span>
+<span class="sd">        cumulative_logprob (float, optional): The cumulative log probability of the generated output text. Defaults to None.</span>
+<span class="sd">        logprobs (List[float], optional): The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to None.</span>
+<span class="sd">        finish_reason (Literal[&#39;stop&#39;, &#39;length&#39;, &#39;timeout&#39;, &#39;cancelled&#39;], optional): The reason why the sequence is finished. Defaults to None.</span>
+<span class="sd">        stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.</span>
+<span class="sd">        generation_logits (torch.Tensor, optional): The logits on the generated output token ids. Defaults to None.</span>
+<span class="sd">        disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Parameters needed for disaggregated serving. Includes the type of request, the first generated tokens, the context request id and the any additional state needing to be transferred from context and generation instances. Defaults to None.</span>
+
+<span class="sd">    Attributes:</span>
+<span class="sd">        length (int): The number of generated tokens.</span>
+<span class="sd">        token_ids_diff (List[int]): Newly generated token ids.</span>
+<span class="sd">        logprobs_diff (List[float]): Logprobs of newly generated tokens.</span>
+<span class="sd">        text_diff (str): Newly generated tokens.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">index</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">text</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
+    <span class="n">token_ids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">cumulative_logprob</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">logprobs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">finish_reason</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Literal</span><span class="p">[</span><span class="s1">&#39;stop&#39;</span><span class="p">,</span> <span class="s1">&#39;length&#39;</span><span class="p">,</span> <span class="s1">&#39;timeout&#39;</span><span class="p">,</span>
+                                    <span class="s1">&#39;cancelled&#39;</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">stop_reason</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">generation_logits</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">disaggregated_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">DisaggregatedParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="c1"># hidden fields for tracking the diffs</span>
+    <span class="n">_last_text_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="n">_last_token_ids_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="n">_last_logprobs_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="n">_incremental_states</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                                                <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                                                <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="c1"># the result of result_handler passed to postprocess workers</span>
+    <span class="n">_postprocess_result</span><span class="p">:</span> <span class="n">Any</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_ids</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">token_ids</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">=</span> <span class="p">[]</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">length</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">token_ids</span><span class="p">)</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">text_diff</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">text</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_last_text_len</span><span class="p">:]</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">token_ids_diff</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_ids</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_last_token_ids_len</span><span class="p">:]</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">logprobs_diff</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_last_logprobs_len</span><span class="p">:]</span></div>
+
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">GenerationResultBase</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&#39;&#39;&#39; This holds the core logic of the GenerationResult class. &#39;&#39;&#39;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                 <span class="nb">id</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                 <span class="n">sampling_params</span><span class="p">:</span> <span class="n">SamplingParams</span><span class="p">,</span>
+                 <span class="n">background_error_handler</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Callable</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">postproc_params</span><span class="p">:</span> <span class="s2">&quot;Optional[PostprocParams]&quot;</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">id</span> <span class="o">=</span> <span class="nb">id</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span> <span class="o">=</span> <span class="n">sampling_params</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">postproc_params</span> <span class="o">=</span> <span class="n">postproc_params</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">decoding_iter</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="o">=</span> <span class="kc">False</span>
+
+        <span class="k">if</span> <span class="n">has_event_loop</span><span class="p">():</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span> <span class="o">=</span> <span class="n">AsyncQueue</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">queue</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span><span class="o">.</span><span class="n">sync_q</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">queue</span> <span class="o">=</span> <span class="n">Queue</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span> <span class="o">=</span> <span class="kc">None</span>
+
+        <span class="c1"># In Sampling mode, the Executor runtime will return best_of sequences</span>
+        <span class="c1"># in total, which the LLM API will select the n-best sequences among</span>
+        <span class="c1"># them based on their cumulative log probabilities.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">CompletionOutput</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">CompletionOutput</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">best_of</span><span class="p">)</span>
+        <span class="p">]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_context_logits</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_background_error_handler</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">background_error_handler</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">background_error_handler</span><span class="p">,</span> <span class="n">WeakMethod</span><span class="p">):</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_background_error_handler</span> <span class="o">=</span> <span class="n">WeakMethod</span><span class="p">(</span>
+                    <span class="n">background_error_handler</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_background_error_handler</span> <span class="o">=</span> <span class="n">background_error_handler</span>
+
+        <span class="c1"># This is used for avoid duplicate transmission the sampling_params for a</span>
+        <span class="c1"># request. SamplingParams is necessary for creating dummy</span>
+        <span class="c1"># GenerationResultBase instances on postprocess worker processes.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_params_transmitted</span> <span class="o">=</span> <span class="kc">False</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">outputs</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">CompletionOutput</span><span class="p">]:</span>
+        <span class="n">sampling_param</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">sampling_param</span><span class="o">.</span><span class="n">use_beam_search</span>
+                <span class="ow">or</span> <span class="n">sampling_param</span><span class="o">.</span><span class="n">n</span> <span class="o">==</span> <span class="n">sampling_param</span><span class="o">.</span><span class="n">best_of</span><span class="p">):</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span><span class="p">[:</span><span class="n">sampling_param</span><span class="o">.</span><span class="n">n</span><span class="p">]</span>
+        <span class="c1"># Pick the top-n outputs, sorted by cumulative log probs.</span>
+        <span class="n">sorted_outputs</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span><span class="p">,</span>
+            <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span>
+            <span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">cumulative_logprob</span>
+             <span class="k">if</span> <span class="n">x</span><span class="o">.</span><span class="n">cumulative_logprob</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="nb">float</span><span class="p">(</span><span class="s1">&#39;-inf&#39;</span><span class="p">)),</span>
+            <span class="n">reverse</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="c1"># Reindex the sequence.</span>
+        <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">sorted_out</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">sorted_outputs</span><span class="p">):</span>
+            <span class="n">sorted_out</span><span class="o">.</span><span class="n">index</span> <span class="o">=</span> <span class="n">i</span>
+        <span class="k">return</span> <span class="n">sorted_outputs</span><span class="p">[:</span><span class="n">sampling_param</span><span class="o">.</span><span class="n">n</span><span class="p">]</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">context_logits</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_context_logits</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_handle_sequence</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">finish_reasons</span><span class="p">,</span> <span class="n">response_tensors</span><span class="p">,</span>
+                         <span class="n">sequence_index</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot; Handle a single sequence in the response. &quot;&quot;&quot;</span>
+
+        <span class="n">seq_idx</span> <span class="o">=</span> <span class="n">sequence_index</span>
+        <span class="n">src_idx</span> <span class="o">=</span> <span class="n">sequence_index</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">use_beam_search</span> <span class="k">else</span> <span class="mi">0</span>
+
+        <span class="n">output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span><span class="p">[</span><span class="n">seq_idx</span><span class="p">]</span>
+        <span class="n">output</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span>
+        <span class="n">output</span><span class="o">.</span><span class="n">_last_token_ids_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">token_ids</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">use_beam_search</span><span class="p">:</span>
+            <span class="c1"># Beam search enforces returning all generated tokens</span>
+            <span class="n">output</span><span class="o">.</span><span class="n">token_ids</span> <span class="o">=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">output_token_ids</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">output</span><span class="o">.</span><span class="n">token_ids</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">response_tensors</span><span class="o">.</span><span class="n">output_token_ids</span><span class="p">[</span><span class="n">src_idx</span><span class="p">])</span>
+
+        <span class="c1"># In PD, the first token should be ignored in streaming mode, since it&#39;s already been returned by the context server</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span><span class="o">.</span><span class="n">request_type</span> <span class="o">==</span> <span class="s2">&quot;generation_only&quot;</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streaming</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoding_iter</span> <span class="o">==</span> <span class="mi">2</span><span class="p">:</span>
+            <span class="n">output</span><span class="o">.</span><span class="n">_last_token_ids_len</span> <span class="o">=</span> <span class="mi">1</span>
+
+        <span class="k">if</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">cum_log_probs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">output</span><span class="o">.</span><span class="n">cumulative_logprob</span> <span class="o">=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">cum_log_probs</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span>
+        <span class="k">if</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">output</span><span class="o">.</span><span class="n">_last_logprobs_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="p">)</span>
+            <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span>
+            <span class="c1"># overcome some WAR in the cpp executor</span>
+            <span class="k">if</span> <span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span> <span class="o">!=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">FinishReason</span><span class="o">.</span><span class="n">CANCELLED</span><span class="p">:</span>
+                <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="p">)</span> <span class="o">==</span> <span class="n">output</span><span class="o">.</span><span class="n">length</span>
+        <span class="k">if</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">generation_logits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">output</span><span class="o">.</span><span class="n">generation_logits</span> <span class="o">=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">generation_logits</span><span class="p">[</span>
+                <span class="n">src_idx</span><span class="p">,</span> <span class="p">:</span><span class="n">output</span><span class="o">.</span><span class="n">length</span><span class="p">]</span>
+
+        <span class="c1"># when sampling_params.n &gt; 1 and is cancelled, make sure all the outputs</span>
+        <span class="c1"># be marked as cancelled.</span>
+        <span class="k">if</span> <span class="n">finish_reasons</span> <span class="ow">and</span> <span class="n">finish_reasons</span><span class="p">[</span>
+                <span class="n">src_idx</span><span class="p">]</span> <span class="o">==</span> <span class="n">tllm</span><span class="o">.</span><span class="n">FinishReason</span><span class="o">.</span><span class="n">CANCELLED</span><span class="p">:</span>
+            <span class="n">output</span><span class="o">.</span><span class="n">finish_reason</span> <span class="o">=</span> <span class="s1">&#39;cancelled&#39;</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span> <span class="o">==</span> <span class="n">tllm</span><span class="o">.</span><span class="n">FinishReason</span><span class="o">.</span><span class="n">END_ID</span><span class="p">:</span>
+                <span class="n">output</span><span class="o">.</span><span class="n">finish_reason</span> <span class="o">=</span> <span class="s1">&#39;stop&#39;</span>
+            <span class="k">elif</span> <span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span> <span class="o">==</span> <span class="n">tllm</span><span class="o">.</span><span class="n">FinishReason</span><span class="o">.</span><span class="n">STOP_WORDS</span><span class="p">:</span>
+                <span class="n">output</span><span class="o">.</span><span class="n">finish_reason</span> <span class="o">=</span> <span class="s1">&#39;stop&#39;</span>
+                <span class="k">for</span> <span class="n">stop_reason</span><span class="p">,</span> <span class="n">stop_ids</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">_get_stop_reasons_and_words</span><span class="p">(</span>
+                <span class="p">):</span>
+                    <span class="k">if</span> <span class="n">output</span><span class="o">.</span><span class="n">token_ids</span><span class="p">[</span><span class="o">-</span><span class="nb">len</span><span class="p">(</span><span class="n">stop_ids</span><span class="p">):]</span> <span class="o">==</span> <span class="n">stop_ids</span><span class="p">:</span>
+                        <span class="n">output</span><span class="o">.</span><span class="n">stop_reason</span> <span class="o">=</span> <span class="n">stop_reason</span>
+                        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">include_stop_str_in_output</span><span class="p">:</span>
+                            <span class="n">output</span><span class="o">.</span><span class="n">token_ids</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">token_ids</span><span class="p">[:</span><span class="o">-</span><span class="nb">len</span><span class="p">(</span><span class="n">stop_ids</span><span class="p">)]</span>
+                        <span class="k">break</span>
+            <span class="k">elif</span> <span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span> <span class="o">==</span> <span class="n">tllm</span><span class="o">.</span><span class="n">FinishReason</span><span class="o">.</span><span class="n">LENGTH</span><span class="p">:</span>
+                <span class="n">output</span><span class="o">.</span><span class="n">finish_reason</span> <span class="o">=</span> <span class="s1">&#39;length&#39;</span>
+            <span class="k">elif</span> <span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span> <span class="o">==</span> <span class="n">tllm</span><span class="o">.</span><span class="n">FinishReason</span><span class="o">.</span><span class="n">TIMED_OUT</span><span class="p">:</span>
+                <span class="n">output</span><span class="o">.</span><span class="n">finish_reason</span> <span class="o">=</span> <span class="s1">&#39;timeout&#39;</span>
+            <span class="k">elif</span> <span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span> <span class="o">==</span> <span class="n">tllm</span><span class="o">.</span><span class="n">FinishReason</span><span class="o">.</span><span class="n">CANCELLED</span><span class="p">:</span>
+                <span class="k">pass</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;Unknown finish reason: </span><span class="si">{</span><span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="nd">@nvtx_range_debug</span><span class="p">(</span><span class="s2">&quot;handle_response&quot;</span><span class="p">,</span>
+                      <span class="n">color</span><span class="o">=</span><span class="s2">&quot;red&quot;</span><span class="p">,</span>
+                      <span class="n">category</span><span class="o">=</span><span class="s2">&quot;GenerationResultBase&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_handle_response</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">response</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="s2">&quot;PostprocWorker.Output&quot;</span><span class="p">,</span>
+                                               <span class="n">tllm</span><span class="o">.</span><span class="n">Response</span><span class="p">,</span> <span class="n">ErrorResponse</span><span class="p">]):</span>
+
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">response</span><span class="p">,</span> <span class="n">PostprocWorker</span><span class="o">.</span><span class="n">Output</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">is_final</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">res</span><span class="p">,</span> <span class="n">CompletionOutput</span><span class="p">):</span>
+                <span class="c1"># in streaming mode</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">res</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">_postprocess_result</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">res</span>
+
+            <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">error</span><span class="p">:</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_background_error_handler</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span>
+                        <span class="n">handler</span> <span class="o">:=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_background_error_handler</span><span class="p">()):</span>
+                    <span class="n">handler</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">error</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">response</span><span class="p">,</span> <span class="n">tllm</span><span class="o">.</span><span class="n">Response</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">has_error</span><span class="p">():</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_background_error_handler</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span>
+                        <span class="n">handler</span> <span class="o">:=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_background_error_handler</span><span class="p">()):</span>
+                    <span class="n">handler</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">error_msg</span><span class="p">)</span>
+
+            <span class="n">response_result</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">result</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">is_final</span>
+            <span class="n">context_phase_params</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">context_phase_params</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">decoding_iter</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">decoding_iter</span>
+            <span class="k">if</span> <span class="n">context_phase_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="o">=</span> <span class="n">DisaggregatedParams</span><span class="p">(</span>
+                    <span class="n">request_type</span><span class="o">=</span><span class="s2">&quot;context_only&quot;</span><span class="p">,</span>
+                    <span class="n">first_gen_tokens</span><span class="o">=</span><span class="n">context_phase_params</span><span class="o">.</span><span class="n">first_gen_tokens</span><span class="p">,</span>
+                    <span class="n">ctx_request_id</span><span class="o">=</span><span class="n">context_phase_params</span><span class="o">.</span><span class="n">req_id</span><span class="p">,</span>
+                    <span class="n">opaque_state</span><span class="o">=</span><span class="n">context_phase_params</span><span class="o">.</span><span class="n">opaque_state</span><span class="p">,</span>
+                    <span class="n">draft_tokens</span><span class="o">=</span><span class="n">context_phase_params</span><span class="o">.</span><span class="n">draft_tokens</span><span class="p">)</span>
+
+            <span class="n">finish_reasons</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">finish_reasons</span>
+            <span class="c1"># output_token_ids = (beams, tokens)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">use_beam_search</span><span class="p">:</span>
+                <span class="k">for</span> <span class="n">beam_idx</span><span class="p">,</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">response_result</span><span class="o">.</span><span class="n">output_token_ids</span><span class="p">):</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_handle_sequence</span><span class="p">(</span><span class="n">finish_reasons</span><span class="p">,</span> <span class="n">response_result</span><span class="p">,</span>
+                                          <span class="n">beam_idx</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_handle_sequence</span><span class="p">(</span><span class="n">finish_reasons</span><span class="p">,</span> <span class="n">response_result</span><span class="p">,</span>
+                                      <span class="n">response_result</span><span class="o">.</span><span class="n">sequence_index</span><span class="p">)</span>
+
+            <span class="k">if</span> <span class="n">response_result</span><span class="o">.</span><span class="n">context_logits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_context_logits</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">context_logits</span>
+
+            <span class="c1"># Processing background errors here ASAF during generation.</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_background_error_handler</span> <span class="ow">and</span> <span class="p">(</span>
+                    <span class="n">handler</span> <span class="o">:=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_background_error_handler</span><span class="p">()):</span>
+                <span class="n">handler</span><span class="p">()</span>
+        <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">response</span><span class="p">,</span> <span class="n">ErrorResponse</span><span class="p">):</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_background_error_handler</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span>
+                    <span class="n">handler</span> <span class="o">:=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_background_error_handler</span><span class="p">()):</span>
+                <span class="n">handler</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">error_msg</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unknown response type: </span><span class="si">{</span><span class="n">response</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">DetokenizedGenerationResultBase</span><span class="p">(</span><span class="n">GenerationResultBase</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&#39;&#39;&#39; The base class for the generation result with detokenization support. &#39;&#39;&#39;</span>
+    <span class="c1"># import once and avoid cyclic import</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">.postproc_worker</span><span class="w"> </span><span class="kn">import</span> <span class="n">PostprocWorker</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                 <span class="nb">id</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                 <span class="n">sampling_params</span><span class="p">:</span> <span class="n">SamplingParams</span><span class="p">,</span>
+                 <span class="n">tokenizer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Callable</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">streaming</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                 <span class="n">background_error_handler</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Callable</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">postproc_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="s2">&quot;PostprocParams&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span>
+            <span class="nb">id</span><span class="p">,</span>
+            <span class="n">sampling_params</span><span class="p">,</span>
+            <span class="n">background_error_handler</span><span class="o">=</span><span class="n">background_error_handler</span><span class="p">,</span>
+            <span class="n">postproc_params</span><span class="o">=</span><span class="n">postproc_params</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="o">=</span> <span class="n">tokenizer</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_streaming</span> <span class="o">=</span> <span class="n">streaming</span>
+
+    <span class="nd">@nvtx_range_debug</span><span class="p">(</span><span class="s2">&quot;handle_response&quot;</span><span class="p">,</span>
+                      <span class="n">color</span><span class="o">=</span><span class="s2">&quot;red&quot;</span><span class="p">,</span>
+                      <span class="n">category</span><span class="o">=</span><span class="s2">&quot;DetokenizedGenerationResultBase&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_handle_response</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">response</span><span class="p">:</span> <span class="s2">&quot;GenerationExecutor.Response&quot;</span><span class="p">):</span>
+        <span class="n">GenerationResultBase</span><span class="o">.</span><span class="n">_handle_response</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">response</span><span class="p">)</span>
+
+        <span class="c1"># The postprocess has been performed, return directly</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">response</span><span class="p">,</span> <span class="n">PostprocWorker</span><span class="o">.</span><span class="n">Output</span><span class="p">):</span>
+            <span class="k">return</span>
+
+        <span class="n">kwargs</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s1">&#39;skip_special_tokens&#39;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">skip_special_tokens</span><span class="p">,</span>
+            <span class="s1">&#39;spaces_between_special_tokens&#39;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">spaces_between_special_tokens</span>
+        <span class="p">}</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">detokenize</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">beam_output</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">outputs</span><span class="p">:</span>
+                <span class="n">beam_output</span><span class="o">.</span><span class="n">_last_text_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">beam_output</span><span class="o">.</span><span class="n">text</span><span class="p">)</span>
+                <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span> <span class="s1">&#39;decode_incrementally&#39;</span><span class="p">):</span>
+                    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streaming</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">use_beam_search</span><span class="p">:</span>
+                        <span class="n">beam_output</span><span class="o">.</span><span class="n">text</span><span class="p">,</span> <span class="n">beam_output</span><span class="o">.</span><span class="n">_incremental_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">decode_incrementally</span><span class="p">(</span>
+                            <span class="n">beam_output</span><span class="o">.</span><span class="n">token_ids_diff</span><span class="p">,</span>
+                            <span class="n">prev_text</span><span class="o">=</span><span class="n">beam_output</span><span class="o">.</span><span class="n">text</span><span class="p">,</span>
+                            <span class="n">states</span><span class="o">=</span><span class="n">beam_output</span><span class="o">.</span><span class="n">_incremental_states</span><span class="p">,</span>
+                            <span class="n">flush</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="p">,</span>
+                            <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="n">beam_output</span><span class="o">.</span><span class="n">text</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">decode_incrementally</span><span class="p">(</span>
+                            <span class="n">beam_output</span><span class="o">.</span><span class="n">token_ids</span><span class="p">,</span> <span class="n">flush</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">beam_output</span><span class="o">.</span><span class="n">text</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span>
+                        <span class="n">beam_output</span><span class="o">.</span><span class="n">token_ids</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+
+
+<span class="c1"># alias</span>
+<span class="n">PostprocWorker</span> <span class="o">=</span> <span class="n">DetokenizedGenerationResultBase</span><span class="o">.</span><span class="n">PostprocWorker</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">GenerationResult</span><span class="p">(</span><span class="n">GenerationResultBase</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
+<span class="sd">    The result of a generation request. It can be used to wait for the completion of the request.</span>
+
+<span class="sd">    Args:</span>
+<span class="sd">        generation_request (GenerationRequest): The generation request object.</span>
+<span class="sd">        background_error_handler (Callable, optional): The error handler to process the errors from the background threads/processes. Defaults to None.</span>
+<span class="sd">        executor (GenerationExecutor, optional): The executor that created this result. Defaults to None.</span>
+<span class="sd">    &#39;&#39;&#39;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+            <span class="bp">self</span><span class="p">,</span>
+            <span class="n">generation_request</span><span class="p">:</span> <span class="s2">&quot;GenerationRequest&quot;</span><span class="p">,</span>
+            <span class="n">background_error_handler</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Callable</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">executor</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="s2">&quot;GenerationExecutor&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">disaggregated_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">DisaggregatedParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span>
+            <span class="n">generation_request</span><span class="o">.</span><span class="n">id</span><span class="p">,</span>
+            <span class="n">generation_request</span><span class="o">.</span><span class="n">sampling_params</span><span class="p">,</span>
+            <span class="n">background_error_handler</span><span class="p">,</span>
+            <span class="n">postproc_params</span><span class="o">=</span><span class="n">generation_request</span><span class="o">.</span><span class="n">postproc_params</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_generation_request</span> <span class="o">=</span> <span class="n">generation_request</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_streaming</span> <span class="o">=</span> <span class="n">generation_request</span><span class="o">.</span><span class="n">streaming</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="o">=</span> <span class="n">disaggregated_params</span>
+
+        <span class="c1"># for aborting the request</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">weakref</span><span class="o">.</span><span class="n">ReferenceType</span><span class="p">[</span>
+            <span class="s2">&quot;GenerationExecutor&quot;</span><span class="p">]]</span> <span class="o">=</span> <span class="n">weakref</span><span class="o">.</span><span class="n">ref</span><span class="p">(</span><span class="n">executor</span><span class="p">)</span> <span class="k">if</span> <span class="n">executor</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_aborted</span> <span class="o">=</span> <span class="kc">False</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">request_id</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_generation_request</span><span class="o">.</span><span class="n">id</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">prompt_token_ids</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_generation_request</span><span class="o">.</span><span class="n">prompt_token_ids</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">abort</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Abort the generation request.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;The executor is not set for this result.&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="p">()</span><span class="o">.</span><span class="n">abort_request</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">request_id</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_aborted</span> <span class="o">=</span> <span class="kc">True</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">aborted</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Return whether the generation request is aborted.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            bool: whether the generation request is aborted.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_aborted</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">finished</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_result_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="n">response</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_handle_response</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_aresult_step</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;The asyncio event loop was not present during initialization, so async operations are not available.&quot;</span>
+        <span class="n">response</span> <span class="o">=</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
+        <span class="n">global_tracer</span><span class="p">()</span><span class="o">.</span><span class="n">log_instant</span><span class="p">(</span><span class="s2">&quot;result_step.get&quot;</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_handle_response</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">result</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;GenerationResult&quot;</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Wait for the completion of the request, and return the result.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            timeout (float, optional): Timeout. Defaults to None.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            tensorrt_llm.executor.result.GenerationResult: generation result.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">while</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_result_step</span><span class="p">(</span><span class="n">timeout</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">aresult</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;GenerationResult&quot;</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Wait for the completion of the request, and return the result.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            tensorrt_llm.executor.result.GenerationResult: generation result.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">while</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="p">:</span>
+            <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">_aresult_step</span><span class="p">()</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__await__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">aresult</span><span class="p">()</span><span class="o">.</span><span class="fm">__await__</span><span class="p">()</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__iter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__next__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">StopIteration</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_result_step</span><span class="p">()</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__aiter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="fm">__anext__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">StopAsyncIteration</span>
+
+        <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">_aresult_step</span><span class="p">()</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_exception</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">result</span><span class="p">(</span><span class="n">timeout</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">RuntimeError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">e</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_repr_fields</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="p">[</span>
+            <span class="s1">&#39;request_id&#39;</span><span class="p">,</span> <span class="s1">&#39;prompt_token_ids&#39;</span><span class="p">,</span> <span class="s1">&#39;outputs&#39;</span><span class="p">,</span> <span class="s1">&#39;finished&#39;</span><span class="p">,</span>
+            <span class="s2">&quot;context_logits&quot;</span>
+        <span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__repr__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+        <span class="nb">repr</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">field</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_repr_fields</span><span class="p">():</span>
+            <span class="n">value</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field</span><span class="p">)</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+                <span class="nb">repr</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">field</span><span class="si">}</span><span class="s2">=</span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="nb">repr</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">field</span><span class="si">}</span><span class="s2">=</span><span class="si">{</span><span class="n">value</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">repr</span> <span class="o">=</span> <span class="s2">&quot;, &quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="nb">repr</span><span class="p">)</span>
+        <span class="nb">repr</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">(</span><span class="si">{</span><span class="nb">repr</span><span class="si">}</span><span class="s2">)&quot;</span>
+        <span class="k">return</span> <span class="nb">repr</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__hash__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="nb">hash</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">request_id</span><span class="p">)</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">IterationResult</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Runtime results for all available iterations.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_timeout</span> <span class="o">=</span> <span class="mi">2</span>
+
+        <span class="k">if</span> <span class="n">has_event_loop</span><span class="p">():</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span> <span class="o">=</span> <span class="n">AsyncQueue</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">queue</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span><span class="o">.</span><span class="n">sync_q</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">queue</span> <span class="o">=</span> <span class="n">Queue</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_timeout</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="nb">float</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_timeout</span> <span class="o">=</span> <span class="n">timeout</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">mark_undone</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># should be called when new prompts are submitted</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="o">=</span> <span class="kc">False</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_results</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">dict</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Return all runtime results in the queue.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">results</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">while</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">data</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_timeout</span><span class="p">)</span>
+                <span class="n">results</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">data</span><span class="p">))</span>
+            <span class="k">except</span> <span class="n">Empty</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="k">return</span> <span class="n">results</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__aiter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="fm">__anext__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">StopAsyncIteration</span>
+
+        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;The asyncio event loop was not present during initialization, so async operations are not available.&quot;</span>
+
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">data</span> <span class="o">=</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_timeout</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
+        <span class="k">except</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">TimeoutError</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="o">=</span> <span class="kc">True</span>
+            <span class="k">raise</span> <span class="ne">StopAsyncIteration</span>
+</pre></div>
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+<div class="bd-sidebar-secondary"></div>
+
+
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

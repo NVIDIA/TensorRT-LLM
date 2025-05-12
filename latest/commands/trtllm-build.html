@@ -1,0 +1,1043 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>trtllm-build &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'commands/trtllm-build';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="trtllm-serve" href="trtllm-serve.html" />
+    <link rel="prev" title="Runtime" href="../_cpp_gen/runtime.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">trtllm-build</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="trtllm-build">
+<h1>trtllm-build<a class="headerlink" href="#trtllm-build" title="Link to this heading">#</a></h1>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">usage</span><span class="p">:</span> <span class="n">trtllm</span><span class="o">-</span><span class="n">build</span> <span class="p">[</span><span class="o">-</span><span class="n">h</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">checkpoint_dir</span> <span class="n">CHECKPOINT_DIR</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">model_config</span> <span class="n">MODEL_CONFIG</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">build_config</span> <span class="n">BUILD_CONFIG</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">model_cls_file</span> <span class="n">MODEL_CLS_FILE</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">model_cls_name</span> <span class="n">MODEL_CLS_NAME</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">output_dir</span> <span class="n">OUTPUT_DIR</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">max_batch_size</span> <span class="n">MAX_BATCH_SIZE</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">max_input_len</span> <span class="n">MAX_INPUT_LEN</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">max_seq_len</span> <span class="n">MAX_SEQ_LEN</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">max_beam_width</span> <span class="n">MAX_BEAM_WIDTH</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">max_num_tokens</span> <span class="n">MAX_NUM_TOKENS</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">opt_num_tokens</span> <span class="n">OPT_NUM_TOKENS</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">max_encoder_input_len</span> <span class="n">MAX_ENCODER_INPUT_LEN</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">max_prompt_embedding_table_size</span> <span class="n">MAX_PROMPT_EMBEDDING_TABLE_SIZE</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">kv_cache_type</span> <span class="n">KV_CACHE_TYPE</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">paged_kv_cache</span> <span class="n">PAGED_KV_CACHE</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">input_timing_cache</span> <span class="n">INPUT_TIMING_CACHE</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">output_timing_cache</span> <span class="n">OUTPUT_TIMING_CACHE</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">profiling_verbosity</span> <span class="p">{</span><span class="n">layer_names_only</span><span class="p">,</span><span class="n">detailed</span><span class="p">,</span><span class="n">none</span><span class="p">}]</span> <span class="p">[</span><span class="o">--</span><span class="n">strip_plan</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">weight_sparsity</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">weight_streaming</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">fast_build</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">workers</span> <span class="n">WORKERS</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">log_level</span> <span class="p">{</span><span class="n">internal_error</span><span class="p">,</span><span class="n">error</span><span class="p">,</span><span class="n">warning</span><span class="p">,</span><span class="n">info</span><span class="p">,</span><span class="n">verbose</span><span class="p">,</span><span class="n">debug</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">enable_debug_output</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">visualize_network</span> <span class="n">VISUALIZE_NETWORK</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">dry_run</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">monitor_memory</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">logits_dtype</span> <span class="p">{</span><span class="n">float16</span><span class="p">,</span><span class="n">float32</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">gather_context_logits</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">gather_generation_logits</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">gather_all_token_logits</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">lora_dir</span> <span class="n">LORA_DIR</span> <span class="p">[</span><span class="n">LORA_DIR</span> <span class="o">...</span><span class="p">]]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">lora_ckpt_source</span> <span class="p">{</span><span class="n">hf</span><span class="p">,</span><span class="n">nemo</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">lora_target_modules</span> <span class="p">{</span><span class="n">attn_qkv</span><span class="p">,</span><span class="n">attn_q</span><span class="p">,</span><span class="n">attn_k</span><span class="p">,</span><span class="n">attn_v</span><span class="p">,</span><span class="n">attn_dense</span><span class="p">,</span><span class="n">mlp_h_to_4h</span><span class="p">,</span><span class="n">mlp_4h_to_h</span><span class="p">,</span><span class="n">mlp_gate</span><span class="p">,</span><span class="n">cross_attn_qkv</span><span class="p">,</span><span class="n">cross_attn_q</span><span class="p">,</span><span class="n">cross_attn_k</span><span class="p">,</span><span class="n">cross_attn_v</span><span class="p">,</span><span class="n">cross_attn_dense</span><span class="p">,</span><span class="n">moe_h_to_4h</span><span class="p">,</span><span class="n">moe_4h_to_h</span><span class="p">,</span><span class="n">moe_gate</span><span class="p">,</span><span class="n">moe_router</span><span class="p">,</span><span class="n">mlp_router</span><span class="p">,</span><span class="n">mlp_gate_up</span><span class="p">}</span> <span class="p">[{</span><span class="n">attn_qkv</span><span class="p">,</span><span class="n">attn_q</span><span class="p">,</span><span class="n">attn_k</span><span class="p">,</span><span class="n">attn_v</span><span class="p">,</span><span class="n">attn_dense</span><span class="p">,</span><span class="n">mlp_h_to_4h</span><span class="p">,</span><span class="n">mlp_4h_to_h</span><span class="p">,</span><span class="n">mlp_gate</span><span class="p">,</span><span class="n">cross_attn_qkv</span><span class="p">,</span><span class="n">cross_attn_q</span><span class="p">,</span><span class="n">cross_attn_k</span><span class="p">,</span><span class="n">cross_attn_v</span><span class="p">,</span><span class="n">cross_attn_dense</span><span class="p">,</span><span class="n">moe_h_to_4h</span><span class="p">,</span><span class="n">moe_4h_to_h</span><span class="p">,</span><span class="n">moe_gate</span><span class="p">,</span><span class="n">moe_router</span><span class="p">,</span><span class="n">mlp_router</span><span class="p">,</span><span class="n">mlp_gate_up</span><span class="p">}</span> <span class="o">...</span><span class="p">]]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">max_lora_rank</span> <span class="n">MAX_LORA_RANK</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">speculative_decoding_mode</span> <span class="p">{</span><span class="n">draft_tokens_external</span><span class="p">,</span><span class="n">lookahead_decoding</span><span class="p">,</span><span class="n">medusa</span><span class="p">,</span><span class="n">explicit_draft_tokens</span><span class="p">,</span><span class="n">eagle</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">max_draft_len</span> <span class="n">MAX_DRAFT_LEN</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">auto_parallel</span> <span class="n">AUTO_PARALLEL</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">gpus_per_node</span> <span class="n">GPUS_PER_NODE</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">cluster_key</span> <span class="p">{</span><span class="n">A100</span><span class="o">-</span><span class="n">SXM</span><span class="o">-</span><span class="mi">80</span><span class="n">GB</span><span class="p">,</span><span class="n">A100</span><span class="o">-</span><span class="n">SXM</span><span class="o">-</span><span class="mi">40</span><span class="n">GB</span><span class="p">,</span><span class="n">A100</span><span class="o">-</span><span class="n">PCIe</span><span class="o">-</span><span class="mi">80</span><span class="n">GB</span><span class="p">,</span><span class="n">A100</span><span class="o">-</span><span class="n">PCIe</span><span class="o">-</span><span class="mi">40</span><span class="n">GB</span><span class="p">,</span><span class="n">H100</span><span class="o">-</span><span class="n">SXM</span><span class="p">,</span><span class="n">H100</span><span class="o">-</span><span class="n">PCIe</span><span class="p">,</span><span class="n">H20</span><span class="p">,</span><span class="n">H200</span><span class="o">-</span><span class="n">SXM</span><span class="p">,</span><span class="n">H200</span><span class="o">-</span><span class="n">NVL</span><span class="p">,</span><span class="n">A40</span><span class="p">,</span><span class="n">A30</span><span class="p">,</span><span class="n">A10</span><span class="p">,</span><span class="n">A10G</span><span class="p">,</span><span class="n">L40S</span><span class="p">,</span><span class="n">L40</span><span class="p">,</span><span class="n">L20</span><span class="p">,</span><span class="n">L4</span><span class="p">,</span><span class="n">L2</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">bert_attention_plugin</span> <span class="p">{</span><span class="n">auto</span><span class="p">,</span><span class="n">float16</span><span class="p">,</span><span class="n">float32</span><span class="p">,</span><span class="n">bfloat16</span><span class="p">,</span><span class="n">int32</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">gpt_attention_plugin</span> <span class="p">{</span><span class="n">auto</span><span class="p">,</span><span class="n">float16</span><span class="p">,</span><span class="n">float32</span><span class="p">,</span><span class="n">bfloat16</span><span class="p">,</span><span class="n">int32</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">gemm_plugin</span> <span class="p">{</span><span class="n">auto</span><span class="p">,</span><span class="n">float16</span><span class="p">,</span><span class="n">float32</span><span class="p">,</span><span class="n">bfloat16</span><span class="p">,</span><span class="n">int32</span><span class="p">,</span><span class="n">fp8</span><span class="p">,</span><span class="n">nvfp4</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">gemm_swiglu_plugin</span> <span class="p">{</span><span class="n">fp8</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">fp8_rowwise_gemm_plugin</span> <span class="p">{</span><span class="n">auto</span><span class="p">,</span><span class="n">float16</span><span class="p">,</span><span class="n">float32</span><span class="p">,</span><span class="n">bfloat16</span><span class="p">,</span><span class="n">int32</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">nccl_plugin</span> <span class="p">{</span><span class="n">auto</span><span class="p">,</span><span class="n">float16</span><span class="p">,</span><span class="n">float32</span><span class="p">,</span><span class="n">bfloat16</span><span class="p">,</span><span class="n">int32</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">lora_plugin</span> <span class="p">{</span><span class="n">auto</span><span class="p">,</span><span class="n">float16</span><span class="p">,</span><span class="n">float32</span><span class="p">,</span><span class="n">bfloat16</span><span class="p">,</span><span class="n">int32</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">dora_plugin</span> <span class="p">{</span><span class="n">enable</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">moe_plugin</span> <span class="p">{</span><span class="n">auto</span><span class="p">,</span><span class="n">float16</span><span class="p">,</span><span class="n">float32</span><span class="p">,</span><span class="n">bfloat16</span><span class="p">,</span><span class="n">int32</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">mamba_conv1d_plugin</span> <span class="p">{</span><span class="n">auto</span><span class="p">,</span><span class="n">float16</span><span class="p">,</span><span class="n">float32</span><span class="p">,</span><span class="n">bfloat16</span><span class="p">,</span><span class="n">int32</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">low_latency_gemm_plugin</span> <span class="p">{</span><span class="n">fp8</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">low_latency_gemm_swiglu_plugin</span> <span class="p">{</span><span class="n">fp8</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">gemm_allreduce_plugin</span> <span class="p">{</span><span class="n">float16</span><span class="p">,</span><span class="n">bfloat16</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">context_fmha</span> <span class="p">{</span><span class="n">enable</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">bert_context_fmha_fp32_acc</span> <span class="p">{</span><span class="n">enable</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">remove_input_padding</span> <span class="p">{</span><span class="n">enable</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">norm_quant_fusion</span> <span class="p">{</span><span class="n">enable</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span> <span class="p">[</span><span class="o">--</span><span class="n">reduce_fusion</span> <span class="p">{</span><span class="n">enable</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">user_buffer</span> <span class="p">{</span><span class="n">enable</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span> <span class="p">[</span><span class="o">--</span><span class="n">tokens_per_block</span> <span class="n">TOKENS_PER_BLOCK</span><span class="p">]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">use_paged_context_fmha</span> <span class="p">{</span><span class="n">enable</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">use_fp8_context_fmha</span> <span class="p">{</span><span class="n">enable</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">fuse_fp4_quant</span> <span class="p">{</span><span class="n">enable</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">multiple_profiles</span> <span class="p">{</span><span class="n">enable</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span> <span class="p">[</span><span class="o">--</span><span class="n">paged_state</span> <span class="p">{</span><span class="n">enable</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">streamingllm</span> <span class="p">{</span><span class="n">enable</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span> <span class="p">[</span><span class="o">--</span><span class="n">use_fused_mlp</span> <span class="p">{</span><span class="n">enable</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">pp_reduce_scatter</span> <span class="p">{</span><span class="n">enable</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
+</pre></div>
+</div>
+<section id="tensorrt_llm.commands.build-parse_arguments-named-arguments">
+<h2>Named Arguments<a class="headerlink" href="#tensorrt_llm.commands.build-parse_arguments-named-arguments" title="Link to this heading">#</a></h2>
+<dl class="option-list">
+<dt><kbd>--checkpoint_dir</kbd></dt>
+<dd><p>The directory path that contains TensorRT-LLM checkpoint.</p>
+</dd>
+<dt><kbd>--model_config</kbd></dt>
+<dd><p>The file path that saves TensorRT-LLM checkpoint config.</p>
+</dd>
+<dt><kbd>--build_config</kbd></dt>
+<dd><p>The file path that saves TensorRT-LLM build config.</p>
+</dd>
+<dt><kbd>--model_cls_file</kbd></dt>
+<dd><p>The file path that defines customized TensorRT-LLM model.</p>
+</dd>
+<dt><kbd>--model_cls_name</kbd></dt>
+<dd><p>The customized TensorRT-LLM model class name.</p>
+</dd>
+<dt><kbd>--output_dir</kbd></dt>
+<dd><p>The directory path to save the serialized engine files and engine config file.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'engine_outputs'</span></code></p>
+</dd>
+<dt><kbd>--max_batch_size</kbd></dt>
+<dd><p>Maximum number of requests that the engine can schedule.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">2048</span></code></p>
+</dd>
+<dt><kbd>--max_input_len</kbd></dt>
+<dd><p>Maximum input length of one request.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">1024</span></code></p>
+</dd>
+<dt><kbd>--max_seq_len, --max_decoder_seq_len</kbd></dt>
+<dd><p>Maximum total length of one request, including prompt and outputs. If unspecified, the value is deduced from the model config.</p>
+</dd>
+<dt><kbd>--max_beam_width</kbd></dt>
+<dd><p>Maximum number of beams for beam search decoding.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">1</span></code></p>
+</dd>
+<dt><kbd>--max_num_tokens</kbd></dt>
+<dd><p>Maximum number of batched input tokens after padding is removed in each batch. Currently, the input padding is removed by default; you may explicitly disable it by specifying <code class="docutils literal notranslate"><span class="pre">--remove_input_padding</span> <span class="pre">disable</span></code>.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">8192</span></code></p>
+</dd>
+<dt><kbd>--opt_num_tokens</kbd></dt>
+<dd><p>Optimal number of batched input tokens after padding is removed in each batch It equals to <code class="docutils literal notranslate"><span class="pre">max_batch_size</span> <span class="pre">*</span> <span class="pre">max_beam_width</span></code> by default, set this value as close as possible to the actual number of tokens on your workload. Note that this argument might be removed in the future.</p>
+</dd>
+<dt><kbd>--max_encoder_input_len</kbd></dt>
+<dd><p>Maximum encoder input length for enc-dec models. Set <code class="docutils literal notranslate"><span class="pre">max_input_len</span></code> to 1 to start generation from decoder_start_token_id of length 1.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">1024</span></code></p>
+</dd>
+<dt><kbd>--max_prompt_embedding_table_size, --max_multimodal_len</kbd></dt>
+<dd><p>Maximum prompt embedding table size for prompt tuning, or maximum multimodal input size for multimodal models. Setting a value &gt; 0 enables prompt tuning or multimodal input.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">0</span></code></p>
+</dd>
+<dt><kbd>--kv_cache_type</kbd></dt>
+<dd><p>Set KV cache type (continuous, paged, or disabled). For disabled case, KV cache is disabled and only context phase is allowed.</p>
+</dd>
+<dt><kbd>--paged_kv_cache</kbd></dt>
+<dd><p>Deprecated. Enabling this option is equvilient to <code class="docutils literal notranslate"><span class="pre">--kv_cache_type</span> <span class="pre">paged</span></code> for transformer based models.</p>
+</dd>
+<dt><kbd>--input_timing_cache</kbd></dt>
+<dd><p>The file path to read the timing cache. This option is ignored if the file does not exist.</p>
+</dd>
+<dt><kbd>--output_timing_cache</kbd></dt>
+<dd><p>The file path to write the timing cache.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'model.cache'</span></code></p>
+</dd>
+<dt><kbd>--profiling_verbosity</kbd></dt>
+<dd><p>Possible choices: layer_names_only, detailed, none</p>
+<p>The profiling verbosity for the generated TensorRT engine. Setting to detailed allows inspecting tactic choices and kernel parameters.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'layer_names_only'</span></code></p>
+</dd>
+<dt><kbd>--strip_plan</kbd></dt>
+<dd><p>Enable stripping weights from the final TensorRT engine under the assumption that the refit weights are identical to those provided at build time.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">False</span></code></p>
+</dd>
+<dt><kbd>--weight_sparsity</kbd></dt>
+<dd><p>Enable weight sparsity.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">False</span></code></p>
+</dd>
+<dt><kbd>--weight_streaming</kbd></dt>
+<dd><p>Enable offloading weights to CPU and streaming loading at runtime.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">False</span></code></p>
+</dd>
+<dt><kbd>--fast_build</kbd></dt>
+<dd><p>Enable features for faster engine building. This may cause some performance degradation and is currently incompatible with int8/int4 quantization without plugin.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">False</span></code></p>
+</dd>
+<dt><kbd>--workers</kbd></dt>
+<dd><p>The number of workers for building in parallel.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">1</span></code></p>
+</dd>
+<dt><kbd>--log_level</kbd></dt>
+<dd><p>Possible choices: internal_error, error, warning, info, verbose, debug</p>
+<p>The logging level.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'info'</span></code></p>
+</dd>
+<dt><kbd>--enable_debug_output</kbd></dt>
+<dd><p>Enable debug output.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">False</span></code></p>
+</dd>
+<dt><kbd>--visualize_network</kbd></dt>
+<dd><p>The directory path to export TensorRT Network as ONNX prior to Engine build for debugging.</p>
+</dd>
+<dt><kbd>--dry_run</kbd></dt>
+<dd><p>Run through the build process except the actual Engine build for debugging.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">False</span></code></p>
+</dd>
+<dt><kbd>--monitor_memory</kbd></dt>
+<dd><p>Enable memory monitor during Engine build.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">False</span></code></p>
+</dd>
+</dl>
+</section>
+<section id="tensorrt_llm.commands.build-parse_arguments-logits-arguments">
+<h2>Logits arguments<a class="headerlink" href="#tensorrt_llm.commands.build-parse_arguments-logits-arguments" title="Link to this heading">#</a></h2>
+<dl class="option-list">
+<dt><kbd>--logits_dtype</kbd></dt>
+<dd><p>Possible choices: float16, float32</p>
+<p>The data type of logits.</p>
+</dd>
+<dt><kbd>--gather_context_logits</kbd></dt>
+<dd><p>Enable gathering context logits.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">False</span></code></p>
+</dd>
+<dt><kbd>--gather_generation_logits</kbd></dt>
+<dd><p>Enable gathering generation logits.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">False</span></code></p>
+</dd>
+<dt><kbd>--gather_all_token_logits</kbd></dt>
+<dd><p>Enable both <code class="docutils literal notranslate"><span class="pre">gather_context_logits</span></code> and <code class="docutils literal notranslate"><span class="pre">gather_generation_logits</span></code>.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">False</span></code></p>
+</dd>
+</dl>
+</section>
+<section id="tensorrt_llm.commands.build-parse_arguments-lora-arguments">
+<h2>LoRA arguments<a class="headerlink" href="#tensorrt_llm.commands.build-parse_arguments-lora-arguments" title="Link to this heading">#</a></h2>
+<dl class="option-list">
+<dt><kbd>--lora_dir</kbd></dt>
+<dd><p>The directory of LoRA weights. If multiple directories are provided, the first one is used for configuration.</p>
+</dd>
+<dt><kbd>--lora_ckpt_source</kbd></dt>
+<dd><p>Possible choices: hf, nemo</p>
+<p>The source type of LoRA checkpoint.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'hf'</span></code></p>
+</dd>
+<dt><kbd>--lora_target_modules</kbd></dt>
+<dd><p>Possible choices: attn_qkv, attn_q, attn_k, attn_v, attn_dense, mlp_h_to_4h, mlp_4h_to_h, mlp_gate, cross_attn_qkv, cross_attn_q, cross_attn_k, cross_attn_v, cross_attn_dense, moe_h_to_4h, moe_4h_to_h, moe_gate, moe_router, mlp_router, mlp_gate_up</p>
+<p>The target module names that LoRA is applied. Only effective when <code class="docutils literal notranslate"><span class="pre">lora_plugin</span></code> is enabled.</p>
+</dd>
+<dt><kbd>--max_lora_rank</kbd></dt>
+<dd><p>Maximum LoRA rank for different LoRA modules. It is used to compute the workspace size of LoRA plugin.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">64</span></code></p>
+</dd>
+</dl>
+</section>
+<section id="tensorrt_llm.commands.build-parse_arguments-speculative-decoding-arguments">
+<h2>Speculative decoding arguments<a class="headerlink" href="#tensorrt_llm.commands.build-parse_arguments-speculative-decoding-arguments" title="Link to this heading">#</a></h2>
+<dl class="option-list">
+<dt><kbd>--speculative_decoding_mode</kbd></dt>
+<dd><p>Possible choices: draft_tokens_external, lookahead_decoding, medusa, explicit_draft_tokens, eagle</p>
+<p>Mode of speculative decoding.</p>
+</dd>
+<dt><kbd>--max_draft_len</kbd></dt>
+<dd><p>Maximum lengths of draft tokens for speculative decoding target model.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">0</span></code></p>
+</dd>
+</dl>
+</section>
+<section id="tensorrt_llm.commands.build-parse_arguments-auto-parallel-arguments">
+<h2>Auto parallel arguments<a class="headerlink" href="#tensorrt_llm.commands.build-parse_arguments-auto-parallel-arguments" title="Link to this heading">#</a></h2>
+<dl class="option-list">
+<dt><kbd>--auto_parallel</kbd></dt>
+<dd><p>MPI world size for auto parallel.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">1</span></code></p>
+</dd>
+<dt><kbd>--gpus_per_node</kbd></dt>
+<dd><p>Number of GPUs each node has in a multi-node setup. This is a cluster spec and can be greater/smaller than world size. This option is only used for auto parallel specified with <code class="docutils literal notranslate"><span class="pre">--auto_parallel</span></code>.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">8</span></code></p>
+</dd>
+<dt><kbd>--cluster_key</kbd></dt>
+<dd><p>Possible choices: A100-SXM-80GB, A100-SXM-40GB, A100-PCIe-80GB, A100-PCIe-40GB, H100-SXM, H100-PCIe, H20, H200-SXM, H200-NVL, A40, A30, A10, A10G, L40S, L40, L20, L4, L2</p>
+<p>Unique name for target GPU type. Inferred from current GPU type if not specified. This option is only used for auto parallel specified with <code class="docutils literal notranslate"><span class="pre">--auto_parallel</span></code>.</p>
+</dd>
+</dl>
+</section>
+<section id="tensorrt_llm.commands.build-parse_arguments-plugin-config-arguments">
+<h2>Plugin config arguments<a class="headerlink" href="#tensorrt_llm.commands.build-parse_arguments-plugin-config-arguments" title="Link to this heading">#</a></h2>
+<dl class="option-list">
+<dt><kbd>--bert_attention_plugin</kbd></dt>
+<dd><p>Possible choices: auto, float16, float32, bfloat16, int32, disable</p>
+<p>The plugin that uses efficient kernels and enables an in-place update of the KV cache for attention layer of BERT-like encoder models.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'auto'</span></code></p>
+</dd>
+<dt><kbd>--gpt_attention_plugin</kbd></dt>
+<dd><p>Possible choices: auto, float16, float32, bfloat16, int32, disable</p>
+<p>The plugin that uses efficient kernels and enables an in-place update of the KV cache for attention layer of GPT-like decoder models.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'auto'</span></code></p>
+</dd>
+<dt><kbd>--gemm_plugin</kbd></dt>
+<dd><p>Possible choices: auto, float16, float32, bfloat16, int32, fp8, nvfp4, disable</p>
+<p>The GEMM plugin that utilizes NVIDIA cuBLASLt to perform GEMM operations. Note: it’s only affective for non-quantized gemm operations (except FP8).Note: For FP8, it also requires same calibration in checkpoint.</p>
+</dd>
+<dt><kbd>--gemm_swiglu_plugin</kbd></dt>
+<dd><p>Possible choices: fp8, disable</p>
+<p>The GEMM + SwiGLU fusion in Gated-MLP combines two Matmul operations and one SwiGLU operation into a single kernel. Currently this is only supported for FP8 precision on Hopper.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'disable'</span></code></p>
+</dd>
+<dt><kbd>--fp8_rowwise_gemm_plugin</kbd></dt>
+<dd><p>Possible choices: auto, float16, float32, bfloat16, int32, disable</p>
+<p>The quantized GEMM for fp8, which uses per token dynamic scales for activation and per channel static scales for weights.Note: It also requires same calibration in checkpoint.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'disable'</span></code></p>
+</dd>
+<dt><kbd>--nccl_plugin</kbd></dt>
+<dd><p>Possible choices: auto, float16, float32, bfloat16, int32, disable</p>
+<p>The NCCL plugin wraps NCCL operators to support multi-GPU and even multi-nodes.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'auto'</span></code></p>
+</dd>
+<dt><kbd>--lora_plugin</kbd></dt>
+<dd><p>Possible choices: auto, float16, float32, bfloat16, int32, disable</p>
+<p>Enable LoRA.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'disable'</span></code></p>
+</dd>
+<dt><kbd>--dora_plugin</kbd></dt>
+<dd><p>Possible choices: enable, disable</p>
+<p>Enable DoRA.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'disable'</span></code></p>
+</dd>
+<dt><kbd>--moe_plugin</kbd></dt>
+<dd><p>Possible choices: auto, float16, float32, bfloat16, int32, disable</p>
+<p>Enable some customized kernels to speed up the MoE layer of MoE models.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'auto'</span></code></p>
+</dd>
+<dt><kbd>--mamba_conv1d_plugin</kbd></dt>
+<dd><p>Possible choices: auto, float16, float32, bfloat16, int32, disable</p>
+<p>Enable customized kernels to speed up conv1d operator for Mamba.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'auto'</span></code></p>
+</dd>
+<dt><kbd>--low_latency_gemm_plugin</kbd></dt>
+<dd><p>Possible choices: fp8, disable</p>
+<p>The GEMM plugin that optimized specially for low latency scenarios.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'disable'</span></code></p>
+</dd>
+<dt><kbd>--low_latency_gemm_swiglu_plugin</kbd></dt>
+<dd><p>Possible choices: fp8, disable</p>
+<p>The GEMM + SwiGLU fusion plugin that optimized specially for low latency scenarios.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'disable'</span></code></p>
+</dd>
+<dt><kbd>--gemm_allreduce_plugin</kbd></dt>
+<dd><p>Possible choices: float16, bfloat16, disable</p>
+<p>The GEMM + AllReduce kernel fusion plugin.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'disable'</span></code></p>
+</dd>
+<dt><kbd>--context_fmha</kbd></dt>
+<dd><p>Possible choices: enable, disable</p>
+<p>Enable the fused multi-head attention during the context phase, will trigger a kernel that performs the MHA/MQA/GQA block using a single kernel.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'enable'</span></code></p>
+</dd>
+<dt><kbd>--bert_context_fmha_fp32_acc</kbd></dt>
+<dd><p>Possible choices: enable, disable</p>
+<p>Enable the FP32 accumulator for context FMHA in the bert_attention_plugin. If disabled, FP16 is used, better performance but potentially worse accuracy is expected.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'disable'</span></code></p>
+</dd>
+<dt><kbd>--remove_input_padding</kbd></dt>
+<dd><p>Possible choices: enable, disable</p>
+<p>Pack different tokens together, which reduces both the amount of computations and memory consumption.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'enable'</span></code></p>
+</dd>
+<dt><kbd>--norm_quant_fusion</kbd></dt>
+<dd><p>Possible choices: enable, disable</p>
+<p>Fuse the LayerNorm and quantization kernels into a single kernel, resulting in improved end-to-end performance.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'disable'</span></code></p>
+</dd>
+<dt><kbd>--reduce_fusion</kbd></dt>
+<dd><p>Possible choices: enable, disable</p>
+<p>Fuse the ResidualAdd and LayerNorm kernels after AllReduce into a single kernel, resulting in improved end-to-end performance.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'disable'</span></code></p>
+</dd>
+<dt><kbd>--user_buffer</kbd></dt>
+<dd><p>Possible choices: enable, disable</p>
+<p>Eliminate extra copies from the local buffer to the shared buffer in the communication kernel, leading to improved end-to-end performance. This feature must be enabled with <cite>–reduce_fusion enable</cite> and is currently only supported for the FP8 LLAMA model.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'disable'</span></code></p>
+</dd>
+<dt><kbd>--tokens_per_block</kbd></dt>
+<dd><p>Define how many tokens are contained in each paged kv cache block.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">32</span></code></p>
+</dd>
+<dt><kbd>--use_paged_context_fmha</kbd></dt>
+<dd><p>Possible choices: enable, disable</p>
+<p>Allow advanced features like KV cache reuse and chunked context.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'enable'</span></code></p>
+</dd>
+<dt><kbd>--use_fp8_context_fmha</kbd></dt>
+<dd><p>Possible choices: enable, disable</p>
+<p>When FP8 quantization is activated, the attention can be further accelerated by enabling FP8 Context FMHA</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'enable'</span></code></p>
+</dd>
+<dt><kbd>--fuse_fp4_quant</kbd></dt>
+<dd><p>Possible choices: enable, disable</p>
+<p>Whether to fuse FP4 quantization into attention kernel.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'disable'</span></code></p>
+</dd>
+<dt><kbd>--multiple_profiles</kbd></dt>
+<dd><p>Possible choices: enable, disable</p>
+<p>Enables multiple TensorRT optimization profiles in the built engines, will benefits the performance especially when GEMM plugin is disabled, because more optimization profiles help TensorRT have more chances to select better kernels. Note: This feature increases engine build time but no other adverse effects are expected.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'disable'</span></code></p>
+</dd>
+<dt><kbd>--paged_state</kbd></dt>
+<dd><p>Possible choices: enable, disable</p>
+<p>Enable paged state, which helps manage memory for the RNN state more efficiently.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'enable'</span></code></p>
+</dd>
+<dt><kbd>--streamingllm</kbd></dt>
+<dd><p>Possible choices: enable, disable</p>
+<p>Enable [StreamingLLM](<a class="reference external" href="https://arxiv.org/abs/2309.17453">https://arxiv.org/abs/2309.17453</a>), which uses a window attention to perform efficient and stable LLM on long texts.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'disable'</span></code></p>
+</dd>
+<dt><kbd>--use_fused_mlp</kbd></dt>
+<dd><p>Possible choices: enable, disable</p>
+<p>Enable horizontal fusion in Gated-MLP that combines two Matmul operations into a single one followed by a separate SwiGLU kernel.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'enable'</span></code></p>
+</dd>
+<dt><kbd>--pp_reduce_scatter</kbd></dt>
+<dd><p>Possible choices: enable, disable</p>
+<p>Enable a pipeline parallelism optimization with ReduceScatter + AllGather targeting large MoE models.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">'disable'</span></code></p>
+</dd>
+</dl>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../_cpp_gen/runtime.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Runtime</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="trtllm-serve.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">trtllm-serve</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.commands.build-parse_arguments-named-arguments">Named Arguments</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.commands.build-parse_arguments-logits-arguments">Logits arguments</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.commands.build-parse_arguments-lora-arguments">LoRA arguments</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.commands.build-parse_arguments-speculative-decoding-arguments">Speculative decoding arguments</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.commands.build-parse_arguments-auto-parallel-arguments">Auto parallel arguments</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.commands.build-parse_arguments-plugin-config-arguments">Plugin config arguments</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

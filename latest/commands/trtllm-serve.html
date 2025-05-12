@@ -1,0 +1,1085 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>trtllm-serve &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'commands/trtllm-serve';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="TensorRT-LLM Architecture" href="../architecture/overview.html" />
+    <link rel="prev" title="trtllm-build" href="trtllm-build.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">trtllm-serve</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="trtllm-serve">
+<h1>trtllm-serve<a class="headerlink" href="#trtllm-serve" title="Link to this heading">#</a></h1>
+<section id="about">
+<h2>About<a class="headerlink" href="#about" title="Link to this heading">#</a></h2>
+<p>The <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> command starts an OpenAI compatible server that supports the following endpoints:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">/v1/models</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/v1/completions</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/v1/chat/completions</span></code></p></li>
+</ul>
+<p>For information about the inference endpoints, refer to the <a class="reference external" href="https://platform.openai.com/docs/api-reference">OpenAI API Reference</a>.</p>
+<p>The server also supports the following endpoints:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">/health</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/metrics</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/version</span></code></p></li>
+</ul>
+<p>The <code class="docutils literal notranslate"><span class="pre">metrics</span></code> endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details.</p>
+</section>
+<section id="starting-a-server">
+<h2>Starting a Server<a class="headerlink" href="#starting-a-server" title="Link to this heading">#</a></h2>
+<p>The following abbreviated command syntax shows the commonly used arguments to start a server:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>&lt;model&gt;<span class="w"> </span><span class="o">[</span>--backend<span class="w"> </span>pytorch<span class="w"> </span>--tp_size<span class="w"> </span>&lt;tp&gt;<span class="w"> </span>--pp_size<span class="w"> </span>&lt;pp&gt;<span class="w"> </span>--ep_size<span class="w"> </span>&lt;ep&gt;<span class="w"> </span>--host<span class="w"> </span>&lt;host&gt;<span class="w"> </span>--port<span class="w"> </span>&lt;port&gt;<span class="o">]</span>
+</pre></div>
+</div>
+<p>For the full syntax and argument descriptions, refer to <a class="reference internal" href="#syntax"><span class="std std-ref">Syntax</span></a>.</p>
+</section>
+<section id="inference-endpoints">
+<h2>Inference Endpoints<a class="headerlink" href="#inference-endpoints" title="Link to this heading">#</a></h2>
+<p>After you start the server, you can send inference requests through completions API and Chat API, which are compatible with corresponding OpenAI APIs. We use <a class="reference external" href="https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0">TinyLlama-1.1B-Chat-v1.0</a> for examples in the following sections.</p>
+<section id="chat-api">
+<h3>Chat API<a class="headerlink" href="#chat-api" title="Link to this heading">#</a></h3>
+<p>You can query Chat API with any http clients, a typical example is OpenAI Python client:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="c1">### OpenAI Chat Client</span>
+<span class="linenos"> 2</span>
+<span class="linenos"> 3</span><span class="kn">from</span><span class="w"> </span><span class="nn">openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">OpenAI</span>
+<span class="linenos"> 4</span>
+<span class="linenos"> 5</span><span class="n">client</span> <span class="o">=</span> <span class="n">OpenAI</span><span class="p">(</span>
+<span class="linenos"> 6</span>    <span class="n">base_url</span><span class="o">=</span><span class="s2">&quot;http://localhost:8000/v1&quot;</span><span class="p">,</span>
+<span class="linenos"> 7</span>    <span class="n">api_key</span><span class="o">=</span><span class="s2">&quot;tensorrt_llm&quot;</span><span class="p">,</span>
+<span class="linenos"> 8</span><span class="p">)</span>
+<span class="linenos"> 9</span>
+<span class="linenos">10</span><span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+<span class="linenos">11</span>    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
+<span class="linenos">12</span>    <span class="n">messages</span><span class="o">=</span><span class="p">[{</span>
+<span class="linenos">13</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;system&quot;</span><span class="p">,</span>
+<span class="linenos">14</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;you are a helpful assistant&quot;</span>
+<span class="linenos">15</span>    <span class="p">},</span> <span class="p">{</span>
+<span class="linenos">16</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;user&quot;</span><span class="p">,</span>
+<span class="linenos">17</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;Where is New York?&quot;</span>
+<span class="linenos">18</span>    <span class="p">}],</span>
+<span class="linenos">19</span>    <span class="n">max_tokens</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span>
+<span class="linenos">20</span><span class="p">)</span>
+<span class="linenos">21</span><span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Another example uses <code class="docutils literal notranslate"><span class="pre">curl</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="ch">#! /usr/bin/env bash</span>
+<span class="linenos"> 2</span>
+<span class="linenos"> 3</span>curl<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span><span class="se">\</span>
+<span class="linenos"> 4</span><span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos"> 5</span><span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="linenos"> 6</span><span class="s1">        &quot;model&quot;: &quot;TinyLlama-1.1B-Chat-v1.0&quot;,</span>
+<span class="linenos"> 7</span><span class="s1">        &quot;messages&quot;:[{&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: &quot;You are a helpful assistant.&quot;},</span>
+<span class="linenos"> 8</span><span class="s1">                    {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Where is New York?&quot;}],</span>
+<span class="linenos"> 9</span><span class="s1">        &quot;max_tokens&quot;: 16,</span>
+<span class="linenos">10</span><span class="s1">        &quot;temperature&quot;: 0</span>
+<span class="linenos">11</span><span class="s1">    }&#39;</span>
+</pre></div>
+</div>
+</section>
+<section id="completions-api">
+<h3>Completions API<a class="headerlink" href="#completions-api" title="Link to this heading">#</a></h3>
+<p>You can query Completions API with any http clients, a typical example is OpenAI Python client:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="c1">### OpenAI Completion Client</span>
+<span class="linenos"> 2</span>
+<span class="linenos"> 3</span><span class="kn">from</span><span class="w"> </span><span class="nn">openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">OpenAI</span>
+<span class="linenos"> 4</span>
+<span class="linenos"> 5</span><span class="n">client</span> <span class="o">=</span> <span class="n">OpenAI</span><span class="p">(</span>
+<span class="linenos"> 6</span>    <span class="n">base_url</span><span class="o">=</span><span class="s2">&quot;http://localhost:8000/v1&quot;</span><span class="p">,</span>
+<span class="linenos"> 7</span>    <span class="n">api_key</span><span class="o">=</span><span class="s2">&quot;tensorrt_llm&quot;</span><span class="p">,</span>
+<span class="linenos"> 8</span><span class="p">)</span>
+<span class="linenos"> 9</span>
+<span class="linenos">10</span><span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+<span class="linenos">11</span>    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
+<span class="linenos">12</span>    <span class="n">prompt</span><span class="o">=</span><span class="s2">&quot;Where is New York?&quot;</span><span class="p">,</span>
+<span class="linenos">13</span>    <span class="n">max_tokens</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span>
+<span class="linenos">14</span><span class="p">)</span>
+<span class="linenos">15</span><span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Another example uses <code class="docutils literal notranslate"><span class="pre">curl</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="ch">#! /usr/bin/env bash</span>
+<span class="linenos"> 2</span>
+<span class="linenos"> 3</span>curl<span class="w"> </span>http://localhost:8000/v1/completions<span class="w"> </span><span class="se">\</span>
+<span class="linenos"> 4</span><span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos"> 5</span><span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="linenos"> 6</span><span class="s1">        &quot;model&quot;: &quot;TinyLlama-1.1B-Chat-v1.0&quot;,</span>
+<span class="linenos"> 7</span><span class="s1">        &quot;prompt&quot;: &quot;Where is New York?&quot;,</span>
+<span class="linenos"> 8</span><span class="s1">        &quot;max_tokens&quot;: 16,</span>
+<span class="linenos"> 9</span><span class="s1">        &quot;temperature&quot;: 0</span>
+<span class="linenos">10</span><span class="s1">    }&#39;</span>
+</pre></div>
+</div>
+</section>
+<section id="multimodal-serving">
+<h3>Multimodal Serving<a class="headerlink" href="#multimodal-serving" title="Link to this heading">#</a></h3>
+<p>For multimodal models (e.g., Qwen2-VL), you’ll need to create a configuration file and start the server with additional options:</p>
+<p>First, create a configuration file:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>cat<span class="w"> </span>&gt;./extra-llm-api-config.yml<span class="s">&lt;&lt;EOF</span>
+<span class="s">kv_cache_config:</span>
+<span class="s">    enable_block_reuse: false</span>
+<span class="s">EOF</span>
+</pre></div>
+</div>
+<p>Then, start the server with the configuration file:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>Qwen/Qwen2-VL-7B-Instruct<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--extra_llm_api_options<span class="w"> </span>./extra-llm-api-config.yml<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--backend<span class="w"> </span>pytorch
+</pre></div>
+</div>
+</section>
+<section id="id1">
+<h3>Completions API<a class="headerlink" href="#id1" title="Link to this heading">#</a></h3>
+<p>You can query Completions API with any http clients, a typical example is OpenAI Python client:</p>
+<p>Another example uses <code class="docutils literal notranslate"><span class="pre">curl</span></code>:</p>
+</section>
+</section>
+<section id="benchmark">
+<h2>Benchmark<a class="headerlink" href="#benchmark" title="Link to this heading">#</a></h2>
+<p>You can use any benchmark clients compatible with OpenAI API to test serving performance of <code class="docutils literal notranslate"><span class="pre">trtllm_serve</span></code>, we recommend <code class="docutils literal notranslate"><span class="pre">genai-perf</span></code> and here is a benchmarking recipe.</p>
+<p>First, install <code class="docutils literal notranslate"><span class="pre">genai-perf</span></code> with <code class="docutils literal notranslate"><span class="pre">pip</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>genai-perf
+</pre></div>
+</div>
+<p>Then, <a class="reference internal" href="#starting-a-server"><span class="std std-ref">start a server</span></a> with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> and <code class="docutils literal notranslate"><span class="pre">TinyLlama-1.1B-Chat-v1.0</span></code>.</p>
+<p>Finally, test performance with the following command:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="ch">#! /usr/bin/env bash</span>
+<span class="linenos"> 2</span>
+<span class="linenos"> 3</span>genai-perf<span class="w"> </span>profile<span class="w"> </span><span class="se">\</span>
+<span class="linenos"> 4</span><span class="w">    </span>-m<span class="w"> </span>TinyLlama-1.1B-Chat-v1.0<span class="w"> </span><span class="se">\</span>
+<span class="linenos"> 5</span><span class="w">    </span>--tokenizer<span class="w"> </span>TinyLlama/TinyLlama-1.1B-Chat-v1.0<span class="w"> </span><span class="se">\</span>
+<span class="linenos"> 6</span><span class="w">    </span>--service-kind<span class="w"> </span>openai<span class="w"> </span><span class="se">\</span>
+<span class="linenos"> 7</span><span class="w">    </span>--endpoint-type<span class="w"> </span>chat<span class="w"> </span><span class="se">\</span>
+<span class="linenos"> 8</span><span class="w">    </span>--random-seed<span class="w"> </span><span class="m">123</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos"> 9</span><span class="w">    </span>--synthetic-input-tokens-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos">10</span><span class="w">    </span>--synthetic-input-tokens-stddev<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos">11</span><span class="w">    </span>--output-tokens-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos">12</span><span class="w">    </span>--output-tokens-stddev<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos">13</span><span class="w">    </span>--request-count<span class="w"> </span><span class="m">100</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos">14</span><span class="w">    </span>--request-rate<span class="w"> </span><span class="m">10</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos">15</span><span class="w">    </span>--profile-export-file<span class="w"> </span>my_profile_export.json<span class="w"> </span><span class="se">\</span>
+<span class="linenos">16</span><span class="w">    </span>--url<span class="w"> </span>localhost:8000<span class="w"> </span><span class="se">\</span>
+<span class="linenos">17</span><span class="w">    </span>--streaming
+</pre></div>
+</div>
+<p>Refer to <a class="reference external" href="https://github.com/triton-inference-server/perf_analyzer/blob/main/genai-perf/README.md">README</a> of <code class="docutils literal notranslate"><span class="pre">genai-perf</span></code> for more guidance.</p>
+</section>
+<section id="multi-node-serving-with-slurm">
+<h2>Multi-node Serving with Slurm<a class="headerlink" href="#multi-node-serving-with-slurm" title="Link to this heading">#</a></h2>
+<p>You can deploy <a class="reference external" href="https://huggingface.co/deepseek-ai/DeepSeek-V3">DeepSeek-V3</a> model across two nodes with Slurm and <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">echo</span><span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;enable_attention_dp: true\npytorch_backend_config:\n  enable_overlap_scheduler: true&quot;</span><span class="w"> </span>&gt;<span class="w"> </span>extra-llm-api-config.yml
+
+srun<span class="w"> </span>-N<span class="w"> </span><span class="m">2</span><span class="w"> </span>-w<span class="w"> </span><span class="o">[</span>NODES<span class="o">]</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output<span class="o">=</span>benchmark_2node.log<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--ntasks<span class="w"> </span><span class="m">16</span><span class="w"> </span>--ntasks-per-node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--mpi<span class="o">=</span>pmix<span class="w"> </span>--gres<span class="o">=</span>gpu:8<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--container-image<span class="o">=</span>&lt;CONTAINER_IMG&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--container-mounts<span class="o">=</span>/workspace:/workspace<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--container-workdir<span class="w"> </span>/workspace<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;trtllm-llmapi-launch trtllm-serve deepseek-ai/DeepSeek-V3 --backend pytorch --max_batch_size 161 --max_num_tokens 1160 --tp_size 16 --ep_size 4 --kv_cache_free_gpu_memory_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml&quot;</span>
+</pre></div>
+</div>
+<p>See <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/trtllm-llmapi-launch">the source code</a> of <code class="docutils literal notranslate"><span class="pre">trtllm-llmapi-launch</span></code> for more details.</p>
+</section>
+<section id="metrics-endpoint">
+<h2>Metrics Endpoint<a class="headerlink" href="#metrics-endpoint" title="Link to this heading">#</a></h2>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>This endpoint is beta maturity.</p>
+<p>The statistics for the PyTorch backend are beta and not as comprehensive as those for the TensorRT backend.</p>
+<p>Some fields, such as CPU memory usage, are not available for the PyTorch backend.</p>
+<p>Enabling <code class="docutils literal notranslate"><span class="pre">enable_iter_perf_stats</span></code> in the PyTorch backend can impact performance slightly, depending on the serving configuration.</p>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details.
+For the TensorRT backend, these statistics are enabled by default.
+However, for the PyTorch backend, specified with the <code class="docutils literal notranslate"><span class="pre">--backend</span> <span class="pre">pytorch</span></code> argument, you must explicitly enable iteration statistics logging by setting the <cite>enable_iter_perf_stats</cite> field in a YAML configuration file as shown in the following example:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># extra-llm-api-config.yml</span>
+<span class="nt">pytorch_backend_config</span><span class="p">:</span>
+<span class="w"> </span><span class="nt">enable_iter_perf_stats</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+</pre></div>
+</div>
+<p>Then start the server and specify the <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span></code> argument with the path to the YAML file as shown in the following example:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>&lt;model&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--extra_llm_api_options<span class="w"> </span>&lt;path-to-extra-llm-api-config.yml&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="o">[</span>--backend<span class="w"> </span>pytorch<span class="w"> </span>--tp_size<span class="w"> </span>&lt;tp&gt;<span class="w"> </span>--pp_size<span class="w"> </span>&lt;pp&gt;<span class="w"> </span>--ep_size<span class="w"> </span>&lt;ep&gt;<span class="w"> </span>--host<span class="w"> </span>&lt;host&gt;<span class="w"> </span>--port<span class="w"> </span>&lt;port&gt;<span class="o">]</span>
+</pre></div>
+</div>
+<p>After at least one inference request is sent to the server, you can fetch the runtime-iteration statistics by polling the <cite>/metrics</cite> endpoint:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-X<span class="w"> </span>GET<span class="w"> </span>http://&lt;host&gt;:&lt;port&gt;/metrics
+</pre></div>
+</div>
+<p><em>Example Output</em></p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;gpuMemUsage&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">56401920000</span><span class="p">,</span>
+<span class="w">     </span><span class="nt">&quot;inflightBatchingStats&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">         </span><span class="err">...</span>
+<span class="w">     </span><span class="p">},</span>
+<span class="w">     </span><span class="nt">&quot;iter&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">     </span><span class="nt">&quot;iterLatencyMS&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">16.505143404006958</span><span class="p">,</span>
+<span class="w">     </span><span class="nt">&quot;kvCacheStats&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">         </span><span class="err">...</span>
+<span class="w">     </span><span class="p">},</span>
+<span class="w">     </span><span class="nt">&quot;newActiveRequestsQueueLatencyMS&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0007503032684326172</span>
+<span class="w"> </span><span class="p">}</span>
+</pre></div>
+</div>
+<p>]</p>
+</section>
+<section id="syntax">
+<h2>Syntax<a class="headerlink" href="#syntax" title="Link to this heading">#</a></h2>
+<section id="trtllm-serve">
+<h3>trtllm-serve<a class="headerlink" href="#trtllm-serve" title="Link to this heading">#</a></h3>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>COMMAND<span class="w"> </span><span class="o">[</span>ARGS<span class="o">]</span>...
+</pre></div>
+</div>
+<section id="trtllm-serve-disaggregated">
+<h4>disaggregated<a class="headerlink" href="#trtllm-serve-disaggregated" title="Link to this heading">#</a></h4>
+<p>Running server in disaggregated mode</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>disaggregated<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+</pre></div>
+</div>
+<p class="rubric">Options</p>
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-disaggregated-c">
+<span id="cmdoption-trtllm-serve-disaggregated-config_file"></span><span class="sig-name descname"><span class="pre">-c</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--config_file</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;config_file&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-disaggregated-c" title="Link to this definition">#</a></dt>
+<dd><p>Specific option for disaggregated mode.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-disaggregated-t">
+<span id="cmdoption-trtllm-serve-disaggregated-server_start_timeout"></span><span class="sig-name descname"><span class="pre">-t</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--server_start_timeout</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;server_start_timeout&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-disaggregated-t" title="Link to this definition">#</a></dt>
+<dd><p>Server start timeout</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-disaggregated-r">
+<span id="cmdoption-trtllm-serve-disaggregated-request_timeout"></span><span class="sig-name descname"><span class="pre">-r</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--request_timeout</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;request_timeout&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-disaggregated-r" title="Link to this definition">#</a></dt>
+<dd><p>Request timeout</p>
+</dd></dl>
+
+</section>
+<section id="trtllm-serve-disaggregated-mpi-worker">
+<h4>disaggregated_mpi_worker<a class="headerlink" href="#trtllm-serve-disaggregated-mpi-worker" title="Link to this heading">#</a></h4>
+<p>Launching disaggregated MPI worker</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>disaggregated_mpi_worker<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+</pre></div>
+</div>
+<p class="rubric">Options</p>
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-disaggregated_mpi_worker-c">
+<span id="cmdoption-trtllm-serve-disaggregated_mpi_worker-config_file"></span><span class="sig-name descname"><span class="pre">-c</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--config_file</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;config_file&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-disaggregated_mpi_worker-c" title="Link to this definition">#</a></dt>
+<dd><p>Specific option for disaggregated mode.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-disaggregated_mpi_worker-log_level">
+<span class="sig-name descname"><span class="pre">--log_level</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;log_level&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-disaggregated_mpi_worker-log_level" title="Link to this definition">#</a></dt>
+<dd><p>The logging level.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Options<span class="colon">:</span></dt>
+<dd class="field-odd"><p>internal_error | error | warning | info | verbose | debug</p>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+<section id="trtllm-serve-serve">
+<h4>serve<a class="headerlink" href="#trtllm-serve-serve" title="Link to this heading">#</a></h4>
+<p>Running an OpenAI API compatible server</p>
+<p>MODEL: model name | HF checkpoint path | TensorRT engine path</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>serve<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>MODEL
+</pre></div>
+</div>
+<p class="rubric">Options</p>
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-tokenizer">
+<span class="sig-name descname"><span class="pre">--tokenizer</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;tokenizer&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-tokenizer" title="Link to this definition">#</a></dt>
+<dd><p>Path | Name of the tokenizer.Specify this value only if using TensorRT engine as model.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-host">
+<span class="sig-name descname"><span class="pre">--host</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;host&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-host" title="Link to this definition">#</a></dt>
+<dd><p>Hostname of the server.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-port">
+<span class="sig-name descname"><span class="pre">--port</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;port&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-port" title="Link to this definition">#</a></dt>
+<dd><p>Port of the server.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-backend">
+<span class="sig-name descname"><span class="pre">--backend</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;backend&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-backend" title="Link to this definition">#</a></dt>
+<dd><p>Set to ‘pytorch’ for pytorch path. Default is cpp path.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Options<span class="colon">:</span></dt>
+<dd class="field-odd"><p>pytorch</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-log_level">
+<span class="sig-name descname"><span class="pre">--log_level</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;log_level&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-log_level" title="Link to this definition">#</a></dt>
+<dd><p>The logging level.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Options<span class="colon">:</span></dt>
+<dd class="field-odd"><p>internal_error | error | warning | info | verbose | debug</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-max_beam_width">
+<span class="sig-name descname"><span class="pre">--max_beam_width</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_beam_width&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-max_beam_width" title="Link to this definition">#</a></dt>
+<dd><p>Maximum number of beams for beam search decoding.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-max_batch_size">
+<span class="sig-name descname"><span class="pre">--max_batch_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_batch_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-max_batch_size" title="Link to this definition">#</a></dt>
+<dd><p>Maximum number of requests that the engine can schedule.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-max_num_tokens">
+<span class="sig-name descname"><span class="pre">--max_num_tokens</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_num_tokens&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-max_num_tokens" title="Link to this definition">#</a></dt>
+<dd><p>Maximum number of batched input tokens after padding is removed in each batch.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-max_seq_len">
+<span class="sig-name descname"><span class="pre">--max_seq_len</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_seq_len&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-max_seq_len" title="Link to this definition">#</a></dt>
+<dd><p>Maximum total length of one request, including prompt and outputs. If unspecified, the value is deduced from the model config.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-tp_size">
+<span class="sig-name descname"><span class="pre">--tp_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;tp_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-tp_size" title="Link to this definition">#</a></dt>
+<dd><p>Tensor parallelism size.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-pp_size">
+<span class="sig-name descname"><span class="pre">--pp_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;pp_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-pp_size" title="Link to this definition">#</a></dt>
+<dd><p>Pipeline parallelism size.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-ep_size">
+<span class="sig-name descname"><span class="pre">--ep_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;ep_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-ep_size" title="Link to this definition">#</a></dt>
+<dd><p>expert parallelism size</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-gpus_per_node">
+<span class="sig-name descname"><span class="pre">--gpus_per_node</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;gpus_per_node&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-gpus_per_node" title="Link to this definition">#</a></dt>
+<dd><p>Number of GPUs per node. Default to None, and it will be detected automatically.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-kv_cache_free_gpu_memory_fraction">
+<span class="sig-name descname"><span class="pre">--kv_cache_free_gpu_memory_fraction</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;kv_cache_free_gpu_memory_fraction&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-kv_cache_free_gpu_memory_fraction" title="Link to this definition">#</a></dt>
+<dd><p>Free GPU memory fraction reserved for KV Cache, after allocating model weights and buffers.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-num_postprocess_workers">
+<span class="sig-name descname"><span class="pre">--num_postprocess_workers</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;num_postprocess_workers&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-num_postprocess_workers" title="Link to this definition">#</a></dt>
+<dd><p>[Experimental] Number of workers to postprocess raw responses to comply with OpenAI protocol.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-trust_remote_code">
+<span class="sig-name descname"><span class="pre">--trust_remote_code</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-trust_remote_code" title="Link to this definition">#</a></dt>
+<dd><p>Flag for HF transformers.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-extra_llm_api_options">
+<span class="sig-name descname"><span class="pre">--extra_llm_api_options</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;extra_llm_api_options&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-extra_llm_api_options" title="Link to this definition">#</a></dt>
+<dd><p>Path to a YAML file that overwrites the parameters specified by trtllm-serve.</p>
+</dd></dl>
+
+<p class="rubric">Arguments</p>
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-arg-MODEL">
+<span class="sig-name descname"><span class="pre">MODEL</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-arg-MODEL" title="Link to this definition">#</a></dt>
+<dd><p>Required argument</p>
+</dd></dl>
+
+</section>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="trtllm-build.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">trtllm-build</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="../architecture/overview.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">TensorRT-LLM Architecture</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#about">About</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#starting-a-server">Starting a Server</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#inference-endpoints">Inference Endpoints</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#chat-api">Chat API</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#completions-api">Completions API</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-serving">Multimodal Serving</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">Completions API</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmark">Benchmark</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-node-serving-with-slurm">Multi-node Serving with Slurm</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#metrics-endpoint">Metrics Endpoint</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#syntax">Syntax</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve">trtllm-serve</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve-disaggregated">disaggregated</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve-disaggregated-mpi-worker">disaggregated_mpi_worker</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve-serve">serve</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

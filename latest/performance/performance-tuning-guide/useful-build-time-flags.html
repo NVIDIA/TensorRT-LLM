@@ -1,0 +1,940 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Useful Build-Time Flags &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'performance/performance-tuning-guide/useful-build-time-flags';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Tuning Max Batch Size and Max Num Tokens" href="tuning-max-batch-size-and-max-num-tokens.html" />
+    <link rel="prev" title="Benchmarking Default Performance" href="benchmarking-default-performance.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 current active has-children"><a class="reference internal" href="index.html">Performance Tuning Guide</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    
+    <li class="breadcrumb-item"><a href="index.html" class="nav-link">Performance Tuning Guide</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Useful Build-Time Flags</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="useful-build-time-flags">
+<span id="id1"></span><h1>Useful Build-Time Flags<a class="headerlink" href="#useful-build-time-flags" title="Link to this heading">#</a></h1>
+<p>This page presents several build-time flags, set via the LLM-API’s <code class="docutils literal notranslate"><span class="pre">BuildConfig</span></code> class that you can enable to improve upon the baseline performance. Build-time refers to the fact that these flags affect how the TensorRT-LLM engine is built and cannot be changed without rebuilding the engine. For each flag there is an explanation of what it does, a description of how to enable it, and then an example of running it through the benchmarking flow described in <a class="reference internal" href="benchmarking-default-performance.html"><span class="std std-doc">Benchmarking Default Performance</span></a> to showcase its impact on performance. All options compatible with <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> can be found in the Command Line Reference section of the docs.</p>
+<blockquote>
+<div><p>Disclaimer: While performance numbers shown here are real, they are only for demonstration purposes. Differences in environment, SKU, interconnect, and workload can all significantly affect performance and lead to your results differing from what is shown here.</p>
+</div></blockquote>
+<section id="multiple-profiles">
+<h2>Multiple Profiles<a class="headerlink" href="#multiple-profiles" title="Link to this heading">#</a></h2>
+<p>TensorRT-LLM is built on TensorRT, which handles engine building through “optimization profiles” defining min, optimal, and max input tensor shapes. TensorRT optimizes for the optimal shape while supporting the range between min and max.</p>
+<p>TensorRT-LLM abstracts away the need to create optimization profiles although flags like max_batch_size and max_num_tokens (covered later) influence how they are created. By default, only one profile is created.</p>
+<p>During inference serving, varying request loads can pose different tensor shapes to the engine. TensorRT addresses this by allowing multiple profiles, which TensorRT-LLM supports via the BuildConfig option in the LLM-API. Enabling multiple profiles increases build times but has no performance downsides, so it is recommended for production builds.</p>
+<p>The only thing to watch out for is that enabling this can lead to slightly different outputs when the same prompt is run multiple times as different profiles and consequently kernels might be used depending on the request load. However this variance should not affect output quality so it is safe to enable this flag as long as you don’t need completely deterministic outputs.</p>
+<section id="enabling-building-with-multiple-profiles">
+<h3>Enabling building with multiple profiles<a class="headerlink" href="#enabling-building-with-multiple-profiles" title="Link to this heading">#</a></h3>
+<p>Below is an example of how you can modify the baseline example to enable multiple profiles.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">BuildConfig</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+    <span class="n">build_config</span> <span class="o">=</span> <span class="n">BuildConfig</span><span class="p">()</span>
+    <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">multiple_profiles</span> <span class="o">=</span> <span class="kc">True</span>
+
+    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
+        <span class="n">model</span><span class="o">=</span><span class="s2">&quot;/scratch/Llama-3.3-70B-Instruct&quot;</span><span class="p">,</span>
+        <span class="n">tensor_parallel_size</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+        <span class="n">build_config</span><span class="o">=</span><span class="n">build_config</span>
+    <span class="p">)</span>
+
+    <span class="n">llm</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="s2">&quot;build_flags_multiple_profiles&quot;</span><span class="p">)</span>
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+    <span class="n">main</span><span class="p">()</span>
+</pre></div>
+</div>
+<p>If you are using the <a class="reference internal" href="benchmarking-default-performance.html#building-and-saving-engines-via-cli"><span class="std std-ref">CLI flow for building engines</span></a> pass <code class="docutils literal notranslate"><span class="pre">--multiple_profiles</span></code> to <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> to enable the feature.</p>
+</section>
+<section id="performance-with-multiple-profiles">
+<h3>Performance with multiple profiles<a class="headerlink" href="#performance-with-multiple-profiles" title="Link to this heading">#</a></h3>
+<p>Baseline refers to the engine that was benchmarked in the previous Benchmarking Default Performance page.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric</p></th>
+<th class="head"><p>Baseline</p></th>
+<th class="head"><p>Multiple Profiles ON</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Token Throughput (tokens/sec)</p></td>
+<td><p>1564.3040</p></td>
+<td><p>1861.0881</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request Throughput (req/sec)</p></td>
+<td><p>0.7638</p></td>
+<td><p>0.9087</p></td>
+</tr>
+<tr class="row-even"><td><p>Average Time To First Token (ms)</p></td>
+<td><p>147.6976</p></td>
+<td><p>145.8958</p></td>
+</tr>
+<tr class="row-odd"><td><p>Average Inter-Token Latency (ms)</p></td>
+<td><p>31.3276</p></td>
+<td><p>19.6452</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>As you can see, enabling multiple profiles significantly improves the metrics across the board.</p>
+</section>
+</section>
+<section id="paged-context-attention">
+<h2>Paged Context Attention<a class="headerlink" href="#paged-context-attention" title="Link to this heading">#</a></h2>
+<p>By default all the tokens of the prompt of a new request are processed in one iteration as the context phase. Enabling paged context attention allows TensorRT-LLM to break the context phase into chunks and handle the prompt over several iterations. This is particularly useful for workloads with large input length. In the worst case, this feature can provide a small performance hit in benchmarking runs (&lt;2%) so it can be safely enabled. This feature is discussed further in the <a class="reference internal" href="tuning-max-batch-size-and-max-num-tokens.html#revisiting-paged-context-attention-and-context-chunking"><span class="std std-ref">next page</span></a> of the guide.</p>
+<section id="enabling-paged-context-attention">
+<h3>Enabling Paged Context Attention<a class="headerlink" href="#enabling-paged-context-attention" title="Link to this heading">#</a></h3>
+<p>Add the following line to our multiple profiles example from above to enable paged context attention</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_paged_context_fmha</span><span class="o">=</span><span class="kc">True</span>
+</pre></div>
+</div>
+<p>If you are using the <a class="reference internal" href="benchmarking-default-performance.html#building-and-saving-engines-via-cli"><span class="std std-ref">CLI flow for building engines</span></a> pass <code class="docutils literal notranslate"><span class="pre">--use_paged_context_fmha</span></code> to <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> to enable the feature.</p>
+</section>
+<section id="performance">
+<h3>Performance<a class="headerlink" href="#performance" title="Link to this heading">#</a></h3>
+<p>Paged Context OFF refers to the same engine shown as Multiple Profiles ON in the previous example.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric</p></th>
+<th class="head"><p>Paged Context OFF</p></th>
+<th class="head"><p>Paged Context ON</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Token Throughput (tokens/sec)</p></td>
+<td><p>1861.0881</p></td>
+<td><p>1866.6684</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request Throughput (req/sec)</p></td>
+<td><p>0.9087</p></td>
+<td><p>0.9115</p></td>
+</tr>
+<tr class="row-even"><td><p>Average Time To First Token (ms)</p></td>
+<td><p>145.8958</p></td>
+<td><p>145.4089</p></td>
+</tr>
+<tr class="row-odd"><td><p>Average Inter-Token Latency (ms)</p></td>
+<td><p>19.6452</p></td>
+<td><p>19.6523</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>In this case enabling paged context attention provides a small boost to performance, but a rerun of our tests found this to be within run to run variance of around 10 tok/s for token throughput and 2ms for average time to first token (ITL was stable with &lt;1ms and request throughput corresponded directly to token throughput). In other cases naively enabling it might actually provide a small hit to performance. However, further guidance on how to reason about this flag and why we recommend enabling it is discussed in the <a class="reference internal" href="tuning-max-batch-size-and-max-num-tokens.html#revisiting-paged-context-attention-and-context-chunking"><span class="std std-ref">next page</span></a> as it is closely intertwined with how TensorRT-LLM schedules requests as well as the max-num tokens flag.</p>
+</section>
+</section>
+<section id="gemm-plugin">
+<h2>GEMM Plugin<a class="headerlink" href="#gemm-plugin" title="Link to this heading">#</a></h2>
+<p>TensorRT allows you to add “plugins” or custom kernels that can be used instead of the kernels that TensorRT selects for particular operations. TensorRT-LLM has a host of custom plugins that are specifically tailored to speed up supported modules. The GEMM plugin utilizes NVIDIA cuBLASLt and some custom kernels to perform GEMM operations. On FP16 and BF16, it’s recommended to be enabled for better performance and smaller GPU memory usage. On FP8, it’s recommended to be disabled.</p>
+<section id="enabling-gemm-plugin">
+<h3>Enabling GEMM Plugin<a class="headerlink" href="#enabling-gemm-plugin" title="Link to this heading">#</a></h3>
+<p>Add the following line to the multiple profiles example from above to enable paged context attention.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gemm_plugin</span> <span class="o">=</span> <span class="s1">&#39;auto&#39;</span>
+</pre></div>
+</div>
+<p>If you are using the <a class="reference internal" href="benchmarking-default-performance.html#building-and-saving-engines-via-cli"><span class="std std-ref">CLI flow for building engines</span></a> pass <code class="docutils literal notranslate"><span class="pre">--gemm_plugin</span> <span class="pre">auto</span></code> to <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> to enable the feature. <code class="docutils literal notranslate"><span class="pre">'auto'</span></code> tells the GEMM plugin to have the same type as the model (fp16, bf16, etc). It is fine to leave it on auto unless you are trying to do mixed precision.</p>
+</section>
+<section id="performance-with-gemm-plugin">
+<h3>Performance with GEMM Plugin<a class="headerlink" href="#performance-with-gemm-plugin" title="Link to this heading">#</a></h3>
+<p>GEMM Plugin OFF refers to the same engine shown as Paged Context ON in the previous example.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric</p></th>
+<th class="head"><p>GEMM Plugin OFF</p></th>
+<th class="head"><p>GEMM Plugin ON</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Token Throughput (tokens/sec)</p></td>
+<td><p>1866.6684</p></td>
+<td><p>2033.2640</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request Throughput (req/sec)</p></td>
+<td><p>0.9115</p></td>
+<td><p>0.9928</p></td>
+</tr>
+<tr class="row-even"><td><p>Average Time To First Token (ms)</p></td>
+<td><p>145.4089</p></td>
+<td><p>147.8307</p></td>
+</tr>
+<tr class="row-odd"><td><p>Average Inter-Token Latency (ms)</p></td>
+<td><p>19.6523</p></td>
+<td><p>15.4133</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>In this case the GEMM plugin greatly improves throughput as well as ITL, with a slight hit to TTFT.</p>
+</section>
+</section>
+<section id="reduce-norm-fusion-plugin-for-llama-models">
+<h2>Reduce Norm Fusion Plugin for Llama models:<a class="headerlink" href="#reduce-norm-fusion-plugin-for-llama-models" title="Link to this heading">#</a></h2>
+<p>TensorRT-LLM has custom kernels for AllReduce operations that are enabled by default. This feature extends this functionality by fusing the ResidualAdd and LayerNorm kernels that run after AllReduce into the AllReduce kernel, resulting in a single kernel that handles those operations and improves end-to-end performance. This feature is currently only available for Llama models. It is most beneficial in workloads that are generation-phase heavy. For extremely context-phase heavy workloads its worth checking performance with and without this. Additionally, since this is an optimization for AllReduce, it is only beneficial for cases with tensor-parallelism. For scenarios only using pipeline parallelism this should stay disabled since pipeline parallelism doesn’t require any AllReduce operations.</p>
+<section id="enabling-reduce-norm-fusion-plugin">
+<h3>Enabling Reduce Norm Fusion Plugin<a class="headerlink" href="#enabling-reduce-norm-fusion-plugin" title="Link to this heading">#</a></h3>
+<p>Add the following line to the multiple profiles example from above to enable paged context attention.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">reduce_fusion</span> <span class="o">=</span> <span class="kc">True</span>
+</pre></div>
+</div>
+<p>If you are using the <a class="reference internal" href="benchmarking-default-performance.html#building-and-saving-engines-via-cli"><span class="std std-ref">CLI flow for building engines</span></a> pass <code class="docutils literal notranslate"><span class="pre">--reduce_fusion</span> <span class="pre">enable</span></code> to <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> to enable the feature.</p>
+</section>
+<section id="performance-with-reduce-norm-fusion">
+<h3>Performance with Reduce Norm Fusion<a class="headerlink" href="#performance-with-reduce-norm-fusion" title="Link to this heading">#</a></h3>
+<p>Reduce Fusion OFF refers to the same engine shown as GEMM Plugin ON in the previous example.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric</p></th>
+<th class="head"><p>REDUCE FUSION OFF</p></th>
+<th class="head"><p>REDUCE FUSION ON</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Token Throughput (tokens/sec)</p></td>
+<td><p>2033.2640</p></td>
+<td><p>2044.2628</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request Throughput (req/sec)</p></td>
+<td><p>0.9928</p></td>
+<td><p>0.9982</p></td>
+</tr>
+<tr class="row-even"><td><p>Average Time To First Token (ms)</p></td>
+<td><p>147.8307</p></td>
+<td><p>146.6628</p></td>
+</tr>
+<tr class="row-odd"><td><p>Average Inter-Token Latency (ms)</p></td>
+<td><p>15.4133</p></td>
+<td><p>14.4493</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>For the ISL/OSL pair of 2048/2048 enabling the reduce norm fusion plugin slightly improves performance all around. However, test reruns found that with run to run variance, in the worst case, they performed at par. Again this flag’s effectiveness is dependent on the workload so users should check whether it provides meaningful performance boosts in their case.</p>
+</section>
+</section>
+<section id="pipeline-parallel-reduce-scatter-optimization">
+<h2>Pipeline Parallel Reduce Scatter Optimization<a class="headerlink" href="#pipeline-parallel-reduce-scatter-optimization" title="Link to this heading">#</a></h2>
+<p>This feature adds a pipeline parallelism optimization with ReduceScatter + AllGather targeting large mixture of experts models.
+This can be enabled via the LLM-API as such</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span>    <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">pp_reduce_scatter</span> <span class="o">=</span> <span class="kc">True</span>
+</pre></div>
+</div>
+<p>If you are using the <a class="reference internal" href="benchmarking-default-performance.html#building-and-saving-engines-via-cli"><span class="std std-ref">CLI flow for building engines</span></a> flow you can enable this feature by adding <code class="docutils literal notranslate"><span class="pre">--pp_reduce_scatter</span></code> to <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>.</p>
+<p>As the Llama model is not a MoE model this flag was not included as part of the case study.</p>
+</section>
+<section id="conclusion">
+<h2>Conclusion<a class="headerlink" href="#conclusion" title="Link to this heading">#</a></h2>
+<p>Overall, enabling these flags can greatly boost performance. However, the degree to which they are effective can vary from workload to workload, and it’s recommended that you run sanity checks on your workloads to verify performance.</p>
+<p>The case-study example showed that enabling these flags provided the following performance uplifts from the baseline numbers. This included significant boosts in Token Throughput, Request Throughput, and Average Inter-Token Latency. TTFT remained largely unchanged.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric</p></th>
+<th class="head"><p>Baseline</p></th>
+<th class="head"><p>Build-Time Flags ON</p></th>
+<th class="head"><p>% Improvement</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Token Throughput (tokens/sec)</p></td>
+<td><p>1564.3040</p></td>
+<td><p>2044.2628</p></td>
+<td><p>30.68</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request Throughput (req/sec)</p></td>
+<td><p>0.7638</p></td>
+<td><p>0.9982</p></td>
+<td><p>30.69</p></td>
+</tr>
+<tr class="row-even"><td><p>Average Time To First Token (ms)</p></td>
+<td><p>147.6976</p></td>
+<td><p>146.6628</p></td>
+<td><p>0.70</p></td>
+</tr>
+<tr class="row-odd"><td><p>Average Inter-Token Latency (ms)</p></td>
+<td><p>31.3276</p></td>
+<td><p>14.4493</p></td>
+<td><p>53.88</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<section id="summary-of-configuration-option-recommendations">
+<h3>Summary of Configuration Option Recommendations:<a class="headerlink" href="#summary-of-configuration-option-recommendations" title="Link to this heading">#</a></h3>
+<ol class="arabic simple">
+<li><p>Multiple profiles: Always enable. It may increase build times a little but will only ever help performance. Enabling might cause engine to produce slightly different outputs when the same prompt is run multiple times depending on request load but it should not affect output quality, see <a class="reference internal" href="#multiple-profiles"><span class="std std-ref">Multiple Profiles section</span></a> for explanation.</p></li>
+<li><p>Paged Context Attention: In the worst case it may hurt performance a little initially but typically helps with request scheduling and boosts performance after further tuning of max batch size and max num tokens. More on this topic is discussed in the next page.</p></li>
+<li><p>GEMM Plugin: It’s recommended to enable it for FP16 and BF16 models as it usually helps. However, it is a good idea to benchmark your workload and double check that it is helping.</p></li>
+<li><p>Reduce Fusion: This feature is only supported on Llama and Mistral/Mixtral models. Effectiveness is workload dependent and it’s recommend that you benchmark your workload with and without it and compare the results.</p></li>
+</ol>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="benchmarking-default-performance.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Benchmarking Default Performance</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="tuning-max-batch-size-and-max-num-tokens.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Tuning Max Batch Size and Max Num Tokens</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multiple-profiles">Multiple Profiles</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#enabling-building-with-multiple-profiles">Enabling building with multiple profiles</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-with-multiple-profiles">Performance with multiple profiles</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#paged-context-attention">Paged Context Attention</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#enabling-paged-context-attention">Enabling Paged Context Attention</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#performance">Performance</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gemm-plugin">GEMM Plugin</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#enabling-gemm-plugin">Enabling GEMM Plugin</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-with-gemm-plugin">Performance with GEMM Plugin</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reduce-norm-fusion-plugin-for-llama-models">Reduce Norm Fusion Plugin for Llama models:</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#enabling-reduce-norm-fusion-plugin">Enabling Reduce Norm Fusion Plugin</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-with-reduce-norm-fusion">Performance with Reduce Norm Fusion</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#pipeline-parallel-reduce-scatter-optimization">Pipeline Parallel Reduce Scatter Optimization</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#conclusion">Conclusion</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#summary-of-configuration-option-recommendations">Summary of Configuration Option Recommendations:</a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

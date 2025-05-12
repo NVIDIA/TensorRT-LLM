@@ -1,0 +1,1185 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>tensorrt_llm.models.bert.model &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../../../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/models/bert/model';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../../../../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../../search.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    
+    <li class="breadcrumb-item"><a href="../../../index.html" class="nav-link">Module code</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">tensorrt_llm.models.bert.model</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <h1>Source code for tensorrt_llm.models.bert.model</h1><div class="highlight"><pre>
+<span></span><span class="c1"># SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &amp; AFFILIATES. All rights reserved.</span>
+<span class="c1"># SPDX-License-Identifier: Apache-2.0</span>
+<span class="c1">#</span>
+<span class="c1"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="c1"># you may not use this file except in compliance with the License.</span>
+<span class="c1"># You may obtain a copy of the License at</span>
+<span class="c1">#</span>
+<span class="c1"># http://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="c1">#</span>
+<span class="c1"># Unless required by applicable law or agreed to in writing, software</span>
+<span class="c1"># distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="c1"># See the License for the specific language governing permissions and</span>
+<span class="c1"># limitations under the License.</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">OrderedDict</span><span class="p">,</span> <span class="n">Union</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">trt</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">transformers</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.models.modeling_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">PretrainedModel</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">..._common</span><span class="w"> </span><span class="kn">import</span> <span class="n">default_net</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">...functional</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">ACT2FN</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">concat</span><span class="p">,</span> <span class="n">constant</span><span class="p">,</span> <span class="n">cumsum</span><span class="p">,</span> <span class="n">expand</span><span class="p">,</span>
+                           <span class="n">index_select</span><span class="p">,</span> <span class="n">select</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span> <span class="nb">slice</span><span class="p">,</span> <span class="n">unsqueeze</span><span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">...layers</span><span class="w"> </span><span class="kn">import</span> <span class="n">MLP</span><span class="p">,</span> <span class="n">BertAttention</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span> <span class="n">LayerNorm</span><span class="p">,</span> <span class="n">Linear</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">...mapping</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">...module</span><span class="w"> </span><span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..modeling_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">QuantConfig</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">BERTConfig</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.convert</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">load_hf_bert_base</span><span class="p">,</span> <span class="n">load_hf_bert_cls</span><span class="p">,</span> <span class="n">load_hf_bert_qa</span><span class="p">,</span>
+                      <span class="n">load_weights_from_hf_model</span><span class="p">)</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">BertEmbedding</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                 <span class="n">vocab_size</span><span class="p">,</span>
+                 <span class="n">hidden_size</span><span class="p">,</span>
+                 <span class="n">max_position_embeddings</span><span class="p">,</span>
+                 <span class="n">type_vocab_size</span><span class="p">,</span>
+                 <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">vocab_embedding</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span><span class="n">vocab_size</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span><span class="n">max_position_embeddings</span><span class="p">,</span>
+                                            <span class="n">hidden_size</span><span class="p">,</span>
+                                            <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">token_embedding</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span><span class="n">type_vocab_size</span><span class="p">,</span>
+                                         <span class="n">hidden_size</span><span class="p">,</span>
+                                         <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span> <span class="o">=</span> <span class="n">max_position_embeddings</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">embedding_ln</span> <span class="o">=</span> <span class="n">LayerNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">position_ids</span><span class="p">,</span> <span class="n">token_type_ids</span><span class="p">):</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">vocab_embedding</span><span class="p">(</span><span class="n">input_ids</span><span class="p">)</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding</span><span class="p">(</span><span class="n">position_ids</span><span class="p">)</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_embedding</span><span class="p">(</span><span class="n">token_type_ids</span><span class="p">)</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding_ln</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">x</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">BertEncoderLayer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                 <span class="n">hidden_size</span><span class="p">,</span>
+                 <span class="n">num_attention_heads</span><span class="p">,</span>
+                 <span class="n">max_position_embeddings</span><span class="p">,</span>
+                 <span class="n">hidden_act</span><span class="o">=</span><span class="s1">&#39;relu&#39;</span><span class="p">,</span>
+                 <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+                 <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">input_layernorm</span> <span class="o">=</span> <span class="n">LayerNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+                                         <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">attention</span> <span class="o">=</span> <span class="n">BertAttention</span><span class="p">(</span>
+            <span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">num_attention_heads</span><span class="p">,</span>
+            <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">max_position_embeddings</span><span class="p">,</span>
+            <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
+            <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span> <span class="o">=</span> <span class="n">MLP</span><span class="p">(</span><span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+                       <span class="n">ffn_hidden_size</span><span class="o">=</span><span class="n">hidden_size</span> <span class="o">*</span> <span class="mi">4</span><span class="p">,</span>
+                       <span class="n">hidden_act</span><span class="o">=</span><span class="n">hidden_act</span><span class="p">,</span>
+                       <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
+                       <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
+                       <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">post_layernorm</span> <span class="o">=</span> <span class="n">LayerNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+                                        <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                <span class="n">hidden_states</span><span class="p">,</span>
+                <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">input_lengths</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">max_input_length</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+        <span class="n">residual</span> <span class="o">=</span> <span class="n">hidden_states</span>
+
+        <span class="n">attention_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
+                                          <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
+                                          <span class="n">input_lengths</span><span class="o">=</span><span class="n">input_lengths</span><span class="p">,</span>
+                                          <span class="n">max_input_length</span><span class="o">=</span><span class="n">max_input_length</span><span class="p">)</span>
+
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">attention_output</span>
+
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+
+        <span class="n">residual</span> <span class="o">=</span> <span class="n">hidden_states</span>
+
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">hidden_states</span>
+
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">post_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">hidden_states</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">BertBase</span><span class="p">(</span><span class="n">PretrainedModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
+<span class="sd">    Base class that provides from_huggingface() and prepare_inputs() methods</span>
+<span class="sd">    &#39;&#39;&#39;</span>
+    <span class="n">config_class</span> <span class="o">=</span> <span class="n">BERTConfig</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">BERTConfig</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">load_hf_bert</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">model_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">load_model_on_cpu</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+                     <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Use as the abstractmethod, load corresponding HF model.</span>
+<span class="sd">        Subclass must implement this method!</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+
+        <span class="k">assert</span> <span class="bp">cls</span><span class="o">.</span><span class="vm">__name__</span> <span class="o">!=</span> <span class="s2">&quot;BertBase&quot;</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Never call from BertBase class!&quot;</span>
+
+        <span class="k">if</span> <span class="bp">cls</span><span class="o">.</span><span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;BertModel&quot;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">load_hf_bert_base</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">load_model_on_cpu</span><span class="p">,</span> <span class="n">dtype</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="bp">cls</span><span class="o">.</span><span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;BertForQuestionAnswering&quot;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">load_hf_bert_qa</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">load_model_on_cpu</span><span class="p">,</span> <span class="n">dtype</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="bp">cls</span><span class="o">.</span><span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;BertForSequenceClassification&quot;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">load_hf_bert_cls</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">load_model_on_cpu</span><span class="p">,</span> <span class="n">dtype</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="kc">False</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Unknown class </span><span class="si">{</span><span class="bp">cls</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">!&quot;</span>
+
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_hugging_face</span><span class="p">(</span>
+            <span class="bp">cls</span><span class="p">,</span>
+            <span class="n">hf_model_or_dir</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s1">&#39;transformers.PreTrainedModel&#39;</span><span class="p">],</span>
+            <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;float16&#39;</span><span class="p">,</span>
+            <span class="n">mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">quant_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Create a BertModel object from give parameters</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">transformers</span>
+
+        <span class="k">assert</span> <span class="n">hf_model_or_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+        <span class="n">use_preloading</span> <span class="o">=</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">hf_model_or_dir</span><span class="p">,</span>
+                                    <span class="n">transformers</span><span class="o">.</span><span class="n">PreTrainedModel</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">use_preloading</span><span class="p">:</span>
+            <span class="n">hf_model</span> <span class="o">=</span> <span class="n">hf_model_or_dir</span>
+            <span class="n">hf_config_or_dir</span> <span class="o">=</span> <span class="n">hf_model</span><span class="o">.</span><span class="n">config</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">hf_model_dir</span> <span class="o">=</span> <span class="n">hf_model_or_dir</span>
+            <span class="n">hf_config_or_dir</span> <span class="o">=</span> <span class="n">hf_model_or_dir</span>
+
+        <span class="n">load_model_on_cpu</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;load_model_on_cpu&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+        <span class="n">tllm_config</span> <span class="o">=</span> <span class="n">BERTConfig</span><span class="o">.</span><span class="n">from_hugging_face</span><span class="p">(</span>
+            <span class="n">hf_config_or_dir</span><span class="o">=</span><span class="n">hf_config_or_dir</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">,</span>
+            <span class="n">quant_config</span><span class="o">=</span><span class="n">quant_config</span><span class="p">,</span>
+            <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+        <span class="c1">#NOTE: override architecture info</span>
+        <span class="n">RobertaCls_mapping</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s2">&quot;BertModel&quot;</span><span class="p">:</span> <span class="s2">&quot;RobertaModel&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;BertForQuestionAnswering&quot;</span><span class="p">:</span> <span class="s2">&quot;RobertaForQuestionAnswering&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;BertForSequenceClassification&quot;</span><span class="p">:</span> <span class="s2">&quot;RobertaForSequenceClassification&quot;</span><span class="p">,</span>
+        <span class="p">}</span>
+        <span class="k">if</span> <span class="n">tllm_config</span><span class="o">.</span><span class="n">is_roberta</span><span class="p">:</span>
+            <span class="nb">setattr</span><span class="p">(</span><span class="n">tllm_config</span><span class="p">,</span> <span class="s1">&#39;architecture&#39;</span><span class="p">,</span>
+                    <span class="n">RobertaCls_mapping</span><span class="p">[</span><span class="bp">cls</span><span class="o">.</span><span class="vm">__name__</span><span class="p">])</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="nb">setattr</span><span class="p">(</span><span class="n">tllm_config</span><span class="p">,</span> <span class="s1">&#39;architecture&#39;</span><span class="p">,</span> <span class="bp">cls</span><span class="o">.</span><span class="vm">__name__</span><span class="p">)</span>
+
+        <span class="n">torch_dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">float16</span> <span class="k">if</span> <span class="n">dtype</span> <span class="o">==</span> <span class="s1">&#39;float16&#39;</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">float32</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">use_preloading</span><span class="p">:</span>
+            <span class="n">hf_model</span> <span class="o">=</span> <span class="bp">cls</span><span class="o">.</span><span class="n">load_hf_bert</span><span class="p">(</span><span class="n">model_dir</span><span class="o">=</span><span class="n">hf_model_dir</span><span class="p">,</span>
+                                        <span class="n">load_model_on_cpu</span><span class="o">=</span><span class="n">load_model_on_cpu</span><span class="p">,</span>
+                                        <span class="n">dtype</span><span class="o">=</span><span class="n">torch_dtype</span><span class="p">)</span>
+        <span class="n">weights</span> <span class="o">=</span> <span class="n">load_weights_from_hf_model</span><span class="p">(</span><span class="n">hf_model</span><span class="o">=</span><span class="n">hf_model</span><span class="p">,</span>
+                                             <span class="n">config</span><span class="o">=</span><span class="n">tllm_config</span><span class="p">)</span>
+        <span class="n">model</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">(</span><span class="n">tllm_config</span><span class="p">)</span>
+        <span class="n">model</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">weights</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">model</span>
+
+    <span class="c1"># Override the PretrainedModel&#39;s meothd, can unify in the future.</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">max_batch_size</span><span class="p">,</span> <span class="n">max_input_len</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="n">remove_input_padding</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span>
+        <span class="c1"># opt_shape is set to half of max batch_size and seq_len by default</span>
+        <span class="c1"># tune this according to real data distribution</span>
+        <span class="n">bs_range</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="p">(</span><span class="n">max_batch_size</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="n">max_batch_size</span><span class="p">]</span>
+        <span class="n">inlen_range</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="p">(</span><span class="n">max_input_len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="n">max_input_len</span><span class="p">]</span>
+        <span class="n">num_tokens_range</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="mi">1</span><span class="p">,</span>
+            <span class="p">(</span><span class="n">max_input_len</span> <span class="o">*</span> <span class="n">max_batch_size</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span>
+            <span class="n">max_input_len</span> <span class="o">*</span> <span class="n">max_batch_size</span><span class="p">,</span>
+        <span class="p">]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">remove_input_padding</span><span class="p">:</span>
+            <span class="n">input_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                <span class="n">name</span><span class="o">=</span><span class="s1">&#39;input_ids&#39;</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">bs_range</span><span class="p">]),</span>
+                                       <span class="p">(</span><span class="s1">&#39;input_len&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">inlen_range</span><span class="p">])]),</span>
+            <span class="p">)</span>
+            <span class="c1"># also called segment_ids</span>
+            <span class="n">token_type_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                <span class="n">name</span><span class="o">=</span><span class="s1">&#39;token_type_ids&#39;</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">bs_range</span><span class="p">]),</span>
+                                       <span class="p">(</span><span class="s1">&#39;input_len&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">inlen_range</span><span class="p">])]),</span>
+            <span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">input_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                <span class="n">name</span><span class="o">=</span><span class="s2">&quot;input_ids&quot;</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s2">&quot;num_tokens&quot;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_tokens_range</span><span class="p">])]),</span>
+            <span class="p">)</span>
+            <span class="n">token_type_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                <span class="n">name</span><span class="o">=</span><span class="s1">&#39;token_type_ids&#39;</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;num_tokens&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_tokens_range</span><span class="p">])]),</span>
+            <span class="p">)</span>
+            <span class="n">position_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                <span class="n">name</span><span class="o">=</span><span class="s1">&#39;position_ids&#39;</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;num_tokens&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_tokens_range</span><span class="p">])]),</span>
+            <span class="p">)</span>
+            <span class="n">max_input_length</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                <span class="n">name</span><span class="o">=</span><span class="s2">&quot;max_input_length&quot;</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s2">&quot;max_input_length&quot;</span><span class="p">,</span> <span class="p">[</span><span class="n">inlen_range</span><span class="p">])]),</span>
+            <span class="p">)</span>
+        <span class="n">input_lengths</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;input_lengths&#39;</span><span class="p">,</span>
+                               <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                               <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                               <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">bs_range</span><span class="p">])</span>
+                                                      <span class="p">]))</span>
+
+        <span class="n">inputs</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s1">&#39;input_ids&#39;</span><span class="p">:</span> <span class="n">input_ids</span><span class="p">,</span>
+            <span class="s1">&#39;input_lengths&#39;</span><span class="p">:</span> <span class="n">input_lengths</span><span class="p">,</span>
+            <span class="s1">&#39;token_type_ids&#39;</span><span class="p">:</span> <span class="n">token_type_ids</span><span class="p">,</span>
+        <span class="p">}</span>
+
+        <span class="k">if</span> <span class="n">remove_input_padding</span><span class="p">:</span>
+            <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;position_ids&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">position_ids</span>
+            <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;max_input_length&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">max_input_length</span>
+
+        <span class="k">return</span> <span class="n">inputs</span>
+
+
+<div class="viewcode-block" id="BertModel">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BertModel">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">BertModel</span><span class="p">(</span><span class="n">BertBase</span><span class="p">):</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">BERTConfig</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">max_position_embeddings</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">padding_idx</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pad_token_id</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">is_roberta</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">is_roberta</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span> <span class="o">=</span> <span class="n">BertEmbedding</span><span class="p">(</span>
+            <span class="n">vocab_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
+            <span class="n">hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
+            <span class="n">type_vocab_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">type_vocab_size</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">layers</span> <span class="o">=</span> <span class="n">ModuleList</span><span class="p">([</span>
+            <span class="n">BertEncoderLayer</span><span class="p">(</span>
+                <span class="n">hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
+                <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
+                <span class="n">hidden_act</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_act</span><span class="p">,</span>
+                <span class="n">tp_group</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
+                <span class="n">tp_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">)</span>
+        <span class="p">])</span>
+
+<div class="viewcode-block" id="BertModel.forward">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BertModel.forward">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                <span class="n">input_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">input_lengths</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">token_type_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">hidden_states</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">max_input_length</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+        <span class="c1"># remove_input_padding requires these fields as explicit input</span>
+        <span class="n">mask</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">:</span>
+            <span class="n">seq_len_2d</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="mi">1</span><span class="p">,</span> <span class="n">shape</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="mi">1</span><span class="p">)])</span>
+
+            <span class="c1"># create position ids</span>
+            <span class="n">position_ids_buffer</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span>
+                <span class="n">np</span><span class="o">.</span><span class="n">expand_dims</span><span class="p">(</span>
+                    <span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+                    <span class="mi">0</span><span class="p">))</span>
+            <span class="n">tmp_position_ids</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">position_ids_buffer</span><span class="p">,</span>
+                                     <span class="n">starts</span><span class="o">=</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span>
+                                     <span class="n">sizes</span><span class="o">=</span><span class="n">seq_len_2d</span><span class="p">)</span>
+            <span class="n">tmp_position_ids</span> <span class="o">=</span> <span class="n">expand</span><span class="p">(</span><span class="n">tmp_position_ids</span><span class="p">,</span> <span class="n">shape</span><span class="p">(</span><span class="n">input_ids</span><span class="p">))</span>  <span class="c1">#BxL</span>
+            <span class="n">tmp_input_lengths</span> <span class="o">=</span> <span class="n">unsqueeze</span><span class="p">(</span><span class="n">input_lengths</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>  <span class="c1">#Bx1</span>
+            <span class="n">tmp_input_lengths</span> <span class="o">=</span> <span class="n">expand</span><span class="p">(</span><span class="n">tmp_input_lengths</span><span class="p">,</span>
+                                       <span class="n">shape</span><span class="p">(</span><span class="n">input_ids</span><span class="p">))</span>  <span class="c1">#BxL</span>
+            <span class="n">mask</span> <span class="o">=</span> <span class="n">tmp_position_ids</span> <span class="o">&lt;</span> <span class="n">tmp_input_lengths</span>  <span class="c1"># BxL</span>
+            <span class="n">mask</span> <span class="o">=</span> <span class="n">mask</span><span class="o">.</span><span class="n">cast</span><span class="p">(</span><span class="s1">&#39;int32&#39;</span><span class="p">)</span>
+
+            <span class="k">if</span> <span class="n">position_ids</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_roberta</span><span class="p">:</span>
+                    <span class="c1"># see create_position_ids_from_input_ids() in https://github.com/huggingface/transformers/blob/main/src/transformers/models/roberta/modeling_roberta.py</span>
+                    <span class="n">position_ids</span> <span class="o">=</span> <span class="p">(</span><span class="n">tmp_position_ids</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">mask</span>
+                    <span class="n">position_ids</span> <span class="o">=</span> <span class="n">position_ids</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">padding_idx</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">position_ids</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">position_ids_buffer</span><span class="p">,</span>
+                                         <span class="n">starts</span><span class="o">=</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span>
+                                         <span class="n">sizes</span><span class="o">=</span><span class="n">seq_len_2d</span><span class="p">)</span>
+                    <span class="n">position_ids</span> <span class="o">=</span> <span class="n">expand</span><span class="p">(</span><span class="n">position_ids</span><span class="p">,</span> <span class="n">shape</span><span class="p">(</span><span class="n">input_ids</span><span class="p">))</span>
+
+            <span class="c1"># create token_type_ids</span>
+            <span class="k">if</span> <span class="n">token_type_ids</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">token_type_ids_buffer</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span>
+                    <span class="n">np</span><span class="o">.</span><span class="n">expand_dims</span><span class="p">(</span>
+                        <span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+                        <span class="mi">0</span><span class="p">))</span>
+                <span class="n">token_type_ids</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">token_type_ids_buffer</span><span class="p">,</span>
+                                       <span class="n">starts</span><span class="o">=</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span>
+                                       <span class="n">sizes</span><span class="o">=</span><span class="n">seq_len_2d</span><span class="p">)</span>
+                <span class="n">token_type_ids</span> <span class="o">=</span> <span class="n">expand</span><span class="p">(</span><span class="n">token_type_ids</span><span class="p">,</span> <span class="n">shape</span><span class="p">(</span><span class="n">input_ids</span><span class="p">))</span>
+
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">position_ids</span><span class="p">,</span> <span class="n">token_type_ids</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;embedding_output&#39;</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
+
+        <span class="k">for</span> <span class="n">idx</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">):</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">layer</span><span class="p">(</span><span class="n">hidden_states</span><span class="o">=</span><span class="n">hidden_states</span><span class="p">,</span>
+                                  <span class="n">input_lengths</span><span class="o">=</span><span class="n">input_lengths</span><span class="p">,</span>
+                                  <span class="n">attention_mask</span><span class="o">=</span><span class="n">mask</span><span class="p">,</span>
+                                  <span class="n">max_input_length</span><span class="o">=</span><span class="n">max_input_length</span><span class="p">)</span>
+            <span class="c1"># keep the last layer output name as hidden_states</span>
+            <span class="k">if</span> <span class="p">((</span><span class="n">idx</span> <span class="o">==</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span> <span class="o">-</span> <span class="mi">1</span><span class="p">))</span> <span class="ow">and</span>
+                <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">architecture</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;BertModel&quot;</span><span class="p">,</span> <span class="s2">&quot;RobertaModel&quot;</span><span class="p">])):</span>
+                <span class="n">hidden_states</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="s1">&#39;hidden_states&#39;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;layer_</span><span class="si">{</span><span class="n">idx</span><span class="si">}</span><span class="s2">_output&quot;</span><span class="p">,</span>
+                                             <span class="n">hidden_states</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">hidden_states</span></div>
+</div>
+
+
+
+<span class="n">RobertaModel</span> <span class="o">=</span> <span class="n">BertModel</span>
+
+
+<div class="viewcode-block" id="BertForQuestionAnswering">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BertForQuestionAnswering">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">BertForQuestionAnswering</span><span class="p">(</span><span class="n">BertBase</span><span class="p">):</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">BERTConfig</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">bert</span> <span class="o">=</span> <span class="n">BertModel</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_labels</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">num_labels</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">qa_outputs</span> <span class="o">=</span> <span class="n">Linear</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                                 <span class="n">config</span><span class="o">.</span><span class="n">num_labels</span><span class="p">,</span>
+                                 <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+
+<div class="viewcode-block" id="BertForQuestionAnswering.forward">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BertForQuestionAnswering.forward">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                <span class="n">input_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">input_lengths</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">token_type_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">hidden_states</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">max_input_length</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+
+        <span class="n">remove_input_padding</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span>
+        <span class="k">if</span> <span class="n">remove_input_padding</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="n">token_type_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> \
+                   <span class="n">position_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> \
+                   <span class="n">max_input_length</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> \
+                   <span class="s2">&quot;token_type_ids, position_ids, max_input_length is required &quot;</span> \
+                   <span class="s2">&quot;in remove_input_padding mode&quot;</span>
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">bert</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span><span class="n">input_ids</span><span class="o">=</span><span class="n">input_ids</span><span class="p">,</span>
+                                          <span class="n">input_lengths</span><span class="o">=</span><span class="n">input_lengths</span><span class="p">,</span>
+                                          <span class="n">token_type_ids</span><span class="o">=</span><span class="n">token_type_ids</span><span class="p">,</span>
+                                          <span class="n">position_ids</span><span class="o">=</span><span class="n">position_ids</span><span class="p">,</span>
+                                          <span class="n">hidden_states</span><span class="o">=</span><span class="n">hidden_states</span><span class="p">,</span>
+                                          <span class="n">max_input_length</span><span class="o">=</span><span class="n">max_input_length</span><span class="p">)</span>
+
+        <span class="n">logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">qa_outputs</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+        <span class="n">logits</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="s1">&#39;logits&#39;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">logits_dtype</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">logits</span></div>
+</div>
+
+
+
+<span class="n">RobertaForQuestionAnswering</span> <span class="o">=</span> <span class="n">BertForQuestionAnswering</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">BertPooler</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="n">dtype</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dense</span> <span class="o">=</span> <span class="n">Linear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">activation</span> <span class="o">=</span> <span class="n">ACT2FN</span><span class="p">[</span><span class="s1">&#39;tanh&#39;</span><span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">,</span> <span class="n">remove_input_padding</span><span class="p">):</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">remove_input_padding</span><span class="p">:</span>
+            <span class="c1"># We &quot;pool&quot; the model by simply taking the hidden state corresponding</span>
+            <span class="c1"># to the first token.</span>
+            <span class="n">first_token_tensor</span> <span class="o">=</span> <span class="n">select</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># when remove_input_padding is enabled, the shape of hidden_states is [num_tokens, hidden_size]</span>
+            <span class="c1"># We can take the first token of each sequence according to input_lengths,</span>
+            <span class="c1"># and then do pooling similar to padding mode.</span>
+            <span class="c1"># For example, if input_lengths is [8, 5, 6], then the indices of first tokens</span>
+            <span class="c1"># should be [0, 8, 13]</span>
+            <span class="n">first_token_indices</span> <span class="o">=</span> <span class="n">cumsum</span><span class="p">(</span>
+                <span class="n">concat</span><span class="p">([</span>
+                    <span class="mi">0</span><span class="p">,</span>
+                    <span class="nb">slice</span><span class="p">(</span><span class="n">input_lengths</span><span class="p">,</span>
+                          <span class="n">starts</span><span class="o">=</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+                          <span class="n">sizes</span><span class="o">=</span><span class="p">(</span><span class="n">shape</span><span class="p">(</span><span class="n">input_lengths</span><span class="p">)</span> <span class="o">-</span>
+                                 <span class="n">constant</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="mi">1</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">))))</span>
+                <span class="p">]),</span> <span class="mi">0</span><span class="p">)</span>
+            <span class="n">first_token_tensor</span> <span class="o">=</span> <span class="n">index_select</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+                                              <span class="n">first_token_indices</span><span class="p">)</span>
+
+        <span class="n">pooled_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dense</span><span class="p">(</span><span class="n">first_token_tensor</span><span class="p">)</span>
+        <span class="n">pooled_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">activation</span><span class="p">(</span><span class="n">pooled_output</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">pooled_output</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">RobertaClassificationHead</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Head for sentence-level classification tasks.&quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">num_labels</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dense</span> <span class="o">=</span> <span class="n">Linear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">out_proj</span> <span class="o">=</span> <span class="n">Linear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">num_labels</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">,</span> <span class="n">remove_input_padding</span><span class="p">):</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">remove_input_padding</span><span class="p">:</span>
+            <span class="c1"># We &quot;pool&quot; the model by simply taking the hidden state corresponding</span>
+            <span class="c1"># to the first token.</span>
+            <span class="n">first_token_tensor</span> <span class="o">=</span> <span class="n">select</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># when remove_input_padding is enabled, the shape of hidden_states is [num_tokens, hidden_size]</span>
+            <span class="c1"># We can take the first token of each sequence according to input_lengths,</span>
+            <span class="c1"># and then do pooling similar to padding mode.</span>
+            <span class="c1"># For example, if input_lengths is [8, 5, 6], then the indices of first tokens</span>
+            <span class="c1"># should be [0, 8, 13]</span>
+            <span class="n">first_token_indices</span> <span class="o">=</span> <span class="n">cumsum</span><span class="p">(</span>
+                <span class="n">concat</span><span class="p">([</span>
+                    <span class="mi">0</span><span class="p">,</span>
+                    <span class="nb">slice</span><span class="p">(</span><span class="n">input_lengths</span><span class="p">,</span>
+                          <span class="n">starts</span><span class="o">=</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+                          <span class="n">sizes</span><span class="o">=</span><span class="p">(</span><span class="n">shape</span><span class="p">(</span><span class="n">input_lengths</span><span class="p">)</span> <span class="o">-</span>
+                                 <span class="n">constant</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="mi">1</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">))))</span>
+                <span class="p">]),</span> <span class="mi">0</span><span class="p">)</span>
+            <span class="n">first_token_tensor</span> <span class="o">=</span> <span class="n">index_select</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+                                              <span class="n">first_token_indices</span><span class="p">)</span>
+
+        <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dense</span><span class="p">(</span><span class="n">first_token_tensor</span><span class="p">)</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="n">ACT2FN</span><span class="p">[</span><span class="s1">&#39;tanh&#39;</span><span class="p">](</span><span class="n">x</span><span class="p">)</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">out_proj</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">x</span>
+
+
+<div class="viewcode-block" id="BertForSequenceClassification">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BertForSequenceClassification">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">BertForSequenceClassification</span><span class="p">(</span><span class="n">BertBase</span><span class="p">):</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">BERTConfig</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">is_roberta</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">is_roberta</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">bert</span> <span class="o">=</span> <span class="n">BertModel</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_labels</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">num_labels</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">config</span><span class="o">.</span><span class="n">is_roberta</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">pooler</span> <span class="o">=</span> <span class="n">BertPooler</span><span class="p">(</span><span class="n">hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                                     <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">classifier</span> <span class="o">=</span> <span class="n">Linear</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                                     <span class="n">config</span><span class="o">.</span><span class="n">num_labels</span><span class="p">,</span>
+                                     <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">classifier</span> <span class="o">=</span> <span class="n">RobertaClassificationHead</span><span class="p">(</span>
+                <span class="n">hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                <span class="n">num_labels</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">num_labels</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+
+<div class="viewcode-block" id="BertForSequenceClassification.forward">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BertForSequenceClassification.forward">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                <span class="n">input_ids</span><span class="p">,</span>
+                <span class="n">input_lengths</span><span class="p">,</span>
+                <span class="n">token_type_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">hidden_states</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">max_input_length</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+
+        <span class="n">remove_input_padding</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span>
+
+        <span class="c1"># required as explicit input in remove_input_padding mode</span>
+        <span class="c1"># see examples/bert/run_remove_input_padding.py for how to create them from input_ids and input_lengths</span>
+        <span class="k">if</span> <span class="n">remove_input_padding</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="n">token_type_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> \
+                   <span class="n">position_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> \
+                   <span class="n">max_input_length</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> \
+                   <span class="s2">&quot;token_type_ids, position_ids, max_input_length is required &quot;</span> \
+                   <span class="s2">&quot;in remove_input_padding mode&quot;</span>
+
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">bert</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span><span class="n">input_ids</span><span class="o">=</span><span class="n">input_ids</span><span class="p">,</span>
+                                          <span class="n">input_lengths</span><span class="o">=</span><span class="n">input_lengths</span><span class="p">,</span>
+                                          <span class="n">token_type_ids</span><span class="o">=</span><span class="n">token_type_ids</span><span class="p">,</span>
+                                          <span class="n">position_ids</span><span class="o">=</span><span class="n">position_ids</span><span class="p">,</span>
+                                          <span class="n">hidden_states</span><span class="o">=</span><span class="n">hidden_states</span><span class="p">,</span>
+                                          <span class="n">max_input_length</span><span class="o">=</span><span class="n">max_input_length</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_roberta</span><span class="p">:</span>
+            <span class="n">pooled_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pooler</span><span class="p">(</span>
+                <span class="n">hidden_states</span><span class="o">=</span><span class="n">hidden_states</span><span class="p">,</span>
+                <span class="n">input_lengths</span><span class="o">=</span><span class="n">input_lengths</span><span class="p">,</span>
+                <span class="n">remove_input_padding</span><span class="o">=</span><span class="n">remove_input_padding</span><span class="p">)</span>
+            <span class="n">logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">classifier</span><span class="p">(</span><span class="n">pooled_output</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">classifier</span><span class="p">(</span><span class="n">hidden_states</span><span class="o">=</span><span class="n">hidden_states</span><span class="p">,</span>
+                                     <span class="n">input_lengths</span><span class="o">=</span><span class="n">input_lengths</span><span class="p">,</span>
+                                     <span class="n">remove_input_padding</span><span class="o">=</span><span class="n">remove_input_padding</span><span class="p">)</span>
+
+        <span class="n">logits</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="s1">&#39;logits&#39;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">logits_dtype</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">logits</span></div>
+</div>
+
+
+
+<span class="n">RobertaForSequenceClassification</span> <span class="o">=</span> <span class="n">BertForSequenceClassification</span>
+</pre></div>
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+<div class="bd-sidebar-secondary"></div>
+
+
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

@@ -1,0 +1,848 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>TensorRT-LLM Build Workflow &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'architecture/workflow';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Adding a Model" href="add-model.html" />
+    <link rel="prev" title="TensorRT-LLM Checkpoint" href="checkpoint.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">TensorRT-LLM Build Workflow</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="tensorrt-llm-build-workflow">
+<h1>TensorRT-LLM Build Workflow<a class="headerlink" href="#tensorrt-llm-build-workflow" title="Link to this heading">#</a></h1>
+<section id="overview">
+<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h2>
+<p>The build workflow contains two major steps.</p>
+<ol class="arabic simple">
+<li><p>Create TensorRT-LLM models from existing model checkpoints exported by the training framework.</p></li>
+<li><p>Build the TensorRT-LLM models to TensorRT-LLM engines.</p></li>
+</ol>
+<p>To generalize the TensorRT-LLM optimization features to all models, and to share the same workflow between different models for TensorRT-LLM users, TensorRT-LLM has conventions about how the models shall be defined and how the models shall be imported.</p>
+<p>TensorRT-LLM checkpoint convention is documented in <a class="reference internal" href="checkpoint.html"><span class="std std-doc">TensorRT-LLM Checkpoint</span></a> and all decoder-only models had been migrated to adopt the convention. Model-specific convert_checkpoint.py scripts are shipped as source code in example directories, and a trtllm-build CLI tool had been added. However, there are some disadvantages of providing convert checkpoint scripts outside the core TensorRT-LLM lib as example:</p>
+<ol class="arabic simple">
+<li><p>TensorRT-LLM evolves so quickly that the model’s definition code might have changed for better performance; which means the <code class="docutils literal notranslate"><span class="pre">convert_checkpoint.py</span></code> is out of date.</p></li>
+<li><p>TensorRT-LLM is creating a new set of high-level APIs which handle model conversion, engine building, and inference in one class for easier-of-use. Thus, the high-level APIs need to call the weights conversion code, which shall be part of TensorRT-LLM core lib, not the example. And the conversion code of different models shall have same interface such that the high-level APIs do not need to add many ad-hoc code for different models.</p></li>
+</ol>
+<p>To mitigate these issues, the model specific <code class="docutils literal notranslate"><span class="pre">convert_checkpoint.py</span></code> scripts are being refactored. Most of the conversion code will be moved into core lib, sitting next to the model definition. Refer to <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/models/llama/</span></code> as an example. There is a new set of APIs for importing models and converting weights. The 0.9 release refactored the LLaMA model class to adopt the new APIs, others models’ refactor work is ongoing.</p>
+</section>
+<section id="conversion-apis">
+<h2>Conversion APIs<a class="headerlink" href="#conversion-apis" title="Link to this heading">#</a></h2>
+<p>The API for weight conversion of the LLaMA model looks like this. A <code class="docutils literal notranslate"><span class="pre">TopModelMixin</span></code> class is introduced, <code class="docutils literal notranslate"><span class="pre">from_hugging_face()</span></code> interface is declared, the <code class="docutils literal notranslate"><span class="pre">LLaMAForCausalLM</span></code> class inherits <code class="docutils literal notranslate"><span class="pre">TopModelMixin</span></code> (not direct parent class, but in its base class hierarchy), and implements the interface.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">TopModelMixin</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_hugging_face</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span>
+                          <span class="n">hf_model_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+                          <span class="n">dtype</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="s1">&#39;float16&#39;</span><span class="p">,</span>
+                          <span class="n">mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                          <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">&quot;Subclass shall override this&quot;</span><span class="p">)</span>
+
+<span class="c1"># TopModelMixin is in the part of base class hierarchy</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">LLaMAForCausalLM</span> <span class="p">(</span><span class="n">DecoderModelForCausalLM</span><span class="p">):</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_hugging_face</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span>
+             <span class="n">hf_model_dir</span><span class="p">,</span>
+             <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float16&#39;</span><span class="p">,</span>
+             <span class="n">mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">LLaMAForCausalLM</span><span class="p">:</span>
+        <span class="c1"># creating a TensorRT-LLM llama model object</span>
+        <span class="c1"># converting HuggingFace checkpoint to TensorRT-LLM expected weights dict</span>
+        <span class="c1"># Load the weights to llama model object</span>
+</pre></div>
+</div>
+<p>Then, in the convert_checkpoint.py script in the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama/"><code class="docutils literal notranslate"><span class="pre">examples/llama/</span></code></a> directory of the GitHub repo,
+the logic can be greatly simplified. Even if the model definition code of TensorRT-LLM LLaMA class is changed due to some reason, the <code class="docutils literal notranslate"><span class="pre">from_hugging_face</span></code> API will keep the same, thus the existing workflow using this interface will not be affected.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1">#other args omitted for simplicity here.</span>
+<span class="n">llama</span> <span class="o">=</span> <span class="n">LLaMAForCausalLM</span><span class="o">.</span><span class="n">from_hugging_face</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">)</span>
+<span class="n">llama</span><span class="o">.</span><span class="n">save_checkpoint</span><span class="p">(</span><span class="n">output_dir</span><span class="p">,</span> <span class="n">save_config</span><span class="o">=</span><span class="p">(</span><span class="n">rank</span><span class="o">==</span><span class="mi">0</span><span class="p">))</span>
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">from_hugging_face</span></code> API does not save the checkpoint into disk intentionally, instead it returns an in-memory object. Call <code class="docutils literal notranslate"><span class="pre">save_checkpoint</span></code> to save the models. This keeps the flexibility and makes the flow of convert-&gt;build in one process faster. Typically, saving and loading disk for large models are slower and thus should be avoided.</p>
+<p>Since LLaMA models were also released with different formats, such as the Meta checkpoint, the <code class="docutils literal notranslate"><span class="pre">LLaMAForCausalLM</span></code> class has a <code class="docutils literal notranslate"><span class="pre">from_meta_ckpt</span></code> function for that. This function is not declared in the <code class="docutils literal notranslate"><span class="pre">TopModelMixin</span></code> class due to it being LLaMA specific, and therefore, other models don’t use it.</p>
+<p>In the 0.9 release, only LLaMA is refactored. Since popular LLaMA (and its variants) models are released by Hugging Face and Meta checkpoint formats, only these two functions are implemented.</p>
+<p>In future releases, there might be <code class="docutils literal notranslate"><span class="pre">from_jax</span></code>, <code class="docutils literal notranslate"><span class="pre">from_nemo</span></code>, <code class="docutils literal notranslate"><span class="pre">from_keras</span></code> or other factory methods for different training checkpoints added.
+For example, the Gemma 2B model and the convert_checkpoint.py file in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gemma/"><code class="docutils literal notranslate"><span class="pre">examples/gemma</span></code></a>
+directory support JAX and Keras formats in addition to Hugging Face. The model developers can choose to implement <strong>any subset</strong> of these factory methods for the models they contributed to TensorRT-LLM.</p>
+<p>For some formats which are not supported by TensorRT-LLM model developers, you still have the freedom to implement your own weights conversion outside the core lib; the flow will look like this:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">config</span> <span class="o">=</span> <span class="n">read_config_from_the_custom_training_checkpoint</span><span class="p">(</span><span class="n">model_dir</span><span class="p">)</span>
+<span class="n">llama</span> <span class="o">=</span> <span class="n">LLaMAForCausalLM</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+
+<span class="c1"># option 1:</span>
+<span class="c1"># Create a weights dict and then calls LLaMAForCausalLM.load</span>
+<span class="n">weights_dict</span> <span class="o">=</span> <span class="n">convert_weights_from_custom_training_checkpoint</span><span class="p">(</span><span class="n">model_dir</span><span class="p">)</span>
+<span class="n">llama</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">weights_dict</span><span class="p">)</span>
+
+<span class="c1"># option 2:</span>
+<span class="c1"># Internally assign the model parameters directly</span>
+<span class="n">convert_and_load_weights_into_trtllm_llama</span><span class="p">(</span><span class="n">llama</span><span class="p">,</span> <span class="n">model_dir</span><span class="p">)</span>
+<span class="c1"># Use the llama object as usual, to save the checkpoint or build engines</span>
+</pre></div>
+</div>
+<p>Though there are some limitations and pitfalls of doing these custom weights loading, if the model definition is inside TensorRT-LLM core lib, and the weights loading/conversion are outside the core lib, the conversion code might need to be updated when new TensorRT-LLM is released.</p>
+</section>
+<section id="quantization-apis">
+<h2>Quantization APIs<a class="headerlink" href="#quantization-apis" title="Link to this heading">#</a></h2>
+<p>TensorRT-LLM relies on NVIDIA Modelopt toolkit to support some of the quantization like: FP8, W4A16_AWQ, W4A8_AWQ, while it also has some its own quantization implementation for Smooth Quant, INT8 KV cache, and INT4/INT8 weight only.</p>
+<p>In TensorRT-LLM 0.8 version:</p>
+<ul class="simple">
+<li><p>For Modelopt-supported quantization algorithms, a standalone script,
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/quantization/quantize.py">example/quantization/quantize.py</a>
+can export TensorRT-LLM checkpoints, and the trtllm-build command needs to be executed to build the checkpoints to engines.</p></li>
+<li><p>For the non-Modelopt quantization algorithms, users need to use the per-model convert_checkpoint.py scripts to export TensorRT-LLM checkpoints.</p></li>
+</ul>
+<p>Use the <code class="docutils literal notranslate"><span class="pre">quantize()</span></code> interface to unify the different quantization flows. The default implementation is added in the <code class="docutils literal notranslate"><span class="pre">PretrainedModel</span></code> class.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">PretrainedModel</span><span class="p">:</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">quantize</span><span class="p">(</span>
+        <span class="bp">cls</span><span class="p">,</span>
+        <span class="n">hf_model_dir</span><span class="p">,</span>
+        <span class="n">output_dir</span><span class="p">,</span>
+        <span class="n">quant_config</span><span class="p">:</span> <span class="n">QuantConfig</span><span class="p">,</span>
+        <span class="n">mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span> <span class="c1">#some args are omitted here</span>
+        <span class="c1"># Internally quantize the given hugging face models using Modelopt</span>
+        <span class="c1"># and save the checkpoint to output_dir</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>The default implementation only handles the Modelopt supported quantization. The LLaMA class then inherits this <code class="docutils literal notranslate"><span class="pre">PretrainedModel</span></code> and dispatches the Modelopt quantization to the super class’s default implementation.</p></li>
+<li><p>The model developer raises errors in the sub-class implementation if the new model is not supported by Modelopt yet.</p></li>
+</ul>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">LLaMAForCausalLM</span><span class="p">:</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">quantize</span><span class="p">(</span>
+        <span class="bp">cls</span><span class="p">,</span>
+        <span class="n">hf_model_dir</span><span class="p">,</span>
+        <span class="n">output_dir</span><span class="p">,</span>
+        <span class="n">quant_config</span><span class="p">:</span> <span class="n">QuantiConfig</span><span class="p">,</span>
+        <span class="n">mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span> <span class="c1">#some args are omitted here</span>
+        <span class="n">use_modelopt_quantization</span> <span class="o">=</span> <span class="o">...</span> <span class="c1"># determine if to use Modelopt or use native</span>
+        <span class="k">if</span> <span class="n">use_modelopt_quantization</span><span class="p">:</span>
+            <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">quantize</span><span class="p">(</span><span class="n">hf_model_dir</span><span class="p">,</span>
+                             <span class="n">output_dir</span><span class="p">,</span>
+                             <span class="n">quant_config</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># handles TensorRT-LLM native model specific quantization</span>
+            <span class="c1"># or raise exceptions if not supported</span>
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">quantize</span></code> API is designed to take multi-GPU resources internally to make quantization. For example, a LLaMA 70B BF16 takes 140G memory, if we make FP8 quantization, then, another 70G is needed. So, we need at least 210G, 4 * A100(H100) is needed to quantize the LLaMA 70B model. If you want to call <code class="docutils literal notranslate"><span class="pre">quantize</span></code> API inside a MPI program, be cautious and ensure the quantize API is only called by rank 0.</p>
+<p>Usage of the <code class="docutils literal notranslate"><span class="pre">quantize</span></code> API in an MPI program looks like this, only rank 0 calls it. In an non-MPI program, the <code class="docutils literal notranslate"><span class="pre">if</span> <span class="pre">rank</span> <span class="pre">==</span> <span class="pre">0</span></code> and the <code class="docutils literal notranslate"><span class="pre">mpi_barrier()</span></code> are not needed.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">quant_config</span> <span class="o">=</span> <span class="n">QuantConfig</span><span class="p">()</span>
+<span class="n">quant_config</span><span class="o">.</span><span class="n">quant_algo</span> <span class="o">=</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">W4A16_AWQ</span>
+<span class="n">mapping</span> <span class="o">=</span> <span class="n">Mapping</span><span class="p">(</span><span class="n">world_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span> <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">)</span>
+<span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+    <span class="n">LLaMAForCausalLM</span><span class="o">.</span><span class="n">quantize</span><span class="p">(</span><span class="n">hf_model_dir</span><span class="p">,</span>
+                          <span class="n">checkpoint_dir</span><span class="p">,</span>
+                          <span class="n">quant_config</span><span class="o">=</span><span class="n">quant_config</span><span class="p">)</span>
+<span class="n">mpi_barrier</span><span class="p">()</span> <span class="c1"># wait for rank-o finishes the quantization</span>
+<span class="n">llama</span> <span class="o">=</span> <span class="n">LLaMAForCausalLM</span><span class="o">.</span><span class="n">from_checkpoint</span><span class="p">(</span><span class="n">checkpoint_dir</span><span class="p">,</span> <span class="n">rank</span><span class="p">)</span>
+<span class="n">engine</span> <span class="o">=</span> <span class="n">build</span><span class="p">(</span><span class="n">llama</span><span class="p">,</span> <span class="n">build_config</span><span class="p">)</span>
+<span class="n">engine</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="n">engine_dir</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">examples/quantization/quantize.py</span></code> is kept for backward compatibility.</p>
+</section>
+<section id="build-apis">
+<h2>Build APIs<a class="headerlink" href="#build-apis" title="Link to this heading">#</a></h2>
+<p>The <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.build</span></code> API builds the TensorRT-LLM model object to TensorRT-LLM engine. This new API replaced the older flow: creating a builder, creating a network object, tracing the model to the network, and building TensorRT engines.
+The usage of this API looks like this:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llama</span> <span class="o">=</span> <span class="o">...</span> <span class="c1"># create LLaMAForCausalLM object</span>
+<span class="n">build_config</span> <span class="o">=</span> <span class="n">BuildConfig</span><span class="p">(</span><span class="n">max_batch_size</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+<span class="n">engine</span> <span class="o">=</span> <span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">build</span><span class="p">(</span><span class="n">llama</span><span class="p">,</span> <span class="n">build_config</span><span class="p">)</span>
+<span class="n">engine</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="n">engine_dir</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>The Llama object can be created by any method mentioned in the <a class="reference internal" href="#conversion-apis"><span class="std std-ref">Conversion APIs</span></a> or <a class="reference internal" href="#quantization-apis"><span class="std std-ref">Quantization APIs</span></a> sections.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> CLI tool is a thin wrapper around this <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.build</span></code> API. The flags of the CLI tool are kept close to the fields of the <code class="docutils literal notranslate"><span class="pre">BuildConfig</span></code> class.</p>
+<p>If a model were to be saved into disk and then built to the engine later, TensorRT-LLM provides a <code class="docutils literal notranslate"><span class="pre">from_checkpoint</span></code> API to deserialize the checkpoint.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1">## TensorRT-LLM code</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">PretrainedModel</span><span class="p">:</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_checkpoint</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span>
+                    <span class="n">ckpt_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+                    <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+                    <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="c1"># Internally load the model weights from a given checkpoint directory</span>
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">from_checkpoint</span></code> API is called to deserialize the checkpoint to a model object.  The <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.build</span></code> API can be called to build the engine.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llama</span> <span class="o">=</span> <span class="n">LLaMAForCausalLM</span><span class="o">.</span><span class="n">from_checkpoint</span><span class="p">(</span><span class="n">checkpoint_dir</span><span class="p">)</span>
+<span class="n">engine</span> <span class="o">=</span> <span class="n">build</span><span class="p">(</span><span class="n">llama</span><span class="p">,</span> <span class="n">build_config</span><span class="p">)</span>
+<span class="n">engine</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="n">engine_dir</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="cli-tools">
+<h2>CLI Tools<a class="headerlink" href="#cli-tools" title="Link to this heading">#</a></h2>
+<p>All the weights conversion, quantization, and build APIs mentioned above have corresponding CLI tools for convenience.</p>
+<ul class="simple">
+<li><p>Model specific <code class="docutils literal notranslate"><span class="pre">convert_checkpoint.py</span></code> scripts are inside the <code class="docutils literal notranslate"><span class="pre">examples/&lt;model</span> <span class="pre">xxx&gt;/</span></code> folder.</p></li>
+<li><p>A unified quantization script is inside the <code class="docutils literal notranslate"><span class="pre">examples/quantization/quantize.py</span></code> and can be shared by all <strong>supported</strong> models.</p></li>
+<li><p>A <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> CLI tool builds all models from TensorRT-LLM checkpoint.</p></li>
+</ul>
+<p>Refer to the following considerations for the CLI tools:</p>
+<ul>
+<li><p>These scripts and tools should be used for scripting. Do not import the Python functions/class defined in these tools. TensorRT-LLM does not promise the content of these scripts can be compatible with previous versions. The options of these tools may also be changed when it’s not avoidable.</p></li>
+<li><p>These scripts in the example folder may use TensorRT-LLM internal/unstable APIs, which is not guaranteed to work if the examples’ version and the TensorRT-LLM install version are mismatched. There are some GitHub issues caused by version mismatch.</p>
+<ul class="simple">
+<li><p>https://github.com/NVIDIA/TensorRT-LLM/issues/1293</p></li>
+<li><p>https://github.com/NVIDIA/TensorRT-LLM/issues/1252</p></li>
+<li><p>https://github.com/NVIDIA/TensorRT-LLM/issues/1079</p></li>
+</ul>
+<p>You should always install the same TensorRT-LLM version specified in <code class="docutils literal notranslate"><span class="pre">examples/&lt;model</span> <span class="pre">xxx&gt;/requirements.txt</span></code>.</p>
+</li>
+<li><p>In the future, the per-model conversion script may or may not be unified to one single script shared by models, given the nature of different models’ attributes may be different. However, the TensorRT-LLM team will try to make sure the flags for the same feature are consistent between different scripts.</p></li>
+<li><p>The TensorRT-LLM team encourages use of the new low-level conversion/quantization/build API instead of these scripts. The conversion APIs will be added model-by-model gradually, which may span a few releases.</p></li>
+</ul>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="checkpoint.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">TensorRT-LLM Checkpoint</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="add-model.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Adding a Model</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#conversion-apis">Conversion APIs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#quantization-apis">Quantization APIs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#build-apis">Build APIs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cli-tools">CLI Tools</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

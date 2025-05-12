@@ -1,0 +1,2900 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Overview &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'performance/perf-overview';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="TensorRT-LLM Benchmarking" href="perf-benchmarking.html" />
+    <link rel="prev" title="Disaggregated-Service (experimental)" href="../advanced/disaggregated-service.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Overview</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <blockquote id="perf-overview">
+<div><p>[!IMPORTANT]
+As of TensorRT-LLM v0.10, these performance benchmarks have changed methodology to utilize in-flight batching and
+no longer utilize static benchmarking. These numbers are initial measurements and are expected to improve in future
+releases.</p>
+</div></blockquote>
+<section id="overview">
+<h1>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h1>
+<p>This document summarizes performance measurements of TensorRT-LLM on a number of GPUs across a set of key models.</p>
+<p>The data in the following tables is provided as a reference point to help users
+validate observed performance. It should not be considered as the peak
+performance that can be delivered by TensorRT-LLM.</p>
+<section id="known-issues">
+<h2>Known Issues<a class="headerlink" href="#known-issues" title="Link to this heading">#</a></h2>
+<p>The following issues are being addressed to improve the efficiency of TensorRT-LLM.</p>
+<section id="known-allreduce-performance-issue-on-amd-based-cpu-platforms">
+<h3>Known AllReduce performance issue on AMD-based CPU platforms<a class="headerlink" href="#known-allreduce-performance-issue-on-amd-based-cpu-platforms" title="Link to this heading">#</a></h3>
+<p>We observed a performance issue on NCCL 2.23.4, which can be workarounded by setting <code class="docutils literal notranslate"><span class="pre">NCCL_P2P_LEVEL</span></code> to <code class="docutils literal notranslate"><span class="pre">SYS</span></code>:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">export</span> <span class="n">NCCL_P2P_LEVEL</span><span class="o">=</span><span class="n">SYS</span>
+</pre></div>
+</div>
+<p>Multi-GPU cases could be affected due to the issue, which is being addressed.</p>
+</section>
+<section id="fused-matmul-gated-silu-llama">
+<h3>Fused Matmul + Gated-SiLU (LLaMA)<a class="headerlink" href="#fused-matmul-gated-silu-llama" title="Link to this heading">#</a></h3>
+<p>The current implementation combines two Matmul operations into one Matmul followed by
+a separate SwiGLU kernel (when <code class="docutils literal notranslate"><span class="pre">--use_fused_mlp=enable</span></code> is enabled). There is also a more
+efficient implementation that runs single Matmul + SwiGLU fused kernel for FP8 on Hopper
+(when <code class="docutils literal notranslate"><span class="pre">--use_fused_mlp=enable</span> <span class="pre">--gemm_swiglu_plugin</span> <span class="pre">fp8</span></code> is enabled). The gemm_swiglu_plugin
+will support more data types and GPU architectures in the future release.</p>
+</section>
+<section id="use-gptmanagerbenchmark-for-gh200">
+<h3>Use <em>gptManagerBenchmark</em> for GH200<a class="headerlink" href="#use-gptmanagerbenchmark-for-gh200" title="Link to this heading">#</a></h3>
+<p>For release v0.17, on GH200 systems, we recommend using the legacy flow based on <em>gptManagerBenchmark</em> to measure performance.</p>
+</section>
+</section>
+<section id="throughput-measurements">
+<h2>Throughput Measurements<a class="headerlink" href="#throughput-measurements" title="Link to this heading">#</a></h2>
+<p>The below table shows performance data where a local inference client is fed requests at an infinite rate (no delay between messages),
+and shows the throughput client-server scenario under maximum load.</p>
+<p>The performance numbers below were collected using the steps described in this document.</p>
+<p><strong>All data in the table below was generated using version 0.17 and presents token throughput in tokens/second.</strong></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Throughput (tokens / sec)</p></th>
+<th class="head text-left"><p></p></th>
+<th class="head text-left"><p>GPU</p></th>
+<th class="head text-left"><p>H200 141GB HBM3</p></th>
+<th class="head text-left"><p>H100 80GB HBM3</p></th>
+<th class="head text-left"><p>GH200 480GB</p></th>
+<th class="head text-left"><p>L40S</p></th>
+<th class="head text-left"><p>A100-SXM4-80GB</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p>Precision</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>FP8</p></td>
+<td class="text-left"><p>FP8</p></td>
+<td class="text-left"><p>FP8</p></td>
+<td class="text-left"><p>FP8</p></td>
+<td class="text-left"><p>FP16</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Model</p></td>
+<td class="text-left"><p>Tensor Model Parallel Size</p></td>
+<td class="text-left"><p>Runtime Input/Output Lengths</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>LLaMA v3.1 8B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128, 128</p></td>
+<td class="text-left"><p>29526.04</p></td>
+<td class="text-left"><p>28836.77</p></td>
+<td class="text-left"><p>29852.96</p></td>
+<td class="text-left"><p>9104.61</p></td>
+<td class="text-left"><p>6627.27</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 2048</p></td>
+<td class="text-left"><p>25398.86</p></td>
+<td class="text-left"><p>21109.38</p></td>
+<td class="text-left"><p>21769.55</p></td>
+<td class="text-left"><p>5365.81</p></td>
+<td class="text-left"><p>5255.99</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 4096</p></td>
+<td class="text-left"><p>17370.8</p></td>
+<td class="text-left"><p>13593.65</p></td>
+<td class="text-left"><p>14189.89</p></td>
+<td class="text-left"><p>3025.92</p></td>
+<td class="text-left"><p>3453.79</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>500, 2000</p></td>
+<td class="text-left"><p>21020.81</p></td>
+<td class="text-left"><p>16500.69</p></td>
+<td class="text-left"><p>17137.29</p></td>
+<td class="text-left"><p>4273.75</p></td>
+<td class="text-left"><p>4276.58</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1000, 1000</p></td>
+<td class="text-left"><p>17537.96</p></td>
+<td class="text-left"><p>15244.78</p></td>
+<td class="text-left"><p>16482.77</p></td>
+<td class="text-left"><p>4054.71</p></td>
+<td class="text-left"><p>3786.83</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 128</p></td>
+<td class="text-left"><p>3794.14</p></td>
+<td class="text-left"><p>3556.73</p></td>
+<td class="text-left"><p>3843.95</p></td>
+<td class="text-left"><p>1066.52</p></td>
+<td class="text-left"><p>799.61</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 2048</p></td>
+<td class="text-left"><p>11968.5</p></td>
+<td class="text-left"><p>9488.42</p></td>
+<td class="text-left"><p>10265.9</p></td>
+<td class="text-left"><p>2225.27</p></td>
+<td class="text-left"><p>2424.16</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>5000, 500</p></td>
+<td class="text-left"><p>3987.79</p></td>
+<td class="text-left"><p>3559.36</p></td>
+<td class="text-left"><p>3932.58</p></td>
+<td class="text-left"><p>981.2</p></td>
+<td class="text-left"><p>825.13</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>20000, 2000</p></td>
+<td class="text-left"><p>1804.1</p></td>
+<td class="text-left"><p>1401.31</p></td>
+<td class="text-left"><p>1560.2</p></td>
+<td class="text-left"><p>327.97</p></td>
+<td class="text-left"><p>330.04</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>LLaMA v3.1 70B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128, 128</p></td>
+<td class="text-left"><p>4020.75</p></td>
+<td class="text-left"><p>3378.03</p></td>
+<td class="text-left"><p>3636.91</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 2048</p></td>
+<td class="text-left"><p>4165.68</p></td>
+<td class="text-left"><p>911.62</p></td>
+<td class="text-left"><p>2082.74</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 4096</p></td>
+<td class="text-left"><p>2651.75</p></td>
+<td class="text-left"><p>426.32</p></td>
+<td class="text-left"><p>1263.98</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>500, 2000</p></td>
+<td class="text-left"><p>3018.39</p></td>
+<td class="text-left"><p>775.57</p></td>
+<td class="text-left"><p>1973.86</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1000, 1000</p></td>
+<td class="text-left"><p>2823.45</p></td>
+<td class="text-left"><p>839.97</p></td>
+<td class="text-left"><p>1746.12</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 128</p></td>
+<td class="text-left"><p>465.99</p></td>
+<td class="text-left"><p>343.29</p></td>
+<td class="text-left"><p>424.96</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 2048</p></td>
+<td class="text-left"><p>1913.8</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1086.93</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>5000, 500</p></td>
+<td class="text-left"><p>560.16</p></td>
+<td class="text-left"><p>245.34</p></td>
+<td class="text-left"><p>422.36</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>20000, 2000</p></td>
+<td class="text-left"><p>279.52</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p>2</p></td>
+<td class="text-left"><p>128, 128</p></td>
+<td class="text-left"><p>6823.01</p></td>
+<td class="text-left"><p>6645.12</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1313.96</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 2048</p></td>
+<td class="text-left"><p>8290.35</p></td>
+<td class="text-left"><p>6169.58</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>531.26</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 4096</p></td>
+<td class="text-left"><p>6526.67</p></td>
+<td class="text-left"><p>3897.06</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>500, 2000</p></td>
+<td class="text-left"><p>6848.02</p></td>
+<td class="text-left"><p>4972.57</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>439.41</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1000, 1000</p></td>
+<td class="text-left"><p>5164.76</p></td>
+<td class="text-left"><p>4390.53</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>472.94</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 128</p></td>
+<td class="text-left"><p>809</p></td>
+<td class="text-left"><p>772.66</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>148.96</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 2048</p></td>
+<td class="text-left"><p>4183.88</p></td>
+<td class="text-left"><p>2898.16</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>261.1</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>5000, 500</p></td>
+<td class="text-left"><p>1025.38</p></td>
+<td class="text-left"><p>919.73</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>121.47</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>20000, 2000</p></td>
+<td class="text-left"><p>640.62</p></td>
+<td class="text-left"><p>443.01</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p>4</p></td>
+<td class="text-left"><p>128, 128</p></td>
+<td class="text-left"><p>11098.63</p></td>
+<td class="text-left"><p>11127.53</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1523.52</p></td>
+<td class="text-left"><p>2733.48</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 2048</p></td>
+<td class="text-left"><p>14156</p></td>
+<td class="text-left"><p>11511.93</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1942.66</p></td>
+<td class="text-left"><p>2811.27</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 4096</p></td>
+<td class="text-left"><p>10574.06</p></td>
+<td class="text-left"><p>7439.41</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1440.23</p></td>
+<td class="text-left"><p>1976.49</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>500, 2000</p></td>
+<td class="text-left"><p>12452.79</p></td>
+<td class="text-left"><p>9836.7</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1634.72</p></td>
+<td class="text-left"><p>2275.79</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1000, 1000</p></td>
+<td class="text-left"><p>8911.29</p></td>
+<td class="text-left"><p>7430.99</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1209.25</p></td>
+<td class="text-left"><p>1921.77</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 128</p></td>
+<td class="text-left"><p>1358.06</p></td>
+<td class="text-left"><p>1302.6</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>177.72</p></td>
+<td class="text-left"><p>325.15</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 2048</p></td>
+<td class="text-left"><p>7130.44</p></td>
+<td class="text-left"><p>5480.03</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>969.68</p></td>
+<td class="text-left"><p>1393.64</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>5000, 500</p></td>
+<td class="text-left"><p>1811.55</p></td>
+<td class="text-left"><p>1602.78</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>249.52</p></td>
+<td class="text-left"><p>392.62</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>20000, 2000</p></td>
+<td class="text-left"><p>1199.68</p></td>
+<td class="text-left"><p>920.19</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>162.25</p></td>
+<td class="text-left"><p>212.08</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>128, 128</p></td>
+<td class="text-left"><p>15355.84</p></td>
+<td class="text-left"><p>14730.69</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1464.03</p></td>
+<td class="text-left"><p>4717.62</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 2048</p></td>
+<td class="text-left"><p>21195.88</p></td>
+<td class="text-left"><p>17061.82</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2303.31</p></td>
+<td class="text-left"><p>5241.5</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 4096</p></td>
+<td class="text-left"><p>16941.52</p></td>
+<td class="text-left"><p>14171.43</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2018.22</p></td>
+<td class="text-left"><p>3724.67</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>500, 2000</p></td>
+<td class="text-left"><p>17278.4</p></td>
+<td class="text-left"><p>14679.33</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1971.96</p></td>
+<td class="text-left"><p>4445.37</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1000, 1000</p></td>
+<td class="text-left"><p>13181.24</p></td>
+<td class="text-left"><p>11451.16</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1333.62</p></td>
+<td class="text-left"><p>3320.41</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 128</p></td>
+<td class="text-left"><p>1983.03</p></td>
+<td class="text-left"><p>1923.41</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>176.16</p></td>
+<td class="text-left"><p>542.38</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 2048</p></td>
+<td class="text-left"><p>11142.47</p></td>
+<td class="text-left"><p>8801.95</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1200.16</p></td>
+<td class="text-left"><p>2553.71</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>5000, 500</p></td>
+<td class="text-left"><p>2717.83</p></td>
+<td class="text-left"><p>2457.42</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>259.71</p></td>
+<td class="text-left"><p>696.34</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>20000, 2000</p></td>
+<td class="text-left"><p>1920.45</p></td>
+<td class="text-left"><p>1512.6</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>209.87</p></td>
+<td class="text-left"><p>413.38</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>LLaMA v3.1 405B</p></td>
+<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>128, 128</p></td>
+<td class="text-left"><p>3874.19</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 2048</p></td>
+<td class="text-left"><p>5938.09</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 4096</p></td>
+<td class="text-left"><p>5168.37</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>500, 2000</p></td>
+<td class="text-left"><p>5084.29</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1000, 1000</p></td>
+<td class="text-left"><p>3399.69</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 128</p></td>
+<td class="text-left"><p>463.42</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 2048</p></td>
+<td class="text-left"><p>2940.62</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>5000, 500</p></td>
+<td class="text-left"><p>669.13</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>20000, 2000</p></td>
+<td class="text-left"><p>535.31</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Mistral 7B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128, 128</p></td>
+<td class="text-left"><p>31938.12</p></td>
+<td class="text-left"><p>31674.49</p></td>
+<td class="text-left"><p>32498.47</p></td>
+<td class="text-left"><p>9664.13</p></td>
+<td class="text-left"><p>6982.53</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 2048</p></td>
+<td class="text-left"><p>27409.3</p></td>
+<td class="text-left"><p>23496.42</p></td>
+<td class="text-left"><p>23337.29</p></td>
+<td class="text-left"><p>5720.65</p></td>
+<td class="text-left"><p>5630.62</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 4096</p></td>
+<td class="text-left"><p>18505.03</p></td>
+<td class="text-left"><p>14350.99</p></td>
+<td class="text-left"><p>15017.88</p></td>
+<td class="text-left"><p>3136.33</p></td>
+<td class="text-left"><p>3591.22</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>500, 2000</p></td>
+<td class="text-left"><p>22354.67</p></td>
+<td class="text-left"><p>18026.27</p></td>
+<td class="text-left"><p>18556</p></td>
+<td class="text-left"><p>4521.77</p></td>
+<td class="text-left"><p>4400.48</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1000, 1000</p></td>
+<td class="text-left"><p>18426.16</p></td>
+<td class="text-left"><p>16035.66</p></td>
+<td class="text-left"><p>17252.11</p></td>
+<td class="text-left"><p>4177.76</p></td>
+<td class="text-left"><p>3896.58</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 128</p></td>
+<td class="text-left"><p>3834.43</p></td>
+<td class="text-left"><p>3642.48</p></td>
+<td class="text-left"><p>3813.13</p></td>
+<td class="text-left"><p>1076.74</p></td>
+<td class="text-left"><p>808.58</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 2048</p></td>
+<td class="text-left"><p>12347.37</p></td>
+<td class="text-left"><p>9958.17</p></td>
+<td class="text-left"><p>10755.94</p></td>
+<td class="text-left"><p>2286.71</p></td>
+<td class="text-left"><p>2489.77</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>5000, 500</p></td>
+<td class="text-left"><p>4041.59</p></td>
+<td class="text-left"><p>3591.33</p></td>
+<td class="text-left"><p>3949.66</p></td>
+<td class="text-left"><p>1001.02</p></td>
+<td class="text-left"><p>844.64</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>20000, 2000</p></td>
+<td class="text-left"><p>1822.69</p></td>
+<td class="text-left"><p>1373.24</p></td>
+<td class="text-left"><p>1601.28</p></td>
+<td class="text-left"><p>337.83</p></td>
+<td class="text-left"><p>332.3</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Mixtral 8x7B</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>128, 128</p></td>
+<td class="text-left"><p>17157.72</p></td>
+<td class="text-left"><p>15962.49</p></td>
+<td class="text-left"><p>16859.18</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 2048</p></td>
+<td class="text-left"><p>15095.21</p></td>
+<td class="text-left"><p>8290.13</p></td>
+<td class="text-left"><p>11120.16</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 4096</p></td>
+<td class="text-left"><p>9534.62</p></td>
+<td class="text-left"><p>4784.86</p></td>
+<td class="text-left"><p>6610.47</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>500, 2000</p></td>
+<td class="text-left"><p>12105.27</p></td>
+<td class="text-left"><p>6800.6</p></td>
+<td class="text-left"><p>9192.86</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1000, 1000</p></td>
+<td class="text-left"><p>10371.36</p></td>
+<td class="text-left"><p>6868.52</p></td>
+<td class="text-left"><p>8849.18</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 128</p></td>
+<td class="text-left"><p>2009.67</p></td>
+<td class="text-left"><p>1892.81</p></td>
+<td class="text-left"><p>1994.31</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 2048</p></td>
+<td class="text-left"><p>6940.32</p></td>
+<td class="text-left"><p>3983.1</p></td>
+<td class="text-left"><p>5545.46</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>5000, 500</p></td>
+<td class="text-left"><p>2309.1</p></td>
+<td class="text-left"><p>1764.7</p></td>
+<td class="text-left"><p>2078.27</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>20000, 2000</p></td>
+<td class="text-left"><p>1151.78</p></td>
+<td class="text-left"><p>673.7</p></td>
+<td class="text-left"><p>860.68</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p>2</p></td>
+<td class="text-left"><p>128, 128</p></td>
+<td class="text-left"><p>27825.34</p></td>
+<td class="text-left"><p>27451.13</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>5541.47</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 2048</p></td>
+<td class="text-left"><p>29584.05</p></td>
+<td class="text-left"><p>22830.08</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>4169.78</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 4096</p></td>
+<td class="text-left"><p>21564.68</p></td>
+<td class="text-left"><p>14237.01</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2608.05</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>500, 2000</p></td>
+<td class="text-left"><p>23410.63</p></td>
+<td class="text-left"><p>17036.04</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>3446.37</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1000, 1000</p></td>
+<td class="text-left"><p>19151.19</p></td>
+<td class="text-left"><p>15770.89</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>3154.52</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 128</p></td>
+<td class="text-left"><p>3383.16</p></td>
+<td class="text-left"><p>3333.68</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>649</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 2048</p></td>
+<td class="text-left"><p>14007.29</p></td>
+<td class="text-left"><p>10685.85</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2056.58</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>5000, 500</p></td>
+<td class="text-left"><p>4223.68</p></td>
+<td class="text-left"><p>3646.09</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>724.44</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>20000, 2000</p></td>
+<td class="text-left"><p>2299.21</p></td>
+<td class="text-left"><p>1757.45</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>337.51</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p>4</p></td>
+<td class="text-left"><p>128, 128</p></td>
+<td class="text-left"><p>42551.59</p></td>
+<td class="text-left"><p>41068.23</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>6921.87</p></td>
+<td class="text-left"><p>10324.28</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 2048</p></td>
+<td class="text-left"><p>52291.78</p></td>
+<td class="text-left"><p>41164.73</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>7996.93</p></td>
+<td class="text-left"><p>10911.86</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 4096</p></td>
+<td class="text-left"><p>39513.73</p></td>
+<td class="text-left"><p>27912.48</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>5736.09</p></td>
+<td class="text-left"><p>7666.51</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>500, 2000</p></td>
+<td class="text-left"><p>43818.99</p></td>
+<td class="text-left"><p>34489.34</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>6914.68</p></td>
+<td class="text-left"><p>8456.21</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1000, 1000</p></td>
+<td class="text-left"><p>33580.9</p></td>
+<td class="text-left"><p>27784.74</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>5251.49</p></td>
+<td class="text-left"><p>7122.84</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 128</p></td>
+<td class="text-left"><p>5467.62</p></td>
+<td class="text-left"><p>5234.98</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>827.62</p></td>
+<td class="text-left"><p>1237.62</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 2048</p></td>
+<td class="text-left"><p>24980.93</p></td>
+<td class="text-left"><p>19432.08</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>3935.32</p></td>
+<td class="text-left"><p>5222.98</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>5000, 500</p></td>
+<td class="text-left"><p>7084.94</p></td>
+<td class="text-left"><p>6401.56</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1092.88</p></td>
+<td class="text-left"><p>1500.55</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>20000, 2000</p></td>
+<td class="text-left"><p>4236.84</p></td>
+<td class="text-left"><p>3303.83</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>682.48</p></td>
+<td class="text-left"><p>829.59</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>128, 128</p></td>
+<td class="text-left"><p>53212.55</p></td>
+<td class="text-left"><p>50849.55</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>6740.84</p></td>
+<td class="text-left"><p>17043.54</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 2048</p></td>
+<td class="text-left"><p>68608.45</p></td>
+<td class="text-left"><p>61607.7</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>10393.3</p></td>
+<td class="text-left"><p>20277.88</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 4096</p></td>
+<td class="text-left"><p>54827.78</p></td>
+<td class="text-left"><p>48280.37</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>8472.35</p></td>
+<td class="text-left"><p>15282.89</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>500, 2000</p></td>
+<td class="text-left"><p>58706.39</p></td>
+<td class="text-left"><p>52583.65</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>8660.71</p></td>
+<td class="text-left"><p>17184.24</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1000, 1000</p></td>
+<td class="text-left"><p>44705.48</p></td>
+<td class="text-left"><p>40631.71</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>5947.72</p></td>
+<td class="text-left"><p>12851.44</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 128</p></td>
+<td class="text-left"><p>7554.38</p></td>
+<td class="text-left"><p>6988.18</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>811.96</p></td>
+<td class="text-left"><p>2165.52</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 2048</p></td>
+<td class="text-left"><p>36193.64</p></td>
+<td class="text-left"><p>30983.35</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>5136.98</p></td>
+<td class="text-left"><p>9809.76</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>5000, 500</p></td>
+<td class="text-left"><p>10271.8</p></td>
+<td class="text-left"><p>9210.11</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1153.76</p></td>
+<td class="text-left"><p>2761.28</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>20000, 2000</p></td>
+<td class="text-left"><p>6835.53</p></td>
+<td class="text-left"><p>5602.43</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>918.95</p></td>
+<td class="text-left"><p>1592.53</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Mixtral 8x22B</p></td>
+<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>128, 128</p></td>
+<td class="text-left"><p>22948.57</p></td>
+<td class="text-left"><p>21876.08</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>6381.95</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 2048</p></td>
+<td class="text-left"><p>32415.81</p></td>
+<td class="text-left"><p>25150.03</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>6685.99</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>128, 4096</p></td>
+<td class="text-left"><p>25753.14</p></td>
+<td class="text-left"><p>18387.4</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>4789.13</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>500, 2000</p></td>
+<td class="text-left"><p>27429.6</p></td>
+<td class="text-left"><p>21421.86</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>5648.46</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1000, 1000</p></td>
+<td class="text-left"><p>19712.35</p></td>
+<td class="text-left"><p>16573.24</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>4549.46</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 128</p></td>
+<td class="text-left"><p>2899.84</p></td>
+<td class="text-left"><p>2794.97</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>761.56</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2048, 2048</p></td>
+<td class="text-left"><p>15798.59</p></td>
+<td class="text-left"><p>12244.93</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>3521.98</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>5000, 500</p></td>
+<td class="text-left"><p>4031.79</p></td>
+<td class="text-left"><p>3645.27</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>959.14</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>20000, 2000</p></td>
+<td class="text-left"><p>2815.76</p></td>
+<td class="text-left"><p>2227.63</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>575.02</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><em>TP stands for Tensor Parallelism</em></p>
+</section>
+<section id="reproducing-benchmarked-results">
+<h2>Reproducing Benchmarked Results<a class="headerlink" href="#reproducing-benchmarked-results" title="Link to this heading">#</a></h2>
+<blockquote>
+<div><p>[!NOTE] The only models supported in this workflow are those listed in the table above.</p>
+</div></blockquote>
+<p>The following tables are references for commands that are used as part of the benchmarking process. For a more detailed
+description of this benchmarking workflow, see the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html">benchmarking suite documentation</a>.</p>
+<section id="commands">
+<h3>Commands<a class="headerlink" href="#commands" title="Link to this heading">#</a></h3>
+<section id="for-systems-other-than-gh200">
+<h4>For systems other than GH200<a class="headerlink" href="#for-systems-other-than-gh200" title="Link to this heading">#</a></h4>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Stage</p></th>
+<th class="head"><p>Description</p></th>
+<th class="head"><p>Command</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p><a class="reference internal" href="#preparing-a-dataset">Dataset</a></p></td>
+<td><p>Create a synthetic dataset</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">benchmarks/cpp/prepare_dataset.py</span> <span class="pre">--tokenizer=$model_name</span> <span class="pre">--stdout</span> <span class="pre">token-norm-dist</span> <span class="pre">--num-requests=$num_requests</span> <span class="pre">--input-mean=$isl</span> <span class="pre">--output-mean=$osl</span> <span class="pre">--input-stdev=0</span> <span class="pre">--output-stdev=0</span> <span class="pre">&gt;</span> <span class="pre">$dataset_file</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><a class="reference internal" href="#engine-building">Build</a></p></td>
+<td><p>Build a TensorRT-LLM engine</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">--model</span> <span class="pre">$model_name</span> <span class="pre">build</span> <span class="pre">--tp_size</span> <span class="pre">$tp_size</span> <span class="pre">--pp_size</span> <span class="pre">$pp_size</span> <span class="pre">--quantization</span> <span class="pre">FP8</span> <span class="pre">--dataset</span> <span class="pre">$dataset_file</span></code></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><a class="reference internal" href="#running-the-benchmark">Run</a></p></td>
+<td><p>Run a benchmark with a dataset</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">--model</span> <span class="pre">$model_name</span> <span class="pre">throughput</span> <span class="pre">--dataset</span> <span class="pre">$dataset_file</span> <span class="pre">--engine_dir</span> <span class="pre">$engine_dir</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="for-gh200-systems-only">
+<h4>For GH200 systems only<a class="headerlink" href="#for-gh200-systems-only" title="Link to this heading">#</a></h4>
+<p>For release v0.17, on GH200 systems, the recommendation is to use the legacy flow based on <em>gptManagerBenchmark</em> to measure performance.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Stage</p></th>
+<th class="head"><p>Description</p></th>
+<th class="head"><p>Command</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p><a class="reference internal" href="#preparing-a-dataset">Dataset</a></p></td>
+<td><p>Create a synthetic dataset for engine building</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">benchmarks/cpp/prepare_dataset.py</span> <span class="pre">--tokenizer=$model_name</span> <span class="pre">--stdout</span> <span class="pre">token-norm-dist</span> <span class="pre">--num-requests=$num_requests</span> <span class="pre">--input-mean=$isl</span> <span class="pre">--output-mean=$osl</span> <span class="pre">--input-stdev=0</span> <span class="pre">--output-stdev=0</span> <span class="pre">&gt;</span> <span class="pre">$dataset_file</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><a class="reference internal" href="#engine-building">Build</a></p></td>
+<td><p>Build a TensorRT-LLM engine</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">--model</span> <span class="pre">$model_name</span> <span class="pre">build</span> <span class="pre">--tp_size</span> <span class="pre">$tp_size</span> <span class="pre">--quantization</span> <span class="pre">FP8</span> <span class="pre">--dataset</span> <span class="pre">$dataset_file</span></code></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><a class="reference internal" href="#preparing-a-dataset">Dataset</a></p></td>
+<td><p>Create a synthetic dataset for benchmarking in json format</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">benchmarks/cpp/prepare_dataset.py</span> <span class="pre">--output=$dataset_file_json</span> <span class="pre">--tokenizer=$model_name</span> <span class="pre">token-norm-dist</span> <span class="pre">--num-requests=$num_requests</span> <span class="pre">--input-mean=$isl</span> <span class="pre">--output-mean=$osl</span> <span class="pre">--input-stdev=0</span> <span class="pre">--output-stdev=0</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><a class="reference internal" href="#running-the-benchmark">Run</a></p></td>
+<td><p>Run a benchmark with a dataset in json format</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/app/tensorrt_llm/benchmarks/cpp/gptManagerBenchmark</span> <span class="pre">--engine_dir</span> <span class="pre">$engine_dir</span> <span class="pre">--type</span> <span class="pre">IFB</span> <span class="pre">--api</span> <span class="pre">executor</span> <span class="pre">--dataset</span> <span class="pre">$dataset_file_json</span> <span class="pre">--eos_id</span> <span class="pre">-1</span> <span class="pre">--log_iteration_data</span> <span class="pre">--scheduler_policy</span> <span class="pre">guaranteed_no_evict</span> <span class="pre">--kv_cache_free_gpu_mem_fraction</span> <span class="pre">0.95</span> <span class="pre">--output_csv</span> <span class="pre">result.csv</span> <span class="pre">--request_rate</span> <span class="pre">-1.0</span> <span class="pre">--enable_chunked_context</span> <span class="pre">--warm_up</span> <span class="pre">0</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+</section>
+<section id="variables">
+<h3>Variables<a class="headerlink" href="#variables" title="Link to this heading">#</a></h3>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Name</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$isl</span></code></p></td>
+<td><p>Benchmark input sequence length.</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$osl</span></code></p></td>
+<td><p>Benchmark output sequence length.</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$tp_size</span></code></p></td>
+<td><p>Tensor parallel mapping degree to run the benchmark with</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$pp_size</span></code></p></td>
+<td><p>Pipeline parallel mapping degree to run the benchmark with</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$engine_dir</span></code></p></td>
+<td><p>Location to store built engine file (can be deleted after running benchmarks).</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$model_name</span></code></p></td>
+<td><p>HuggingFace model name eg. meta-llama/Llama-2-7b-hf or use the path to a local weights directory</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$dataset_file</span></code></p></td>
+<td><p>Location of the dataset file generated by <code class="docutils literal notranslate"><span class="pre">prepare_dataset.py</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$num_requests</span></code></p></td>
+<td><p>The number of requests to generate for dataset generation</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$seq_len</span></code></p></td>
+<td><p>A sequence length of ISL + OSL</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="preparing-a-dataset">
+<h3>Preparing a Dataset<a class="headerlink" href="#preparing-a-dataset" title="Link to this heading">#</a></h3>
+<p>In order to prepare a dataset, you can use the provided <a class="reference download internal" download="" href="../_downloads/ea8faa5e98124e92f96b66dc586fb429/prepare_dataset.py"><span class="xref download myst">script</span></a>.
+To generate a synthetic dataset, run the following command:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>benchmarks/cpp/prepare_dataset.py<span class="w"> </span>--tokenizer<span class="o">=</span><span class="nv">$model_name</span><span class="w"> </span>--stdout<span class="w"> </span>token-norm-dist<span class="w"> </span>--num-requests<span class="o">=</span><span class="nv">$num_requests</span><span class="w"> </span>--input-mean<span class="o">=</span><span class="nv">$isl</span><span class="w"> </span>--output-mean<span class="o">=</span><span class="nv">$osl</span><span class="w"> </span>--input-stdev<span class="o">=</span><span class="m">0</span><span class="w"> </span>--output-stdev<span class="o">=</span><span class="m">0</span><span class="w"> </span>&gt;<span class="w"> </span><span class="nv">$dataset_file</span>
+</pre></div>
+</div>
+<p>The command will generate a text file located at the path specified <code class="docutils literal notranslate"><span class="pre">$dataset_file</span></code> where all requests are of the same
+input/output sequence length combinations. The script works by using the tokenizer to retrieve the vocabulary size and
+randomly sample token IDs from it to create entirely random sequences. In the command above, all requests will be uniform
+because the standard deviations for both input and output sequences are set to 0.</p>
+<p>For each input and output sequence length combination, the table below details the <code class="docutils literal notranslate"><span class="pre">$num_requests</span></code> that were used. For
+shorter input and output lengths, a larger number of messages were used to guarantee that the system hit a steady state
+because requests enter and exit the system at a much faster rate. For longer input/output sequence lengths, requests
+remain in the system longer and therefore require less requests to achieve steady state.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Input Length</p></th>
+<th class="head"><p>Output Length</p></th>
+<th class="head"><p>$seq_len</p></th>
+<th class="head"><p>$num_requests</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>128</p></td>
+<td><p>128</p></td>
+<td><p>256</p></td>
+<td><p>30000</p></td>
+</tr>
+<tr class="row-odd"><td><p>128</p></td>
+<td><p>2048</p></td>
+<td><p>2176</p></td>
+<td><p>3000</p></td>
+</tr>
+<tr class="row-even"><td><p>128</p></td>
+<td><p>4096</p></td>
+<td><p>4224</p></td>
+<td><p>1500</p></td>
+</tr>
+<tr class="row-odd"><td><p>2048</p></td>
+<td><p>128</p></td>
+<td><p>2176</p></td>
+<td><p>3000</p></td>
+</tr>
+<tr class="row-even"><td><p>2048</p></td>
+<td><p>2048</p></td>
+<td><p>4096</p></td>
+<td><p>1500</p></td>
+</tr>
+<tr class="row-odd"><td><p>5000</p></td>
+<td><p>500</p></td>
+<td><p>5500</p></td>
+<td><p>1500</p></td>
+</tr>
+<tr class="row-even"><td><p>1000</p></td>
+<td><p>1000</p></td>
+<td><p>2000</p></td>
+<td><p>3000</p></td>
+</tr>
+<tr class="row-odd"><td><p>500</p></td>
+<td><p>2000</p></td>
+<td><p>2500</p></td>
+<td><p>3000</p></td>
+</tr>
+<tr class="row-even"><td><p>20000</p></td>
+<td><p>2000</p></td>
+<td><p>22000</p></td>
+<td><p>1000</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="engine-building">
+<h3>Engine Building<a class="headerlink" href="#engine-building" title="Link to this heading">#</a></h3>
+<p>All engines are built using the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> subcommand.
+The basic command for FP8 quantized engines is as follows:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>trtllm-bench --model $model_name build --tp_size $tp_size --pp_size $pp_size --quantization FP8 --dataset $dataset_file
+</pre></div>
+</div>
+<p>When providing <code class="docutils literal notranslate"><span class="pre">--dataset</span></code> in the build subcommand, <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> uses high-level statistics of the dataset (average ISL/OSL, max sequence length) and tuning heuristics to optimize engine build settings.</p>
+<p>Alternatively, if you would like to build the engine with specific settings, you can do so by specifying the values for <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> and <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code>:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>trtllm-bench --model $model_name build --tp_size $tp_size --pp_size $pp_size --quantization FP8 --max_seq_len $seq_len --max_batch_size $max_bs --max_num_tokens $max_token
+</pre></div>
+</div>
+<p>If you would like to build an FP16 engine without any quantization, simply remove the <code class="docutils literal notranslate"><span class="pre">--quantization</span> <span class="pre">FP8</span></code> option. If using pre-quantized weights (e.g. <code class="docutils literal notranslate"><span class="pre">nvidia/Llama-3.1-70B-Instruct-FP8</span></code> from HuggingFace), please set the <code class="docutils literal notranslate"><span class="pre">--quantization</span></code> argument to the model dtype to ensure the KV Cache is set to the appropriate dtype.</p>
+<blockquote>
+<div><p>[!NOTE] If you specify FP8 quantization, the KV cache will automatically be set to FP8 as well!</p>
+</div></blockquote>
+<p>The <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> subcommand will output the path where the engine is located upon a successful build. For example,</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="o">===========================================================</span>
+ENGINE<span class="w"> </span>SAVED:<span class="w"> </span>/tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
+<span class="o">===========================================================</span>
+</pre></div>
+</div>
+</section>
+<section id="running-the-benchmark">
+<h3>Running the Benchmark<a class="headerlink" href="#running-the-benchmark" title="Link to this heading">#</a></h3>
+</section>
+<section id="for-non-gh200-systems">
+<h3>For non GH200 systems<a class="headerlink" href="#for-non-gh200-systems" title="Link to this heading">#</a></h3>
+<p>To run the benchmark with the generated data set, simply use the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">throughput</span></code> subcommand. The benchmarker will
+run an offline maximum throughput scenario such that all requests are queued in rapid succession. You simply need to provide
+the patch to the engine from the <a class="reference internal" href="#engine-building">build</a> phase and a <a class="reference internal" href="#preparing-a-dataset">generated dataset</a>.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span><span class="nv">$model_name</span><span class="w"> </span>throughput<span class="w"> </span>--dataset<span class="w"> </span><span class="nv">$dataset_file</span><span class="w"> </span>--engine_dir<span class="w"> </span><span class="nv">$engine_dir</span>
+</pre></div>
+</div>
+<p>In majority of cases, we also use a higher KV cache percentage by setting <code class="docutils literal notranslate"><span class="pre">--kv_cache_free_gpu_mem_fraction</span> <span class="pre">0.95</span></code> in the benchmark command. This allows us to obtain better performance than the default setting of <code class="docutils literal notranslate"><span class="pre">0.90</span></code>. We fall back to <code class="docutils literal notranslate"><span class="pre">0.90</span></code> if we hit an out of memory issue.</p>
+<p>The results will be printed to the terminal upon benchmark completion. For example,</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="o">===========================================================</span>
+<span class="o">=</span><span class="w"> </span>ENGINE<span class="w"> </span><span class="nv">DETAILS</span>
+<span class="o">===========================================================</span>
+Model:<span class="w">                  </span>meta-llama/Llama-2-7b-hf
+Engine<span class="w"> </span>Directory:<span class="w">       </span>/tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
+TensorRT-LLM<span class="w"> </span>Version:<span class="w">   </span><span class="m">0</span>.12.0
+Dtype:<span class="w">                  </span>float16
+KV<span class="w"> </span>Cache<span class="w"> </span>Dtype:<span class="w">         </span>FP8
+Quantization:<span class="w">           </span>FP8
+Max<span class="w"> </span>Input<span class="w"> </span>Length:<span class="w">       </span><span class="m">2048</span>
+Max<span class="w"> </span>Sequence<span class="w"> </span>Length:<span class="w">    </span><span class="nv">4098</span>
+
+<span class="o">===========================================================</span>
+<span class="o">=</span><span class="w"> </span>WORLD<span class="w"> </span>+<span class="w"> </span>RUNTIME<span class="w"> </span><span class="nv">INFORMATION</span>
+<span class="o">===========================================================</span>
+TP<span class="w"> </span>Size:<span class="w">                </span><span class="m">1</span>
+PP<span class="w"> </span>Size:<span class="w">                </span><span class="m">1</span>
+Max<span class="w"> </span>Runtime<span class="w"> </span>Batch<span class="w"> </span>Size:<span class="w"> </span><span class="m">4096</span>
+Max<span class="w"> </span>Runtime<span class="w"> </span>Tokens:<span class="w">     </span><span class="m">8192</span>
+Scheduling<span class="w"> </span>Policy:<span class="w">      </span>Guaranteed<span class="w"> </span>No<span class="w"> </span>Evict
+KV<span class="w"> </span>Memory<span class="w"> </span>Percentage:<span class="w">   </span><span class="m">99</span>.0%
+Issue<span class="w"> </span>Rate<span class="w"> </span><span class="o">(</span>req/sec<span class="o">)</span>:<span class="w">   </span><span class="m">3</span>.680275266452667e+18
+<span class="o">===========================================================</span>
+<span class="o">=</span><span class="w"> </span><span class="nv">STATISTICS</span>
+<span class="o">===========================================================</span>
+Number<span class="w"> </span>of<span class="w"> </span>requests:<span class="w">             </span><span class="m">3000</span>
+Average<span class="w"> </span>Input<span class="w"> </span>Length<span class="w"> </span><span class="o">(</span>tokens<span class="o">)</span>:<span class="w">  </span><span class="m">128</span>.0
+Average<span class="w"> </span>Output<span class="w"> </span>Length<span class="w"> </span><span class="o">(</span>tokens<span class="o">)</span>:<span class="w"> </span><span class="m">128</span>.0
+Token<span class="w"> </span>Throughput<span class="w"> </span><span class="o">(</span>tokens/sec<span class="o">)</span>:<span class="w">  </span><span class="m">23405</span>.927228471104
+Request<span class="w"> </span>Throughput<span class="w"> </span><span class="o">(</span>req/sec<span class="o">)</span>:<span class="w">   </span><span class="m">182</span>.8588064724305
+Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</span>seconds<span class="o">)</span>:<span class="w">        </span><span class="m">16</span>.406100739
+<span class="o">===========================================================</span>
+</pre></div>
+</div>
+<blockquote>
+<div><p>[!WARNING] In some cases, the benchmarker may not print anything at all. This behavior usually
+means that the benchmark has hit an out of memory issue. Try reducing the KV cache percentage
+using the <code class="docutils literal notranslate"><span class="pre">--kv_cache_free_gpu_mem_fraction</span></code> option to lower the percentage of used memory.</p>
+</div></blockquote>
+</section>
+</section>
+<section id="online-serving-measurements">
+<h2>Online Serving Measurements<a class="headerlink" href="#online-serving-measurements" title="Link to this heading">#</a></h2>
+<p>The <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend">TensorRT-LLM backend</a> is used to measure the performance of TensorRT-LLM for online serving.</p>
+<p>The below table shows the throughput and latency under a serving scenario.</p>
+<p><strong>All data in the table below was generated using version 0.14.0, with 500 requests and BF16 precision.</strong></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p></p></th>
+<th class="head"><p></p></th>
+<th class="head"><p></p></th>
+<th class="head"><p></p></th>
+<th class="head"><p></p></th>
+<th class="head"><p></p></th>
+<th class="head"><p></p></th>
+<th class="head"><p></p></th>
+<th class="head"><p></p></th>
+<th class="head"><p></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong>Model</strong></p></td>
+<td><p><strong>GPU</strong></p></td>
+<td><p><strong>TP</strong></p></td>
+<td><p><strong>Input Length</strong></p></td>
+<td><p><strong>Output Length</strong></p></td>
+<td><p><strong>QPS</strong></p></td>
+<td><p><strong>Tput(req/s)</strong></p></td>
+<td><p><strong>Mean TTFT(ms)</strong></p></td>
+<td><p><strong>Mean ITL(ms)</strong></p></td>
+<td><p><strong>Total Token Tput (tok/s)</strong></p></td>
+<td><p><strong>Output Tput (tok/s)</strong></p></td>
+</tr>
+<tr class="row-odd"><td><p>LLaMA 3.1 70B</p></td>
+<td><p>H100 80GB HBM3</p></td>
+<td><p>4</p></td>
+<td><p>467</p></td>
+<td><p>256</p></td>
+<td><p>2</p></td>
+<td><p>2</p></td>
+<td><p>62</p></td>
+<td><p>21</p></td>
+<td><p>1406</p></td>
+<td><p>498</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>4</p></td>
+<td><p>68</p></td>
+<td><p>24</p></td>
+<td><p>2750</p></td>
+<td><p>973</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>7</p></td>
+<td><p>92</p></td>
+<td><p>32</p></td>
+<td><p>5256</p></td>
+<td><p>1860</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>16</p></td>
+<td><p>12</p></td>
+<td><p>175</p></td>
+<td><p>66</p></td>
+<td><p>8941</p></td>
+<td><p>3164</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>32</p></td>
+<td><p>16</p></td>
+<td><p>1229</p></td>
+<td><p>86</p></td>
+<td><p>11537</p></td>
+<td><p>4083</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>INF</p></td>
+<td><p>16</p></td>
+<td><p>9123</p></td>
+<td><p>85</p></td>
+<td><p>11593</p></td>
+<td><p>4103</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>467</p></td>
+<td><p>16</p></td>
+<td><p>2</p></td>
+<td><p>2</p></td>
+<td><p>53</p></td>
+<td><p>18</p></td>
+<td><p>844</p></td>
+<td><p>28</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>4</p></td>
+<td><p>58</p></td>
+<td><p>20</p></td>
+<td><p>1908</p></td>
+<td><p>63</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>8</p></td>
+<td><p>71</p></td>
+<td><p>24</p></td>
+<td><p>3795</p></td>
+<td><p>126</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>16</p></td>
+<td><p>16</p></td>
+<td><p>109</p></td>
+<td><p>38</p></td>
+<td><p>7492</p></td>
+<td><p>248</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>32</p></td>
+<td><p>28</p></td>
+<td><p>1197</p></td>
+<td><p>482</p></td>
+<td><p>13655</p></td>
+<td><p>452</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>INF</p></td>
+<td><p>28</p></td>
+<td><p>9126</p></td>
+<td><p>548</p></td>
+<td><p>13719</p></td>
+<td><p>454</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>202</p></td>
+<td><p>214</p></td>
+<td><p>2</p></td>
+<td><p>2</p></td>
+<td><p>48</p></td>
+<td><p>20</p></td>
+<td><p>780</p></td>
+<td><p>401</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>4</p></td>
+<td><p>51</p></td>
+<td><p>22</p></td>
+<td><p>1499</p></td>
+<td><p>771</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>7</p></td>
+<td><p>57</p></td>
+<td><p>25</p></td>
+<td><p>2702</p></td>
+<td><p>1390</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>16</p></td>
+<td><p>11</p></td>
+<td><p>74</p></td>
+<td><p>32</p></td>
+<td><p>4364</p></td>
+<td><p>2245</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>32</p></td>
+<td><p>14</p></td>
+<td><p>116</p></td>
+<td><p>42</p></td>
+<td><p>5837</p></td>
+<td><p>3003</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>INF</p></td>
+<td><p>16</p></td>
+<td><p>4482</p></td>
+<td><p>50</p></td>
+<td><p>6725</p></td>
+<td><p>3459</p></td>
+</tr>
+<tr class="row-odd"><td><p>LLaMA 3.1 8B</p></td>
+<td><p></p></td>
+<td><p>1</p></td>
+<td><p>467</p></td>
+<td><p>256</p></td>
+<td><p>2</p></td>
+<td><p>2</p></td>
+<td><p>23</p></td>
+<td><p>8</p></td>
+<td><p>1423</p></td>
+<td><p>504</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>4</p></td>
+<td><p>24</p></td>
+<td><p>9</p></td>
+<td><p>2624</p></td>
+<td><p>929</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>8</p></td>
+<td><p>26</p></td>
+<td><p>9</p></td>
+<td><p>5535</p></td>
+<td><p>1959</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>16</p></td>
+<td><p>15</p></td>
+<td><p>30</p></td>
+<td><p>11</p></td>
+<td><p>10636</p></td>
+<td><p>3765</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>32</p></td>
+<td><p>26</p></td>
+<td><p>50</p></td>
+<td><p>19</p></td>
+<td><p>19138</p></td>
+<td><p>6774</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>INF</p></td>
+<td><p>37</p></td>
+<td><p>3335</p></td>
+<td><p>39</p></td>
+<td><p>26614</p></td>
+<td><p>9420</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>467</p></td>
+<td><p>16</p></td>
+<td><p>2</p></td>
+<td><p>2</p></td>
+<td><p>19</p></td>
+<td><p>7</p></td>
+<td><p>956</p></td>
+<td><p>32</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>4</p></td>
+<td><p>20</p></td>
+<td><p>7</p></td>
+<td><p>1910</p></td>
+<td><p>63</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>8</p></td>
+<td><p>22</p></td>
+<td><p>7</p></td>
+<td><p>3808</p></td>
+<td><p>126</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>16</p></td>
+<td><p>16</p></td>
+<td><p>24</p></td>
+<td><p>8</p></td>
+<td><p>7567</p></td>
+<td><p>251</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>32</p></td>
+<td><p>31</p></td>
+<td><p>29</p></td>
+<td><p>10</p></td>
+<td><p>14894</p></td>
+<td><p>493</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>INF</p></td>
+<td><p>79</p></td>
+<td><p>3280</p></td>
+<td><p>193</p></td>
+<td><p>38319</p></td>
+<td><p>1269</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>202</p></td>
+<td><p>214</p></td>
+<td><p>2</p></td>
+<td><p>2</p></td>
+<td><p>19</p></td>
+<td><p>7</p></td>
+<td><p>809</p></td>
+<td><p>416</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>4</p></td>
+<td><p>20</p></td>
+<td><p>8</p></td>
+<td><p>1586</p></td>
+<td><p>816</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>7</p></td>
+<td><p>21</p></td>
+<td><p>9</p></td>
+<td><p>3047</p></td>
+<td><p>1568</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>16</p></td>
+<td><p>13</p></td>
+<td><p>23</p></td>
+<td><p>10</p></td>
+<td><p>5597</p></td>
+<td><p>2879</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>32</p></td>
+<td><p>23</p></td>
+<td><p>27</p></td>
+<td><p>11</p></td>
+<td><p>9381</p></td>
+<td><p>4825</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>INF</p></td>
+<td><p>39</p></td>
+<td><p>1657</p></td>
+<td><p>21</p></td>
+<td><p>16117</p></td>
+<td><p>8291</p></td>
+</tr>
+<tr class="row-odd"><td><p>LLaMA 3.1 70B</p></td>
+<td><p>H200 131GB HBM3</p></td>
+<td><p>4</p></td>
+<td><p>467</p></td>
+<td><p>256</p></td>
+<td><p>2</p></td>
+<td><p>2</p></td>
+<td><p>58</p></td>
+<td><p>18</p></td>
+<td><p>1411</p></td>
+<td><p>499</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>4</p></td>
+<td><p>63</p></td>
+<td><p>20</p></td>
+<td><p>2770</p></td>
+<td><p>980</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>7</p></td>
+<td><p>84</p></td>
+<td><p>27</p></td>
+<td><p>5328</p></td>
+<td><p>1886</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>16</p></td>
+<td><p>13</p></td>
+<td><p>165</p></td>
+<td><p>60</p></td>
+<td><p>9224</p></td>
+<td><p>3264</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>32</p></td>
+<td><p>16</p></td>
+<td><p>1279</p></td>
+<td><p>83</p></td>
+<td><p>11800</p></td>
+<td><p>4176</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>INF</p></td>
+<td><p>16</p></td>
+<td><p>9222</p></td>
+<td><p>83</p></td>
+<td><p>11826</p></td>
+<td><p>4185</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>467</p></td>
+<td><p>16</p></td>
+<td><p>2</p></td>
+<td><p>2</p></td>
+<td><p>50</p></td>
+<td><p>15</p></td>
+<td><p>956</p></td>
+<td><p>32</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>4</p></td>
+<td><p>55</p></td>
+<td><p>16</p></td>
+<td><p>1909</p></td>
+<td><p>63</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>8</p></td>
+<td><p>67</p></td>
+<td><p>20</p></td>
+<td><p>3799</p></td>
+<td><p>126</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>16</p></td>
+<td><p>16</p></td>
+<td><p>103</p></td>
+<td><p>33</p></td>
+<td><p>7499</p></td>
+<td><p>248</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>32</p></td>
+<td><p>28</p></td>
+<td><p>1259</p></td>
+<td><p>485</p></td>
+<td><p>13586</p></td>
+<td><p>450</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>INF</p></td>
+<td><p>29</p></td>
+<td><p>9074</p></td>
+<td><p>546</p></td>
+<td><p>13792</p></td>
+<td><p>457</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>202</p></td>
+<td><p>214</p></td>
+<td><p>2</p></td>
+<td><p>2</p></td>
+<td><p>43</p></td>
+<td><p>17</p></td>
+<td><p>793</p></td>
+<td><p>408</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>4</p></td>
+<td><p>46</p></td>
+<td><p>18</p></td>
+<td><p>1524</p></td>
+<td><p>784</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>7</p></td>
+<td><p>51</p></td>
+<td><p>21</p></td>
+<td><p>2796</p></td>
+<td><p>1438</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>16</p></td>
+<td><p>11</p></td>
+<td><p>67</p></td>
+<td><p>28</p></td>
+<td><p>4639</p></td>
+<td><p>2386</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>32</p></td>
+<td><p>15</p></td>
+<td><p>112</p></td>
+<td><p>39</p></td>
+<td><p>6288</p></td>
+<td><p>3235</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>INF</p></td>
+<td><p>17</p></td>
+<td><p>4480</p></td>
+<td><p>48</p></td>
+<td><p>7230</p></td>
+<td><p>3719</p></td>
+</tr>
+<tr class="row-odd"><td><p>LLaMA 3.1 8B</p></td>
+<td><p>H200 131GB HBM3</p></td>
+<td><p>1</p></td>
+<td><p>467</p></td>
+<td><p>256</p></td>
+<td><p>2</p></td>
+<td><p>2</p></td>
+<td><p>21</p></td>
+<td><p>6</p></td>
+<td><p>1425</p></td>
+<td><p>504</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>4</p></td>
+<td><p>23</p></td>
+<td><p>7</p></td>
+<td><p>2828</p></td>
+<td><p>1001</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>8</p></td>
+<td><p>24</p></td>
+<td><p>7</p></td>
+<td><p>5567</p></td>
+<td><p>1971</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>16</p></td>
+<td><p>15</p></td>
+<td><p>27</p></td>
+<td><p>9</p></td>
+<td><p>10761</p></td>
+<td><p>3809</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>32</p></td>
+<td><p>27</p></td>
+<td><p>44</p></td>
+<td><p>16</p></td>
+<td><p>19848</p></td>
+<td><p>7025</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>INF</p></td>
+<td><p>40</p></td>
+<td><p>3237</p></td>
+<td><p>36</p></td>
+<td><p>28596</p></td>
+<td><p>10121</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>467</p></td>
+<td><p>16</p></td>
+<td><p>2</p></td>
+<td><p>2</p></td>
+<td><p>18</p></td>
+<td><p>5</p></td>
+<td><p>956</p></td>
+<td><p>32</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>4</p></td>
+<td><p>19</p></td>
+<td><p>6</p></td>
+<td><p>1910</p></td>
+<td><p>63</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>8</p></td>
+<td><p>20</p></td>
+<td><p>6</p></td>
+<td><p>3810</p></td>
+<td><p>126</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>16</p></td>
+<td><p>16</p></td>
+<td><p>22</p></td>
+<td><p>7</p></td>
+<td><p>7567</p></td>
+<td><p>250</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>32</p></td>
+<td><p>31</p></td>
+<td><p>27</p></td>
+<td><p>9</p></td>
+<td><p>14927</p></td>
+<td><p>494</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>INF</p></td>
+<td><p>81</p></td>
+<td><p>3227</p></td>
+<td><p>190</p></td>
+<td><p>39007</p></td>
+<td><p>1291</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>202</p></td>
+<td><p>214</p></td>
+<td><p>2</p></td>
+<td><p>2</p></td>
+<td><p>17</p></td>
+<td><p>6</p></td>
+<td><p>812</p></td>
+<td><p>418</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>4</p></td>
+<td><p>18</p></td>
+<td><p>6</p></td>
+<td><p>1597</p></td>
+<td><p>822</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>7</p></td>
+<td><p>19</p></td>
+<td><p>7</p></td>
+<td><p>3088</p></td>
+<td><p>1589</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>16</p></td>
+<td><p>14</p></td>
+<td><p>20</p></td>
+<td><p>8</p></td>
+<td><p>5771</p></td>
+<td><p>2969</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>32</p></td>
+<td><p>24</p></td>
+<td><p>24</p></td>
+<td><p>9</p></td>
+<td><p>9931</p></td>
+<td><p>5109</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>INF</p></td>
+<td><p>43</p></td>
+<td><p>1665</p></td>
+<td><p>19</p></td>
+<td><p>17861</p></td>
+<td><p>9189</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><em>TP stands for Tensor Parallelism</em></p>
+<p><em>TTFT stands for Time To First Token</em></p>
+<p><em>ITL stands for Inter Token Latency</em></p>
+<section id="id1">
+<h3>For GH200 systems only<a class="headerlink" href="#id1" title="Link to this heading">#</a></h3>
+<p>For release v0.17, on GH200 systems, the recommendation is to use <em>gptManagerBenchmark</em> to measure performance. Throughput measurements are reported based on the below commands.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="w"> </span>/app/tensorrt_llm/benchmarks/cpp/gptManagerBenchmark<span class="w">  </span>--engine_dir<span class="w"> </span><span class="nv">$engine_dir</span><span class="w"> </span>--type<span class="w"> </span>IFB<span class="w"> </span>--dataset<span class="w"> </span><span class="nv">$dataset_file_json</span><span class="w"> </span>--eos_id<span class="w"> </span>-1<span class="w"> </span>--scheduler_policy<span class="w"> </span>guaranteed_no_evict<span class="w"> </span>--kv_cache_free_gpu_mem_fraction<span class="w"> </span><span class="m">0</span>.95<span class="w"> </span>--output_csv<span class="w"> </span>result.csv<span class="w"> </span>--request_rate<span class="w"> </span>-1.0<span class="w"> </span>--enable_chunked_context<span class="w"> </span>--warm_up<span class="w"> </span><span class="m">0</span>
+</pre></div>
+</div>
+<p>The command will run the <code class="docutils literal notranslate"><span class="pre">gptManagerBenchmark</span></code> binary that will report the throughput and other metrics as part of its output
+that can be compared with the table in the <a class="reference internal" href="#throughput-measurements">Throughput Measurements</a> of this README.</p>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../advanced/disaggregated-service.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Disaggregated-Service (experimental)</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="perf-benchmarking.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">TensorRT-LLM Benchmarking</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#known-issues">Known Issues</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#known-allreduce-performance-issue-on-amd-based-cpu-platforms">Known AllReduce performance issue on AMD-based CPU platforms</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fused-matmul-gated-silu-llama">Fused Matmul + Gated-SiLU (LLaMA)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#use-gptmanagerbenchmark-for-gh200">Use <em>gptManagerBenchmark</em> for GH200</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#throughput-measurements">Throughput Measurements</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reproducing-benchmarked-results">Reproducing Benchmarked Results</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#commands">Commands</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#for-systems-other-than-gh200">For systems other than GH200</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#for-gh200-systems-only">For GH200 systems only</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#variables">Variables</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#preparing-a-dataset">Preparing a Dataset</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#engine-building">Engine Building</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#running-the-benchmark">Running the Benchmark</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#for-non-gh200-systems">For non GH200 systems</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#online-serving-measurements">Online Serving Measurements</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">For GH200 systems only</a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

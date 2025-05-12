@@ -1,0 +1,1066 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>C++ GPT Runtime &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'advanced/gpt-runtime';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Executor API" href="executor.html" />
+    <link rel="prev" title="Multi-Head, Multi-Query, and Group-Query Attention" href="gpt-attention.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">C++ GPT Runtime</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="c-gpt-runtime">
+<span id="gpt-runtime"></span><h1>C++ GPT Runtime<a class="headerlink" href="#c-gpt-runtime" title="Link to this heading">#</a></h1>
+<p>TensorRT-LLM includes a C++ component to execute TensorRT engines built with
+the Python API as described in the <a class="reference internal" href="../architecture/overview.html#architecture-overview"><span class="std std-ref">TensorRT-LLM Architecture</span></a> section.
+That component is called the C++ runtime.</p>
+<p>The API of the C++ runtime is composed of the classes declared in
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/include/tensorrt_llm/runtime"><code class="docutils literal notranslate"><span class="pre">cpp/include/tensorrt_llm/runtime</span></code></a> and
+implemented in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/runtime"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/runtime</span></code></a>.</p>
+<p>Even if the different components described in that document mention GPT in
+their name, they are not restricted to this specific model. Those classes can
+be used to implement auto-regressive models like BLOOM, GPT-J, GPT-NeoX or
+LLaMA, for example.</p>
+<p>Complete support of encoder-decoder models, like T5, will be added to
+TensorRT-LLM in a future release. An experimental version, only in Python for
+now, can be found in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec"><code class="docutils literal notranslate"><span class="pre">examples/enc_dec</span></code></a> folder.</p>
+<section id="overview">
+<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h2>
+<p>Runtime models are described by an instance of the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime//modelConfig.h"><code class="docutils literal notranslate"><span class="pre">ModelConfig</span></code></a>
+class and a pointer to the TensorRT engine that must be
+executed to perform the inference.
+The environment is configured through the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/worldConfig.h"><code class="docutils literal notranslate"><span class="pre">WorldConfig</span></code></a>
+(that name comes from
+<a class="reference external" href="https://en.wikipedia.org/wiki/Message_Passing_Interface">MPI</a> and its “famous”
+<code class="docutils literal notranslate"><span class="pre">MPI_COMM_WORLD</span></code> default communicator).
+The <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/samplingConfig.h"><code class="docutils literal notranslate"><span class="pre">SamplingConfig</span></code></a>
+class encapsulates parameters that control the
+<a class="reference external" href="https://huggingface.co/blog/how-to-generate">generation</a> of new tokens.</p>
+<section id="model-configuration">
+<h3>Model Configuration<a class="headerlink" href="#model-configuration" title="Link to this heading">#</a></h3>
+<p>The model configuration is an instance of the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime//modelConfig.h"><code class="docutils literal notranslate"><span class="pre">ModelConfig</span></code></a> class.
+That class encapsulates the following parameters (they are declared as private
+member variables and exposed through getters and setters):</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">vocabSize</span></code>, the size of the vocabulary,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">numLayers</span></code>, the number of layers in the model,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">numHeads</span></code>, the number of heads in the attention block,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">numKvHeads</span></code>, the number of heads for K and V in the attention component.
+When the number of K/V heads is the same as the number of (Q) heads, the
+model uses multi-head attention. When the number of K/V heads is 1, it uses
+multi-query attention. Otherwise, it uses group-query attention. Refer to <a class="reference internal" href="gpt-attention.html#gpt-attention"><span class="std std-ref">Multi-Head, Multi-Query, and Group-Query Attention</span></a> for more information,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">hiddenSize</span></code>, the size of the hidden dimension,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">dataType</span></code>, the datatype that was used to build the TensorRT engine and that
+must be used to run the model during inference,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">useGptAttentionPlugin</span></code>, indicates if the <a class="reference internal" href="gpt-attention.html#gpt-attention"><span class="std std-ref">Multi-Head, Multi-Query, and Group-Query Attention</span></a> operator was compiled using the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/plugins/gptAttentionPlugin">GPT Attention plugin</a>,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">inputPacked</span></code>, indicates that the input must be packed (or padded when set
+to <code class="docutils literal notranslate"><span class="pre">false</span></code>). For performance reasons, it is recommended to always use packed,
+even if its default is set to <code class="docutils literal notranslate"><span class="pre">false</span></code> (will be changed in a future release).
+Refer to <a class="reference internal" href="gpt-attention.html#gpt-attention"><span class="std std-ref">Multi-Head, Multi-Query, and Group-Query Attention</span></a> for more information,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">pagedKvCache</span></code>, indicates if the K/V cache uses paging.
+Refer to <a class="reference internal" href="gpt-attention.html#gpt-attention"><span class="std std-ref">Multi-Head, Multi-Query, and Group-Query Attention</span></a> for more information,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">tokensPerBlock</span></code>, is the number of tokens in each block of the K/V cache.
+It’s relevant when the paged K/V cache is enabled. By default, the value is
+64. Refer to <a class="reference internal" href="gpt-attention.html#gpt-attention"><span class="std std-ref">Multi-Head, Multi-Query, and Group-Query Attention</span></a> for more information,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">quantMode</span></code>, controls the quantization method. Refer to <a class="reference internal" href="../reference/precision.html#precision"><span class="std std-ref">Numerical Precision</span></a> for more information.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">maxBatchSize</span></code>, indicates the maximum batch size that the TensorRT engine
+was built for,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">maxInputLen</span></code>, the maximum size of the input sequences,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">maxSequenceLen</span></code>, the maximum total size (input+output) of the sequences.</p></li>
+</ul>
+</section>
+<section id="world-configuration">
+<h3>World Configuration<a class="headerlink" href="#world-configuration" title="Link to this heading">#</a></h3>
+<p>Familiarity with
+<a class="reference external" href="https://en.wikipedia.org/wiki/Message_Passing_Interface">MPI</a>, is not required
+to utilize the TensorRT-LMM C++ runtime. There are two main things
+you need to know:</p>
+<ul class="simple">
+<li><p>The C++ Runtime in TensorRT-LLM uses
+<a class="reference external" href="https://en.wikipedia.org/wiki/Process_(computing)">processes</a> to execute
+TensorRT engines on the different GPUs. Those GPUs can be located on a single
+node as well as on different nodes in a cluster. Each process is called a
+<em>rank</em> in MPI.</p></li>
+<li><p>The ranks are grouped in communication groups. The
+TensorRT-LLM C++ Runtime calls that group the <em>world</em>.</p></li>
+</ul>
+<p>The world configuration is an instance of the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/worldConfig.h"><code class="docutils literal notranslate"><span class="pre">WorldConfig</span></code></a>
+class, which encapsulates the following parameters:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">tensorParallelism</span></code>, the number of ranks that collaborate together to
+implement Tensor Parallelism (TP). With TP, each GPU performs computations for
+all the layers of the model. Some of those computations are distributed
+across the GPU. TP is more balanced than Pipeline Parallelism (PP), in most cases, but
+requires higher bandwidth between the GPUs. It is the recommended setting in
+the presence of NVLINK between GPUs,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">pipelineParallelism</span></code>, the number of ranks that collaborate together to
+implement Pipeline Parallelism (PP). With PP, each GPU works on a subset of
+consecutive layers. Communications between the GPUs happen only at the
+boundaries of the subsets of layers. It is harder to guarantee the full
+utilization of the GPUs with PP but it requires less memory bandwidth. It
+is the recommended setting in the absence of NVLINK between GPUs,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">rank</span></code>, the unique identifier of the rank,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">gpusPerNode</span></code>, indicates the number of GPUs on each node. Having that
+information allows the C++ runtime to optimize communications between GPUs in
+a node (like taking advantage of the
+<a class="reference external" href="https://www.nvidia.com/en-us/data-center/nvlink/">NVLINK</a>
+interconnect between GPUs of an A100
+<a class="reference external" href="https://www.nvidia.com/en-us/data-center/dgx-platform/">DGX</a>
+node).</p></li>
+</ul>
+</section>
+<section id="sampling-parameters">
+<h3>Sampling Parameters<a class="headerlink" href="#sampling-parameters" title="Link to this heading">#</a></h3>
+<p>The <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/samplingConfig.h"><code class="docutils literal notranslate"><span class="pre">SamplingConfig</span></code></a>
+class encapsulates parameters that control the
+<a class="reference external" href="https://huggingface.co/blog/how-to-generate">generation</a> of new tokens.
+A comparison of selecting decoding method is listed as the table below (<code class="docutils literal notranslate"><span class="pre">X</span></code> means it is not supported yet).
+Except for the <code class="docutils literal notranslate"><span class="pre">beamWidth</span></code> parameter, all the fields are optional and the
+runtime will use a default value if no values are provided by the user. For
+vector fields, the TensorRT-LLM runtime supports one value per sequence (that is,
+the vector contains <code class="docutils literal notranslate"><span class="pre">batchSize</span></code> values). If all the sequences use the same
+value for a given parameter, the vector can be limited to a single element
+(that is, <code class="docutils literal notranslate"><span class="pre">size()</span> <span class="pre">==</span> <span class="pre">1</span></code>).</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Method name in HF</p></th>
+<th class="head text-center"><p>Condition in HF</p></th>
+<th class="head text-center"><p>Method name in TRT-LLM</p></th>
+<th class="head text-center"><p>Condition in TRT-LLM</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>assisted decoding</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">assistant_model</span></code> or <code class="docutils literal notranslate"><span class="pre">prompt_lookup_num_tokens!=None</span></code></p></td>
+<td class="text-center"><p>X</p></td>
+<td class="text-center"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>beam-search decoding</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">num_beams&gt;1</span></code> and <code class="docutils literal notranslate"><span class="pre">do_sample=False</span></code></p></td>
+<td class="text-center"><p>beam search</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">beamWidth</span> <span class="pre">&gt;</span> <span class="pre">1</span></code></p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>beam-search multinomial sampling</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">num_beams&gt;1</span></code> and <code class="docutils literal notranslate"><span class="pre">do_sample=True</span></code></p></td>
+<td class="text-center"><p>X</p></td>
+<td class="text-center"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>constrained beam-search decoding</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">constraints!=None</span></code> or <code class="docutils literal notranslate"><span class="pre">force_words_ids!=None</span></code></p></td>
+<td class="text-center"><p>X</p></td>
+<td class="text-center"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>contrastive search</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">penalty_alpha&gt;0</span></code> and <code class="docutils literal notranslate"><span class="pre">top_k&gt;1</span></code></p></td>
+<td class="text-center"><p>X</p></td>
+<td class="text-center"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>diverse beam-search decoding</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">num_beams&gt;1</span></code> and <code class="docutils literal notranslate"><span class="pre">num_beam_groups&gt;1</span></code></p></td>
+<td class="text-center"><p>X</p></td>
+<td class="text-center"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>greedy decoding</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">num_beams=1</span></code> and <code class="docutils literal notranslate"><span class="pre">do_sample=False</span></code></p></td>
+<td class="text-center"><p>sampling</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">beamWidth</span> <span class="pre">==</span> <span class="pre">1</span></code> and <code class="docutils literal notranslate"><span class="pre">topK=0</span></code> and <code class="docutils literal notranslate"><span class="pre">topP=0.0f</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>multinomial sampling</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">num_beams=1</span></code> and <code class="docutils literal notranslate"><span class="pre">do_sample=True</span></code></p></td>
+<td class="text-center"><p>sampling</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">beamWidth</span> <span class="pre">==</span> <span class="pre">1</span></code> and (<code class="docutils literal notranslate"><span class="pre">topK&gt;0</span></code> or <code class="docutils literal notranslate"><span class="pre">topP&gt;0.0f</span></code>)</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><em><strong>General</strong></em></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Name in TRT-LLM</p></th>
+<th class="head text-center"><p>Description</p></th>
+<th class="head text-center"><p>Data type</p></th>
+<th class="head text-center"><p>Range of value</p></th>
+<th class="head text-center"><p>Default value</p></th>
+<th class="head text-center"><p>Name in HF</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">temperature</span></code></p></td>
+<td class="text-center"><p>modulation of logits in sampling workflow</p></td>
+<td class="text-center"><p>List[Float]</p></td>
+<td class="text-center"><p>[0.0f, $+\infty$)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">1.0f</span></code> (no modulation)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">temperature</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">minLength</span></code></p></td>
+<td class="text-center"><p>lower-bound on the number of tokens generated</p></td>
+<td class="text-center"><p>List[Int]</p></td>
+<td class="text-center"><p>[0, $+\infty$)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0</span></code> (no effect (the first generated token can be EOS)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">min_length</span></code></p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">repetitionPenalty</span></code></p></td>
+<td class="text-center"><p>penalize repetitive tokens <br> multiplicative, irrespective of appearances count</p></td>
+<td class="text-center"><p>List[Float]</p></td>
+<td class="text-center"><p>[0.0f, $+\infty$) <br> <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">1.0f</span></code> encourages repetition <br> <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">1.0f</span></code> discourages it</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">1.0f</span></code> (no effect)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">presencePenalty</span></code></p></td>
+<td class="text-center"><p>penalize existed tokens <br> additive, irrespective of appearances count</p></td>
+<td class="text-center"><p>List[Float]</p></td>
+<td class="text-center"><p>($-\infty$, $+\infty$) <br> <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">0.0f</span></code> encourages repetition <br> <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.0f</span></code> discourages it</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0.0f</span></code> (no effect)</p></td>
+<td class="text-center"><p>no</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">frequencyPenalty</span></code></p></td>
+<td class="text-center"><p>penalize existed tokens <br> additive, dependent on appearances count</p></td>
+<td class="text-center"><p>List[Float]</p></td>
+<td class="text-center"><p>($-\infty$, $+\infty$) <br> <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">0.0f</span></code> encourages repetition <br> <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.0f</span></code> discourages it</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0.0f</span></code> (no effect)</p></td>
+<td class="text-center"><p>no</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">noRepeatNgramSize</span></code></p></td>
+<td class="text-center"><p></p></td>
+<td class="text-center"><p>List[Int]</p></td>
+<td class="text-center"><p>[0, $+\infty$) <br> <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0</span></code> all ngrams of that size can only occur once</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0</span></code> (no effect)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">no_repeat_ngram_size</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<ul class="simple">
+<li><p>The tokens of input prompt are included during adopting <code class="docutils literal notranslate"><span class="pre">repetitionPenalty</span></code>, <code class="docutils literal notranslate"><span class="pre">presencePenalty</span></code>, and <code class="docutils literal notranslate"><span class="pre">frequencyPenalty</span></code> onto logits.</p></li>
+<li><p>The parameters <code class="docutils literal notranslate"><span class="pre">repetitionPenalty</span></code>, <code class="docutils literal notranslate"><span class="pre">presencePenalty</span></code>, and <code class="docutils literal notranslate"><span class="pre">frequencyPenalty</span></code> are not mutually exclusive.</p></li>
+</ul>
+<p><em><strong>Sampling</strong></em></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Name in TRT-LLM</p></th>
+<th class="head text-center"><p>Description</p></th>
+<th class="head text-center"><p>Data type</p></th>
+<th class="head text-center"><p>Range of value</p></th>
+<th class="head text-center"><p>Default value</p></th>
+<th class="head text-center"><p>Name in HF</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">randomSeed</span></code></p></td>
+<td class="text-center"><p>random seed for random number generator</p></td>
+<td class="text-center"><p>Int64</p></td>
+<td class="text-center"><p>[0, 2^64-1]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td class="text-center"><p>no</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">topK</span></code></p></td>
+<td class="text-center"><p>the number of logits to sample from</p></td>
+<td class="text-center"><p>List[Int]</p></td>
+<td class="text-center"><p>[0, 1024]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">top_k</span></code></p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">topP</span></code></p></td>
+<td class="text-center"><p>the top-P probability to sample from</p></td>
+<td class="text-center"><p>List[Float]</p></td>
+<td class="text-center"><p>[0.0f, 1.0f]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0.0f</span></code></p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">top_p</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">topPDecay</span></code></p></td>
+<td class="text-center"><p>the decay in the <code class="docutils literal notranslate"><span class="pre">topP</span></code> algorithm</p></td>
+<td class="text-center"><p>List[Float]</p></td>
+<td class="text-center"><p>(0.0f, 1.0f]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">1.0f</span></code></p></td>
+<td class="text-center"><p>no</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">topPMin</span></code></p></td>
+<td class="text-center"><p>the decay in the <code class="docutils literal notranslate"><span class="pre">topP</span></code> algorithm</p></td>
+<td class="text-center"><p>List[Float]</p></td>
+<td class="text-center"><p>(0.0f, 1.0f]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">1.0e-6,f</span></code></p></td>
+<td class="text-center"><p>no</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">topPResetIds</span></code></p></td>
+<td class="text-center"><p>the decay in the <code class="docutils literal notranslate"><span class="pre">topP</span></code> algorithm</p></td>
+<td class="text-center"><p>List[Int]</p></td>
+<td class="text-center"><p>[-1, $+\infty$)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">-1</span></code> (no effect)</p></td>
+<td class="text-center"><p>no</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">minP</span></code></p></td>
+<td class="text-center"><p>scale the most likely token to determine the minimum token probability.</p></td>
+<td class="text-center"><p>List[Float]</p></td>
+<td class="text-center"><p>[0.0f, 1.0f]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0.0</span></code> (no effect)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">min_p</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<ul class="simple">
+<li><p>If setting <code class="docutils literal notranslate"><span class="pre">topK</span> <span class="pre">=</span> <span class="pre">0</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span> <span class="pre">=</span> <span class="pre">0.0f</span></code>, greedy search is performed.</p></li>
+<li><p>If setting <code class="docutils literal notranslate"><span class="pre">topK</span> <span class="pre">&gt;</span> <span class="pre">0</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span> <span class="pre">=</span> <span class="pre">0.0f</span></code>, <code class="docutils literal notranslate"><span class="pre">topK</span></code> tokens of highest probabilities will become the candidates of sampling (named <code class="docutils literal notranslate"><span class="pre">TopK</span> <span class="pre">sampling</span></code> in TRT-LLM).</p></li>
+<li><p>If setting <code class="docutils literal notranslate"><span class="pre">topK</span> <span class="pre">=</span> <span class="pre">0</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span> <span class="pre">&gt;</span> <span class="pre">0.0f</span></code>, tokens will be sorted with probability descendly, then the tokens with highest probabilities which the accumulated probability larger than <code class="docutils literal notranslate"><span class="pre">topP</span></code> will become the candidates of sampling (named <code class="docutils literal notranslate"><span class="pre">TopP</span> <span class="pre">sampling</span></code> in TRT-LLM).</p></li>
+<li><p>If setting <code class="docutils literal notranslate"><span class="pre">topK</span> <span class="pre">&gt;</span> <span class="pre">0</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span> <span class="pre">&gt;</span> <span class="pre">0.0f</span></code>, <code class="docutils literal notranslate"><span class="pre">topK</span></code> tokens of highest probabilities will be selected, then those selected tokens will be sorted with probability descendly and their probability will be normalized, then the tokens with highest normalized probabilities which the accumulated probability larger than <code class="docutils literal notranslate"><span class="pre">topP</span></code> will become the candidates of sampling (named <code class="docutils literal notranslate"><span class="pre">TopKTopP</span> <span class="pre">sampling</span></code> in TRT-LLM)</p></li>
+<li><p>If different <code class="docutils literal notranslate"><span class="pre">topK</span></code> values are provided for the different sequences in the batch, the performance of the implementation will depend on the largest value. For efficiency reasons, we recommend to batch requests with similar <code class="docutils literal notranslate"><span class="pre">topK</span></code> values together.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">topPDecay</span></code>, <code class="docutils literal notranslate"><span class="pre">topPMin</span></code> and <code class="docutils literal notranslate"><span class="pre">topPResetIds</span></code> are explained in
+<a class="reference external" href="https://arxiv.org/abs/2206.04624"><em>Factuality Enhanced Language Models for Open-Ended Text Generation</em></a>.
+<code class="docutils literal notranslate"><span class="pre">topPDecay</span></code> is the decay, <code class="docutils literal notranslate"><span class="pre">topPMin</span></code> is the lower-bound and <code class="docutils literal notranslate"><span class="pre">topPResetIds</span></code> indicates where to reset the decay.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">minP</span></code> is explained in <a class="reference external" href="https://arxiv.org/abs/2407.01082"><em>Turning Up the Heat: Min-p Sampling for Creative and Coherent LLM Outputs</em></a>.</p></li>
+</ul>
+<p><em><strong>Beam-search</strong></em></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Name in TRT-LLM</p></th>
+<th class="head text-center"><p>Description</p></th>
+<th class="head text-center"><p>Data type</p></th>
+<th class="head text-center"><p>Range of value</p></th>
+<th class="head text-center"><p>Default value</p></th>
+<th class="head text-center"><p>Name in HF</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">beamWidth</span></code></p></td>
+<td class="text-center"><p>width for beam-search algorithm</p></td>
+<td class="text-center"><p>Int</p></td>
+<td class="text-center"><p>[0, 1024]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0</span></code> (disable beam search)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">beam_width</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">beamSearchDiversityRate</span></code></p></td>
+<td class="text-center"><p>diversity of generated tokens</p></td>
+<td class="text-center"><p>List[Float]</p></td>
+<td class="text-center"><p>[0, $+\infty$)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0.0f</span></code></p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">diversity_penalty</span></code></p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">lengthPenalty</span></code></p></td>
+<td class="text-center"><p>penalize longer sequences</p></td>
+<td class="text-center"><p>List[Float]</p></td>
+<td class="text-center"><p>[0, $+\infty$)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0.0f</span></code></p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">length_penalty</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">earlyStopping</span></code></p></td>
+<td class="text-center"><p>see description below</p></td>
+<td class="text-center"><p>List[Int]</p></td>
+<td class="text-center"><p>($-\infty$, $+\infty$)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">early_stopping</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<ul class="simple">
+<li><p>Beam-search algorithm: <a class="reference external" href="https://en.wikipedia.org/wiki/Beam_search">beam search</a>.</p></li>
+<li><p>Parameter <code class="docutils literal notranslate"><span class="pre">diversity_penalty</span></code> in HF is only used for <code class="docutils literal notranslate"><span class="pre">diverse</span> <span class="pre">beam-search</span> <span class="pre">decoding</span></code> (or named <code class="docutils literal notranslate"><span class="pre">Group-Beam-Search</span></code>), which is not supported by TRT-LLM yet.</p></li>
+<li><p>If setting <code class="docutils literal notranslate"><span class="pre">earlyStopping</span> <span class="pre">=</span> <span class="pre">1</span></code>, decoding will stop once <code class="docutils literal notranslate"><span class="pre">beamWidth</span></code> finished sentences are generated.</p></li>
+<li><p>If setting <code class="docutils literal notranslate"><span class="pre">earlyStopping</span> <span class="pre">=</span> <span class="pre">0</span></code>, decoding will keep going until no better sentences (with better score) can be generated.</p></li>
+<li><p>If setting <code class="docutils literal notranslate"><span class="pre">earlyStopping</span></code> to other values, decoding will stop only depending on <code class="docutils literal notranslate"><span class="pre">lengthlengthPenalty</span></code>.</p></li>
+<li><p>The <code class="docutils literal notranslate"><span class="pre">beamWidth</span></code> parameter is a scalar value. It means that in this release of
+TensorRT-LLM, it is not possible to specify a different width for each input
+sequence. This limitation is likely to be removed in a future release.</p></li>
+</ul>
+</section>
+</section>
+<section id="the-session">
+<h2>The Session<a class="headerlink" href="#the-session" title="Link to this heading">#</a></h2>
+<p><em>The runtime session is deprecated in favor of the <a class="reference internal" href="executor.html#executor"><span class="std std-ref">Executor API</span></a>.
+It will be removed in a future release of TensorRT-LLM.</em></p>
+<p>An example of how to use the <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> to run a GPT-like auto-regressive model can be found in
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tests/runtime/gptSessionTest.cpp"><code class="docutils literal notranslate"><span class="pre">cpp/tests/runtime/gptSessionTest.cpp</span></code></a>.</p>
+<section id="internal-components">
+<h3>Internal Components<a class="headerlink" href="#internal-components" title="Link to this heading">#</a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> class encapsulates two main components. The
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/runtime/tllmRuntime.h"><code class="docutils literal notranslate"><span class="pre">TllmRuntime</span></code></a> is in charge of the
+execution of the TensorRT engine. The
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/gptDecoder.h"><code class="docutils literal notranslate"><span class="pre">GptDecoder</span></code></a>
+does the generation of the tokens from the logits.  The <code class="docutils literal notranslate"><span class="pre">TllmRuntime</span></code> class is
+an internal component and you are not expected to use that class directly.
+The <code class="docutils literal notranslate"><span class="pre">GptDecoder</span></code> can be used directly to implement custom generation loop
+and for use cases that cannot be satisfied by the implementation in
+<code class="docutils literal notranslate"><span class="pre">GptSession</span></code>.</p>
+</section>
+</section>
+<section id="in-flight-batching-support">
+<h2>In-flight Batching Support<a class="headerlink" href="#in-flight-batching-support" title="Link to this heading">#</a></h2>
+<p>In-flight batching is supported using separate decoders per
+request. The biggest difference compared to using a single decoder is in how
+the token generation from logits is managed. A batch is split into <code class="docutils literal notranslate"><span class="pre">batchSize</span></code>
+individual requests and kernels are issued using separated CUDA streams.
+This behavior may be revisited in a future release to maintain the structure
+of the batch and improve efficiency.</p>
+</section>
+<section id="know-issues-and-future-changes">
+<h2>Know Issues and Future Changes<a class="headerlink" href="#know-issues-and-future-changes" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>In the current release of TensorRT-LLM, the C++ and Python runtimes are two
+separate software components and the C++ runtime is being more actively
+developed (with features like in-flight batching). An objective, for a
+future release, could be to rebuild the Python runtime on top of the C++
+one.</p></li>
+</ul>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="gpt-attention.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Multi-Head, Multi-Query, and Group-Query Attention</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="executor.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Executor API</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#model-configuration">Model Configuration</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#world-configuration">World Configuration</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#sampling-parameters">Sampling Parameters</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#the-session">The Session</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#internal-components">Internal Components</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#in-flight-batching-support">In-flight Batching Support</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#know-issues-and-future-changes">Know Issues and Future Changes</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

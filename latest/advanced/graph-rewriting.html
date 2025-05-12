@@ -1,0 +1,860 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Graph Rewriting Module &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'advanced/graph-rewriting';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Run gpt-2b + LoRA using Executor / cpp runtime" href="lora.html" />
+    <link rel="prev" title="Executor API" href="executor.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="executor.html">Executor API</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Graph Rewriting Module</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="graph-rewriting-module">
+<span id="graph-rewriting"></span><h1>Graph Rewriting Module<a class="headerlink" href="#graph-rewriting-module" title="Link to this heading">#</a></h1>
+<p>TensorRT-LLM uses a declarative approach to define neural networks and contains
+techniques to optimize the underlying graph.  It provides a wrapper similar to PyTorch’s Module. When a user invokes the <code class="docutils literal notranslate"><span class="pre">forward</span></code> method, the layers are lowered to TensorRT’s <code class="docutils literal notranslate"><span class="pre">ILayer</span></code>s and become part of an <code class="docutils literal notranslate"><span class="pre">INetworkDefinition</span></code>. The Graph Rewriting (GW) module can be used to manipulate the network at the <code class="docutils literal notranslate"><span class="pre">ILayer</span></code>/<code class="docutils literal notranslate"><span class="pre">INetworkDefinition</span></code> level.</p>
+<section id="when-to-use-graph-rewriting">
+<h2>When to Use Graph Rewriting?<a class="headerlink" href="#when-to-use-graph-rewriting" title="Link to this heading">#</a></h2>
+<p>For network manipulation, there are two options in TensorRT-LLM:</p>
+<ol class="arabic simple">
+<li><p><strong>Module Rewriting:</strong> This method modifies the members of <code class="docutils literal notranslate"><span class="pre">Module</span></code> instances before triggering the <code class="docutils literal notranslate"><span class="pre">forward</span></code> method (that is, creating the TensorRT graph). It works on the highest level of the network representation and facilitates the modification of sequences of operations (like modifying the GEMM + activation for SmoothQuant),</p></li>
+<li><p><strong>Graph Rewriting:</strong> Graph Rewriting manipulates TensorRT’s <code class="docutils literal notranslate"><span class="pre">INetworkDefinition</span></code> after the <code class="docutils literal notranslate"><span class="pre">forward</span></code> method is triggered. It operates at a finer-grained <code class="docutils literal notranslate"><span class="pre">ILayer</span></code> level and can alter the structure across multiple Module instances. It is typically used for layer fusion.</p></li>
+</ol>
+<p>Graph Rewriting (GW) is ideally used in the following conditions:</p>
+<ol class="arabic simple">
+<li><p>When only <code class="docutils literal notranslate"><span class="pre">ILayer</span></code>/<code class="docutils literal notranslate"><span class="pre">INetworkDefinition</span></code> is available,</p></li>
+<li><p>When Module Rewriting would lead to nested control flow or scattered functionality.</p></li>
+</ol>
+</section>
+<section id="graph-rewriting-apis">
+<h2>Graph Rewriting APIs<a class="headerlink" href="#graph-rewriting-apis" title="Link to this heading">#</a></h2>
+<p>Several core APIs are provided for Graph Rewriting:</p>
+<section id="tensor-related-methods">
+<h3>Tensor-Related Methods<a class="headerlink" href="#tensor-related-methods" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">Tensor.get_parent</span></code>: Get the <code class="docutils literal notranslate"><span class="pre">ILayer</span></code> that produces this tensor,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Tensor.get_users</span></code>: Get the consumer <code class="docutils literal notranslate"><span class="pre">ILayer</span></code>s of this tensor,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">replace_all_uses_with</span></code>: Replace this tensor with another tensor in all consumer <code class="docutils literal notranslate"><span class="pre">ILayer</span></code>s.</p></li>
+</ul>
+</section>
+<section id="flayerinfo-for-retrieving-high-level-information-for-a-functional">
+<h3>FLayerInfo for Retrieving High-Level Information for a Functional<a class="headerlink" href="#flayerinfo-for-retrieving-high-level-information-for-a-functional" title="Link to this heading">#</a></h3>
+<p>For all the layers located in <code class="docutils literal notranslate"><span class="pre">functional.py</span></code>, the original input information is missing once lowered to <code class="docutils literal notranslate"><span class="pre">INetworkDefinition</span></code>, especially for TensorRT plugins, which are opaque in the Python world. <code class="docutils literal notranslate"><span class="pre">FLayerInfo</span></code> holds their original information as a high-level signature containing inputs like <code class="docutils literal notranslate"><span class="pre">Tensor</span></code>, Python attributes, and more. There is a Network-wise singleton called <code class="docutils literal notranslate"><span class="pre">FLayerInfoMemo</span></code> to map each <code class="docutils literal notranslate"><span class="pre">ILayer</span></code> to its corresponding <code class="docutils literal notranslate"><span class="pre">FLayerInfo</span></code>.</p>
+<p>For <code class="docutils literal notranslate"><span class="pre">FLayerInfo</span></code>:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">FLayerInfo.replace_input_with</span></code>: Replace some input tensor with another tensor,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">FLayerInfo.replace_output_uses_with</span></code>: Redirect the usage of the original output tensors to a set of new tensors.</p></li>
+</ul>
+<p>For <code class="docutils literal notranslate"><span class="pre">FLayerInfoMemo</span></code>:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">FLayerInfoMemo.instance()</span></code>: Get the singleton instance,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">FLayerInfoMemo.get</span></code>: Get the corresponding <code class="docutils literal notranslate"><span class="pre">FLayerInfo</span></code> for an <code class="docutils literal notranslate"><span class="pre">ILayer</span></code>.</p></li>
+</ul>
+<p><code class="docutils literal notranslate"><span class="pre">FLayerInfo</span></code> remains consistent with the actual <code class="docutils literal notranslate"><span class="pre">ILayer</span></code> during GW, making it safe to use.</p>
+</section>
+<section id="pattern-and-pattern-manager">
+<h3>Pattern and Pattern Manager<a class="headerlink" href="#pattern-and-pattern-manager" title="Link to this heading">#</a></h3>
+<p>There are two kinds of patterns:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">PatternRewriter</span></code>: Used for defining a rewriting pattern, which actually alters the network.</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">match</span></code>: Match the pattern; returns true if a layer is matched,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">rewrite</span></code>: Manipulate a layer,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">match_and_rewrite</span></code>: Combines both <code class="docutils literal notranslate"><span class="pre">match</span></code> and <code class="docutils literal notranslate"><span class="pre">rewrite</span></code>, used for complex states that need to pass from <code class="docutils literal notranslate"><span class="pre">match</span></code> to <code class="docutils literal notranslate"><span class="pre">rewrite</span></code>.</p></li>
+</ul>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">PatternAnalyzer</span></code>: Used for defining an analysis pattern, which collects information from the network.</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">match</span></code>: Match the pattern,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">analyze</span></code>: Perform analysis on a list of layers.</p></li>
+</ul>
+</li>
+</ul>
+<p>There are two managers for managing multiple <code class="docutils literal notranslate"><span class="pre">PatternRewriter</span></code> or <code class="docutils literal notranslate"><span class="pre">PatternAnalyzer</span></code>:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">RewritePatternManager</span></code>:</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">add</span></code>: Add a pattern with its label and benefit; the benefit specifies its privilege,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">get</span></code>: Get a pattern by label,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">rewrite</span></code>: Apply the rewriting patterns contained to a network.</p></li>
+</ul>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">AnalysisPatternManager</span></code>:</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">add</span></code>: Add a pattern with its label and benefit; the benefit specifies its privilege,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">get</span></code>: Get a pattern by label,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">analyze</span></code>: Apply the analysis patterns contained to a network.</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="record-signature-to-decorate-functionals-requiring-flayerinfo">
+<h3>&#64;record_signature to Decorate Functionals Requiring FLayerInfo<a class="headerlink" href="#record-signature-to-decorate-functionals-requiring-flayerinfo" title="Link to this heading">#</a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">&#64;record_signature</span></code> decorator is used to record the <code class="docutils literal notranslate"><span class="pre">FLayerInfo</span></code> for a functional. While FLayerInfo is vital for GW when analyzing or rewriting certain functionals, it is used in an “add as needed” manner. If you are adding GW patterns, ensure that the functional requires the <code class="docutils literal notranslate"><span class="pre">&#64;record_signature</span></code> decorator.</p>
+</section>
+</section>
+<section id="classical-workflow">
+<h2>Classical Workflow<a class="headerlink" href="#classical-workflow" title="Link to this heading">#</a></h2>
+<p>There are specific routines for defining a GW pattern. Let’s start with a simple example: replacing a sum layer with a subtract layer, which can also be found in the <code class="docutils literal notranslate"><span class="pre">test_graph_rewriting.py</span></code> file.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">NaivePatternRewriter_ReplaceAddWithSub</span><span class="p">(</span><span class="n">PatternRewriter</span><span class="p">):</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="s1">&#39;replace_add_with_sub&#39;</span><span class="p">,</span>
+                         <span class="n">root_layer</span><span class="o">=</span><span class="p">{</span><span class="n">trt</span><span class="o">.</span><span class="n">LayerType</span><span class="o">.</span><span class="n">ELEMENTWISE</span><span class="p">},</span>
+                         <span class="n">separate_match_rewrite</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">match</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer</span><span class="p">:</span> <span class="n">Layer</span><span class="p">):</span>
+        <span class="c1"># The rewriter will stop at the first matched layer, and then the Rewriter will enter the rewrite() to do the rewriting.</span>
+        <span class="k">return</span> <span class="n">layer</span><span class="o">.</span><span class="n">as_layer</span><span class="p">()</span><span class="o">.</span><span class="n">op</span> <span class="o">==</span> <span class="n">trt</span><span class="o">.</span><span class="n">ElementWiseOperation</span><span class="o">.</span><span class="n">SUM</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">rewrite</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer</span><span class="p">:</span> <span class="n">Layer</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># The layer here should be an Elementwise_SUM layer.</span>
+        <span class="k">with</span> <span class="n">net_guard</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">network</span><span class="p">):</span>
+            <span class="c1"># There are several stages to replace some subgraph with another subgraph:</span>
+
+            <span class="c1"># Stage 1: Get the input tensors and output tensors of the subgraph to replace.</span>
+            <span class="c1"># - For Elementwise_SUM, there are two inputs and one output.</span>
+            <span class="n">a</span><span class="p">,</span> <span class="n">b</span> <span class="o">=</span> <span class="n">layer</span><span class="o">.</span><span class="n">get_inputs</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="n">o</span> <span class="o">=</span> <span class="n">layer</span><span class="o">.</span><span class="n">get_outputs</span><span class="p">(</span><span class="mi">0</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+
+            <span class="c1"># Stage 2: Create a new subgraph that takes the old one&#39;s inputs.</span>
+            <span class="c1"># - Here we insert an Elementwise_SUB layer, and &#39;c&#39; is the output.</span>
+            <span class="n">c</span> <span class="o">=</span> <span class="n">a</span> <span class="o">-</span> <span class="n">b</span>
+
+            <span class="c1"># Stage 3: Redirect all the layers depending on the outputs of the old subgraph to the new subgraph&#39;s.</span>
+            <span class="c1"># - After this, the SUM becomes dangling and will be pruned by TensorRT when building the engine.</span>
+            <span class="c1"># - Note that there is no API in TensorRT python to remove a layer explicitly; `replace_all_uses_with` is the only way to &quot;remove&quot; a layer.</span>
+            <span class="n">o</span><span class="o">.</span><span class="n">replace_all_uses_with</span><span class="p">(</span><span class="n">c</span><span class="p">)</span>
+
+            <span class="c1"># Stage 4: Mark all the layers in the old subgraph as removed.</span>
+            <span class="c1"># - This helps the PatternRewriter to skip the removed layers.</span>
+            <span class="n">layer</span><span class="o">.</span><span class="n">mark_as_removed</span><span class="p">()</span>
+</pre></div>
+</div>
+<p>In this example, we deal with <code class="docutils literal notranslate"><span class="pre">ILayer</span></code> rather than Plugins, so <code class="docutils literal notranslate"><span class="pre">FLayerInfo</span></code> is unnecessary. As illustrated in the <code class="docutils literal notranslate"><span class="pre">rewrite</span></code> method, there are four stages that are shared across nearly all rewrite patterns.</p>
+<p>Note that in GW, we <strong>NEVER</strong> rewrite a layer directly. Instead, we do it in two steps: first, create another layer with the same input and deprive all the users of the original outputs, redirecting them to the outputs of the new layers. In this way, the old layer will be dangling and pruned automatically by TensorRT during the engine building phase. This is a limitation of TensorRT since remove-layer-like APIs are not available in Python.</p>
+<p>In Stage 2, we rely on operators and layers commonly used during the network building phase. Ideally, you can replace them with any network structure during GW.</p>
+<p>For the usage of <code class="docutils literal notranslate"><span class="pre">FLayerInfo</span></code>, let’s rewrite the <code class="docutils literal notranslate"><span class="pre">gpt_attention</span></code> to enable the <code class="docutils literal notranslate"><span class="pre">remove-padding</span></code> feature. <code class="docutils literal notranslate"><span class="pre">gpt_attention</span></code> is actually</p>
+<p>a TensorRT plugin, so we need <code class="docutils literal notranslate"><span class="pre">FLayerInfo</span></code> to hold the original Tensor-wise inputs to help create new <code class="docutils literal notranslate"><span class="pre">gpt_attention</span></code> layers.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">GPTAttentionPluginRemovePaddingRewritePass</span><span class="p">(</span><span class="n">PatternRewriter</span><span class="p">):</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="s1">&#39;gpt_attention_plugin_remove_padding&#39;</span><span class="p">,</span>
+                         <span class="n">root_layer</span><span class="o">=</span><span class="p">{</span><span class="n">trt</span><span class="o">.</span><span class="n">LayerType</span><span class="o">.</span><span class="n">PLUGIN_V2</span><span class="p">})</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">match_and_rewrite</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer</span><span class="p">:</span> <span class="n">Layer</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">layer</span><span class="o">.</span><span class="n">as_layer</span><span class="p">()</span><span class="o">.</span><span class="n">type</span> <span class="o">!=</span> <span class="n">trt</span><span class="o">.</span><span class="n">LayerType</span><span class="o">.</span><span class="n">PLUGIN_V2</span> <span class="ow">or</span> \
+                <span class="n">layer</span><span class="o">.</span><span class="n">as_layer</span><span class="p">()</span><span class="o">.</span><span class="n">plugin</span><span class="o">.</span><span class="n">plugin_namespace</span> <span class="o">!=</span> <span class="s1">&#39;tensorrt_llm&#39;</span> <span class="ow">or</span> \
+                <span class="n">layer</span><span class="o">.</span><span class="n">as_layer</span><span class="p">()</span><span class="o">.</span><span class="n">plugin</span><span class="o">.</span><span class="n">plugin_type</span> <span class="o">!=</span> <span class="s1">&#39;GPTAttention&#39;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">False</span>
+
+        <span class="c1"># Retrieve the FLayerInfo</span>
+        <span class="n">flayer</span> <span class="o">=</span> <span class="n">FLayerInfoMemo</span><span class="o">.</span><span class="n">instance</span><span class="p">()</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
+        <span class="k">assert</span> <span class="n">flayer</span>
+        <span class="c1"># Although the layer is a plugin, which is a black box, we get some high-level input information from the FLayerInfo.</span>
+        <span class="n">tensor_input</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="n">flayer</span><span class="o">.</span><span class="n">get_input</span><span class="p">(</span><span class="s1">&#39;qkv&#39;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">tensor_input</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>  <span class="c1"># Already in remove-padding mode</span>
+            <span class="k">return</span> <span class="kc">False</span>
+
+        <span class="c1"># Some information could be passed in from external</span>
+        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;args should be passed in from RewritePatternManager.rewrite()&quot;</span>
+        <span class="n">batch_size</span><span class="p">,</span> <span class="n">in_len</span><span class="p">,</span> <span class="n">hidden_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">[</span><span class="s1">&#39;batch_size&#39;</span><span class="p">],</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">[</span><span class="s1">&#39;in_len&#39;</span><span class="p">],</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">[</span><span class="s1">&#39;hidden_size&#39;</span><span class="p">]</span>
+
+        <span class="k">with</span> <span class="n">net_guard</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">network</span><span class="p">):</span>
+            <span class="n">new_inputs</span> <span class="o">=</span> <span class="n">flayer</span><span class="o">.</span><span class="n">clone_inputs</span><span class="p">()</span>
+
+            <span class="c1"># Step 1: Create new inputs and replace the original arglist.</span>
+            <span class="nb">input</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                <span class="n">name</span><span class="o">=</span><span class="s1">&#39;qkv&#39;</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">float16</span><span class="p">,</span>
+                <span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">batch_size</span> <span class="o">*</span> <span class="n">in_len</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">),</span>
+            <span class="p">)</span>
+            <span class="n">new_inputs</span><span class="p">[</span><span class="s1">&#39;qkv&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">input</span>
+
+            <span class="c1"># Step 2: Create a new plugin instance.</span>
+            <span class="n">new_outs</span> <span class="o">=</span> <span class="n">gpt_attention</span><span class="p">(</span><span class="o">**</span><span class="n">new_inputs</span><span class="p">)</span>
+
+            <span class="c1"># Step 3: Deprive all the users of the old plugin instance.</span>
+            <span class="n">flayer</span><span class="o">.</span><span class="n">replace_outputs_uses_with</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">network</span><span class="p">,</span> <span class="n">new_outs</span><span class="p">)</span>
+
+            <span class="c1"># Step 4: Remove the old plugin instance.</span>
+            <span class="n">layer</span><span class="o">.</span><span class="n">mark_as_removed</span><span class="p">()</span>
+
+        <span class="k">return</span> <span class="kc">True</span>
+</pre></div>
+</div>
+<p>This is quite similar to the first example, with the focus on the <code class="docutils literal notranslate"><span class="pre">FLayerInfo</span></code> part. Through the code below, we can get the original inputs of this layer, enabling us to alter the inputs related to remove-padding and create a new layer to replace it.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">flayer</span> <span class="o">=</span> <span class="n">FLayerInfoMemo</span><span class="o">.</span><span class="n">instance</span><span class="p">()</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
+<span class="k">assert</span> <span class="n">flayer</span>
+</pre></div>
+</div>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">new_inputs</span> <span class="o">=</span> <span class="n">flayer</span><span class="o">.</span><span class="n">clone_inputs</span><span class="p">()</span>
+
+<span class="c1"># Step 1: Create new inputs and replace the original arglist.</span>
+<span class="nb">input</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+    <span class="n">name</span><span class="o">=</span><span class="s1">&#39;tensor&#39;</span><span class="p">,</span>
+    <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">float16</span><span class="p">,</span>
+    <span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">batch_size</span> <span class="o">*</span> <span class="n">in_len</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">),</span>
+<span class="p">)</span>
+<span class="n">new_inputs</span><span class="p">[</span><span class="s1">&#39;tensor&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">input</span>
+
+<span class="c1"># Step 2: Create a new plugin instance.</span>
+<span class="n">new_outs</span> <span class="o">=</span> <span class="n">gpt_attention</span><span class="p">(</span><span class="o">**</span><span class="n">new_inputs</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>For real examples, please refer to the <code class="docutils literal notranslate"><span class="pre">FuseAttentionWithBiasPass</span></code> in the <code class="docutils literal notranslate"><span class="pre">graph_rewriting.py</span></code>.</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="executor.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Executor API</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="lora.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Run gpt-2b + LoRA using Executor / cpp runtime</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#when-to-use-graph-rewriting">When to Use Graph Rewriting?</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#graph-rewriting-apis">Graph Rewriting APIs</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-related-methods">Tensor-Related Methods</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#flayerinfo-for-retrieving-high-level-information-for-a-functional">FLayerInfo for Retrieving High-Level Information for a Functional</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#pattern-and-pattern-manager">Pattern and Pattern Manager</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#record-signature-to-decorate-functionals-requiring-flayerinfo">@record_signature to Decorate Functionals Requiring FLayerInfo</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#classical-workflow">Classical Workflow</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

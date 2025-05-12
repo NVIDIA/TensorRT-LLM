@@ -1,0 +1,1167 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>tensorrt_llm.runtime.enc_dec_model_runner &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/runtime/enc_dec_model_runner';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../../../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../search.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    
+    <li class="breadcrumb-item"><a href="../../index.html" class="nav-link">Module code</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">tensorrt_llm.runtime.enc_dec_model_runner</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <h1>Source code for tensorrt_llm.runtime.enc_dec_model_runner</h1><div class="highlight"><pre>
+<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
+
+<span class="c1"># isort: off</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">trt</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">torch_to_numpy</span><span class="p">,</span> <span class="n">trt_dtype_to_torch</span><span class="p">,</span> <span class="n">mpi_world_size</span><span class="p">,</span> <span class="n">mpi_rank</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..plugin.plugin</span><span class="w"> </span><span class="kn">import</span> <span class="n">CustomAllReduceHelper</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.generation</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelConfig</span><span class="p">,</span> <span class="n">SamplingConfig</span><span class="p">,</span> <span class="n">LoraManager</span><span class="p">,</span> <span class="n">GenerationSession</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..mapping</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.session</span><span class="w"> </span><span class="kn">import</span> <span class="n">Session</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..models.modeling_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">get_kv_cache_type_from_legacy</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">get_engine_name</span><span class="p">(</span><span class="n">rank</span><span class="p">):</span>
+    <span class="k">return</span> <span class="s1">&#39;rank</span><span class="si">{}</span><span class="s1">.engine&#39;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">rank</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">read_config</span><span class="p">(</span><span class="n">config_path</span><span class="p">:</span> <span class="n">Path</span><span class="p">):</span>
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">config_path</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+        <span class="n">config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+
+    <span class="n">builder_config</span> <span class="o">=</span> <span class="n">config</span><span class="p">[</span><span class="s1">&#39;build_config&#39;</span><span class="p">]</span>
+    <span class="n">plugin_config</span> <span class="o">=</span> <span class="n">builder_config</span><span class="p">[</span><span class="s1">&#39;plugin_config&#39;</span><span class="p">]</span>
+    <span class="n">pretrained_config</span> <span class="o">=</span> <span class="n">config</span><span class="p">[</span><span class="s1">&#39;pretrained_config&#39;</span><span class="p">]</span>
+    <span class="n">lora_config</span> <span class="o">=</span> <span class="n">builder_config</span><span class="p">[</span><span class="s1">&#39;lora_config&#39;</span><span class="p">]</span>
+    <span class="n">auto_parallel_config</span> <span class="o">=</span> <span class="n">builder_config</span><span class="p">[</span><span class="s1">&#39;auto_parallel_config&#39;</span><span class="p">]</span>
+    <span class="n">use_gpt_attention_plugin</span> <span class="o">=</span> <span class="n">plugin_config</span><span class="p">[</span><span class="s2">&quot;gpt_attention_plugin&quot;</span><span class="p">]</span>
+    <span class="n">remove_input_padding</span> <span class="o">=</span> <span class="n">plugin_config</span><span class="p">[</span><span class="s2">&quot;remove_input_padding&quot;</span><span class="p">]</span>
+    <span class="n">use_lora_plugin</span> <span class="o">=</span> <span class="n">plugin_config</span><span class="p">[</span><span class="s2">&quot;lora_plugin&quot;</span><span class="p">]</span>
+    <span class="n">tp_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="p">[</span><span class="s1">&#39;mapping&#39;</span><span class="p">][</span><span class="s1">&#39;tp_size&#39;</span><span class="p">]</span>
+    <span class="n">pp_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="p">[</span><span class="s1">&#39;mapping&#39;</span><span class="p">][</span><span class="s1">&#39;pp_size&#39;</span><span class="p">]</span>
+    <span class="n">gpus_per_node</span> <span class="o">=</span> <span class="n">auto_parallel_config</span><span class="p">[</span><span class="s1">&#39;gpus_per_node&#39;</span><span class="p">]</span>
+    <span class="n">world_size</span> <span class="o">=</span> <span class="n">tp_size</span> <span class="o">*</span> <span class="n">pp_size</span>
+    <span class="k">assert</span> <span class="n">world_size</span> <span class="o">==</span> <span class="n">mpi_world_size</span><span class="p">(),</span> \
+        <span class="sa">f</span><span class="s1">&#39;Engine world size (</span><span class="si">{</span><span class="n">world_size</span><span class="si">}</span><span class="s1">) != Runtime world size (</span><span class="si">{</span><span class="n">mpi_world_size</span><span class="p">()</span><span class="si">}</span><span class="s1">)&#39;</span>
+    <span class="n">num_heads</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="p">[</span><span class="s2">&quot;num_attention_heads&quot;</span><span class="p">]</span>
+    <span class="n">hidden_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="p">[</span><span class="s2">&quot;hidden_size&quot;</span><span class="p">]</span>
+    <span class="n">head_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="p">[</span><span class="s2">&quot;head_size&quot;</span><span class="p">]</span>
+    <span class="n">vocab_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="p">[</span><span class="s2">&quot;vocab_size&quot;</span><span class="p">]</span>
+    <span class="n">max_batch_size</span> <span class="o">=</span> <span class="n">builder_config</span><span class="p">[</span><span class="s2">&quot;max_batch_size&quot;</span><span class="p">]</span>
+    <span class="n">max_beam_width</span> <span class="o">=</span> <span class="n">builder_config</span><span class="p">[</span><span class="s2">&quot;max_beam_width&quot;</span><span class="p">]</span>
+    <span class="n">num_layers</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="p">[</span><span class="s2">&quot;num_hidden_layers&quot;</span><span class="p">]</span>
+    <span class="n">num_kv_heads</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;num_kv_heads&#39;</span><span class="p">,</span> <span class="n">num_heads</span><span class="p">)</span>
+
+    <span class="k">assert</span> <span class="p">(</span><span class="n">num_heads</span> <span class="o">%</span> <span class="n">tp_size</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span>
+    <span class="n">num_heads</span> <span class="o">=</span> <span class="n">num_heads</span> <span class="o">//</span> <span class="n">tp_size</span>
+    <span class="n">hidden_size</span> <span class="o">=</span> <span class="n">hidden_size</span> <span class="o">//</span> <span class="n">tp_size</span>
+    <span class="n">num_kv_heads</span> <span class="o">=</span> <span class="p">(</span><span class="n">num_kv_heads</span> <span class="o">+</span> <span class="n">tp_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="n">tp_size</span>
+
+    <span class="n">cross_attention</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="p">[</span><span class="s2">&quot;architecture&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="s2">&quot;DecoderModel&quot;</span>
+    <span class="n">skip_cross_kv</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;skip_cross_kv&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+    <span class="n">has_position_embedding</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="p">[</span><span class="s2">&quot;has_position_embedding&quot;</span><span class="p">]</span>
+    <span class="n">has_token_type_embedding</span> <span class="o">=</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">pretrained_config</span><span class="p">,</span> <span class="s2">&quot;type_vocab_size&quot;</span><span class="p">)</span>
+    <span class="n">dtype</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="p">[</span><span class="s2">&quot;dtype&quot;</span><span class="p">]</span>
+
+    <span class="n">paged_kv_cache</span> <span class="o">=</span> <span class="n">plugin_config</span><span class="p">[</span><span class="s1">&#39;paged_kv_cache&#39;</span><span class="p">]</span>
+    <span class="n">tokens_per_block</span> <span class="o">=</span> <span class="n">plugin_config</span><span class="p">[</span><span class="s1">&#39;tokens_per_block&#39;</span><span class="p">]</span>
+
+    <span class="n">gather_context_logits</span> <span class="o">=</span> <span class="n">builder_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;gather_context_logits&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+    <span class="n">gather_generation_logits</span> <span class="o">=</span> <span class="n">builder_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;gather_generation_logits&#39;</span><span class="p">,</span>
+                                                  <span class="kc">False</span><span class="p">)</span>
+    <span class="n">max_prompt_embedding_table_size</span> <span class="o">=</span> <span class="n">builder_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+        <span class="s1">&#39;max_prompt_embedding_table_size&#39;</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+
+    <span class="n">kv_cache_type</span> <span class="o">=</span> <span class="n">get_kv_cache_type_from_legacy</span><span class="p">(</span><span class="kc">True</span><span class="p">,</span> <span class="n">paged_kv_cache</span><span class="p">)</span>
+    <span class="n">language_adapter_config</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;language_adapter_config&quot;</span><span class="p">,</span>
+                                                    <span class="kc">None</span><span class="p">)</span>
+
+    <span class="n">model_config</span> <span class="o">=</span> <span class="n">ModelConfig</span><span class="p">(</span>
+        <span class="n">num_heads</span><span class="o">=</span><span class="n">num_heads</span><span class="p">,</span>
+        <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">num_kv_heads</span><span class="p">,</span>
+        <span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+        <span class="n">head_size</span><span class="o">=</span><span class="n">head_size</span><span class="p">,</span>
+        <span class="n">max_batch_size</span><span class="o">=</span><span class="n">max_batch_size</span><span class="p">,</span>
+        <span class="n">max_beam_width</span><span class="o">=</span><span class="n">max_beam_width</span><span class="p">,</span>
+        <span class="n">vocab_size</span><span class="o">=</span><span class="n">vocab_size</span><span class="p">,</span>
+        <span class="n">num_layers</span><span class="o">=</span><span class="n">num_layers</span><span class="p">,</span>
+        <span class="n">gpt_attention_plugin</span><span class="o">=</span><span class="n">use_gpt_attention_plugin</span><span class="p">,</span>
+        <span class="n">remove_input_padding</span><span class="o">=</span><span class="n">remove_input_padding</span><span class="p">,</span>
+        <span class="n">kv_cache_type</span><span class="o">=</span><span class="n">kv_cache_type</span><span class="p">,</span>
+        <span class="n">tokens_per_block</span><span class="o">=</span><span class="n">tokens_per_block</span><span class="p">,</span>
+        <span class="n">cross_attention</span><span class="o">=</span><span class="n">cross_attention</span><span class="p">,</span>
+        <span class="n">has_position_embedding</span><span class="o">=</span><span class="n">has_position_embedding</span><span class="p">,</span>
+        <span class="n">has_token_type_embedding</span><span class="o">=</span><span class="n">has_token_type_embedding</span><span class="p">,</span>
+        <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+        <span class="n">gather_context_logits</span><span class="o">=</span><span class="n">gather_context_logits</span><span class="p">,</span>
+        <span class="n">gather_generation_logits</span><span class="o">=</span><span class="n">gather_generation_logits</span><span class="p">,</span>
+        <span class="n">max_prompt_embedding_table_size</span><span class="o">=</span><span class="n">max_prompt_embedding_table_size</span><span class="p">,</span>
+        <span class="n">lora_plugin</span><span class="o">=</span><span class="n">use_lora_plugin</span><span class="p">,</span>
+        <span class="n">lora_target_modules</span><span class="o">=</span><span class="n">lora_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;lora_target_modules&#39;</span><span class="p">),</span>
+        <span class="n">trtllm_modules_to_hf_modules</span><span class="o">=</span><span class="n">lora_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+            <span class="s1">&#39;trtllm_modules_to_hf_modules&#39;</span><span class="p">),</span>
+        <span class="n">skip_cross_kv</span><span class="o">=</span><span class="n">skip_cross_kv</span><span class="p">,</span>
+        <span class="n">language_adapter_config</span><span class="o">=</span><span class="n">language_adapter_config</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">model_config</span><span class="p">,</span> <span class="n">tp_size</span><span class="p">,</span> <span class="n">pp_size</span><span class="p">,</span> <span class="n">gpus_per_node</span><span class="p">,</span> <span class="n">dtype</span>
+
+
+<div class="viewcode-block" id="EncDecModelRunner">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.EncDecModelRunner">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">EncDecModelRunner</span><span class="p">:</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                 <span class="n">engine_name</span><span class="p">,</span>
+                 <span class="n">engine_dir</span><span class="p">,</span>
+                 <span class="n">lora_dir</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">lora_task_uids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">debug_mode</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                 <span class="n">skip_encoder</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                 <span class="n">stream</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">enable_context_fmha_fp32_acc</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="c1"># in multi-node setup, it&#39;s important to set_device at the very beginning so .to(&#39;cuda&#39;) refers to current device</span>
+        <span class="c1"># accordingly, all input &amp; output tensors should be moved to current device</span>
+        <span class="c1"># otherwise, it&#39;s default to &#39;cuda:0&#39;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">runtime_rank</span> <span class="o">=</span> <span class="n">mpi_rank</span><span class="p">()</span>
+        <span class="n">device_id</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime_rank</span> <span class="o">%</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">device_count</span><span class="p">()</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="n">device_id</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_device</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">skip_encoder</span> <span class="o">=</span> <span class="n">skip_encoder</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">lora_task_uids</span> <span class="o">=</span> <span class="n">lora_task_uids</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">enable_context_fmha_fp32_acc</span> <span class="o">=</span> <span class="n">enable_context_fmha_fp32_acc</span>
+
+        <span class="c1"># when enc-dec runs by itself, stream can be None and we create new stream here</span>
+        <span class="c1"># when enc-dec has to run as a component in a bigger workflow (e.g., multimodal), earlier components in the workflow may have results in its stream, which we should pass that stream in to avoid unnecessary stream sync</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">stream</span> <span class="o">=</span> <span class="n">stream</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">stream</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_stream</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">stream</span><span class="p">)</span>
+
+        <span class="n">engine_dir</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">engine_dir</span><span class="p">)</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">engine_setup</span><span class="p">(</span><span class="n">component</span><span class="p">):</span>
+            <span class="c1"># model config</span>
+            <span class="n">config_path</span> <span class="o">=</span> <span class="n">engine_dir</span> <span class="o">/</span> <span class="n">component</span> <span class="o">/</span> <span class="s2">&quot;config.json&quot;</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Using config path </span><span class="si">{</span><span class="n">config_path</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="n">model_config</span><span class="p">,</span> <span class="n">tp_size</span><span class="p">,</span> <span class="n">pp_size</span><span class="p">,</span> <span class="n">gpus_per_node</span><span class="p">,</span> <span class="n">dtype</span> <span class="o">=</span> <span class="n">read_config</span><span class="p">(</span>
+                <span class="n">config_path</span><span class="p">)</span>
+
+            <span class="c1"># MGMN config</span>
+            <span class="n">world_size</span> <span class="o">=</span> <span class="n">tp_size</span> <span class="o">*</span> <span class="n">pp_size</span>
+            <span class="n">runtime_rank</span> <span class="o">=</span> <span class="n">mpi_rank</span><span class="p">()</span>
+            <span class="k">assert</span> <span class="n">runtime_rank</span> <span class="o">&lt;</span> <span class="n">world_size</span><span class="p">,</span> <span class="s2">&quot;Runtime GPU rank exceeds MPI world size. Did you launch more MPI processes than required?&quot;</span>
+            <span class="n">runtime_mapping</span> <span class="o">=</span> <span class="n">Mapping</span><span class="p">(</span><span class="n">world_size</span><span class="p">,</span>
+                                      <span class="n">runtime_rank</span><span class="p">,</span>
+                                      <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
+                                      <span class="n">pp_size</span><span class="o">=</span><span class="n">pp_size</span><span class="p">,</span>
+                                      <span class="n">gpus_per_node</span><span class="o">=</span><span class="n">gpus_per_node</span><span class="p">)</span>
+
+            <span class="c1"># load engine</span>
+            <span class="n">engine_fname</span> <span class="o">=</span> <span class="n">get_engine_name</span><span class="p">(</span><span class="n">runtime_rank</span><span class="p">)</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">engine_dir</span> <span class="o">/</span> <span class="n">component</span> <span class="o">/</span> <span class="n">engine_fname</span><span class="p">,</span> <span class="s2">&quot;rb&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">engine_buffer</span> <span class="o">=</span> <span class="n">f</span><span class="o">.</span><span class="n">read</span><span class="p">()</span>
+
+            <span class="k">return</span> <span class="n">model_config</span><span class="p">,</span> <span class="n">runtime_mapping</span><span class="p">,</span> <span class="n">engine_buffer</span>
+
+        <span class="c1"># Note: encoder and decoder doesn&#39;t necessarily have the same TP &amp; PP config</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_encoder</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">encoder_model_config</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="p">,</span> <span class="n">encoder_engine_buffer</span> <span class="o">=</span> <span class="n">engine_setup</span><span class="p">(</span>
+                <span class="n">component</span><span class="o">=</span><span class="s1">&#39;encoder&#39;</span><span class="p">)</span>
+
+            <span class="bp">self</span><span class="o">.</span><span class="n">nccl_comm</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="o">.</span><span class="n">has_pp</span><span class="p">():</span>
+                <span class="c1"># for Pipeline Parallelism in encoder</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">nccl_comm</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">classes</span><span class="o">.</span><span class="n">trtllm</span><span class="o">.</span><span class="n">NcclCommunicatorOp</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="o">.</span><span class="n">pp_size</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="o">.</span><span class="n">rank</span><span class="p">)</span>
+
+            <span class="c1"># session setup</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">encoder_session</span> <span class="o">=</span> <span class="n">Session</span><span class="o">.</span><span class="n">from_serialized_engine</span><span class="p">(</span>
+                <span class="n">encoder_engine_buffer</span><span class="p">)</span>
+
+            <span class="c1"># encoder lora manager setup</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_model_config</span><span class="o">.</span><span class="n">lora_plugin</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">encoder_lora_manager</span> <span class="o">=</span> <span class="n">LoraManager</span><span class="p">()</span>
+                <span class="c1"># TODO: this is only for bart</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">encoder_lora_manager</span><span class="o">.</span><span class="n">load_from_hf</span><span class="p">(</span>
+                    <span class="n">model_dirs</span><span class="o">=</span><span class="n">lora_dir</span><span class="p">,</span>
+                    <span class="n">model_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">encoder_model_config</span><span class="p">,</span>
+                    <span class="n">runtime_mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="p">,</span>
+                    <span class="n">component</span><span class="o">=</span><span class="s1">&#39;encoder&#39;</span><span class="p">,</span>
+                <span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">encoder_lora_manager</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">encoder_model_config</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="p">,</span> <span class="n">encoder_engine_buffer</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">nccl_comm</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_session</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">decoder_model_config</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_runtime_mapping</span><span class="p">,</span> <span class="n">decoder_engine_buffer</span> <span class="o">=</span> <span class="n">engine_setup</span><span class="p">(</span>
+            <span class="n">component</span><span class="o">=</span><span class="s1">&#39;decoder&#39;</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">decoder_session</span> <span class="o">=</span> <span class="n">GenerationSession</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">decoder_model_config</span><span class="p">,</span>
+                                                 <span class="n">decoder_engine_buffer</span><span class="p">,</span>
+                                                 <span class="bp">self</span><span class="o">.</span><span class="n">decoder_runtime_mapping</span><span class="p">,</span>
+                                                 <span class="n">debug_mode</span><span class="o">=</span><span class="n">debug_mode</span><span class="p">)</span>
+
+        <span class="c1"># decoder lora manager setup</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_model_config</span><span class="o">.</span><span class="n">lora_plugin</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">decoder_lora_manager</span> <span class="o">=</span> <span class="n">LoraManager</span><span class="p">()</span>
+            <span class="c1"># TODO: this is only for bart</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">decoder_lora_manager</span><span class="o">.</span><span class="n">load_from_hf</span><span class="p">(</span>
+                <span class="n">model_dirs</span><span class="o">=</span><span class="n">lora_dir</span><span class="p">,</span>
+                <span class="n">model_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">decoder_model_config</span><span class="p">,</span>
+                <span class="n">runtime_mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">decoder_runtime_mapping</span><span class="p">,</span>
+                <span class="n">component</span><span class="o">=</span><span class="s1">&#39;decoder&#39;</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">decoder_lora_manager</span> <span class="o">=</span> <span class="kc">None</span>
+
+<div class="viewcode-block" id="EncDecModelRunner.from_engine">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.EncDecModelRunner.from_engine">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_engine</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span>
+                    <span class="n">engine_name</span><span class="p">,</span>
+                    <span class="n">engine_dir</span><span class="p">,</span>
+                    <span class="n">lora_dir</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                    <span class="n">lora_task_uids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                    <span class="n">debug_mode</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                    <span class="n">skip_encoder</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                    <span class="n">stream</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                    <span class="n">enable_context_fmha_fp32_acc</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">engine_name</span><span class="p">,</span>
+                   <span class="n">engine_dir</span><span class="p">,</span>
+                   <span class="n">lora_dir</span><span class="p">,</span>
+                   <span class="n">lora_task_uids</span><span class="p">,</span>
+                   <span class="n">debug_mode</span><span class="o">=</span><span class="n">debug_mode</span><span class="p">,</span>
+                   <span class="n">skip_encoder</span><span class="o">=</span><span class="n">skip_encoder</span><span class="p">,</span>
+                   <span class="n">stream</span><span class="o">=</span><span class="n">stream</span><span class="p">,</span>
+                   <span class="n">enable_context_fmha_fp32_acc</span><span class="o">=</span><span class="n">enable_context_fmha_fp32_acc</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="EncDecModelRunner.process_input">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.EncDecModelRunner.process_input">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">process_input</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                      <span class="n">input_ids</span><span class="p">,</span>
+                      <span class="n">remove_input_padding</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                      <span class="n">pad_token_id</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+                      <span class="n">prompt_tasks</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                      <span class="n">language_adapter_routings</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">remove_input_padding</span><span class="p">:</span>
+            <span class="c1"># in remove padding mode --&gt; flatten input, calculate actual length and max length</span>
+            <span class="c1"># Note: 1st token should never be removed, even if it is pad_token_id</span>
+            <span class="n">first_ids</span> <span class="o">=</span> <span class="n">input_ids</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">]</span>
+            <span class="n">input_ids</span> <span class="o">=</span> <span class="n">input_ids</span><span class="p">[:,</span> <span class="mi">1</span><span class="p">:]</span>
+            <span class="n">input_lengths</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">+</span> <span class="p">(</span><span class="n">input_ids</span> <span class="o">!=</span> <span class="n">pad_token_id</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">type</span><span class="p">(</span>
+                <span class="n">torch</span><span class="o">.</span><span class="n">IntTensor</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>  <span class="c1"># [batch_size]</span>
+            <span class="n">new_ids</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">input_ids</span><span class="p">)):</span>
+                <span class="n">row</span> <span class="o">=</span> <span class="n">input_ids</span><span class="p">[</span><span class="n">i</span><span class="p">,</span> <span class="p">:]</span>
+                <span class="n">row</span> <span class="o">=</span> <span class="n">row</span><span class="p">[</span><span class="n">row</span> <span class="o">!=</span> <span class="n">pad_token_id</span><span class="p">]</span>
+                <span class="n">new_ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                    <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span>
+                        <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">IntTensor</span><span class="p">([</span><span class="n">first_ids</span><span class="p">[</span><span class="n">i</span><span class="p">]])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">),</span> <span class="n">row</span><span class="p">)))</span>
+            <span class="n">input_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">new_ids</span><span class="p">)</span>  <span class="c1"># [num_tokens]</span>
+            <span class="k">if</span> <span class="n">prompt_tasks</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">prompt_tasks</span> <span class="o">=</span> <span class="n">prompt_tasks</span><span class="p">[:</span><span class="n">input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># in padding mode --&gt; keep input, just calculate actual length and max length</span>
+            <span class="c1"># Note: 1st token should always count, even if it is pad_token_id. e.g., decoder start id in enc-dec models could be a single pad_token_id, we should count</span>
+            <span class="n">input_lengths</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>
+                <span class="mi">1</span> <span class="o">+</span> <span class="p">(</span><span class="n">input_ids</span><span class="p">[:,</span> <span class="mi">1</span><span class="p">:]</span> <span class="o">!=</span> <span class="n">pad_token_id</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">type</span><span class="p">(</span>
+                    <span class="n">torch</span><span class="o">.</span><span class="n">IntTensor</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">),</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+        <span class="n">max_input_length</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">max</span><span class="p">(</span><span class="n">input_lengths</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">language_adapter_routings</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">language_adapter_routings</span> <span class="o">=</span> <span class="n">language_adapter_routings</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">,</span> <span class="n">max_input_length</span><span class="p">,</span> <span class="n">prompt_tasks</span><span class="p">,</span> <span class="n">language_adapter_routings</span></div>
+
+
+<div class="viewcode-block" id="EncDecModelRunner.encoder_run">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.EncDecModelRunner.encoder_run">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">encoder_run</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                    <span class="n">input_ids</span><span class="p">,</span>
+                    <span class="n">input_lengths</span><span class="p">,</span>
+                    <span class="n">max_input_length</span><span class="p">,</span>
+                    <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                    <span class="n">token_type_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                    <span class="n">debug_mode</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                    <span class="n">prompt_embedding_table</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                    <span class="n">prompt_tasks</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                    <span class="n">prompt_vocab_size</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                    <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                    <span class="n">language_adapter_routings</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+
+        <span class="c1"># each engine has hidden_dim/TP, don&#39;t forget to multiply TP</span>
+        <span class="n">hidden_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_model_config</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="o">.</span><span class="n">tp_size</span>
+        <span class="k">if</span> <span class="n">input_ids</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">hidden_states_shape</span> <span class="o">=</span> <span class="p">(</span><span class="n">input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">hidden_size</span>
+                                   <span class="p">)</span>  <span class="c1"># [num_tokens,D]</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">hidden_states_shape</span> <span class="o">=</span> <span class="p">(</span><span class="n">input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span>
+                                   <span class="n">hidden_size</span><span class="p">)</span>  <span class="c1"># [BS,seqlen,D]</span>
+        <span class="n">hidden_states_dtype</span> <span class="o">=</span> <span class="k">lambda</span> <span class="n">name</span><span class="p">:</span> <span class="n">trt_dtype_to_torch</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">encoder_session</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">get_tensor_dtype</span><span class="p">(</span><span class="n">name</span><span class="p">))</span>
+
+        <span class="c1"># input tensors. only first PP rank has id input, others are hidden_states input</span>
+        <span class="n">inputs</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
+            <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;input_ids&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">input_ids</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_model_config</span><span class="o">.</span><span class="n">has_position_embedding</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">position_ids</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_model_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">:</span>
+                        <span class="n">position_ids</span> <span class="o">=</span> <span class="p">[</span>
+                            <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">sample_length</span><span class="p">,</span>
+                                         <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                                         <span class="n">device</span><span class="o">=</span><span class="n">input_ids</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+                            <span class="k">for</span> <span class="n">sample_length</span> <span class="ow">in</span> <span class="n">torch_to_numpy</span><span class="p">(</span><span class="n">input_lengths</span><span class="p">)</span>
+                        <span class="p">]</span>
+                        <span class="n">position_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">position_ids</span><span class="p">)</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="n">bsz</span><span class="p">,</span> <span class="n">seq_len</span> <span class="o">=</span> <span class="n">input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="mi">2</span><span class="p">]</span>
+                        <span class="n">position_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span>
+                            <span class="n">seq_len</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                            <span class="n">device</span><span class="o">=</span><span class="n">input_ids</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="n">bsz</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+                <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;position_ids&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">position_ids</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_model_config</span><span class="o">.</span><span class="n">has_token_type_embedding</span><span class="p">:</span>
+                <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;token_type_ids&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">token_type_ids</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_model_config</span><span class="o">.</span><span class="n">max_prompt_embedding_table_size</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="n">inputs</span><span class="p">[</span>
+                    <span class="s1">&#39;prompt_embedding_table&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">prompt_embedding_table</span><span class="o">.</span><span class="n">contiguous</span><span class="p">(</span>
+                    <span class="p">)</span>
+                <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;tasks&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">prompt_tasks</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+                <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;prompt_vocab_size&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">prompt_vocab_size</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># just need a placeholder, engine will call NCCL to recv and fill data from previous rank</span>
+            <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;hidden_states_input&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span>
+                <span class="n">hidden_states_shape</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">hidden_states_dtype</span><span class="p">(</span><span class="s1">&#39;hidden_states_input&#39;</span><span class="p">),</span>
+                <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">attention_mask</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_model_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span><span class="p">:</span>
+            <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;attention_mask&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">attention_mask</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+
+        <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;input_lengths&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">input_lengths</span>
+        <span class="c1"># use shape info to pass max length info in remove padding mode</span>
+        <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;max_input_length&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span>
+            <span class="p">(</span><span class="n">max_input_length</span><span class="p">,</span> <span class="p">),</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">hidden_states_dtype</span><span class="p">(</span><span class="s1">&#39;max_input_length&#39;</span><span class="p">),</span>
+            <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">ipc_buffers</span><span class="p">,</span> <span class="n">all_reduce_workspace</span> <span class="o">=</span> <span class="n">CustomAllReduceHelper</span><span class="o">.</span><span class="n">allocate_workspace</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="p">,</span>
+                <span class="n">CustomAllReduceHelper</span><span class="o">.</span><span class="n">max_workspace_size_auto</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">))</span>
+            <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;all_reduce_workspace&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">all_reduce_workspace</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_model_config</span><span class="o">.</span><span class="n">lora_plugin</span><span class="p">:</span>
+            <span class="n">inputs</span><span class="o">.</span><span class="n">update</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">encoder_lora_manager</span><span class="o">.</span><span class="n">input_buffers</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">lora_task_uids</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">encoder_model_config</span><span class="o">.</span><span class="n">num_layers</span><span class="p">,</span>
+                <span class="p">))</span>
+            <span class="n">batch_size</span> <span class="o">=</span> <span class="n">input_lengths</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+            <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;host_request_types&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">IntTensor</span><span class="p">([</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span>
+                                                           <span class="n">batch_size</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s1">&#39;cpu&#39;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_model_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">:</span>
+                <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;host_context_lengths&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">input_lengths</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s1">&#39;cpu&#39;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">language_adapter_routings</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;language_adapter_routings&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">language_adapter_routings</span>
+        <span class="c1"># Note: runtime.Session&#39;s run() method will set input/output tensor address, here we only need to provide tensor shape</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">encoder_session</span><span class="o">.</span><span class="n">set_shapes</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span>
+
+        <span class="c1"># output tensors. only last PP rank final encoder output, others are intermediate hidden_states output. Need broadcast later</span>
+        <span class="n">outputs</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
+            <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;encoder_output&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span>
+                <span class="n">hidden_states_shape</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">hidden_states_dtype</span><span class="p">(</span><span class="s1">&#39;encoder_output&#39;</span><span class="p">),</span>
+                <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;hidden_states_output&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span>
+                <span class="n">hidden_states_shape</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">hidden_states_dtype</span><span class="p">(</span><span class="s1">&#39;hidden_states_output&#39;</span><span class="p">),</span>
+                <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+
+        <span class="c1"># -------------------------------------------</span>
+        <span class="k">if</span> <span class="n">debug_mode</span><span class="p">:</span>
+            <span class="n">engine</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_session</span><span class="o">.</span><span class="n">engine</span>
+            <span class="n">context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_session</span><span class="o">.</span><span class="n">context</span>
+            <span class="c1"># setup debugging buffer for the encoder</span>
+            <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">encoder_session</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">num_io_tensors</span><span class="p">):</span>
+                <span class="n">name</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">get_tensor_name</span><span class="p">(</span><span class="n">i</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">engine</span><span class="o">.</span><span class="n">get_tensor_mode</span><span class="p">(</span>
+                        <span class="n">name</span>
+                <span class="p">)</span> <span class="o">==</span> <span class="n">trt</span><span class="o">.</span><span class="n">TensorIOMode</span><span class="o">.</span><span class="n">OUTPUT</span> <span class="ow">and</span> <span class="n">name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">outputs</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
+                    <span class="n">dtype</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">get_tensor_dtype</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+                    <span class="n">shape</span> <span class="o">=</span> <span class="n">context</span><span class="o">.</span><span class="n">get_tensor_shape</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+                    <span class="n">outputs</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="nb">tuple</span><span class="p">(</span><span class="n">shape</span><span class="p">),</span>
+                                                <span class="n">dtype</span><span class="o">=</span><span class="n">trt_dtype_to_torch</span><span class="p">(</span><span class="n">dtype</span><span class="p">),</span>
+                                                <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+                    <span class="n">context</span><span class="o">.</span><span class="n">set_tensor_address</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">outputs</span><span class="p">[</span><span class="n">name</span><span class="p">]</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">())</span>
+        <span class="c1"># -------------------------------------------</span>
+
+        <span class="c1"># TRT session run</span>
+        <span class="c1"># Note: need cuda stream ID, not a torch Stream</span>
+        <span class="n">ok</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_session</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="n">outputs</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">stream</span><span class="o">.</span><span class="n">cuda_stream</span><span class="p">)</span>
+        <span class="k">assert</span> <span class="n">ok</span><span class="p">,</span> <span class="s2">&quot;Runtime execution failed&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">stream</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+
+        <span class="c1"># Tensor Parallelism is handled by model/engine definition</span>
+        <span class="c1"># But we need to broadcast among PP group at the end of encoder&#39;s Pipeline Parallelism</span>
+        <span class="c1"># After this, all ranks should recv the encoder output, and world might be re-configured using decoder&#39;s TP-PP config</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">pp_communicate_encoder_output</span><span class="p">(</span><span class="n">encoder_output</span><span class="p">):</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
+                <span class="k">for</span> <span class="n">pp_rank</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="o">.</span><span class="n">pp_group</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="n">pp_rank</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="o">.</span><span class="n">rank</span><span class="p">:</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">nccl_comm</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">encoder_output</span><span class="p">,</span> <span class="n">pp_rank</span><span class="p">)</span>
+                <span class="k">return</span> <span class="n">encoder_output</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">nccl_comm</span><span class="o">.</span><span class="n">recv</span><span class="p">(</span><span class="n">encoder_output</span><span class="p">,</span>
+                                    <span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="o">.</span><span class="n">pp_group</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+                <span class="k">return</span> <span class="n">encoder_output</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="o">.</span><span class="n">has_pp</span><span class="p">():</span>
+            <span class="c1"># use hidden_states output buffer to receive output as the shapes are same</span>
+            <span class="n">encoder_output_buf</span> <span class="o">=</span> <span class="n">outputs</span><span class="p">[</span>
+                <span class="s1">&#39;encoder_output&#39;</span><span class="p">]</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_runtime_mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">(</span>
+                <span class="p">)</span> <span class="k">else</span> <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;hidden_states_output&#39;</span><span class="p">]</span>
+            <span class="n">encoder_output</span> <span class="o">=</span> <span class="n">pp_communicate_encoder_output</span><span class="p">(</span><span class="n">encoder_output_buf</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">encoder_output</span> <span class="o">=</span> <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;encoder_output&#39;</span><span class="p">]</span>
+
+        <span class="k">return</span> <span class="n">encoder_output</span></div>
+
+
+<div class="viewcode-block" id="EncDecModelRunner.generate">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.EncDecModelRunner.generate">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">generate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                 <span class="n">encoder_input_ids</span><span class="p">,</span>
+                 <span class="n">decoder_input_ids</span><span class="p">,</span>
+                 <span class="n">max_new_tokens</span><span class="p">,</span>
+                 <span class="n">num_beams</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+                 <span class="n">pad_token_id</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">eos_token_id</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">bos_token_id</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">debug_mode</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                 <span class="n">return_dict</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                 <span class="n">prompt_embedding_table</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">prompt_tasks</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">prompt_vocab_size</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">time_encoder</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                 <span class="n">return_encoder_output</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                 <span class="n">encoder_language_adapter_routings</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">decoder_language_adapter_routings</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+        <span class="c1">## ensure all externally provided tensors are on the correct device.</span>
+        <span class="n">encoder_input_ids</span> <span class="o">=</span> <span class="n">encoder_input_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+        <span class="n">decoder_input_ids</span> <span class="o">=</span> <span class="n">decoder_input_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">attention_mask</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">attention_mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">attention_mask</span><span class="p">,</span>
+                                          <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                                          <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+
+        <span class="c1">## encoder run</span>
+        <span class="n">encoder_remove_input_padding</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_model_config</span><span class="o">.</span><span class="n">remove_input_padding</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_model_config</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_model_config</span><span class="o">.</span><span class="n">remove_input_padding</span>
+
+        <span class="n">encoder_input_ids</span><span class="p">,</span> <span class="n">encoder_input_lengths</span><span class="p">,</span> <span class="n">encoder_max_input_length</span><span class="p">,</span> <span class="n">prompt_tasks</span><span class="p">,</span> <span class="n">encoder_language_adapter_routings</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">process_input</span><span class="p">(</span>
+            <span class="n">encoder_input_ids</span><span class="p">,</span> <span class="n">encoder_remove_input_padding</span><span class="p">,</span> <span class="n">pad_token_id</span><span class="p">,</span>
+            <span class="n">prompt_tasks</span><span class="p">,</span> <span class="n">encoder_language_adapter_routings</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">skip_encoder</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Rank </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">runtime_rank</span><span class="si">}</span><span class="s2"> Running encoder engine ...&quot;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">time_encoder</span><span class="p">:</span>
+                <span class="n">tik</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+            <span class="n">encoder_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_run</span><span class="p">(</span>
+                <span class="n">encoder_input_ids</span><span class="p">,</span>
+                <span class="n">encoder_input_lengths</span><span class="p">,</span>
+                <span class="n">encoder_max_input_length</span><span class="p">,</span>
+                <span class="n">debug_mode</span><span class="o">=</span><span class="n">debug_mode</span><span class="p">,</span>
+                <span class="n">prompt_embedding_table</span><span class="o">=</span><span class="n">prompt_embedding_table</span><span class="p">,</span>
+                <span class="n">prompt_tasks</span><span class="o">=</span><span class="n">prompt_tasks</span><span class="p">,</span>
+                <span class="n">prompt_vocab_size</span><span class="o">=</span><span class="n">prompt_vocab_size</span><span class="p">,</span>
+                <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
+                <span class="n">language_adapter_routings</span><span class="o">=</span><span class="n">encoder_language_adapter_routings</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">time_encoder</span><span class="p">:</span>
+                <span class="n">tok</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+                <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;TRT-LLM Encoder time </span><span class="si">{</span><span class="p">(</span><span class="n">tok</span><span class="o">-</span><span class="n">tik</span><span class="p">)</span><span class="o">*</span><span class="mi">1000</span><span class="si">}</span><span class="s2">ms&quot;</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">encoder_output</span> <span class="o">=</span> <span class="n">prompt_embedding_table</span>
+            <span class="k">if</span> <span class="n">encoder_input_ids</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+                <span class="n">encoder_output</span> <span class="o">=</span> <span class="n">encoder_output</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+
+        <span class="c1">## decoder run</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Rank </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">runtime_rank</span><span class="si">}</span><span class="s2"> Running decoder engine ...&quot;</span><span class="p">)</span>
+        <span class="n">decoder_input_ids</span><span class="p">,</span> <span class="n">decoder_input_lengths</span><span class="p">,</span> <span class="n">decoder_max_input_length</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">decoder_language_adapter_routings</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">process_input</span><span class="p">(</span>
+            <span class="n">decoder_input_ids</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_model_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">,</span>
+            <span class="n">pad_token_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="n">decoder_language_adapter_routings</span><span class="p">)</span>
+        <span class="c1"># `cross_attention_mask` in context phase [batch_size, query_len, encoder_input_len]</span>
+        <span class="c1"># where query_len happens to be 1 in current cases, but not necessarily always, and</span>
+        <span class="c1"># `cross_attention_mask` in generation phase [batch_size, 1, encoder_input_len] where</span>
+        <span class="c1"># the query_len is always 1 since we have kv cache. But we use</span>
+        <span class="c1"># cross_attention_mask[:, step, :] during generation</span>
+        <span class="n">cross_attention_mask</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">attention_mask</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">cross_attention_mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">attention_mask</span><span class="p">,</span>
+                                                <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                                                <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span>
+                                                    <span class="n">attention_mask</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="mi">1</span><span class="p">,</span>
+                                                    <span class="n">attention_mask</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
+            <span class="n">cross_attention_mask</span> <span class="o">=</span> <span class="n">cross_attention_mask</span><span class="o">.</span><span class="n">repeat</span><span class="p">(</span>
+                <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="n">decoder_max_input_length</span> <span class="o">+</span> <span class="n">max_new_tokens</span><span class="p">,</span> <span class="mi">1</span><span class="p">])</span>
+
+        <span class="c1"># generation config</span>
+        <span class="n">sampling_config</span> <span class="o">=</span> <span class="n">SamplingConfig</span><span class="p">(</span><span class="n">end_id</span><span class="o">=</span><span class="n">eos_token_id</span><span class="p">,</span>
+                                         <span class="n">pad_id</span><span class="o">=</span><span class="n">pad_token_id</span><span class="p">,</span>
+                                         <span class="n">num_beams</span><span class="o">=</span><span class="n">num_beams</span><span class="p">,</span>
+                                         <span class="n">min_length</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+                                         <span class="n">return_dict</span><span class="o">=</span><span class="n">return_dict</span><span class="p">)</span>
+        <span class="n">sampling_config</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">output_cum_log_probs</span><span class="o">=</span><span class="n">return_dict</span><span class="p">,</span>
+                               <span class="n">output_log_probs</span><span class="o">=</span><span class="n">return_dict</span><span class="p">)</span>
+
+        <span class="c1"># decoder autoregressive generation</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">decoder_session</span><span class="o">.</span><span class="n">setup</span><span class="p">(</span>
+            <span class="n">decoder_input_lengths</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+            <span class="n">decoder_max_input_length</span><span class="p">,</span>
+            <span class="n">max_new_tokens</span><span class="p">,</span>
+            <span class="n">num_beams</span><span class="p">,</span>
+            <span class="n">max_attention_window_size</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+            <span class="n">encoder_max_input_length</span><span class="o">=</span><span class="n">encoder_max_input_length</span><span class="p">,</span>
+            <span class="n">lora_manager</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">decoder_lora_manager</span><span class="p">,</span>
+            <span class="n">lora_uids</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">lora_task_uids</span><span class="p">,</span>
+            <span class="n">enable_context_fmha_fp32_acc</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_context_fmha_fp32_acc</span><span class="p">)</span>
+
+        <span class="n">output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_session</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span>
+            <span class="n">decoder_input_ids</span><span class="p">,</span>
+            <span class="n">decoder_input_lengths</span><span class="p">,</span>
+            <span class="n">sampling_config</span><span class="p">,</span>
+            <span class="n">encoder_output</span><span class="o">=</span><span class="n">encoder_output</span><span class="p">,</span>
+            <span class="n">encoder_input_lengths</span><span class="o">=</span><span class="n">encoder_input_lengths</span><span class="p">,</span>
+            <span class="n">return_dict</span><span class="o">=</span><span class="n">return_dict</span><span class="p">,</span>
+            <span class="n">cross_attention_mask</span><span class="o">=</span><span class="n">cross_attention_mask</span><span class="p">,</span>
+            <span class="n">language_adapter_routings</span><span class="o">=</span><span class="n">decoder_language_adapter_routings</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">return_dict</span> <span class="ow">and</span> <span class="n">return_encoder_output</span><span class="p">:</span>
+            <span class="n">output</span><span class="p">[</span><span class="s1">&#39;encoder_output&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">encoder_output</span>
+
+        <span class="k">return</span> <span class="n">output</span></div>
+</div>
+
+</pre></div>
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+<div class="bd-sidebar-secondary"></div>
+
+
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

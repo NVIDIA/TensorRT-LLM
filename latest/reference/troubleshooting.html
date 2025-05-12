@@ -1,0 +1,972 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Troubleshooting &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'reference/troubleshooting';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Support Matrix" href="support-matrix.html" />
+    <link rel="prev" title="Performance Analysis" href="../performance/perf-analysis.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.20.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Troubleshooting</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="troubleshooting">
+<span id="id1"></span><h1>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading">#</a></h1>
+<p>This document describes some of the frequently asked questions and their solutions in TensorRT-LLM, including problems of installation, model-building, model-execution, and input / output size.</p>
+<section id="installation-errors">
+<h2>Installation Errors<a class="headerlink" href="#installation-errors" title="Link to this heading">#</a></h2>
+<p>During compilation and installation of TensorRT-LLM, many build errors can be resolved by simply deleting the build tree and rebuilding again.</p>
+<p>In most occasions, these problems are caused by the workflow like: an old compilation -&gt; some code change (update of the repo or users’ writing) -&gt; a later compilation.</p>
+<p>Solution: try running build script with <code class="docutils literal notranslate"><span class="pre">--clean</span></code>, or try running <code class="docutils literal notranslate"><span class="pre">rm</span> <span class="pre">-r</span> <span class="pre">build</span> <span class="pre">cpp/build</span></code> before running build script again.</p>
+</section>
+<section id="debug-on-unit-tests">
+<h2>Debug on Unit Tests<a class="headerlink" href="#debug-on-unit-tests" title="Link to this heading">#</a></h2>
+<p>Here is an example to print the values of the MLP output tensor in the a unit test (<a class="reference internal" href="#../../../tests/test_debugging_api.py"><span class="xref myst">full example</span></a>).</p>
+<ol class="arabic simple">
+<li><p>Register the intermediate tensors as the network outputs with <code class="docutils literal notranslate"><span class="pre">register_network_output</span></code> API.</p></li>
+</ol>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">MLP</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="c1"># Do not modify the definition in `__init__` method</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">fc</span> <span class="o">=</span> <span class="o">...</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">proj</span> <span class="o">=</span> <span class="o">...</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">):</span>
+        <span class="n">inter</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+        <span class="n">inter</span> <span class="o">=</span> <span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">relu</span><span class="p">(</span><span class="n">inter</span><span class="p">)</span>
+        <span class="c1"># Here register the tensor `inter` as our debug output tensor</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;inter&#39;</span><span class="p">,</span> <span class="n">inter</span><span class="p">)</span>
+        <span class="n">output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span><span class="p">(</span><span class="n">inter</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">output</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="2">
+<li><p>Mark the intermediate tensors as network outputs.</p></li>
+</ol>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">gm</span><span class="o">.</span><span class="n">named_network_outputs</span><span class="p">():</span>
+    <span class="n">net</span><span class="o">.</span><span class="n">_mark_output</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">dtype</span><span class="p">)</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="3">
+<li><p>Print the tensors at runtime.</p></li>
+</ol>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nb">print</span><span class="p">(</span><span class="n">outputs</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;inter&#39;</span><span class="p">])</span>
+</pre></div>
+</div>
+</section>
+<section id="debug-on-e2e-models">
+<h2>Debug on E2E Models<a class="headerlink" href="#debug-on-e2e-models" title="Link to this heading">#</a></h2>
+<p>Here is an example to print the values of the MLP output tensor in the GPT model.</p>
+<ol class="arabic simple">
+<li><p>Register the MLP output tensor in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/models/gpt/model.py</span></code>.</p></li>
+</ol>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span>        <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">attention_output</span><span class="o">.</span><span class="n">data</span>
+
+        <span class="n">residual</span> <span class="o">=</span> <span class="n">hidden_states</span>
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">post_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+        <span class="c1"># Register as model output</span>
+        <span class="c1"># ------------------------------------------------------</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;mlp_output&#39;</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
+        <span class="c1"># ------------------------------------------------------</span>
+
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">hidden_states</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="2">
+<li><p>Build the TensorRT engine of the model.</p></li>
+</ol>
+<p>Enable the <code class="docutils literal notranslate"><span class="pre">--enable_debug_output</span></code> option when building engines with <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>examples/gpt
+
+<span class="c1"># Download hf gpt2 model</span>
+rm<span class="w"> </span>-rf<span class="w"> </span>gpt2<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>git<span class="w"> </span>clone<span class="w"> </span>https://huggingface.co/gpt2-medium<span class="w"> </span>gpt2
+<span class="nb">pushd</span><span class="w"> </span>gpt2<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>rm<span class="w"> </span>pytorch_model.bin<span class="w"> </span>model.safetensors<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>wget<span class="w"> </span>-q<span class="w"> </span>https://huggingface.co/gpt2-medium/resolve/main/pytorch_model.bin<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">popd</span>
+
+<span class="c1"># Convert to TensorRT-LLM checkpoint</span>
+python3<span class="w"> </span>convert_checkpoint.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model_dir<span class="w"> </span>gpt2<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dtype<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output_dir<span class="w"> </span>gpt2/trt_ckpt/fp16/1-gpu
+
+<span class="c1"># Build TensorRT-LLM engines with --enable_debug_output</span>
+trtllm-build<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--checkpoint_dir<span class="w"> </span>gpt2/trt_ckpt/fp16/1-gpu<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable_debug_output<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output_dir<span class="w"> </span>gpt2/trt_engines/fp16/1-gpu
+</pre></div>
+</div>
+<ol class="arabic simple" start="3">
+<li><p>Print the intermediate output tensors.</p></li>
+</ol>
+<p>Add debug info in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/runtime/generation.py</span></code>.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span>        <span class="n">stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span><span class="o">.</span><span class="n">cuda_stream</span>
+        <span class="n">instance_idx</span> <span class="o">=</span> <span class="n">step</span> <span class="o">%</span> <span class="mi">2</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_mode</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">cuda_graph_instances</span><span class="p">[</span>
+                <span class="n">instance_idx</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># launch cuda graph</span>
+            <span class="n">CUASSERT</span><span class="p">(</span>
+                <span class="n">cudart</span><span class="o">.</span><span class="n">cudaGraphLaunch</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">cuda_graph_instances</span><span class="p">[</span><span class="n">instance_idx</span><span class="p">],</span> <span class="n">stream</span><span class="p">))</span>
+            <span class="n">ok</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">ok</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">_run</span><span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="n">stream</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">ok</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Executing TRT engine failed step=</span><span class="si">{</span><span class="n">step</span><span class="si">}</span><span class="s2">!&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">debug_mode</span><span class="p">:</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+            <span class="c1"># -------------------------------------------</span>
+            <span class="k">if</span> <span class="n">step</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="nb">print</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">debug_buffer</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Step: </span><span class="si">{</span><span class="n">step</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">debug_buffer</span><span class="p">[</span><span class="s1">&#39;transformer.layers.6.mlp_output&#39;</span><span class="p">])</span>
+            <span class="c1"># -------------------------------------------</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="4">
+<li><p>Run <code class="docutils literal notranslate"><span class="pre">../run.py</span></code> with <code class="docutils literal notranslate"><span class="pre">--debug_mode</span></code> and <code class="docutils literal notranslate"><span class="pre">--use_py_session</span></code>.</p></li>
+</ol>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>../run.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--engine_dir<span class="w"> </span>gpt2/trt_engines/fp16/1-gpu<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tokenizer_dir<span class="w"> </span>gpt2<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_output_len<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--debug_mode<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--use_py_session
+</pre></div>
+</div>
+<ol class="arabic simple" start="5">
+<li><p>See the value of the tensor.</p></li>
+</ol>
+<div class="highlight-txt notranslate"><div class="highlight"><pre><span></span>......
+dict_keys([&#39;context_lengths&#39;, &#39;cache_indirection&#39;, &#39;position_ids&#39;, &#39;logits&#39;, &#39;last_token_ids&#39;, &#39;input_ids&#39;, &#39;kv_cache_block_pointers&#39;, &#39;host_kv_cache_block_pointers&#39;, &#39;sequence_length&#39;, &#39;host_past_key_value_lengths&#39;, &#39;host_sink_token_length&#39;, &#39;host_request_types&#39;, &#39;host_max_attention_window_sizes&#39;, &#39;host_context_lengths&#39;, &#39;transformer.layers.0.mlp_output&#39;, &#39;transformer.layers.1.mlp_output&#39;, &#39;transformer.layers.2.mlp_output&#39;, &#39;transformer.layers.3.mlp_output&#39;, &#39;transformer.layers.4.mlp_output&#39;, &#39;transformer.layers.5.mlp_output&#39;, &#39;transformer.layers.6.mlp_output&#39;, &#39;transformer.layers.7.mlp_output&#39;, &#39;transformer.layers.8.mlp_output&#39;, &#39;transformer.layers.9.mlp_output&#39;, &#39;transformer.layers.10.mlp_output&#39;, &#39;transformer.layers.11.mlp_output&#39;, &#39;transformer.layers.12.mlp_output&#39;, &#39;transformer.layers.13.mlp_output&#39;, &#39;transformer.layers.14.mlp_output&#39;, &#39;transformer.layers.15.mlp_output&#39;, &#39;transformer.layers.16.mlp_output&#39;, &#39;transformer.layers.17.mlp_output&#39;, &#39;transformer.layers.18.mlp_output&#39;, &#39;transformer.layers.19.mlp_output&#39;, &#39;transformer.layers.20.mlp_output&#39;, &#39;transformer.layers.21.mlp_output&#39;, &#39;transformer.layers.22.mlp_output&#39;, &#39;transformer.layers.23.mlp_output&#39;])
+Step: 0
+tensor([[ 0.0294, -0.0260, -0.0776,  ..., -0.0560, -0.0235,  0.0273],
+        [-0.0071,  0.5879,  0.1993,  ..., -1.0449, -0.6299,  0.5957],
+        [-0.8779,  0.1050,  0.7090,  ...,  0.0910,  1.0713, -0.2939],
+        ...,
+        [ 0.1212, -0.0903, -0.5918,  ..., -0.1045, -0.3445,  0.1082],
+        [-1.0723, -0.0732,  0.6157,  ...,  0.3452,  0.2998,  0.2649],
+        [-0.7134,  0.9692, -0.1141,  ..., -0.0096,  0.9521,  0.1437]],
+       device=&#39;cuda:0&#39;, dtype=torch.float16)
+Step: 1
+tensor([[-0.2107,  0.5874,  0.8179,  ...,  0.7900, -0.6890,  0.6064]],
+       device=&#39;cuda:0&#39;, dtype=torch.float16)
+Step: 2
+tensor([[ 0.4192, -0.0047,  1.3887,  ..., -0.9028, -0.0682, -0.2820]],
+       device=&#39;cuda:0&#39;, dtype=torch.float16)
+Step: 3
+tensor([[-0.7949, -0.5073, -0.1721,  ..., -0.5830, -0.1378, -0.0070]],
+       device=&#39;cuda:0&#39;, dtype=torch.float16)
+Step: 4
+tensor([[-0.0804,  0.1272, -0.6255,  ..., -0.1072, -0.0523,  0.7144]],
+       device=&#39;cuda:0&#39;, dtype=torch.float16)
+Step: 5
+tensor([[-0.3328, -0.8828,  0.3442,  ...,  0.8149, -0.0630,  1.2305]],
+       device=&#39;cuda:0&#39;, dtype=torch.float16)
+Step: 6
+tensor([[-0.2225, -0.2079, -0.1459,  ..., -0.3555, -0.1672,  0.1135]],
+       device=&#39;cuda:0&#39;, dtype=torch.float16)
+Step: 7
+tensor([[ 0.1290, -0.1556,  0.3977,  ..., -0.8218, -0.3291, -0.8672]],
+       device=&#39;cuda:0&#39;, dtype=torch.float16)
+Input [Text 0]: &quot;Born in north-east France, Soyer trained as a&quot;
+Output [Text 0 Beam 0]: &quot; chef before moving to London in the early&quot;
+</pre></div>
+</div>
+</section>
+<section id="debug-execution-errors">
+<h2>Debug Execution Errors<a class="headerlink" href="#debug-execution-errors" title="Link to this heading">#</a></h2>
+<p>If problems come from plugins, try setting the environment variable <code class="docutils literal notranslate"><span class="pre">CUDA_LAUNCH_BLOCKING=1</span></code> to make kernels launch synchronously with their return status checked immediately.</p>
+<p>If problems come from runtime-shape of the input tensors, double-check the shape (rank and length of each rank) and location (CPU / GPU) of input tensors for the engine obey the build-time setting.</p>
+<p>For example, one possible reason of getting the error information like below is, we use mismatched configuration between engine building and running, including code change (update of repo or users’ rewrting), too large or too small input shape, etc..</p>
+<div class="highlight-txt notranslate"><div class="highlight"><pre><span></span>unexpected shape for input &#39;XXX&#39; for model &#39;YYY&#39;. Expected [-1,-1,-1], got [8,16]. NOTE: Setting a non-zero max_batch_size in the model config requires a batch dimension to be prepended to each input shape. If you want to specify the full shape including the batch dim in your input dims config, try setting max_batch_size to zero. See the model configuration docs for more info on max_batch_size.
+
+[TensorRT-LLM][ERROR] Assertion failed: Tensor &#39;input_ids&#39; has invalid shape (8192), expected (-1) (/code/tensorrt_llm/cpp/tensorrt_llm/runtime/tllmRuntime.cpp:149)
+
+RuntimeError: Sizes of tensors must match except in dimension 0. Expected size 8192 but got size 1024 for tensor number 1 in the list.
+</pre></div>
+</div>
+<p>By setting environment variable <code class="docutils literal notranslate"><span class="pre">export</span> <span class="pre">TLLM_LOG_LEVEL=TRACE</span></code>, we can get more information about the TensorRT engine and context at runtime.</p>
+<p>Before the first forward computation, the shapes of all input / output tensors and their corresponding allowed ranges are provided in a table like:</p>
+<div class="highlight-txt notranslate"><div class="highlight"><pre><span></span>[TensorRT-LLM][TRACE] Information of engine input / output.
+[TensorRT-LLM][TRACE] =====================================================================
+[TensorRT-LLM][TRACE]              Name              |I/O|Location|DataType|    Shape     |
+[TensorRT-LLM][TRACE] ---------------------------------------------------------------------
+[TensorRT-LLM][TRACE] input_ids                      | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] position_ids                   | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] last_token_ids                 | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] kv_cache_block_offsets         | I |  GPU   | INT32  |(1, -1, 2, -1)|
+[TensorRT-LLM][TRACE] host_kv_cache_block_offsets    | I |  GPU   | INT32  |(1, -1, 2, -1)|
+[TensorRT-LLM][TRACE] host_kv_cache_pool_pointers    | I |  GPU   | INT64  |    (1, 2)    |
+[TensorRT-LLM][TRACE] host_kv_cache_pool_mapping     | I |  GPU   | INT32  |     (28)     |
+[TensorRT-LLM][TRACE] sequence_length                | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] host_request_types             | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] host_past_key_value_lengths    | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] context_lengths                | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] host_runtime_perf_knobs        | I |  GPU   | INT64  |     (16)     |
+[TensorRT-LLM][TRACE] host_context_lengths           | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] host_max_attention_window_sizes| I |  GPU   | INT32  |     (28)     |
+[TensorRT-LLM][TRACE] host_sink_token_length         | I |  GPU   | INT32  |     (1)      |
+[TensorRT-LLM][TRACE] cache_indirection              | I |  GPU   | INT32  | (-1, 1, -1)  |
+[TensorRT-LLM][TRACE] logits                         | O |  GPU   |  FP32  | (-1, 65024)  |
+[TensorRT-LLM][TRACE] =====================================================================
+[TensorRT-LLM][TRACE] Information of optimization profile.
+[TensorRT-LLM][TRACE] Optimization Profile 0:
+[TensorRT-LLM][TRACE] =============================================================================
+[TensorRT-LLM][TRACE]              Name              |     Min      |     Opt      |     Max      |
+[TensorRT-LLM][TRACE] -----------------------------------------------------------------------------
+[TensorRT-LLM][TRACE] input_ids                      |     (1)      |     (8)      |    (8192)    |
+[TensorRT-LLM][TRACE] position_ids                   |     (1)      |     (8)      |    (8192)    |
+[TensorRT-LLM][TRACE] last_token_ids                 |     (1)      |     (4)      |     (8)      |
+[TensorRT-LLM][TRACE] kv_cache_block_offsets         | (1, 1, 2, 1) |(1, 4, 2, 16) |(1, 8, 2, 32) |
+[TensorRT-LLM][TRACE] host_kv_cache_block_offsets    | (1, 1, 2, 1) |(1, 4, 2, 16) |(1, 8, 2, 32) |
+[TensorRT-LLM][TRACE] host_kv_cache_pool_pointers    |    (1, 2)    |    (1, 2)    |    (1, 2)    |
+[TensorRT-LLM][TRACE] host_kv_cache_pool_mapping     |     (28)     |     (28)     |     (28)     |
+[TensorRT-LLM][TRACE] sequence_length                |     (1)      |     (4)      |     (8)      |
+[TensorRT-LLM][TRACE] host_request_types             |     (1)      |     (4)      |     (8)      |
+[TensorRT-LLM][TRACE] host_past_key_value_lengths    |     (1)      |     (4)      |     (8)      |
+[TensorRT-LLM][TRACE] context_lengths                |     (1)      |     (4)      |     (8)      |
+[TensorRT-LLM][TRACE] host_runtime_perf_knobs        |     (16)     |     (16)     |     (16)     |
+[TensorRT-LLM][TRACE] host_context_lengths           |     (1)      |     (4)      |     (8)      |
+[TensorRT-LLM][TRACE] host_max_attention_window_sizes|     (28)     |     (28)     |     (28)     |
+[TensorRT-LLM][TRACE] host_sink_token_length         |     (1)      |     (1)      |     (1)      |
+[TensorRT-LLM][TRACE] cache_indirection              |  (1, 1, 1)   | (4, 1, 1024) | (8, 1, 2048) |
+[TensorRT-LLM][TRACE] logits                         |  (1, 65024)  |  (4, 65024)  |  (8, 65024)  |
+[TensorRT-LLM][TRACE] =============================================================================
+</pre></div>
+</div>
+<p>Before each forward computation, the real shapes of all input / output tensors for TRT engine are provided by a table like:</p>
+<div class="highlight-txt notranslate"><div class="highlight"><pre><span></span>[TensorRT-LLM][TRACE] Information of context input / output.
+[TensorRT-LLM][TRACE] Using Optimization Profile: 0
+[TensorRT-LLM][TRACE] =================================================
+[TensorRT-LLM][TRACE]              Name              |I/O|   Shape    |
+[TensorRT-LLM][TRACE] -------------------------------------------------
+[TensorRT-LLM][TRACE] input_ids                      | I |    (33)    |
+[TensorRT-LLM][TRACE] position_ids                   | I |    (33)    |
+[TensorRT-LLM][TRACE] last_token_ids                 | I |    (3)     |
+[TensorRT-LLM][TRACE] kv_cache_block_offsets         | I |(1, 3, 2, 4)|
+[TensorRT-LLM][TRACE] host_kv_cache_block_offsets    | I |(1, 3, 2, 4)|
+[TensorRT-LLM][TRACE] host_kv_cache_pool_pointers    | I |   (1, 2)   |
+[TensorRT-LLM][TRACE] host_kv_cache_pool_mapping     | I |    (28)    |
+[TensorRT-LLM][TRACE] sequence_length                | I |    (3)     |
+[TensorRT-LLM][TRACE] host_request_types             | I |    (3)     |
+[TensorRT-LLM][TRACE] host_past_key_value_lengths    | I |    (3)     |
+[TensorRT-LLM][TRACE] context_lengths                | I |    (3)     |
+[TensorRT-LLM][TRACE] host_runtime_perf_knobs        | I |    (16)    |
+[TensorRT-LLM][TRACE] host_context_progress          | I |    (1)     |
+[TensorRT-LLM][TRACE] host_context_lengths           | I |    (3)     |
+[TensorRT-LLM][TRACE] host_max_attention_window_sizes| I |    (28)    |
+[TensorRT-LLM][TRACE] host_sink_token_length         | I |    (1)     |
+[TensorRT-LLM][TRACE] cache_indirection              | I |(3, 2, 256) |
+[TensorRT-LLM][TRACE] logits                         | O | (3, 65024) |
+[TensorRT-LLM][TRACE] =================================================
+</pre></div>
+</div>
+</section>
+<section id="tips">
+<h2>Tips<a class="headerlink" href="#tips" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>It’s recommended to add options <code class="docutils literal notranslate"><span class="pre">–shm-size=1g</span> <span class="pre">–ulimit</span> <span class="pre">memlock=-1</span></code> to the
+docker or nvidia-docker run command.  Otherwise you may see NCCL errors when
+running multiple GPU inferences. See
+https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting.html#errors
+for details.</p></li>
+<li><p>When building models, memory-related issues such as</p></li>
+</ul>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="p">[</span><span class="mi">09</span><span class="o">/</span><span class="mi">23</span><span class="o">/</span><span class="mi">2023</span><span class="o">-</span><span class="mi">03</span><span class="p">:</span><span class="mi">13</span><span class="p">:</span><span class="mi">00</span><span class="p">]</span> <span class="p">[</span><span class="n">TRT</span><span class="p">]</span> <span class="p">[</span><span class="n">E</span><span class="p">]</span> <span class="mi">9</span><span class="p">:</span> <span class="n">GPTLMHeadModel</span><span class="o">/</span><span class="n">layers</span><span class="o">/</span><span class="mi">0</span><span class="o">/</span><span class="n">attention</span><span class="o">/</span><span class="n">qkv</span><span class="o">/</span><span class="n">PLUGIN_V2_Gemm_0</span><span class="p">:</span> <span class="n">could</span> <span class="ow">not</span> <span class="n">find</span> <span class="nb">any</span> <span class="n">supported</span> <span class="n">formats</span> <span class="n">consistent</span> <span class="k">with</span> <span class="nb">input</span><span class="o">/</span><span class="n">output</span> <span class="n">data</span> <span class="n">types</span>
+<span class="p">[</span><span class="mi">09</span><span class="o">/</span><span class="mi">23</span><span class="o">/</span><span class="mi">2023</span><span class="o">-</span><span class="mi">03</span><span class="p">:</span><span class="mi">13</span><span class="p">:</span><span class="mi">00</span><span class="p">]</span> <span class="p">[</span><span class="n">TRT</span><span class="p">]</span> <span class="p">[</span><span class="n">E</span><span class="p">]</span> <span class="mi">9</span><span class="p">:</span> <span class="p">[</span><span class="n">pluginV2Builder</span><span class="o">.</span><span class="n">cpp</span><span class="p">::</span><span class="n">reportPluginError</span><span class="p">::</span><span class="mi">24</span><span class="p">]</span> <span class="n">Error</span> <span class="n">Code</span> <span class="mi">9</span><span class="p">:</span> <span class="n">Internal</span> <span class="n">Error</span> <span class="p">(</span><span class="n">GPTLMHeadModel</span><span class="o">/</span><span class="n">layers</span><span class="o">/</span><span class="mi">0</span><span class="o">/</span><span class="n">attention</span><span class="o">/</span><span class="n">qkv</span><span class="o">/</span><span class="n">PLUGIN_V2_Gemm_0</span><span class="p">:</span> <span class="n">could</span> <span class="ow">not</span> <span class="n">find</span> <span class="nb">any</span> <span class="n">supported</span> <span class="n">formats</span> <span class="n">consistent</span> <span class="k">with</span> <span class="nb">input</span><span class="o">/</span><span class="n">output</span> <span class="n">data</span> <span class="n">types</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>may happen. One possible solution is to reduce the amount of memory needed by
+reducing the maximum batch size, input and output lengths. Another option is to
+enable plugins, for example: <code class="docutils literal notranslate"><span class="pre">--gpt_attention_plugin</span></code>.</p>
+<ul class="simple">
+<li><p>MPI + Slurm</p></li>
+</ul>
+<p>TensorRT-LLM is a
+<a class="reference external" href="https://en.wikipedia.org/wiki/Message_Passing_Interface">MPI</a>-aware package
+that uses <a class="reference external" href="https://mpi4py.readthedocs.io/en/stable/"><code class="docutils literal notranslate"><span class="pre">mpi4py</span></code></a>. If you are
+running scripts in a <a class="reference external" href="https://slurm.schedmd.com/">Slurm</a> environment, you might
+encounter interferences:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="o">--------------------------------------------------------------------------</span>
+<span class="n">PMI2_Init</span> <span class="n">failed</span> <span class="n">to</span> <span class="n">initialize</span><span class="o">.</span>  <span class="n">Return</span> <span class="n">code</span><span class="p">:</span> <span class="mi">14</span>
+<span class="o">--------------------------------------------------------------------------</span>
+<span class="o">--------------------------------------------------------------------------</span>
+<span class="n">The</span> <span class="n">application</span> <span class="n">appears</span> <span class="n">to</span> <span class="n">have</span> <span class="n">been</span> <span class="n">direct</span> <span class="n">launched</span> <span class="n">using</span> <span class="s2">&quot;srun&quot;</span><span class="p">,</span>
+<span class="n">but</span> <span class="n">OMPI</span> <span class="n">was</span> <span class="ow">not</span> <span class="n">built</span> <span class="k">with</span> <span class="n">SLURM</span><span class="s1">&#39;s PMI support and therefore cannot</span>
+<span class="n">execute</span><span class="o">.</span> <span class="n">There</span> <span class="n">are</span> <span class="n">several</span> <span class="n">options</span> <span class="k">for</span> <span class="n">building</span> <span class="n">PMI</span> <span class="n">support</span> <span class="n">under</span>
+<span class="n">SLURM</span><span class="p">,</span> <span class="n">depending</span> <span class="n">upon</span> <span class="n">the</span> <span class="n">SLURM</span> <span class="n">version</span> <span class="n">you</span> <span class="n">are</span> <span class="n">using</span><span class="p">:</span>
+
+  <span class="n">version</span> <span class="mf">16.05</span> <span class="ow">or</span> <span class="n">later</span><span class="p">:</span> <span class="n">you</span> <span class="n">can</span> <span class="n">use</span> <span class="n">SLURM</span><span class="s1">&#39;s PMIx support. This</span>
+  <span class="n">requires</span> <span class="n">that</span> <span class="n">you</span> <span class="n">configure</span> <span class="ow">and</span> <span class="n">build</span> <span class="n">SLURM</span> <span class="o">--</span><span class="k">with</span><span class="o">-</span><span class="n">pmix</span><span class="o">.</span>
+
+  <span class="n">Versions</span> <span class="n">earlier</span> <span class="n">than</span> <span class="mf">16.05</span><span class="p">:</span> <span class="n">you</span> <span class="n">must</span> <span class="n">use</span> <span class="n">either</span> <span class="n">SLURM</span><span class="s1">&#39;s PMI-1 or</span>
+  <span class="n">PMI</span><span class="o">-</span><span class="mi">2</span> <span class="n">support</span><span class="o">.</span> <span class="n">SLURM</span> <span class="n">builds</span> <span class="n">PMI</span><span class="o">-</span><span class="mi">1</span> <span class="n">by</span> <span class="n">default</span><span class="p">,</span> <span class="ow">or</span> <span class="n">you</span> <span class="n">can</span> <span class="n">manually</span>
+  <span class="n">install</span> <span class="n">PMI</span><span class="o">-</span><span class="mf">2.</span> <span class="n">You</span> <span class="n">must</span> <span class="n">then</span> <span class="n">build</span> <span class="n">Open</span> <span class="n">MPI</span> <span class="n">using</span> <span class="o">--</span><span class="k">with</span><span class="o">-</span><span class="n">pmi</span> <span class="n">pointing</span>
+  <span class="n">to</span> <span class="n">the</span> <span class="n">SLURM</span> <span class="n">PMI</span> <span class="n">library</span> <span class="n">location</span><span class="o">.</span>
+
+<span class="n">Please</span> <span class="n">configure</span> <span class="k">as</span> <span class="n">appropriate</span> <span class="ow">and</span> <span class="k">try</span> <span class="n">again</span><span class="o">.</span>
+<span class="o">--------------------------------------------------------------------------</span>
+</pre></div>
+</div>
+<p>You may experience other problems like hanging on the program startup.</p>
+<p>As a rule of thumb, if you are running TensorRT-LLM interactively on a Slurm
+node, prefix your commands with <code class="docutils literal notranslate"><span class="pre">mpirun</span> <span class="pre">-n</span> <span class="pre">1</span></code> to run TensorRT-LLM in a
+dedicated MPI environment, not the one provided by your Slurm allocation.</p>
+<p>For example: <code class="docutils literal notranslate"><span class="pre">mpirun</span> <span class="pre">-n</span> <span class="pre">1</span> <span class="pre">python3</span> <span class="pre">examples/gpt/build.py</span> <span class="pre">...</span></code></p>
+<p>It’s critical that it’s always <code class="docutils literal notranslate"><span class="pre">-n</span> <span class="pre">1</span></code> regardless of how many GPUs are being used. If you’d use <code class="docutils literal notranslate"><span class="pre">-n</span> <span class="pre">2</span></code> for a 2 GPU program it will not work. <code class="docutils literal notranslate"><span class="pre">mpirun</span></code> here isn’t being used to orchestrate multiple processes, but to invoke the right environment on SLURM. The internal MPI implementation deals with spawning the additional processes.</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../performance/perf-analysis.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Performance Analysis</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="support-matrix.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Support Matrix</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#installation-errors">Installation Errors</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#debug-on-unit-tests">Debug on Unit Tests</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#debug-on-e2e-models">Debug on E2E Models</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#debug-execution-errors">Debug Execution Errors</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tips">Tips</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
