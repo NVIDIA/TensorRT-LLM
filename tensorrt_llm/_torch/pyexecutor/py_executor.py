@@ -20,10 +20,13 @@ import torch
 
 from tensorrt_llm._utils import (global_mpi_rank, is_trace_enabled, nvtx_range,
                                  trace_func)
-from tensorrt_llm.bindings.executor import (FinishReason, InflightBatchingStats,
+from tensorrt_llm.bindings.executor import (DisServingRequestStats,
+                                            FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
+                                            RequestStage, RequestStats,
                                             RequestType, StaticBatchingStats)
-from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
+from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
+                                                          ReqIdsSet)
 from tensorrt_llm.logger import logger
 
 from ..distributed import Distributed
@@ -196,6 +199,7 @@ class PyExecutor:
         self.max_draft_tokens = max_draft_tokens
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
         self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
+        self.enable_iter_req_stats = model_engine.pytorch_backend_config.enable_iter_req_stats
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
@@ -373,10 +377,10 @@ class PyExecutor:
         if self.enable_iter_perf_stats == False:
             return []
 
-        latest_stats = tuple()
+        latest_stats = (IterationStats(), None)
         try:
             self.stats_lock.acquire()
-            latest_stats = tuple(self.stats)
+            latest_stats = self.stats
             self.stats = []
         finally:
             self.stats_lock.release()
@@ -510,8 +514,63 @@ class PyExecutor:
         stats.static_batching_stats = StaticBatchingStats()
         return stats
 
+    def _populate_req_stats(
+            self, finished_requests: List[LlmRequest],
+            active_requests: List[LlmRequest],
+            scheduled_requests: ScheduledRequests
+    ) -> Optional[List[RequestStats]]:
+
+        def get_req_stats(req: LlmRequest) -> RequestStats:
+            req_stat = RequestStats()
+            req_stat.id = req.request_id
+            req_stat.context_prefill_position = req.context_current_position
+            req_stat.num_generated_tokens = req.max_beam_num_tokens - req.orig_prompt_len
+            req_stat.avg_num_decoded_tokens_per_iter = req.avg_decoded_tokens_per_iter
+            req_stat.alloc_total_blocks_per_request = req.alloc_total_blocks
+            req_stat.alloc_new_blocks_per_request = req.alloc_new_blocks
+            req_stat.reused_blocks_per_request = req.reused_blocks
+            req_stat.missed_blocks_per_request = req.missed_blocks
+            req_stat.kv_cache_hit_rate_per_request = req.kv_cache_hit_rate
+            req_stat.scheduled = req in scheduled_requests.context_requests or req in scheduled_requests.generation_requests
+            if req.llm_request_type == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY or req.llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
+                req_stat.dis_serving_stats = DisServingRequestStats()
+                req_stat.dis_serving_stats.kv_cache_transfer_ms = req.kv_cache_transfer_time_ms
+                req_stat.dis_serving_stats.kv_cache_size = req.kv_cache_size
+            return req_stat
+
+        def get_queued_req_stats(req: LlmRequest) -> RequestStats:
+            req_stat = RequestStats()
+            req_stat.id = req.request_id
+            req_stat.context_prefill_position = 0
+            req_stat.num_generated_tokens = 0
+            req_stat.avg_num_decoded_tokens_per_iter = 0
+            req_stat.alloc_total_blocks_per_request = 0
+            req_stat.alloc_new_blocks_per_request = 0
+            req_stat.reused_blocks_per_request = 0
+            req_stat.missed_blocks_per_request = 0
+            req_stat.kv_cache_hit_rate_per_request = 0
+            return req_stat
+
+        req_stats = []
+        for req in active_requests:
+            req_stat = get_req_stats(req)
+            req_stat.stage = req.stage
+            req_stats.append(req_stat)
+
+        for req in list(self.request_queue.queue):
+            req_stat = get_queued_req_stats(req)
+            req.stage = RequestStage.QUEUED
+            req_stats.append(req_stat)
+
+        for req in finished_requests:
+            req_stat = get_req_stats(req)
+            req_stat.stage = RequestStage.GENERATION_COMPLETE
+            req_stats.append(req_stat)
+
+        return req_stats
+
     def _update_iter_stats(self, stats, iter_latency_ms, num_completed_requests,
-                           scheduled_batch):
+                           scheduled_batch) -> IterationStats:
         stats.iter_latency_ms = iter_latency_ms
 
         stats.num_queued_requests = self.request_queue.qsize()
@@ -554,23 +613,34 @@ class PyExecutor:
         stats.inflight_batching_stats.micro_batch_id = 0
         return stats
 
-    def _append_iter_stats(self, stats):
+    def _append_iter_stats(self,
+                           stats: IterationStats,
+                           req_stats: Optional[List[RequestStats]] = None):
+
         try:
             self.stats_lock.acquire()
-            self.stats.append(stats)
+            self.stats.append((stats, req_stats))
         finally:
             self.stats_lock.release()
 
     def _process_iter_stats(self, finished_requests: list[LlmRequest],
+                            active_requests: List[LlmRequest],
                             batch_state: BatchState):
         iter_end_time = time.time()
         iter_latency_ms = iter_end_time - batch_state.iter_start_time
         if batch_state.iter_stats is None:
             return
+
+        req_stats = self._populate_req_stats(
+            finished_requests, active_requests,
+            batch_state.decoder_state.scheduled_requests) if (
+                self.enable_iter_req_stats
+                and self.enable_iter_perf_stats) else None
+
         self._append_iter_stats(
             self._update_iter_stats(
                 batch_state.iter_stats, iter_latency_ms, len(finished_requests),
-                batch_state.decoder_state.scheduled_requests))
+                batch_state.decoder_state.scheduled_requests), req_stats)
 
     def _executor_loop_cleanup(self):
         with self.response_cv:
@@ -677,7 +747,9 @@ class PyExecutor:
                 self._gather_dp_requests_num()
 
                 if self.enable_iter_perf_stats and previous_batch is not None:
-                    self._process_iter_stats(finished_requests, previous_batch)
+                    self._process_iter_stats(finished_requests,
+                                             self.active_requests,
+                                             previous_batch)
         self._executor_loop_cleanup()
 
     def _executor_loop_pp_overlap(self):
@@ -815,7 +887,9 @@ class PyExecutor:
                 self._gather_dp_requests_num()
 
                 if self.enable_iter_perf_stats and previous_batch is not None:
-                    self._process_iter_stats(finished_requests, previous_batch)
+                    self._process_iter_stats(finished_requests,
+                                             self.active_requests,
+                                             previous_batch)
         self._executor_loop_cleanup()
 
     def _executor_loop(self):
@@ -921,7 +995,7 @@ class PyExecutor:
                     iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                         'num_ctx_tokens']
                     self._process_iter_stats(
-                        finished_requests,
+                        finished_requests, self.active_requests,
                         BatchState(decoder_state=DecoderState(
                             scheduled_requests=scheduled_batch),
                                    iter_stats=iter_stats,
@@ -1099,7 +1173,8 @@ class PyExecutor:
             self._add_kv_cache_events()
 
         if self.enable_iter_perf_stats:
-            self._process_iter_stats(finished_requests, self.previous_batch)
+            self._process_iter_stats(finished_requests, self.active_requests,
+                                     self.previous_batch)
 
     @nvtx_range("_forward_step_inter_pp")
     def _forward_step_inter_pp(self, scheduled_batch) -> DecoderState:

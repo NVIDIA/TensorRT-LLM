@@ -86,15 +86,20 @@ public:
     }
 
     //! Mandatory parameters
-    TensorPtr ids;     // [batchSize, beamWidth, maxInputLength + maxNewTokens], on gpu
-    TensorPtr lengths; // [batchSize, beamWidth], on gpu
+    //! [batchSize, beamWidth, maxInputLength + maxNewTokens], on gpu
+    TensorPtr ids;
+    //! [batchSize, beamWidth], on gpu
+    TensorPtr lengths;
 
     //! Optional parameters
-    TensorPtr cumLogProbs;      // [batchSize, beamWidth], on gpu
-    TensorPtr logProbs;         // [batchSize, beamWidth, maxInputLength + maxNewTokens], on gpu
-    TensorPtr contextLogits;    // [packedSize, vocabSizePadded] if packed
-                                // [batchSize, maxInputLength, vocabSizePadded] if not, on gpu
-    TensorPtr generationLogits; // [batchSize, beamWidth, maxOutputLength, vocabSizePadded], on gpu
+    //! [batchSize, beamWidth], on gpu
+    TensorPtr cumLogProbs;
+    //! [batchSize, beamWidth, maxInputLength + maxNewTokens], on gpu
+    TensorPtr logProbs;
+    //! // [packedSize, vocabSizePadded] if packed [batchSize, maxInputLength, vocabSizePadded] if not, on gpu
+    TensorPtr contextLogits;
+    //! // [batchSize, beamWidth, maxOutputLength, vocabSizePadded], on gpu
+    TensorPtr generationLogits;
 
     //! Callbacks
     Callback onTokenGenerated;

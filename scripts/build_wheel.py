@@ -157,6 +157,43 @@ def setup_conan(scripts_dir, venv_python):
     return venv_conan
 
 
+def apply_torch_nvtx3_workaround(venv_python: Path):
+    """Workaround for nvtx3 path detection in PyTorch's CMake files."""
+    try:
+        # Get site-packages directory
+        result = check_output(
+            f'"{venv_python}" -c "import site; print(site.getsitepackages()[0])"',
+            shell=True,
+            text=True)
+        site_packages = Path(result.strip())
+        torch_dir = site_packages / "torch"
+
+        if not torch_dir.exists():
+            print(f"Not found torch installation for patching NVTX3 workaround")
+            return
+
+        # Define patterns and their corresponding messages
+        replacement_patterns = [
+            ("find_path(nvtx3_dir NAMES nvtx3)",
+             "Applying NVTX3 workaround to {cmake_file}"),
+            ('find_path(nvtx3_dir NAMES nvtx3 PATHS "${PROJECT_SOURCE_DIR}/third_party/NVTX/c/include" NO_DEFAULT_PATH)',
+             "Applying additional NVTX3 workaround to {cmake_file}")
+        ]
+
+        replacement = "find_path(nvtx3_dir NAMES nvtx3 PATHS ${CUDA_INCLUDE_DIRS})"
+
+        for search_pattern, message_template in replacement_patterns:
+            for cmake_file in torch_dir.rglob("*.cmake"):
+                content = cmake_file.read_text()
+                if search_pattern in content:
+                    print(message_template.format(cmake_file=cmake_file))
+                    new_content = content.replace(search_pattern, replacement)
+                    cmake_file.write_text(new_content)
+
+    except Exception as e:
+        print(f"Failed to apply NVTX3 workaround: {e}")
+
+
 def main(*,
          build_type: str = "Release",
          generator: str = "",
@@ -206,6 +243,11 @@ def main(*,
     # Setup venv and install requirements
     venv_python, venv_conan = setup_venv(project_dir,
                                          project_dir / requirements_filename)
+
+    # Workaround for torch nvtx3 find_path not work issue with CUDA 12.9.
+    # See https://github.com/pytorch/pytorch/pull/147418.
+    apply_torch_nvtx3_workaround(Path(sys.executable))
+    apply_torch_nvtx3_workaround(venv_python)
 
     # Ensure base TRT is installed (check inside the venv)
     reqs = check_output([str(venv_python), "-m", "pip", "freeze"])

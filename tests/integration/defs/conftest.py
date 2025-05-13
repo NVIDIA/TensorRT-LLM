@@ -1758,6 +1758,8 @@ def star_attention_input_root(llm_root):
 def parametrize_with_ids(argnames: str | Sequence[str],
                          argvalues: Iterable[ParameterSet | Sequence[object]
                                              | object], **kwargs):
+    """An alternative to pytest.mark.parametrize with automatically generated test ids.
+    """
     if isinstance(argnames, str):
         argname_list = [n.strip() for n in argnames.split(",")]
     else:
@@ -1772,15 +1774,10 @@ def parametrize_with_ids(argnames: str | Sequence[str],
             case_argvalues = (case_argvalues, )
         assert len(case_argvalues) == len(argname_list)
 
-        case_id = []
-        for name, value in zip(argname_list, case_argvalues):
-            if value is None:
-                pass
-            elif isinstance(value, bool):
-                if value:
-                    case_id.append(name)
-            else:
-                case_id.append(f"{name}={value}")
+        case_id = [
+            f"{name}={value}"
+            for name, value in zip(argname_list, case_argvalues)
+        ]
         case_ids.append("-".join(case_id))
 
     return pytest.mark.parametrize(argnames, argvalues, ids=case_ids, **kwargs)
