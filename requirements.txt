@@ -51,3 +51,4 @@ xgrammar==0.1.16
 backoff
 nvtx
 matplotlib # FIXME: this is added to make nvtx happy
+h11>=0.16.0 # this addresses security issue
