@@ -18,7 +18,9 @@ BASE_EXAMPLE_CLASSES = {
 }
 
 BASE_PARALLEL_CLASSES = {
-    "tensorrt_llm.auto_parallel.parallelization": ["ParallelConfig"]
+    "tensorrt_llm.auto_parallel.parallelization": ["ParallelConfig"],
+    "tensorrt_llm.auto_parallel.config": ["AutoParallelConfig", "CostModel"],
+    "tensorrt_llm.auto_parallel.simplifier": ["GraphConfig", "StageType"]
 }
 
 

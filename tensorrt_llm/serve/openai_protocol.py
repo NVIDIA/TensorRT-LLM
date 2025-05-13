@@ -14,6 +14,7 @@ from typing_extensions import Annotated, Required, TypedDict
 
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.serialization import register_approved_ipc_class
 
 
 class OpenAIBaseModel(BaseModel):
