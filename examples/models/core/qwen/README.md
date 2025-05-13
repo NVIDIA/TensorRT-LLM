@@ -597,8 +597,6 @@ TensorRT-LLM now supports Qwen3, the latest version of the Qwen model series. Th
 - Qwen3-30B-A3B
 - Qwen3-235B-A22B
 
-Note: Qwen3 models are only supported on Blackwell, Hopper and Ada Lovelace architectures. They are not supported on Ampere and older architectures.
-
 Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TensorRT-LLM from source and start a TRT-LLM docker container if needed.
 
 > [!NOTE]
