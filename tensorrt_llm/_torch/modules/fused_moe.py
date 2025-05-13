@@ -733,11 +733,11 @@ class FusedMoE(nn.Module):
         outputs = inputs
         if self.parallel_size > 1 and not self.enable_alltoall:
             if self.use_dp:
-                outputs = reducescatter(inputs,
-                                        self.mapping,
-                                        scatter_dim=0,
-                                        all_rank_split_size=None if
-                                        use_dp_padding else all_rank_num_tokens)
+                outputs = reducescatter(
+                    inputs,
+                    self.mapping,
+                    dim=0,
+                    sizes=None if use_dp_padding else all_rank_num_tokens)
             elif self.reduce_results:
                 outputs = self.all_reduce(inputs)
         return outputs
@@ -822,17 +822,15 @@ class FusedMoE(nn.Module):
                 x, token_selected_experts, token_final_scales = allgather(
                     [x, token_selected_experts, token_final_scales],
                     self.mapping,
-                    gather_dim=0,
-                    all_rank_split_size=None
-                    if use_dp_padding else all_rank_num_tokens)
+                    dim=0,
+                    sizes=None if use_dp_padding else all_rank_num_tokens)
             else:
                 # Fp4 gemm has extra scaling factor
                 x, x_sf, token_selected_experts, token_final_scales = allgather(
                     [x, x_sf, token_selected_experts, token_final_scales],
                     self.mapping,
-                    gather_dim=0,
-                    all_rank_split_size=None
-                    if use_dp_padding else all_rank_num_tokens)
+                    dim=0,
+                    sizes=None if use_dp_padding else all_rank_num_tokens)
                 x_sf = reswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
 
@@ -1145,9 +1143,7 @@ class FusedMoE(nn.Module):
             token_final_scales,
             (0, 0, 0, max_num_token - token_final_scales.shape[0]))
         gathered_token_selected_experts, gathered_token_final_scales = allgather(
-            [token_selected_experts, token_final_scales],
-            self.mapping,
-            gather_dim=0)
+            [token_selected_experts, token_final_scales], self.mapping, dim=0)
         gathered_token_selected_experts = torch.flatten(
             gathered_token_selected_experts.contiguous(),
             start_dim=0,

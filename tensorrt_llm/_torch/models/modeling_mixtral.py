@@ -68,11 +68,10 @@ class MixtralMoE(nn.Module):
             # FP4 all_gather moves this bf16 allgather in to after topk and fp4 quantization
             # to reduce allreduce BW
             if disable_fp4_allgather():
-                hidden_states = allgather(
-                    hidden_states,
-                    self.mapping,
-                    gather_dim=0,
-                    all_rank_split_size=all_rank_num_tokens)
+                hidden_states = allgather(hidden_states,
+                                          self.mapping,
+                                          dim=0,
+                                          sizes=all_rank_num_tokens)
             elif not self.experts.is_cutlass() or (not self.experts.has_fp8_qdq
                                                    and self.experts.has_nvfp4):
                 # Use padding when not using the cutlass path or when x_sf in self.experts is not None

@@ -24,12 +24,7 @@ def similar(a, b, threshold=0.9):
 @pytest.mark.parametrize("backend", ["TRTLLM"], ids=["trtllm"])
 @pytest.mark.parametrize("quant", ["bf16"])
 @pytest.mark.parametrize("tp_size", [1, 4], ids=["tp1", "tp4"])
-@pytest.mark.parametrize("enable_attention_dp", [False, True],
-                         ids=["adp_off", "adp_on"])
-@pytest.mark.parametrize("moe_max_num_tokens", [None, 64],
-                         ids=["moe_chunk_off", "moe_chunk_on"])
-def test_deepseek_streaming(model_name, backend, quant, tp_size,
-                            enable_attention_dp, moe_max_num_tokens):
+def test_deepseek_streaming(model_name, backend, quant, tp_size):
     model_path = {
         "bf16": "bf16",
         "fp8": "fp8",
@@ -52,6 +47,13 @@ def test_deepseek_streaming(model_name, backend, quant, tp_size,
 
     if get_total_gpu_memory(0) < 60 * 1024**3:
         pytest.skip(f"Not enough GPU memory to run. {get_total_gpu_memory(0)}")
+
+    if tp_size == 1:
+        enable_attention_dp = False
+        moe_max_num_tokens = None
+    else:
+        enable_attention_dp = True
+        moe_max_num_tokens = 64
 
     prompts = [
         "The president of the United States is",

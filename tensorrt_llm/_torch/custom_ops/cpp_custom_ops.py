@@ -61,11 +61,11 @@ def _register_fake():
         return [norm_out, residual_out]
 
     @torch.library.register_fake("trtllm::allgather")
-    def _(input, all_rank_split_size, group):
-        if all_rank_split_size is None:
+    def _(input, sizes, group):
+        if sizes is None:
             output_shape = (len(group) * input.shape[0], *input.shape[1:])
         else:
-            output_shape = (sum(all_rank_split_size), *input.shape[1:])
+            output_shape = (sum(sizes), *input.shape[1:])
         return input.new_empty(output_shape)
 
     @torch.library.register_fake("trtllm::cublas_scaled_mm")
