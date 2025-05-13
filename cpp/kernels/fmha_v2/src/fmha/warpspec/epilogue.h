@@ -914,13 +914,6 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
             local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 2), local_max_[mi]);
         }
 
-        if constexpr (Kernel_traits::D == 128)
-        {
-            // This gives about 1.03x boost by allowing FFMA/FMULs to be distributed more evenly in the
-            // shadow of MUFU instructions as of CTK 12.4. Future compiler might improve the scheduling
-            // heuristics.
-            asm volatile(".pragma \"next knob FenceCode\";\n" : : : "memory");
-        }
 // Softmax Exp.
 #pragma unroll
         for (int ni = 0; ni < Mma_tile_p::CORES_N; ni++)
