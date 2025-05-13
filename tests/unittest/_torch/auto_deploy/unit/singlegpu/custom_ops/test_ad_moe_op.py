@@ -22,9 +22,9 @@ def setup_moe_test(dtype, num_experts):
     NUM_EXPERTS = num_experts
     TOP_K = 2
 
-    torch.manual_seed(0)
-    torch.cuda.manual_seed(0)
-    x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda() * 0.5
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed(1234)  # seed=0 will fail
+    x = torch.rand(SEQ_LEN, HIDDEN_SIZE, dtype=dtype).cuda() * 0.1
 
     router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS), dtype=torch.float32).cuda()
     routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
@@ -40,9 +40,9 @@ def setup_moe_test(dtype, num_experts):
     fused_w2_weight = torch.empty((NUM_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE), dtype=dtype).cuda()
 
     for expert_id in range(NUM_EXPERTS):
-        w1 = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype).cuda() * 0.5
-        w2 = torch.randn((HIDDEN_SIZE, INTERMEDIATE_SIZE), dtype=dtype).cuda() * 0.5
-        w3 = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype).cuda() * 0.5
+        w1 = torch.rand(INTERMEDIATE_SIZE, HIDDEN_SIZE, dtype=dtype).cuda() * 0.1
+        w2 = torch.rand(HIDDEN_SIZE, INTERMEDIATE_SIZE, dtype=dtype).cuda() * 0.1
+        w3 = torch.rand(INTERMEDIATE_SIZE, HIDDEN_SIZE, dtype=dtype).cuda() * 0.1
 
         weights[f"{expert_id}.w1.weight"] = w1
         weights[f"{expert_id}.w2.weight"] = w2

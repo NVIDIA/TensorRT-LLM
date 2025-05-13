@@ -186,8 +186,9 @@ class HFFactory(ModelFactory):
         # sharded checkpoint
         if os.path.isfile(os.path.join(ckpt_path, "model.safetensors.index.json")):
             _to_maybe_empty(model, device="cpu")
-            with load_state_dict_with_assign():
-                load_sharded_checkpoint(model, ckpt_path, strict=False)
+            load_sharded_checkpoint(model, ckpt_path, strict=False)
+            # with load_state_dict_with_assign():
+            #     load_sharded_checkpoint(model, ckpt_path, strict=False)
             return
 
         # look for a single file in the directory ending with .safetensors or .pt/.pth
@@ -204,8 +205,9 @@ class HFFactory(ModelFactory):
         else:
             raise ValueError(f"No checkpoint found in {ckpt_path}")
 
-        with load_state_dict_with_assign():
-            model.load_state_dict(state_dict, strict=False)
+        model.load_state_dict(state_dict, strict=False, assign=True)
+        # with load_state_dict_with_assign():
+        #     model.load_state_dict(state_dict, strict=False)
 
     def _load_quantization_config(self):
         assert self.ckpt_path
