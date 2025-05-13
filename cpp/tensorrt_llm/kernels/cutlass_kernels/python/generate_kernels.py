@@ -308,16 +308,13 @@ def write_file(launcher_inl_files, operations, output_file):
         f.write(content)
 
 
-from operator import mul, truediv
-
-
 def elementwise(x, y, f):
     return tuple(f(a, b) for (a, b) in zip(x, y))
 
 
 def is_gemm_op_valid_sm100(op):
     # TODO These are much more restricted than theory dictates, investigate if more can be enabled in future
-    tile_m, tile_n, _ = elementwise(op.cta_shape, op.cga_shape, truediv)
+    tile_m, tile_n, _ = op.cta_shape
     cga_m, cga_n, _ = op.cga_shape
 
     # Default shapes
@@ -521,8 +518,6 @@ def calc_shape_mnk_sm100_grouped_gemm(cta_shape_mn, dtype):
     cta_shape_k = max_k_bits // GetDataTypeBits(dtype)
     if dtype == DataType.e4m3 and (cta_shape_mn[1] == 8):
         cta_shape_k = 256
-    if dtype == DataType.e4m3 and (cta_shape_mn[1] == 16):
-        cta_shape_k = 128
     return cta_shape_mn + (cta_shape_k, )
 
 
@@ -595,7 +590,7 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled):
 
     epi_fusions = [
         TrtLlm_EpilogueFusion.epilogue_fusion_none,
-        # TrtLlm_EpilogueFusion.epilogue_fusion_finalize
+        TrtLlm_EpilogueFusion.epilogue_fusion_finalize
     ]
 
     cga_shapes = list(product([1, 2], [1, 2], [1]))
@@ -606,7 +601,6 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled):
     operations = list()
     for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mn, cga_shape in partial_args:
         cta_shape_mnk = calc_shape_mnk_sm100_grouped_gemm(cta_shape_mn, dtype)
-        cga_tile_shape_mnk = elementwise(cta_shape_mnk, cga_shape, mul)
 
         # Ignored
         mainloop_schedule = KernelScheduleType.TmaWarpSpecializedCooperative
@@ -619,8 +613,8 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled):
         for otype in otypes:
             moe_gemm_operation = TrtLlm_GemmLauncher(
                 GemmKind.Grouped, arch, dtype, dtype, dtype, dtype, otype,
-                quant_op, epi_tag, cga_tile_shape_mnk, warp_shape, stages,
-                cga_shape, mainloop_schedule, epi_schedule, epi_fusion)
+                quant_op, epi_tag, cta_shape_mnk, warp_shape, stages, cga_shape,
+                mainloop_schedule, epi_schedule, epi_fusion)
 
             if is_op_valid(moe_gemm_operation):
                 operations.append(moe_gemm_operation)
