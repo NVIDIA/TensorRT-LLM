@@ -166,7 +166,7 @@ def _is_impure_node(node: Node) -> bool:
 def _canonicalize_single_gm(
     gm: GraphModule, shape_prop: bool = False, args_static: Optional[Tuple[Any, ...]] = None
 ) -> GraphModule:
-    # clean up graph
+    # clean up graph (needs to be done repeatedly until no more dead code)
     gm.graph.eliminate_dead_code(is_impure_node=_is_impure_node)
 
     # recompile to propagate all graph changes to the graph module
