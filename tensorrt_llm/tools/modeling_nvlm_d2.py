@@ -41,7 +41,7 @@ class NVLM_D_Model(PreTrainedModel):
     _supports_flash_attn_2 = True
     _no_split_modules = ['InternVisionModel', 'SiglipVisionModel', 'Qwen2DecoderLayer']
 
-    def __init__(self, config: NVLM_D_Config):
+    def __init__(self, config: NVLM_D_Config, use_flash_attn: bool = True):
         super().__init__(config)
 
         assert version_cmp(transformers.__version__, '4.36.2', 'ge')
@@ -53,8 +53,8 @@ class NVLM_D_Model(PreTrainedModel):
         self.downsample_ratio = config.downsample_ratio
         self.ps_version = config.ps_version
         self.image_tag_type = config.image_tag_type
-        config.vision_config.use_flash_attn = True
-        config.llm_config._attn_implementation = 'flash_attention_2'
+        config.vision_config.use_flash_attn = use_flash_attn
+        config.llm_config._attn_implementation = 'flash_attention_2' if use_flash_attn else 'eager'
 
         logger.info(f'num_image_token: {self.num_image_token}')
         logger.info(f'ps_version: {self.ps_version}')

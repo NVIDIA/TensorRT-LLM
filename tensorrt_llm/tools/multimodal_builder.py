@@ -1273,6 +1273,7 @@ def build_qwen2_vl_engine(args):
 def build_cosmos_8b_engine(args):
     model = NVLM_D_Model.from_pretrained(
         args.model_path,
+        use_flash_attn=False,
     )
 
     class RadioWithNeck(torch.nn.Module):
