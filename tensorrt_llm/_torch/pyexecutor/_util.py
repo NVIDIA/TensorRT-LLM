@@ -339,6 +339,9 @@ def create_py_executor_instance(dist,
         if spec_config is not None:
             raise ValueError(
                 "Guided decoding is not supported with speculative decoding.")
+        if pytorch_backend_config.enable_overlap_scheduler:
+            raise ValueError(
+                "Guided decoding is not supported with overlap scheduler.")
 
     logger.info(
         f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}"

@@ -454,7 +454,7 @@ void printArrayInfo(T const* ptr, uint64_t nElement = 1, std::string name = "", 
     if (isDevicePtr)
     {
         tmpVec.resize(nElement);
-        tmp = tmpVec.data();
+        tmp = tmpVec.data(); // Note `data()` is not supported for vector<bool>
         check_cuda_error(cudaMemcpy(tmp, ptr, sizeInByte, cudaMemcpyDeviceToHost));
         cudaDeviceSynchronize();
     }
@@ -626,6 +626,11 @@ __host__ __device__ inline void print_element_(__nv_fp8_e4m3 x)
 }
 #endif
 
+__host__ __device__ inline void print_element_(bool ui)
+{
+    printf("%7" PRIu32 " ", (unsigned int) ui);
+}
+
 __host__ __device__ inline void print_element_(uint8_t ui)
 {
     printf("%7" PRIu32 " ", (unsigned int) ui);
@@ -702,7 +707,7 @@ inline void printMatrix(T const* ptr, int nRow, int nCol, int nStride)
     {
         std::vector<T> tmpVec;
         tmpVec.resize(nRow * nStride);
-        T* tmp = tmpVec.data();
+        T* tmp = tmpVec.data(); // Note `data()` is not supported for vector<bool>
         check_cuda_error(cudaMemcpy(tmp, ptr, sizeInByte, cudaMemcpyDeviceToHost));
         cudaDeviceSynchronize();
         check_cuda_error(cudaGetLastError());

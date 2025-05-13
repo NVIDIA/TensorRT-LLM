@@ -50,6 +50,8 @@ def get_test_config(test_desc, example_dir, test_root):
         "overlap": (2, f"{test_configs_root}/disagg_config_overlap.yaml"),
         "load_balance":
         (4, f"{test_configs_root}/disagg_config_load_balance.yaml"),
+        "cache_aware_balance":
+        (4, f"{test_configs_root}/disagg_config_cache_aware_balance.yaml"),
         "deepseek_v3_lite_fp8":
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite.yaml"
@@ -94,8 +96,6 @@ def get_test_config(test_desc, example_dir, test_root):
         (2,
          f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp_attention_dp_overlap.yaml"
          ),
-        "load_balance":
-        (4, f"{test_configs_root}/disagg_config_load_balance.yaml"),
     }
 
     if test_desc not in config_map:
@@ -123,7 +123,7 @@ def run_disaggregated_test(example_dir,
         str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
         config_file
     ]
-    with open('output_workers', 'w') as f:
+    with open('output_workers.log', 'w') as f:
         workers_proc = subprocess.Popen(workers_cmd,
                                         stdout=f,
                                         stderr=subprocess.STDOUT,
@@ -136,7 +136,7 @@ def run_disaggregated_test(example_dir,
         'trtllm-serve', 'disaggregated', '--server_start_timeout',
         str(server_start_timeout), '-c', config_file
     ]
-    with open('output_disagg', 'w') as f:
+    with open('output_disagg.log', 'w') as f:
         server_proc = subprocess.Popen(server_cmd,
                                        stdout=f,
                                        stderr=subprocess.STDOUT,
@@ -202,13 +202,13 @@ def run_disaggregated_test(example_dir,
     print("------------------")
     print("Workers output:")
     print("------------------")
-    with open('output_workers', 'r') as f:
+    with open('output_workers.log', 'r') as f:
         print(f.read())
 
     print("\n\n------------------")
     print("Disagg server output")
     print("------------------")
-    with open('output_disagg', 'r') as f:
+    with open('output_disagg.log', 'r') as f:
         print(f.read())
 
     kill_disaggregated_processes()
@@ -350,6 +350,26 @@ def test_disaggregated_load_balance(disaggregated_test_root, llm_venv,
 
     run_disaggregated_test(disaggregated_example_root,
                            "load_balance",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_cache_aware_balance(disaggregated_test_root, llm_venv,
+                                           disaggregated_example_root,
+                                           llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "cache_aware_balance",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
 

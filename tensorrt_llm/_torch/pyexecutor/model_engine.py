@@ -2035,6 +2035,7 @@ class PyTorchModelEngine(ModelEngine):
             # Reshape to align w/ the shape used in the TRT backend,
             # so the same logit processors can be used across both backends.
             logits_row = logits_row.view(1, 1, -1)
+            token_ids = [token_ids]
             for lp in logits_processors:
                 lp_params = inspect.signature(lp).parameters
 
