@@ -1137,6 +1137,11 @@ class TestQwen2_0_5BInstruct(CliFlowAccuracyTestHarness):
     def test_auto_dtype(self):
         self.run(dtype='auto')
 
+    @pytest.mark.skip_less_device(4)
+    def test_auto_dtype_cp4(self):
+        "RCCA: https://nvbugs/5170106"
+        self.run(dtype='auto', cp_size=4)
+
     @skip_post_blackwell
     def test_weight_only(self):
         self.run(quant_algo=QuantAlgo.W8A16)
