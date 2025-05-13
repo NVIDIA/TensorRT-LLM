@@ -153,7 +153,14 @@ macro(setup_cuda_architectures)
   set(CMAKE_CUDA_ARCHITECTURES_ORIG "${CMAKE_CUDA_ARCHITECTURES}")
   message(STATUS "GPU architectures: ${CMAKE_CUDA_ARCHITECTURES_ORIG}")
 
-  set(ARCHITECTURES_WITH_KERNELS "80" "86" "89" "90" "100" "120")
+  set(ARCHITECTURES_WITH_KERNELS
+      "80"
+      "86"
+      "89"
+      "90"
+      "100"
+      "120"
+      "121")
   foreach(CUDA_ARCH IN LISTS ARCHITECTURES_WITH_KERNELS)
     if(NOT "${CUDA_ARCH}" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
       add_definitions("-DEXCLUDE_SM_${CUDA_ARCH}")
@@ -161,7 +168,7 @@ macro(setup_cuda_architectures)
     endif()
   endforeach()
 
-  set(ARCHITECTURES_WITH_ACCEL "90" "100" "101" "120")
+  set(ARCHITECTURES_WITH_ACCEL "90" "100" "101" "120" "121")
   unset(CMAKE_CUDA_ARCHITECTURES_NORMALIZED)
   foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
     if("${CUDA_ARCH}" IN_LIST ARCHITECTURES_WITH_ACCEL)

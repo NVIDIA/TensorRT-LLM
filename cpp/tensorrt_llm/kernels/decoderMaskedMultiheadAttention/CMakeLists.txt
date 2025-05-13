@@ -31,7 +31,7 @@ filter_cuda_archs("80" SRC_CPP)
 filter_cuda_archs("86" SRC_CPP)
 filter_cuda_archs("89" SRC_CPP)
 filter_cuda_archs("90" SRC_CPP)
-filter_cuda_archs("120" SRC_CPP)
+# filter_cuda_archs("120" SRC_CPP)
 
 set(basic_heads 32 64 128)
 foreach(HEAD ${basic_heads})
