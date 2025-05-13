@@ -964,24 +964,29 @@ class TestNemotronUltra(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
-    # @pytest.mark.skip_less_device(8)
-    # @pytest.mark.skip_device_not_contain(["H100", "B200"])
-    # @parametrize_with_ids("cuda_graph", [False, True])
-    # @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4), (8, 1, 8)],
-    #                         ids=["tp8", "tp8ep4", "tp8ep8"])
-    # def test_fp8_tp8(self, cuda_graph, tp_size, pp_size, ep_size):
-    #     model_path = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8"
-    #     with LLM(model_path,
-    #             tensor_parallel_size=tp_size,
-    #             pipeline_parallel_size=pp_size,
-    #             moe_expert_parallel_size=ep_size,
-    #             use_cuda_graph=cuda_graph) as llm:
-    #         assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-    #         assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
-    #         task = CnnDailymail(self.MODEL_NAME)
-    #         task.evaluate(llm)
-    #         task = MMLU(self.MODEL_NAME)
-    #         task.evaluate(llm)
+    @pytest.mark.skip(
+        reason=
+        "Temporarily skipping test_fp8_tp8 due to not having FP8 model on scratch."
+    )
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_device_not_contain(["H100", "B200"])
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
+                                                         (8, 1, 8)],
+                             ids=["tp8", "tp8ep4", "tp8ep8"])
+    def test_fp8_tp8(self, cuda_graph, tp_size, pp_size, ep_size):
+        model_path = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8"
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 use_cuda_graph=cuda_graph) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 class TestNemotronH(LlmapiAccuracyTestHarness):
