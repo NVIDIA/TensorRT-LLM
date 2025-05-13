@@ -18,7 +18,7 @@ class TensorParallelMode(str, enum.Enum):
         return 1 if mode == cls.ROW else 0
 
 
-class LinearBaseQuant:
+class BaseQuant:
 
     def __init__(self, quant_config, device):
         self.quant_config = quant_config
@@ -49,12 +49,30 @@ class LinearBaseQuant:
         dst.data.copy_(src)
 
 
-class LinearQDQ(LinearBaseQuant):
+class NoopQuant(BaseQuant):
+
+    def __init__(self, quant_config, device):
+        super().__init__(quant_config, device)
+        self.scale = Parameter(torch.tensor(1.,
+                                            dtype=torch.float32,
+                                            device=device),
+                               requires_grad=False)
+
+    def __call__(self, input):
+        return input, self.scale
+
+    def load_weight(self, weights, tensor_name):
+        scale = self._load_weight_for_name(weights, tensor_name)
+        self._copy(self.scale, scale)
+        self.inv_scale.data = 1.0 / self.scale
+
+
+class QDQ(BaseQuant):
 
     def __init__(self, quant_config, device):
         super().__init__(quant_config, device)
         assert quant_config.layer_quant_mode.has_fp8_qdq(
-        ), "LinearQDQ only support fp8"
+        ), "QDQ only support fp8"
         self.scale = Parameter(torch.tensor(1.,
                                             dtype=torch.float32,
                                             device=device),
@@ -78,7 +96,7 @@ class LinearQDQ(LinearBaseQuant):
         self.inv_scale.data = 1.0 / self.scale
 
 
-class LinearBlockScalesQuant(LinearBaseQuant):
+class BlockScalesQuant(BaseQuant):
 
     def __init__(self, quant_config, device):
         super().__init__(quant_config, device)
@@ -104,7 +122,7 @@ class LinearBlockScalesQuant(LinearBaseQuant):
         self.inv_scale.data = 1.0 / self.scale
 
 
-class LinearNVFP4(LinearBaseQuant):
+class NVFP4(BaseQuant):
 
     def __init__(self, quant_config, device):
         super().__init__(quant_config, device)
@@ -112,12 +130,12 @@ class LinearNVFP4(LinearBaseQuant):
 
         # FP32 per-tensor global scaling factor = 448*6/amax_input
         self.scale = Parameter(torch.tensor([1],
-                                           dtype=torch.float32,
-                                           device=self.device),
+                                            dtype=torch.float32,
+                                            device=self.device),
                                requires_grad=False)
         self.inv_scale = Parameter(torch.tensor([1],
-                                               dtype=torch.float32,
-                                               device=self.device),
+                                                dtype=torch.float32,
+                                                device=self.device),
                                    requires_grad=False)
 
     def __call__(self, input):
@@ -145,10 +163,28 @@ class LinearQuant:
         # TODO: need to make src/target dtype to be parameters.
         if quant_mode:
             if quant_mode.has_fp8_qdq():
-                quant = LinearQDQ(quant_config, device)
+                quant = QDQ(quant_config, device)
             elif quant_mode.has_nvfp4():
-                quant = LinearNVFP4(quant_config, device)
+                quant = NVFP4(quant_config, device)
             elif quant_mode.has_fp8_block_scales():
-                quant = LinearBlockScalesQuant(quant_config, device)
+                quant = BlockScalesQuant(quant_config, device)
+
+        return quant
+
+
+class MoeQuant:
+
+    @staticmethod
+    def create_quantizer(quant_config, device):
+        quant_mode = quant_config.layer_quant_mode if quant_config else None
+        quant = None
+        # TODO: need to make src/target dtype to be parameters.
+        if quant_mode:
+            if quant_mode.has_fp8_qdq():
+                quant = QDQ(quant_config, device)
+            elif quant_mode.has_nvfp4():
+                quant = NVFP4(quant_config, device)
+            elif quant_mode.has_fp8_block_scales():
+                quant = NoopQuant(quant_config, device)
 
         return quant
