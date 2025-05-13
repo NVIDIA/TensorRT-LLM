@@ -63,9 +63,7 @@ def scaled_dot_product_attention_fake(
     query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
 ):
     """Fake implementation of scaled_dot_product_attention."""
-    b, n, s, _ = query.shape
-    v_head_dim = value.shape[-1]
-    return torch.empty(b, n, s, v_head_dim, dtype=query.dtype, device=query.device).contiguous()
+    return torch.empty_like(query.contiguous())
 
 
 @torch.library.custom_op("attention::grouped_sdpa", mutates_args=())
@@ -103,9 +101,7 @@ def grouped_sdpa_fake(
     scale=None,
 ):
     """Fake implementation of grouped SDPA."""
-    b, n, s, _ = query.shape
-    v_head_dim = value.shape[-1]
-    return torch.empty(b, n, s, v_head_dim, dtype=query.dtype, device=query.device).contiguous()
+    return torch.empty_like(query.contiguous())
 
 
 @torch.library.custom_op("attention::bsnd_grouped_sdpa", mutates_args=())
@@ -139,9 +135,7 @@ def bsnd_grouped_sdpa_fake(
     query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
 ):
     """Fake implementation of bnsd grouped SDPA."""
-    b, s, n, _ = query.shape
-    v_head_dim = value.shape[-1]
-    return torch.empty(b, s, n, v_head_dim, dtype=query.dtype, device=query.device).contiguous()
+    return torch.empty_like(query.contiguous())
 
 
 # Function to apply rotary positional embeddings (RoPE)
