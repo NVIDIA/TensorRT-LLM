@@ -17,6 +17,7 @@ from torch.fx.passes.tools_common import legalize_graph
 from torch.utils._pytree import _LEAF_SPEC
 
 from ..utils.logger import ad_logger
+from ..utils.node_utils import is_op
 
 
 def get_buffers_and_params(model: nn.Module) -> Dict[str, torch.Tensor]:
@@ -89,14 +90,26 @@ def lift_to_meta(model: nn.Module, strict_missing: bool = True, strict_unexpecte
         )
 
 
-def named_graphmodules(gm: fx.GraphModule) -> Iterator[Tuple[str, fx.GraphModule]]:
-    """Yield (name, submodule) for every fx.GraphModule inside gm (including gm itself)."""
-    for name, m in gm.named_modules():
-        if isinstance(m, fx.GraphModule):
-            yield name, m
+def named_graphmodules(
+    gm: fx.GraphModule, prefix: str = ""
+) -> Iterator[Tuple[str, fx.GraphModule]]:
+    """
+    Yield (name, GraphModule) for every fx.GraphModule inside gm (including gm itself)
+    in a post-order recursive traversal with children visited in reverse order.
+    """
+    # recurse into children in reverse order
+    for name, child in reversed(list(gm.named_children())):
+        if isinstance(child, fx.GraphModule):
+            sub_prefix = f"{prefix}.{name}" if prefix else name
+            yield from named_graphmodules(child, sub_prefix)
+
+    # finally, yield the current GraphModule
+    yield prefix, gm
 
 
-def _move_single_gm_to_device(gm: GraphModule, device: torch.device) -> None:
+def _move_single_gm_to_device(
+    gm: GraphModule, device: torch.device, recompile_graph: bool = False
+) -> None:
     """Move one GraphModule and its nodes to the specified device in-place.
     Partially inspired by https://github.com/pytorch/pytorch/blob/05cb98f91d49df9eadfcb3fc29bbd1b621d88860/torch/export/passes/__init__.py#L11
     """
@@ -110,9 +123,8 @@ def _move_single_gm_to_device(gm: GraphModule, device: torch.device) -> None:
             kwargs["device"] = device
             node.kwargs = kwargs
 
-        if node.op == "call_function" and node.target in (torch.ops.aten.to.device,):
+        if is_op(node, torch.ops.aten.to.device):
             args = list(node.args)
-            # aten.to.device(tensor, device)
             args[1] = device
             node.args = tuple(args)
 
@@ -121,10 +133,10 @@ def _move_single_gm_to_device(gm: GraphModule, device: torch.device) -> None:
             lambda v: v.to(device) if isinstance(v, torch.Tensor) else v,
             node.meta.get("val"),
         )
-
-    # recompile graph to update self generated codes in subgraph
-    gm.graph.lint()
-    gm.recompile()
+    if recompile_graph:
+        # recompile graph to update self generated codes in subgraph
+        gm.graph.lint()
+        gm.recompile()
 
 
 def move_to_device(gm: fx.GraphModule, device: DeviceLikeType) -> fx.GraphModule:
@@ -133,7 +145,7 @@ def move_to_device(gm: fx.GraphModule, device: DeviceLikeType) -> fx.GraphModule
     device = torch.device(device)
 
     for _, subgm in named_graphmodules(gm):
-        _move_single_gm_to_device(subgm, device)
+        _move_single_gm_to_device(subgm, device, subgm is not gm)
 
 
 def _is_impure_node(node: Node) -> bool:
@@ -188,9 +200,6 @@ def _canonicalize_single_gm(
     # lint the graph
     gm.graph.lint()
 
-    # lint the graph
-    gm.graph.lint()
-
 
 def canonicalize_graph(
     gm: GraphModule, shape_prop: bool = False, args_static: Optional[Tuple[Any, ...]] = None
@@ -213,7 +222,9 @@ def canonicalize_graph(
     ad_logger.debug(f"Before canonicalizing: {gm}")
 
     for _, subgm in named_graphmodules(gm):
-        _canonicalize_single_gm(subgm, shape_prop=shape_prop, args_static=args_static)
+        _canonicalize_single_gm(
+            subgm, shape_prop=shape_prop, args_static=args_static if subgm is gm else None
+        )
 
     ad_logger.debug(f"After canonicalizing: {gm}")
 
