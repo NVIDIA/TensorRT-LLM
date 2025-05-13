@@ -93,7 +93,7 @@ def match_moe_pattern(gm: GraphModule) -> GraphModule:
 def fuse_moe(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     """
     Scan the FX graph and replace all calls to torch.ops.moe.torch_moe with
-    torch.ops.moe.torch_fused_moe.
+    torch.ops.moe.trtllm_fused_moe.
     """
     ad_logger.info("MoE fusion")
     ad_logger.debug("Before MoE fusion: " + str(gm))
