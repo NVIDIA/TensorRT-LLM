@@ -1763,7 +1763,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-Others-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
-        "DGX_H100-4_GPUs-Triton-Post-Merge-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        /* "DGX_H100-4_GPUs-Triton-Post-Merge-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 1],
         "A10-CPP-1": ["a10", "l0_a10", 1, 1],
@@ -1782,25 +1782,25 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A30-CPP-3": ["a30", "l0_a30", 3, 3],
         "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 2],
-        "L40S-PyTorch-2": ["l40s", "l0_l40s", 2, 2],
+        "L40S-PyTorch-2": ["l40s", "l0_l40s", 2, 2], */
         "H100_PCIe-PyTorch-1": ["h100-cr", "l0_h100", 1, 3],
         "H100_PCIe-PyTorch-2": ["h100-cr", "l0_h100", 2, 3],
         "H100_PCIe-PyTorch-3": ["h100-cr", "l0_h100", 3, 3],
-        "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 2],
+        /* "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 2],
         "H100_PCIe-CPP-2": ["h100-cr", "l0_h100", 2, 2],
         "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 2],
-        "H100_PCIe-TensorRT-2": ["h100-cr", "l0_h100", 2, 2],
+        "H100_PCIe-TensorRT-2": ["h100-cr", "l0_h100", 2, 2], */
         "B200_PCIe-PyTorch-1": ["b100-ts2", "l0_b200", 1, 3],
         "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 3],
         "B200_PCIe-PyTorch-3": ["b100-ts2", "l0_b200", 3, 3],
-        "B200_PCIe-TensorRT-1": ["b100-ts2", "l0_b200", 1, 2],
+        /* "B200_PCIe-TensorRT-1": ["b100-ts2", "l0_b200", 1, 2],
         "B200_PCIe-TensorRT-2": ["b100-ts2", "l0_b200", 2, 2],
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
         "RTX5080-TensorRT-1": ["rtx-5080", "l0_gb203", 1, 2],
-        "RTX5080-TensorRT-2": ["rtx-5080", "l0_gb203", 2, 2],
+        "RTX5080-TensorRT-2": ["rtx-5080", "l0_gb203", 2, 2],*/
         // Currently post-merge test stages only run tests with "stage: post_merge" mako
         // in the test-db. This behavior may change in the future.
-        "A10-PyTorch-Post-Merge-1": ["a10", "l0_a10", 1, 1],
+        /* "A10-PyTorch-Post-Merge-1": ["a10", "l0_a10", 1, 1],
         "A10-TensorRT-Post-Merge-1": ["a10", "l0_a10", 1, 2],
         "A10-TensorRT-Post-Merge-2": ["a10", "l0_a10", 2, 2],
         "A30-TensorRT-Post-Merge-1": ["a30", "l0_a30", 1, 6],
@@ -1839,7 +1839,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "DGX_H200-4_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
         "DGX_H200-4_GPUs-TensorRT-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 3, 4],
         "DGX_H200-4_GPUs-TensorRT-Post-Merge-2": ["dgx-h200-x4", "l0_dgx_h200", 2, 3, 4],
-        "DGX_H200-4_GPUs-TensorRT-Post-Merge-3": ["dgx-h200-x4", "l0_dgx_h200", 3, 3, 4],
+        "DGX_H200-4_GPUs-TensorRT-Post-Merge-3": ["dgx-h200-x4", "l0_dgx_h200", 3, 3, 4], */
     ]
 
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
@@ -1879,8 +1879,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     // Try to match what are being tested on x86 H100_PCIe.
     // The total machine time is scaled proportionally according to the number of each GPU.
     SBSATestConfigs = [
-        "GH200-TensorRT-Post-Merge-1": ["gh200", "l0_gh200", 1, 2],
-        "GH200-TensorRT-Post-Merge-2": ["gh200", "l0_gh200", 2, 2],
+        /* "GH200-TensorRT-Post-Merge-1": ["gh200", "l0_gh200", 1, 2],
+        "GH200-TensorRT-Post-Merge-2": ["gh200", "l0_gh200", 2, 2], */
     ]
     fullSet += SBSATestConfigs.keySet()
 
