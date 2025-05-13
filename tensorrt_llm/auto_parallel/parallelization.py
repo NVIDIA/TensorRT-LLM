@@ -11,7 +11,7 @@ import tensorrt as trt
 import torch
 from filelock import FileLock
 
-import tensorrt_llm.executor.serialization as serialization
+import tensorrt_llm.serialization as serialization
 from tensorrt_llm._utils import (str_dtype_to_trt, trt_dtype_to_np,
                                  trt_dtype_to_torch)
 from tensorrt_llm.functional import AllReduceParams, create_allreduce_plugin

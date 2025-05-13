@@ -8,7 +8,7 @@ import torch
 from pydantic import BaseModel
 
 from tensorrt_llm.bindings import executor as tllme
-from tensorrt_llm.executor.serialization import register_approved_ipc_class
+from tensorrt_llm.serialization import register_approved_ipc_class
 
 
 @dataclass(slots=True, kw_only=True)

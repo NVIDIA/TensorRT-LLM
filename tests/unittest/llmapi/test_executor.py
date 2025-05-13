@@ -10,7 +10,7 @@ import pytest
 import torch
 import zmq
 
-import tensorrt_llm.executor.serialization as serialization
+import tensorrt_llm.serialization as serialization
 from tensorrt_llm._utils import mpi_world_size
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (DetokenizedGenerationResultBase,

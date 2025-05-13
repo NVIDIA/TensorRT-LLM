@@ -9,7 +9,7 @@ from typing import Any, Optional
 import zmq
 import zmq.asyncio
 
-import tensorrt_llm.executor.serialization as serialization
+import tensorrt_llm.serialization as serialization
 from tensorrt_llm.logger import logger
 
 from .._utils import nvtx_mark, nvtx_range_debug
