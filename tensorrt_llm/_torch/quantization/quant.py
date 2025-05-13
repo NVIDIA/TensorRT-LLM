@@ -111,13 +111,13 @@ class LinearNVFP4(LinearBaseQuant):
         self.scaling_vector_size = 16
 
         # FP32 per-tensor global scaling factor = 448*6/amax_input
-        self.scale = Parameter(torch.empty([1],
+        self.scale = Parameter(torch.tensor([1],
                                            dtype=torch.float32,
-                                           device=device),
+                                           device=self.device),
                                requires_grad=False)
-        self.inv_scale = Parameter(torch.empty([1],
+        self.inv_scale = Parameter(torch.tensor([1],
                                                dtype=torch.float32,
-                                               device=device),
+                                               device=self.device),
                                    requires_grad=False)
 
     def __call__(self, input):
@@ -130,6 +130,7 @@ class LinearNVFP4(LinearBaseQuant):
 
     def load_weight(self, weights, tensor_name):
         scale = self._load_weight_for_name(weights, tensor_name)
+
         scale = 1.0 / scale
         self._copy(self.scale, scale)
         self.inv_scale.data = self.scale / E2M1_MAX

@@ -470,9 +470,6 @@ class Linear(nn.Module):
                                                      self.tp_size, self.tp_rank,
                                                      self.tp_mode, device)
                     _copy(self.weight_scale, weight_scale)
-                    if INPUT_SCALE_NAME in weights[0]:
-                        _copy(self.input_scale, weights[0][INPUT_SCALE_NAME])
-                        self.inv_input_scale.data = 1.0 / self.input_scale
 
         elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
             assert len(weights) == 3
