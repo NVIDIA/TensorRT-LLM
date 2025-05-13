@@ -1,7 +1,6 @@
 import contextlib
 import copy
 import itertools
-import pickle  # nosec B403
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -12,6 +11,7 @@ import tensorrt as trt
 import torch
 from filelock import FileLock
 
+import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm._utils import (str_dtype_to_trt, trt_dtype_to_np,
                                  trt_dtype_to_torch)
 from tensorrt_llm.functional import AllReduceParams, create_allreduce_plugin
@@ -55,12 +55,13 @@ class ParallelConfig:
 
     def save(self, filename):
         with open(filename, 'wb') as file:
-            pickle.dump(self, file)
+            serialization.dump(self, file)
 
     @staticmethod
     def from_file(filename) -> "ParallelConfig":
         with open(filename, "rb") as file:
-            return pickle.load(file)  # nosec B301
+            return serialization.load(
+                file, approved_imports=serialization.BASE_PARALLEL_CLASSES)
 
     def print_graph_strategy(self, file=None):
         for index, (node_name,
