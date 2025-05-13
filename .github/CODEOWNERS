@@ -6,30 +6,6 @@
 # Without approval from a member of this team, PRs cannot be merged to release branches.
 # * @NVIDIA/trt-llm-release-branch-approval
 
-# Core TensorRT-LLM
-/tensorrt_llm/autotuner.py @hyukn @litaotju
-/tensorrt_llm/pipeline_interface.py @amukkara @chang-l
-
-# Pytorch backend
-/tensorrt_llm/_torch @QiJune @hlu1
-/tensorrt_llm/_torch/attention_backend @yuxianq @hlu1
-/tensorrt_llm/_torch/auto_deploy @lucaslie @suyoggupta
-/tensorrt_llm/_torch/compilation @litaotju @yizhang-nv @liji-nv
-/tensorrt_llm/_torch/custom_ops @yizhang-nv
-/tensorrt_llm/_torch/distributed @yilin-void @yuxianq @hyukn @yizhang-nv @hlu1
-/tensorrt_llm/_torch/peft @byshiue @shaharmor98
-/tensorrt_llm/_torch/pyexecutor @dongxuy04 @HuiGao-NV
-/tensorrt_llm/_torch/speculative @lfr-0531 @mikeiovine
-/tensorrt_llm/_torch/models/modeling_deepseekv3.py @hlu1 @zongfeijing
-/tensorrt_llm/_torch/models/modeling_llama.py @chang-l @mikeiovine
-/tensorrt_llm/_torch/models/modeling_qwen3_moe.py @byshiue
-/tensorrt_llm/_torch/models/modeling_qwen3.py @byshiue
-/tensorrt_llm/_torch/modules/attention.py @yuxianq @hlu1
-/tensorrt_llm/_torch/modules/fused_moe.py @hlu1 @dongxuy04 @zongfeijing @HuiGao-NV
-
-# Examples
-/examples/pytorch @QiJune @hlu1
-
 # The rule below requires that any PR modifying public APIs must be approved by at least one member
 # of the NVIDIA/trt-llm-committed-api-review-committee or NVIDIA/trt-llm-noncommitted-api-review-committee team.
 # This approval is mandatory regardless of other approvals the PR may have received. Without approval

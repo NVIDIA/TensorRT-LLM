@@ -73,7 +73,10 @@ void StopCriteriaLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> con
     auto inputs = std::dynamic_pointer_cast<DecodingInputs>(baseInputs);
     auto outputs = std::dynamic_pointer_cast<BaseDecodingOutputs>(baseOutputs);
 
-    auto const localDecoderDomain = getLocalDecoderDomain(inputs, mDecoderDomain);
+    auto localDecoderDomain = getLocalDecoderDomain(inputs, mDecoderDomain);
+    // Beam width might have been changed in Variable-Beam-Width-Search mode
+    localDecoderDomain.setBeamWidth(baseOutputs->beamWidth);
+
     auto const maxSeqLen = outputs->outputIds->getDimension<-1>();
 
     TLLM_CHECK_WITH_INFO(inputs->stopCriteriaInputs, "stopCriteriaInputs for forward is not set");

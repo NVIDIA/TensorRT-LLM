@@ -29,27 +29,37 @@ def test_tinyllama_logits_processor():
     tinyllama_logits_processor_test_harness(backend="pytorch")
 
 
-@pytest.mark.parametrize("return_context_logits, use_overlap", [
-    (False, False),
-    (False, True),
-])
-def test_llm_get_stats(return_context_logits, use_overlap):
+@pytest.mark.parametrize(
+    "return_context_logits, use_overlap, enable_iter_req_stats", [
+        (False, False, False),
+        (False, False, True),
+        (False, True, False),
+        (False, True, True),
+    ])
+def test_llm_get_stats(return_context_logits, use_overlap,
+                       enable_iter_req_stats):
     llm_get_stats_test_harness(tp_size=1,
                                return_context_logits=return_context_logits,
                                pytorch_backend=True,
-                               use_overlap=use_overlap)
+                               use_overlap=use_overlap,
+                               enable_iter_req_stats=enable_iter_req_stats)
 
 
-@pytest.mark.parametrize("return_context_logits, use_overlap", [
-    (False, False),
-    (False, True),
-])
-def test_llm_get_stats_async(return_context_logits, use_overlap):
+@pytest.mark.parametrize(
+    "return_context_logits, use_overlap, enable_iter_req_stats", [
+        (False, False, False),
+        (False, False, True),
+        (False, True, False),
+        (False, True, True),
+    ])
+def test_llm_get_stats_async(return_context_logits, use_overlap,
+                             enable_iter_req_stats):
     llm_get_stats_async_test_harness(
         tp_size=1,
         return_context_logits=return_context_logits,
         pytorch_backend=True,
-        use_overlap=use_overlap)
+        use_overlap=use_overlap,
+        enable_iter_req_stats=enable_iter_req_stats)
 
 
 @force_ampere

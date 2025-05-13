@@ -64,7 +64,7 @@ trt_llm_release_perf_test:
   - perf/test_perf.py::test_perf[llama_v3.1_8b-cppmanager-exe-plugin_ifb-bfloat16-mp-maxbs:256-input_output_len:128,128-pp:2]
   - perf/test_perf.py::test_perf[t5-bench-float16-input_output_len:128,20-gpus:2]
   - perf/test_perf.py::test_perf[flan_t5_large-bench-float16-input_output_len:128,20-gpus:2]
-  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-bfloat16-input_output_len:128,128-quant:int8_sq-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-bfloat16-input_output_len:128,128-quant:int8-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-bfloat16-input_output_len:128,128-quant:int8_wo-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-bfloat16-input_output_len:128,128-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-streaming-bfloat16-input_output_len:128,128-gpus:2]
@@ -96,9 +96,10 @@ trt_llm_release_perf_test:
   - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-streaming-bfloat16-input_output_len:128,128-gpus:4]
   - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-bfloat16-input_output_len:128,128-gpus:4]
   - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-bfloat16-input_output_len:512,32-gpus:4]
-  - perf/test_perf.py::test_perf[qwen_14b_chat-bench-float16-input_output_len:128,128-gpus:4]
-  - perf/test_perf.py::test_perf[qwen_14b_chat-bench-float16-input_output_len:512,32-gpus:4]
-  - perf/test_perf.py::test_perf[starcoder_15b-bench-pytorch-float16-input_output_len:512,200-gpus:4]
+  - perf/test_perf.py::test_perf[qwen_14b_chat-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128-gpus:4]
+  - perf/test_perf.py::test_perf[qwen_14b_chat-cppmanager-ootb_except_mha-float16-input_output_len:128,128+512,32-gpus:4]
+  - perf/test_perf.py::test_perf[starcoder_15.5b-cppmanager-exe-plugin_ifb-float16-maxbs:1-input_output_len:512,200-reqs:10-gpus:4]
+  - perf/test_perf.py::test_perf[starcoder_15.5b-cppmanager-ootb_except_mha-float16-maxbs:1-input_output_len:512,200-reqs:10-gpus:4]
 
 - condition:
     ranges:
@@ -197,7 +198,6 @@ trt_llm_release_perf_test:
   - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-bfloat16-input_output_len:512,200-quant:fp8-tp:4]
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-tp:4]
   - perf/test_perf.py::test_perf[mixtral_8x22b_v0.1-bench-float16-input_output_len:512,512-quant:fp8-tp:4]
-  - perf/test_perf.py::test_perf[starcoder_15b-bench-pytorch-float16-input_output_len:512,512-quant:fp8-tp:4]
 
 - condition:
     terms:

@@ -12,10 +12,11 @@ _thread_local = threading.local()
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
-    if not hasattr(_thread_local, 'allreduce_workspaces'):
-        _thread_local.allreduce_workspaces = [{}
-                                              for _ in range(mapping.pp_size)]
-    allreduce_workspaces = _thread_local.allreduce_workspaces[mapping.pp_rank]
+    if not hasattr(_thread_local, f'allreduce_workspaces_{mapping.pp_rank}'):
+        setattr(_thread_local, f'allreduce_workspaces_{mapping.pp_rank}', {})
+
+    allreduce_workspaces = getattr(_thread_local,
+                                   f'allreduce_workspaces_{mapping.pp_rank}')
     if mapping not in allreduce_workspaces:
         ipc_buffers, workspace = CustomAllReduceHelper.allocate_allreduce_fusion_workspace(
             mapping,

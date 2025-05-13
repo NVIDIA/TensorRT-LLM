@@ -303,7 +303,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (True, True, True)])
     # Only Hopper and Blackwell MLA kernel supports MTP
     @parametrize_with_ids("mtp_nextn",
-                          [None, pytest.param(2, marks=skip_pre_hopper)])
+                          [0, pytest.param(2, marks=skip_pre_hopper)])
     def test_bfloat16(self, mtp_nextn, attention_dp, cuda_graph,
                       overlap_scheduler):
         # OOM on H100 with default free_gpu_memory_fraction=0.9
@@ -311,10 +311,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)
-        if mtp_nextn is not None and mtp_nextn > 0:
+        mtp_config = None
+        if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-        else:
-            mtp_config = None
         llm = LLM(self.MODEL_PATH,
                   kv_cache_config=kv_cache_config,
                   pytorch_backend_config=pytorch_config,
@@ -333,7 +332,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (True, True, True)])
     # Only Hopper and Blackwell MLA kernel supports MTP
     @parametrize_with_ids("mtp_nextn",
-                          [None, pytest.param(2, marks=skip_pre_hopper)])
+                          [0, pytest.param(2, marks=skip_pre_hopper)])
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
                                                          (2, 2, 1), (1, 4, 1)],
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
@@ -344,10 +343,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)
-        if mtp_nextn is not None and mtp_nextn > 0:
+        mtp_config = None
+        if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-        else:
-            mtp_config = None
         llm = LLM(self.MODEL_PATH,
                   tensor_parallel_size=tp_size,
                   pipeline_parallel_size=pp_size,
@@ -370,7 +368,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (False, False, True, False),
                            (False, False, False, True),
                            (True, True, True, True)])
-    @parametrize_with_ids("mtp_nextn", [None, 2])
+    @parametrize_with_ids("mtp_nextn", [0, 2])
     def test_fp8_block_scales(self, mtp_nextn, fp8kv, attention_dp, cuda_graph,
                               overlap_scheduler):
         # OOM on H100 with default free_gpu_memory_fraction=0.9
@@ -385,10 +383,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             pytorch_config.kv_cache_dtype = "fp8"
 
-        if mtp_nextn is not None and mtp_nextn > 0:
+        mtp_config = None
+        if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-        else:
-            mtp_config = None
 
         llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
                   kv_cache_config=kv_cache_config,
@@ -418,7 +415,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (False, False, True, False),
                            (False, False, False, True),
                            (False, True, True, True), (True, True, True, True)])
-    @parametrize_with_ids("mtp_nextn", [None, 2])
+    @parametrize_with_ids("mtp_nextn", [0, 2])
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
                                                          (2, 2, 1), (1, 4, 1)],
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
@@ -437,10 +434,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             pytorch_config.kv_cache_dtype = "fp8"
 
-        if mtp_nextn is not None and mtp_nextn > 0:
+        mtp_config = None
+        if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-        else:
-            mtp_config = None
 
         llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
                   tensor_parallel_size=tp_size,
@@ -555,7 +551,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("cuda_graph", [False, True])
     @parametrize_with_ids("attention_dp", [False, True])
     @parametrize_with_ids("fp8kv", [False, True])
-    @parametrize_with_ids("mtp_nextn", [None, 2])
+    @parametrize_with_ids("mtp_nextn", [0, 2])
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
                                                          (8, 1, 8)],
                              ids=["tp8", "tp8ep4", "tp8ep8"])
@@ -572,10 +568,9 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             pytorch_config.kv_cache_dtype = "fp8"
 
-        if mtp_nextn is not None and mtp_nextn > 0:
+        mtp_config = None
+        if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-        else:
-            mtp_config = None
         llm = LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-FP4",
                   tensor_parallel_size=tp_size,
                   pipeline_parallel_size=pp_size,
@@ -619,10 +614,9 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             pytorch_config.kv_cache_dtype = "fp8"
 
-        if mtp_nextn is not None and mtp_nextn > 0:
+        mtp_config = None
+        if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-        else:
-            mtp_config = None
         llm = LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1",
                   batch_size=batch_size,
                   tensor_parallel_size=tp_size,

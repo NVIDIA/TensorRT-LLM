@@ -73,35 +73,38 @@ public:
         TLLM_CHECK_WITH_INFO(static_cast<bool>(this->ids), "Invalid ids tensor");
     }
 
-    // mandatory parameters
-    TensorPtr ids;                       // [BS, BM, MSL], contains previously generated token ids for all
-                                         // steps before DecodingInput.step
+    //! Mandatory parameters
+    //! Previously generated token ids for all steps before DecodingInput.step, [BS, BM, MSL]
+    TensorPtr ids;
+    //! The tokens computed during the gatherTree step, [BS, BM, MSL]
+    //! Necessary for "Streaming + Beam Search" mode since beam search kernels store ungathered tokens in `ids`.
+    TensorPtr gatheredIds;
+    //! New tokens at each generated token of maxTokensPerStep, [maxTokensPerStep, BS, BM]
+    TensorPtr newTokensSteps;
+    //! A view of newTokensSteps for the current token, [BS, BM]
+    TensorPtr newTokens;
+    //! A Vector of views on newTokensSteps for each token [BS, BM].
+    std::vector<TensorPtr> newTokensVec;
 
-    TensorPtr gatheredIds;               // [BS, BM, MSL], these are the tokens computed during the gatherTree step
-                                         // When doing beam search and streaming, this second set of tokens is needed
-                                         // due to the beam search kernels assuming ungathered tokens (stored in `ids`).
+    //! Optional parameters
+    //! FinishedState by decoding if any of the stop conditions are met or if DecodingInput.finished is true, [BS, BM]
+    TensorPtr finishReasons;
+    //! The sum of finished sequences per request, in pinned memory, [BS]
+    TensorPtr finishedSum;
 
-    TensorPtr newTokensSteps;            // [maxTokensPerStep, BS, BM] new tokens at each generated token of
-                                         // maxTokensPerStep
-    TensorPtr newTokens;                 // [BS, BM] usually a view of newTokensSteps for the current token
-    std::vector<TensorPtr> newTokensVec; // vector of size maxTokensPerStep with tensor [BS, BM].
-                                         // Vector of views on newTokensSteps for each token
-
-    // optional parameters
-    TensorPtr finishReasons; // [BS, BM], set to FinishedState by decoding if any of the stop conditions are met or if
-                             // DecodingInput.finished is true. In beam search and to determine whether to stop
-                             // according to DecodingInput.sequenceLimitLength
-    TensorPtr finishedSum;   // [BS], the sum of finished sequences per request, in pinned memory
-
-    // mandatory parameters for beam search
-    TensorPtr logProbs;         // [BS, BM, MSL], must be float*
-    TensorPtr cumLogProbs;      // [BS, BM], optional for sampling
-    TensorPtr parentIds;        // [BS, BM, MSL] index of the beam where the previous token is
-    TensorPtr lengths;          // [BS, BM], total sequence lengths including padding
-    TensorPtr cacheIndirection; // [BS, BM, MSL], k/v indirection for next generation step
-
-    TensorPtr logProbsTiled;    // [MSL, BS, BM] Buffer used to store the transpose of the logProbs.
-                                // Needed because the kernels have been written to use that shape.
+    //! Mandatory parameters for Beam Search
+    //! log-probility of generated tokens, [BS, BM, MSL], float
+    TensorPtr logProbs;
+    //! Sum log-probility of all generated tokens, [BS, BM]
+    TensorPtr cumLogProbs;
+    //! Index of the beam where the previous token is, [BS, BM, MSL]
+    TensorPtr parentIds;
+    //! Total sequence lengths including padding, [BS, BM]
+    TensorPtr lengths;
+    //! K/V indirection for next generation step, [BS, BM, MSL]
+    TensorPtr cacheIndirection;
+    //! Buffer used to store the transpose of the logProbs, [MSL, BS, BM]
+    TensorPtr logProbsTiled;
 
     BeamHypotheses beamHypotheses;
 
