@@ -231,6 +231,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
 
 def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
                             executor_config: ExecutorConfig) -> KVCacheManager:
+    kv_cache_manager = None
     if executor_config.pytorch_backend_config.use_kv_cache:
         config = model_engine.model.model_config.pretrained_config
         quant_config = model_engine.model.model_config.quant_config
@@ -256,7 +257,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
             if spec_config is not None:
                 num_hidden_layers += get_num_spec_layers(spec_config)
 
-            return KVCacheManager(
+            kv_cache_manager = KVCacheManager(
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.
                 SELFKONLY,
@@ -276,7 +277,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
             num_layers = config.hybrid_override_pattern.count("*")
             mamba_num_layers = num_mamba_layers = config.hybrid_override_pattern.count(
                 "M")
-            return MambaHybridCacheManager(
+            kv_cache_manager = MambaHybridCacheManager(
                 # mamba cache parameters
                 config.hidden_size,
                 config.ssm_state_size,
@@ -302,7 +303,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
         else:
             if spec_config is not None:
                 num_hidden_layers += get_num_spec_layers(spec_config)
-            return KVCacheManager(
+            kv_cache_manager = KVCacheManager(
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
                 num_layers=num_hidden_layers,
@@ -316,8 +317,11 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
                 num_extra_kv_tokens=0
                 if spec_config is None else spec_config.num_extra_kv_tokens,
             )
-    else:
-        return None
+        # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
+        if model_engine.kv_cache_manager_key == KV_CACHE_MANAGER_KEY:
+            executor_config.max_seq_len = kv_cache_manager.max_seq_len
+
+    return kv_cache_manager
 
 
 def create_py_executor_instance(dist,
