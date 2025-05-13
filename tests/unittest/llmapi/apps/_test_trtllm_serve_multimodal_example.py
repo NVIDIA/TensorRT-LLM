@@ -25,6 +25,7 @@ def temp_extra_llm_api_options_file(request):
         extra_llm_api_options_dict = {
             "kv_cache_config": {
                 "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.6,
             },
             # NOTE: This is for video support.
             "build_config": {
