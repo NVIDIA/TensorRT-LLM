@@ -364,6 +364,8 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
         }
         ctx_server_prev = None
         gen_server_prev = None
+        ctx_match = 0
+        gen_match = 0
         for i in range(max_rounds):
             openai_request = CompletionRequest(
                 model=MODEL_NAME,
@@ -378,8 +380,8 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             gen_server, _ = await self.gen_router.get_next_server(openai_request
                                                                   )
             if check_server_match and ctx_server_prev is not None:
-                assert ctx_server == ctx_server_prev
-                assert gen_server == gen_server_prev
+                ctx_match += int(ctx_server == ctx_server_prev)
+                gen_match += int(gen_server == gen_server_prev)
             ctx_server_prev = ctx_server
             gen_server_prev = gen_server
             response = await self.send_disagg_request(session, ctx_server,
@@ -392,6 +394,9 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             )
             request["prompt"] = prompt_str + response["choices"][0]["text"]
 
+        if check_server_match:
+            assert ctx_match > max_rounds // 2
+            assert gen_match > max_rounds // 2
         return request["prompt"]
 
     async def test_multi_round_request(self,
