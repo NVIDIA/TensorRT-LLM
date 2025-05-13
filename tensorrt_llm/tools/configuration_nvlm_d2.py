@@ -38,13 +38,7 @@ class NVLM_D_Config(PretrainedConfig):
         self.llm_config = AutoConfig.from_pretrained("unsloth/Meta-Llama-3.1-8B-Instruct")
         self.llm_config.vocab_size = 128512
 
-        if vision_projection_config is None:
-            vision_projection_config = {
-                "hidden_size": self.llm_config.hidden_size,
-                "normalization": "LayerNorm",
-            }
-        self.vision_projection_config = VisionProjectionConfig(**vision_projection_config)
-
+        self.vision_projection_config = VisionProjectionConfig(4096, 1280, 4096)
         # Assign configuration values
         self.use_backbone_lora = use_backbone_lora
         self.use_llm_lora = use_llm_lora
@@ -90,4 +84,18 @@ class VisionProjectionConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.vit_hidden_size = vit_hidden_size
         self.llm_hidden_size = llm_hidden_size
+
+    def to_dict(self):
+        """
+        Serializes this instance to a Python dictionary. Overrides the default `PretrainedConfig.to_dict`.
+
+        Returns:
+            Dict[str, Any]: Dictionary of all the attributes that make up this configuration instance.
+        """
+        output = copy.deepcopy(self.__dict__)
+        output['hidden_size'] = self.hidden_size
+        output['vit_hidden_size'] = self.vit_hidden_size
+        output['llm_hidden_size'] = self.llm_hidden_size
+
+        return output
 
