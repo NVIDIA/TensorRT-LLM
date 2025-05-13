@@ -45,6 +45,8 @@ def get_test_config(test_desc, example_dir, test_root):
         "2_ranks_trt_backend":
         (2, f"{test_configs_root}/disagg_config_trt_backend.yaml"),
         "gen_only": (2, f"{test_configs_root}/disagg_config_gen_only.yaml"),
+        "gen_only_trt_backend":
+        (2, f"{test_configs_root}/disagg_config_gen_only_trt_backend.yaml"),
         "4_ranks": (4, f"{test_configs_root}/disagg_config_ctxtp2_gentp1.yaml"),
         "4_ranks_trt_backend":
         (4,
@@ -185,7 +187,7 @@ def run_disaggregated_test(example_dir,
             # due to bug
             output_files.extend(['output_chat.json'])
 
-        if test_desc == "gen_only":
+        if test_desc.startswith("gen_only"):
             continue
 
         for output_file in output_files:
@@ -277,6 +279,28 @@ def test_disaggregated_benchmark_gen_only(disaggregated_test_root,
     env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only",
+                           env=env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_benchmark_gen_only_trt_backend(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    env = llm_venv._new_env.copy()
+    env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
+    run_disaggregated_test(disaggregated_example_root,
+                           "gen_only_trt_backend",
                            env=env,
                            cwd=llm_venv.get_working_directory())
 
