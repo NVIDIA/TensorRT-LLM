@@ -114,6 +114,10 @@ BASE_ZMQ_CLASSES = {
     "tokenizers.models": ["Model"],
 }
 
+BASE_PARALLEL_CLASSES = {
+    "tensorrt_llm.auto_parallel.parallelization": ["ParallelConfig"]
+}
+
 
 def _register_class(dict, obj):
     name = getattr(obj, '__qualname__', None)
