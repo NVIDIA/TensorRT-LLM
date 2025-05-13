@@ -1,12 +1,12 @@
 import copy
 from abc import ABC
-from dataclasses import dataclass
 from enum import Enum
 from typing import Any, List, Mapping
 
 import torch
 from torch.nn import functional as F
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.scaffolding.math_utils import get_digit_majority_vote_result
 from tensorrt_llm.scaffolding.task import (GenerationTask, ScaffoldingOutput,
                                            Task)
@@ -22,6 +22,9 @@ class ScaffoldingOutput:
 
 class Controller(ABC):
 
+    def __init__(self):
+        self.task_collections = {}
+
     def clone(self):
         return copy.deepcopy(self)
 
@@ -36,11 +39,16 @@ class Controller(ABC):
         raise NotImplementedError
 
 
-@dataclass(frozen=True)
 class ParallelProcess:
-    controllers: List[Controller]
-    tasks_list: List[List[Task]]
-    kwargs_list: List[Mapping[str, Any]]
+
+    def __init__(self, controllers: List[Controller],
+                 tasks_list: List[List[Task]], kwargs_list: List[Mapping[str,
+                                                                         Any]]):
+        self.sub_gens = []
+        for controller, tasks, kwargs in zip(controllers, tasks_list,
+                                             kwargs_list):
+            gen = controller.process(tasks, **kwargs)
+            self.sub_gens.append(gen)
 
 
 # Controller runs multiple generation tasks.
@@ -49,18 +57,23 @@ class NativeGenerationController(Controller):
     class WorkerTag(Enum):
         GENERATION = "generation"
 
-    def __init__(self, custom_sampling_params: dict = None):
+    def __init__(self, sampling_params: dict = None):
         super().__init__()
-        self.custom_sampling_params = copy.deepcopy(
-            custom_sampling_params) if custom_sampling_params else None
+        if sampling_params is None:
+            sampling_params = {}
+        for key, value in list(sampling_params.items()):
+            if key not in GenerationTask.__annotations__:
+                logger.warning(
+                    f"{key} is not a supported field for GenerationTask")
+                sampling_params.pop(key)
+        self.sampling_params = sampling_params
 
     def process(self, tasks: List[Task], **kwargs):
         for task in tasks:
             task.worker_tag = self.WorkerTag.GENERATION
-            if self.custom_sampling_params:
-                for key, value in self.custom_sampling_params.items():
-                    if hasattr(task, key) and getattr(task, key) is None:
-                        setattr(task, key, value)
+            for key, value in self.sampling_params.items():
+                if getattr(task, key) is None:
+                    setattr(task, key, value)
 
         yield tasks
 

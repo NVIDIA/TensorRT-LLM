@@ -37,24 +37,32 @@ from ..conftest import llm_models_root
 from ..trt_test_alternative import check_call, exists
 
 
+def compute_theta(num_samples: int,
+                  sigma: float,
+                  alpha: float = 0.05,
+                  beta: float = 0.2):
+    scale = (2 * sigma**2 / num_samples)**0.5
+
+    # Single-tail testing
+    z_alpha = scipy.stats.norm.ppf(alpha)
+    z_beta = scipy.stats.norm.ppf(beta)
+    theta = -(z_alpha + z_beta) * scale
+    return theta
+
+
 def compute_threshold(num_samples: int,
                       ref_accuracy: float,
                       sigma: float,
                       alpha: float = 0.05,
-                      beta: float = 0.2,
                       higher_is_better: bool = True):
     scale = (2 * sigma**2 / num_samples)**0.5
 
     # Single-tail testing
     z_alpha = scipy.stats.norm.ppf(alpha)
     if higher_is_better:
-        threshold = ref_accuracy + z_alpha * scale
+        return ref_accuracy + z_alpha * scale
     else:
-        threshold = ref_accuracy - z_alpha * scale
-
-    z_beta = scipy.stats.norm.ppf(beta)
-    theta = -(z_alpha + z_beta) * scale
-    return threshold, theta
+        return ref_accuracy - z_alpha * scale
 
 
 class AccuracyTask:
@@ -82,7 +90,7 @@ class AccuracyTask:
 
     def __init__(self, model_name: str):
         with open(f"{self.REFERENCE_DIR}/{self.DATASET}.yaml") as f:
-            self.reference = yaml.safe_load(f)[model_name]
+            self.reference: List[dict] = yaml.safe_load(f).get(model_name, [])
 
     def get_num_samples_and_threshold(self, **acc_specs):
         """Get num_samples and threshold via accuracy specifications.
@@ -116,12 +124,12 @@ class AccuracyTask:
         sigma = entry.get("sigma", self.SIGMA)
         num_samples = entry.get("num_samples", self.NUM_SAMPLES)
         higher_is_better = entry.get("higher_is_better", self.HIGHER_IS_BETTER)
-        threshold, theta = compute_threshold(num_samples,
-                                             accuracy,
-                                             sigma=sigma,
-                                             alpha=alpha,
-                                             beta=beta,
-                                             higher_is_better=higher_is_better)
+        theta = compute_theta(num_samples, sigma=sigma, alpha=alpha, beta=beta)
+        threshold = compute_threshold(num_samples,
+                                      accuracy,
+                                      sigma=sigma,
+                                      alpha=alpha,
+                                      higher_is_better=higher_is_better)
         print("===========================================================\n"
               "= ACCURACY HYPOTHESIS TESTING\n"
               "===========================================================\n"
@@ -256,7 +264,7 @@ class MMLU(AccuracyTask):
     DATASET = "mmlu"
     DATASET_DIR = f"{llm_models_root()}/datasets/mmlu"
 
-    ALPHA = 0.01
+    ALPHA = 0.05
     BETA = 0.2
     SIGMA = 50
     NUM_SAMPLES = 4096
@@ -273,7 +281,7 @@ class GSM8K(AccuracyTask):
     DATASET = "gsm8k"
     DATASET_DIR = f"{llm_models_root()}/datasets/openai/gsm8k"
 
-    ALPHA = 0.02
+    ALPHA = 0.05
     BETA = 0.2
     SIGMA = 50
     NUM_SAMPLES = 1319  # Full sample

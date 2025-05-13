@@ -16,6 +16,13 @@ This document shows how to build and run a [Qwen](https://huggingface.co/Qwen) m
     - [Run](#run)
     - [Run models with LoRA](#run-models-with-lora)
     - [Summarization using the Qwen model](#summarization-using-the-qwen-model)
+  - [Qwen3](#qwen3)
+    - [Downloading the Model Weights](#downloading-the-model-weights)
+    - [Quick start](#quick-start)
+      - [Run a single inference](#run-a-single-inference)
+    - [Evaluation](#evaluation)
+    - [Serving](#serving)
+    - [Notes and Troubleshooting](#notes-and-troubleshooting)
   - [Credits](#credits)
 
 ## Overview
@@ -579,34 +586,59 @@ load rouge done
 
 ## Qwen3
 
-TensorRT-LLM now supports Qwen3, the latest version of the Qwen model series. According to the support matrix, TensorRT-LLM provides comprehensive support for various Qwen3 model variants including:
+TensorRT-LLM now supports Qwen3, the latest version of the Qwen model series. This guide walks you through the examples to run the Qwen3 models using NVIDIA's TensorRT-LLM framework with the PyTorch backend. According to the support matrix, TensorRT-LLM provides comprehensive support for various Qwen3 model variants including:
+
+- Qwen3-0.6B
+- Qwen3-1.7B
+- Qwen3-4B
+- Qwen3-8B
+- Qwen3-14B
+- Qwen3-32B
+- Qwen3-30B-A3B
+- Qwen3-235B-A22B
+
+Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TensorRT-LLM from source and start a TRT-LLM docker container if needed.
+
+> [!NOTE]
+> This guide assumes that you replace placeholder values (e.g. `<YOUR_MODEL_DIR>`) with the appropriate paths.
+
+### Downloading the Model Weights
+
+Qwen3 model weights are available on [Hugging Face](https://huggingface.co/Qwen/Qwen3-30B-A3B). To download the weights, execute the following commands (replace `<YOUR_MODEL_DIR>` with the target directory where you want the weights stored):
+
+```bash
+git lfs install
+git clone https://huggingface.co/Qwen/Qwen3-30B-A3B <YOUR_MODEL_DIR>
+```
 
 ### Quick start
 
 #### Run a single inference
 
-To quickly run Qwen3, examples/pytorch/quickstart_advanced.py:
+To quickly run Qwen3, [examples/pytorch/quickstart_advanced.py](../../../pytorch/quickstart_advanced.py):
 
+```bash
 python3 examples/pytorch/quickstart_advanced.py --model_dir Qwen3-30B-A3B/ --kv_cache_fraction 0.6
+```
 
 ### Evaluation
 
 1. Evaluate accuracy on the MMLU dataset:
 
 ```bash
-python -m tensorrt_llm.commands.eval --model=Qwen3-32B/ --tokenizer=Qwen3-32B/ --backend=pytorch mmlu --dataset_path=./datasets/mmlu/
+trtllm-eval --model=Qwen3-32B/ --tokenizer=Qwen3-32B/ --backend=pytorch mmlu --dataset_path=./datasets/mmlu/
 [05/01/2025-13:56:15] [TRT-LLM] [I] MMLU weighted average accuracy: 79.09 (14042)
 ```
 
 ```bash
-python -m tensorrt_llm.commands.eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ --backend=pytorch mmlu --dataset_path=./datasets/mmlu/
+trtllm-eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ --backend=pytorch mmlu --dataset_path=./datasets/mmlu/
 [05/05/2025-11:33:02] [TRT-LLM] [I] MMLU weighted average accuracy: 79.44 (14042)
 ```
 
 2. Evaluate accuracy on GSM8K dataset:
 
 ```bash
-python -m tensorrt_llm.commands.eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ --backend=pytorch gsm8k --dataset_path=./datasets/openai/gsm8k/
+trtllm-eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ --backend=pytorch gsm8k --dataset_path=./datasets/openai/gsm8k/
 [05/05/2025-12:05:40] [TRT-LLM] [I] lm-eval gsm8k results (scores normalized to range 0~100):
 |Tasks|Version|     Filter     |n-shot|  Metric   |   | Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|------:|---|-----:|
@@ -614,6 +646,64 @@ python -m tensorrt_llm.commands.eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30
 |     |       |strict-match    |     5|exact_match|↑  |88.6277|±  |0.8745|
 
 ```
+
+### Serving
+
+To serve the model using `trtllm-serve`:
+
+```bash
+cat >./extra-llm-api-config.yml <<EOF
+pytorch_backend_config:
+    use_cuda_graph: true
+    cuda_graph_padding_enabled: true
+    cuda_graph_batch_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    - 256
+    - 384
+    print_iter_log: true
+    enable_overlap_scheduler: true
+enable_attention_dp: true
+EOF
+
+trtllm-serve \
+  Qwen3-30B-A3B/ \
+  --host localhost \
+  --port 8000 \
+  --backend pytorch \
+  --max_batch_size 161 \
+  --max_num_tokens 1160 \
+  --tp_size 1 \
+  --ep_size 1 \
+  --pp_size 1 \
+  --kv_cache_free_gpu_memory_fraction 0.8 \
+  --extra_llm_api_options ./extra-llm-api-config.yml
+```
+
+To query the server, you can start with a `curl` command:
+```bash
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+      "model": "Qwen3-30B-A3B/",
+      "prompt": "Please describe what is Qwen.",
+      "max_tokens": 12,
+      "temperature": 0
+  }'
+```
+
+
+## Notes and Troubleshooting
+
+- **Model Directory:** Update `<YOUR_MODEL_DIR>` with the actual path where the model weights reside.
+- **GPU Memory:** Adjust `--max_batch_size` and `--max_num_tokens` if you encounter out-of-memory errors.
+- **Configuration Files:** Verify that the configuration files are correctly formatted to avoid runtime issues.
 
 ## Credits
 This Qwen model example exists thanks to Tlntin (TlntinDeng01@gmail.com) and zhaohb (zhaohbcloud@126.com).

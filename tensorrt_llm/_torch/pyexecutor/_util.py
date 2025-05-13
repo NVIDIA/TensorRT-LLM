@@ -1,5 +1,4 @@
 import math
-import os
 import random
 from collections.abc import Iterable
 
@@ -10,14 +9,15 @@ import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_manager import LoraConfig, load_torch_hf_lora
+from tensorrt_llm.lora_manager import (LoraConfig,
+                                       get_default_trtllm_modules_to_hf_modules,
+                                       load_torch_hf_lora)
 from tensorrt_llm.mapping import Mapping
 
 from ..speculative import get_num_spec_layers, get_spec_decoder
 from .decoder import (EarlyStopDecoder, TorchDecoder, TorchStarAttentionDecoder,
                       TRTLLMDecoder)
-from .kv_cache_transceiver import (AttentionTypeCpp, CacheTransBufferManager,
-                                   create_kv_cache_transceiver)
+from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .model_engine import KV_CACHE_MANAGER_KEY, PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
@@ -149,29 +149,6 @@ def get_token_num_for_estimation(executor_config, model_config):
         return None
 
 
-def get_cache_transceiver_prealloc_size(executor_config: ExecutorConfig,
-                                        model_config: PyTorchModelEngine,
-                                        mapping: Mapping):
-    if (os.getenv("TRTLLM_USE_MPI_KVCACHE")
-            or os.getenv("TRTLLM_USE_UCX_KVCACHE")):
-        kv_size_per_token = int(get_cache_size_per_token(model_config, mapping))
-        logger.info(
-            f"get_cache_transceiver_prealloc_size kv_size_per_token: {kv_size_per_token} , executor_config.cache_transceiver_config: {executor_config.cache_transceiver_config}"
-        )
-        if executor_config.cache_transceiver_config is not None:
-            logger.info(
-                f"get_cache_transceiver_prealloc_size executor_config.cache_transceiver_config.max_num_tokens: {executor_config.cache_transceiver_config.max_num_tokens}"
-            )
-            return CacheTransBufferManager.pre_alloc_buffer_size(
-                executor_config.cache_transceiver_config.max_num_tokens,
-                kv_size_per_token)
-        else:
-            return CacheTransBufferManager.pre_alloc_buffer_size(
-                None, kv_size_per_token)
-    else:
-        return 0
-
-
 def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
                                  model_engine: PyTorchModelEngine,
                                  executor_config: ExecutorConfig,
@@ -219,12 +196,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     total_used_bytes = total_gpu_memory - end
     activation_bytes = torch_peak_memory - model_bytes
     extra_cost = max(total_used_bytes - torch_used_bytes, 0)
-    kv_cache_transceiver_prealloc_size = get_cache_transceiver_prealloc_size(
-        executor_config, model_engine.model.model_config, mapping)
-    logger.info(
-        f"kv_cache_transceiver_prealloc_size: {kv_cache_transceiver_prealloc_size}"
-    )
-    peak_memory = torch_peak_memory + extra_cost + kv_cache_transceiver_prealloc_size
+    peak_memory = torch_peak_memory + extra_cost
     logger.info(
         f"Memory dynamically allocated during inference (inside torch) in memory usage profiling: {activation_bytes / (GB):.2f} GiB"
     )
@@ -259,6 +231,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
 
 def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
                             executor_config: ExecutorConfig) -> KVCacheManager:
+    kv_cache_manager = None
     if executor_config.pytorch_backend_config.use_kv_cache:
         config = model_engine.model.model_config.pretrained_config
         quant_config = model_engine.model.model_config.quant_config
@@ -284,7 +257,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
             if spec_config is not None:
                 num_hidden_layers += get_num_spec_layers(spec_config)
 
-            return KVCacheManager(
+            kv_cache_manager = KVCacheManager(
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.
                 SELFKONLY,
@@ -304,7 +277,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
             num_layers = config.hybrid_override_pattern.count("*")
             mamba_num_layers = num_mamba_layers = config.hybrid_override_pattern.count(
                 "M")
-            return MambaHybridCacheManager(
+            kv_cache_manager = MambaHybridCacheManager(
                 # mamba cache parameters
                 config.hidden_size,
                 config.ssm_state_size,
@@ -330,7 +303,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
         else:
             if spec_config is not None:
                 num_hidden_layers += get_num_spec_layers(spec_config)
-            return KVCacheManager(
+            kv_cache_manager = KVCacheManager(
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
                 num_layers=num_hidden_layers,
@@ -344,8 +317,11 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
                 num_extra_kv_tokens=0
                 if spec_config is None else spec_config.num_extra_kv_tokens,
             )
-    else:
-        return None
+        # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
+        if model_engine.kv_cache_manager_key == KV_CACHE_MANAGER_KEY:
+            executor_config.max_seq_len = kv_cache_manager.max_seq_len
+
+    return kv_cache_manager
 
 
 def create_py_executor_instance(dist,
@@ -367,6 +343,9 @@ def create_py_executor_instance(dist,
         if spec_config is not None:
             raise ValueError(
                 "Guided decoding is not supported with speculative decoding.")
+        if pytorch_backend_config.enable_overlap_scheduler:
+            raise ValueError(
+                "Guided decoding is not supported with overlap scheduler.")
 
     logger.info(
         f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}"
@@ -380,7 +359,16 @@ def create_py_executor_instance(dist,
 
     if lora_config is not None:
         from tensorrt_llm.bindings import LoraModule
-        load_torch_hf_lora(lora_config)
+
+        if len(lora_config.lora_dir) == 1:
+            load_torch_hf_lora(lora_config)
+        else:
+            assert len(lora_config.lora_target_modules
+                       ) >= 1, "Expecting at least one lora target module"
+            if not bool(lora_config.trtllm_modules_to_hf_modules):
+                lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules(
+                )
+
         model_binding_config = model_engine.model.model_config.get_bindings_model_config(
         )
         lora_modules = LoraModule.create_lora_modules(
@@ -406,9 +394,19 @@ def create_py_executor_instance(dist,
             max_cpu_loras,
         )
 
+        from tensorrt_llm.bindings import WorldConfig
+        world_config = WorldConfig(
+            tensor_parallelism=mapping.tp_size,
+            pipeline_parallelism=mapping.pp_size,
+            context_parallelism=mapping.cp_size,
+            rank=dist.mapping.rank,
+            gpus_per_node=dist.mapping.gpus_per_node,
+        )
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=executor_config.peft_cache_config,
-            model_config=model_binding_config)
+            model_config=model_binding_config,
+            world_config=world_config,
+        )
         resources["peft_cache_manager"] = peft_cache_manager
         model_engine.set_lora_model_config(
             lora_config.lora_target_modules,

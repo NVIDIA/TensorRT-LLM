@@ -92,7 +92,7 @@ def create_py_executor(executor_config: ExecutorConfig,
             pytorch_backend_config,
             batch_size=executor_config.max_batch_size,
             max_num_tokens=executor_config.max_num_tokens,
-            max_seq_len=executor_config.max_seq_len,
+            max_seq_len=model_engine.max_seq_len,
             mapping=mapping,
             attn_runtime_features=attn_runtime_features,
             dist=dist,
@@ -161,10 +161,6 @@ def create_py_executor(executor_config: ExecutorConfig,
             executor_config) if draft_model_engine is not None else None
         resources[KV_CACHE_MANAGER_KEY] = kv_cache_manager
         resources[DRAFT_KV_CACHE_MANAGER_KEY] = draft_kv_cache_manager
-
-    # KVCacheManager modifies these fields, update them to executor_config
-    if kv_cache_manager is not None:
-        executor_config.max_seq_len = kv_cache_manager.max_seq_len
 
     # resource managers for speculative decoding
     if spec_config is not None:
