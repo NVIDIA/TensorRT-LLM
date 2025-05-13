@@ -702,45 +702,54 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
 
     def test_auto_dtype(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)], dtype='auto')
+                        MMLU(self.MODEL_NAME)],
+                 dtype='auto')
 
     @skip_post_blackwell
     def test_smooth_quant(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)], quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN)
+                        MMLU(self.MODEL_NAME)],
+                 quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN)
 
     @skip_post_blackwell
     def test_smooth_quant_ootb(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)], quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL)
+                        MMLU(self.MODEL_NAME)],
+                 quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL)
 
     @skip_post_blackwell
     def test_smooth_quant_ootb_manage_weights(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)], quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL,
+                        MMLU(self.MODEL_NAME)],
+                 quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL,
                  extra_build_args=["--fast_build"])
 
     @skip_post_blackwell
     def test_int4_awq(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)], quant_algo=QuantAlgo.W4A16_AWQ)
+                        MMLU(self.MODEL_NAME)],
+                 quant_algo=QuantAlgo.W4A16_AWQ)
 
     @skip_post_blackwell
     def test_int4_awq_int8_kv_cache(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)], quant_algo=QuantAlgo.W4A16_AWQ,
+                        MMLU(self.MODEL_NAME)],
+                 quant_algo=QuantAlgo.W4A16_AWQ,
                  kv_cache_quant_algo=QuantAlgo.INT8)
 
     @skip_post_blackwell
     def test_int4_awq_manage_weights(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)], quant_algo=QuantAlgo.W4A16_AWQ,
+                        MMLU(self.MODEL_NAME)],
+                 quant_algo=QuantAlgo.W4A16_AWQ,
                  extra_build_args=["--fast_build"])
 
     @skip_pre_ada
     def test_fp8(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)], quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
+                        MMLU(self.MODEL_NAME)],
+                 quant_algo=QuantAlgo.FP8,
+                 kv_cache_quant_algo=QuantAlgo.FP8)
 
     @skip_pre_ada
     @pytest.mark.skip_less_device(2)
@@ -768,7 +777,8 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
             extra_build_args.append("--reduce_fusion=disable")
 
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)], quant_algo=QuantAlgo.FP8,
+                        MMLU(self.MODEL_NAME)],
+                 quant_algo=QuantAlgo.FP8,
                  kv_cache_quant_algo=QuantAlgo.FP8,
                  tp_size=2,
                  extra_build_args=extra_build_args)
@@ -777,7 +787,8 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     def test_fp8_pp2(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)], quant_algo=QuantAlgo.FP8,
+                        MMLU(self.MODEL_NAME)],
+                 quant_algo=QuantAlgo.FP8,
                  kv_cache_quant_algo=QuantAlgo.FP8,
                  pp_size=2)
 
@@ -785,20 +796,23 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
     @skip_post_blackwell
     def test_fp8_rowwise(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)], quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
+                        MMLU(self.MODEL_NAME)],
+                 quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
 
     @skip_pre_ada
     @skip_post_blackwell
     def test_fp8_rowwise_meta_recipe(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)], quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+                        MMLU(self.MODEL_NAME)],
+                 quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
                  extra_acc_spec="meta_recipe",
                  extra_convert_args=["--use_meta_fp8_rowwise_recipe"])
 
     @pytest.mark.parametrize("max_gpu_percent", [0.1, 1.0])
     def test_weight_streaming(self, max_gpu_percent: float):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)], extra_build_args=["--weight_streaming"],
+                        MMLU(self.MODEL_NAME)],
+                 extra_build_args=["--weight_streaming"],
                  extra_summarize_args=["--gpu_weights_percent=0"])
 
         for gpu_percent in [0.1, 0.5, 0.9, 1]:
@@ -809,13 +823,15 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
 
     def test_cyclic_kv_cache(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)], extra_acc_spec="max_attention_window_size=960",
+                        MMLU(self.MODEL_NAME)],
+                 extra_acc_spec="max_attention_window_size=960",
                  extra_summarize_args=["--max_attention_window_size=960"])
 
     @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5166352")
     # TODO: Add MMLU benchmark when restoring the test
     def test_cyclic_kv_cache_beam_search(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME)], extra_acc_spec="max_attention_window_size=960;beam_width=4",
+        self.run(tasks=[CnnDailymail(self.MODEL_NAME)],
+                 extra_acc_spec="max_attention_window_size=960;beam_width=4",
                  extra_build_args=["--max_beam_width=4"],
                  extra_summarize_args=[
                      "--max_attention_window_size=960", "--num_beams=4"
