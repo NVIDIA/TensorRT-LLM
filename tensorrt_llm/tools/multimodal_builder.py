@@ -1271,9 +1271,10 @@ def build_qwen2_vl_engine(args):
                      max_hw_dims=args.max_hw_dims)
 
 def build_cosmos_8b_engine(args):
-    model = NVLM_D_Model.from_pretrained(
+    model = AutoModel.from_pretrained(
         args.model_path,
         use_flash_attn=False,
+        trust_remote_code=True,
     )
 
     class RadioWithNeck(torch.nn.Module):

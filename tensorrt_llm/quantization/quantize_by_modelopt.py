@@ -143,6 +143,7 @@ MODEL_NAME_PATTERN_MAP = {
     "DeepseekForCausalLM": "deepseek",
     "GraniteForCausalLM": "granite",
     "GraniteMoeForCausalLM": "granitemoe",
+    "NVLM_D": "cosmos-nemotron",
 }
 
 MULTIMODAL_DATASETS = ['scienceqa', 'science_qa']
@@ -637,6 +638,13 @@ def quantize_and_export(*,
                                   max_seq_length=tokenizer_max_seq_length,
                                   model_type=model_type,
                                   device=device)
+    elif model_type == "cosmos-nemotron":
+        tokenizer = get_tokenizer(model_dir,
+                                  max_seq_length=tokenizer_max_seq_length,
+                                  model_type=model_type)
+        IMG_CONTEXT_TOKEN = "<image>"
+        img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+        model.img_context_token_id = img_context_token_id
     else:
         tokenizer = get_tokenizer(model_dir,
                                   max_seq_length=tokenizer_max_seq_length,
