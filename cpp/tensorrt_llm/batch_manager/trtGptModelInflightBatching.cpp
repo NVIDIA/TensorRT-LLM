@@ -2192,11 +2192,14 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
             auto const seqLen = sequenceLengthsHostData[seqSlot * mOperatingBeamWidth + beam];
             // Actual number of tokens that should be added to the request.
             auto const numNewOutputTokens = seqLen - llmReq->getNumTokens(beam);
-            TLLM_CHECK_WITH_INFO(numGeneratedTokens >= numNewOutputTokens,
-                "numNewOutputTokens must not be greater than numGeneratedTokens: "
-                "numGeneratedTokens %d < numNewOutputTokens %d",
-                numGeneratedTokens, numNewOutputTokens);
-            numNewTokens[beam] = numNewOutputTokens;
+            if (reqBeamWidth == 1)
+            {
+                TLLM_CHECK_WITH_INFO(numGeneratedTokens >= numNewOutputTokens,
+                    "numNewOutputTokens must not be greater than numGeneratedTokens: "
+                    "numGeneratedTokens %d < numNewOutputTokens %d",
+                    numGeneratedTokens, numNewOutputTokens);
+            }
+            numNewTokens[beam] = std::min(numGeneratedTokens, numNewOutputTokens);
             numDroppedTokens[beam] = numGeneratedTokens - numNewTokens[beam];
             for (SizeType32 step = 0; step < numNewTokens[beam]; ++step)
             {
