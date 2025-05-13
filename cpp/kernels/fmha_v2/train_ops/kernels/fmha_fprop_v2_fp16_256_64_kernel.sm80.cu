@@ -13,54 +13,51 @@
 #include "fused_multihead_attention_fprop.h"
 #include "fused_multihead_attention_fprop_kernel_1xN.h"
 
-using Kernel_traits =
-    fmha::Kernel_traits_v2<fmha::Ampere_hmma_fp32_traits, 256, 64, 16, 1, 4, 1, 0x20u>;
+using Kernel_traits = fmha::Kernel_traits_v2<fmha::Ampere_hmma_fp32_traits, 256, 64, 16, 1, 4, 1, 0x20u>;
 
-template<bool IS_TRAINING>
-__global__ void fmha_fprop_v2_fp16_256_64_sm80_kernel(Fused_multihead_attention_fprop_params params,
-                                                      const int total_heads) {
+template <bool IS_TRAINING>
+__global__ void fmha_fprop_v2_fp16_256_64_sm80_kernel(
+    Fused_multihead_attention_fprop_params params, int const total_heads)
+{
 
     fused_multihead_attention::device_1xN<Kernel_traits, IS_TRAINING>(params, total_heads);
 }
 
-template<bool IS_TRAINING>
-__global__ void
-fmha_fprop_v2_fp16_256_64_sm80_kernel_nl(Fused_multihead_attention_fprop_params params,
-                                         const int num_full_heads,
-                                         const int num_main_groups,
-                                         const int main_group_size,
-                                         const int main_steps,
-                                         const int rest_steps) {
+template <bool IS_TRAINING>
+__global__ void fmha_fprop_v2_fp16_256_64_sm80_kernel_nl(Fused_multihead_attention_fprop_params params,
+    int const num_full_heads, int const num_main_groups, int const main_group_size, int const main_steps,
+    int const rest_steps)
+{
 
     fused_multihead_attention::device_1xN<Kernel_traits, IS_TRAINING>(
         params, num_full_heads, num_main_groups, main_group_size, main_steps, rest_steps);
 }
 
 void run_fmha_v2_fp16_256_64_sm80_(
-    Launch_params<Fused_multihead_attention_fprop_params> &launch_params,
-    const bool configure) {
+    Launch_params<Fused_multihead_attention_fprop_params>& launch_params, bool const configure)
+{
 
     auto kernel = launch_params.is_training ? &fmha_fprop_v2_fp16_256_64_sm80_kernel<true>
                                             : &fmha_fprop_v2_fp16_256_64_sm80_kernel<false>;
 
     constexpr int smem_size = fused_multihead_attention::get_dynamic_smem_size<Kernel_traits>();
 
-    if( smem_size >= 48 * 1024 ) {
-        FMHA_CHECK_CUDA(
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    if (smem_size >= 48 * 1024)
+    {
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     }
 
-    const int sm_count = launch_params.props->multiProcessorCount;
+    int const sm_count = launch_params.props->multiProcessorCount;
     int ctas_per_sm;
-    FMHA_CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &ctas_per_sm, kernel, Kernel_traits::THREADS, smem_size));
+    FMHA_CHECK_CUDA(
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas_per_sm, kernel, Kernel_traits::THREADS, smem_size));
     int total_ctas = sm_count * ctas_per_sm;
 
-    const int heads_total = launch_params.params.b * launch_params.params.h;
-    if( configure ) {
+    int const heads_total = launch_params.params.b * launch_params.params.h;
+    if (configure)
+    {
 
-        using Mma_tile_p =
-            typename Kernel_traits::Traits_p::template Mma_tile<typename Kernel_traits::Cta_tile_p>;
+        using Mma_tile_p = typename Kernel_traits::Traits_p::template Mma_tile<typename Kernel_traits::Cta_tile_p>;
         constexpr size_t STEPS = Kernel_traits::Cta_tile_p::N / Kernel_traits::Cta_tile_p::M;
         constexpr size_t MMAS_M = Mma_tile_p::MMAS_M;
         constexpr size_t MMAS_N = Mma_tile_p::MMAS_N;
@@ -72,62 +69,57 @@ void run_fmha_v2_fp16_256_64_sm80_(
     }
 
     dim3 grid(total_ctas);
-    kernel<<<grid, Kernel_traits::THREADS, smem_size, launch_params.stream>>>(launch_params.params,
-                                                                              heads_total);
+    kernel<<<grid, Kernel_traits::THREADS, smem_size, launch_params.stream>>>(launch_params.params, heads_total);
 
     FMHA_CHECK_CUDA(cudaPeekAtLastError());
 }
 
 void run_fmha_v2_fp16_256_64_sm80_nl_(
-    Launch_params<Fused_multihead_attention_fprop_params> &launch_params,
-    const bool configure) {
+    Launch_params<Fused_multihead_attention_fprop_params>& launch_params, bool const configure)
+{
 
     auto kernel = launch_params.is_training ? &fmha_fprop_v2_fp16_256_64_sm80_kernel_nl<true>
                                             : &fmha_fprop_v2_fp16_256_64_sm80_kernel_nl<false>;
 
     constexpr int smem_size = fused_multihead_attention::get_dynamic_smem_size<Kernel_traits>();
 
-    if( smem_size >= 48 * 1024 ) {
-        FMHA_CHECK_CUDA(
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    if (smem_size >= 48 * 1024)
+    {
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     }
 
-    const int sm_count = launch_params.props->multiProcessorCount;
+    int const sm_count = launch_params.props->multiProcessorCount;
     int ctas_per_sm;
-    FMHA_CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &ctas_per_sm, kernel, Kernel_traits::THREADS, smem_size));
+    FMHA_CHECK_CUDA(
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas_per_sm, kernel, Kernel_traits::THREADS, smem_size));
     int total_ctas = sm_count * ctas_per_sm;
 
-    if( configure ) {
-        const int heads_total = launch_params.params.b * launch_params.params.h;
-        std::tie(launch_params.num_full_heads,
-                 launch_params.num_main_groups,
-                 launch_params.heads_last_wave,
-                 launch_params.main_steps,
-                 launch_params.rest_steps,
-                 launch_params.elts_per_thread) =
-            work_dist<Kernel_traits>(launch_params.params.s, total_ctas, heads_total);
+    if (configure)
+    {
+        int const heads_total = launch_params.params.b * launch_params.params.h;
+        std::tie(launch_params.num_full_heads, launch_params.num_main_groups, launch_params.heads_last_wave,
+            launch_params.main_steps, launch_params.rest_steps, launch_params.elts_per_thread)
+            = work_dist<Kernel_traits>(launch_params.params.s, total_ctas, heads_total);
         return;
     }
 
     dim3 grid(total_ctas);
-    kernel<<<grid, Kernel_traits::THREADS, smem_size, launch_params.stream>>>(
-        launch_params.params,
-        launch_params.num_full_heads,
-        launch_params.num_main_groups,
-        launch_params.heads_last_wave,
-        launch_params.main_steps,
-        launch_params.rest_steps);
+    kernel<<<grid, Kernel_traits::THREADS, smem_size, launch_params.stream>>>(launch_params.params,
+        launch_params.num_full_heads, launch_params.num_main_groups, launch_params.heads_last_wave,
+        launch_params.main_steps, launch_params.rest_steps);
 
     FMHA_CHECK_CUDA(cudaPeekAtLastError());
 }
 
 void run_fmha_v2_fp16_256_64_sm80(
-    Launch_params<Fused_multihead_attention_fprop_params> &launch_params,
-    const bool configure) {
-    if( launch_params.is_nl ) {
+    Launch_params<Fused_multihead_attention_fprop_params>& launch_params, bool const configure)
+{
+    if (launch_params.is_nl)
+    {
         run_fmha_v2_fp16_256_64_sm80_nl_(launch_params, configure);
-    } else {
+    }
+    else
+    {
         run_fmha_v2_fp16_256_64_sm80_(launch_params, configure);
     }
 }

@@ -12,18 +12,20 @@
 
 #pragma once
 
-#include <fmha/hopper/utils_warpgroup.h>
-#include <fused_multihead_attention_kernel.h>
-#include <fmha/hopper/kernel_traits.h>
 #include <fmha/gemm.h>
 #include <fmha/hopper/arrive_wait.h>
+#include <fmha/hopper/kernel_traits.h>
+#include <fmha/hopper/utils_warpgroup.h>
+#include <fused_multihead_attention_kernel.h>
 
-namespace fused_multihead_attention {
+namespace fused_multihead_attention
+{
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, typename Params>
-inline __device__ void device_4xN_hopper_nl(const Params &params) {
+template <typename Kernel_traits, typename Params>
+inline __device__ void device_4xN_hopper_nl(Params const& params)
+{
     // The instruction traits for P.
     using Traits_p = typename Kernel_traits::Traits_p;
     // The instruction traits for O.
@@ -66,12 +68,26 @@ inline __device__ void device_4xN_hopper_nl(const Params &params) {
     using Compute_tile_o = typename Kernel_traits::Compute_tile_o;
 
     // Do we use LDGSTS for Q, K or V?
-    enum { USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q };
-    enum { USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K };
-    enum { USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V };
+    enum
+    {
+        USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q
+    };
+
+    enum
+    {
+        USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K
+    };
+
+    enum
+    {
+        USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V
+    };
 
     // Do we use LDGSTS for any of the 3 input matrices.
-    enum { USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V };
+    enum
+    {
+        USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V
+    };
 
     // If either K or V uses LDGSTS, they cannot share a buffer.
     static_assert(!(USE_LDGSTS_K || USE_LDGSTS_V) || !Kernel_traits::SHARE_SMEM_FOR_K_AND_V, "");
@@ -79,27 +95,28 @@ inline __device__ void device_4xN_hopper_nl(const Params &params) {
     // Shared memory.
     extern __shared__ char smem_[];
 
-    char *q_smem_ = &smem_[0];
+    char* q_smem_ = &smem_[0];
     // It is good to make sure the start address of SMEM is 1024B aligned.
     q_smem_ = fmha::align_1024(q_smem_);
-    char *k_smem_ = &q_smem_[Smem_tile_q::BYTES_PER_TILE];
-    char *v_smem_ = &k_smem_[Smem_tile_k::BYTES_PER_TILE];
-    char *o_smem_ = &v_smem_[Smem_tile_v::BYTES_PER_TILE];
-    char *softmax_smem_ = &o_smem_[Smem_tile_o::BYTES_PER_TILE];
+    char* k_smem_ = &q_smem_[Smem_tile_q::BYTES_PER_TILE];
+    char* v_smem_ = &k_smem_[Smem_tile_k::BYTES_PER_TILE];
+    char* o_smem_ = &v_smem_[Smem_tile_v::BYTES_PER_TILE];
+    char* softmax_smem_ = &o_smem_[Smem_tile_o::BYTES_PER_TILE];
 
     // we should make sure that SMEM address is 1024B aligned.
 
     // The loop -- each CTA works on a different loop iteration.
-    const int loop = blockIdx.z;
+    int const loop = blockIdx.z;
     // The block index for the batch.
-    const int bidb = blockIdx.y;
+    int const bidb = blockIdx.y;
     // The block index for the head.
-    const int bidh = blockIdx.x;
+    int const bidh = blockIdx.x;
     // The thread index.
-    const int tidx = threadIdx.x;
+    int const tidx = threadIdx.x;
 
-    const Single_cta<Kernel_traits::VERSION> binfo(params, bidb, bidh, 0, tidx);
-    if( binfo.stop_early(loop) ) {
+    Single_cta<Kernel_traits::VERSION> const binfo(params, bidb, bidh, 0, tidx);
+    if (binfo.stop_early(loop))
+    {
         return;
     }
 
@@ -140,7 +157,8 @@ inline __device__ void device_4xN_hopper_nl(const Params &params) {
     // Push the LDGDEPBAR instruction after the loads for Q and K.
     fmha::ldgdepbar<USE_LDGSTS>();
 
-    if( Smem_tile_v::TRANSPOSE ) {
+    if (Smem_tile_v::TRANSPOSE)
+    {
         // Wait for V to be available in SMEM: up to two ldgsts can be outstanding (q0+k above)
         fmha::depbar_<USE_LDGSTS, 1>();
         __syncthreads();
@@ -149,23 +167,31 @@ inline __device__ void device_4xN_hopper_nl(const Params &params) {
         // Fence to guarantee ordering between STSM and GMMA.
         fmha::fence_view_async_shared();
         // Not needed as we call it for BMM1.
-        //fmha::warpgroup_arrive();
+        // fmha::warpgroup_arrive();
     }
 
     // Store/load P to/from memory (for debugging).
 #if defined(STORE_P)
-    enum { BITS_PER_ELT_P = sizeof(typename Traits_p::Accumulator_type) * 8 };
+    enum
+    {
+        BITS_PER_ELT_P = sizeof(typename Traits_p::Accumulator_type) * 8
+    };
+
     using Gmem_tile_p = fmha::Gmem_tile_ps_hopper<Traits_p, Cta_tile_p, BITS_PER_ELT_P>;
-    char *p_ptr = reinterpret_cast<char *>(params.p_ptr);
+    char* p_ptr = reinterpret_cast<char*>(params.p_ptr);
     p_ptr += loop * Cta_tile_p::M * params.p_stride_in_bytes;
     Gmem_tile_p gmem_p(p_ptr, params.p_stride_in_bytes, params.scale_bmm1, tidx);
 #endif
 
     // Store S to memory (for debugging). NOTE: We use A_type as C_type is int32 for IMMA???
 #if defined(STORE_S)
-    enum { BITS_PER_ELT_S = sizeof(typename Traits_p::A_type) * 8 };
+    enum
+    {
+        BITS_PER_ELT_S = sizeof(typename Traits_p::A_type) * 8
+    };
+
     using Gmem_tile_s = fmha::Gmem_tile_ps_hopper<Traits_p, Cta_tile_p, BITS_PER_ELT_S>;
-    char *s_ptr = reinterpret_cast<char *>(params.s_ptr);
+    char* s_ptr = reinterpret_cast<char*>(params.s_ptr);
     s_ptr += loop * Cta_tile_p::M * params.s_stride_in_bytes;
     Gmem_tile_s gmem_s(s_ptr, params.s_stride_in_bytes, params.scale_softmax, tidx);
 #endif
@@ -177,7 +203,7 @@ inline __device__ void device_4xN_hopper_nl(const Params &params) {
 
     // Make sure the data is in shared memory.
     fmha::depbar<USE_LDGSTS_Q, 2>();
-    __syncthreads();  // At this point, no LDGSTS outstanding (N-2!)
+    __syncthreads(); // At this point, no LDGSTS outstanding (N-2!)
     // GEMM 0.
 
     // Let's try to use compute_tile for now.
@@ -186,11 +212,10 @@ inline __device__ void device_4xN_hopper_nl(const Params &params) {
     // compute_tile for P. ( should take care of the 64x512x64 tile. )
     int warp = tidx / 32;
     int warp_n = warp / 4;
-    //static_assert(Traits_p::GMMA_N == 192);
-    // TODO how to set this up? Also GMMA_N % 8 = 0 to line up with XOR?
-    Compute_tile_p compute_tile_p(q_smem_,
-                                  k_smem_ + warp_n * Cta_tile_p::K * Traits_p::GMMA_N *
-                                                sizeof(typename Traits_p::B_type));
+    // static_assert(Traits_p::GMMA_N == 192);
+    //  TODO how to set this up? Also GMMA_N % 8 = 0 to line up with XOR?
+    Compute_tile_p compute_tile_p(
+        q_smem_, k_smem_ + warp_n * Cta_tile_p::K * Traits_p::GMMA_N * sizeof(typename Traits_p::B_type));
     compute_tile_p.clear();
 
     static_assert(Compute_tile_p::MMAS_N == 1);
@@ -199,7 +224,8 @@ inline __device__ void device_4xN_hopper_nl(const Params &params) {
     // promise to compiler that data are ready in SMEM
     fmha::warpgroup_arrive();
 #pragma unroll
-    for( int mmas_k_idx = 0; mmas_k_idx < Mma_tile_p::MMAS_K - 1; ++mmas_k_idx ) {
+    for (int mmas_k_idx = 0; mmas_k_idx < Mma_tile_p::MMAS_K - 1; ++mmas_k_idx)
+    {
         compute_tile_p.compute(mmas_k_idx);
     }
     // Last GMMA increments score board.
@@ -223,29 +249,37 @@ inline __device__ void device_4xN_hopper_nl(const Params &params) {
     softmax.unpack(compute_tile_p.acc_);
 
     // Apply the mask.
-    if( params.has_alibi ) {
+    if (params.has_alibi)
+    {
         softmax.apply_mask_alibi(mask, bidh, params.alibi_params);
-    } else {
+    }
+    else
+    {
         softmax.apply_mask(mask);
     }
 
     // Make sure we are done reading the data.
     // For Hopper, most likely it is not shared.
-    if( Kernel_traits::SHARE_SMEM_FOR_K_AND_V && loop == 0 ) {
+    if (Kernel_traits::SHARE_SMEM_FOR_K_AND_V && loop == 0)
+    {
         __syncthreads();
     }
 
     float p_max[Softmax::ROWS_PER_THREAD * Softmax::MMAS_M];
     // Enable our trick to use the max for INT8 to scale.
-    if( Kernel_traits::USE_SCALE_MAX ) {
+    if (Kernel_traits::USE_SCALE_MAX)
+    {
         // 16129 == 127 ^ 2.
-        //float p_max = reinterpret_cast<const float&>(params.scale_bmm1) * 16129.f;
-        //softmax.apply_exp(p_max);
-    } else {
+        // float p_max = reinterpret_cast<const float&>(params.scale_bmm1) * 16129.f;
+        // softmax.apply_exp(p_max);
+    }
+    else
+    {
         // Compute the max.
         softmax.template reduce<fmha::Max_>(p_max);
 
-        if( Cta_tile_p::WARPS_N > 1 ) {
+        if (Cta_tile_p::WARPS_N > 1)
+        {
             // Inter warp reduction needed.
             __syncthreads();
         }
@@ -277,9 +311,9 @@ inline __device__ void device_4xN_hopper_nl(const Params &params) {
     Frag_a frag_s[Mma_tile_o::MMAS_K][Mma_tile_o::MMAS_M];
 
     static_assert(Frag_a::NUM_ELTS == 16 * Traits_o::GMMA_K / 32);
-    //static_assert(Mma_tile_o::MMAS_K == 6);
+    // static_assert(Mma_tile_o::MMAS_K == 6);
     static_assert(Mma_tile_o::MMAS_M == 1);
-    //static_assert(Compute_tile_o::MMAS_K == 4);
+    // static_assert(Compute_tile_o::MMAS_K == 4);
 
     // Fill frag_s with the results from softmax
     softmax.pack(frag_s);
@@ -294,7 +328,8 @@ inline __device__ void device_4xN_hopper_nl(const Params &params) {
 
 // Loop over MMAS_M.
 #pragma unroll
-    for( int ii = 0; ii < Gmem_tile_o::LOOPS; ++ii ) {
+    for (int ii = 0; ii < Gmem_tile_o::LOOPS; ++ii)
+    {
 
         // Swizzle the elements and do the final reduction.
         smem_o.store(compute_tile_o.acc_, ii);
@@ -307,7 +342,8 @@ inline __device__ void device_4xN_hopper_nl(const Params &params) {
         smem_o.load(out);
 
         // Make sure the data was read from shared memory.
-        if( ii < Gmem_tile_o::LOOPS - 1 ) {
+        if (ii < Gmem_tile_o::LOOPS - 1)
+        {
             __syncthreads();
         }
 
@@ -315,54 +351,64 @@ inline __device__ void device_4xN_hopper_nl(const Params &params) {
         gmem_o.store(out, ii);
     }
 
-    if( params.softmax_stats_ptr != nullptr ) {
+    if (params.softmax_stats_ptr != nullptr)
+    {
         using Mma_tile = typename Traits_p::template Mma_tile<Cta_tile_o>;
         fmha::Softmax_saver<Cta_tile_o, Mma_tile> saver(params, binfo);
-        //float scale_bmm1 = Kernel_traits::USE_SCALE_MAX ? reinterpret_cast<const float&>(params.scale_bmm1) : 0.0;//TODO
+        // float scale_bmm1 = Kernel_traits::USE_SCALE_MAX ? reinterpret_cast<const float&>(params.scale_bmm1) :
+        // 0.0;//TODO
         saver.store(loop, p_sum, p_max);
     }
 
 #ifdef DEBUG_HAS_PRINT_BUFFER
     int lane = tidx % 32;
     using Acc = fmha::Fragment_accumulator<Traits_o>;
-    float *ptr = reinterpret_cast<float *>(params.print_ptr);
-    float *ptr_o = reinterpret_cast<float *>(o_smem_);
-    if( loop == 0 && warp_n < 2 && lane == 0 ) {
+    float* ptr = reinterpret_cast<float*>(params.print_ptr);
+    float* ptr_o = reinterpret_cast<float*>(o_smem_);
+    if (loop == 0 && warp_n < 2 && lane == 0)
+    {
         ptr[0 + warp_n] = compute_tile_o.acc_[0][0].elt(0);
         ptr[2 + warp_n] = compute_tile_o.acc_[0][0].elt(4);
-        if( warp_n == 0 ) {
-            fmha::e4m3_t *bla = reinterpret_cast<fmha::e4m3_t *>(v_smem_);
+        if (warp_n == 0)
+        {
+            fmha::e4m3_t* bla = reinterpret_cast<fmha::e4m3_t*>(v_smem_);
             float tmp = 0.f;
-            for( int it = 0; it < 128; it++ ) {
+            for (int it = 0; it < 128; it++)
+            {
                 tmp += float(bla[it]);
             }
 
             bla = &bla[64 * 128];
-            for( int it = 0; it < 64; it++ ) {
+            for (int it = 0; it < 64; it++)
+            {
                 tmp += float(bla[it]);
             }
             ptr[4 + warp_n] = tmp / 384.f;
-
-        } else {
-            fmha::e4m3_t *bla = &reinterpret_cast<fmha::e4m3_t *>(v_smem_)[64 * 128 + 64];
+        }
+        else
+        {
+            fmha::e4m3_t* bla = &reinterpret_cast<fmha::e4m3_t*>(v_smem_)[64 * 128 + 64];
             float tmp = 0.f;
 
-            for( int it = 0; it < 64; it++ ) {
+            for (int it = 0; it < 64; it++)
+            {
                 tmp += float(bla[it]);
             }
 
             bla = &bla[64 * 128];
 
-            for( int it = 0; it < 128; it++ ) {
+            for (int it = 0; it < 128; it++)
+            {
                 tmp += float(bla[it]);
             }
 
             ptr[4 + warp_n] = tmp / 384.f;
         }
-        //ptr[4 + warp_n * 2 + 0] = reinterpret_cast<const float&>(out[0].x);
-        //ptr[4 + warp_n * 2 + 1] = reinterpret_cast<const float&>(out[0].y);
+        // ptr[4 + warp_n * 2 + 0] = reinterpret_cast<const float&>(out[0].x);
+        // ptr[4 + warp_n * 2 + 1] = reinterpret_cast<const float&>(out[0].y);
     }
-    if( tidx == 0 && loop == 0 ) {
+    if (tidx == 0 && loop == 0)
+    {
         ptr[6 + 0] = ptr_o[0];
         ptr[6 + 1] = ptr_o[64];
 
@@ -373,8 +419,8 @@ inline __device__ void device_4xN_hopper_nl(const Params &params) {
 
 #endif
 
-}  // kernel
+} // kernel
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace fused_multihead_attention
+} // namespace fused_multihead_attention

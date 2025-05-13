@@ -27,26 +27,32 @@
 /// }));
 /// ```
 /// We need "({" and "})" to make sure that the code is a single argument being passed to the macro.
-#define BOOL_SWITCH(COND, CONST_NAME, F)                                                           \
-    {                                                                                              \
-        if( COND ) {                                                                               \
-            constexpr bool CONST_NAME = true;                                                      \
-            F();                                                                                   \
-        } else {                                                                                   \
-            constexpr bool CONST_NAME = false;                                                     \
-            F();                                                                                   \
-        }                                                                                          \
+#define BOOL_SWITCH(COND, CONST_NAME, F)                                                                               \
+    {                                                                                                                  \
+        if (COND)                                                                                                      \
+        {                                                                                                              \
+            constexpr bool CONST_NAME = true;                                                                          \
+            F();                                                                                                       \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            constexpr bool CONST_NAME = false;                                                                         \
+            F();                                                                                                       \
+        }                                                                                                              \
     }
 
 // modified from BOOL_SWITCH
 // because MSVC cannot handle std::conditional with constexpr variable
-#define FP16_SWITCH(COND, F)                                                                       \
-    {                                                                                              \
-        if( COND ) {                                                                               \
-            using elem_type = __nv_bfloat16;                                                       \
-            F();                                                                                   \
-        } else {                                                                                   \
-            using elem_type = __half;                                                              \
-            F();                                                                                   \
-        }                                                                                          \
+#define FP16_SWITCH(COND, F)                                                                                           \
+    {                                                                                                                  \
+        if (COND)                                                                                                      \
+        {                                                                                                              \
+            using elem_type = __nv_bfloat16;                                                                           \
+            F();                                                                                                       \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            using elem_type = __half;                                                                                  \
+            F();                                                                                                       \
+        }                                                                                                              \
     }

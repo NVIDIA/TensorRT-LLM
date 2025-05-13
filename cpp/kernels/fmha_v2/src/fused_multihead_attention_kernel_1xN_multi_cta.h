@@ -12,15 +12,17 @@
 
 #pragma once
 
-#include <fused_multihead_attention_kernel.h>
-#include <fmha/kernel_traits.h>
 #include <fmha/gemm.h>
+#include <fmha/kernel_traits.h>
+#include <fused_multihead_attention_kernel.h>
 
-namespace fused_multihead_attention {
+namespace fused_multihead_attention
+{
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline __device__ void spin_wait_(int *barrier, int step, int expected) {
+inline __device__ void spin_wait_(int* barrier, int step, int expected)
+{
 
     // THE FOLLOWING CODE MUST BE EXECUTED BY A SINGLE THREAD IN THE CTA.
 
@@ -28,34 +30,39 @@ inline __device__ void spin_wait_(int *barrier, int step, int expected) {
     asm volatile("red.release.gpu.global.add.s32 [%0], %1;" ::"l"(barrier), "r"(step));
 
     // Busy wait. We could use found = old + step with old = atomicAdd(...) but it's not faster.
-    for( int found = -1; found != expected; ) {
+    for (int found = -1; found != expected;)
+    {
         asm volatile("ld.global.acquire.gpu.b32 %0, [%1];" : "=r"(found) : "l"(barrier));
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, typename Functor, typename Params>
-inline __device__ float
-reduce(float x, const Params &params, int *barrier, int bidx, int bidn, int tidx, bool inc) {
+template <typename Kernel_traits, typename Functor, typename Params>
+inline __device__ float reduce(float x, Params const& params, int* barrier, int bidx, int bidn, int tidx, bool inc)
+{
 
     // The M dimension of the CTA tile.
-    enum { M = Kernel_traits::Cta_tile_p::M };
+    enum
+    {
+        M = Kernel_traits::Cta_tile_p::M
+    };
 
     // Make sure it does not exceed the CTA size.
     static_assert(M <= Kernel_traits::Cta_tile_p::THREADS_PER_CTA, "");
 
     // The offset to beginning of the scratch space for that head.
-    const int offset = bidx * Kernel_traits::CTAS_PER_HEAD * M + tidx;
+    int const offset = bidx * Kernel_traits::CTAS_PER_HEAD * M + tidx;
 
     // The scratch buffer for that thread.
-    float *scratch_ptr = Functor::IS_SUM ? params.sum_scratch_ptr : params.max_scratch_ptr;
+    float* scratch_ptr = Functor::IS_SUM ? params.sum_scratch_ptr : params.max_scratch_ptr;
 
     // Move to the beginning of the buffer.
     scratch_ptr += offset;
 
     // Active threads store their elements to global memory.
-    if( tidx < M ) {
+    if (tidx < M)
+    {
         scratch_ptr[bidn * M] = x;
     }
 
@@ -65,7 +72,8 @@ reduce(float x, const Params &params, int *barrier, int bidx, int bidn, int tidx
     int expected = inc ? Kernel_traits::CTAS_PER_HEAD : 0;
 
     // Make sure the data is in memory.
-    if( tidx == 0 ) {
+    if (tidx == 0)
+    {
         spin_wait_(barrier, step, expected);
     }
 
@@ -73,13 +81,16 @@ reduce(float x, const Params &params, int *barrier, int bidx, int bidn, int tidx
     __syncthreads();
 
     // Load the element from memory.
-    if( bidn > 0 && tidx < M ) {
+    if (bidn > 0 && tidx < M)
+    {
         x = *scratch_ptr;
     }
 
     // Each CTA does the parallel reduction of values.
-    for( int ii = 1; ii < Kernel_traits::CTAS_PER_HEAD; ++ii ) {
-        if( tidx < M ) {
+    for (int ii = 1; ii < Kernel_traits::CTAS_PER_HEAD; ++ii)
+    {
+        if (tidx < M)
+        {
             x = Functor::apply(x, scratch_ptr[ii * M]);
         }
     }
@@ -90,28 +101,34 @@ reduce(float x, const Params &params, int *barrier, int bidx, int bidn, int tidx
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<int CTAS_PER_HEAD>
-inline __device__ void acquire_lock_(int *lock, int bidn, int tidx) {
+template <int CTAS_PER_HEAD>
+inline __device__ void acquire_lock_(int* lock, int bidn, int tidx)
+{
 
     // THE FOLLOWING CODE MUST BE EXECUTED BY A SINGLE THREAD IN THE CTA.
 
     // Poll.
-    for( int found = -1; found != bidn; ) {
+    for (int found = -1; found != bidn;)
+    {
         asm volatile("ld.global.acquire.gpu.b32 %0, [%1];" : "=r"(found) : "l"(lock));
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<int CTAS_PER_HEAD>
-inline __device__ void release_lock_(int *lock, int bidn, int tidx) {
+template <int CTAS_PER_HEAD>
+inline __device__ void release_lock_(int* lock, int bidn, int tidx)
+{
 
     // THE FOLLOWING CODE MUST BE EXECUTED BY A SINGLE THREAD IN THE CTA.
 
     // Update the global counter. The last CTA resets the counter.
-    if( bidn == CTAS_PER_HEAD - 1 ) {
+    if (bidn == CTAS_PER_HEAD - 1)
+    {
         asm volatile("st.global.release.gpu.b32 [%0], 0;" ::"l"(lock));
-    } else {
+    }
+    else
+    {
         // atomicAdd(lock, 1);
         asm volatile("red.release.gpu.global.add.s32 [%0], 1;" ::"l"(lock));
     }
@@ -119,8 +136,9 @@ inline __device__ void release_lock_(int *lock, int bidn, int tidx) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, typename Params>
-inline __device__ void device_1xN_multi_cta(const Params &params) {
+template <typename Kernel_traits, typename Params>
+inline __device__ void device_1xN_multi_cta(Params const& params)
+{
 
     // The instruction traits.
     using Traits_p = typename Kernel_traits::Traits_p;
@@ -157,12 +175,26 @@ inline __device__ void device_1xN_multi_cta(const Params &params) {
     using Smem_tile_o = typename Kernel_traits::Smem_tile_o;
 
     // Do we use LDGSTS for Q, K or V?
-    enum { USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q };
-    enum { USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K };
-    enum { USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V };
+    enum
+    {
+        USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q
+    };
+
+    enum
+    {
+        USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K
+    };
+
+    enum
+    {
+        USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V
+    };
 
     // Do we use LDGSTS for any of the 3 input matrices.
-    enum { USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V };
+    enum
+    {
+        USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V
+    };
 
     // If either K or V uses LDGSTS, they cannot share a buffer.
     static_assert(!(USE_LDGSTS_K || USE_LDGSTS_V) || !Kernel_traits::SHARE_SMEM_FOR_K_AND_V, "");
@@ -171,19 +203,22 @@ inline __device__ void device_1xN_multi_cta(const Params &params) {
     extern __shared__ char smem_[];
 
     // The base pointer of smem_v;
-    char *smem_v_ = nullptr;
-    if( Kernel_traits::SHARE_SMEM_FOR_K_AND_V ) {
+    char* smem_v_ = nullptr;
+    if (Kernel_traits::SHARE_SMEM_FOR_K_AND_V)
+    {
         smem_v_ = &smem_[Smem_tile_q::BYTES_PER_TILE];
-    } else {
+    }
+    else
+    {
         smem_v_ = &smem_[Smem_tile_q::BYTES_PER_TILE + Smem_tile_k::BYTES_PER_TILE];
     }
 
     // The block index for the batch * head.
-    const int bidx = blockIdx.y;
+    int const bidx = blockIdx.y;
     // The block index for the multi-CTA distribution.
-    const int bidn = blockIdx.x;
+    int const bidn = blockIdx.x;
     // The thread index.
-    const int tidx = threadIdx.x;
+    int const tidx = threadIdx.x;
 
     // Allocate the shared memory tile loader for Q.
     Smem_tile_q smem_q(&smem_[0], tidx);
@@ -198,15 +233,17 @@ inline __device__ void device_1xN_multi_cta(const Params &params) {
     bool barrier_inc = true;
 
     // Outer persistent loop.
-    for( int bidbh = bidx; bidbh < params.b * params.h; bidbh += params.heads_per_wave ) {
+    for (int bidbh = bidx; bidbh < params.b * params.h; bidbh += params.heads_per_wave)
+    {
 
         // Decompose the index into b/h. TODO: Should we use fast divmod?
         int bidb = bidbh / params.h;
         int bidh = bidbh % params.h;
 
         // The special structure to control the block info.
-        const Multi_cta<Kernel_traits::VERSION> binfo(params, bidb, bidh, bidn, tidx);
-        if( bidb >= params.b || binfo.stop_early() ) {
+        Multi_cta<Kernel_traits::VERSION> const binfo(params, bidb, bidh, bidn, tidx);
+        if (bidb >= params.b || binfo.stop_early())
+        {
             return;
         }
 
@@ -237,7 +274,8 @@ inline __device__ void device_1xN_multi_cta(const Params &params) {
         gmem_k.commit(smem_k);
 
         // Commit the data for V to shared memory.
-        if( !Kernel_traits::SHARE_SMEM_FOR_K_AND_V ) {
+        if (!Kernel_traits::SHARE_SMEM_FOR_K_AND_V)
+        {
             gmem_v.commit(smem_v);
         }
 
@@ -252,12 +290,14 @@ inline __device__ void device_1xN_multi_cta(const Params &params) {
         // Load the fragments for K. We keep the data in registers during the entire kernel.
         typename Smem_tile_k::Fragment frag_k[Mma_tile_p::MMAS_K][Mma_tile_p::MMAS_N];
 #pragma unroll
-        for( int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki ) {
+        for (int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki)
+        {
             smem_k.load(frag_k[ki], ki);
         }
 
         // Commit the data for V to shared memory if it has not been done already.
-        if( Kernel_traits::SHARE_SMEM_FOR_K_AND_V ) {
+        if (Kernel_traits::SHARE_SMEM_FOR_K_AND_V)
+        {
 
             // Make sure we are done loading the fragments for K.
             __syncthreads();
@@ -272,7 +312,8 @@ inline __device__ void device_1xN_multi_cta(const Params &params) {
         // Load the fragments for V. We keep the data in registers during the entire kernel.
         typename Smem_tile_v::Fragment frag_v[Mma_tile_o::MMAS_K][Mma_tile_o::VALID_MMAS_N];
 #pragma unroll
-        for( int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki ) {
+        for (int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki)
+        {
             smem_v.load(frag_v[ki], ki);
         }
 
@@ -281,10 +322,12 @@ inline __device__ void device_1xN_multi_cta(const Params &params) {
         Softmax softmax(params, &smem_[Smem_tile_q::BYTES_PER_TILE], bidb, tidx);
 
         // Load over the entire sequence length.
-        for( int loop = 0, outer = 0; loop < binfo.actual_seqlen; loop += Cta_tile_p::M, outer++ ) {
+        for (int loop = 0, outer = 0; loop < binfo.actual_seqlen; loop += Cta_tile_p::M, outer++)
+        {
 
             // If we have reached the length of the sequence, stop earlier.
-            if( loop >= binfo.actual_seqlen ) {
+            if (loop >= binfo.actual_seqlen)
+            {
                 break;
             }
 
@@ -295,18 +338,21 @@ inline __device__ void device_1xN_multi_cta(const Params &params) {
 
 // Do this part of P^T = (Q * K^T)^T.
 #pragma unroll
-            for( int ki = 1; ki < Mma_tile_p::MMAS_K; ++ki ) {
+            for (int ki = 1; ki < Mma_tile_p::MMAS_K; ++ki)
+            {
 
                 // Trigger the load from shared memory for the next series of Q values.
                 smem_q.load(frag_q[ki & 1], ki);
                 // Do the math for the values already in registers.
-                if( ki <= Mma_tile_p::VALID_MMAS_K ) {
+                if (ki <= Mma_tile_p::VALID_MMAS_K)
+                {
                     fmha::gemm(acc_p, frag_q[(ki - 1) & 1], frag_k[(ki - 1)]);
                 }
             }
 
             // Do the final stage of math.
-            if( Mma_tile_p::MMAS_K <= Mma_tile_p::VALID_MMAS_K ) {
+            if (Mma_tile_p::MMAS_K <= Mma_tile_p::VALID_MMAS_K)
+            {
                 int ki = Mma_tile_p::MMAS_K;
                 fmha::gemm(acc_p, frag_q[(ki - 1) & 1], frag_k[(ki - 1)]);
             }
@@ -318,9 +364,12 @@ inline __device__ void device_1xN_multi_cta(const Params &params) {
             softmax.unpack(acc_p);
 
             // Apply the mask.
-            if( params.has_alibi ) {
+            if (params.has_alibi)
+            {
                 softmax.apply_mask_alibi(mask, bidh, params.alibi_params);
-            } else {
+            }
+            else
+            {
                 softmax.apply_mask(mask);
             }
 
@@ -328,10 +377,13 @@ inline __device__ void device_1xN_multi_cta(const Params &params) {
             __syncthreads();
 
             // Enable our trick to use the max for INT8 to scale. 16129 == 127 ^ 2.
-            if( Kernel_traits::USE_SCALE_MAX ) {
-                float p_max = reinterpret_cast<const float &>(params.scale_bmm1) * 16129.f;
+            if (Kernel_traits::USE_SCALE_MAX)
+            {
+                float p_max = reinterpret_cast<float const&>(params.scale_bmm1) * 16129.f;
                 softmax.apply_exp(p_max);
-            } else {
+            }
+            else
+            {
                 // Compute the max.
                 float partial = softmax.template reduce_<fmha::Max_>();
                 float total = reduce<Kernel_traits, fmha::Max_>(
@@ -373,7 +425,8 @@ inline __device__ void device_1xN_multi_cta(const Params &params) {
 
             // Trigger the load for the next Q values.
             int do_prefetching = loop + Cta_tile_p::M < binfo.actual_seqlen;
-            if( do_prefetching ) {
+            if (do_prefetching)
+            {
                 smem_q.move_to_next_write_buffer();
                 gmem_q.move();
                 gmem_q.load(smem_q);
@@ -387,26 +440,28 @@ inline __device__ void device_1xN_multi_cta(const Params &params) {
             softmax.pack(frag_p);
 
             // Declare the accumulators for the 1st gemm.
-            fmha::Fragment_accumulator<Traits_o> acc_o[Mma_tile_o::MMAS_M]
-                                                      [Mma_tile_o::VALID_MMAS_N];
+            fmha::Fragment_accumulator<Traits_o> acc_o[Mma_tile_o::MMAS_M][Mma_tile_o::VALID_MMAS_N];
             using Acc_type_o = typename Traits_o::Accumulator_type;
             fmha::Clear_accumulator<Acc_type_o, Cta_tile_o::WARPS_K>::apply(acc_o);
 
 // Do this part of O = P^T * V^T.
 #pragma unroll
-            for( int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki ) {
+            for (int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki)
+            {
                 fmha::gemm(acc_o, frag_p[ki], frag_v[ki]);
             }
 
             // Declare a lock.
-            int *lock = &params.locks[bidx];
+            int* lock = &params.locks[bidx];
 
 // Loop over MMAS_M.
 #pragma unroll
-            for( int ii = 0; ii < Gmem_tile_o::LOOPS; ++ii ) {
+            for (int ii = 0; ii < Gmem_tile_o::LOOPS; ++ii)
+            {
 
                 // Enter the critical section.
-                if( tidx == 0 ) {
+                if (tidx == 0)
+                {
                     acquire_lock_<Kernel_traits::CTAS_PER_HEAD>(lock, bidn, tidx);
                 }
 
@@ -434,7 +489,8 @@ inline __device__ void device_1xN_multi_cta(const Params &params) {
                 __syncthreads();
 
                 // Leave the critical section.
-                if( tidx == 0 ) {
+                if (tidx == 0)
+                {
                     release_lock_<Kernel_traits::CTAS_PER_HEAD>(lock, bidn, tidx);
                 }
             }
@@ -443,12 +499,14 @@ inline __device__ void device_1xN_multi_cta(const Params &params) {
             gmem_o.move();
 
             // Commit the values for Q into shared memory.
-            if( do_prefetching ) {
+            if (do_prefetching)
+            {
                 gmem_q.commit(smem_q);
             }
 
             // Make sure we are reading from the correct buffer.
-            if( USE_LDGSTS_Q && do_prefetching ) {
+            if (USE_LDGSTS_Q && do_prefetching)
+            {
                 smem_q.move_to_next_read_buffer();
             }
 
@@ -457,18 +515,19 @@ inline __device__ void device_1xN_multi_cta(const Params &params) {
             __syncthreads();
 
             // Trigger the loads for the values of Q for the next iteration.
-            if( do_prefetching ) {
+            if (do_prefetching)
+            {
                 smem_q.load(frag_q[0], 0);
             }
 
-        }  // Loop over the sequence length
+        } // Loop over the sequence length
 
         // Make sure we can start reusing shared memory.
         __syncthreads();
 
-    }  // Loop over the heads
+    } // Loop over the heads
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace fused_multihead_attention
+} // namespace fused_multihead_attention

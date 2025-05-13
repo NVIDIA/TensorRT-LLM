@@ -12,10 +12,13 @@
 
 #pragma once
 
-namespace fmha {
+namespace fmha
+{
 
-struct AlibiParams {
-    constexpr static int round_down_to_power_two(int x) {
+struct AlibiParams
+{
+    constexpr static int round_down_to_power_two(int x)
+    {
         x = x | (x >> 1);
         x = x | (x >> 2);
         x = x | (x >> 4);
@@ -25,12 +28,17 @@ struct AlibiParams {
     }
 
     AlibiParams() = default;
-    AlibiParams(int h, float scale_after_alibi = 1.f) : scale_after_alibi(scale_after_alibi) {
+
+    AlibiParams(int h, float scale_after_alibi = 1.f)
+        : scale_after_alibi(scale_after_alibi)
+    {
         h_pow_2 = round_down_to_power_two(h);
         alibi_neg4_div_h = -4.0f / h_pow_2;
     }
+
     AlibiParams(int h, int s, int tp_size, int rank, float scale_after_alibi = 1.f)
-        : AlibiParams(h * tp_size, scale_after_alibi) {
+        : AlibiParams(h * tp_size, scale_after_alibi)
+    {
         head_idx_offset = h * rank;
         sequence_pos_offset = s * rank;
     }
@@ -45,4 +53,4 @@ struct AlibiParams {
     int sequence_pos_offset = 0;
 };
 
-}  // namespace fmha
+} // namespace fmha

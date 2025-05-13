@@ -13,29 +13,31 @@
 #pragma once
 
 #include <cuda.h>
-#include <vector>
-#include <fused_multihead_attention_utils.h>
 #include <fused_multihead_attention.h>
+#include <fused_multihead_attention_utils.h>
+#include <vector>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace bert {
+namespace bert
+{
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #if USE_DEMO_BERT_PARAMS
 
-    //TODO TRT plugins use a different parameter struct taken from the old XMMA fork.
-    //     Until all cubins in the plugin are replaced with new kernels, we need to conform to that.
-    #include <fused_multihead_attention_demo_bert_params.h>
+// TODO TRT plugins use a different parameter struct taken from the old XMMA fork.
+//      Until all cubins in the plugin are replaced with new kernels, we need to conform to that.
+#include <fused_multihead_attention_demo_bert_params.h>
 
-#endif  // USE_DEMO_BERT_PARAMS
+#endif // USE_DEMO_BERT_PARAMS
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct Gmem_params {
+struct Gmem_params
+{
     // The matrix.
-    void *ptr;
+    void* ptr;
 
     // The stride between rows of the Q, K and V matrices.
     int64_t stride_in_bytes;
@@ -47,12 +49,13 @@ struct Gmem_params {
     int d;
 
     // array of length b+1 holding prefix sum of actual sequence lengths.
-    int *cu_seqlens;
+    int* cu_seqlens;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct Fused_multihead_attention_params_mhca : Fused_multihead_attention_params_v2 {
+struct Fused_multihead_attention_params_mhca : Fused_multihead_attention_params_v2
+{
     // Sequence length of Q
     int s_q;
     int d_padded;
@@ -63,4 +66,4 @@ struct Fused_multihead_attention_params_mhca : Fused_multihead_attention_params_
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace bert
+} // namespace bert

@@ -13,24 +13,26 @@
 #pragma once
 
 #include "fmha/alibi_params.h"
+#include "fmha/hopper/fragment.h"
 #include "fmha/hopper/utils_warpgroup.h"
 #include "fmha/softmax.h"
 #include "fmha/warpspec/circular_buffer.h"
 #include "fmha/warpspec/epilogue.h"
-#include "fmha/hopper/fragment.h"
 
-namespace fmha {
-namespace ws {
+namespace fmha
+{
+namespace ws
+{
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<
+template <
     // Template instruction traits to specialize structs
-    template<int, int, int, bool, bool>
-    class Instruction_traits,
+    template <int, int, int, bool, bool> class Instruction_traits,
     // Kernel Traits
     typename Kernel_traits>
-struct Compute {
+struct Compute
+{
 
     // The shared struct.
     using Shared = typename Kernel_traits::Shared;
@@ -79,108 +81,182 @@ struct Compute {
     using Tile_o_epilogue = Tile_o_epilogue<Instruction_traits, Kernel_traits>;
 
     // The step size of Q loop.
-    enum { STEP_Q = Kernel_traits::STEP_Q };
+    enum
+    {
+        STEP_Q = Kernel_traits::STEP_Q
+    };
+
     // The step size of KV loop.
-    enum { STEP_KV = Kernel_traits::STEP_KV };
+    enum
+    {
+        STEP_KV = Kernel_traits::STEP_KV
+    };
+
     // The number of compute groups (currently fixed at 2).
-    enum { NUM_COMPUTE_GROUPS = Kernel_traits::NUM_COMPUTE_GROUPS };
+    enum
+    {
+        NUM_COMPUTE_GROUPS = Kernel_traits::NUM_COMPUTE_GROUPS
+    };
+
     // Whether do we skip those masked tiles when causal mask is enabled ?
-    enum { SKIP_CAUSAL_MASK_TILES = Kernel_traits::CAUSAL_MASK && !Kernel_traits::USE_CUSTOM_MASK };
+    enum
+    {
+        SKIP_CAUSAL_MASK_TILES = Kernel_traits::CAUSAL_MASK && !Kernel_traits::USE_CUSTOM_MASK
+    };
+
     // Whether we will ignore the long distance tokens in the beginning.
-    enum { SLIDING_WINDOW_ATTENTION = Kernel_traits::SLIDING_WINDOW_ATTENTION };
+    enum
+    {
+        SLIDING_WINDOW_ATTENTION = Kernel_traits::SLIDING_WINDOW_ATTENTION
+    };
+
     // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
-    enum { APPLY_ALIBI = Kernel_traits::APPLY_ALIBI };
+    enum
+    {
+        APPLY_ALIBI = Kernel_traits::APPLY_ALIBI
+    };
+
     // Do we use custom mask input ?
-    enum { USE_CUSTOM_MASK = Kernel_traits::USE_CUSTOM_MASK };
+    enum
+    {
+        USE_CUSTOM_MASK = Kernel_traits::USE_CUSTOM_MASK
+    };
+
     // Do we always need to apply the mask ?
-    enum { ALWAYS_APPLY_MASK = APPLY_ALIBI || USE_CUSTOM_MASK };
+    enum
+    {
+        ALWAYS_APPLY_MASK = APPLY_ALIBI || USE_CUSTOM_MASK
+    };
 
     // Enable mutex for overlapping mma and softmax instructions.
-    enum { ENABLE_MUTEX = Kernel_traits::ENABLE_MUTEX };
+    enum
+    {
+        ENABLE_MUTEX = Kernel_traits::ENABLE_MUTEX
+    };
 
     // The head_dimension groups.
-    enum { D_GROUPS = Kernel_traits::D_GROUPS };
+    enum
+    {
+        D_GROUPS = Kernel_traits::D_GROUPS
+    };
+
     // The MMA_K groups (corresponding to head_dimension groups).
-    enum { BMM1_MMAS_K_GROUPS = Kernel_traits::D_GROUPS };
+    enum
+    {
+        BMM1_MMAS_K_GROUPS = Kernel_traits::D_GROUPS
+    };
+
     // The number of MMAS_K for each head_dimension group.
-    enum { BMM1_MMAS_K_PER_GROUP = Mma_tile_p::MMAS_K / BMM1_MMAS_K_GROUPS };
+    enum
+    {
+        BMM1_MMAS_K_PER_GROUP = Mma_tile_p::MMAS_K / BMM1_MMAS_K_GROUPS
+    };
 
     // The MMA_K groups (corresponding to kv_step groups).
-    enum { BMM2_MMAS_K_GROUPS = Kernel_traits::BMM2_K_GROUPS };
+    enum
+    {
+        BMM2_MMAS_K_GROUPS = Kernel_traits::BMM2_K_GROUPS
+    };
+
     // The number of MMAS_K for each head_dimension group.
-    enum { BMM2_MMAS_K_PER_GROUP = Mma_tile_o::MMAS_K / BMM2_MMAS_K_GROUPS };
+    enum
+    {
+        BMM2_MMAS_K_PER_GROUP = Mma_tile_o::MMAS_K / BMM2_MMAS_K_GROUPS
+    };
 
     // The tile size of V after head_dimension split.
-    enum { TILE_SIZE_V_PER_D_GROUP = STEP_KV * Kernel_traits::D_PER_GROUP };
-    enum { TILE_SIZE_V = STEP_KV * Kernel_traits::D };
-    enum { TILE_BYTES_V_PER_D_GROUP = STEP_KV * Kernel_traits::D_BYTES_PER_GROUP };
-    enum { TILE_BYTES_V_PER_K_GROUP = BMM2_MMAS_K_PER_GROUP * Kernel_traits::D_BYTES_PER_GROUP };
+    enum
+    {
+        TILE_SIZE_V_PER_D_GROUP = STEP_KV * Kernel_traits::D_PER_GROUP
+    };
+
+    enum
+    {
+        TILE_SIZE_V = STEP_KV * Kernel_traits::D
+    };
+
+    enum
+    {
+        TILE_BYTES_V_PER_D_GROUP = STEP_KV * Kernel_traits::D_BYTES_PER_GROUP
+    };
+
+    enum
+    {
+        TILE_BYTES_V_PER_K_GROUP = BMM2_MMAS_K_PER_GROUP * Kernel_traits::D_BYTES_PER_GROUP
+    };
 
     // Named barrier for inter-warpgroup sync
-    enum { SYNC_BARRIER = Kernel_traits::MMA_SYNC_BARRIER_ID };
-    // Whether Q and KV is in separate buffer, which means we need to consider different Q and KV lengths.
-    enum { SEPARATE_Q_KV_BUFFER = Kernel_traits::SEPARATE_Q_KV_BUFFER };
+    enum
+    {
+        SYNC_BARRIER = Kernel_traits::MMA_SYNC_BARRIER_ID
+    };
 
-    enum { SAGE_BLOCK_SIZE_Q = Kernel_traits::SAGE_BLOCK_SIZE_Q };
+    // Whether Q and KV is in separate buffer, which means we need to consider different Q and KV lengths.
+    enum
+    {
+        SEPARATE_Q_KV_BUFFER = Kernel_traits::SEPARATE_Q_KV_BUFFER
+    };
+
+    enum
+    {
+        SAGE_BLOCK_SIZE_Q = Kernel_traits::SAGE_BLOCK_SIZE_Q
+    };
+
     // sanitize 0 to -1, avoid DIV BY ZERO below
-    enum {
-        SAGE_BLOCK_SIZE_K =
-            Kernel_traits::SAGE_BLOCK_SIZE_K > 0 ? Kernel_traits::SAGE_BLOCK_SIZE_K : -1
+    enum
+    {
+        SAGE_BLOCK_SIZE_K = Kernel_traits::SAGE_BLOCK_SIZE_K > 0 ? Kernel_traits::SAGE_BLOCK_SIZE_K : -1
     };
-    enum {
-        SAGE_BLOCK_SIZE_V =
-            Kernel_traits::SAGE_BLOCK_SIZE_V > 0 ? Kernel_traits::SAGE_BLOCK_SIZE_V : -1
+
+    enum
+    {
+        SAGE_BLOCK_SIZE_V = Kernel_traits::SAGE_BLOCK_SIZE_V > 0 ? Kernel_traits::SAGE_BLOCK_SIZE_V : -1
     };
+
     // BLOCK_SIZE_Q should be multiply of STEP_Q (usually 64) so that q scale can be fused into scale_bmm1
     static_assert(SAGE_BLOCK_SIZE_Q < 0 || SAGE_BLOCK_SIZE_Q % STEP_Q == 0);
-    static_assert(SAGE_BLOCK_SIZE_K < 0 ||
-                  SAGE_BLOCK_SIZE_K % 8 == 0);   // 8 = columns of a gmma CORE
-    static_assert(SAGE_BLOCK_SIZE_V < 0 ||
-                  SAGE_BLOCK_SIZE_V % 32 == 0);  // 32 = K dimension of a qgmma
+    static_assert(SAGE_BLOCK_SIZE_K < 0 || SAGE_BLOCK_SIZE_K % 8 == 0);  // 8 = columns of a gmma CORE
+    static_assert(SAGE_BLOCK_SIZE_V < 0 || SAGE_BLOCK_SIZE_V % 32 == 0); // 32 = K dimension of a qgmma
+
     // SAGE_BLOCKS_PER_STEP_X is used to declare scale buffer like `float scales_k[SAGE_BLOCKS_PER_STEP_K];`
     // if SAGE_BLOCKS_PER_STEP_X == 0, you will get `zero-sized variable is not allowed in device code`
     // error from nvcc, so the minimal value have to be 1. But don't worry, unused local variables will
     // be optimized out by compiler.
-    enum { SAGE_BLOCKS_PER_STEP_K = std::max(STEP_KV / SAGE_BLOCK_SIZE_K, 1) };
-    enum { SAGE_BLOCKS_PER_STEP_V = std::max(STEP_KV / SAGE_BLOCK_SIZE_V, 1) };
+    enum
+    {
+        SAGE_BLOCKS_PER_STEP_K = std::max(STEP_KV / SAGE_BLOCK_SIZE_K, 1)
+    };
 
-#define K_TILE_WAIT()                                                                              \
-    int ready_k = cbr_k.peek();                                                                    \
-    if( !ready_k ) {                                                                               \
-        cbr_k.wait();                                                                              \
+    enum
+    {
+        SAGE_BLOCKS_PER_STEP_V = std::max(STEP_KV / SAGE_BLOCK_SIZE_V, 1)
+    };
+
+#define K_TILE_WAIT()                                                                                                  \
+    int ready_k = cbr_k.peek();                                                                                        \
+    if (!ready_k)                                                                                                      \
+    {                                                                                                                  \
+        cbr_k.wait();                                                                                                  \
     }
 
-#define KV_TILE_COMPLETE()                                                                         \
-    cbr_k.complete(tidx == 0, cbr_k.ptr());                                                        \
-    cbr_v.complete(tidx == 0, cbr_v.ptr());                                                        \
-    cbr_k.advance();                                                                               \
+#define KV_TILE_COMPLETE()                                                                                             \
+    cbr_k.complete(tidx == 0, cbr_k.ptr());                                                                            \
+    cbr_v.complete(tidx == 0, cbr_v.ptr());                                                                            \
+    cbr_k.advance();                                                                                                   \
     cbr_v.advance();
 
-#define COMPUTE_SINGLE_TILE(IS_FIRST_COL, APPLY_MASK)                                              \
-    compute_single_tile<IS_FIRST_COL, APPLY_MASK>(                                                 \
-        params,                                                                                    \
-        ctile_p,                                                                                   \
-        softmax,                                                                                   \
-        ctile_o,                                                                                   \
-        p_max,                                                                                     \
-        p_sum,                                                                                     \
-        tidx,                                                                                      \
-        actual_kv_seqlen,                                                                          \
-        params.sliding_window_size,                                                                \
-        alibi_head_scale,                                                                          \
-        USE_CUSTOM_MASK ? (head_info.mask_sum_s + q_step_idx * STEP_Q + local_q_tile_offset)       \
-                        : (q_step_idx * STEP_Q + head_info.q_tile_offset),                         \
-        kv_step_idx * STEP_KV,                                                                     \
-        sage_scale_row,                                                                            \
-        cbr,                                                                                       \
-        cbr_v,                                                                                     \
-        mutex_accessor,                                                                            \
-        kv_step_idx == kv_idx_end - 1);
+#define COMPUTE_SINGLE_TILE(IS_FIRST_COL, APPLY_MASK)                                                                  \
+    compute_single_tile<IS_FIRST_COL, APPLY_MASK>(params, ctile_p, softmax, ctile_o, p_max, p_sum, tidx,               \
+        actual_kv_seqlen, params.sliding_window_size, alibi_head_scale,                                                \
+        USE_CUSTOM_MASK ? (head_info.mask_sum_s + q_step_idx * STEP_Q + local_q_tile_offset)                           \
+                        : (q_step_idx * STEP_Q + head_info.q_tile_offset),                                             \
+        kv_step_idx * STEP_KV, sage_scale_row, cbr, cbr_v, mutex_accessor, kv_step_idx == kv_idx_end - 1);
 
     ////////////////////////////////////////////////////////////////////////////////////////////////
 
-    template<typename Params>
-    inline __device__ void run(int warpgroup_id, int tidx, Shared *shared, const Params &params) {
+    template <typename Params>
+    inline __device__ void run(int warpgroup_id, int tidx, Shared* shared, Params const& params)
+    {
 
         auto head_tracker = shared->head_info_tracker[warpgroup_id].createReader();
         auto cbr = shared->tma_q_tracker[warpgroup_id].createReader();
@@ -189,8 +265,8 @@ struct Compute {
         auto cbr_v = shared->tma_v_tracker.createReader();
 
         // Ctile_p initialize (relies on q_stage, kv_stage).
-        char *smem_q = reinterpret_cast<char *>(&shared->smem_q[warpgroup_id][0]);
-        char *smem_k = reinterpret_cast<char *>(&shared->smem_k[0]);
+        char* smem_q = reinterpret_cast<char*>(&shared->smem_q[warpgroup_id][0]);
+        char* smem_k = reinterpret_cast<char*>(&shared->smem_k[0]);
         Compute_tile_p ctile_p(smem_q, smem_k);
 
         // Softmax
@@ -206,108 +282,100 @@ struct Compute {
         // Mutex between two compute groups.
         OrderedMutexAccessor mutex_accessor(shared->compute_mutex, warpgroup_id, SYNC_BARRIER);
         // Notify warpgroup 0 to execute HGMMA first (overlap HGMMA and Softmax Math Instructions).
-        if( ENABLE_MUTEX && warpgroup_id == 1 && Kernel_traits::ELEMENT_BYTES == 2 ) {
+        if (ENABLE_MUTEX && warpgroup_id == 1 && Kernel_traits::ELEMENT_BYTES == 2)
+        {
             mutex_accessor.arrive();
         }
 
         // While loop for different heads.
-        while( true ) {
+        while (true)
+        {
 
             typename Shared::Head_info head_info = head_tracker.pop(true);
 
-            if( head_info.kv_steps == -1 ) {
+            if (head_info.kv_steps == -1)
+            {
                 break;
             }
 
-            const int kv_steps = head_info.kv_steps;
-            const int q_steps = head_info.q_steps;
-            const int local_q_tile_offset = head_info.local_q_tile_offset;
+            int const kv_steps = head_info.kv_steps;
+            int const q_steps = head_info.q_steps;
+            int const local_q_tile_offset = head_info.local_q_tile_offset;
             // The global q tile offset (based on past kv cache).
             // Not used by custom mask input.
-            const int q_tile_offset =
-                SEPARATE_Q_KV_BUFFER ? head_info.q_tile_offset : head_info.local_q_tile_offset;
-            const int actual_q_seqlen = head_info.actual_seqlen;
+            int const q_tile_offset = SEPARATE_Q_KV_BUFFER ? head_info.q_tile_offset : head_info.local_q_tile_offset;
+            int const actual_q_seqlen = head_info.actual_seqlen;
             // Contiguous QKV FMHA assumes q, and kv have the same sequence length.
-            const int actual_kv_seqlen =
-                SEPARATE_Q_KV_BUFFER ? head_info.actual_kv_seqlen : actual_q_seqlen;
+            int const actual_kv_seqlen = SEPARATE_Q_KV_BUFFER ? head_info.actual_kv_seqlen : actual_q_seqlen;
 
             // Calculate the alibi head_scaling_factor.
-            float alibi_head_scale = APPLY_ALIBI ? get_alibi_head_scaling_factor<AlibiParams>(
-                                                       head_info.bidh, params.alibi_params)
-                                                 : 0.f;
+            float alibi_head_scale
+                = APPLY_ALIBI ? get_alibi_head_scaling_factor<AlibiParams>(head_info.bidh, params.alibi_params) : 0.f;
             // pre-compute the row of the scale for reuse
             int sage_scale_row;
-            if constexpr( Kernel_traits::SAGE_ATTENTION ) {
+            if constexpr (Kernel_traits::SAGE_ATTENTION)
+            {
                 sage_scale_row = head_info.bidb * params.h + head_info.bidh;
             }
 
             // Need to check if it is masked when sliding_window_size is smaller than what actual_seqlen.
             static_assert(STEP_KV >= STEP_Q, "");
             // There will only be one kv tile needed to be masked since STEP_KV >= STEP_Q;
-            const bool apply_start_mask =
-                (SLIDING_WINDOW_ATTENTION && actual_kv_seqlen > params.sliding_window_size) ||
-                ALWAYS_APPLY_MASK;
+            bool const apply_start_mask
+                = (SLIDING_WINDOW_ATTENTION && actual_kv_seqlen > params.sliding_window_size) || ALWAYS_APPLY_MASK;
 
             int q_step_idx = warpgroup_id;
 
             // Compute work.
-            for( ; q_step_idx < q_steps; q_step_idx += NUM_COMPUTE_GROUPS ) {
+            for (; q_step_idx < q_steps; q_step_idx += NUM_COMPUTE_GROUPS)
+            {
 
                 // Check whether it is a valid run of q steps.
-                const int q_offset = q_step_idx * STEP_Q + local_q_tile_offset;
-                const bool valid_run = q_offset < actual_q_seqlen;
+                int const q_offset = q_step_idx * STEP_Q + local_q_tile_offset;
+                bool const valid_run = q_offset < actual_q_seqlen;
                 // fuse the scale of q into scale_bmm1
-                if constexpr( SAGE_BLOCK_SIZE_Q > 0 ) {
+                if constexpr (SAGE_BLOCK_SIZE_Q > 0)
+                {
                     // I tried another implementation here: store original `scale_bmm1` to a local variable
                     // to avoid frequent `__ldg`. But experiment shows that the current one is faster.
                     // A bit counterintuitive.
-                    const auto scale_bmm1 =
-                        params.scale_bmm1_d ? __ldg(params.scale_bmm1_d) : params.scale_bmm1;
-                    const int idx =
-                        sage_scale_row * params.sage.q.max_nblock + q_offset / SAGE_BLOCK_SIZE_Q;
-                    *(float *)(&softmax.scale_bmm1_) = reinterpret_cast<const float &>(scale_bmm1) *
-                                                       __ldg(&params.sage.q.scales[idx]);
+                    auto const scale_bmm1 = params.scale_bmm1_d ? __ldg(params.scale_bmm1_d) : params.scale_bmm1;
+                    int const idx = sage_scale_row * params.sage.q.max_nblock + q_offset / SAGE_BLOCK_SIZE_Q;
+                    *(float*) (&softmax.scale_bmm1_)
+                        = reinterpret_cast<float const&>(scale_bmm1) * __ldg(&params.sage.q.scales[idx]);
                 }
 
                 // KV tile is shared by two q tiles,
                 // so we need to consider the last compute group's q tile.
-                const int curr_tile_offset = q_step_idx * STEP_Q + q_tile_offset;
-                const int q_tile_offset_start = curr_tile_offset - warpgroup_id * STEP_Q;
-                const int q_tile_offset_end =
-                    curr_tile_offset + (NUM_COMPUTE_GROUPS - warpgroup_id) * STEP_Q - 1;
+                int const curr_tile_offset = q_step_idx * STEP_Q + q_tile_offset;
+                int const q_tile_offset_start = curr_tile_offset - warpgroup_id * STEP_Q;
+                int const q_tile_offset_end = curr_tile_offset + (NUM_COMPUTE_GROUPS - warpgroup_id) * STEP_Q - 1;
 
                 // Skip initial kv tiles due to sliding window attention.
                 // Consider the last 2 tiles.
-                const int kv_idx_start =
-                    SLIDING_WINDOW_ATTENTION
-                        ? (max(0, q_tile_offset_start - params.sliding_window_size) / STEP_KV)
-                        : 0;
+                int const kv_idx_start = SLIDING_WINDOW_ATTENTION
+                    ? (max(0, q_tile_offset_start - params.sliding_window_size) / STEP_KV)
+                    : 0;
 
                 static_assert(STEP_KV >= STEP_Q, "");
-                int kv_start_mask_bound =
-                    SLIDING_WINDOW_ATTENTION
-                        ? int((max(0, curr_tile_offset + STEP_Q - 1 - params.sliding_window_size) +
-                               STEP_KV - 1) /
-                              STEP_KV)
-                        : 0;
+                int kv_start_mask_bound = SLIDING_WINDOW_ATTENTION
+                    ? int((max(0, curr_tile_offset + STEP_Q - 1 - params.sliding_window_size) + STEP_KV - 1) / STEP_KV)
+                    : 0;
 
                 // We will skip unnecessary kv steps for causal mask.
                 // Exclusive range.
-                const int kv_idx_end =
-                    SKIP_CAUSAL_MASK_TILES ? (q_tile_offset_end + STEP_KV - 1) / STEP_KV : kv_steps;
+                int const kv_idx_end = SKIP_CAUSAL_MASK_TILES ? (q_tile_offset_end + STEP_KV - 1) / STEP_KV : kv_steps;
 
                 // Inclusive range (apply_mask when kv_idx >= kv_end_mask_lower_bound)
-                const int kv_end_mask_lower_bound =
-                    ALWAYS_APPLY_MASK
-                        ? 0
-                        : (SKIP_CAUSAL_MASK_TILES ? (curr_tile_offset / STEP_KV) : kv_idx_end - 1);
+                int const kv_end_mask_lower_bound
+                    = ALWAYS_APPLY_MASK ? 0 : (SKIP_CAUSAL_MASK_TILES ? (curr_tile_offset / STEP_KV) : kv_idx_end - 1);
 
-                Gmem_tile_o gmem_o(
-                    params, head_info, *shared, tidx, q_step_idx * STEP_Q + local_q_tile_offset);
+                Gmem_tile_o gmem_o(params, head_info, *shared, tidx, q_step_idx * STEP_Q + local_q_tile_offset);
 
                 // Q ready to use in smem.
                 int ready = cbr.peek();
-                if( !ready ) {
+                if (!ready)
+                {
                     cbr.wait();
                 }
 
@@ -319,31 +387,41 @@ struct Compute {
                 // First K tiles ready to use in smem.
                 K_TILE_WAIT();
                 // Need to apply mask if only kv tile exists.
-                if( kv_idx_start >= kv_end_mask_lower_bound || apply_start_mask ) {
+                if (kv_idx_start >= kv_end_mask_lower_bound || apply_start_mask)
+                {
                     COMPUTE_SINGLE_TILE(true, true);
-                } else {
+                }
+                else
+                {
                     COMPUTE_SINGLE_TILE(true, false);
                 }
                 KV_TILE_COMPLETE();
 
-                for( kv_step_idx += 1; kv_step_idx < kv_end_mask_lower_bound; ++kv_step_idx ) {
+                for (kv_step_idx += 1; kv_step_idx < kv_end_mask_lower_bound; ++kv_step_idx)
+                {
 
                     // Current step's K tiles ready to use in smem.
                     K_TILE_WAIT();
 
                     // Move kv tile to next buffer.
-                    if( D_GROUPS > 1 ) {
+                    if (D_GROUPS > 1)
+                    {
                         ctile_p.increment_gmma_desc_group();
-                    } else {
+                    }
+                    else
+                    {
                         ctile_p.increment_gmma_desc_b_group();
                     }
 
                     ctile_o.increment_gmma_desc_group();
 
                     // Apply the start mask only when sliding window attention is enabled.
-                    if( apply_start_mask && kv_step_idx < kv_start_mask_bound ) {
+                    if (apply_start_mask && kv_step_idx < kv_start_mask_bound)
+                    {
                         COMPUTE_SINGLE_TILE(false, true);
-                    } else {
+                    }
+                    else
+                    {
                         COMPUTE_SINGLE_TILE(false, false);
                     }
 
@@ -351,14 +429,18 @@ struct Compute {
                 }
 
                 // Always apply the mask in the end.
-                for( ; kv_step_idx < kv_idx_end; ++kv_step_idx ) {
+                for (; kv_step_idx < kv_idx_end; ++kv_step_idx)
+                {
                     // Current step's K tiles ready to use in smem.
                     K_TILE_WAIT();
 
                     // Move kv tile to next buffer.
-                    if( D_GROUPS > 1 ) {
+                    if (D_GROUPS > 1)
+                    {
                         ctile_p.increment_gmma_desc_group();
-                    } else {
+                    }
+                    else
+                    {
                         ctile_p.increment_gmma_desc_b_group();
                     }
 
@@ -368,7 +450,8 @@ struct Compute {
 
                     KV_TILE_COMPLETE();
                 }
-                if( valid_run ) {
+                if (valid_run)
+                {
                     // Final step's update.
                     tile_o_epilogue.scale(ctile_o, p_sum);
                     // Store o_tile to gmem.
@@ -380,7 +463,8 @@ struct Compute {
                 ctile_p.increment_gmma_desc_b_group();
                 ctile_o.increment_gmma_desc_group();
 
-                if constexpr( Kernel_traits::RETURN_SOFTMAX_STATS ) {
+                if constexpr (Kernel_traits::RETURN_SOFTMAX_STATS)
+                {
                     using Mma_tile = typename Traits_p::template Mma_tile<Cta_tile_o>;
                     fmha::Softmax_saver_tma<Cta_tile_o, Mma_tile> saver(params, head_info);
                     saver.store(p_sum, p_max, sqrtf(params.d), q_step_idx * STEP_Q, valid_run);
@@ -391,34 +475,24 @@ struct Compute {
 
     ////////////////////////////////////////////////////////////////////////////////////////////////
 
-    template<bool IS_FIRST_COL, bool APPLY_MASK, typename Params>
-    inline __device__ void compute_single_tile(Params params,
-                                               Compute_tile_p &ctile_p,
-                                               Softmax &softmax,
-                                               Compute_tile_o &ctile_o,
-                                               float (&p_max)[Mma_tile_p::CORES_M],
-                                               float (&p_sum)[Mma_tile_p::CORES_M],
-                                               const int tidx,
-                                               const int actual_kv_seqlen,
-                                               const int sliding_window_size,
-                                               const float alibi_head_scale,
-                                               const int row_offset,
-                                               const int col_offset,
-                                               const int sage_scale_row,
-                                               Circular_buffer_q_reader &cbr,
-                                               Circular_buffer_kv_reader &cbr_v,
-                                               OrderedMutexAccessor &mutex,
-                                               bool complete = false) {
+    template <bool IS_FIRST_COL, bool APPLY_MASK, typename Params>
+    inline __device__ void compute_single_tile(Params params, Compute_tile_p& ctile_p, Softmax& softmax,
+        Compute_tile_o& ctile_o, float (&p_max)[Mma_tile_p::CORES_M], float (&p_sum)[Mma_tile_p::CORES_M],
+        int const tidx, int const actual_kv_seqlen, int const sliding_window_size, float const alibi_head_scale,
+        int const row_offset, int const col_offset, int const sage_scale_row, Circular_buffer_q_reader& cbr,
+        Circular_buffer_kv_reader& cbr_v, OrderedMutexAccessor& mutex, bool complete = false)
+    {
 // load the scales of K/V from global memory
-#define LOAD_SCALES_KV(dst, which, blocks_per_step, block_size)                                    \
-    if constexpr( block_size > 0 ) {                                                               \
-        const int _start = col_offset / block_size;                                                \
-        const float *_src =                                                                        \
-            params.sage.which.scales + sage_scale_row * params.sage.which.max_nblock + _start;     \
-        const int _end = params.sage.which.max_nblock - _start;                                    \
-        _Pragma("unroll") for( int _i = 0; _i < blocks_per_step; _i++ ) {                          \
-            dst[_i] = _i < _end ? _src[_i] : 1.0f;                                                 \
-        }                                                                                          \
+#define LOAD_SCALES_KV(dst, which, blocks_per_step, block_size)                                                        \
+    if constexpr (block_size > 0)                                                                                      \
+    {                                                                                                                  \
+        const int _start = col_offset / block_size;                                                                    \
+        const float* _src = params.sage.which.scales + sage_scale_row * params.sage.which.max_nblock + _start;         \
+        const int _end = params.sage.which.max_nblock - _start;                                                        \
+        _Pragma("unroll") for (int _i = 0; _i < blocks_per_step; _i++)                                                 \
+        {                                                                                                              \
+            dst[_i] = _i < _end ? _src[_i] : 1.0f;                                                                     \
+        }                                                                                                              \
     }
 
 #define LOAD_SCALES_K(scales) LOAD_SCALES_KV(scales, k, SAGE_BLOCKS_PER_STEP_K, SAGE_BLOCK_SIZE_K)
@@ -433,7 +507,8 @@ struct Compute {
         LOAD_SCALES_K(scales_k)
 
         // Wait until another warpgroup has already executed HGMMA.
-        if constexpr( ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 2 ) {
+        if constexpr (ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 2)
+        {
             mutex.wait();
         }
 
@@ -445,16 +520,19 @@ struct Compute {
 
 // Only single K groups when sizeof(D) <= 128B.
 #pragma unroll
-        for( int kbi = 0; kbi < BMM1_MMAS_K_GROUPS - 1; kbi++ ) {
+        for (int kbi = 0; kbi < BMM1_MMAS_K_GROUPS - 1; kbi++)
+        {
 #pragma unroll
-            for( int ki = 0; ki < BMM1_MMAS_K_PER_GROUP; ki++ ) {
+            for (int ki = 0; ki < BMM1_MMAS_K_PER_GROUP; ki++)
+            {
                 ctile_p.compute(ki, false, ki == BMM1_MMAS_K_PER_GROUP - 1);
             }
             ctile_p.increment_gmma_desc_group();
         }
 
 #pragma unroll
-        for( int ki = 0; ki < BMM1_MMAS_K_PER_GROUP - 1; ki++ ) {
+        for (int ki = 0; ki < BMM1_MMAS_K_PER_GROUP - 1; ki++)
+        {
             ctile_p.compute(ki);
         }
 
@@ -464,16 +542,19 @@ struct Compute {
         warpgroup_wait<0>();
 
         // Arrive when the last tile consumes the q tile.
-        if( complete ) {
+        if (complete)
+        {
             cbr.complete(tidx == 0, cbr.ptr());
             cbr.advance();
         }
 
-        if constexpr( ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 2 ) {
+        if constexpr (ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 2)
+        {
             // Notify another warpgroup to execute HGMMA.
             mutex.arrive();
         }
-        if constexpr( ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 1 ) {
+        if constexpr (ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 1)
+        {
             // Wait until another warpgroup has already executed QGMMA.
             mutex.named_bar_wait();
         }
@@ -484,12 +565,15 @@ struct Compute {
         // Unpack the elements from bmm1 output to floats.
         softmax.unpack(ctile_p);
         // apply the scales of K before softmax
-        if constexpr( SAGE_BLOCK_SIZE_K > 0 ) {
+        if constexpr (SAGE_BLOCK_SIZE_K > 0)
+        {
 #pragma unroll
-            for( int ni = 0; ni < Mma_tile_p::CORES_N; ni++ ) {
-                const float scale_k = scales_k[SAGE_BLOCKS_PER_STEP_K * ni / Mma_tile_p::CORES_N];
+            for (int ni = 0; ni < Mma_tile_p::CORES_N; ni++)
+            {
+                float const scale_k = scales_k[SAGE_BLOCKS_PER_STEP_K * ni / Mma_tile_p::CORES_N];
 #pragma unroll
-                for( int mi = 0; mi < Mma_tile_p::CORES_M; mi++ ) {
+                for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++)
+                {
                     softmax.elt_[mi][2 * ni] *= scale_k;
                     softmax.elt_[mi][2 * ni + 1] *= scale_k;
                 }
@@ -497,13 +581,8 @@ struct Compute {
         }
 
         // Apply the alibi and mask.
-        softmax.apply_alibi_and_mask<APPLY_MASK>(ctile_p,
-                                                 params.alibi_params,
-                                                 alibi_head_scale,
-                                                 actual_kv_seqlen,
-                                                 sliding_window_size,
-                                                 row_offset,
-                                                 col_offset);
+        softmax.apply_alibi_and_mask<APPLY_MASK>(ctile_p, params.alibi_params, alibi_head_scale, actual_kv_seqlen,
+            sliding_window_size, row_offset, col_offset);
 
         // Softmax Exp, max/sum, and update scales.
         softmax.compute_and_update_scale<IS_FIRST_COL>(p_max, p_sum);
@@ -515,14 +594,16 @@ struct Compute {
         // Update flash attention scales and pack it for BMM2
         softmax.pack<IS_FIRST_COL>(ctile_o, frag_p);
 
-        if constexpr( ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 1 ) {
+        if constexpr (ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 1)
+        {
             // Notify another warpgroup to execute QGMMA.
             mutex.named_bar_arrive();
         }
 
         // Wait until v buffer is ready.
         int ready = cbr_v.peek();
-        if( !ready ) {
+        if (!ready)
+        {
             cbr_v.wait();
         }
 
@@ -549,25 +630,30 @@ struct Compute {
 //   and the final block uses the actual scale.
 // But to fetch the next scale in next STEP leads to bad performance. So we apply s[i-1]/s[i] to
 // current partial result BEFORE each V block.
-#define APPLY_SCALE_V(mma_ki)                                                                      \
-    if constexpr( SAGE_BLOCK_SIZE_V > 0 ) {                                                        \
-        if( mma_ki % (Mma_tile_o::MMAS_K / SAGE_BLOCKS_PER_STEP_V) == 0 ) {                        \
-            float _scale_v = scales_v[SAGE_BLOCKS_PER_STEP_V * mma_ki / Mma_tile_o::MMAS_K];       \
-            if( mma_ki != 0 ) {                                                                    \
-                warpgroup_commit();                                                                \
-                warpgroup_wait<0>();                                                               \
-                float _scale = last_scale_v / _scale_v;                                            \
-            }                                                                                      \
-            last_scale_v = _scale_v;                                                               \
-        }                                                                                          \
+#define APPLY_SCALE_V(mma_ki)                                                                                          \
+    if constexpr (SAGE_BLOCK_SIZE_V > 0)                                                                               \
+    {                                                                                                                  \
+        if (mma_ki % (Mma_tile_o::MMAS_K / SAGE_BLOCKS_PER_STEP_V) == 0)                                               \
+        {                                                                                                              \
+            float _scale_v = scales_v[SAGE_BLOCKS_PER_STEP_V * mma_ki / Mma_tile_o::MMAS_K];                           \
+            if (mma_ki != 0)                                                                                           \
+            {                                                                                                          \
+                warpgroup_commit();                                                                                    \
+                warpgroup_wait<0>();                                                                                   \
+                float _scale = last_scale_v / _scale_v;                                                                \
+            }                                                                                                          \
+            last_scale_v = _scale_v;                                                                                   \
+        }                                                                                                              \
     }
 
 // BMM2 (S * V).
 #pragma unroll
-        for( int kbi = 0; kbi < BMM2_MMAS_K_GROUPS - 1; kbi++ ) {
+        for (int kbi = 0; kbi < BMM2_MMAS_K_GROUPS - 1; kbi++)
+        {
 #pragma unroll
-            for( int ki = 0; ki < BMM2_MMAS_K_PER_GROUP; ++ki ) {
-                const int mma_ki = kbi * BMM2_MMAS_K_PER_GROUP + ki;
+            for (int ki = 0; ki < BMM2_MMAS_K_PER_GROUP; ++ki)
+            {
+                int const mma_ki = kbi * BMM2_MMAS_K_PER_GROUP + ki;
                 APPLY_SCALE_V(mma_ki)
                 ctile_o.fill_frag_a(frag_p[mma_ki]);
                 ctile_o.compute(ki, false, ki == BMM2_MMAS_K_PER_GROUP - 1);
@@ -576,8 +662,9 @@ struct Compute {
         }
 
 #pragma unroll
-        for( int ki = 0; ki < BMM2_MMAS_K_PER_GROUP - 1; ++ki ) {
-            const int mma_ki = (BMM2_MMAS_K_GROUPS - 1) * BMM2_MMAS_K_PER_GROUP + ki;
+        for (int ki = 0; ki < BMM2_MMAS_K_PER_GROUP - 1; ++ki)
+        {
+            int const mma_ki = (BMM2_MMAS_K_GROUPS - 1) * BMM2_MMAS_K_PER_GROUP + ki;
             APPLY_SCALE_V(mma_ki)
             ctile_o.fill_frag_a(frag_p[mma_ki]);
             ctile_o.compute(ki);
@@ -594,5 +681,5 @@ struct Compute {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace ws
-}  // namespace fmha
+} // namespace ws
+} // namespace fmha

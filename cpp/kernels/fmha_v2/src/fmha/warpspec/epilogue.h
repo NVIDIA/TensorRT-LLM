@@ -16,14 +16,17 @@
 #include <fmha/traits.h>
 #include <fmha/utils.h>
 
-namespace fmha {
-namespace ws {
+namespace fmha
+{
+namespace ws
+{
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Special Softmax struct to handle optimization tricks on Hopper Warp-Specialized Kernels.
-template<template<int, int, int, bool, bool> class Traits, typename Kernel_traits>
-struct Softmax_base {
+template <template <int, int, int, bool, bool> class Traits, typename Kernel_traits>
+struct Softmax_base
+{
 
     // The instruction traits for BMM1.
     using Traits_p = typename Kernel_traits::Traits_p;
@@ -49,44 +52,79 @@ struct Softmax_base {
     using Fragment_p = typename Compute_tile_o::Fragment;
 
     // The step size of KV loop.
-    enum { STEP_KV = Kernel_traits::STEP_KV };
+    enum
+    {
+        STEP_KV = Kernel_traits::STEP_KV
+    };
 
     // Whether apply causal mask or not.
-    enum { CAUSAL_MASK = Kernel_traits::CAUSAL_MASK };
+    enum
+    {
+        CAUSAL_MASK = Kernel_traits::CAUSAL_MASK
+    };
+
     // Whether we will ignore the long distance tokens in the beginning.
-    enum { SLIDING_WINDOW_ATTENTION = Kernel_traits::SLIDING_WINDOW_ATTENTION };
+    enum
+    {
+        SLIDING_WINDOW_ATTENTION = Kernel_traits::SLIDING_WINDOW_ATTENTION
+    };
+
     // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
-    enum { APPLY_ALIBI = Kernel_traits::APPLY_ALIBI };
+    enum
+    {
+        APPLY_ALIBI = Kernel_traits::APPLY_ALIBI
+    };
+
     // Are we applying softcapping scale for qk products ?
-    enum { ENABLE_BMM1_SOFTCAPPING_SCALE = Kernel_traits::ENABLE_BMM1_SOFTCAPPING_SCALE };
+    enum
+    {
+        ENABLE_BMM1_SOFTCAPPING_SCALE = Kernel_traits::ENABLE_BMM1_SOFTCAPPING_SCALE
+    };
+
     // Do we use custom mask input ?
-    enum { USE_CUSTOM_MASK = Kernel_traits::USE_CUSTOM_MASK };
+    enum
+    {
+        USE_CUSTOM_MASK = Kernel_traits::USE_CUSTOM_MASK
+    };
+
     // Apply the exp2f optimization (fuse bmm1_scale and -max into FMAs).
-    enum { EXP2F_OPTIMIZATION = Kernel_traits::EXP2F_OPTIMIZATION };
+    enum
+    {
+        EXP2F_OPTIMIZATION = Kernel_traits::EXP2F_OPTIMIZATION
+    };
+
     // Whether we need to check if local_max could be -inf or not.
-    enum { CHECK_IF_NEG_INF_EXISTS = SLIDING_WINDOW_ATTENTION || USE_CUSTOM_MASK };
+    enum
+    {
+        CHECK_IF_NEG_INF_EXISTS = SLIDING_WINDOW_ATTENTION || USE_CUSTOM_MASK
+    };
 
     // Ctor.
-    template<typename Params>
+    template <typename Params>
     inline __device__ Softmax_base(Params params, int tidx)
-        : tidx_(tidx), scale_bmm1_(params.scale_bmm1_d ? *params.scale_bmm1_d : params.scale_bmm1),
-          softcapping_scale_bmm1_(params.softcapping_scale_bmm1),
-          packed_mask_ptr_{ reinterpret_cast<uint32_t *>(params.packed_mask_ptr) },
-          params_packed_mask_stride_in_bytes_{ params.packed_mask_stride_in_bytes } {
+        : tidx_(tidx)
+        , scale_bmm1_(params.scale_bmm1_d ? *params.scale_bmm1_d : params.scale_bmm1)
+        , softcapping_scale_bmm1_(params.softcapping_scale_bmm1)
+        , packed_mask_ptr_{reinterpret_cast<uint32_t*>(params.packed_mask_ptr)}
+        , params_packed_mask_stride_in_bytes_{params.packed_mask_stride_in_bytes}
+    {
 
         int warp = tidx / 32;
         int lane = tidx % 32;
         // The corresponding row/col for each thread after MMA.
         // fixed 4x1 warp layout.
         quad_col_ = lane % 4;
-        if( CAUSAL_MASK ) {
+        if (CAUSAL_MASK)
+        {
             quad_row_ = warp * 16 + lane / 4;
         }
     }
 
     // Load the packed mask in global memory.
-    inline __device__ void load_packed_mask(int row_offset, int col_offset) {
-        if constexpr( USE_CUSTOM_MASK ) {
+    inline __device__ void load_packed_mask(int row_offset, int col_offset)
+    {
+        if constexpr (USE_CUSTOM_MASK)
+        {
             static_assert(Mma_tile_p::CORES_M == 2, "Not implemented!");
             // Note that row_offset takes sum_s into consideration.
             // row_offset % 64 == 0.
@@ -94,18 +132,22 @@ struct Softmax_base {
             int64_t mask_row_offset_in_bytes = row_offset * params_packed_mask_stride_in_bytes_;
             // offset_in_bytes = (tidx_ * 32 + (col_offset / (16 * 4)) * 128 * 32) / 8.
             // note that col_offset % 64 == 0 here.
-            int64_t mask_col_offset_in_bytes =
-                tidx_ * 4 + col_offset * Cta_tile_p::THREADS_PER_CTA / 16;
+            int64_t mask_col_offset_in_bytes = tidx_ * 4 + col_offset * Cta_tile_p::THREADS_PER_CTA / 16;
             // add the two offsets for uint32 packed mask.
             int64_t mask_offset = (mask_row_offset_in_bytes + mask_col_offset_in_bytes) / 4;
-            if constexpr( STEP_KV == 64 ) {
+            if constexpr (STEP_KV == 64)
+            {
                 // 32 bits (2 rows, 16 cols) are needed.
                 packed_mask_.x = packed_mask_ptr_[mask_offset];
-            } else if constexpr( STEP_KV == 128 ) {
+            }
+            else if constexpr (STEP_KV == 128)
+            {
                 // 2 x 32 bits (4 rows, 16 cols) are needed.
                 packed_mask_.x = packed_mask_ptr_[mask_offset];
                 packed_mask_.y = packed_mask_ptr_[mask_offset + 128];
-            } else if constexpr( STEP_KV == 256 ) {
+            }
+            else if constexpr (STEP_KV == 256)
+            {
                 // 4 x 32 bits (4 rows, 16 cols) are needed.
                 packed_mask_.x = packed_mask_ptr_[mask_offset];
                 packed_mask_.y = packed_mask_ptr_[mask_offset + 128];
@@ -116,33 +158,49 @@ struct Softmax_base {
     }
 
     // Check if the two positions are valid or not.
-    inline __device__ void valid_positions(int mi, int ni, bool &v0, bool &v1) {
+    inline __device__ void valid_positions(int mi, int ni, bool& v0, bool& v1)
+    {
         // Only need one uint32_t packed mask in this case.
-        if constexpr( STEP_KV == 64 ) {
+        if constexpr (STEP_KV == 64)
+        {
             // Packed mask input.
             v0 = packed_mask_.x & (1 << (ni * 4 + mi * 2 + 0));
             v1 = packed_mask_.x & (1 << (ni * 4 + mi * 2 + 1));
-        } else if constexpr( STEP_KV == 128 ) {
+        }
+        else if constexpr (STEP_KV == 128)
+        {
             // Packed mask input.
-            if( ni < 8 ) {
+            if (ni < 8)
+            {
                 v0 = packed_mask_.x & (1 << (ni * 4 + mi * 2 + 0));
                 v1 = packed_mask_.x & (1 << (ni * 4 + mi * 2 + 1));
-            } else {
+            }
+            else
+            {
                 v0 = packed_mask_.y & (1 << (ni * 4 + mi * 2 + 0 - 32));
                 v1 = packed_mask_.y & (1 << (ni * 4 + mi * 2 + 1 - 32));
             }
-        } else if constexpr( STEP_KV == 256 ) {
+        }
+        else if constexpr (STEP_KV == 256)
+        {
             // KV step size is 256 in this case (i.e CORES_N = 32).
-            if( ni < 8 ) {
+            if (ni < 8)
+            {
                 v0 = packed_mask_.x & (1 << (ni * 4 + mi * 2 + 0));
                 v1 = packed_mask_.x & (1 << (ni * 4 + mi * 2 + 1));
-            } else if( ni < 16 ) {
+            }
+            else if (ni < 16)
+            {
                 v0 = packed_mask_.y & (1 << (ni * 4 + mi * 2 + 0 - 32));
                 v1 = packed_mask_.y & (1 << (ni * 4 + mi * 2 + 1 - 32));
-            } else if( ni < 24 ) {
+            }
+            else if (ni < 24)
+            {
                 v0 = packed_mask_.z & (1 << (ni * 4 + mi * 2 + 0 - 64));
                 v1 = packed_mask_.z & (1 << (ni * 4 + mi * 2 + 1 - 64));
-            } else {
+            }
+            else
+            {
                 v0 = packed_mask_.w & (1 << (ni * 4 + mi * 2 + 0 - 96));
                 v1 = packed_mask_.w & (1 << (ni * 4 + mi * 2 + 1 - 96));
             }
@@ -150,47 +208,50 @@ struct Softmax_base {
     }
 
     // Convert from bmm1 output fragments to floats.
-    inline __device__ void unpack(Compute_tile_p &ctile_p) {
+    inline __device__ void unpack(Compute_tile_p& ctile_p)
+    {
 #pragma unroll
-        for( int mi = 0; mi < Mma_tile_p::CORES_M; mi++ ) {
+        for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++)
+        {
 #pragma unroll
-            for( int ni = 0; ni < Mma_tile_p::CORES_N; ni++ ) {
+            for (int ni = 0; ni < Mma_tile_p::CORES_N; ni++)
+            {
                 // Satfinite in case of overflow (due to fp16 accumulation).
                 // When there is no alibi bias, we fuse bmm1_scale with -max by FMAs.
-                uint32_t scaled_h2 =
-                    EXP2F_OPTIMIZATION
-                        ? satfinite_h2(ctile_p.acc_[0][0].reg(ni * Mma_tile_p::CORES_M + mi))
-                        : satfinite_h2(hmul2(ctile_p.acc_[0][0].reg(ni * Mma_tile_p::CORES_M + mi),
-                                             scale_bmm1_));
+                uint32_t scaled_h2 = EXP2F_OPTIMIZATION
+                    ? satfinite_h2(ctile_p.acc_[0][0].reg(ni * Mma_tile_p::CORES_M + mi))
+                    : satfinite_h2(hmul2(ctile_p.acc_[0][0].reg(ni * Mma_tile_p::CORES_M + mi), scale_bmm1_));
                 // Convert from half2 to float2.
-                reinterpret_cast<float2 *>(&elt_[mi][2 * ni])[0] = half2_to_float2(scaled_h2);
+                reinterpret_cast<float2*>(&elt_[mi][2 * ni])[0] = half2_to_float2(scaled_h2);
             }
         }
     }
 
     // Convert from bmm1 output fragments to floats.
-    template<bool APPLY_MASK, typename AlibiParams>
-    inline __device__ void apply_alibi_and_mask(Compute_tile_p &ctile_p,
-                                                const AlibiParams &alibi_params,
-                                                const float alibi_head_scale,
-                                                int actual_seqlen,
-                                                int sliding_window_size,
-                                                int row_offset,
-                                                int col_offset) {
+    template <bool APPLY_MASK, typename AlibiParams>
+    inline __device__ void apply_alibi_and_mask(Compute_tile_p& ctile_p, AlibiParams const& alibi_params,
+        float const alibi_head_scale, int actual_seqlen, int sliding_window_size, int row_offset, int col_offset)
+    {
 #pragma unroll
-        for( int mi = 0; mi < Mma_tile_p::CORES_M; mi++ ) {
+        for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++)
+        {
 #pragma unroll
-            for( int ni = 0; ni < Mma_tile_p::CORES_N; ni++ ) {
+            for (int ni = 0; ni < Mma_tile_p::CORES_N; ni++)
+            {
 
                 bool v0 = true, v1 = true;
                 int col = 0;
-                if constexpr( APPLY_MASK ) {
+                if constexpr (APPLY_MASK)
+                {
                     // Custom mask input.
-                    if constexpr( USE_CUSTOM_MASK ) {
+                    if constexpr (USE_CUSTOM_MASK)
+                    {
                         // Packed mask input.
                         valid_positions(mi, ni, v0, v1);
                         // Causal mask.
-                    } else if constexpr( CAUSAL_MASK ) {
+                    }
+                    else if constexpr (CAUSAL_MASK)
+                    {
                         // Causal Mask: we have to apply mask before getting max.
                         int row = row_offset + quad_row_ + mi * 8;
                         col = col_offset + quad_col_ * 2 + ni * 8;
@@ -199,13 +260,16 @@ struct Softmax_base {
                         v1 = (col + 1 <= row);
 
                         // Only pay attention to the last max-past-seqlen long tokens.
-                        if constexpr( SLIDING_WINDOW_ATTENTION ) {
+                        if constexpr (SLIDING_WINDOW_ATTENTION)
+                        {
                             int start_seqlen = max(0, row - sliding_window_size);
                             v0 &= (col >= start_seqlen);
                             v1 &= (col + 1 >= start_seqlen);
                         }
                         // Dense(padding) mask.
-                    } else {
+                    }
+                    else
+                    {
                         col = col_offset + quad_col_ * 2 + ni * 8;
                         v0 = (col < actual_seqlen);
                         v1 = (col + 1 < actual_seqlen);
@@ -213,24 +277,28 @@ struct Softmax_base {
                 }
 
                 // The unpacked floats from the array.
-                float2 &f2 = reinterpret_cast<float2 *>(&elt_[mi][2 * ni])[0];
+                float2& f2 = reinterpret_cast<float2*>(&elt_[mi][2 * ni])[0];
 
                 // Attention logit softcapping scale.
                 // 1.0f / softcapping_scale has been fused into scale_bmm1.
-                if constexpr( ENABLE_BMM1_SOFTCAPPING_SCALE ) {
+                if constexpr (ENABLE_BMM1_SOFTCAPPING_SCALE)
+                {
                     f2.x = softcapping_scale_bmm1_ * fmha::__tanhf(f2.x);
                     f2.y = softcapping_scale_bmm1_ * fmha::__tanhf(f2.y);
                 }
 
                 // Use minimum value of float here to avoid generating NANs with expf.
-                if constexpr( APPLY_ALIBI ) {
-                    f2.x = v0 ? (f2.x * alibi_params.scale_after_alibi +
-                                 (col + alibi_params.sequence_pos_offset) * alibi_head_scale)
+                if constexpr (APPLY_ALIBI)
+                {
+                    f2.x = v0 ? (f2.x * alibi_params.scale_after_alibi
+                               + (col + alibi_params.sequence_pos_offset) * alibi_head_scale)
                               : -FLT_MAX;
-                    f2.y = v1 ? (f2.y * alibi_params.scale_after_alibi +
-                                 (col + 1 + alibi_params.sequence_pos_offset) * alibi_head_scale)
+                    f2.y = v1 ? (f2.y * alibi_params.scale_after_alibi
+                               + (col + 1 + alibi_params.sequence_pos_offset) * alibi_head_scale)
                               : -FLT_MAX;
-                } else {
+                }
+                else
+                {
                     f2.x = v0 ? f2.x : -FLT_MAX;
                     f2.y = v1 ? f2.y : -FLT_MAX;
                 }
@@ -239,9 +307,10 @@ struct Softmax_base {
     }
 
     // Calculate max/sum, and update flash-attention scales.
-    template<bool IS_FIRST_COL>
-    inline __device__ void compute_and_update_scale(float (&global_max)[Mma_tile_p::CORES_M],
-                                                    float (&global_sum)[Mma_tile_p::CORES_M]) {
+    template <bool IS_FIRST_COL>
+    inline __device__ void compute_and_update_scale(
+        float (&global_max)[Mma_tile_p::CORES_M], float (&global_sum)[Mma_tile_p::CORES_M])
+    {
 
         // Internal knob to WAR exposed 17 clk MUFU latency for Hopper and possibly all prev archs
         //
@@ -262,50 +331,55 @@ struct Softmax_base {
         // /*0030*/  FADD.FTZ R109, R110, R61   &req={3}  ?WAIT7_END_GROUP;
 #if defined(JETFIRE_ENABLED)
         asm volatile(".pragma \"set knob SchedResBusyXU64=1\";\n" : : : "memory");
-#endif  // JETFIRE_ENABLED
+#endif // JETFIRE_ENABLED
 
-        const float scale = reinterpret_cast<const float &>(scale_bmm1_);
+        float const scale = reinterpret_cast<float const&>(scale_bmm1_);
 
 // Row-wise max of current tile.
 #pragma unroll
-        for( int mi = 0; mi < Mma_tile_p::CORES_M; mi++ ) {
-            if( IS_FIRST_COL ) {
+        for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++)
+        {
+            if (IS_FIRST_COL)
+            {
                 local_max_[mi] = elt_[mi][0];
-            } else {
+            }
+            else
+            {
                 local_max_[mi] = fmaxf(global_max[mi], elt_[mi][0]);
             }
 #pragma unroll
-            for( int ni = 1; ni < Mma_tile_p::CORES_N * 2; ni++ ) {
+            for (int ni = 1; ni < Mma_tile_p::CORES_N * 2; ni++)
+            {
                 local_max_[mi] = fmaxf(local_max_[mi], elt_[mi][ni]);
             }
-            local_max_[mi] =
-                fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 1), local_max_[mi]);
-            local_max_[mi] =
-                fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 2), local_max_[mi]);
+            local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 1), local_max_[mi]);
+            local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 2), local_max_[mi]);
         }
 
 // Softmax Exp.
 #pragma unroll
-        for( int ni = 0; ni < Mma_tile_p::CORES_N; ni++ ) {
+        for (int ni = 0; ni < Mma_tile_p::CORES_N; ni++)
+        {
 #pragma unroll
-            for( int mi = 0; mi < Mma_tile_p::CORES_M; mi++ ) {
+            for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++)
+            {
 
-                float &p0 = elt_[mi][2 * ni + 0];
-                float &p1 = elt_[mi][2 * ni + 1];
+                float& p0 = elt_[mi][2 * ni + 0];
+                float& p1 = elt_[mi][2 * ni + 1];
 
                 // When all elts of the tile are -FLT_MAX, we have to make sure
                 //  expf generates 0 for all values instead of 1.
-                if constexpr( !EXP2F_OPTIMIZATION ) {
-                    float masked_max = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX)
-                                           ? local_max_[mi]
-                                           : 0.f;
+                if constexpr (!EXP2F_OPTIMIZATION)
+                {
+                    float masked_max = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX) ? local_max_[mi] : 0.f;
                     p0 = expf(p0 - masked_max);
                     p1 = expf(p1 - masked_max);
-                } else {
+                }
+                else
+                {
                     // Use exp2f optimization for cases without alibi.
-                    float masked_max = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX)
-                                           ? local_max_[mi] * scale
-                                           : 0.f;
+                    float masked_max
+                        = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX) ? local_max_[mi] * scale : 0.f;
                     p0 = custom_exp2f(p0, scale, masked_max);
                     p1 = custom_exp2f(p1, scale, masked_max);
                 }
@@ -314,10 +388,12 @@ struct Softmax_base {
 
 // Row-wise sum of current tile.
 #pragma unroll
-        for( int mi = 0; mi < Mma_tile_p::CORES_M; mi++ ) {
+        for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++)
+        {
             local_sum_[mi] = elt_[mi][0];
 #pragma unroll
-            for( int ni = 1; ni < Mma_tile_p::CORES_N * 2; ni++ ) {
+            for (int ni = 1; ni < Mma_tile_p::CORES_N * 2; ni++)
+            {
                 local_sum_[mi] += elt_[mi][ni];
             }
             local_sum_[mi] += __shfl_xor_sync(uint32_t(-1), local_sum_[mi], 1);
@@ -325,24 +401,31 @@ struct Softmax_base {
         }
 
         // Initialize or update the global sum and max.
-        if( IS_FIRST_COL ) {
+        if (IS_FIRST_COL)
+        {
 #pragma unroll
-            for( int mi = 0; mi < Mma_tile_p::CORES_M; mi++ ) {
+            for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++)
+            {
                 global_sum[mi] = local_sum_[mi];
                 global_max[mi] = local_max_[mi];
             }
-
-        } else {
+        }
+        else
+        {
 #pragma unroll
-            for( int mi = 0; mi < Mma_tile_p::CORES_M; mi++ ) {
+            for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++)
+            {
                 float max_old = global_max[mi];
                 float max_new = local_max_[mi];
                 float sum_old = global_sum[mi];
                 float sum_new = local_sum_[mi];
                 // Remove the old max and replace by the new one.
-                if constexpr( !EXP2F_OPTIMIZATION ) {
+                if constexpr (!EXP2F_OPTIMIZATION)
+                {
                     correction_[mi] = expf(max_old - max_new);
-                } else {
+                }
+                else
+                {
                     // Use exp2f optimization for cases without alibi.
                     correction_[mi] = exp2f((max_old - max_new) * scale);
                 }
@@ -355,44 +438,52 @@ struct Softmax_base {
     }
 
     // Update flash attention scales and pack elements for BMM2.
-    template<bool IS_FIRST_COL>
-    inline __device__ void pack(Compute_tile_o &ctile_o, Fragment_p (&frag_p)[Mma_tile_o::MMAS_K]) {
+    template <bool IS_FIRST_COL>
+    inline __device__ void pack(Compute_tile_o& ctile_o, Fragment_p (&frag_p)[Mma_tile_o::MMAS_K])
+    {
 
 // Pack 4 cols for BMM2 A tile.
 #pragma unroll
-        for( int ni = 0; ni < Mma_tile_o::MMAS_K; ni++ ) {
+        for (int ni = 0; ni < Mma_tile_o::MMAS_K; ni++)
+        {
             frag_p[ni].reg(0) = float2_to_half2(elt_[0][4 * ni + 0], elt_[0][4 * ni + 1]);
             frag_p[ni].reg(1) = float2_to_half2(elt_[1][4 * ni + 0], elt_[1][4 * ni + 1]);
             frag_p[ni].reg(2) = float2_to_half2(elt_[0][4 * ni + 2], elt_[0][4 * ni + 3]);
             frag_p[ni].reg(3) = float2_to_half2(elt_[1][4 * ni + 2], elt_[1][4 * ni + 3]);
         }
 
-        if( !IS_FIRST_COL ) {
+        if (!IS_FIRST_COL)
+        {
 // Correct accumulators to current max.
 #pragma unroll
-            for( int mi = 0; mi < Mma_tile_o::CORES_M; mi++ ) {
-                const uint32_t scale = float_to_half2(correction_[mi]);
+            for (int mi = 0; mi < Mma_tile_o::CORES_M; mi++)
+            {
+                uint32_t const scale = float_to_half2(correction_[mi]);
 
 // Assume only N has multiple MMAs (MMAS_M = 1).
 // MMAS_N > 1 when N dimension is split.
 #pragma unroll
-                for( int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++ ) {
+                for (int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++)
+                {
 #pragma unroll
-                    for( int ni = 0; ni < Mma_tile_o::CORES_N; ni++ ) {
-                        uint32_t &reg = ctile_o.acc_[0][mma_ni].reg(ni * Mma_tile_o::CORES_M + mi);
+                    for (int ni = 0; ni < Mma_tile_o::CORES_N; ni++)
+                    {
+                        uint32_t& reg = ctile_o.acc_[0][mma_ni].reg(ni * Mma_tile_o::CORES_M + mi);
                         reg = hmul2(reg, scale);
                     }
                 }
             }
-        } else {
+        }
+        else
+        {
             ctile_o.clear();
         }
     }
 
     // BMM1 scale.
-    const uint32_t scale_bmm1_;
+    uint32_t const scale_bmm1_;
     // BMM1 softcapping scale.
-    const float softcapping_scale_bmm1_;
+    float const softcapping_scale_bmm1_;
     // The thread idx in the warp group.
     int tidx_;
     // The col index for the mma thread layout.
@@ -401,9 +492,9 @@ struct Softmax_base {
     int quad_row_;
 
     // The packed mask ptr.
-    const uint32_t *packed_mask_ptr_;
+    uint32_t const* packed_mask_ptr_;
     // The packed mask k-dim stride in bytes;
-    const int64_t params_packed_mask_stride_in_bytes_;
+    int64_t const params_packed_mask_stride_in_bytes_;
 
     // Unpacked BMM1 output buffer.
     float elt_[Mma_tile_p::CORES_M][Mma_tile_p::CORES_N * 2];
@@ -419,30 +510,35 @@ struct Softmax_base {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<template<int, int, int, bool, bool> class Traits, typename Kernel_traits>
-struct Softmax {};
+template <template <int, int, int, bool, bool> class Traits, typename Kernel_traits>
+struct Softmax
+{
+};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Hopper_hgmma_fp16_traits
-template<typename Kernel_traits>
-struct Softmax<Hopper_hgmma_fp16_traits, Kernel_traits>
-    : public Softmax_base<Hopper_hgmma_fp16_traits, Kernel_traits> {
+template <typename Kernel_traits>
+struct Softmax<Hopper_hgmma_fp16_traits, Kernel_traits> : public Softmax_base<Hopper_hgmma_fp16_traits, Kernel_traits>
+{
 
     // The Base class.
     using Base = Softmax_base<Hopper_hgmma_fp16_traits, Kernel_traits>;
 
     // Ctor.
-    template<typename Params>
-    inline __device__ Softmax(const Params &params, int tidx) : Base(params, tidx) {
+    template <typename Params>
+    inline __device__ Softmax(Params const& params, int tidx)
+        : Base(params, tidx)
+    {
     }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Fp32 accumulation traits.
-template<template<int, int, int, bool, bool> class Traits, typename Kernel_traits>
-struct Softmax_fp32_base : public Softmax_base<Traits, Kernel_traits> {
+template <template <int, int, int, bool, bool> class Traits, typename Kernel_traits>
+struct Softmax_fp32_base : public Softmax_base<Traits, Kernel_traits>
+{
 
     // The Base class.
     using Base = Softmax_base<Traits, Kernel_traits>;
@@ -471,41 +567,73 @@ struct Softmax_fp32_base : public Softmax_base<Traits, Kernel_traits> {
     using Fragment_p = typename Compute_tile_o::Fragment;
 
     // Whether apply causal mask or not.
-    enum { CAUSAL_MASK = Base::CAUSAL_MASK };
+    enum
+    {
+        CAUSAL_MASK = Base::CAUSAL_MASK
+    };
+
     // Do we use custom mask input ?
-    enum { USE_CUSTOM_MASK = Base::USE_CUSTOM_MASK };
+    enum
+    {
+        USE_CUSTOM_MASK = Base::USE_CUSTOM_MASK
+    };
+
     // Whether we will ignore the long distance tokens in the beginning.
-    enum { SLIDING_WINDOW_ATTENTION = Base::SLIDING_WINDOW_ATTENTION };
+    enum
+    {
+        SLIDING_WINDOW_ATTENTION = Base::SLIDING_WINDOW_ATTENTION
+    };
+
     // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
-    enum { APPLY_ALIBI = Base::APPLY_ALIBI };
+    enum
+    {
+        APPLY_ALIBI = Base::APPLY_ALIBI
+    };
+
     // Are we applying softcapping_scale for qk products ?
-    enum { ENABLE_BMM1_SOFTCAPPING_SCALE = Base::ENABLE_BMM1_SOFTCAPPING_SCALE };
+    enum
+    {
+        ENABLE_BMM1_SOFTCAPPING_SCALE = Base::ENABLE_BMM1_SOFTCAPPING_SCALE
+    };
+
     // Apply the exp2f optimization (fuse bmm1_scale and -max into FMAs).
-    enum { EXP2F_OPTIMIZATION = Base::EXP2F_OPTIMIZATION };
+    enum
+    {
+        EXP2F_OPTIMIZATION = Base::EXP2F_OPTIMIZATION
+    };
+
     // Whether we need to check if local_max could be -inf or not.
-    enum { CHECK_IF_NEG_INF_EXISTS = Base::CHECK_IF_NEG_INF_EXISTS };
+    enum
+    {
+        CHECK_IF_NEG_INF_EXISTS = Base::CHECK_IF_NEG_INF_EXISTS
+    };
 
     // Ctor.
-    template<typename Params>
-    inline __device__ Softmax_fp32_base(const Params &params, int tidx) : Base(params, tidx) {
+    template <typename Params>
+    inline __device__ Softmax_fp32_base(Params const& params, int tidx)
+        : Base(params, tidx)
+    {
     }
 
     // Convert from bmm1 output fragments to floats.
-    inline __device__ void unpack(Compute_tile_p &ctile_p) {
+    inline __device__ void unpack(Compute_tile_p& ctile_p)
+    {
 #pragma unroll
-        for( int mi = 0; mi < Mma_tile_p::CORES_M; mi++ ) {
+        for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++)
+        {
 #pragma unroll
-            for( int ni = 0; ni < Mma_tile_p::CORES_N; ni++ ) {
+            for (int ni = 0; ni < Mma_tile_p::CORES_N; ni++)
+            {
                 float2 f2;
                 f2.x = ctile_p.acc_[0][0].elt(2 * ni * Mma_tile_p::CORES_M + 2 * mi);
                 f2.y = ctile_p.acc_[0][0].elt(2 * ni * Mma_tile_p::CORES_M + 2 * mi + 1);
 
-                const float scale = reinterpret_cast<const float &>(this->scale_bmm1_);
+                float const scale = reinterpret_cast<float const&>(this->scale_bmm1_);
                 f2.x = EXP2F_OPTIMIZATION ? f2.x : f2.x * scale;
                 f2.y = EXP2F_OPTIMIZATION ? f2.y : f2.y * scale;
 
                 // Store to elt array.
-                reinterpret_cast<float2 *>(&this->elt_[mi][2 * ni])[0] = f2;
+                reinterpret_cast<float2*>(&this->elt_[mi][2 * ni])[0] = f2;
             }
         }
     }
@@ -514,9 +642,10 @@ struct Softmax_fp32_base : public Softmax_base<Traits, Kernel_traits> {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Hopper_hgmma_fp32_traits
-template<typename Kernel_traits>
+template <typename Kernel_traits>
 struct Softmax<Hopper_hgmma_fp32_traits, Kernel_traits>
-    : public Softmax_fp32_base<Hopper_hgmma_fp32_traits, Kernel_traits> {
+    : public Softmax_fp32_base<Hopper_hgmma_fp32_traits, Kernel_traits>
+{
 
     // The Base class.
     using Base = Softmax_fp32_base<Hopper_hgmma_fp32_traits, Kernel_traits>;
@@ -531,58 +660,64 @@ struct Softmax<Hopper_hgmma_fp32_traits, Kernel_traits>
     using Fragment_p = typename Compute_tile_o::Fragment;
 
     // Ctor.
-    template<typename Params>
-    inline __device__ Softmax(const Params &params, int tidx) : Base(params, tidx) {
+    template <typename Params>
+    inline __device__ Softmax(Params const& params, int tidx)
+        : Base(params, tidx)
+    {
     }
 
     // Update flash attention scales and pack elements for BMM2.
-    template<bool IS_FIRST_COL>
-    inline __device__ void pack(Compute_tile_o &ctile_o, Fragment_p (&frag_p)[Mma_tile_o::MMAS_K]) {
+    template <bool IS_FIRST_COL>
+    inline __device__ void pack(Compute_tile_o& ctile_o, Fragment_p (&frag_p)[Mma_tile_o::MMAS_K])
+    {
 
 // Pack 4 cols for BMM2 A tile.
 #pragma unroll
-        for( int ni = 0; ni < Mma_tile_o::MMAS_K; ni++ ) {
-            frag_p[ni].reg(0) =
-                float2_to_half2(this->elt_[0][4 * ni + 0], this->elt_[0][4 * ni + 1]);
-            frag_p[ni].reg(1) =
-                float2_to_half2(this->elt_[1][4 * ni + 0], this->elt_[1][4 * ni + 1]);
-            frag_p[ni].reg(2) =
-                float2_to_half2(this->elt_[0][4 * ni + 2], this->elt_[0][4 * ni + 3]);
-            frag_p[ni].reg(3) =
-                float2_to_half2(this->elt_[1][4 * ni + 2], this->elt_[1][4 * ni + 3]);
+        for (int ni = 0; ni < Mma_tile_o::MMAS_K; ni++)
+        {
+            frag_p[ni].reg(0) = float2_to_half2(this->elt_[0][4 * ni + 0], this->elt_[0][4 * ni + 1]);
+            frag_p[ni].reg(1) = float2_to_half2(this->elt_[1][4 * ni + 0], this->elt_[1][4 * ni + 1]);
+            frag_p[ni].reg(2) = float2_to_half2(this->elt_[0][4 * ni + 2], this->elt_[0][4 * ni + 3]);
+            frag_p[ni].reg(3) = float2_to_half2(this->elt_[1][4 * ni + 2], this->elt_[1][4 * ni + 3]);
         }
 
-        if( !IS_FIRST_COL ) {
+        if (!IS_FIRST_COL)
+        {
 // Correct accumulators to current max.
 #pragma unroll
-            for( int mi = 0; mi < Mma_tile_o::CORES_M; mi++ ) {
+            for (int mi = 0; mi < Mma_tile_o::CORES_M; mi++)
+            {
                 // Assume only N has multiple MMAs (MMAS_M = 1).
                 // MMAS_N > 1 when N dimension is split.
                 float correction = this->correction_[mi];
 #pragma unroll
-                for( int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++ ) {
+                for (int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++)
+                {
 #pragma unroll
-                    for( int ni = 0; ni < Mma_tile_o::CORES_N; ni++ ) {
-                        uint32_t &reg0 =
-                            ctile_o.acc_[0][mma_ni].reg(2 * ni * Mma_tile_o::CORES_M + 2 * mi);
-                        uint32_t &reg1 =
-                            ctile_o.acc_[0][mma_ni].reg(2 * ni * Mma_tile_o::CORES_M + 2 * mi + 1);
+                    for (int ni = 0; ni < Mma_tile_o::CORES_N; ni++)
+                    {
+                        uint32_t& reg0 = ctile_o.acc_[0][mma_ni].reg(2 * ni * Mma_tile_o::CORES_M + 2 * mi);
+                        uint32_t& reg1 = ctile_o.acc_[0][mma_ni].reg(2 * ni * Mma_tile_o::CORES_M + 2 * mi + 1);
                         asm volatile("mul.f32 %0, %0, %1;\n" : "+r"(reg0) : "f"(correction));
                         asm volatile("mul.f32 %0, %0, %1;\n" : "+r"(reg1) : "f"(correction));
                     }
                 }
             }
-        } else {
+        }
+        else
+        {
             ctile_o.clear();
         }
     }
 };
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Hopper_hgmma_bf16_traits
-template<typename Kernel_traits>
+template <typename Kernel_traits>
 struct Softmax<Hopper_hgmma_bf16_traits, Kernel_traits>
-    : public Softmax_fp32_base<Hopper_hgmma_bf16_traits, Kernel_traits> {
+    : public Softmax_fp32_base<Hopper_hgmma_bf16_traits, Kernel_traits>
+{
 
     // The Base class.
     using Base = Softmax_fp32_base<Hopper_hgmma_bf16_traits, Kernel_traits>;
@@ -597,48 +732,52 @@ struct Softmax<Hopper_hgmma_bf16_traits, Kernel_traits>
     using Fragment_p = typename Compute_tile_o::Fragment;
 
     // Ctor.
-    template<typename Params>
-    inline __device__ Softmax(const Params &params, int tidx) : Base(params, tidx) {
+    template <typename Params>
+    inline __device__ Softmax(Params const& params, int tidx)
+        : Base(params, tidx)
+    {
     }
 
     // Update flash attention scales and pack elements for BMM2.
-    template<bool IS_FIRST_COL>
-    inline __device__ void pack(Compute_tile_o &ctile_o, Fragment_p (&frag_p)[Mma_tile_o::MMAS_K]) {
+    template <bool IS_FIRST_COL>
+    inline __device__ void pack(Compute_tile_o& ctile_o, Fragment_p (&frag_p)[Mma_tile_o::MMAS_K])
+    {
 
 // Pack 4 cols for BMM2 A tile.
 #pragma unroll
-        for( int ni = 0; ni < Mma_tile_o::MMAS_K; ni++ ) {
-            frag_p[ni].reg(0) =
-                float2_to_bf16_x2(this->elt_[0][4 * ni + 0], this->elt_[0][4 * ni + 1]);
-            frag_p[ni].reg(1) =
-                float2_to_bf16_x2(this->elt_[1][4 * ni + 0], this->elt_[1][4 * ni + 1]);
-            frag_p[ni].reg(2) =
-                float2_to_bf16_x2(this->elt_[0][4 * ni + 2], this->elt_[0][4 * ni + 3]);
-            frag_p[ni].reg(3) =
-                float2_to_bf16_x2(this->elt_[1][4 * ni + 2], this->elt_[1][4 * ni + 3]);
+        for (int ni = 0; ni < Mma_tile_o::MMAS_K; ni++)
+        {
+            frag_p[ni].reg(0) = float2_to_bf16_x2(this->elt_[0][4 * ni + 0], this->elt_[0][4 * ni + 1]);
+            frag_p[ni].reg(1) = float2_to_bf16_x2(this->elt_[1][4 * ni + 0], this->elt_[1][4 * ni + 1]);
+            frag_p[ni].reg(2) = float2_to_bf16_x2(this->elt_[0][4 * ni + 2], this->elt_[0][4 * ni + 3]);
+            frag_p[ni].reg(3) = float2_to_bf16_x2(this->elt_[1][4 * ni + 2], this->elt_[1][4 * ni + 3]);
         }
 
-        if( !IS_FIRST_COL ) {
+        if (!IS_FIRST_COL)
+        {
 // Correct accumulators to current max.
 #pragma unroll
-            for( int mi = 0; mi < Mma_tile_o::CORES_M; mi++ ) {
+            for (int mi = 0; mi < Mma_tile_o::CORES_M; mi++)
+            {
                 // Assume only N has multiple MMAs (MMAS_M = 1).
                 // MMAS_N > 1 when N dimension is split.
                 float correction = this->correction_[mi];
 #pragma unroll
-                for( int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++ ) {
+                for (int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++)
+                {
 #pragma unroll
-                    for( int ni = 0; ni < Mma_tile_o::CORES_N; ni++ ) {
-                        uint32_t &reg0 =
-                            ctile_o.acc_[0][mma_ni].reg(2 * ni * Mma_tile_o::CORES_M + 2 * mi);
-                        uint32_t &reg1 =
-                            ctile_o.acc_[0][mma_ni].reg(2 * ni * Mma_tile_o::CORES_M + 2 * mi + 1);
+                    for (int ni = 0; ni < Mma_tile_o::CORES_N; ni++)
+                    {
+                        uint32_t& reg0 = ctile_o.acc_[0][mma_ni].reg(2 * ni * Mma_tile_o::CORES_M + 2 * mi);
+                        uint32_t& reg1 = ctile_o.acc_[0][mma_ni].reg(2 * ni * Mma_tile_o::CORES_M + 2 * mi + 1);
                         asm volatile("mul.f32 %0, %0, %1;\n" : "+r"(reg0) : "f"(correction));
                         asm volatile("mul.f32 %0, %0, %1;\n" : "+r"(reg1) : "f"(correction));
                     }
                 }
             }
-        } else {
+        }
+        else
+        {
             ctile_o.clear();
         }
     }
@@ -647,9 +786,10 @@ struct Softmax<Hopper_hgmma_bf16_traits, Kernel_traits>
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Hopper_qgmma_e4m3_fp32_traits
-template<typename Kernel_traits>
+template <typename Kernel_traits>
 struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
-    : public Softmax_fp32_base<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits> {
+    : public Softmax_fp32_base<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
+{
 
     // The Base class.
     using Base = Softmax_fp32_base<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>;
@@ -678,27 +818,53 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
     using Fragment_p = typename Compute_tile_o::Fragment;
 
     // Whether apply causal mask or not.
-    enum { CAUSAL_MASK = Base::CAUSAL_MASK };
+    enum
+    {
+        CAUSAL_MASK = Base::CAUSAL_MASK
+    };
+
     // Whether we will ignore the long distance tokens in the beginning.
-    enum { SLIDING_WINDOW_ATTENTION = Base::SLIDING_WINDOW_ATTENTION };
+    enum
+    {
+        SLIDING_WINDOW_ATTENTION = Base::SLIDING_WINDOW_ATTENTION
+    };
+
     // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
-    enum { APPLY_ALIBI = Base::APPLY_ALIBI };
+    enum
+    {
+        APPLY_ALIBI = Base::APPLY_ALIBI
+    };
+
     // Apply the exp2f optimization (fuse bmm1_scale and -max into FMAs).
-    enum { EXP2F_OPTIMIZATION = Base::EXP2F_OPTIMIZATION };
+    enum
+    {
+        EXP2F_OPTIMIZATION = Base::EXP2F_OPTIMIZATION
+    };
+
     // Are we applying softcapping_scale for qk products ?
-    enum { ENABLE_BMM1_SOFTCAPPING_SCALE = Base::ENABLE_BMM1_SOFTCAPPING_SCALE };
+    enum
+    {
+        ENABLE_BMM1_SOFTCAPPING_SCALE = Base::ENABLE_BMM1_SOFTCAPPING_SCALE
+    };
+
     // Whether we need to check if local_max could be -inf or not.
-    enum { CHECK_IF_NEG_INF_EXISTS = Base::CHECK_IF_NEG_INF_EXISTS };
+    enum
+    {
+        CHECK_IF_NEG_INF_EXISTS = Base::CHECK_IF_NEG_INF_EXISTS
+    };
 
     // Ctor.
-    template<typename Params>
-    inline __device__ Softmax(const Params &params, int tidx) : Base(params, tidx) {
+    template <typename Params>
+    inline __device__ Softmax(Params const& params, int tidx)
+        : Base(params, tidx)
+    {
     }
 
     // Calculate max/sum, and update flash-attention scales.
-    template<bool IS_FIRST_COL>
-    inline __device__ void compute_and_update_scale(float (&global_max)[Mma_tile_p::CORES_M],
-                                                    float (&global_sum)[Mma_tile_p::CORES_M]) {
+    template <bool IS_FIRST_COL>
+    inline __device__ void compute_and_update_scale(
+        float (&global_max)[Mma_tile_p::CORES_M], float (&global_sum)[Mma_tile_p::CORES_M])
+    {
 
         // Internal knob to WAR exposed 17 clk MUFU latency for Hopper and possibly all prev archs
         //
@@ -719,9 +885,9 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
         // /*0030*/  FADD.FTZ R109, R110, R61   &req={3}  ?WAIT7_END_GROUP;
 #if defined(JETFIRE_ENABLED)
         asm volatile(".pragma \"set knob SchedResBusyXU64=1\";\n" : : : "memory");
-#endif  // JETFIRE_ENABLED
+#endif // JETFIRE_ENABLED
 
-        const float scale = reinterpret_cast<const float &>(this->scale_bmm1_);
+        float const scale = reinterpret_cast<float const&>(this->scale_bmm1_);
         float(&local_max_)[Mma_tile_p::CORES_M] = this->local_max_;
         float(&local_sum_)[Mma_tile_p::CORES_M] = this->local_sum_;
         float(&correction_)[Mma_tile_p::CORES_M] = this->correction_;
@@ -729,23 +895,27 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
 
 // Row-wise max of current tile.
 #pragma unroll
-        for( int mi = 0; mi < Mma_tile_p::CORES_M; mi++ ) {
-            if( IS_FIRST_COL ) {
+        for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++)
+        {
+            if (IS_FIRST_COL)
+            {
                 local_max_[mi] = elt_[mi][0];
-            } else {
+            }
+            else
+            {
                 local_max_[mi] = fmaxf(global_max[mi], elt_[mi][0]);
             }
 #pragma unroll
-            for( int ni = 1; ni < Mma_tile_p::CORES_N * 2; ni++ ) {
+            for (int ni = 1; ni < Mma_tile_p::CORES_N * 2; ni++)
+            {
                 local_max_[mi] = fmaxf(local_max_[mi], elt_[mi][ni]);
             }
-            local_max_[mi] =
-                fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 1), local_max_[mi]);
-            local_max_[mi] =
-                fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 2), local_max_[mi]);
+            local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 1), local_max_[mi]);
+            local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 2), local_max_[mi]);
         }
 
-        if constexpr( Kernel_traits::D == 128 ) {
+        if constexpr (Kernel_traits::D == 128)
+        {
             // This gives about 1.03x boost by allowing FFMA/FMULs to be distributed more evenly in the
             // shadow of MUFU instructions as of CTK 12.4. Future compiler might improve the scheduling
             // heuristics.
@@ -753,9 +923,11 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
         }
 // Softmax Exp.
 #pragma unroll
-        for( int ni = 0; ni < Mma_tile_p::CORES_N; ni++ ) {
+        for (int ni = 0; ni < Mma_tile_p::CORES_N; ni++)
+        {
 #pragma unroll
-            for( int mi = 0; mi < Mma_tile_p::CORES_M; mi++ ) {
+            for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++)
+            {
                 // The equation exp2(scale * x - max) * q_scale_s
                 // equals to:   exp2(scale * x - max) * exp2(log2(q_scale_s))
                 // equals to:   exp2(scale * x - (max - log2(q_scale_s)))
@@ -763,22 +935,25 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
                 // So instead of per-accumulator muls, we can do per-row subs which saves FP cycles.
                 // As we scale the softmax output early, before doing the local_sum, we have to unscale
                 // the local_sum afterwards.
-                float &p0 = elt_[mi][2 * ni + 0];
-                float &p1 = elt_[mi][2 * ni + 1];
+                float& p0 = elt_[mi][2 * ni + 0];
+                float& p1 = elt_[mi][2 * ni + 1];
 
                 // When all elts of the tile are -FLT_MAX, we have to make sure
                 //  expf generates 0 for all values instead of 1.
-                if constexpr( !EXP2F_OPTIMIZATION ) {
+                if constexpr (!EXP2F_OPTIMIZATION)
+                {
                     float masked_max = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX)
-                                           ? local_max_[mi] - logf(q_scale_s_)
-                                           : 0.f;
+                        ? local_max_[mi] - logf(q_scale_s_)
+                        : 0.f;
                     p0 = expf(p0 - masked_max);
                     p1 = expf(p1 - masked_max);
-                } else {
+                }
+                else
+                {
                     // Use exp2f optimization for cases without alibi.
                     float masked_max = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX)
-                                           ? local_max_[mi] * scale - log2f(q_scale_s_)
-                                           : 0.f;
+                        ? local_max_[mi] * scale - log2f(q_scale_s_)
+                        : 0.f;
                     p0 = custom_exp2f(p0, scale, masked_max);
                     p1 = custom_exp2f(p1, scale, masked_max);
                 }
@@ -787,10 +962,12 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
 
 // Row-wise sum of current tile.
 #pragma unroll
-        for( int mi = 0; mi < Mma_tile_p::CORES_M; mi++ ) {
+        for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++)
+        {
             local_sum_[mi] = elt_[mi][0];
 #pragma unroll
-            for( int ni = 1; ni < Mma_tile_p::CORES_N * 2; ni++ ) {
+            for (int ni = 1; ni < Mma_tile_p::CORES_N * 2; ni++)
+            {
                 local_sum_[mi] += elt_[mi][ni];
             }
             local_sum_[mi] += __shfl_xor_sync(uint32_t(-1), local_sum_[mi], 1);
@@ -798,24 +975,31 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
         }
 
         // Initialize or update the global sum and max.
-        if( IS_FIRST_COL ) {
+        if (IS_FIRST_COL)
+        {
 #pragma unroll
-            for( int mi = 0; mi < Mma_tile_p::CORES_M; mi++ ) {
+            for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++)
+            {
                 global_sum[mi] = local_sum_[mi];
                 global_max[mi] = local_max_[mi];
             }
-
-        } else {
+        }
+        else
+        {
 #pragma unroll
-            for( int mi = 0; mi < Mma_tile_p::CORES_M; mi++ ) {
+            for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++)
+            {
                 float max_old = global_max[mi];
                 float max_new = local_max_[mi];
                 float sum_old = global_sum[mi];
                 float sum_new = local_sum_[mi];
                 // Remove the old max and replace by the new one.
-                if constexpr( !EXP2F_OPTIMIZATION ) {
+                if constexpr (!EXP2F_OPTIMIZATION)
+                {
                     correction_[mi] = expf(max_old - max_new);
-                } else {
+                }
+                else
+                {
                     // Use exp2f optimization for cases without alibi.
                     correction_[mi] = exp2f((max_old - max_new) * scale);
                 }
@@ -828,65 +1012,67 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
     }
 
     // Update flash attention scales and pack elements for BMM2.
-    template<bool IS_FIRST_COL>
-    inline __device__ void pack(Compute_tile_o &ctile_o, Fragment_p (&frag_p)[Mma_tile_o::MMAS_K]) {
+    template <bool IS_FIRST_COL>
+    inline __device__ void pack(Compute_tile_o& ctile_o, Fragment_p (&frag_p)[Mma_tile_o::MMAS_K])
+    {
 
 // Pack 4 cols for BMM2 A tile.
 #pragma unroll
-        for( int ni = 0; ni < Mma_tile_o::MMAS_K; ni++ ) {
+        for (int ni = 0; ni < Mma_tile_o::MMAS_K; ni++)
+        {
 
             // 1st row - 8 elements per row.
-            float tmp_00 = this->elt_[0][8 * ni + 0];  // + 0
-            float tmp_01 = this->elt_[0][8 * ni + 1];  // + 1
-            float tmp_02 = this->elt_[0][8 * ni + 2];  // + 8
-            float tmp_03 = this->elt_[0][8 * ni + 3];  // + 9
-            float tmp_04 = this->elt_[0][8 * ni + 4];  // +16
-            float tmp_05 = this->elt_[0][8 * ni + 5];  // +17
-            float tmp_06 = this->elt_[0][8 * ni + 6];  // +24
-            float tmp_07 = this->elt_[0][8 * ni + 7];  // +25
+            float tmp_00 = this->elt_[0][8 * ni + 0]; // + 0
+            float tmp_01 = this->elt_[0][8 * ni + 1]; // + 1
+            float tmp_02 = this->elt_[0][8 * ni + 2]; // + 8
+            float tmp_03 = this->elt_[0][8 * ni + 3]; // + 9
+            float tmp_04 = this->elt_[0][8 * ni + 4]; // +16
+            float tmp_05 = this->elt_[0][8 * ni + 5]; // +17
+            float tmp_06 = this->elt_[0][8 * ni + 6]; // +24
+            float tmp_07 = this->elt_[0][8 * ni + 7]; // +25
 
             // 2nd row - 8 elements per row.
-            float tmp_10 = this->elt_[1][8 * ni + 0];  // + 0
-            float tmp_11 = this->elt_[1][8 * ni + 1];  // + 1
-            float tmp_12 = this->elt_[1][8 * ni + 2];  // + 8
-            float tmp_13 = this->elt_[1][8 * ni + 3];  // + 9
-            float tmp_14 = this->elt_[1][8 * ni + 4];  // +16
-            float tmp_15 = this->elt_[1][8 * ni + 5];  // +17
-            float tmp_16 = this->elt_[1][8 * ni + 6];  // +24
-            float tmp_17 = this->elt_[1][8 * ni + 7];  // +25
+            float tmp_10 = this->elt_[1][8 * ni + 0]; // + 0
+            float tmp_11 = this->elt_[1][8 * ni + 1]; // + 1
+            float tmp_12 = this->elt_[1][8 * ni + 2]; // + 8
+            float tmp_13 = this->elt_[1][8 * ni + 3]; // + 9
+            float tmp_14 = this->elt_[1][8 * ni + 4]; // +16
+            float tmp_15 = this->elt_[1][8 * ni + 5]; // +17
+            float tmp_16 = this->elt_[1][8 * ni + 6]; // +24
+            float tmp_17 = this->elt_[1][8 * ni + 7]; // +25
 
             // Pack to 4 registers.
-            frag_p[ni].reg(0) = fmha::float4_to_fp8x4<Kernel_traits::Element_data_type>(
-                tmp_00, tmp_01, tmp_02, tmp_03);
-            frag_p[ni].reg(1) = fmha::float4_to_fp8x4<Kernel_traits::Element_data_type>(
-                tmp_10, tmp_11, tmp_12, tmp_13);
-            frag_p[ni].reg(2) = fmha::float4_to_fp8x4<Kernel_traits::Element_data_type>(
-                tmp_04, tmp_05, tmp_06, tmp_07);
-            frag_p[ni].reg(3) = fmha::float4_to_fp8x4<Kernel_traits::Element_data_type>(
-                tmp_14, tmp_15, tmp_16, tmp_17);
+            frag_p[ni].reg(0) = fmha::float4_to_fp8x4<Kernel_traits::Element_data_type>(tmp_00, tmp_01, tmp_02, tmp_03);
+            frag_p[ni].reg(1) = fmha::float4_to_fp8x4<Kernel_traits::Element_data_type>(tmp_10, tmp_11, tmp_12, tmp_13);
+            frag_p[ni].reg(2) = fmha::float4_to_fp8x4<Kernel_traits::Element_data_type>(tmp_04, tmp_05, tmp_06, tmp_07);
+            frag_p[ni].reg(3) = fmha::float4_to_fp8x4<Kernel_traits::Element_data_type>(tmp_14, tmp_15, tmp_16, tmp_17);
         }
 
-        if( !IS_FIRST_COL ) {
+        if (!IS_FIRST_COL)
+        {
 // Correct accumulators to current max.
 #pragma unroll
-            for( int mi = 0; mi < Mma_tile_o::CORES_M; mi++ ) {
+            for (int mi = 0; mi < Mma_tile_o::CORES_M; mi++)
+            {
                 // Assume only N has multiple MMAs (MMAS_M = 1).
                 // MMAS_N > 1 when N dimension is split.
                 float correction = this->correction_[mi];
 #pragma unroll
-                for( int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++ ) {
+                for (int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++)
+                {
 #pragma unroll
-                    for( int ni = 0; ni < Mma_tile_o::CORES_N; ni++ ) {
-                        uint32_t &reg0 =
-                            ctile_o.acc_[0][mma_ni].reg(2 * ni * Mma_tile_o::CORES_M + 2 * mi);
-                        uint32_t &reg1 =
-                            ctile_o.acc_[0][mma_ni].reg(2 * ni * Mma_tile_o::CORES_M + 2 * mi + 1);
+                    for (int ni = 0; ni < Mma_tile_o::CORES_N; ni++)
+                    {
+                        uint32_t& reg0 = ctile_o.acc_[0][mma_ni].reg(2 * ni * Mma_tile_o::CORES_M + 2 * mi);
+                        uint32_t& reg1 = ctile_o.acc_[0][mma_ni].reg(2 * ni * Mma_tile_o::CORES_M + 2 * mi + 1);
                         asm volatile("mul.f32 %0, %0, %1;\n" : "+r"(reg0) : "f"(correction));
                         asm volatile("mul.f32 %0, %0, %1;\n" : "+r"(reg1) : "f"(correction));
                     }
                 }
             }
-        } else {
+        }
+        else
+        {
             ctile_o.clear();
         }
     }
@@ -898,8 +1084,9 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
 
 // BMM2 epilogue to apply scales (flash attention).
 // FP32 accumulation as default.
-template<template<int, int, int, bool, bool> class Traits, typename Kernel_traits>
-struct Tile_o_epilogue_base {
+template <template <int, int, int, bool, bool> class Traits, typename Kernel_traits>
+struct Tile_o_epilogue_base
+{
 
     // The instruction traits for BMM2.
     using Traits_o = typename Kernel_traits::Traits_o;
@@ -913,28 +1100,30 @@ struct Tile_o_epilogue_base {
     // The MMA tile for the BMM2.
     using Mma_tile_o = typename Kernel_traits::Mma_tile_o;
 
-    template<typename Params>
-    inline __device__ Tile_o_epilogue_base(const Params &params) {
-        ;  // nothing to construct.
+    template <typename Params>
+    inline __device__ Tile_o_epilogue_base(Params const& params)
+    {
+        ; // nothing to construct.
     };
 
     // Scale ctile_o output by 1/sum
-    inline __device__ void scale(Compute_tile_o &ctile_o,
-                                 float (&global_sum)[Mma_tile_o::CORES_M]) {
+    inline __device__ void scale(Compute_tile_o& ctile_o, float (&global_sum)[Mma_tile_o::CORES_M])
+    {
 // Final step's update.
 #pragma unroll
-        for( int mi = 0; mi < Mma_tile_o::CORES_M; mi++ ) {
+        for (int mi = 0; mi < Mma_tile_o::CORES_M; mi++)
+        {
             global_sum[mi] = global_sum[mi] == 0.f ? 1.f : 1.0f / global_sum[mi];
 
 // Assume only N has multiple MMAs (MMAS_M = 1).
 #pragma unroll
-            for( int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++ ) {
+            for (int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++)
+            {
 #pragma unroll
-                for( int ni = 0; ni < Mma_tile_o::CORES_N; ni++ ) {
-                    float &reg0 =
-                        ctile_o.acc_[0][mma_ni].elt(2 * ni * Mma_tile_o::CORES_M + 2 * mi);
-                    float &reg1 =
-                        ctile_o.acc_[0][mma_ni].elt(2 * ni * Mma_tile_o::CORES_M + 2 * mi + 1);
+                for (int ni = 0; ni < Mma_tile_o::CORES_N; ni++)
+                {
+                    float& reg0 = ctile_o.acc_[0][mma_ni].elt(2 * ni * Mma_tile_o::CORES_M + 2 * mi);
+                    float& reg1 = ctile_o.acc_[0][mma_ni].elt(2 * ni * Mma_tile_o::CORES_M + 2 * mi + 1);
                     reg0 *= global_sum[mi];
                     reg1 *= global_sum[mi];
                 }
@@ -945,15 +1134,18 @@ struct Tile_o_epilogue_base {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<template<int, int, int, bool, bool> class Traits, typename Kernel_traits>
-struct Tile_o_epilogue {};
+template <template <int, int, int, bool, bool> class Traits, typename Kernel_traits>
+struct Tile_o_epilogue
+{
+};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Hopper_hgmma_fp16_traits
-template<typename Kernel_traits>
+template <typename Kernel_traits>
 struct Tile_o_epilogue<Hopper_hgmma_fp16_traits, Kernel_traits>
-    : public Tile_o_epilogue_base<Hopper_hgmma_fp16_traits, Kernel_traits> {
+    : public Tile_o_epilogue_base<Hopper_hgmma_fp16_traits, Kernel_traits>
+{
 
     // The Base class.
     using Base = Tile_o_epilogue_base<Hopper_hgmma_fp16_traits, Kernel_traits>;
@@ -974,20 +1166,23 @@ struct Tile_o_epilogue<Hopper_hgmma_fp16_traits, Kernel_traits>
     using Base::Tile_o_epilogue_base;
 
     // Scale ctile_o output by 1/sum
-    inline __device__ void scale(Compute_tile_o &ctile_o,
-                                 float (&global_sum)[Mma_tile_o::CORES_M]) {
+    inline __device__ void scale(Compute_tile_o& ctile_o, float (&global_sum)[Mma_tile_o::CORES_M])
+    {
 // Final step's update.
 #pragma unroll
-        for( int mi = 0; mi < Mma_tile_o::CORES_M; mi++ ) {
+        for (int mi = 0; mi < Mma_tile_o::CORES_M; mi++)
+        {
             global_sum[mi] = global_sum[mi] == 0.f ? 1.f : 1.0f / global_sum[mi];
-            const uint32_t scale = float_to_half2(global_sum[mi]);
+            uint32_t const scale = float_to_half2(global_sum[mi]);
 
 // Assume only N has multiple MMAs (MMAS_M = 1).
 #pragma unroll
-            for( int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++ ) {
+            for (int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++)
+            {
 #pragma unroll
-                for( int ni = 0; ni < Mma_tile_o::CORES_N; ni++ ) {
-                    uint32_t &reg = ctile_o.acc_[0][mma_ni].reg(ni * Mma_tile_o::CORES_M + mi);
+                for (int ni = 0; ni < Mma_tile_o::CORES_N; ni++)
+                {
+                    uint32_t& reg = ctile_o.acc_[0][mma_ni].reg(ni * Mma_tile_o::CORES_M + mi);
                     reg = hmul2(reg, scale);
                 }
             }
@@ -998,9 +1193,10 @@ struct Tile_o_epilogue<Hopper_hgmma_fp16_traits, Kernel_traits>
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Hopper_hgmma_fp32_traits
-template<typename Kernel_traits>
+template <typename Kernel_traits>
 struct Tile_o_epilogue<Hopper_hgmma_fp32_traits, Kernel_traits>
-    : public Tile_o_epilogue_base<Hopper_hgmma_fp32_traits, Kernel_traits> {
+    : public Tile_o_epilogue_base<Hopper_hgmma_fp32_traits, Kernel_traits>
+{
 
     // The Base class.
     using Base = Tile_o_epilogue_base<Hopper_hgmma_fp32_traits, Kernel_traits>;
@@ -1012,9 +1208,10 @@ struct Tile_o_epilogue<Hopper_hgmma_fp32_traits, Kernel_traits>
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Hopper_hgmma_bf16_traits
-template<typename Kernel_traits>
+template <typename Kernel_traits>
 struct Tile_o_epilogue<Hopper_hgmma_bf16_traits, Kernel_traits>
-    : public Tile_o_epilogue_base<Hopper_hgmma_bf16_traits, Kernel_traits> {
+    : public Tile_o_epilogue_base<Hopper_hgmma_bf16_traits, Kernel_traits>
+{
 
     // The Base class.
     using Base = Tile_o_epilogue_base<Hopper_hgmma_bf16_traits, Kernel_traits>;
@@ -1026,9 +1223,10 @@ struct Tile_o_epilogue<Hopper_hgmma_bf16_traits, Kernel_traits>
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Hopper_qgmma_e4m3_fp32_traits
-template<typename Kernel_traits>
+template <typename Kernel_traits>
 struct Tile_o_epilogue<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
-    : public Tile_o_epilogue_base<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits> {
+    : public Tile_o_epilogue_base<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
+{
 
     // The Base class.
     using Base = Tile_o_epilogue_base<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>;
@@ -1046,33 +1244,36 @@ struct Tile_o_epilogue<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
     using Mma_tile_o = typename Base::Mma_tile_o;
 
     // Ctor.
-    template<typename Params>
-    inline __device__ Tile_o_epilogue(const Params &params)
-        : Base(params), scale_bmm2_(*params.scale_bmm2_d) {
+    template <typename Params>
+    inline __device__ Tile_o_epilogue(Params const& params)
+        : Base(params)
+        , scale_bmm2_(*params.scale_bmm2_d)
+    {
     }
 
     // Scale ctile_o output by 1/sum
-    inline __device__ void scale(Compute_tile_o &ctile_o,
-                                 float (&global_sum)[Mma_tile_o::CORES_M]) {
+    inline __device__ void scale(Compute_tile_o& ctile_o, float (&global_sum)[Mma_tile_o::CORES_M])
+    {
 // Final step's update.
 #pragma unroll
-        for( int mi = 0; mi < Mma_tile_o::CORES_M; mi++ ) {
+        for (int mi = 0; mi < Mma_tile_o::CORES_M; mi++)
+        {
 #ifdef UNIFIED_EPILOGUE_SCALE
             // Descaling factor
-            const float scale_bmm2_f_ = reinterpret_cast<float &>(scale_bmm2_);
+            float const scale_bmm2_f_ = reinterpret_cast<float&>(scale_bmm2_);
             global_sum[mi] = global_sum[mi] == 0.f ? scale_bmm2_f_ : scale_bmm2_f_ / global_sum[mi];
 #else
             global_sum[mi] = global_sum[mi] == 0.f ? 1.0f : 1.0f / global_sum[mi];
 #endif
 // Assume only N has multiple MMAs (MMAS_M = 1).
 #pragma unroll
-            for( int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++ ) {
+            for (int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++)
+            {
 #pragma unroll
-                for( int ni = 0; ni < Mma_tile_o::CORES_N; ni++ ) {
-                    float &reg0 =
-                        ctile_o.acc_[0][mma_ni].elt(2 * ni * Mma_tile_o::CORES_M + 2 * mi);
-                    float &reg1 =
-                        ctile_o.acc_[0][mma_ni].elt(2 * ni * Mma_tile_o::CORES_M + 2 * mi + 1);
+                for (int ni = 0; ni < Mma_tile_o::CORES_N; ni++)
+                {
+                    float& reg0 = ctile_o.acc_[0][mma_ni].elt(2 * ni * Mma_tile_o::CORES_M + 2 * mi);
+                    float& reg1 = ctile_o.acc_[0][mma_ni].elt(2 * ni * Mma_tile_o::CORES_M + 2 * mi + 1);
                     reg0 *= global_sum[mi];
                     reg1 *= global_sum[mi];
                 }
@@ -1084,5 +1285,5 @@ struct Tile_o_epilogue<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
     uint32_t scale_bmm2_;
 };
 
-}  // namespace ws
-}  // namespace fmha
+} // namespace ws
+} // namespace fmha

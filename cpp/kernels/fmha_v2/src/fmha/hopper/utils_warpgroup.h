@@ -12,11 +12,13 @@
 
 #pragma once
 
-namespace fmha {
+namespace fmha
+{
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline __device__ void warpgroup_arrive() {
+inline __device__ void warpgroup_arrive()
+{
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
     asm volatile("wgmma.fence.sync.aligned;\n" ::);
 #endif
@@ -24,7 +26,8 @@ inline __device__ void warpgroup_arrive() {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline __device__ void warpgroup_commit() {
+inline __device__ void warpgroup_commit()
+{
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
     asm volatile("wgmma.commit_group.sync.aligned;\n" ::);
 #endif
@@ -32,8 +35,9 @@ inline __device__ void warpgroup_commit() {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<int N>
-inline __device__ void warpgroup_wait() {
+template <int N>
+inline __device__ void warpgroup_wait()
+{
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
     asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N));
 #endif
@@ -41,4 +45,4 @@ inline __device__ void warpgroup_wait() {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace fmha
+} // namespace fmha

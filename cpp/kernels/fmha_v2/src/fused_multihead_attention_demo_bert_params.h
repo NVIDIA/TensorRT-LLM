@@ -12,17 +12,18 @@
 
 #pragma once
 
-#include <limits.h>
 #include <fmha/alibi_params.h>
 #include <fmha/hopper/tma_types.h>
+#include <limits.h>
 
-struct Fused_multihead_attention_params_v1 {
+struct Fused_multihead_attention_params_v1
+{
     // The QKV matrices.
-    void *qkv_ptr;
+    void* qkv_ptr;
     // The mask to implement drop-out.
-    void *packed_mask_ptr;
+    void* packed_mask_ptr;
     // The O matrix (output).
-    void *o_ptr;
+    void* o_ptr;
 
     // The stride between rows of the Q, K and V matrices.
     int64_t qkv_stride_in_bytes;
@@ -33,17 +34,17 @@ struct Fused_multihead_attention_params_v1 {
 
 #if defined(STORE_P)
     // The pointer to the P matrix (for debugging).
-    void *p_ptr;
+    void* p_ptr;
     // The stride between rows of the P matrix (for debugging).
     int64_t p_stride_in_bytes;
-#endif  // defined(STORE_P)
+#endif // defined(STORE_P)
 
 #if defined(STORE_S)
     // The pointer to the S matrix (for debugging).
-    void *s_ptr;
+    void* s_ptr;
     // The stride between rows of the S matrix (for debugging).
     int64_t s_stride_in_bytes;
-#endif  // defined(STORE_S)
+#endif // defined(STORE_S)
 
     // The dimensions.
     int b, h, s, d;
@@ -67,24 +68,25 @@ struct Fused_multihead_attention_params_v1 {
     // Scratch buffers to finalize softmax.
     float *max_scratch_ptr, *sum_scratch_ptr;
     // Scratch buffer to finalize the output (not needed for FP16).
-    int *o_scratch_ptr;
+    int* o_scratch_ptr;
 };
 
-struct Fused_multihead_attention_params_v2 {
+struct Fused_multihead_attention_params_v2
+{
     // The QKV matrices.
-    void *qkv_ptr;
+    void* qkv_ptr;
     // The separate Q matrice.
-    void *q_ptr;
+    void* q_ptr;
     // The separate KV matrice.
-    void *kv_ptr;
+    void* kv_ptr;
     // The separate paged kv cache.
     fmha::Kv_block_array paged_kv_cache;
     // The mask to implement drop-out.
-    void *packed_mask_ptr;
+    void* packed_mask_ptr;
     // The O matrix (output).
-    void *o_ptr;
+    void* o_ptr;
     // The Softmax stats vector of layout [2, B, S, H], including softmax_sum and softmax_max
-    void *softmax_stats_ptr;
+    void* softmax_stats_ptr;
 
     // The stride between rows of the Q, K and V matrices.
     int64_t qkv_stride_in_bytes;
@@ -127,23 +129,23 @@ struct Fused_multihead_attention_params_v2 {
     uint32_t scale_bmm1, softcapping_scale_bmm1, scale_softmax, scale_bmm2;
 
     // The scaling factors in the device memory (required by TRT-LLM + FP8 FMHA).
-    uint32_t *scale_bmm1_d;
-    uint32_t *scale_bmm2_d;
+    uint32_t* scale_bmm1_d;
+    uint32_t* scale_bmm2_d;
 
     // array of length b+1 holding prefix sum of actual q sequence lengths.
-    int *cu_q_seqlens;
+    int* cu_q_seqlens;
     // array of length b+1 holding prefix sum of actual kv sequence lengths.
-    int *cu_kv_seqlens;
+    int* cu_kv_seqlens;
     // array of length b+1 holding prefix sum of actual mask sequence lengths.
     // it might not be the same as cu_q_seqlens as the mask seqlens will be padded.
-    int *cu_mask_rows;
+    int* cu_mask_rows;
 
     // If the kernel is using alibi or not
     bool has_alibi = false;
     fmha::AlibiParams alibi_params{};
 
     // M tile id counter for dynamic scheduling
-    uint32_t *tile_id_counter_ptr;
+    uint32_t* tile_id_counter_ptr;
     uint32_t num_tiles;
     uint32_t num_tiles_per_head;
     bool use_balanced_scheduling;
@@ -151,12 +153,14 @@ struct Fused_multihead_attention_params_v2 {
     // is input/output padded
     bool is_s_padded = false;
 
-    struct SageAttention {
-        struct Scales {
+    struct SageAttention
+    {
+        struct Scales
+        {
             // ceil(max_seqlen / block_size)
             int max_nblock;
             // The scale of each block, layout: (B, H, max_nblock)
-            float *scales;
+            float* scales;
         } q, k, v;
     } sage;
 };

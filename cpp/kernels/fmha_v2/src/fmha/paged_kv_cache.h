@@ -12,13 +12,15 @@
 
 #pragma once
 
-#include <math.h>
 #include <cuda_runtime.h>
+#include <math.h>
 
-namespace fmha {
+namespace fmha
+{
 
 // This needs to be aligned with the definition in TRT-LLM
-struct Kv_block_array {
+struct Kv_block_array
+{
     using PtrType = int32_t;
 
     // Current number of sequences
@@ -39,19 +41,21 @@ struct Kv_block_array {
     // Size of KV cache blocks in bytes (H*D*T*sizeof(DataType))
     int32_t mBytesPerBlock;
     // Pointer to beginning of pool.
-    void *mPoolPtr;
+    void* mPoolPtr;
     // Pointer to block offsets.
-    PtrType *mBlockOffsets;
+    PtrType* mBlockOffsets;
 
     Kv_block_array() = default;
 
-    Kv_block_array(int32_t batchSize,
-                   int32_t maxBlocksPerSeq,
-                   int32_t tokensPerBlock,
-                   int32_t bytesPerBlock,
-                   void *poolPtr)
-        : mMaxSeqs(batchSize), mMaxBlocksPerSeq(maxBlocksPerSeq), mTokensPerBlock(tokensPerBlock),
-          mBytesPerBlock{ bytesPerBlock }, mPoolPtr{ poolPtr }, mBlockOffsets{ nullptr } {
+    Kv_block_array(
+        int32_t batchSize, int32_t maxBlocksPerSeq, int32_t tokensPerBlock, int32_t bytesPerBlock, void* poolPtr)
+        : mMaxSeqs(batchSize)
+        , mMaxBlocksPerSeq(maxBlocksPerSeq)
+        , mTokensPerBlock(tokensPerBlock)
+        , mBytesPerBlock{bytesPerBlock}
+        , mPoolPtr{poolPtr}
+        , mBlockOffsets{nullptr}
+    {
         float const tokensPerBlockSeqLog2 = log2(mTokensPerBlock);
         mTokensPerBlockLog2 = static_cast<int>(tokensPerBlockSeqLog2);
     }
@@ -59,4 +63,4 @@ struct Kv_block_array {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace fmha
+} // namespace fmha

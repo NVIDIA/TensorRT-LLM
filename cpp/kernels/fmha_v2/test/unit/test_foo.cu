@@ -12,10 +12,12 @@
 
 #include "gtest/gtest.h"
 
-TEST(Foo, Foo1) {
+TEST(Foo, Foo1)
+{
     EXPECT_EQ(1, 1);
 }
 
-TEST(Foo, Foo2) {
+TEST(Foo, Foo2)
+{
     EXPECT_EQ("1", "1");
 }

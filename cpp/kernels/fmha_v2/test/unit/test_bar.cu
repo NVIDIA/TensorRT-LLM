@@ -12,10 +12,12 @@
 
 #include "gtest/gtest.h"
 
-TEST(Bar, Bar1) {
+TEST(Bar, Bar1)
+{
     EXPECT_EQ(1, 1);
 }
 
-TEST(Bar, Bar2) {
+TEST(Bar, Bar2)
+{
     EXPECT_EQ("1", "1");
 }

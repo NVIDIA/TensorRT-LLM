@@ -13,10 +13,12 @@
 #pragma once
 #include <fmha/traits.h>
 
-namespace fmha {
-namespace v2 {
+namespace fmha
+{
+namespace v2
+{
 
-template<
+template <
     // The instruction traits.
     typename Traits,
     // The dimensions of the tile computed by the CTA.
@@ -33,60 +35,104 @@ template<
     bool HEADS_INTERLEAVED,
     // The number of matrices
     int NUM_MATS = 3>
-struct Gmem_tile_tma_qkv {
+struct Gmem_tile_tma_qkv
+{
     // The size of each LDG.
-    enum { BYTES_PER_LDG = 16 };
+    enum
+    {
+        BYTES_PER_LDG = 16
+    };
+
     // The size of a row in bytes.
-    enum { BYTES_PER_ROW = COLS * BITS_PER_ELEMENT / 8 };
+    enum
+    {
+        BYTES_PER_ROW = COLS * BITS_PER_ELEMENT / 8
+    };
+
     // The number of threads to load a "row" of the matrix.
-    enum { THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDG };
+    enum
+    {
+        THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDG
+    };
+
     // The number of "rows" loaded per LDG.
-    enum { ROWS_PER_LDG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW };
+    enum
+    {
+        ROWS_PER_LDG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
+    };
+
     // The number of rows.
-    enum { ROWS = ROWS_ };
+    enum
+    {
+        ROWS = ROWS_
+    };
+
     // The number of LDGs needed to load a chunk of the Q matrix.
-    enum { LDGS = fmha::Div_up<ROWS, ROWS_PER_LDG>::VALUE };
+    enum
+    {
+        LDGS = fmha::Div_up<ROWS, ROWS_PER_LDG>::VALUE
+    };
+
     // The number of predicate registers.
-    enum { PRED_REGS = fmha::Compute_number_of_pred_regs<LDGS>::VALUE };
+    enum
+    {
+        PRED_REGS = fmha::Compute_number_of_pred_regs<LDGS>::VALUE
+    };
 
     // Is it Hopper?
-    enum {
+    enum
+    {
         IS_HOPPER = std::is_same<typename Traits::Gpu_arch, typename fmha::Hopper>::value == true
     };
+
     // Make sure we use a single register to store predicates. Do not throw for Hopper for now.
     static_assert(!USE_LDGSTS_ || PRED_REGS == 1 || IS_HOPPER, "");
+
     // We do not use LDGSTS (for the moment).
-    enum { USE_LDGSTS = USE_LDGSTS_ };
+    enum
+    {
+        USE_LDGSTS = USE_LDGSTS_
+    };
 
     // TMA DIMS, hard coded for now
-    enum { TMA_DIMS = 3 };
+    enum
+    {
+        TMA_DIMS = 3
+    };
+
     // TMA DESC type, hard coded for now
     static constexpr fmha::cudaTmaDescType TMA_DESC_TYPE = fmha::cudaTmaDescType::TILED;
 
     // Ctor.
-    template<typename Params, typename Block_info>
-    inline __device__ Gmem_tile_tma_qkv(const Params &params,
-                                        const cudaTmaDesc *p_desc,
-                                        int qkv_offset,
-                                        const Block_info &block_info,
-                                        int tidx,
-                                        int cta_row_offset = 0)
-        : params_qkv_stride_in_bytes_(params.qkv_stride_in_bytes),
-          actual_seqlen_(block_info.actual_seqlen),
-          qkv_ptr_(reinterpret_cast<char *>(params.qkv_ptr)), p_desc_(p_desc) {
+    template <typename Params, typename Block_info>
+    inline __device__ Gmem_tile_tma_qkv(Params const& params, cudaTmaDesc const* p_desc, int qkv_offset,
+        Block_info const& block_info, int tidx, int cta_row_offset = 0)
+        : params_qkv_stride_in_bytes_(params.qkv_stride_in_bytes)
+        , actual_seqlen_(block_info.actual_seqlen)
+        , qkv_ptr_(reinterpret_cast<char*>(params.qkv_ptr))
+        , p_desc_(p_desc)
+    {
         // Both MQA and GQA will use non HEADS_INTERLEAVED layout
-        if( params.h_kv < params.h ) {
+        if (params.h_kv < params.h)
+        {
             // QKV layout [b, s, [q_hd, k_h'd, v_h'd]]
-            const int hi = block_info.bidh;
-            const int hi_kv = block_info.bidh / (params.h / params.h_kv);
-            if( qkv_offset == 0 ) {         // Q tensor
+            int const hi = block_info.bidh;
+            int const hi_kv = block_info.bidh / (params.h / params.h_kv);
+            if (qkv_offset == 0)
+            { // Q tensor
                 coord[0] = hi * params.d;
-            } else if( qkv_offset == 1 ) {  // K tensor
+            }
+            else if (qkv_offset == 1)
+            { // K tensor
                 coord[0] = params.h * params.d + hi_kv * params.d;
-            } else if( qkv_offset == 2 ) {  // V tensor
+            }
+            else if (qkv_offset == 2)
+            { // V tensor
                 coord[0] = params.h * params.d + params.h_kv * params.d + hi_kv * params.d;
             }
-        } else {
+        }
+        else
+        {
             coord[0] = qkv_offset * params.d + block_info.bidh * params.d * 3;
         }
         // coord[1] = block_info.bidb * params.s; // should be params.s * batch_idx
@@ -97,23 +143,25 @@ struct Gmem_tile_tma_qkv {
     }
 
     // Store data to shared memory.
-    template<typename Smem_tile>
-    inline __device__ void commit(Smem_tile &smem_tile) {
+    template <typename Smem_tile>
+    inline __device__ void commit(Smem_tile& smem_tile)
+    {
     }
 
     // Load data from memory.
-    template<typename Smem_tile>
-    inline __device__ void load(Smem_tile &smem_tile) {
+    template <typename Smem_tile>
+    inline __device__ void load(Smem_tile& smem_tile)
+    {
         smem_tile.template store<TMA_DIMS, TMA_DESC_TYPE>(p_desc_, coord);
     }
 
     // Store data to memory.
-    inline __device__ void store(const uint4 (&data)[LDGS]) {
-    }
+    inline __device__ void store(uint4 const (&data)[LDGS]) {}
 
     // Move the pointer to the next location.
     // only needed by matrix Q.
-    inline __device__ void move() {
+    inline __device__ void move()
+    {
         // coord[1] is incremented by STEP size.
         coord[1] += ROWS;
     }
@@ -121,7 +169,7 @@ struct Gmem_tile_tma_qkv {
     // The stride between rows for the QKV matrice.
     int64_t params_qkv_stride_in_bytes_;
     // The pointer.
-    char *qkv_ptr_;
+    char* qkv_ptr_;
     // The register to store predicates.
     uint32_t preds_[PRED_REGS];
     // The fetch registers.
@@ -131,10 +179,10 @@ struct Gmem_tile_tma_qkv {
     // The sequence length.
     int actual_seqlen_;
     // tma descriptor
-    const cudaTmaDesc *p_desc_;
+    cudaTmaDesc const* p_desc_;
     // coord use by TMA. For now hard code to 3D.
     int32_t coord[3];
 };
 
-}  // namespace v2
-}  // namespace fmha
+} // namespace v2
+} // namespace fmha

@@ -12,16 +12,18 @@
 
 #pragma once
 
-#include <fused_multihead_attention_kernel.h>
-#include <fmha/kernel_traits.h>
 #include <fmha/gemm.h>
+#include <fmha/kernel_traits.h>
+#include <fused_multihead_attention_kernel.h>
 
-namespace fused_multihead_attention {
+namespace fused_multihead_attention
+{
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, typename Params>
-inline __device__ void device_1xN_nl(const Params &params) {
+template <typename Kernel_traits, typename Params>
+inline __device__ void device_1xN_nl(Params const& params)
+{
 
     // The instruction traits.
     using Traits_p = typename Kernel_traits::Traits_p;
@@ -58,12 +60,26 @@ inline __device__ void device_1xN_nl(const Params &params) {
     using Smem_tile_o = typename Kernel_traits::Smem_tile_o;
 
     // Do we use LDGSTS for Q, K or V?
-    enum { USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q };
-    enum { USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K };
-    enum { USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V };
+    enum
+    {
+        USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q
+    };
+
+    enum
+    {
+        USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K
+    };
+
+    enum
+    {
+        USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V
+    };
 
     // Do we use LDGSTS for any of the 3 input matrices.
-    enum { USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V };
+    enum
+    {
+        USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V
+    };
 
     // If either K or V uses LDGSTS, they cannot share a buffer.
     static_assert(!(USE_LDGSTS_K || USE_LDGSTS_V) || !Kernel_traits::SHARE_SMEM_FOR_K_AND_V, "");
@@ -72,17 +88,18 @@ inline __device__ void device_1xN_nl(const Params &params) {
     extern __shared__ char smem_[];
 
     // The loop -- each CTA works on a different loop iteration.
-    const int loop = blockIdx.z;
+    int const loop = blockIdx.z;
     // The block index for the batch.
-    const int bidb = blockIdx.y;
+    int const bidb = blockIdx.y;
     // The block index for the head.
-    const int bidh = blockIdx.x;
+    int const bidh = blockIdx.x;
     // The thread index.
-    const int tidx = threadIdx.x;
+    int const tidx = threadIdx.x;
 
     // The block info. TODO: Take the loop into account!
-    const Single_cta<Kernel_traits::VERSION> binfo(params, bidb, bidh, 0, tidx);
-    if( binfo.stop_early(loop) ) {
+    Single_cta<Kernel_traits::VERSION> const binfo(params, bidb, bidh, 0, tidx);
+    if (binfo.stop_early(loop))
+    {
         return;
     }
 
@@ -103,10 +120,13 @@ inline __device__ void device_1xN_nl(const Params &params) {
     Gmem_tile_v gmem_v(params, 2, binfo, tidx);
 
     // The base pointer of smem_v;
-    char *smem_v_ = nullptr;
-    if( Kernel_traits::SHARE_SMEM_FOR_K_AND_V ) {
+    char* smem_v_ = nullptr;
+    if (Kernel_traits::SHARE_SMEM_FOR_K_AND_V)
+    {
         smem_v_ = &smem_[Smem_tile_q::BYTES_PER_TILE];
-    } else {
+    }
+    else
+    {
         smem_v_ = &smem_[Smem_tile_q::BYTES_PER_TILE + Smem_tile_k::BYTES_PER_TILE];
     }
 
@@ -118,18 +138,26 @@ inline __device__ void device_1xN_nl(const Params &params) {
 
     // Store/load P to/from memory (for debugging).
 #if defined(STORE_P)
-    enum { BITS_PER_ELT_P = sizeof(typename Traits_p::Accumulator_type) * 8 };
+    enum
+    {
+        BITS_PER_ELT_P = sizeof(typename Traits_p::Accumulator_type) * 8
+    };
+
     using Gmem_tile_p = fmha::Gmem_tile_ps<Traits_p, Cta_tile_p, BITS_PER_ELT_P>;
-    char *p_ptr = reinterpret_cast<char *>(params.p_ptr);
+    char* p_ptr = reinterpret_cast<char*>(params.p_ptr);
     p_ptr += loop * Cta_tile_p::M * params.p_stride_in_bytes;
     Gmem_tile_p gmem_p(p_ptr, params.p_stride_in_bytes, params.scale_bmm1, tidx);
 #endif
 
     // Store S to memory (for debugging). NOTE: We use A_type as C_type is int32 for IMMA???
 #if defined(STORE_S)
-    enum { BITS_PER_ELT_S = sizeof(typename Traits_p::A_type) * 8 };
+    enum
+    {
+        BITS_PER_ELT_S = sizeof(typename Traits_p::A_type) * 8
+    };
+
     using Gmem_tile_s = fmha::Gmem_tile_ps<Traits_p, Cta_tile_p, BITS_PER_ELT_S>;
-    char *s_ptr = reinterpret_cast<char *>(params.s_ptr);
+    char* s_ptr = reinterpret_cast<char*>(params.s_ptr);
     s_ptr += loop * Cta_tile_p::M * params.s_stride_in_bytes;
     Gmem_tile_s gmem_s(s_ptr, params.s_stride_in_bytes, params.scale_softmax, tidx);
 #endif
@@ -149,7 +177,8 @@ inline __device__ void device_1xN_nl(const Params &params) {
     gmem_k.commit(smem_k);
 
     // Commit the data for V to shared memory.
-    if( !Kernel_traits::SHARE_SMEM_FOR_K_AND_V ) {
+    if (!Kernel_traits::SHARE_SMEM_FOR_K_AND_V)
+    {
         gmem_v.commit(smem_v);
     }
 
@@ -164,12 +193,14 @@ inline __device__ void device_1xN_nl(const Params &params) {
     // Load the fragments for K. We keep the data in registers during the entire kernel.
     typename Smem_tile_k::Fragment frag_k[Mma_tile_p::MMAS_K][Mma_tile_p::MMAS_N];
 #pragma unroll
-    for( int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki ) {
+    for (int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki)
+    {
         smem_k.load(frag_k[ki], ki);
     }
 
     // Commit the data for V to shared memory if it has not been done already.
-    if( Kernel_traits::SHARE_SMEM_FOR_K_AND_V ) {
+    if (Kernel_traits::SHARE_SMEM_FOR_K_AND_V)
+    {
         // Make sure we are done loading the fragments for K.
         __syncthreads();
 
@@ -183,7 +214,8 @@ inline __device__ void device_1xN_nl(const Params &params) {
     // Load the fragments for V. We keep the data in registers during the entire kernel.
     typename Smem_tile_v::Fragment frag_v[Mma_tile_o::MMAS_K][Mma_tile_o::VALID_MMAS_N];
 #pragma unroll
-    for( int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki ) {
+    for (int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki)
+    {
         smem_v.load(frag_v[ki], ki);
     }
 
@@ -192,7 +224,10 @@ inline __device__ void device_1xN_nl(const Params &params) {
     Softmax softmax(params, &smem_[Smem_tile_q::BYTES_PER_TILE], bidb, tidx);
 
     // The number of threads per row.
-    enum { THREADS_PER_ROW = 32 };
+    enum
+    {
+        THREADS_PER_ROW = 32
+    };
 
     // Declare the accumulators for the 1st gemm.
     fmha::Fragment_accumulator<Traits_p> acc_p[Mma_tile_p::MMAS_M][Mma_tile_p::MMAS_N];
@@ -200,18 +235,21 @@ inline __device__ void device_1xN_nl(const Params &params) {
 
 // Do this part of P^T = (Q * K^T)^T.
 #pragma unroll
-    for( int ki = 1; ki < Mma_tile_p::MMAS_K; ++ki ) {
+    for (int ki = 1; ki < Mma_tile_p::MMAS_K; ++ki)
+    {
 
         // Trigger the load from shared memory for the next series of Q values.
         smem_q.load(frag_q[ki & 1], ki);
         // Do the math for the values already in registers.
-        if( ki <= Mma_tile_p::VALID_MMAS_K ) {
+        if (ki <= Mma_tile_p::VALID_MMAS_K)
+        {
             fmha::gemm(acc_p, frag_q[(ki - 1) & 1], frag_k[(ki - 1)]);
         }
     }
 
     // Do the final stage of math.
-    if( Mma_tile_p::MMAS_K <= Mma_tile_p::VALID_MMAS_K ) {
+    if (Mma_tile_p::MMAS_K <= Mma_tile_p::VALID_MMAS_K)
+    {
         int ki = Mma_tile_p::MMAS_K;
         fmha::gemm(acc_p, frag_q[(ki - 1) & 1], frag_k[(ki - 1)]);
     }
@@ -228,9 +266,12 @@ inline __device__ void device_1xN_nl(const Params &params) {
     mask.load(loop);
 
     // Apply the mask.
-    if( params.has_alibi ) {
+    if (params.has_alibi)
+    {
         softmax.apply_mask_alibi(mask, bidh, params.alibi_params);
-    } else {
+    }
+    else
+    {
         softmax.apply_mask(mask);
     }
 
@@ -238,11 +279,14 @@ inline __device__ void device_1xN_nl(const Params &params) {
     __syncthreads();
 
     // Apply the INT8 hack.
-    if( Kernel_traits::USE_SCALE_MAX ) {
+    if (Kernel_traits::USE_SCALE_MAX)
+    {
         // 16129 == 127 ^ 2.
-        float p_max = reinterpret_cast<const float &>(params.scale_bmm1) * 16129.f;
+        float p_max = reinterpret_cast<float const&>(params.scale_bmm1) * 16129.f;
         softmax.apply_exp(p_max);
-    } else {
+    }
+    else
+    {
         // Compute the max.
         float p_max[Softmax::ROWS_PER_THREAD];
         softmax.template reduce<fmha::Max_>(p_max);
@@ -279,7 +323,8 @@ inline __device__ void device_1xN_nl(const Params &params) {
 
 // Do this part of O = P^T * V^T.
 #pragma unroll
-    for( int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki ) {
+    for (int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki)
+    {
         fmha::gemm(acc_o, frag_p[ki], frag_v[ki]);
     }
 
@@ -288,7 +333,8 @@ inline __device__ void device_1xN_nl(const Params &params) {
 
 // Loop over MMAS_M.
 #pragma unroll
-    for( int ii = 0; ii < Gmem_tile_o::LOOPS; ++ii ) {
+    for (int ii = 0; ii < Gmem_tile_o::LOOPS; ++ii)
+    {
         // Swizzle the elements and do the final reduction.
         smem_o.store(acc_o, ii);
 
@@ -300,7 +346,8 @@ inline __device__ void device_1xN_nl(const Params &params) {
         smem_o.load(out);
 
         // Make sure the data was read from shared memory.
-        if( ii < Gmem_tile_o::LOOPS - 1 ) {
+        if (ii < Gmem_tile_o::LOOPS - 1)
+        {
             __syncthreads();
         }
 
@@ -311,4 +358,4 @@ inline __device__ void device_1xN_nl(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace fused_multihead_attention
+} // namespace fused_multihead_attention

@@ -10,49 +10,43 @@
  * its affiliates is strictly prohibited.
  */
 
-#include <cuda.h>
-#include "gtest/gtest.h"
 #include "fused_multihead_attention_kernel_1xN_noloop.h"
+#include "gtest/gtest.h"
+#include <cuda.h>
 
-using Kernel_traits_nl = fmha::Kernel_traits_v1<fmha::Volta_hmma_fp16_traits,
-                                                512,
-                                                32,
-                                                32,
-                                                1,
-                                                1 * 8,
-                                                1,
-                                                0x08u | 0x200 /* no_loop flag */>;
+using Kernel_traits_nl
+    = fmha::Kernel_traits_v1<fmha::Volta_hmma_fp16_traits, 512, 32, 32, 1, 1 * 8, 1, 0x08u | 0x200 /* no_loop flag */>;
 
 static_assert(Kernel_traits_nl::CTAS_PER_HEAD == 1, "");
 
-extern "C" __global__ void
-fmha_v1_fp16_512_32_sm70_kernel_nl(bert::Fused_multihead_attention_params_v1 params) {
+extern "C" __global__ void fmha_v1_fp16_512_32_sm70_kernel_nl(bert::Fused_multihead_attention_params_v1 params)
+{
     fused_multihead_attention::device_1xN_nl<Kernel_traits_nl>(params);
 }
 
-void run_fmha_v1_fp16_512_32_sm70_nl(const bert::Fused_multihead_attention_params_v1 &params,
-                                     cudaStream_t stream) {
+void run_fmha_v1_fp16_512_32_sm70_nl(bert::Fused_multihead_attention_params_v1 const& params, cudaStream_t stream)
+{
 
     constexpr int smem_size = Kernel_traits_nl::BYTES_PER_SMEM;
-    if( smem_size >= 48 * 1024 ) {
-        FMHA_CHECK_CUDA(cudaFuncSetAttribute(fmha_v1_fp16_512_32_sm70_kernel_nl,
-                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                             smem_size));
+    if (smem_size >= 48 * 1024)
+    {
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute(
+            fmha_v1_fp16_512_32_sm70_kernel_nl, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     }
     constexpr int loop_iters = (512 + 32 - 1) / 32;
     static_assert(loop_iters * 32 >= 512, "");
     dim3 grid(params.h, params.b, loop_iters);
-    fmha_v1_fp16_512_32_sm70_kernel_nl<<<grid,
-                                         Kernel_traits_nl::THREADS,
-                                         Kernel_traits_nl::BYTES_PER_SMEM,
-                                         stream>>>(params);
+    fmha_v1_fp16_512_32_sm70_kernel_nl<<<grid, Kernel_traits_nl::THREADS, Kernel_traits_nl::BYTES_PER_SMEM, stream>>>(
+        params);
 }
 
-TEST(FMHA_v1_nl, InvalidConfig) {
+TEST(FMHA_v1_nl, InvalidConfig)
+{
     run_fmha_v1_fp16_512_32_sm70_nl(bert::Fused_multihead_attention_params_v1{}, cudaStream_t{});
     cudaDeviceSynchronize();
     cudaError_t error = cudaGetLastError();
-    if( error != cudaSuccess ) {
+    if (error != cudaSuccess)
+    {
         printf("CUDA error: %s\n", cudaGetErrorString(error));
     }
     EXPECT_EQ(error, cudaError::cudaErrorInvalidConfiguration);

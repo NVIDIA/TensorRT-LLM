@@ -14,5 +14,5 @@
 
 #include <fmha/hopper/utils_hgmma.h>
 #include <fmha/hopper/utils_hgmma_bf16.h>
-#include <fmha/hopper/utils_qgmma.h>
 #include <fmha/hopper/utils_igmma.h>
+#include <fmha/hopper/utils_qgmma.h>

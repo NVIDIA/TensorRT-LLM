@@ -12,20 +12,24 @@
 
 #pragma once
 
-#include <fmha/utils.h>
 #include <fmha/fragment.h>
+#include <fmha/utils.h>
 
-namespace fmha {
+namespace fmha
+{
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Acc, typename A, typename B, int M, int N>
-inline __device__ void gemm(Acc (&acc)[M][N], const A (&a)[M], const B (&b)[N]) {
+template <typename Acc, typename A, typename B, int M, int N>
+inline __device__ void gemm(Acc (&acc)[M][N], A const (&a)[M], B const (&b)[N])
+{
 
 #pragma unroll
-    for( int mi = 0; mi < M; ++mi ) {
+    for (int mi = 0; mi < M; ++mi)
+    {
 #pragma unroll
-        for( int ni = 0; ni < N; ++ni ) {
+        for (int ni = 0; ni < N; ++ni)
+        {
             acc[mi][ni].mma(a[mi], b[ni]);
         }
     }
@@ -33,4 +37,4 @@ inline __device__ void gemm(Acc (&acc)[M][N], const A (&a)[M], const B (&b)[N]) 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace fmha
+} // namespace fmha

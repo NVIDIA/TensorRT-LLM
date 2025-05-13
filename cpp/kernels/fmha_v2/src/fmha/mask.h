@@ -13,31 +13,44 @@
 #pragma once
 
 #include "fmha/traits.h"
-namespace fmha {
+
+namespace fmha
+{
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Traits, typename Cta_tile, int FMHA_VERSION>
-struct Mask {};
+template <typename Traits, typename Cta_tile, int FMHA_VERSION>
+struct Mask
+{
+};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Traits, typename Cta_tile>
-struct Mask<Traits, Cta_tile, 1> {
+template <typename Traits, typename Cta_tile>
+struct Mask<Traits, Cta_tile, 1>
+{
 
     // The shape of the MMA tile.
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The number of MMAs in each dimension.
-    enum { MMAS_M = Mma_tile::MMAS_M };
-    enum { MMAS_N = Mma_tile::MMAS_N };
+    enum
+    {
+        MMAS_M = Mma_tile::MMAS_M
+    };
+
+    enum
+    {
+        MMAS_N = Mma_tile::MMAS_N
+    };
 
     // Ctor.
-    template<typename Params, typename Block_info>
-    inline __device__ Mask(const Params &params, const Block_info &block_info, int tidx) {
+    template <typename Params, typename Block_info>
+    inline __device__ Mask(Params const& params, Block_info const& block_info, int tidx)
+    {
 
         // The pointer.
-        packed_mask_ptr_ = reinterpret_cast<const char *>(params.packed_mask_ptr);
+        packed_mask_ptr_ = reinterpret_cast<char const*>(params.packed_mask_ptr);
         // Take the head into account.
         packed_mask_ptr_ += block_info.bidb * params.packed_mask_stride_in_bytes;
         // The thread inside the CTA.
@@ -45,21 +58,25 @@ struct Mask<Traits, Cta_tile, 1> {
     }
 
     // Load the mask into registers (and expand).
-    inline __device__ void load(int it) {
+    inline __device__ void load(int it)
+    {
 
         // One 32-bit integer per MMA.
         uint32_t packed_mask[MMAS_M];
 #pragma unroll
-        for( int mi = 0; mi < MMAS_M; ++mi ) {
+        for (int mi = 0; mi < MMAS_M; ++mi)
+        {
             int offset = (it * MMAS_M + mi) * Cta_tile::THREADS_PER_CTA * sizeof(uint32_t);
             fmha::ldg(packed_mask[mi], packed_mask_ptr_ + offset);
         }
 
 // Expand the mask.
 #pragma unroll
-        for( int mi = 0; mi < MMAS_M; ++mi ) {
+        for (int mi = 0; mi < MMAS_M; ++mi)
+        {
 #pragma unroll
-            for( int ni = 0; ni < MMAS_N; ++ni ) {
+            for (int ni = 0; ni < MMAS_N; ++ni)
+            {
                 mask_[2 * mi + 0][4 * ni + 0] = packed_mask[mi] & (1u << (8 * ni + 0));
                 mask_[2 * mi + 0][4 * ni + 1] = packed_mask[mi] & (1u << (8 * ni + 1));
                 mask_[2 * mi + 1][4 * ni + 0] = packed_mask[mi] & (1u << (8 * ni + 2));
@@ -73,20 +90,22 @@ struct Mask<Traits, Cta_tile, 1> {
     }
 
     // Is a given position valid?
-    inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const {
+    inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const
+    {
         return mask_[mi * 2 + ii][ni * 4 + jj];
     }
 
     // The pointer to the mask.
-    const char *packed_mask_ptr_;
+    char const* packed_mask_ptr_;
     // The mask after expansion.
     bool mask_[MMAS_M * 2][MMAS_N * 4];
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Cta_tile>
-struct Mask<Volta_hmma_fp16_traits, Cta_tile, 1> {
+template <typename Cta_tile>
+struct Mask<Volta_hmma_fp16_traits, Cta_tile, 1>
+{
 
     // The instruction traits.
     using Traits = Volta_hmma_fp16_traits;
@@ -94,15 +113,23 @@ struct Mask<Volta_hmma_fp16_traits, Cta_tile, 1> {
     using Mma_tile = typename Traits::Mma_tile<Cta_tile>;
 
     // The number of MMAs in each dimension.
-    enum { MMAS_M = Mma_tile::MMAS_M };
-    enum { MMAS_N = Mma_tile::MMAS_N };
+    enum
+    {
+        MMAS_M = Mma_tile::MMAS_M
+    };
+
+    enum
+    {
+        MMAS_N = Mma_tile::MMAS_N
+    };
 
     // Ctor.
-    template<typename Params, typename Block_info>
-    inline __device__ Mask(const Params &params, const Block_info &block_info, int tidx) {
+    template <typename Params, typename Block_info>
+    inline __device__ Mask(Params const& params, Block_info const& block_info, int tidx)
+    {
 
         // The pointer.
-        packed_mask_ptr_ = reinterpret_cast<const char *>(params.packed_mask_ptr);
+        packed_mask_ptr_ = reinterpret_cast<char const*>(params.packed_mask_ptr);
         // Take the head into account.
         packed_mask_ptr_ += block_info.bidb * params.packed_mask_stride_in_bytes;
         // The thread inside the CTA.
@@ -110,41 +137,47 @@ struct Mask<Volta_hmma_fp16_traits, Cta_tile, 1> {
     }
 
     // Load the mask into registers (and expand).
-    inline __device__ void load(int it) {
+    inline __device__ void load(int it)
+    {
 
         // One 32-bit integer per MMA.
         uint32_t packed_mask[MMAS_M];
 #pragma unroll
-        for( int mi = 0; mi < MMAS_M; ++mi ) {
+        for (int mi = 0; mi < MMAS_M; ++mi)
+        {
             int offset = (it * MMAS_M + mi) * Cta_tile::THREADS_PER_CTA * sizeof(uint32_t);
             fmha::ldg(packed_mask[mi], packed_mask_ptr_ + offset);
         }
 
 // Expand the mask.
 #pragma unroll
-        for( int mi = 0; mi < MMAS_M; ++mi ) {
+        for (int mi = 0; mi < MMAS_M; ++mi)
+        {
 #pragma unroll
-            for( int ii = 0; ii < MMAS_N * 8; ++ii ) {
+            for (int ii = 0; ii < MMAS_N * 8; ++ii)
+            {
                 mask_[mi][ii] = packed_mask[mi] & (1u << ii);
             }
         }
     }
 
     // Is a given position valid?
-    inline __device__ bool is_valid(int mi, int ni, int, int jj) const {
+    inline __device__ bool is_valid(int mi, int ni, int, int jj) const
+    {
         return mask_[mi][ni * 8 + jj];
     }
 
     // The pointer to the mask.
-    const char *packed_mask_ptr_;
+    char const* packed_mask_ptr_;
     // The mask after expansion.
     bool mask_[MMAS_M][MMAS_N * 8];
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Traits, typename Cta_tile>
-struct Mask<Traits, Cta_tile, 2> {
+template <typename Traits, typename Cta_tile>
+struct Mask<Traits, Cta_tile, 2>
+{
 
     // That implementation works only when WARPS_K is 1.
     static_assert(Cta_tile::WARPS_K == 1, "");
@@ -153,9 +186,11 @@ struct Mask<Traits, Cta_tile, 2> {
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // Ctor.
-    template<typename Params, typename Block_info>
-    inline __device__ Mask(const Params &params, const Block_info &block_info, int tidx)
-        : seqlen_(block_info.actual_seqlen), col_loop_step_(0) {
+    template <typename Params, typename Block_info>
+    inline __device__ Mask(Params const& params, Block_info const& block_info, int tidx)
+        : seqlen_(block_info.actual_seqlen)
+        , col_loop_step_(0)
+    {
 
         // The decomposition of the thread index into warp/lane.
         int warp = tidx / Cta_tile::THREADS_PER_WARP;
@@ -169,48 +204,52 @@ struct Mask<Traits, Cta_tile, 2> {
     }
 
     // Is a given position valid?
-    inline __device__ bool is_valid(int, int ni, int, int jj) const {
+    inline __device__ bool is_valid(int, int ni, int, int jj) const
+    {
 
         // The position of the thread in the sequence.
-        int offset =
-            this->col_ + this->col_loop_step_ * Cta_tile::N + ni * Mma_tile::N_PER_MMA_PER_CTA;
+        int offset = this->col_ + this->col_loop_step_ * Cta_tile::N + ni * Mma_tile::N_PER_MMA_PER_CTA;
         // The position inside the MMA.
         offset += (jj & 0x02) * 4 + (jj & 0x1);
         // Is it a valid position in the sequence?
         return offset < seqlen_;
     }
 
-    //BERT Mask: if upper left is invalid, none are valid
-    inline __device__ bool any_valid(int mi, int ni) const {
+    // BERT Mask: if upper left is invalid, none are valid
+    inline __device__ bool any_valid(int mi, int ni) const
+    {
         return is_valid(mi, ni, 0, 0);
     }
 
     // Move mask to next tile (flash attention)
-    inline __device__ void move() {
+    inline __device__ void move()
+    {
         this->col_ += Cta_tile::N;
     }
 
     // Move mask the col by offset (flash attention)
-    inline __device__ void move_to_offset(int offset) {
+    inline __device__ void move_to_offset(int offset)
+    {
         this->col_ = col_init_ + offset;
     }
 
     // Reset mask to the initial col
-    inline __device__ void reset() {
+    inline __device__ void reset()
+    {
         col_ = col_init_;
     }
 
     // Load the mask... Nothing to do for real.
-    inline __device__ void load(int) {
-    }
+    inline __device__ void load(int) {}
 
     // Load the mask... we use it to keep track of to row, col (flash attention).
-    inline __device__ void load(int, int col_loop_step) {
+    inline __device__ void load(int, int col_loop_step)
+    {
         col_loop_step_ = col_loop_step;
     }
 
     // The length of the sequence.
-    const int seqlen_;
+    int const seqlen_;
     // The left-most position of the thread in the sequence.
     int col_, col_init_;
     // The current col iteration
@@ -219,8 +258,9 @@ struct Mask<Traits, Cta_tile, 2> {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Traits, typename Cta_tile>
-struct Mask<Traits, Cta_tile, 3> : public Mask<Traits, Cta_tile, 2> {
+template <typename Traits, typename Cta_tile>
+struct Mask<Traits, Cta_tile, 3> : public Mask<Traits, Cta_tile, 2>
+{
     // V3 mask is the causal mask (e.g. for GPT) and extends V2 masks (self-attention).
     using Base = Mask<Traits, Cta_tile, 2>;
 
@@ -228,9 +268,11 @@ struct Mask<Traits, Cta_tile, 3> : public Mask<Traits, Cta_tile, 2> {
     using Mma_tile = typename Base::Mma_tile;
 
     // Ctor.
-    template<typename Params, typename Block_info>
-    inline __device__ Mask(const Params &params, const Block_info &block_info, int tidx)
-        : Base(params, block_info, tidx), row_loop_step_(0) {
+    template <typename Params, typename Block_info>
+    inline __device__ Mask(Params const& params, Block_info const& block_info, int tidx)
+        : Base(params, block_info, tidx)
+        , row_loop_step_(0)
+    {
 
         int warp = tidx / Cta_tile::THREADS_PER_WARP;
         int lane = tidx % Cta_tile::THREADS_PER_WARP;
@@ -240,7 +282,8 @@ struct Mask<Traits, Cta_tile, 3> : public Mask<Traits, Cta_tile, 2> {
         row_ = warp_m * 16 + lane / 4;
     }
 
-    inline __device__ void get_row_col(int &row, int &col, int mi, int ni, int ii, int jj) const {
+    inline __device__ void get_row_col(int& row, int& col, int mi, int ni, int ii, int jj) const
+    {
         // The position of the thread in the sequence.
         row = this->row_ + this->row_loop_step_ + mi * Mma_tile::M_PER_MMA_PER_CTA;
         // The position inside the MMA.
@@ -253,7 +296,8 @@ struct Mask<Traits, Cta_tile, 3> : public Mask<Traits, Cta_tile, 2> {
     }
 
     // Is a given position valid?
-    inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const {
+    inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const
+    {
         int row, col;
         get_row_col(row, col, mi, ni, ii, jj);
 
@@ -262,23 +306,27 @@ struct Mask<Traits, Cta_tile, 3> : public Mask<Traits, Cta_tile, 2> {
     }
 
     // Is a given position valid?
-    inline __device__ bool is_valid(int row, int col) const {
+    inline __device__ bool is_valid(int row, int col) const
+    {
         // Is it a valid position in the sequence, i.e. are we in the lower triangle?
         return (row >= col);
     }
 
-    //GPT Mask: if lower left is invalid, none are valid
-    inline __device__ bool any_valid(int mi, int ni) const {
+    // GPT Mask: if lower left is invalid, none are valid
+    inline __device__ bool any_valid(int mi, int ni) const
+    {
         return is_valid(mi, ni, 1, 0);
     }
 
     // Load the mask... we use it to keep track of to row.
-    inline __device__ void load(int row_loop_step) {
+    inline __device__ void load(int row_loop_step)
+    {
         row_loop_step_ = row_loop_step;
     }
 
     // Load the mask... we use it to keep track of to row, col (flash attention).
-    inline __device__ void load(int row_loop_step, int col_loop_step) {
+    inline __device__ void load(int row_loop_step, int col_loop_step)
+    {
         row_loop_step_ = row_loop_step;
         this->col_loop_step_ = col_loop_step;
     }
@@ -303,8 +351,9 @@ struct Mask<Traits, Cta_tile, 3> : public Mask<Traits, Cta_tile, 2> {
 // x x x v v v v v x
 // x x x x v v v v v
 
-template<typename Traits, typename Cta_tile>
-struct Mask<Traits, Cta_tile, 4> : public Mask<Traits, Cta_tile, 3> {
+template <typename Traits, typename Cta_tile>
+struct Mask<Traits, Cta_tile, 4> : public Mask<Traits, Cta_tile, 3>
+{
     // V4 mask is the causal mask (e.g. for GPT) plus the sliding-window feature.
     using Base = Mask<Traits, Cta_tile, 3>;
 
@@ -312,13 +361,16 @@ struct Mask<Traits, Cta_tile, 4> : public Mask<Traits, Cta_tile, 3> {
     using Mma_tile = typename Base::Mma_tile;
 
     // Ctor.
-    template<typename Params, typename Block_info>
-    inline __device__ Mask(const Params &params, const Block_info &block_info, int tidx)
-        : Base(params, block_info, tidx), sliding_window_size_(params.sliding_window_size) {
+    template <typename Params, typename Block_info>
+    inline __device__ Mask(Params const& params, Block_info const& block_info, int tidx)
+        : Base(params, block_info, tidx)
+        , sliding_window_size_(params.sliding_window_size)
+    {
     }
 
     // Is a given position valid?
-    inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const {
+    inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const
+    {
         int row, col;
         this->get_row_col(row, col, mi, ni, ii, jj);
 
@@ -327,7 +379,8 @@ struct Mask<Traits, Cta_tile, 4> : public Mask<Traits, Cta_tile, 3> {
     }
 
     // Is a given position valid?
-    inline __device__ bool is_valid(int row, int col) const {
+    inline __device__ bool is_valid(int row, int col) const
+    {
         // Is it a valid position in the sequence, i.e. are we in the lower triangle?
         return (row >= col) && (col >= max(0, row - sliding_window_size_));
     }
@@ -339,8 +392,9 @@ struct Mask<Traits, Cta_tile, 4> : public Mask<Traits, Cta_tile, 3> {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // The custom mask (from global memory).
-template<typename Traits, typename Cta_tile>
-struct Mask<Traits, Cta_tile, 5> : public Mask<Traits, Cta_tile, 3> {
+template <typename Traits, typename Cta_tile>
+struct Mask<Traits, Cta_tile, 5> : public Mask<Traits, Cta_tile, 3>
+{
 
     using Base = Mask<Traits, Cta_tile, 3>;
 
@@ -348,97 +402,125 @@ struct Mask<Traits, Cta_tile, 5> : public Mask<Traits, Cta_tile, 3> {
     using Mma_tile = typename Base::Mma_tile;
 
     // The number of MMAs in each dimension.
-    enum { MMAS_M = Mma_tile::MMAS_M };
-    enum { MMAS_N = Mma_tile::MMAS_N };
+    enum
+    {
+        MMAS_M = Mma_tile::MMAS_M
+    };
+
+    enum
+    {
+        MMAS_N = Mma_tile::MMAS_N
+    };
+
     // One 32-bit packed mask holds 4 MMAS_N as one group.
-    enum { MMA_GROUPS_N = fmha::Div_up<MMAS_N, 4>::VALUE };
+    enum
+    {
+        MMA_GROUPS_N = fmha::Div_up<MMAS_N, 4>::VALUE
+    };
+
     // The MMAS_N in the group.
-    enum { MMAS_N_IN_GROUP = fmha::Min<MMAS_N, 4>::VALUE };
+    enum
+    {
+        MMAS_N_IN_GROUP = fmha::Min<MMAS_N, 4>::VALUE
+    };
+
     // MMAS_N uses full 32-bit integer packed masks.
-    enum { FULL_PACKED_MASK = (MMAS_N % 4 == 0) };
+    enum
+    {
+        FULL_PACKED_MASK = (MMAS_N % 4 == 0)
+    };
 
     // Ctor.
-    template<typename Params, typename Block_info>
-    inline __device__ Mask(const Params &params, const Block_info &block_info, int tidx)
-        : Base(params, block_info, tidx),
-          packed_mask_ptr_(reinterpret_cast<const char *>(params.packed_mask_ptr)),
-          params_packed_mask_stride_in_bytes_(params.packed_mask_stride_in_bytes), row_offset_(0) {
+    template <typename Params, typename Block_info>
+    inline __device__ Mask(Params const& params, Block_info const& block_info, int tidx)
+        : Base(params, block_info, tidx)
+        , packed_mask_ptr_(reinterpret_cast<char const*>(params.packed_mask_ptr))
+        , params_packed_mask_stride_in_bytes_(params.packed_mask_stride_in_bytes)
+        , row_offset_(0)
+    {
         // Add the thread offset in bytes.
-        packed_mask_ptr_ += (block_info.sum_mask_row * params_packed_mask_stride_in_bytes_ +
-                             tidx * sizeof(uint32_t));
+        packed_mask_ptr_ += (block_info.sum_mask_row * params_packed_mask_stride_in_bytes_ + tidx * sizeof(uint32_t));
     }
 
     // Load the mask... we use it to keep track of row offset.
-    inline __device__ void load(int row_offset) {
+    inline __device__ void load(int row_offset)
+    {
         row_offset_ = row_offset;
     }
 
     // Load the mask into registers (and expand).
-    inline __device__ void load_mask(int col_offset) {
+    inline __device__ void load_mask(int col_offset)
+    {
 
         // The packed_mask_offset in the col(N) dimension.
-        int mask_col_offset = int(col_offset / (Mma_tile::N_PER_MMA_PER_CTA * 4)) *
-                              Cta_tile::THREADS_PER_CTA * sizeof(uint32_t);
+        int mask_col_offset
+            = int(col_offset / (Mma_tile::N_PER_MMA_PER_CTA * 4)) * Cta_tile::THREADS_PER_CTA * sizeof(uint32_t);
         // When MMAS_N < 4, one loaded packed_mask can be expanded to boolean masks
         // of multiple iterations.
         int local_col = FULL_PACKED_MASK ? 0 : (col_offset % (Mma_tile::N_PER_MMA_PER_CTA * 4));
         // The local mma ni if MMAS_N < 4.
         int local_ni = local_col / 16;
 #pragma unroll
-        for( int mi = 0; mi < MMAS_M; ++mi ) {
+        for (int mi = 0; mi < MMAS_M; ++mi)
+        {
             // The M dimension offset.
-            int offset = (row_offset_ + mi * Mma_tile::M_PER_MMA_PER_CTA) *
-                         params_packed_mask_stride_in_bytes_;
+            int offset = (row_offset_ + mi * Mma_tile::M_PER_MMA_PER_CTA) * params_packed_mask_stride_in_bytes_;
             // The N dimension offset.
             offset += mask_col_offset;
             // Set predicate to true only when next 32-bit packed mask is needed.
             bool pred = local_col == 0;
 #pragma unroll
-            for( int ni = 0; ni < MMA_GROUPS_N; ++ni ) {
+            for (int ni = 0; ni < MMA_GROUPS_N; ++ni)
+            {
                 // The MMAS_N group offset.
-                if( pred ) {
+                if (pred)
+                {
                     fmha::ldg(packed_mask_[mi][ni],
-                              packed_mask_ptr_ + offset +
-                                  ni * Cta_tile::THREADS_PER_CTA * sizeof(uint32_t));
+                        packed_mask_ptr_ + offset + ni * Cta_tile::THREADS_PER_CTA * sizeof(uint32_t));
                 }
             }
         }
 
 // Expand the mask.
 #pragma unroll
-        for( int mi = 0; mi < MMAS_M; ++mi ) {
+        for (int mi = 0; mi < MMAS_M; ++mi)
+        {
 #pragma unroll
-            for( int ni = 0; ni < MMA_GROUPS_N; ++ni ) {
+            for (int ni = 0; ni < MMA_GROUPS_N; ++ni)
+            {
 #pragma unroll
-                for( int nni = 0; nni < MMAS_N_IN_GROUP; ++nni ) {
-                    mask_[2 * mi + 0][(ni * 4 + nni) * 4 + 0] =
-                        packed_mask_[mi][ni] & (1u << (8 * (nni + local_ni) + 0));
-                    mask_[2 * mi + 0][(ni * 4 + nni) * 4 + 1] =
-                        packed_mask_[mi][ni] & (1u << (8 * (nni + local_ni) + 1));
-                    mask_[2 * mi + 1][(ni * 4 + nni) * 4 + 0] =
-                        packed_mask_[mi][ni] & (1u << (8 * (nni + local_ni) + 2));
-                    mask_[2 * mi + 1][(ni * 4 + nni) * 4 + 1] =
-                        packed_mask_[mi][ni] & (1u << (8 * (nni + local_ni) + 3));
-                    mask_[2 * mi + 0][(ni * 4 + nni) * 4 + 2] =
-                        packed_mask_[mi][ni] & (1u << (8 * (nni + local_ni) + 4));
-                    mask_[2 * mi + 0][(ni * 4 + nni) * 4 + 3] =
-                        packed_mask_[mi][ni] & (1u << (8 * (nni + local_ni) + 5));
-                    mask_[2 * mi + 1][(ni * 4 + nni) * 4 + 2] =
-                        packed_mask_[mi][ni] & (1u << (8 * (nni + local_ni) + 6));
-                    mask_[2 * mi + 1][(ni * 4 + nni) * 4 + 3] =
-                        packed_mask_[mi][ni] & (1u << (8 * (nni + local_ni) + 7));
+                for (int nni = 0; nni < MMAS_N_IN_GROUP; ++nni)
+                {
+                    mask_[2 * mi + 0][(ni * 4 + nni) * 4 + 0]
+                        = packed_mask_[mi][ni] & (1u << (8 * (nni + local_ni) + 0));
+                    mask_[2 * mi + 0][(ni * 4 + nni) * 4 + 1]
+                        = packed_mask_[mi][ni] & (1u << (8 * (nni + local_ni) + 1));
+                    mask_[2 * mi + 1][(ni * 4 + nni) * 4 + 0]
+                        = packed_mask_[mi][ni] & (1u << (8 * (nni + local_ni) + 2));
+                    mask_[2 * mi + 1][(ni * 4 + nni) * 4 + 1]
+                        = packed_mask_[mi][ni] & (1u << (8 * (nni + local_ni) + 3));
+                    mask_[2 * mi + 0][(ni * 4 + nni) * 4 + 2]
+                        = packed_mask_[mi][ni] & (1u << (8 * (nni + local_ni) + 4));
+                    mask_[2 * mi + 0][(ni * 4 + nni) * 4 + 3]
+                        = packed_mask_[mi][ni] & (1u << (8 * (nni + local_ni) + 5));
+                    mask_[2 * mi + 1][(ni * 4 + nni) * 4 + 2]
+                        = packed_mask_[mi][ni] & (1u << (8 * (nni + local_ni) + 6));
+                    mask_[2 * mi + 1][(ni * 4 + nni) * 4 + 3]
+                        = packed_mask_[mi][ni] & (1u << (8 * (nni + local_ni) + 7));
                 }
             }
         }
     }
 
     // Move mask the col by offset (flash attention)
-    inline __device__ void move_to_offset(int col_offset) {
+    inline __device__ void move_to_offset(int col_offset)
+    {
         load_mask(col_offset);
     }
 
     // Is a given position valid?
-    inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const {
+    inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const
+    {
         return mask_[mi * 2 + ii][ni * 4 + jj];
     }
 
@@ -446,9 +528,9 @@ struct Mask<Traits, Cta_tile, 5> : public Mask<Traits, Cta_tile, 3> {
     int row_offset_;
 
     // The pointer to the mask.
-    const char *packed_mask_ptr_;
+    char const* packed_mask_ptr_;
     // The stride in the n dimension.
-    const int64_t params_packed_mask_stride_in_bytes_;
+    int64_t const params_packed_mask_stride_in_bytes_;
     // The packed mask (one 32-bit integer per MMA GROUP, MMAS_M * 2 rows, MMA_GROUPS_N * 16 cols).
     uint32_t packed_mask_[MMAS_M][MMA_GROUPS_N];
     // The mask after expansion.
@@ -457,8 +539,9 @@ struct Mask<Traits, Cta_tile, 5> : public Mask<Traits, Cta_tile, 3> {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Cta_tile>
-struct Mask<Volta_hmma_fp16_traits, Cta_tile, 2> {
+template <typename Cta_tile>
+struct Mask<Volta_hmma_fp16_traits, Cta_tile, 2>
+{
 
     // The instruction traits.
     using Traits = Volta_hmma_fp16_traits;
@@ -469,9 +552,10 @@ struct Mask<Volta_hmma_fp16_traits, Cta_tile, 2> {
     static_assert(Cta_tile::WARPS_K == 1, "");
 
     // Ctor.
-    template<typename Params, typename Block_info>
-    inline __device__ Mask(const Params &params, const Block_info &block_info, int tidx)
-        : seqlen_(block_info.actual_seqlen) {
+    template <typename Params, typename Block_info>
+    inline __device__ Mask(Params const& params, Block_info const& block_info, int tidx)
+        : seqlen_(block_info.actual_seqlen)
+    {
 
         // The decomposition of the thread index into warp/lane.
         int warp = tidx / Cta_tile::THREADS_PER_WARP;
@@ -485,7 +569,8 @@ struct Mask<Volta_hmma_fp16_traits, Cta_tile, 2> {
     }
 
     // Is a given position valid?
-    inline __device__ bool is_valid(int, int ni, int, int jj) const {
+    inline __device__ bool is_valid(int, int ni, int, int jj) const
+    {
 
         // The position of the thread in the sequence.
         int offset = this->col_ + ni * Mma_tile::N_PER_MMA_PER_CTA;
@@ -496,35 +581,37 @@ struct Mask<Volta_hmma_fp16_traits, Cta_tile, 2> {
     }
 
     // Load the mask... Nothing to do for real.
-    inline __device__ void load(int) {
-    }
+    inline __device__ void load(int) {}
 
     // Reset mask to the initial col
-    inline __device__ void reset() {
+    inline __device__ void reset()
+    {
         col_ = col_init_;
     }
 
     // Move mask to next tile (flash attention)
-    inline __device__ void move() {
+    inline __device__ void move()
+    {
         this->col_ += Cta_tile::N;
     }
 
     // Move mask the col by offset (flash attention)
-    inline __device__ void move_to_offset(int offset) {
+    inline __device__ void move_to_offset(int offset)
+    {
         this->col_ = col_init_ + offset;
     }
 
     // The length of the sequence.
-    const int seqlen_;
+    int const seqlen_;
     // The left-most position of the thread in the sequence.
     int col_, col_init_;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Cta_tile>
-struct Mask<Volta_hmma_fp16_traits, Cta_tile, 3>
-    : public Mask<Volta_hmma_fp16_traits, Cta_tile, 2> {
+template <typename Cta_tile>
+struct Mask<Volta_hmma_fp16_traits, Cta_tile, 3> : public Mask<Volta_hmma_fp16_traits, Cta_tile, 2>
+{
     // V3 mask is the causal mask (e.g. for GPT) and extends V2 masks (self-attention).
     using Base = Mask<Volta_hmma_fp16_traits, Cta_tile, 2>;
 
@@ -532,9 +619,11 @@ struct Mask<Volta_hmma_fp16_traits, Cta_tile, 3>
     using Mma_tile = typename Base::Mma_tile;
 
     // Ctor.
-    template<typename Params, typename Block_info>
-    inline __device__ Mask(const Params &params, const Block_info &block_info, int tidx)
-        : Base(params, block_info, tidx), loop_step_(0) {
+    template <typename Params, typename Block_info>
+    inline __device__ Mask(Params const& params, Block_info const& block_info, int tidx)
+        : Base(params, block_info, tidx)
+        , loop_step_(0)
+    {
 
         int warp = tidx / Cta_tile::THREADS_PER_WARP;
         int lane = tidx % Cta_tile::THREADS_PER_WARP;
@@ -544,7 +633,8 @@ struct Mask<Volta_hmma_fp16_traits, Cta_tile, 3>
         row_ = warp_m * 16 + (lane & 0x07) + (lane & 0x10) / 2;
     }
 
-    inline __device__ void get_row_col(int &row, int &col, int mi, int ni, int ii, int jj) const {
+    inline __device__ void get_row_col(int& row, int& col, int mi, int ni, int ii, int jj) const
+    {
         // The position of the thread in the sequence.
         row = this->row_ + this->loop_step_ + mi * Mma_tile::M_PER_MMA_PER_CTA;
 
@@ -555,7 +645,8 @@ struct Mask<Volta_hmma_fp16_traits, Cta_tile, 3>
     }
 
     // Is a given position valid?
-    inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const {
+    inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const
+    {
         int row, col;
         get_row_col(row, col, mi, ni, ii, jj);
 
@@ -564,18 +655,21 @@ struct Mask<Volta_hmma_fp16_traits, Cta_tile, 3>
     }
 
     // Is a given position valid?
-    inline __device__ bool is_valid(int row, int col) const {
+    inline __device__ bool is_valid(int row, int col) const
+    {
         // Is it a valid position in the sequence, i.e. are we in the lower triangle?
         return (row >= col) && (col < this->seqlen_);
     }
 
-    //GPT Mask: if lower left is invalid, none are valid
-    inline __device__ bool any_valid(int mi, int ni) const {
+    // GPT Mask: if lower left is invalid, none are valid
+    inline __device__ bool any_valid(int mi, int ni) const
+    {
         return is_valid(mi, ni, 0, 0);
     }
 
     // Load the mask... we use it to keep track of to row.
-    inline __device__ void load(int loop_step) {
+    inline __device__ void load(int loop_step)
+    {
         loop_step_ = loop_step;
     }
 
@@ -587,16 +681,18 @@ struct Mask<Volta_hmma_fp16_traits, Cta_tile, 3>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Traits, typename Cta_tile, int FMHA_VERSION>
-struct Mask_hopper {
+template <typename Traits, typename Cta_tile, int FMHA_VERSION>
+struct Mask_hopper
+{
 
     // The shape of the MMA tile.
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // Ctor.
-    template<typename Params, typename Block_info>
-    inline __device__ Mask_hopper(const Params &params, const Block_info &block_info, int tidx)
-        : seqlen_(block_info.actual_seqlen) {
+    template <typename Params, typename Block_info>
+    inline __device__ Mask_hopper(Params const& params, Block_info const& block_info, int tidx)
+        : seqlen_(block_info.actual_seqlen)
+    {
         // For Hopper the warp distribution is always 4x1 within a warpgroup.
         // So maybe there is some assumptions/optimizations to be made here.
 
@@ -607,7 +703,8 @@ struct Mask_hopper {
     }
 
     // Is a given position valid?
-    inline __device__ bool is_valid(int, int ni, int, int jj) const {
+    inline __device__ bool is_valid(int, int ni, int, int jj) const
+    {
         // The position of the thread in the sequence.
         int offset = this->col_ + ni * Mma_tile::N_PER_MMA;
         // The position inside the MMA.
@@ -617,24 +714,25 @@ struct Mask_hopper {
     }
 
     // Load the mask... Nothing to do for real.
-    inline __device__ void load(int) {
-    }
+    inline __device__ void load(int) {}
 
     // The length of the sequence.
-    const int seqlen_;
+    int const seqlen_;
     // The left-most position of the thread in the sequence.
     int col_;
 };
 
-template<typename Traits, typename Cta_tile>
-struct Mask_hopper<Traits, Cta_tile, 3> {
+template <typename Traits, typename Cta_tile>
+struct Mask_hopper<Traits, Cta_tile, 3>
+{
 
     // The shape of the MMA tile.
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // Ctor.
-    template<typename Params, typename Block_info>
-    inline __device__ Mask_hopper(const Params &params, const Block_info &block_info, int tidx) {
+    template <typename Params, typename Block_info>
+    inline __device__ Mask_hopper(Params const& params, Block_info const& block_info, int tidx)
+    {
         // For Hopper the warp distribution is always 4x1 within a warpgroup.
         // So maybe there is some assumptions/optimizations to be made here.
 
@@ -647,7 +745,8 @@ struct Mask_hopper<Traits, Cta_tile, 3> {
         row_ = row_base_;
     }
 
-    inline __device__ void get_row_col(int &row, int &col, int mi, int ni, int ii, int jj) const {
+    inline __device__ void get_row_col(int& row, int& col, int mi, int ni, int ii, int jj) const
+    {
         // The row position of the thread in the sequence.
         row = row_ + mi * Mma_tile::M_PER_MMA + ii * 8;
 
@@ -658,7 +757,8 @@ struct Mask_hopper<Traits, Cta_tile, 3> {
     }
 
     // Is a given position valid?
-    inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const {
+    inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const
+    {
         int row, col;
         get_row_col(row, col, mi, ni, ii, jj);
 
@@ -667,13 +767,15 @@ struct Mask_hopper<Traits, Cta_tile, 3> {
     }
 
     // Is a given position valid?
-    inline __device__ bool is_valid(int row, int col) const {
+    inline __device__ bool is_valid(int row, int col) const
+    {
         // Is it a valid position in the sequence?
         return col <= row;
     }
 
     // Load the mask... Nothing to do for real.
-    inline __device__ void load(int loop_step) {
+    inline __device__ void load(int loop_step)
+    {
         row_ = row_base_ + loop_step * Cta_tile::M;
     }
 
@@ -681,8 +783,9 @@ struct Mask_hopper<Traits, Cta_tile, 3> {
     int row_, row_base_, col_;
 };
 
-template<typename Traits, typename Cta_tile>
-struct Mask_hopper<Traits, Cta_tile, 4> : public Mask_hopper<Traits, Cta_tile, 3> {
+template <typename Traits, typename Cta_tile>
+struct Mask_hopper<Traits, Cta_tile, 4> : public Mask_hopper<Traits, Cta_tile, 3>
+{
 
     // V4 mask is the causal mask (e.g. for GPT) plus the sliding-window feature.
     using Base = Mask_hopper<Traits, Cta_tile, 3>;
@@ -691,13 +794,16 @@ struct Mask_hopper<Traits, Cta_tile, 4> : public Mask_hopper<Traits, Cta_tile, 3
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // Ctor.
-    template<typename Params, typename Block_info>
-    inline __device__ Mask_hopper(const Params &params, const Block_info &block_info, int tidx)
-        : Base(params, block_info, tidx), sliding_window_size_(params.sliding_window_size) {
+    template <typename Params, typename Block_info>
+    inline __device__ Mask_hopper(Params const& params, Block_info const& block_info, int tidx)
+        : Base(params, block_info, tidx)
+        , sliding_window_size_(params.sliding_window_size)
+    {
     }
 
     // Is a given position valid?
-    inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const {
+    inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const
+    {
         int row, col;
         this->get_row_col(row, col, mi, ni, ii, jj);
 
@@ -706,7 +812,8 @@ struct Mask_hopper<Traits, Cta_tile, 4> : public Mask_hopper<Traits, Cta_tile, 3
     }
 
     // Is a given position valid?
-    inline __device__ bool is_valid(int row, int col) const {
+    inline __device__ bool is_valid(int row, int col) const
+    {
         // Is it a valid position in the sequence?
         return col <= row && col >= max(0, row - sliding_window_size_);
     }
@@ -717,4 +824,4 @@ struct Mask_hopper<Traits, Cta_tile, 4> : public Mask_hopper<Traits, Cta_tile, 3
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace fmha
+} // namespace fmha

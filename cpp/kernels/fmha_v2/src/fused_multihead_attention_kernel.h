@@ -12,21 +12,22 @@
 
 #pragma once
 
+#include <fmha/gmem_tile_o.h>
+#include <fmha/gmem_tile_o_packed.h>
+#include <fmha/gmem_tile_ps.h>
+#include <fmha/gmem_tile_qkv.h>
+#include <fmha/gmem_tile_qkv_packed.h>
+#include <fmha/mask.h>
+#include <fmha/smem_tile_o.h>
+#include <fmha/smem_tile_qkv.h>
+#include <fmha/smem_tile_v.h>
+#include <fmha/softmax.h>
+#include <fmha/utils.h>
 #include <fused_multihead_attention.h>
 #include <fused_multihead_cross_attention.h>
-#include <fmha/utils.h>
-#include <fmha/gmem_tile_qkv_packed.h>
-#include <fmha/smem_tile_qkv.h>
-#include <fmha/gmem_tile_qkv.h>
-#include <fmha/gmem_tile_ps.h>
-#include <fmha/mask.h>
-#include <fmha/softmax.h>
-#include <fmha/smem_tile_v.h>
-#include <fmha/smem_tile_o.h>
-#include <fmha/gmem_tile_o_packed.h>
-#include <fmha/gmem_tile_o.h>
 
-namespace fused_multihead_attention {
+namespace fused_multihead_attention
+{
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -62,25 +63,32 @@ namespace fused_multihead_attention {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<int FMHA_VERSION>
-struct Single_cta {};
+template <int FMHA_VERSION>
+struct Single_cta
+{
+};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<>
-struct Single_cta<1> {
+template <>
+struct Single_cta<1>
+{
 
     // Ctor.
-    template<typename Params>
-    inline __device__ Single_cta(const Params &params, int bidb, int bidh, int bidn, int tidx)
-        : bidb(bidb), bidh(bidh), bidn(bidn) {
+    template <typename Params>
+    inline __device__ Single_cta(Params const& params, int bidb, int bidh, int bidn, int tidx)
+        : bidb(bidb)
+        , bidh(bidh)
+        , bidn(bidn)
+    {
         sum_s = params.b * params.s;
         actual_seqlen = params.s;
         bidx = bidb * params.h + bidh;
     }
 
     // Should we do an early exit? No.
-    inline __device__ bool stop_early(int = 0) const {
+    inline __device__ bool stop_early(int = 0) const
+    {
         return false;
     }
 
@@ -94,44 +102,53 @@ struct Single_cta<1> {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<>
-struct Single_cta<2> {
+template <>
+struct Single_cta<2>
+{
 
     // Ctor for fmhca params. TODO: consolidate
-    template<typename Params>
-    inline __device__ Single_cta(const Params &params, int bidb, int bidh, int bidn, int tidx)
-        : bidb(bidb), bidh(bidh), bidn(bidn), num_heads(params.h) {
+    template <typename Params>
+    inline __device__ Single_cta(Params const& params, int bidb, int bidh, int bidn, int tidx)
+        : bidb(bidb)
+        , bidh(bidh)
+        , bidn(bidn)
+        , num_heads(params.h)
+    {
         sum_s = params.cu_seqlens[bidb];
         actual_seqlen = params.cu_seqlens[bidb + 1] - sum_s;
         bidx = sum_s * params.h + bidh;
     }
 
     // Ctor.
-    inline __device__ Single_cta(const bert::Fused_multihead_attention_params_v2 &params,
-                                 int bidb,
-                                 int bidh,
-                                 int bidn,
-                                 int tidx)
-        : bidb(bidb), bidh(bidh), bidn(bidn), num_heads(params.h) {
-        if( params.is_s_padded ) {
+    inline __device__ Single_cta(
+        bert::Fused_multihead_attention_params_v2 const& params, int bidb, int bidh, int bidn, int tidx)
+        : bidb(bidb)
+        , bidh(bidh)
+        , bidn(bidn)
+        , num_heads(params.h)
+    {
+        if (params.is_s_padded)
+        {
             sum_s = params.s * bidb;
             // FIXME: might need s_kv here.
             sum_s_kv = params.s * bidb;
-        } else {
+        }
+        else
+        {
             sum_s = params.cu_q_seqlens[bidb];
             sum_s_kv = params.cu_kv_seqlens[bidb];
         }
         actual_q_seqlen = params.cu_q_seqlens[bidb + 1] - params.cu_q_seqlens[bidb];
-        actual_kv_seqlen = params.cu_kv_seqlens
-                               ? (params.cu_kv_seqlens[bidb + 1] - params.cu_kv_seqlens[bidb])
-                               : actual_q_seqlen;
+        actual_kv_seqlen
+            = params.cu_kv_seqlens ? (params.cu_kv_seqlens[bidb + 1] - params.cu_kv_seqlens[bidb]) : actual_q_seqlen;
         actual_seqlen = actual_kv_seqlen;
         sum_mask_row = params.cu_mask_rows ? params.cu_mask_rows[bidb] : sum_s;
         bidx = sum_s * params.h + bidh;
     }
 
     // Skip empty sequences.
-    inline __device__ bool stop_early(int loop = 0) const {
+    inline __device__ bool stop_early(int loop = 0) const
+    {
         return loop >= actual_q_seqlen;
     }
 
@@ -153,49 +170,55 @@ struct Single_cta<2> {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<int VERSION>
-struct Multi_cta : public Single_cta<VERSION> {
+template <int VERSION>
+struct Multi_cta : public Single_cta<VERSION>
+{
 
     // The base class.
     using Base = Single_cta<VERSION>;
 
     // Ctor.
-    template<typename Params>
-    inline __device__ Multi_cta(const Params &params, int bidb, int bidh, int bidn, int tidx)
-        : Base(params, bidb, bidh, bidn, tidx) {
+    template <typename Params>
+    inline __device__ Multi_cta(Params const& params, int bidb, int bidh, int bidn, int tidx)
+        : Base(params, bidb, bidh, bidn, tidx)
+    {
     }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Layout [Batch, Sequence Length]
-template<int THREADS_PER_CTA, bool SEQUENCES_INTERLEAVED = false>
-struct Block_info_padded {
+template <int THREADS_PER_CTA, bool SEQUENCES_INTERLEAVED = false>
+struct Block_info_padded
+{
 
-    template<typename Params>
-    __device__ inline Block_info_padded(const Params &params,
-                                        const int bidb,
-                                        const int bidh,
-                                        const int tidx)
-        : bidb(bidb), bidh(bidh), bidn(0), num_heads(params.h) {
+    template <typename Params>
+    __device__ inline Block_info_padded(Params const& params, int const bidb, int const bidh, int const tidx)
+        : bidb(bidb)
+        , bidh(bidh)
+        , bidn(0)
+        , num_heads(params.h)
+    {
 
         hidx = bidb * params.h + bidh;
 
         // The block index.
         sum_s = params.cu_seqlens[bidb];
-        //actual_seqlen = params.seqlens[bidb];
+        // actual_seqlen = params.seqlens[bidb];
         actual_seqlen = params.cu_seqlens[bidb + 1] - sum_s;
         bidx = sum_s * params.h + bidh;
 
         tidx_global = hidx * THREADS_PER_CTA + tidx;
     }
 
-    __device__ inline bool stop_early() const {
+    __device__ inline bool stop_early() const
+    {
         return actual_seqlen == 0;
     }
 
-    template<int M_PER_ITER>
-    __device__ inline int get_steps(const int begin) const {
+    template <int M_PER_ITER>
+    __device__ inline int get_steps(int const begin) const
+    {
         return ((actual_seqlen - begin) + M_PER_ITER - 1) / M_PER_ITER;
     }
 
@@ -212,21 +235,23 @@ struct Block_info_padded {
 };
 
 // Layout [Sequence Length, Batch]
-template<int THREADS_PER_CTA>
-struct Block_info_padded<THREADS_PER_CTA, true> {
+template <int THREADS_PER_CTA>
+struct Block_info_padded<THREADS_PER_CTA, true>
+{
 
-    template<typename Params>
-    __device__ inline Block_info_padded(const Params &params,
-                                        const int bidb,
-                                        const int bidh,
-                                        const int tidx)
-        : bidb(bidb), bidh(bidh), bidn(0), num_heads(params.h) {
+    template <typename Params>
+    __device__ inline Block_info_padded(Params const& params, int const bidb, int const bidh, int const tidx)
+        : bidb(bidb)
+        , bidh(bidh)
+        , bidn(0)
+        , num_heads(params.h)
+    {
 
         hidx = bidb * params.h + bidh;
 
         // The block index.
         sum_s = bidb;
-        //actual_seqlen = params.seqlens[bidb];
+        // actual_seqlen = params.seqlens[bidb];
         actual_seqlen = params.cu_seqlens[bidb + 1] - params.cu_seqlens[bidb];
         bidx = sum_s * params.h + bidh;
 
@@ -235,12 +260,14 @@ struct Block_info_padded<THREADS_PER_CTA, true> {
         tidx_global = hidx * THREADS_PER_CTA + tidx;
     }
 
-    __device__ inline bool stop_early() const {
+    __device__ inline bool stop_early() const
+    {
         return actual_seqlen == 0;
     }
 
-    template<int M_PER_ITER>
-    __device__ inline int get_steps(const int begin) const {
+    template <int M_PER_ITER>
+    __device__ inline int get_steps(int const begin) const
+    {
         return ((actual_seqlen - begin) + M_PER_ITER - 1) / M_PER_ITER;
     }
 
@@ -258,4 +285,4 @@ struct Block_info_padded<THREADS_PER_CTA, true> {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace fused_multihead_attention
+} // namespace fused_multihead_attention

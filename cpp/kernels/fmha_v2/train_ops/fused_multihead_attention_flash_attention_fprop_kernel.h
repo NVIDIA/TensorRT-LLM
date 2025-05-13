@@ -13,10 +13,11 @@
 #pragma once
 
 #include "fused_multihead_attention_fprop_kernel.h"
-#include <fmha/kernel_traits.h>
 #include <fmha/gemm.h>
+#include <fmha/kernel_traits.h>
 
-namespace fused_multihead_attention {
+namespace fused_multihead_attention
+{
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 /*
@@ -46,8 +47,9 @@ namespace fused_multihead_attention {
  * |Q |            O               |       S      |  D  | Softmax
  *
  */
-template<typename Kernel_traits>
-struct Gemm_Q_K_base {
+template <typename Kernel_traits>
+struct Gemm_Q_K_base
+{
     using Smem_tile_o = typename Kernel_traits::Smem_tile_o;
     using Smem_tile_q = typename Kernel_traits::Smem_tile_q;
     using Smem_tile_k = typename Kernel_traits::Smem_tile_k;
@@ -62,16 +64,19 @@ struct Gemm_Q_K_base {
     // The MMA tile for the 1st GEMM.
     using Mma_tile_p = typename Traits::template Mma_tile<Cta_tile_p>;
 
-    static constexpr int SMEM_BYTES_SOFTMAX =
-        Cta_tile_p::M * Cta_tile_p::WARPS_N * sizeof(float) * 2;
+    static constexpr int SMEM_BYTES_SOFTMAX = Cta_tile_p::M * Cta_tile_p::WARPS_N * sizeof(float) * 2;
 
-    __device__ inline Gemm_Q_K_base(char *smem_ptr_q, char *smem_ptr_k, const int tidx)
-        : smem_q(smem_ptr_q, tidx), smem_k(smem_ptr_k, tidx) {
+    __device__ inline Gemm_Q_K_base(char* smem_ptr_q, char* smem_ptr_k, int const tidx)
+        : smem_q(smem_ptr_q, tidx)
+        , smem_k(smem_ptr_k, tidx)
+    {
     }
 
-    __device__ inline void load_q() {
+    __device__ inline void load_q()
+    {
 #pragma unroll
-        for( int ki = 0; ki < Mma_tile_p::MMAS_K; ki++ ) {
+        for (int ki = 0; ki < Mma_tile_p::MMAS_K; ki++)
+        {
             smem_q.load(frag_q[ki], ki);
         }
     }
@@ -83,8 +88,9 @@ struct Gemm_Q_K_base {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool K_in_regs>
-struct Gemm_Q_K : public Gemm_Q_K_base<Kernel_traits> {
+template <typename Kernel_traits, bool K_in_regs>
+struct Gemm_Q_K : public Gemm_Q_K_base<Kernel_traits>
+{
 
     using Base = Gemm_Q_K_base<Kernel_traits>;
     using Smem_tile_o = typename Base::Smem_tile_o;
@@ -93,50 +99,64 @@ struct Gemm_Q_K : public Gemm_Q_K_base<Kernel_traits> {
     using Fragment_k = typename Base::Fragment_k;
     using Mma_tile_p = typename Base::Mma_tile_p;
 
-    enum { SHARE_SMEM_FOR_K_AND_V = Kernel_traits::SHARE_SMEM_FOR_K_AND_V };
-
-    enum { SMEM_OFFSET_O = Smem_tile_q::BYTES_PER_TILE };
-    enum {
-        SMEM_OFFSET_V =
-            Smem_tile_q::BYTES_PER_TILE + (SHARE_SMEM_FOR_K_AND_V ? 0 : Smem_tile_k::BYTES_PER_TILE)
+    enum
+    {
+        SHARE_SMEM_FOR_K_AND_V = Kernel_traits::SHARE_SMEM_FOR_K_AND_V
     };
 
-    static constexpr int SMEM_BYTES =
-        Smem_tile_q::BYTES_PER_TILE +
-        std::max((SHARE_SMEM_FOR_K_AND_V ? 1 : 2) * Smem_tile_k::BYTES_PER_TILE,
-                 Smem_tile_o::BYTES_PER_TILE + Base::SMEM_BYTES_SOFTMAX);
+    enum
+    {
+        SMEM_OFFSET_O = Smem_tile_q::BYTES_PER_TILE
+    };
 
-    __device__ inline Gemm_Q_K(char *smem_, const int tidx)
-        : Base(smem_, smem_ + Smem_tile_q::BYTES_PER_TILE, tidx) {
+    enum
+    {
+        SMEM_OFFSET_V = Smem_tile_q::BYTES_PER_TILE + (SHARE_SMEM_FOR_K_AND_V ? 0 : Smem_tile_k::BYTES_PER_TILE)
+    };
+
+    static constexpr int SMEM_BYTES = Smem_tile_q::BYTES_PER_TILE
+        + std::max((SHARE_SMEM_FOR_K_AND_V ? 1 : 2) * Smem_tile_k::BYTES_PER_TILE,
+            Smem_tile_o::BYTES_PER_TILE + Base::SMEM_BYTES_SOFTMAX);
+
+    __device__ inline Gemm_Q_K(char* smem_, int const tidx)
+        : Base(smem_, smem_ + Smem_tile_q::BYTES_PER_TILE, tidx)
+    {
     }
 
-    __device__ inline void load_k() {
+    __device__ inline void load_k()
+    {
 #pragma unroll
-        for( int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki ) {
+        for (int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki)
+        {
             Base::smem_k.load(frag_k[ki], ki);
         }
     }
 
-    template<typename Acc, int M, int N>
-    __device__ inline void operator()(Acc (&acc_p)[M][N]) {
+    template <typename Acc, int M, int N>
+    __device__ inline void operator()(Acc (&acc_p)[M][N])
+    {
 // Do this part of P^T = (Q * K^T)^T.
 #pragma unroll
-        for( int ki = 1; ki < Mma_tile_p::MMAS_K; ++ki ) {
+        for (int ki = 1; ki < Mma_tile_p::MMAS_K; ++ki)
+        {
             // Do the math for the values already in registers.
-            if( ki <= Mma_tile_p::VALID_MMAS_K ) {
+            if (ki <= Mma_tile_p::VALID_MMAS_K)
+            {
                 fmha::gemm(acc_p, Base::frag_q[(ki - 1)], frag_k[(ki - 1)]);
             }
         }
         // Do the final stage of math.
         {
             int ki = Mma_tile_p::MMAS_K;
-            if( ki <= Mma_tile_p::VALID_MMAS_K ) {
+            if (ki <= Mma_tile_p::VALID_MMAS_K)
+            {
                 fmha::gemm(acc_p, Base::frag_q[(ki - 1)], frag_k[(ki - 1)]);
             }
         }
     }
 
-    __device__ inline void reload_k() {
+    __device__ inline void reload_k()
+    {
         // Noop.
     }
 
@@ -145,8 +165,9 @@ struct Gemm_Q_K : public Gemm_Q_K_base<Kernel_traits> {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits>
-struct Gemm_Q_K<Kernel_traits, false> : public Gemm_Q_K_base<Kernel_traits> {
+template <typename Kernel_traits>
+struct Gemm_Q_K<Kernel_traits, false> : public Gemm_Q_K_base<Kernel_traits>
+{
     using Base = Gemm_Q_K_base<Kernel_traits>;
     using Smem_tile_o = typename Base::Smem_tile_o;
     using Smem_tile_q = typename Base::Smem_tile_q;
@@ -157,71 +178,83 @@ struct Gemm_Q_K<Kernel_traits, false> : public Gemm_Q_K_base<Kernel_traits> {
 
     Fragment_k frag_k[2][Mma_tile_p::MMAS_N];
 
-    enum { SHARE_SMEM_FOR_K_AND_V = Kernel_traits::SHARE_SMEM_FOR_K_AND_V };
-
-    enum {
-        SMEM_OFFSET_V =
-            Smem_tile_q::BYTES_PER_TILE + (SHARE_SMEM_FOR_K_AND_V ? 0 : Smem_tile_k::BYTES_PER_TILE)
+    enum
+    {
+        SHARE_SMEM_FOR_K_AND_V = Kernel_traits::SHARE_SMEM_FOR_K_AND_V
     };
-    static_assert(Smem_tile_v::BYTES_PER_TILE == (int)Smem_tile_k::BYTES_PER_TILE);
-    enum { SMEM_OFFSET_O = SMEM_OFFSET_V + Smem_tile_v::BYTES_PER_TILE };
+
+    enum
+    {
+        SMEM_OFFSET_V = Smem_tile_q::BYTES_PER_TILE + (SHARE_SMEM_FOR_K_AND_V ? 0 : Smem_tile_k::BYTES_PER_TILE)
+    };
+
+    static_assert(Smem_tile_v::BYTES_PER_TILE == (int) Smem_tile_k::BYTES_PER_TILE);
+
+    enum
+    {
+        SMEM_OFFSET_O = SMEM_OFFSET_V + Smem_tile_v::BYTES_PER_TILE
+    };
 
     // Q | K/V + O + SOFTMAX
-    static constexpr int SMEM_BYTES =
-        Smem_tile_q::BYTES_PER_TILE +
-        (SHARE_SMEM_FOR_K_AND_V ? 1 : 2) * Smem_tile_k::BYTES_PER_TILE +
-        Smem_tile_o::BYTES_PER_TILE + Base::SMEM_BYTES_SOFTMAX;
+    static constexpr int SMEM_BYTES = Smem_tile_q::BYTES_PER_TILE
+        + (SHARE_SMEM_FOR_K_AND_V ? 1 : 2) * Smem_tile_k::BYTES_PER_TILE + Smem_tile_o::BYTES_PER_TILE
+        + Base::SMEM_BYTES_SOFTMAX;
 
-    __device__ inline Gemm_Q_K(char *smem_, const int tidx)
-        : Base(smem_, smem_ + Smem_tile_q::BYTES_PER_TILE, tidx) {
+    __device__ inline Gemm_Q_K(char* smem_, int const tidx)
+        : Base(smem_, smem_ + Smem_tile_q::BYTES_PER_TILE, tidx)
+    {
     }
 
-    __device__ inline void load_k() {
+    __device__ inline void load_k()
+    {
         Base::smem_k.load(frag_k[0], 0);
     }
 
-    template<typename Acc, int M, int N>
-    __device__ inline void operator()(Acc (&acc_p)[M][N]) {
+    template <typename Acc, int M, int N>
+    __device__ inline void operator()(Acc (&acc_p)[M][N])
+    {
 // Do this part of P^T = (Q * K^T)^T.
 #pragma unroll
-        for( int ki = 1; ki < Mma_tile_p::MMAS_K; ++ki ) {
+        for (int ki = 1; ki < Mma_tile_p::MMAS_K; ++ki)
+        {
             // Trigger the load from shared memory for the next series of Q values.
             Base::smem_k.load(frag_k[ki & 1], ki);
             // Do the math for the values already in registers.
-            if( ki <= Mma_tile_p::VALID_MMAS_K ) {
+            if (ki <= Mma_tile_p::VALID_MMAS_K)
+            {
                 fmha::gemm(acc_p, Base::frag_q[(ki - 1)], frag_k[(ki - 1) & 1]);
             }
         }
         // Do the final stage of math.
         {
             int ki = Mma_tile_p::MMAS_K;
-            if( ki <= Mma_tile_p::VALID_MMAS_K ) {
+            if (ki <= Mma_tile_p::VALID_MMAS_K)
+            {
                 fmha::gemm(acc_p, Base::frag_q[(ki - 1)], frag_k[(ki - 1) & 1]);
             }
         }
     }
 
-    __device__ inline void reload_k() {
+    __device__ inline void reload_k()
+    {
         Base::smem_k.load(frag_k[0], 0);
     }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits>
-constexpr size_t get_dynamic_smem_size() {
+template <typename Kernel_traits>
+constexpr size_t get_dynamic_smem_size()
+{
     return Gemm_Q_K<Kernel_traits, Kernel_traits::K_IN_REGS>::SMEM_BYTES;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool IS_TRAINING, typename Params, typename Prng>
-inline __device__ void device_flash_attention_(const Params &params,
-                                               const int bidb,
-                                               const int bidh,
-                                               const int begin,
-                                               const int steps,
-                                               Prng &ph) {
+template <typename Kernel_traits, bool IS_TRAINING, typename Params, typename Prng>
+inline __device__ void device_flash_attention_(
+    Params const& params, int const bidb, int const bidh, int const begin, int const steps, Prng& ph)
+{
 
     // The instruction traits.
     using Traits = typename Kernel_traits::Traits_p;
@@ -260,33 +293,54 @@ inline __device__ void device_flash_attention_(const Params &params,
     using Gemm1 = Gemm_Q_K<Kernel_traits, Kernel_traits::K_IN_REGS>;
 
     using Softmax = fmha::Softmax<Traits, Cta_tile_p, Kernel_traits>;
+
     // Do we use LDGSTS for Q, K or V?
-    enum { USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q };
-    enum { USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K };
-    enum { USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V };
+    enum
+    {
+        USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q
+    };
+
+    enum
+    {
+        USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K
+    };
+
+    enum
+    {
+        USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V
+    };
 
     // Do we use LDGSTS for any of the 3 input matrices.
-    enum { USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V };
+    enum
+    {
+        USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V
+    };
 
     // If either K or V uses LDGSTS, they cannot share a buffer.
     static_assert(!(USE_LDGSTS_K || USE_LDGSTS_V) || !Kernel_traits::SHARE_SMEM_FOR_K_AND_V, "");
 
     // The number of threads per row.
-    enum { THREADS_PER_ROW = 32 };
+    enum
+    {
+        THREADS_PER_ROW = 32
+    };
 
-    enum { BITS_PER_ELT_S = sizeof(typename Traits::A_type) * 8 };
+    enum
+    {
+        BITS_PER_ELT_S = sizeof(typename Traits::A_type) * 8
+    };
 
     // Shared memory.
     extern __shared__ char smem_[];
 
     // The thread index.
-    const int tidx = threadIdx.x;
+    int const tidx = threadIdx.x;
     // q_loops is configured as blockIdx.y.
     // int q_loop = blockIdx.y;
 
-    const Block_info_padded<Kernel_traits::THREADS, Kernel_traits::SEQUENCES_INTERLEAVED> binfo(
+    Block_info_padded<Kernel_traits::THREADS, Kernel_traits::SEQUENCES_INTERLEAVED> const binfo(
         params, bidb, bidh, tidx);
-    if( binfo.stop_early() )
+    if (binfo.stop_early())
         return;
 
     Gemm1 gemm_q_k(smem_, tidx);
@@ -300,14 +354,14 @@ inline __device__ void device_flash_attention_(const Params &params,
 
     fmha::Mask<Traits, Cta_tile_p, Kernel_traits::MASK_VERSION> mask(params, binfo, tidx);
     // Determine whether causal mask is applied or not
-    const bool causal_mask = Kernel_traits::MASK_VERSION == 3;
+    bool const causal_mask = Kernel_traits::MASK_VERSION == 3;
 
     // Allocate the global memory tile loader for K.
     Gmem_tile_k gmem_k(params, 1, binfo, tidx);
     // Allocate the global memory tile loader for V.
     Gmem_tile_v gmem_v(params, 2, binfo, tidx);
     // The base pointer of smem_v;
-    char *smem_v_ = &smem_[Gemm1::SMEM_OFFSET_V];
+    char* smem_v_ = &smem_[Gemm1::SMEM_OFFSET_V];
 
     // Allocate the shared memory tile loader for V. We use the same as K so be careful!!!
     Smem_tile_v smem_v(smem_v_, tidx);
@@ -318,12 +372,14 @@ inline __device__ void device_flash_attention_(const Params &params,
     // Create the object to do the softmax.
     Softmax softmax(params, &smem_[Gemm1::SMEM_OFFSET_O + Smem_tile_o::BYTES_PER_TILE], bidb, tidx);
 
-    //const int kv_loop_bound =
-    //    ((binfo.actual_seqlen + Cta_tile_p::N - 1) / Cta_tile_p::N);
+    // const int kv_loop_bound =
+    //     ((binfo.actual_seqlen + Cta_tile_p::N - 1) / Cta_tile_p::N);
 
     // Loop over the local sequence length.
-    for( int q_loop = 0; q_loop < steps; q_loop++ ) {
-        if( (begin + q_loop) * Cta_tile_p::M >= binfo.actual_seqlen ) {
+    for (int q_loop = 0; q_loop < steps; q_loop++)
+    {
+        if ((begin + q_loop) * Cta_tile_p::M >= binfo.actual_seqlen)
+        {
             return;
         }
 
@@ -348,7 +404,8 @@ inline __device__ void device_flash_attention_(const Params &params,
         gmem_v.commit(smem_v);
 
         // Commit the data for K to shared memory.
-        if( !Kernel_traits::SHARE_SMEM_FOR_K_AND_V ) {
+        if (!Kernel_traits::SHARE_SMEM_FOR_K_AND_V)
+        {
             gmem_k.commit(gemm_q_k.smem_k);
         }
 
@@ -362,12 +419,14 @@ inline __device__ void device_flash_attention_(const Params &params,
         // Load the fragments for V. We keep the data in registers during the entire kernel.
         typename Smem_tile_v::Fragment frag_v[Mma_tile_o::MMAS_K][Mma_tile_o::VALID_MMAS_N];
 #pragma unroll
-        for( int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki ) {
+        for (int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki)
+        {
             smem_v.load(frag_v[ki], ki);
         }
 
         // Commit the data for V to shared memory if it has not been done already.
-        if( Kernel_traits::SHARE_SMEM_FOR_K_AND_V ) {
+        if (Kernel_traits::SHARE_SMEM_FOR_K_AND_V)
+        {
             // Make sure we are done loading the fragments for K.
             __syncthreads();
 
@@ -394,21 +453,21 @@ inline __device__ void device_flash_attention_(const Params &params,
 
         // avoid unnecessary computation if causal mask is applied
         static_assert(Cta_tile_p::M % Cta_tile_p::N == 0);
-        int kv_loop_bound = causal_mask
-                                ? ((begin + q_loop + 1) * Cta_tile_p::M) / Cta_tile_p::N
-                                : ((binfo.actual_seqlen + Cta_tile_p::N - 1) / Cta_tile_p::N);
+        int kv_loop_bound = causal_mask ? ((begin + q_loop + 1) * Cta_tile_p::M) / Cta_tile_p::N
+                                        : ((binfo.actual_seqlen + Cta_tile_p::N - 1) / Cta_tile_p::N);
 
-        for( int kv_loop = 0; kv_loop < kv_loop_bound; kv_loop++ ) {
+        for (int kv_loop = 0; kv_loop < kv_loop_bound; kv_loop++)
+        {
 
             // Declare the accumulators for the 1st gemm.
             fmha::Fragment_accumulator<Traits> acc_p[Mma_tile_p::MMAS_M][Mma_tile_p::MMAS_N];
-            fmha::Clear_accumulator<typename Traits::Accumulator_type, Cta_tile_p::WARPS_K>::apply(
-                acc_p);
+            fmha::Clear_accumulator<typename Traits::Accumulator_type, Cta_tile_p::WARPS_K>::apply(acc_p);
 
             // Do this part of P^T = (Q * K^T)^T.
             gemm_q_k(acc_p);
 
-            if( kv_loop + 1 < kv_loop_bound ) {
+            if (kv_loop + 1 < kv_loop_bound)
+            {
                 gmem_k.move_to(kv_loop + 1);
                 gemm_q_k.smem_k.move_to_next_write_buffer();
                 gmem_v.move_to(kv_loop + 1);
@@ -416,12 +475,14 @@ inline __device__ void device_flash_attention_(const Params &params,
             }
 
             // reset kv gmem offset for next q loop
-            if( kv_loop + 1 >= kv_loop_bound ) {
+            if (kv_loop + 1 >= kv_loop_bound)
+            {
                 gmem_k.reset();
                 gmem_v.reset();
             }
 
-            if( kv_loop + 1 < kv_loop_bound ) {
+            if (kv_loop + 1 < kv_loop_bound)
+            {
                 gmem_k.load(gemm_q_k.smem_k);
                 gmem_v.load(smem_v);
             }
@@ -435,14 +496,18 @@ inline __device__ void device_flash_attention_(const Params &params,
             mask.load(begin + q_loop, kv_loop);
 
             // Apply the mask.
-            if( params.has_alibi ) {
+            if (params.has_alibi)
+            {
                 softmax.apply_mask_alibi(mask, bidh, params.alibi_params);
-            } else {
+            }
+            else
+            {
                 softmax.apply_mask(mask);
             }
 
             // check whether it is needed
-            if( Kernel_traits::SHARE_SMEM_FOR_K_AND_V ) {
+            if (Kernel_traits::SHARE_SMEM_FOR_K_AND_V)
+            {
                 // if we share K and V, it could be that V was not fully read yet but
                 //  we write into smem for reduction
                 __syncthreads();
@@ -450,7 +515,7 @@ inline __device__ void device_flash_attention_(const Params &params,
 
             // Compute the max.
             // float p_max[Mma_tile_p::MMAS_M * 2];
-            //softmax.template reduce<fmha::Max_>(p_max);
+            // softmax.template reduce<fmha::Max_>(p_max);
             // softmax.reduce_max(acc_o_updater.p_max);
             softmax.template reduce<fmha::Max_>(acc_o_updater.prev_max_);
 
@@ -474,8 +539,10 @@ inline __device__ void device_flash_attention_(const Params &params,
 
             using Frag_p = fmha::Fragment_a<Traits, fmha::Row>;
             Frag_p frag_p[Mma_tile_o::MMAS_K][Mma_tile_o::MMAS_M];
-            if( IS_TRAINING ) {
-                if( params.has_dropout ) {
+            if (IS_TRAINING)
+            {
+                if (params.has_dropout)
+                {
                     // for warp Nx1
                     static_assert(Cta_tile_p::WARPS_N == 1);
 
@@ -483,42 +550,46 @@ inline __device__ void device_flash_attention_(const Params &params,
                     unsigned int warp_idx = threadIdx.x / 32;
                     // 16 means each warp will handle 16 x 16 elements in current MMA computation.
                     unsigned int block_col_idx = kv_loop * Cta_tile_p::N / 16;
-                    unsigned long long philox_subsequence =
-                        ((begin + q_loop) * Cta_tile_p::M / 16 + warp_idx) *
-                            (binfo.actual_seqlen / 16) +
-                        block_col_idx;
+                    unsigned long long philox_subsequence
+                        = ((begin + q_loop) * Cta_tile_p::M / 16 + warp_idx) * (binfo.actual_seqlen / 16)
+                        + block_col_idx;
 
 #pragma unroll
-                    for( int mi = 0; mi < Mma_tile_p::MMAS_M; mi++ ) {
+                    for (int mi = 0; mi < Mma_tile_p::MMAS_M; mi++)
+                    {
 #pragma unroll
-                        for( int ni = 0; ni < Mma_tile_p::MMAS_N; ni++ ) {
+                        for (int ni = 0; ni < Mma_tile_p::MMAS_N; ni++)
+                        {
 
                             // convert 4 int32_t to 8 int16_t
-                            uint16_t *rand_arr = (uint16_t *)&ph(
-                                philox_subsequence + ni * Cta_tile_p::WARPS_N +
-                                mi * Cta_tile_p::WARPS_M * (binfo.actual_seqlen / 16));
+                            uint16_t* rand_arr = (uint16_t*) &ph(philox_subsequence + ni * Cta_tile_p::WARPS_N
+                                + mi * Cta_tile_p::WARPS_M * (binfo.actual_seqlen / 16));
 
 #pragma unroll
-                            for( int jj = 0; jj < 2; jj++ ) {
+                            for (int jj = 0; jj < 2; jj++)
+                            {
 #pragma unroll
-                                for( int ii = 0; ii < 4; ii++ ) {
+                                for (int ii = 0; ii < 4; ii++)
+                                {
                                     // We encode the dropout pattern in the sign bit of
                                     //  the non-negative softmax to distinguish from pre-existing zeros
-                                    softmax.elt_[2 * mi + jj][4 * ni + ii] =
-                                        rand_arr[4 * jj + ii] <= params.p_dropout_16bit
-                                            ? softmax.elt_[2 * mi + jj][4 * ni + ii]
-                                            : -softmax.elt_[2 * mi + jj][4 * ni + ii];
-                                }  // ii
-                            }      // jj
-                        }          // ni
-                    }              // mi
-                }                  // has_dropout
+                                    softmax.elt_[2 * mi + jj][4 * ni + ii]
+                                        = rand_arr[4 * jj + ii] <= params.p_dropout_16bit
+                                        ? softmax.elt_[2 * mi + jj][4 * ni + ii]
+                                        : -softmax.elt_[2 * mi + jj][4 * ni + ii];
+                                } // ii
+                            }     // jj
+                        }         // ni
+                    }             // mi
+                }                 // has_dropout
 
                 softmax.pack(frag_p);
                 // for debug, store the sign of dropout for testing
-                gmem_s.move(begin + q_loop, kv_loop);  // Note the second param is kv_loop_id
+                gmem_s.move(begin + q_loop, kv_loop); // Note the second param is kv_loop_id
                 gmem_s.store_sign(softmax.elt_, mask);
-            } else {
+            }
+            else
+            {
                 softmax.pack(frag_p);
             }
 
@@ -526,24 +597,30 @@ inline __device__ void device_flash_attention_(const Params &params,
             __syncthreads();
 
             // can only be committed after softmax as they share the smem
-            if( kv_loop + 1 < kv_loop_bound ) {
+            if (kv_loop + 1 < kv_loop_bound)
+            {
                 gmem_v.commit(smem_v);
             }
             // Commit the data for K to shared memory.
-            if( !Kernel_traits::SHARE_SMEM_FOR_K_AND_V && kv_loop + 1 < kv_loop_bound ) {
+            if (!Kernel_traits::SHARE_SMEM_FOR_K_AND_V && kv_loop + 1 < kv_loop_bound)
+            {
                 gmem_k.commit(gemm_q_k.smem_k);
             }
 
-            if( params.has_dropout ) {
+            if (params.has_dropout)
+            {
 #pragma unroll
-                for( int ki = 0; ki < Mma_tile_o::MMAS_K; ki++ ) {
+                for (int ki = 0; ki < Mma_tile_o::MMAS_K; ki++)
+                {
 #pragma unroll
-                    for( int mi = 0; mi < Mma_tile_o::MMAS_M; mi++ ) {
+                    for (int mi = 0; mi < Mma_tile_o::MMAS_M; mi++)
+                    {
 #pragma unroll
-                        for( int ii = 0; ii < Frag_p::NUM_REGS; ii++ ) {
+                        for (int ii = 0; ii < Frag_p::NUM_REGS; ii++)
+                        {
                             //"Apply" the dropout.
-                            frag_p[ki][mi].reg(ii) =
-                                fmha::mul2<Data_type>(frag_p[ki][mi].reg(ii), params.scale_dropout);
+                            frag_p[ki][mi].reg(ii)
+                                = fmha::mul2<Data_type>(frag_p[ki][mi].reg(ii), params.scale_dropout);
                             frag_p[ki][mi].reg(ii) = fmha::relu2<Data_type>(frag_p[ki][mi].reg(ii));
                         }
                     }
@@ -558,7 +635,8 @@ inline __device__ void device_flash_attention_(const Params &params,
 
 // Do this part of O = P^T * V^T.
 #pragma unroll
-            for( int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki ) {
+            for (int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki)
+            {
                 fmha::gemm(acc_o, frag_p[ki], frag_v[ki]);
             }
 
@@ -567,12 +645,14 @@ inline __device__ void device_flash_attention_(const Params &params,
 
 // Load the fragments for next K.
 #pragma unroll
-            for( int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki ) {
+            for (int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki)
+            {
                 smem_v.load(frag_v[ki], ki);
             }
 
             // Commit the data for V to shared memory if it has not been done already.
-            if( Kernel_traits::SHARE_SMEM_FOR_K_AND_V ) {
+            if (Kernel_traits::SHARE_SMEM_FOR_K_AND_V)
+            {
                 // Make sure we are done loading the fragments for K.
                 __syncthreads();
 
@@ -587,11 +667,12 @@ inline __device__ void device_flash_attention_(const Params &params,
             gemm_q_k.load_k();
 
             // need to reload q as Q_IN_REGS=false by default
-            if( q_loop + 1 < steps && kv_loop + 1 == kv_loop_bound ) {
+            if (q_loop + 1 < steps && kv_loop + 1 == kv_loop_bound)
+            {
                 gemm_q_k.load_q();
             }
 
-        }  // kv_loop
+        } // kv_loop
 
         // store softmax (m + log(l)) to global memory
         acc_o_updater.store(begin + q_loop);
@@ -599,7 +680,8 @@ inline __device__ void device_flash_attention_(const Params &params,
         gmem_o.move_to(begin + q_loop);
 // Loop over MMAS_M.
 #pragma unroll
-        for( int ii = 0; ii < Gmem_tile_o::LOOPS; ++ii ) {
+        for (int ii = 0; ii < Gmem_tile_o::LOOPS; ++ii)
+        {
 
             // Swizzle the elements and do the final reduction.
             smem_o.store(acc_o, ii);
@@ -612,7 +694,8 @@ inline __device__ void device_flash_attention_(const Params &params,
             smem_o.load(out);
 
             // Make sure the data was read from shared memory.
-            if( ii < Gmem_tile_o::LOOPS - 1 ) {
+            if (ii < Gmem_tile_o::LOOPS - 1)
+            {
                 __syncthreads();
             }
 
@@ -623,70 +706,67 @@ inline __device__ void device_flash_attention_(const Params &params,
         // Move to the next part of the output.
         gemm_q_k.reload_k();
 
-    }  // Outer loop over the sequence length.
+    } // Outer loop over the sequence length.
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool IS_TRAINING, typename Params>
-inline __device__ void device_flash_attention(const Params &params,
-                                              const int num_full_heads,
-                                              const int num_main_groups,
-                                              const int main_group_size,
-                                              const int main_steps,
-                                              const int rest_steps) {
+template <typename Kernel_traits, bool IS_TRAINING, typename Params>
+inline __device__ void device_flash_attention(Params const& params, int const num_full_heads, int const num_main_groups,
+    int const main_group_size, int const main_steps, int const rest_steps)
+{
 
-    const int STEPS = (params.s + Kernel_traits::Cta_tile_p::M - 1) / Kernel_traits::Cta_tile_p::M;
-    const int tidx_global = blockIdx.x * gridDim.x + threadIdx.x;
+    int const STEPS = (params.s + Kernel_traits::Cta_tile_p::M - 1) / Kernel_traits::Cta_tile_p::M;
+    int const tidx_global = blockIdx.x * gridDim.x + threadIdx.x;
     auto seeds = at::cuda::philox::unpack(params.philox_args);
 
-    if( threadIdx.x == 0 && blockIdx.x == 0 ) {
-        uint64_t *ptr = reinterpret_cast<uint64_t *>(params.seed_ptr);
+    if (threadIdx.x == 0 && blockIdx.x == 0)
+    {
+        uint64_t* ptr = reinterpret_cast<uint64_t*>(params.seed_ptr);
         ptr[0] = std::get<0>(seeds);
         ptr[1] = std::get<1>(seeds);
     }
 
-    for( int it = 0; it < num_full_heads; it++ ) {
-        const int bidx = it * gridDim.x + blockIdx.x;
-        const int bidh = bidx % params.h;
-        const int bidb = bidx / params.h;
-        Philox ph(std::get<0>(seeds),
-                  0,
-                  std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + threadIdx.x % 32);
+    for (int it = 0; it < num_full_heads; it++)
+    {
+        int const bidx = it * gridDim.x + blockIdx.x;
+        int const bidh = bidx % params.h;
+        int const bidb = bidx / params.h;
+        Philox ph(std::get<0>(seeds), 0, std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + threadIdx.x % 32);
         fused_multihead_attention::device_flash_attention_<Kernel_traits, IS_TRAINING>(
             params, bidb, bidh, 0, STEPS, ph);
         __syncthreads();
     }
-    if( main_group_size == 0 )
+    if (main_group_size == 0)
         return;
-    const int head_offset = num_full_heads * gridDim.x;
+    int const head_offset = num_full_heads * gridDim.x;
 
-    if( blockIdx.x < main_group_size * num_main_groups ) {
+    if (blockIdx.x < main_group_size * num_main_groups)
+    {
         // process within heads
-        const int group = blockIdx.x % num_main_groups;
-        const int bidx = blockIdx.x / num_main_groups;
-        const int bidh = (head_offset + bidx) % params.h;
-        const int bidb = (head_offset + bidx) / params.h;
-        const int offset = group * main_steps;
-        Philox ph(std::get<0>(seeds),
-                  0,
-                  std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + threadIdx.x % 32);
+        int const group = blockIdx.x % num_main_groups;
+        int const bidx = blockIdx.x / num_main_groups;
+        int const bidh = (head_offset + bidx) % params.h;
+        int const bidb = (head_offset + bidx) / params.h;
+        int const offset = group * main_steps;
+        Philox ph(std::get<0>(seeds), 0, std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + threadIdx.x % 32);
         fused_multihead_attention::device_flash_attention_<Kernel_traits, IS_TRAINING>(
             params, bidb, bidh, offset, main_steps, ph);
-    } else {
-        if( rest_steps == 0 )
+    }
+    else
+    {
+        if (rest_steps == 0)
             return;
         // process across heads
-        const int bidx = blockIdx.x - main_group_size * num_main_groups;
-        const int offset = num_main_groups * main_steps;
-        const int total_heads = params.b * params.h;
-        const int rest_ctas = gridDim.x - main_group_size * num_main_groups;
-        for( int it = head_offset + bidx; it < total_heads; it += rest_ctas ) {
-            const int bidh = it % params.h;
-            const int bidb = it / params.h;
-            Philox ph(std::get<0>(seeds),
-                      0,
-                      std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + threadIdx.x % 32);
+        int const bidx = blockIdx.x - main_group_size * num_main_groups;
+        int const offset = num_main_groups * main_steps;
+        int const total_heads = params.b * params.h;
+        int const rest_ctas = gridDim.x - main_group_size * num_main_groups;
+        for (int it = head_offset + bidx; it < total_heads; it += rest_ctas)
+        {
+            int const bidh = it % params.h;
+            int const bidb = it / params.h;
+            Philox ph(std::get<0>(seeds), 0, std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + threadIdx.x % 32);
             fused_multihead_attention::device_flash_attention_<Kernel_traits, IS_TRAINING>(
                 params, bidb, bidh, offset, rest_steps, ph);
             __syncthreads();
@@ -696,27 +776,29 @@ inline __device__ void device_flash_attention(const Params &params,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool IS_TRAINING, typename Params>
-inline __device__ void device_flash_attention(const Params &params, const int total_heads) {
+template <typename Kernel_traits, bool IS_TRAINING, typename Params>
+inline __device__ void device_flash_attention(Params const& params, int const total_heads)
+{
 
     // std::make_tuple(arg.seed_.val, arg.offset_.val);
     // https://github.com/pytorch/pytorch/blob/
     //  fc94a2115b31dfe7a0d8f28eb4f5ed532c4f0792/aten/src/ATen/cuda/detail/UnpackRaw.cuh#L18-L28
     auto seeds = at::cuda::philox::unpack(params.philox_args);
 
-    if( threadIdx.x == 0 && blockIdx.x == 0 ) {
-        uint64_t *ptr = reinterpret_cast<uint64_t *>(params.seed_ptr);
+    if (threadIdx.x == 0 && blockIdx.x == 0)
+    {
+        uint64_t* ptr = reinterpret_cast<uint64_t*>(params.seed_ptr);
         ptr[0] = std::get<0>(seeds);
         ptr[1] = std::get<1>(seeds);
     }
-    const int STEPS = (params.s + Kernel_traits::Cta_tile_p::M - 1) / Kernel_traits::Cta_tile_p::M;
+    int const STEPS = (params.s + Kernel_traits::Cta_tile_p::M - 1) / Kernel_traits::Cta_tile_p::M;
 
-    for( int bidx = blockIdx.x; bidx < total_heads; bidx += gridDim.x ) {
-        const int bidh = bidx % params.h;
-        const int bidb = bidx / params.h;
-        const int tidx = threadIdx.x;
-        Philox ph(
-            std::get<0>(seeds), 0, std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + tidx % 32);
+    for (int bidx = blockIdx.x; bidx < total_heads; bidx += gridDim.x)
+    {
+        int const bidh = bidx % params.h;
+        int const bidb = bidx / params.h;
+        int const tidx = threadIdx.x;
+        Philox ph(std::get<0>(seeds), 0, std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + tidx % 32);
 
         fused_multihead_attention::device_flash_attention_<Kernel_traits, IS_TRAINING>(
             params, bidb, bidh, 0, STEPS, ph);
@@ -726,4 +808,4 @@ inline __device__ void device_flash_attention(const Params &params, const int to
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace fused_multihead_attention
+} // namespace fused_multihead_attention
