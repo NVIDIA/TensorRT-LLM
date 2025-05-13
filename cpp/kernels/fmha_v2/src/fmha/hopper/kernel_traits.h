@@ -27,7 +27,7 @@ template <
     // Instruction traits.
     typename Traits_o_,
     // The ldgsts global memory tile for Q, K and V.
-    template <typename, typename, int, int, int, int, bool, bool, int> class Gmem_tile_qkv_,
+    template <typename, typename, int, int, int, int, bool, bool, int, bool> class Gmem_tile_qkv_,
     // The tma global memory tile for Q, K and V.
     template <typename, typename, int, int, int, bool, bool, int> class Gmem_tile_tma_qkv_,
     // The global memory tile for the output.
@@ -179,7 +179,7 @@ struct FMHA_kernel_traits_hopper
     // The global memory tile to load Q.
     // Hopefully we don't need to specialize for Hopper.
     using Gmem_tile_ldgsts_q = Gmem_tile_qkv_<Traits_p, Cta_tile_p, Traits_p::BITS_PER_ELEMENT_A, STEP, D, D, true,
-        HEADS_INTERLEAVED, NUM_QKV_MATS>;
+        HEADS_INTERLEAVED, NUM_QKV_MATS, SLIDING_WINDOW_ATTENTION>;
 
     // The global memory tile to load Q with TMA.
     using Gmem_tile_tma_q = Gmem_tile_tma_qkv_<Traits_p, Cta_tile_p, Traits_p::BITS_PER_ELEMENT_A, STEP, D, false,
@@ -216,7 +216,7 @@ struct FMHA_kernel_traits_hopper
     // Hopefully we don't need to specialize for hopper.
     using Gmem_tile_ldgsts_k = Gmem_tile_qkv_<Traits_p, Cta_tile_p, Traits_p::BITS_PER_ELEMENT_B, S, D, D,
         true, // use ldgsts
-        HEADS_INTERLEAVED, NUM_QKV_MATS>;
+        HEADS_INTERLEAVED, NUM_QKV_MATS, SLIDING_WINDOW_ATTENTION>;
 
     // The global memory tile to load K with TMA.
     using Gmem_tile_tma_k = Gmem_tile_tma_qkv_<Traits_p, Cta_tile_p, Traits_p::BITS_PER_ELEMENT_B, S, D, false,
@@ -251,7 +251,7 @@ struct FMHA_kernel_traits_hopper
     // The global memory tile to load V.
     using Gmem_tile_ldgsts_v = Gmem_tile_qkv_<Traits_o, Cta_tile_o, Traits_o::BITS_PER_ELEMENT_B, S, D, D,
         true, // use ldgsts
-        HEADS_INTERLEAVED, NUM_QKV_MATS>;
+        HEADS_INTERLEAVED, NUM_QKV_MATS, SLIDING_WINDOW_ATTENTION>;
 
     // The global memory tile to load V with TMA.
     using Gmem_tile_tma_v = Gmem_tile_tma_qkv_<Traits_o, Cta_tile_o, Traits_o::BITS_PER_ELEMENT_B, S, D, false,
