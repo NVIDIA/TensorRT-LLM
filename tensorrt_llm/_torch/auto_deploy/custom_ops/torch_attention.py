@@ -63,7 +63,9 @@ def scaled_dot_product_attention_fake(
     query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
 ):
     """Fake implementation of scaled_dot_product_attention."""
-    return torch.empty_like(query.contiguous())
+    b, n, s, _ = query.shape
+    v_head_dim = value.shape[-1]
+    return torch.empty(b, n, s, v_head_dim, dtype=query.dtype, device=query.device).contiguous()
 
 
 @torch.library.custom_op("attention::grouped_sdpa", mutates_args=())
@@ -101,7 +103,9 @@ def grouped_sdpa_fake(
     scale=None,
 ):
     """Fake implementation of grouped SDPA."""
-    return torch.empty_like(query.contiguous())
+    b, n, s, _ = query.shape
+    v_head_dim = value.shape[-1]
+    return torch.empty(b, n, s, v_head_dim, dtype=query.dtype, device=query.device).contiguous()
 
 
 @torch.library.custom_op("attention::bsnd_grouped_sdpa", mutates_args=())
@@ -135,7 +139,9 @@ def bsnd_grouped_sdpa_fake(
     query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
 ):
     """Fake implementation of bnsd grouped SDPA."""
-    return torch.empty_like(query.contiguous())
+    b, s, n, _ = query.shape
+    v_head_dim = value.shape[-1]
+    return torch.empty(b, s, n, v_head_dim, dtype=query.dtype, device=query.device).contiguous()
 
 
 # Function to apply rotary positional embeddings (RoPE)
@@ -518,7 +524,7 @@ def mla(
     q_nope: torch.Tensor,  # Down projected/pre-processed q_nope
     q_pe: torch.Tensor,  # q_pe after applying rope
     kv: torch.Tensor,  # compressed kv after passing through layernorm
-    k_pe: torch.Tensor,  # k_pe after applying rope
+    pe: torch.Tensor,  # k_pe after applying rope
     attention_mask: torch.Tensor,  # attention mask
     softmax_scale: float,  # softmax scale
 ) -> torch.Tensor:
@@ -527,11 +533,12 @@ def mla(
     This implementation flattens the inputs and can be used as a reference to debug the triton kernels.
     """
     scores = (
-        torch.einsum("bshc,btc->bsht", q_nope.transpose(1, 2), kv.transpose(1, 2))
-        + torch.einsum("bshr,btr->bsht", q_pe.transpose(1, 2), k_pe.transpose(1, 2))
+        torch.einsum("bhsc,btc->bsht", q_nope, kv) + torch.einsum("bhsr,btr->bsht", q_pe, pe)
     ) * softmax_scale
-
-    attn_output = torch.einsum("bsht,btc->bshc", scores, kv.transpose(1, 2))
+    if attention_mask is not None:
+        scores += attention_mask.unsqueeze(1)
+    scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(q_nope)
+    attn_output = torch.einsum("bsht,btc->bshc", scores, kv)
     return attn_output
 
 
