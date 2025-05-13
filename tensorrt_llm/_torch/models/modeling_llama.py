@@ -15,8 +15,7 @@ from tensorrt_llm._torch.pipeline_interface import PipelineInterface
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
-from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
-                       register_input_processor)
+from ...inputs import ExtraProcessedInputs, InputProcessor, TextPrompt
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
@@ -34,7 +33,6 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
 from ..utils import Fp4QuantizedTensor
-from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, MissingLayer,
                              register_auto_model, support_pp,
@@ -981,13 +979,15 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                          vocab_size=model_config.pretrained_config.vocab_size)
 
 
-@register_auto_model("Llama4ForCausalLM")
-class Llama4ForCausalLM(DecoderModelForCausalLM[Llama4Model, Llama4Config]):
+@register_auto_model("Llama4ForConditionalGeneration")
+class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
+                                                             Llama4Config]):
 
     def __init__(
         self,
         model_config: ModelConfig[Llama4Config],
     ):
+        # TODO: figure out a better way to handle multimodality.
         model_config = copy.copy(model_config)
         architectures = model_config.pretrained_config.architectures
         model_config.pretrained_config = model_config.pretrained_config.text_config
@@ -996,6 +996,95 @@ class Llama4ForCausalLM(DecoderModelForCausalLM[Llama4Model, Llama4Config]):
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
+        self.draft_model = None
+        if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
+        ):
+            draft_config = ModelConfig.from_pretrained(
+                model_config.spec_config.draft_model_path,
+                trust_remote_code=True,
+                attn_backend=model_config.attn_backend,
+                moe_backend=model_config.moe_backend,
+                mapping=model_config.mapping)
+            draft_config.spec_config = model_config.spec_config
+            draft_config.max_num_tokens = model_config.max_num_tokens
+            draft_config.moe_max_num_tokens = model_config.moe_max_num_tokens
+            draft_config.quant_config.kv_cache_quant_algo = \
+                model_config.quant_config.kv_cache_quant_algo
+            self.draft_model = Eagle3LlamaForCausalLM(
+                draft_config, model_config.pretrained_config.num_hidden_layers)
+            self.spec_worker = get_spec_worker(model_config.spec_config,
+                                               model_config.mapping)
+
+            # Set to True to enable delayed all-gather for LM head.
+            # This means LM head will not perform all-gather on the output logits, so each rank will only have
+            # a subset of the logits. The decoding part must be aware of that and apply all gather after top1 reduction.
+            self.enable_lm_head_delayed_all_gather = True
+            if self.enable_lm_head_delayed_all_gather:
+                # Delay all-gather until after top1 reduction.
+                self.lm_head.gather_output = False
+                self.draft_model.lm_head.gather_output = False
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.LongTensor = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pipeline_interface: Optional[PipelineInterface] = None,
+        return_context_logits: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if self._supports_pp and self.pp_size > 1:
+            output = self.model(
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                pipeline_interface=pipeline_interface,
+                spec_metadata=spec_metadata,
+            )
+
+            # No need to compute logits for non-last PP ranks
+            if self.pp_rank < self.pp_size - 1:
+                return output
+            else:
+                hidden_states = output
+        else:
+            hidden_states = self.model(
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                spec_metadata=spec_metadata,
+            )
+
+        if self.draft_model is not None:
+            # get logits
+            logits = self.logits_processor.forward(
+                hidden_states[spec_metadata.gather_ids],
+                self.lm_head,
+                attn_metadata,
+                True,
+            )
+            # get accepted tokens and next draft tokens
+            return self.spec_worker(input_ids=input_ids,
+                                    position_ids=position_ids,
+                                    hidden_states=hidden_states,
+                                    logits=logits,
+                                    attn_metadata=attn_metadata,
+                                    spec_metadata=spec_metadata,
+                                    draft_model=self.draft_model,
+                                    main_model_lm_head=self.lm_head)
+        else:
+            logits = self.logits_processor.forward(
+                hidden_states,
+                self.lm_head,
+                attn_metadata,
+                return_context_logits,
+            )
+
+        return logits
 
     def infer_max_seq_len(self):
         # TODO: increase to support 10M context length. There are two blockers
@@ -1015,7 +1104,7 @@ class Llama4ForCausalLM(DecoderModelForCausalLM[Llama4Model, Llama4Config]):
             else:
                 new_weights[key] = tensor
 
-        super().load_weights(new_weights)
+        super().load_weights(new_weights, skip_modules=["draft_model"])
 
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
@@ -1025,6 +1114,10 @@ class Llama4ForCausalLM(DecoderModelForCausalLM[Llama4Model, Llama4Config]):
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
                 layer.next_attn = self.model.layers[idx + 1].self_attn
+
+    def load_draft_weights(self, weights: Dict):
+        self.draft_model.load_weights(weights)
+        self.draft_model.load_weights_from_target_model(self)
 
 
 class Llama4InputProcessor(InputProcessor):
@@ -1085,35 +1178,6 @@ class Llama4InputProcessor(InputProcessor):
             return token_ids.tolist(), {"mm_embedding": mm_embeds}
         else:
             return processed["input_ids"].squeeze().tolist(), {}
-
-
-@register_auto_model("Llama4ForConditionalGeneration")
-@register_input_processor(Llama4InputProcessor)
-class Llama4ForConditionalGeneration(Llama4ForCausalLM):
-
-    @torch.inference_mode()
-    def forward(
-        self,
-        attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        return_context_logits: Optional[bool] = False,
-        spec_metadata: Optional[SpecMetadata] = None,
-        pipeline_interface: Optional[PipelineInterface] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        mm_embed = kwargs.get("multi_modal_data", [])
-        input_ids, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
-                                                     input_ids, mm_embed)
-        logits = super().forward(attn_metadata,
-                                 input_ids,
-                                 position_ids,
-                                 inputs_embeds,
-                                 spec_metadata=spec_metadata,
-                                 return_context_logits=return_context_logits,
-                                 pipeline_interface=pipeline_interface)
-        return logits
 
 
 @register_auto_model("MistralForCausalLM")
