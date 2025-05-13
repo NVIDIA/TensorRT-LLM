@@ -269,22 +269,13 @@ pipeline {
                         buildImage("tritondevel", params.action, "skip")
                     }
                 }
-                stage("Build x86_64-pre_cxx11_abi") {
+                stage("Build SBSA-skip") {
                     agent {
-                        kubernetes createKubernetesPodConfig("build")
+                        kubernetes createKubernetesPodConfig("agent")
                     }
                     steps
                     {
-                        buildImage("devel", params.action, "src_non_cxx11_abi")
-                    }
-                }
-                stage("Build x86_64-cxx11_abi") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("devel", params.action, "src_cxx11_abi")
+                        buildImage("tritondevel", params.action, "skip", "", "", "", true)
                     }
                 }
                 stage("Build rockylinux8 x86_64-skip-py3.10") {
@@ -303,33 +294,6 @@ pipeline {
                     steps
                     {
                         buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.12.3 STAGE=tritondevel", "", "-py312")
-                    }
-                }
-                stage("Build SBSA-skip") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build", "arm64")
-                    }
-                    steps
-                    {
-                        buildImage("devel", params.action, "skip", "", "", "", true)
-                    }
-                }
-                stage("Build SBSA-pre_cxx11_abi") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("agent")
-                    }
-                    steps
-                    {
-                        triggerSBSARemoteJob(params.action, "src_non_cxx11_abi")
-                    }
-                }
-                stage("Build SBSA-cxx11_abi") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("agent")
-                    }
-                    steps
-                    {
-                        triggerSBSARemoteJob(params.action, "src_cxx11_abi")
                     }
                 }
             }
