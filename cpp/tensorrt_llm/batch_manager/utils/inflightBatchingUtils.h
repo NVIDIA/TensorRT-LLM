@@ -60,6 +60,9 @@ void terminateRequest(SequenceSlotManager& seqSlotManager, LlmRequest& llmReques
     OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager = std::nullopt,
     OptionalRef<BasePeftCacheManager> peftCacheManager = std::nullopt, bool pause = false);
 
+std::vector<SizeType32> getRequestBeamWidths(
+    RequestVector const& contextRequests, RequestVector const& generationRequests);
+
 class CudaGraphExecutor
 {
 public:

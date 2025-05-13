@@ -33,7 +33,6 @@ def get_model_yaml_config(model_label: str) -> dict:
             'print_iter_log': True,
             'use_cuda_graph': True,
             'cuda_graph_padding_enabled': True,
-            'cuda_graph_batch_sizes': [1, 512],
             'cuda_graph_max_batch_size': 4096,
         }
     }
