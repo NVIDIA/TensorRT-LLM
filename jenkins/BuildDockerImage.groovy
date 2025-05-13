@@ -15,9 +15,13 @@ LLM_ROOT = "llm"
 LLM_BRANCH = env.gitlabBranch? env.gitlabBranch : params.branch
 LLM_BRANCH_TAG = LLM_BRANCH.replaceAll('/', '_')
 
+LLM_COMMIT_OR_BRANCH = env.gitlabCommit ?: (params.commit ? params.commit : LLM_BRANCH)
+
 BUILD_JOBS = "32"
 BUILD_JOBS_RELEASE_X86_64 = "16"
 BUILD_JOBS_RELEASE_SBSA = "8"
+
+CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 
 def createKubernetesPodConfig(type, arch = "amd64")
 {
@@ -65,7 +69,11 @@ def createKubernetesPodConfig(type, arch = "amd64")
                         - SYS_ADMIN"""
         break
     }
-
+    def pvcVolume = """
+                - name: sw-tensorrt-pvc
+                  persistentVolumeClaim:
+                    claimName: sw-tensorrt-pvc
+    """
     def podConfig = [
         cloud: targetCould,
         namespace: "sw-tensorrt",
@@ -92,6 +100,12 @@ def createKubernetesPodConfig(type, arch = "amd64")
                         cpu: '2'
                         memory: 10Gi
                         ephemeral-storage: 25Gi
+                volumeMounts:
+                    - name: sw-tensorrt-pvc
+                      mountPath: "/mnt/sw-tensorrt-pvc"
+                      readOnly: false
+                volumes:
+                ${pvcVolume}
         """.stripIndent(),
     ]
 
@@ -106,7 +120,7 @@ def buildImage(target, action="build", torchInstallType="skip", args="", custom_
 
     // Step 1: cloning tekit source code
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
-    trtllm_utils.checkoutSource(LLM_REPO, LLM_BRANCH, LLM_ROOT, true, true)
+    trtllm_utils.checkoutSource(LLM_REPO, LLM_COMMIT_OR_BRANCH, LLM_ROOT, true, true)
 
     // Step 2: building wheels in container
     container("docker") {
@@ -155,6 +169,7 @@ def buildImage(target, action="build", torchInstallType="skip", args="", custom_
                   TORCH_INSTALL_TYPE=${torchInstallType} \
                   IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${tag} \
                   BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} \
+                  SHARED_CCACHE_DIR=${CCACHE_DIR} \
                   GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote
                   """
                 }
@@ -167,6 +182,7 @@ def buildImage(target, action="build", torchInstallType="skip", args="", custom_
                   TORCH_INSTALL_TYPE=${torchInstallType} \
                   IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${custom_tag} \
                   BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} \
+                  SHARED_CCACHE_DIR=${CCACHE_DIR} \
                   GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote
                   """
                }
@@ -199,6 +215,11 @@ pipeline {
             defaultValue: "main",
             description: "Branch to launch job."
         )
+        string(
+            name: "commit",
+            defaultValue: "",
+            description: "Gitlab commit to launch job."
+        )
         choice(
             name: "action",
             choices: ["build", "push"],
@@ -214,6 +235,7 @@ pipeline {
         timeout(time: 24, unit: 'HOURS')
     }
     environment {
+        CCACHE_DIR="${CCACHE_DIR}"
         PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
     }
     stages {

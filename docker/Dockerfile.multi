@@ -107,6 +107,7 @@ COPY .gitmodules setup.py requirements.txt requirements-dev.txt ./
 # Create cache directories for pip and ccache
 RUN mkdir -p /root/.cache/pip /root/.cache/ccache
 ENV CCACHE_DIR=/root/.cache/ccache
+RUN echo "CCACHE_DIR=${CCACHE_DIR}"
 # Build the TRT-LLM wheel
 ARG BUILD_WHEEL_ARGS="--clean --python_bindings --benchmarks"
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=/root/.cache/ccache \

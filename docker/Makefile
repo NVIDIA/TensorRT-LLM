@@ -48,6 +48,7 @@ TRT_LLM_VERSION    ?= $(shell grep '^__version__' ../tensorrt_llm/version.py | g
 GITHUB_MIRROR      ?=
 PYTHON_VERSION     ?=
 NGC_STAGING_REPO   ?= nvcr.io/nvstaging/tensorrt-llm
+SHARED_CCACHE_DIR  ?=
 
 define add_local_user
 	docker build \
@@ -87,6 +88,7 @@ endef
 		$(if $(GITHUB_MIRROR), --build-arg GITHUB_MIRROR="$(GITHUB_MIRROR)") \
 		$(if $(PYTHON_VERSION), --build-arg PYTHON_VERSION="$(PYTHON_VERSION)") \
 		$(if $(PLATFORM), --build-arg PLATFORM="$(PLATFORM)") \
+		$(if $(SHARED_CCACHE_DIR), --build-arg CCACHE_DIR="$(SHARED_CCACHE_DIR)") \
 		$(if $(STAGE), --target $(STAGE)) \
 		--file Dockerfile.multi \
 		--tag $(IMAGE_WITH_TAG) \
