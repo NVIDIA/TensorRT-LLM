@@ -283,8 +283,6 @@ nvidia/Nemotron-Mini-4B-Instruct:
     accuracy: 25.72
 nemotron-nas/Llama-3_1-Nemotron-51B-Instruct:
   - accuracy: 35.672
-nvidia/Nemotron-H-47B-Base-8K:
-  - accuracy: 35.672
 deepseek-ai/DeepSeek-V3-Lite:
   - accuracy: 26.465
   - quant_algo: NVFP4
