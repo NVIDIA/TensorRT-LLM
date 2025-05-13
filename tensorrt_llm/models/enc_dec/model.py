@@ -912,7 +912,7 @@ class EncoderModel(PretrainedModel):
                                dtype=trt.int32,
                                shape=[-1, 1],
                                dim_range=OrderedDict([
-                                   ('batch_size', bs_range),
+                                   ('batch_size', [bs_range]),
                                    ('broadcast_dim', [1]),
                                ]))
             prompt_vocab_size = Tensor(name='prompt_vocab_size',
