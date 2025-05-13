@@ -19,6 +19,7 @@ from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
+from tensorrt_llm.sampling_params import SamplingParams
 
 from ..conftest import (llm_models_root, parametrize_with_ids, skip_pre_ada,
                         skip_pre_blackwell, skip_pre_hopper)
@@ -182,6 +183,26 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @skip_pre_hopper
+    def test_fp8_llm_decoder(self):
+        model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
+        pytorch_config = PyTorchConfig(enable_trtllm_decoder=True)
+        llm = LLM(model_path,
+                  pytorch_backend_config=pytorch_config,
+                  max_batch_size=4)
+        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+
+        sampling_params = SamplingParams(
+            temperature=0.8,
+            top_p=0.95,
+        )
+
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_acc_spec="temperature=0.8,top_p=0.95")
 
 
 class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
