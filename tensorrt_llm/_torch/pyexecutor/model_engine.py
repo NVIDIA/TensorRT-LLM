@@ -364,9 +364,14 @@ class PyTorchModelEngine(ModelEngine):
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
         self._run_cuda_graphs = pytorch_backend_config.use_cuda_graph
 
+        # Add the maximum batch size to the cuda graph batch sizes if it is not already in the list
+        cuda_graph_batch_sizes = pytorch_backend_config.cuda_graph_batch_sizes
+        max_cuda_graph_batch_size = min(self.batch_size, self.max_num_tokens)
+        if max_cuda_graph_batch_size not in cuda_graph_batch_sizes:
+            cuda_graph_batch_sizes.append(max_cuda_graph_batch_size)
         self._cuda_graph_padding_enabled = pytorch_backend_config.cuda_graph_padding_enabled
         self._cuda_graph_batch_sizes = [
-            bs for bs in pytorch_backend_config.cuda_graph_batch_sizes
+            bs for bs in sorted(cuda_graph_batch_sizes)
             if bs <= self.max_num_tokens and bs <= self.batch_size
         ]
         self._max_cuda_graph_batch_size = self._cuda_graph_batch_sizes[-1]
