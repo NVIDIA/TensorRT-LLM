@@ -119,6 +119,8 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     // Set the head size and number of heads.
     mKernelParams.d = mFixedParams.headSize;
     mKernelParams.dv = mFixedParams.headSizeV;
+    // The number of grouped heads (only used by generation-phase MLA kernels) currently.
+    mKernelParams.num_grouped_heads = runnerParams.numGroupedHeads;
     TLLM_CHECK_WITH_INFO(mFixedParams.numQHeads % mFixedParams.numKvHeads == 0,
         "number of Query heads should be multiple of KV heads !");
     mKernelParams.h = mFixedParams.numQHeads;

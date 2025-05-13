@@ -234,6 +234,8 @@ struct MHARunnerParams
 {
     // The batch size.
     int b;
+    // The number of grouped heads.
+    int numGroupedHeads = 1;
     // The max q sequence length.
     int qSeqLen;
     // The max kv sequence length.
@@ -384,6 +386,8 @@ struct Fused_multihead_attention_params_v2
     int b, h, h_kv, h_q_per_kv, s, d;
     // The dimension of V. If unset, dv = d.
     int dv = 0;
+    // The number of grouped heads.
+    int num_grouped_heads = 1;
     // Sliding Window Attention
     // Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
     int sliding_window_size = INT_MAX;
