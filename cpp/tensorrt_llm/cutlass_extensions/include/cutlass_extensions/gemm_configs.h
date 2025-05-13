@@ -484,7 +484,7 @@ struct CutlassGemmConfig
 
     int getTileConfigAsInt() const
     {
-        if (sm_version == 120)
+        if (sm_version >= 120)
             return (int) tile_config_sm120;
         if (sm_version >= 100)
             return (int) tile_config_sm100;
