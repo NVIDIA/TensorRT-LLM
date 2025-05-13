@@ -283,6 +283,9 @@ def torch_fp4_moe(
     for expert_idx in range(num_experts):
         idx, top_x = torch.where(expert_mask[expert_idx])
         tokens_for_expert = x[None, top_x].reshape(-1, hidden_dim)
+
+        if not tokens_for_expert.shape[0]:
+            continue  # input of shape [0, hidden_dim] breaks fp4 kernel
         gate_out = torch.ops.quant.fp4_linear(
             tokens_for_expert,
             w1_weight[expert_idx],
@@ -334,5 +337,4 @@ def torch_fp4_moe(
     w2_alpha: List[torch.Tensor],
     w3_alpha: List[torch.Tensor],
 ) -> torch.Tensor:
-    # Fake implementation for tracing/testing
     return torch.empty_like(x)
