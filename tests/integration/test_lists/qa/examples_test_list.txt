@@ -400,6 +400,7 @@ accuracy/test_cli_flow.py::TestGemma2_9BIt::test_weight_only[int4]
 accuracy/test_cli_flow.py::TestQwen1_5MoeA2_7BChat::test_auto_dtype
 accuracy/test_cli_flow.py::TestQwen1_5MoeA2_7BChat::test_weight_only
 accuracy/test_cli_flow.py::TestQwen2_0_5BInstruct::test_auto_dtype
+accuracy/test_cli_flow.py::TestQwen2_0_5BInstruct::test_auto_dtype_cp4
 accuracy/test_cli_flow.py::TestQwen2_0_5BInstruct::test_weight_only
 accuracy/test_cli_flow.py::TestQwen2_0_5BInstruct::test_fp8
 accuracy/test_llm_api.py::TestQwen2_7BInstruct::test_auto_dtype
