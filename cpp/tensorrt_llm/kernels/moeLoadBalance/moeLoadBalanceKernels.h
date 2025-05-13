@@ -62,14 +62,13 @@ void moeSetSignalForCpuStageForTest(MoeLoadBalanceSingleLayerSignal* signal);
 //
 // @param metaInfo: the meta info
 // @param statisticInfo: the statistic info
-// @param maxTokenCountPerRank: the max token count per rank
+// @param numTotalTokens: the total number of tokens in gatheredRawExpertIds
 // @param enabled: flag on device memory to indicate if the statistic is enabled
 // @param isFirstStage: whether the current stage is the first stage (only first stage need shift window)
 // @param isLastStage: whether the current stage is the last stage (only last stage need update load factor)
-// @param gatheredRawExpertIds: the gathered raw expert ids
-void moeStatisticDevice(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatisticInfo statisticInfo,
-    int maxTokenCountPerRank, int* const enabled, bool isFirstStage, bool isLastStage, int* const gatheredRawExpertIds,
-    cudaStream_t stream);
+// @param gatheredRawExpertIds: the gathered raw expert ids, should have shape [numTotalTokens, metaInfo.topK]
+void moeStatisticDevice(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatisticInfo statisticInfo, int numTotalTokens,
+    int* const enabled, bool isFirstStage, bool isLastStage, int* const gatheredRawExpertIds, cudaStream_t stream);
 
 // @brief compute the route
 //

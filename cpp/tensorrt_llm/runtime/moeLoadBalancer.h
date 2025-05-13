@@ -131,6 +131,16 @@ public:
     // should bind to python
     void setInitialWeightAssignments(std::vector<int> const& initialWeightAssignments);
 
+    int64_t getSelfPtr() const
+    {
+        return reinterpret_cast<int64_t>(this);
+    }
+
+    tensorrt_llm::kernels::MoeLoadBalanceMetaInfo getMetaInfo() const
+    {
+        return mMetaInfo;
+    }
+
     cudaStream_t getStream() const;
 
     MoePlacementCpuInfo* getPlacementCpuInfo()
@@ -184,6 +194,8 @@ private:
     std::mutex mUpdateWeightsMutex;
     std::condition_variable mUpdateWeightsCondition;
     bool mUpdateWeightsDone = false;
+
+    int mLayerId = -1;
 };
 
 class MoeLoadBalancer

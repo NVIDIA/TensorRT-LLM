@@ -54,7 +54,9 @@ void initMoeBindings(pybind11::module_& m)
         .def("add_single_host_weight", &tr::SingleLayerMoeLoadBalancer::addSingleHostWeight, py::arg("expert_id"),
             py::arg("name"), py::arg("host_weight"), "Add a single host weight for a specific expert ID")
         .def("set_initial_weight_assignments", &tr::SingleLayerMoeLoadBalancer::setInitialWeightAssignments,
-            py::arg("initial_weight_assignments"), "Set initial weight assignments for each slot");
+            py::arg("initial_weight_assignments"), "Set initial weight assignments for each slot")
+        .def("get_pointer", &tr::SingleLayerMoeLoadBalancer::getSelfPtr,
+            "Get the pointer of the SingleLayerMoeLoadBalancer");
 
     // Bind MoeLoadBalancer class
     py::class_<tr::MoeLoadBalancer>(m, "MoeLoadBalancer")

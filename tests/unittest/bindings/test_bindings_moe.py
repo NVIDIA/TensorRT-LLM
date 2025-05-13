@@ -25,6 +25,7 @@ import tensorrt_llm.bindings.internal.runtime as _tbr
 class TestMoePythonBindings(unittest.TestCase):
 
     def setUp(self):
+        torch.cuda.set_device(0)
         # Common test parameters
         self.expert_count = 8
         self.top_k = 2
@@ -32,6 +33,15 @@ class TestMoePythonBindings(unittest.TestCase):
         self.ep_size = 2  # Total ranks
         self.slot_count_per_rank = 4
         self.layer_updates_per_iter = 1
+        self.gathered_raw_expert_ids = torch.tensor(
+            [
+                [0, 1],  # Token 0 selects experts 0 and 1
+                [1, 2],  # Token 1 selects experts 1 and 2
+                [2, 3],  # Token 2 selects experts 2 and 3
+                [0, 3]  # Token 3 selects experts 0 and 3
+            ],
+            dtype=torch.int32,
+            device="cuda")
 
     def test_moe_weight_struct(self):
         """Test the Python binding of MoeWeight structure"""
@@ -153,11 +163,25 @@ class TestMoePythonBindings(unittest.TestCase):
         balancer.set_warm_up_iter_count(1)
         balancer.start_iter(
             0, True, True)  # Iteration 0, enable statistics, enable updates
+
+        enabled = torch.ops.trtllm.moe_load_balance_wait_gpu_stage(
+            layer.get_pointer())
+        torch.ops.trtllm.moe_load_balance_statistic(
+            self.gathered_raw_expert_ids, enabled, layer.get_pointer(), True,
+            True)
+        torch.ops.trtllm.moe_load_balance_set_cpu_stage(layer.get_pointer())
+
         balancer.end_iter(0)
 
         # Run a second iteration
         balancer.start_iter(
             1, True, True)  # Iteration 1, enable statistics, enable updates
+        enabled = torch.ops.trtllm.moe_load_balance_wait_gpu_stage(
+            layer.get_pointer())
+        torch.ops.trtllm.moe_load_balance_statistic(
+            self.gathered_raw_expert_ids, enabled, layer.get_pointer(), True,
+            True)
+        torch.ops.trtllm.moe_load_balance_set_cpu_stage(layer.get_pointer())
         balancer.end_iter(1)
 
         # Shutdown the load balancer
@@ -171,6 +195,14 @@ class TestMoePythonBindings(unittest.TestCase):
             ep_size=self.ep_size,
             layer_updates_per_iter=self.layer_updates_per_iter)
 
+        # Create initial weight assignments
+        initial_assignments = []
+        for r in range(self.ep_size):
+            expert_start = r * self.expert_count // self.ep_size
+            for slot_id in range(self.slot_count_per_rank):
+                expert_id = (expert_start + slot_id) % self.expert_count
+                initial_assignments.append(expert_id)
+
         # Add multiple layers
         num_layers = 3
         layers = []
@@ -180,6 +212,7 @@ class TestMoePythonBindings(unittest.TestCase):
                 top_k=self.top_k,
                 slot_count_per_rank=self.slot_count_per_rank)
             layers.append(layer)
+            layer.set_initial_weight_assignments(initial_assignments)
 
         # Verify that we got multiple different layers
         self.assertEqual(len(layers), num_layers)
@@ -210,6 +243,14 @@ class TestMoePythonBindings(unittest.TestCase):
         for iter_id, enable_statistic, enable_update_weights in configs:
             balancer.start_iter(iter_id, enable_statistic,
                                 enable_update_weights)
+            for layer in layers:
+                enabled = torch.ops.trtllm.moe_load_balance_wait_gpu_stage(
+                    layer.get_pointer())
+                torch.ops.trtllm.moe_load_balance_statistic(
+                    self.gathered_raw_expert_ids, enabled, layer.get_pointer(),
+                    enable_statistic, enable_update_weights)
+                torch.ops.trtllm.moe_load_balance_set_cpu_stage(
+                    layer.get_pointer())
             balancer.end_iter(iter_id)
 
         # Shutdown the load balancer
