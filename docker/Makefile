@@ -88,7 +88,7 @@ endef
 		$(if $(GITHUB_MIRROR), --build-arg GITHUB_MIRROR="$(GITHUB_MIRROR)") \
 		$(if $(PYTHON_VERSION), --build-arg PYTHON_VERSION="$(PYTHON_VERSION)") \
 		$(if $(PLATFORM), --build-arg PLATFORM="$(PLATFORM)") \
-		$(if $(SHARED_CCACHE_DIR), --build-arg CCACHE_DIR="$(SHARED_CCACHE_DIR)") \
+		$(if $(SHARED_CCACHE_DIR), --build-arg SHARED_CCACHE_DIR="$(SHARED_CCACHE_DIR)") \
 		$(if $(STAGE), --target $(STAGE)) \
 		--file Dockerfile.multi \
 		--tag $(IMAGE_WITH_TAG) \
