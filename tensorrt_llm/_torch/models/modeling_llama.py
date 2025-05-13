@@ -851,12 +851,7 @@ class Llama4ForCausalLM(DecoderModelForCausalLM[Llama4Model, Llama4Config]):
                          vocab_size=model_config.pretrained_config.vocab_size)
 
     def infer_max_seq_len(self):
-        # TODO: increase to support 10M context length. There are two blockers
-        # right now:
-        # 1. We need to implement chunked attention.
-        # 2. CUDA graph warmup will crash when the cached context is that long.
-        # This only affects the TRTLLM backend; flashinfer is fine. It is
-        # most likely an issue with the kernel.
+        # TODO: implement chunked attention to support 10M context length
         return 8192
 
     def load_weights(self, weights: Dict):
