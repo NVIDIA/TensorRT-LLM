@@ -47,7 +47,7 @@ TODO: Support other variants:
 
 import operator
 from collections import defaultdict
-from typing import Any, DefaultDict, Dict, List, Optional
+from typing import Any, DefaultDict, Dict, List, Optional, Sequence
 
 import torch
 from torch.fx import GraphModule, Node
@@ -65,7 +65,8 @@ def match_explicit_rope(gm: GraphModule) -> GraphModule:
       - DS-style: requires interleaving Q/K before the cos/sin mul
 
     If exactly two such branches (query and key) are detected within each region, they're replaced
-    by a call to `rope::apply_rope_with_qk_interleaving` or `rope::torch_apply_rope_with_explicit_cos_sin` respectively.
+    by a call to `rope::torch_apply_rope_with_qk_interleaving` or
+    `rope::torch_apply_rope_with_explicit_cos_sin` respectively.
     """
     ad_logger.info("Match explicit(HF) style RoPE")
     graph = gm.graph
@@ -715,13 +716,17 @@ def _process_input_interleave_rope(
     k_match: Dict[str, Node],
 ) -> None:
     """
-    Replace a matched DS-style RoPE subgraph with a call to rope::apply_rope_with_qk_interleaving.
+    Replace a matched DS-style RoPE subgraph with a call to rope::torch_apply_rope_with_qk_interleaving.
     Cache the one-time unsqueeze of cos/sin.
     """
     q_node = q_match["raw_input"]
     k_node = k_match["raw_input"]
     cos_node = q_match["unsqueeze_cos"].args[0]
     sin_node = q_match["unsqueeze_sin"].args[0]
+    # A patch for the case when q_output appears before k_input in the graph
+    # Move q_output down right before its first user so that graph remains in
+    # topological order after inserting the apply rope custom op
+    q_match["add_node"] = _move_node_before_first_user(q_match["add_node"])
 
     # Infer unsqueeze_dim from layout
     unsq_dim = 1
@@ -733,7 +738,7 @@ def _process_input_interleave_rope(
         else:
             unsq_dim = 1
 
-    with graph.inserting_before(q_match["add_node"]):
+    with graph.inserting_after(_get_last_node([q_node, k_node, cos_node, sin_node])):
         ds_node = graph.call_function(
             torch.ops.rope.torch_apply_rope_with_qk_interleaving,
             args=(q_node, k_node, cos_node, sin_node, unsq_dim),
@@ -748,6 +753,55 @@ def _process_input_interleave_rope(
 
     q_match["add_node"].replace_all_uses_with(q_out)
     k_match["add_node"].replace_all_uses_with(k_out)
+
+
+def _move_node_before_first_user(node: Node) -> Node:
+    """
+    Remove `node` from the graph and re-insert a clone of it immediately
+    before its earliest user. Returns the new node.
+
+    If `node` has no users, or is already right before its first user,
+    this is a no-op and returns the original node.
+    """
+    graph = node.graph
+    ordering = list(graph.nodes)
+
+    users = list(node.users)
+    if not users:
+        return node
+
+    # locate the earliest user in the current ordering
+    first_user = min(users, key=lambda u: ordering.index(u))
+    if ordering.index(node) == ordering.index(first_user) - 1:
+        return node
+
+    with graph.inserting_before(first_user):
+        new_node = graph.node_copy(node, lambda n: n)
+
+    node.replace_all_uses_with(new_node)
+    graph.erase_node(node)
+
+    return new_node
+
+
+def _get_last_node(nodes: Sequence[Node]) -> Node:
+    """
+    Given a list of FX Nodes,
+    return the one that appears last in the graph's execution order.
+    """
+    if not nodes:
+        raise ValueError("`nodes` must be a non-empty sequence of FX Node objects")
+
+    graph = nodes[0].graph
+    ordering = list(graph.nodes)
+
+    # Sanity check that all nodes are in same graph
+    valid = [n for n in nodes if n in ordering]
+    if not valid:
+        raise ValueError("None of the provided nodes belong to the same graph")
+
+    last = max(valid, key=lambda n: ordering.index(n))
+    return last
 
 
 def _validate_rope_inputs(q_node: Node, k_node: Node) -> bool:
