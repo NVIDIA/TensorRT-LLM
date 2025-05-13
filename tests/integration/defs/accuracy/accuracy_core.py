@@ -31,7 +31,6 @@ from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
-from tensorrt_llm.sampling_params import SamplingParams
 
 from ..common import venv_check_call, venv_mpi_check_call
 from ..conftest import llm_models_root
