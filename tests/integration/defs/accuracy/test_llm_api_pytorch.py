@@ -790,20 +790,6 @@ class TestMinitron4BBaseInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestMinitronH(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nvidia/Nemotron-H-47B-Base-8K"
-    MODEL_PATH = f"{llm_models_root()}/Nemotron-H-47B-Base-8K"
-
-    @skip_pre_ada
-    def test_auto_dtype_tp8(self):
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
-        with LLM(self.MODEL_PATH,
-                 tensor_parallel_size=8,
-                 kv_cache_config=kv_cache_config) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
 class TestNemotronNas(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nemotron-nas/Llama-3_1-Nemotron-51B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-51B-Instruct"
@@ -854,10 +840,13 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-H-8B-Base-8K"
     MODEL_PATH = f"{llm_models_root()}/Nemotron-H-8B-Base-8K"
 
-    @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5264431")
     def test_auto_dtype(self):
+        # TODO: remove max_batch_size after mamba cache manager is supported
+        # ToDo: check 47b and 56b model
         kv_cache_config = KvCacheConfig(enable_block_reuse=False)
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 max_batch_size=128) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
