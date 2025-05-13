@@ -413,7 +413,7 @@ def create_py_executor_instance(dist,
             lora_config.trtllm_modules_to_hf_modules)
 
     num_micro_batches = 1
-    if mapping.has_pp:
+    if mapping.has_pp():
         num_micro_batches = mapping.pp_size + pytorch_backend_config.enable_overlap_scheduler
 
     resources["seq_slot_manager"] = SeqSlotManager(
