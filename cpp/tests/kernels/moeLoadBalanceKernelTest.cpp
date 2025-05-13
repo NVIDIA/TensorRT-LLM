@@ -284,8 +284,8 @@ TEST_P(MoeLoadBalanceStatisticKernelTest, TestStatistics)
     mStatisticInfo.expertTokenCount = mDeviceExpertTokenCount;
 
     // execute the statistics calculation
-    moeStatisticDevice(mMetaInfo, mStatisticInfo, param.maxTokenCountPerRank, mDeviceEnabled, param.isFirstStage,
-        param.isLastStage, mDeviceGatheredIds, mStream);
+    moeStatisticDevice(mMetaInfo, mStatisticInfo, param.maxTokenCountPerRank * param.epSize, mDeviceEnabled,
+        param.isFirstStage, param.isLastStage, mDeviceGatheredIds, mStream);
     ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
 
     // compute the expected result

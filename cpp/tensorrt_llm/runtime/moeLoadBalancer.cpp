@@ -194,6 +194,47 @@ void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* 
 namespace
 {
 
+void printMoePlacementInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo,
+    tensorrt_llm::kernels::MoePlacementInfo* cpuPlacement, std::stringstream& ss)
+{
+    ss << "MoePlacementInfo:\n";
+    ss << "expertReplicaCount: [";
+    for (int i = 0; i < metaInfo.expertCount; ++i)
+    {
+        ss << cpuPlacement->expertReplicaCount[i] << ", ";
+    }
+    ss << "]\n";
+    ss << "expertReplicaStartOffset: [";
+    for (int i = 0; i < metaInfo.expertCount; ++i)
+    {
+        ss << cpuPlacement->expertReplicaStartOffset[i] << ", ";
+    }
+    ss << "]\n";
+    ss << "globalSlotIds: [";
+    for (int i = 0; i < metaInfo.epSize * metaInfo.slotCountPerRank; ++i)
+    {
+        ss << cpuPlacement->globalSlotIds[i] << ", ";
+    }
+    ss << "]\n";
+}
+
+void printCpuPlacementInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, MoePlacementCpuInfo* cpuPlacement)
+{
+    std::stringstream ss;
+    for (int rank = 0; rank < metaInfo.epSize; ++rank)
+    {
+        ss << "rank=" << rank << " expertIds: [";
+        for (int slotId = 0; slotId < metaInfo.slotCountPerRank; ++slotId)
+        {
+            int expertId = cpuPlacement->rankExpertIds[rank][slotId];
+            ss << expertId << ", ";
+        }
+        ss << "]\n";
+    }
+    printMoePlacementInfo(metaInfo, &cpuPlacement->placementInfoForGPU, ss);
+    printf("%s", ss.str().c_str());
+}
+
 void prepareGpuPlacementInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, MoePlacementCpuInfo* cpuPlacement)
 {
     // update placementInfoForGPU (which is used to copy to GPU)
@@ -201,6 +242,7 @@ void prepareGpuPlacementInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaI
     int startOffset = 0;
     for (int expertId = 0; expertId < metaInfo.expertCount; ++expertId)
     {
+        cpuPlacement->placementInfoForGPU.expertReplicaCount[expertId] = cpuPlacement->expertReplicaCount[expertId];
         cpuPlacement->placementInfoForGPU.expertReplicaStartOffset[expertId] = startOffset;
         startOffset += cpuPlacement->expertReplicaCount[expertId];
     }
@@ -223,17 +265,16 @@ void prepareGpuPlacementInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaI
             cpuPlacement->placementInfoForGPU.globalSlotIds[offset] = globalSlotId;
         }
     }
+    // printCpuPlacementInfo(metaInfo, cpuPlacement);
 }
 
 void allocateStatisticInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo const& metaInfo,
     tensorrt_llm::kernels::MoeLoadBalanceStatisticInfo* statisticInfo)
 {
     TLLM_CUDA_CHECK(cudaMallocHost(&statisticInfo->expertLoadFactor, sizeof(float) * metaInfo.expertCount));
-    if (statisticInfo->rawDataWindowSize > 0)
-    {
-        TLLM_CUDA_CHECK(cudaMalloc(
-            &statisticInfo->expertTokenCount, sizeof(int) * metaInfo.expertCount * statisticInfo->rawDataWindowSize));
-    }
+    TLLM_CHECK_WITH_INFO(statisticInfo->rawDataWindowSize > 0, "statisticInfo->rawDataWindowSize should > 0.");
+    TLLM_CUDA_CHECK(cudaMalloc(
+        &statisticInfo->expertTokenCount, sizeof(int) * metaInfo.expertCount * statisticInfo->rawDataWindowSize));
 }
 
 void freeStatisticInfo(tensorrt_llm::kernels::MoeLoadBalanceStatisticInfo* statisticInfo)
@@ -311,6 +352,7 @@ SingleLayerMoeLoadBalancer::SingleLayerMoeLoadBalancer(
     tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalancer* loadBalancer, int balanceLayerId)
     : mMoeLoadBalancer(loadBalancer)
     , mMetaInfo(metaInfo)
+    , mLayerId(balanceLayerId)
 {
 }
 

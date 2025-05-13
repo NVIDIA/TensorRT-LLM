@@ -27,14 +27,12 @@ struct MoeLoadBalanceSingleLayerSignal
     static constexpr unsigned long long kCPU = 1ULL;
     static constexpr unsigned long long kDevice = 1ULL;
     static constexpr unsigned long long kSkipStep = 1ULL << 1U;
-    static constexpr unsigned long long kShutdown = 1ULL << 63U;
+    static constexpr unsigned long long kDisabled = 1ULL << 63U;
     // Bit 0 means the current owner of this layer, 0: gpu, 1: cpu, updated by cpu and gpu alternately
     // Bit 1 means whether skip statistic for current step, cpu set that at one iteration start,
     //  maybe with or without ownership, but since forward is not started, so no conflict.
     // Bits 2-62 means the current step, updated by cpu after one iteration with cpu ownership
-    // Bit 63 means if statistic and step update is shutdown, 0: not shutdown, 1: shutdown, updated by cpu
-    //  once shutdown, it will not be enabled again, cpu takes the ownership and gpu should stop all related operations
-    //  it is used for gracefully stop
+    // Bit 63 means if step update is disabled, 0: not disabled, 1: disabled, updated by cpu
     unsigned long long int volatile stepAndOwner;
 };
 
@@ -65,10 +63,9 @@ struct MoeLoadBalanceStatisticInfo
 
     // rawDataWindowSize means the size of the raw data window.
     // e.g. how many steps of raw data are kept in the memory.
-    // 0 means no need to store raw data, e.g. decay and update directly on expertLoadFactor
-    int rawDataWindowSize = 0;
+    int rawDataWindowSize = 1;
 
-    // decayFactor means the decay factor of the raw data.
+    // decayFactor means the decay factor of the raw data per step.
     // e.g. if decayFactor is 0.9, then the raw data of expert i will be decayed by 0.9 for each step.
     float decayFactor = 0.9f;
 };

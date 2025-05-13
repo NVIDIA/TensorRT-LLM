@@ -45,7 +45,7 @@ __device__ unsigned long long int getCurrentStep(unsigned long long int stepAndO
 
 __device__ bool isDisabled(unsigned long long int stepAndOwner)
 {
-    return stepAndOwner >= MoeLoadBalanceSingleLayerSignal::kShutdown;
+    return stepAndOwner >= MoeLoadBalanceSingleLayerSignal::kDisabled;
 }
 
 __device__ __forceinline__ void moeWaitSignalForGpuStageFunc(MoeLoadBalanceSingleLayerSignal* signal, int* enabled)
@@ -84,7 +84,7 @@ __global__ void moeSetSignalForCpuStageKernel(MoeLoadBalanceSingleLayerSignal* s
         unsigned long long int loaded = signal->stepAndOwner;
         if (!isDisabled(loaded))
         {
-            signal->stepAndOwner = loaded + 1ULL;
+            signal->stepAndOwner |= MoeLoadBalanceSingleLayerSignal::kCPU;
         }
     }
 }
@@ -103,7 +103,7 @@ void moeWaitSignalForGpuStageForTest(MoeLoadBalanceSingleLayerSignal* signal, in
         ready = getOwnerDevice(loaded) == MoeLoadBalanceSingleLayerSignal::kGPU;
         if (ready)
         {
-            if (loaded >= MoeLoadBalanceSingleLayerSignal::kShutdown
+            if (loaded >= MoeLoadBalanceSingleLayerSignal::kDisabled
                 || (loaded & MoeLoadBalanceSingleLayerSignal::kSkipStep))
             {
                 *enabled = 0;
@@ -192,9 +192,8 @@ __global__ void updateLoadFactorKernel(
     loadFactor[expertIdx] = loadFactor[expertIdx] * statisticInfo.decayFactor + expertTokenCount;
 }
 
-void moeStatisticDevice(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatisticInfo statisticInfo,
-    int maxTokenCountPerRank, int* const enabled, bool isFirstStage, bool isLastStage, int* const gatheredRawExpertIds,
-    cudaStream_t stream)
+void moeStatisticDevice(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatisticInfo statisticInfo, int numTotalTokens,
+    int* const enabled, bool isFirstStage, bool isLastStage, int* const gatheredRawExpertIds, cudaStream_t stream)
 {
     static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
     if (isFirstStage)
@@ -213,7 +212,7 @@ void moeStatisticDevice(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatistic
             threadCount /= 2;
             kernelFunc = shiftWindowKernel<int2>;
         }
-        dim3 gridDim(statisticInfo.rawDataWindowSize);
+        dim3 gridDim(statisticInfo.rawDataWindowSize + 1);
         dim3 blockDim(threadCount);
         int* expertTokenCount = statisticInfo.expertTokenCount;
         void* args[]
@@ -226,7 +225,7 @@ void moeStatisticDevice(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatistic
     {
         // do the statistic into expertTokenCount and maybe also expertLoadFactor;
         int threadCount = 1024;
-        int totalEltCount = maxTokenCountPerRank * metaInfo.epSize * metaInfo.topK;
+        int totalEltCount = numTotalTokens * metaInfo.topK;
         int blockCount = (totalEltCount + threadCount - 1) / threadCount;
         if (blockCount > smCount)
         {
