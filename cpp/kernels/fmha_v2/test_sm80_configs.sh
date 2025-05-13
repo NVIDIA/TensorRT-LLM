@@ -267,4 +267,3 @@ bin/fmha.exe -v 0 -runs 1 -s 1024 -d 32 -b 16 -h 16
 
 bin/fmha.exe -v 0 -runs 1 -s 1024 -d 64 -b 16 -h 16 -int8
 bin/fmha.exe -v 0 -runs 1 -s 1024 -d 32 -b 16 -h 16 -int8
-

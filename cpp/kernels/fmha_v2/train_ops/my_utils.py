@@ -8,13 +8,14 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-import torch
-import numpy as np
 import math
+
+import numpy as np
+import torch
 
 
 def widen_cells():
-    from IPython.core.display import display, HTML
+    from IPython.core.display import HTML, display
     display(HTML("<style>.container { width:85% !important; }</style>"))
     np.set_printoptions(edgeitems=1000, linewidth=1000000)
 
@@ -64,15 +65,14 @@ def mask_softmax(S: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
     return Snew
 
 
-def reshape_softmax(
-        S: torch.Tensor,
-        b: int,
-        s: int,
-        h: int,
-        d: int,
-        warps_m: int,
-        warps_n: int,
-        extract_dmask: bool = True) -> [torch.Tensor, torch.Tensor]:
+def reshape_softmax(S: torch.Tensor,
+                    b: int,
+                    s: int,
+                    h: int,
+                    d: int,
+                    warps_m: int,
+                    warps_n: int,
+                    extract_dmask: bool = True) -> [torch.Tensor, torch.Tensor]:
     m = 16
     if warps_m == 1:
         m = 16

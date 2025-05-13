@@ -58,7 +58,7 @@ Elapsed ......: 1172.329590 us (57.49x), 468.94 Tflop/s, 457.95 GB/s
 
 ### Pytest
 
-FMHA_v2 uses pytest to aggregate test results from GTest-based unit tests and prompt-based perf 
+FMHA_v2 uses pytest to aggregate test results from GTest-based unit tests and prompt-based perf
 test that doubles as all-purpose test.
 
 To install dependencies:

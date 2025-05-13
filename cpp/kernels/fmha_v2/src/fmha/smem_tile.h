@@ -408,7 +408,7 @@ struct Smem_tile_without_skews<Cta_tile,
 
     /**
      * \brief load tensor blocks from global memory and stores to shared memory using tma instructions
-     * 
+     *
      * \param p_desc pointer to tma descriptor masked as const void* pointer
      * \param smem_offset shared memory offset in bytes relative to smem_write_buffer_
      * \param coord0 tensor access coordinate in dimension 1, used by tma load

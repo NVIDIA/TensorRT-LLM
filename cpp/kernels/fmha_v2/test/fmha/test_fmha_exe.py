@@ -9,8 +9,8 @@
 # its affiliates is strictly prohibited.
 
 import pytest
-from utils import *
 from filter_rules import *
+from utils import *
 
 fmha_exe_path = 'bin/fmha.exe'
 
@@ -42,9 +42,9 @@ def test_fmha_fp16(fmha_arg, rules, dryrun, disable_rules, gpu_compute_cap):
 @pytest.mark.fmha
 @pytest.mark.parametrize(
     'rules',
-    [[], [force_non_granular_tiling],
-     [causal_mask, multi_query_attention, pad_s],
-     [causal_mask, grouped_query_attention],
+    [[], [force_non_granular_tiling], [
+        causal_mask, multi_query_attention, pad_s
+    ], [causal_mask, grouped_query_attention],
      [force_non_granular_tiling, causal_mask, multi_query_attention, pad_s],
      [force_non_granular_tiling, causal_mask, grouped_query_attention]],
     ids=idfn)
@@ -108,9 +108,9 @@ def test_fmha_bf16(fmha_arg, rules, dryrun, disable_rules, gpu_compute_cap):
 @pytest.mark.fmha
 @pytest.mark.parametrize(
     'rules',
-    [[], [force_non_granular_tiling],
-     [causal_mask, multi_query_attention, pad_s],
-     [force_non_granular_tiling, causal_mask, multi_query_attention, pad_s]],
+    [[], [force_non_granular_tiling], [
+        causal_mask, multi_query_attention, pad_s
+    ], [force_non_granular_tiling, causal_mask, multi_query_attention, pad_s]],
     ids=idfn)
 @pytest.mark.parametrize('fmha_arg', reduced2x_combinations_bf16())
 def test_fmha_flash_extended_bf16(fmha_arg, rules, dryrun, disable_rules,

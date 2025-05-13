@@ -95,8 +95,8 @@ inline __device__ void compute_dot_do_o(const Params &params) {
     if( binfo.stop_early() )
         return;
 
-    Gmem_tile_do gmem_do(params, binfo, tidx);       // treating dout as Q
-    Gmem_tile_output gmem_out(params, binfo, tidx);  // treating dout as Q
+    Gmem_tile_do gmem_do(params, binfo, tidx);       // treating d_out as Q
+    Gmem_tile_output gmem_out(params, binfo, tidx);  // treating d_out as Q
     Gmem_softmax_sum gmem_softmax_d(params, tidx);
 
     for( int l = blockIdx.z; l < STEPS; l += gridDim.z ) {
@@ -207,7 +207,7 @@ inline __device__ void compute_dv_1xN(const Params &params, const int isteps) {
     using Gmem_tile_do = Gmem_tile_dout<Traits, Cta_tile_p>;
 
     // Allocate the global memory tile loader for Q.
-    Gmem_tile_do gmem_do(params, binfo, tidx);   // treating dout as Q
+    Gmem_tile_do gmem_do(params, binfo, tidx);   // treating d_out as Q
     Gmem_tile_q gmem_q(params, 0, binfo, tidx);  // real Q
     Gmem_tile_k gmem_k(params, 1, binfo, tidx);  // real K
     // Allocate the shared memory tile loader for Q.
@@ -368,8 +368,7 @@ inline __device__ void compute_dv_1xN(const Params &params, const int isteps) {
                 smem_do.load(frag_do[ki & 1], ki);
                 smem_vt.load(frag_vt[ki & 1], ki);
                 // Do the math for the values already in registers.
-                fmha::gemm(
-                    acc_p, frag_do[(ki - 1) & 1], frag_vt[(ki - 1) & 1]);  // dS = dO * V^T
+                fmha::gemm(acc_p, frag_do[(ki - 1) & 1], frag_vt[(ki - 1) & 1]);  // dS = dO * V^T
             }
 
             float lse_regs[2 * M];
@@ -467,7 +466,7 @@ inline __device__ void compute_dv_1xN(const Params &params, const int isteps) {
             // float p_sum[2 * M];
             // softmax.template reduce<fmha::Sum_>(p_sum);
 
-            // TODO, nned to check why scale_bmm1 in softmax is 1
+            // TODO, need to check why scale_bmm1 in softmax is 1
             const float scalef = reinterpret_cast<const float &>(params.scale_softmax);
 #pragma unroll
             for( int mi = 0; mi < M; mi++ ) {
@@ -489,7 +488,7 @@ inline __device__ void compute_dv_1xN(const Params &params, const int isteps) {
 
             typename Smem_tile_st::Fragment frag_st[Mma_tile_dv::MMAS_K]
                                                    [Mma_tile_dv::MMAS_M];  // P'^T
-            smem_st.load(frag_st);  // load P' with transpose
+            smem_st.load(frag_st);                                         // load P' with transpose
             for( int ki = 0; ki < Mma_tile_dv::MMAS_K; ki++ ) {
                 for( int mi = 0; mi < Mma_tile_dv::MMAS_M; mi++ ) {
                     for( int ii = 0; ii < Smem_tile_st::Fragment::NUM_REGS; ii++ ) {
@@ -506,7 +505,7 @@ inline __device__ void compute_dv_1xN(const Params &params, const int isteps) {
             //gmem_s.move();
 
             // 6. Reload Q from smem, but transposed.
-            // 7. Accumulate (S * D)' * dout' for next k-slice
+            // 7. Accumulate (S * D)' * d_out' for next k-slice
             static_assert(Mma_tile_dv::MMAS_K == 1);  // DEBUG
 #pragma unroll
             for( int ki = 1; ki < Mma_tile_dv::MMAS_K; ++ki ) {
@@ -553,7 +552,7 @@ inline __device__ void compute_dv_1xN(const Params &params, const int isteps) {
         //            gmem_k.move_to(newloop + 1);
         //        }
 
-        // Epilogue for dV = (S * D)' * dout'. We're fully exposed to this!
+        // Epilogue for dV = (S * D)' * d_out'. We're fully exposed to this!
 
         // Epilogue swizzle for dV
         Smem_tile_dv smem_dv(&smem_[Kernel_traits::Smem_tile_q::BYTES_PER_TILE], tidx);
@@ -597,7 +596,7 @@ inline __device__ void compute_dv_1xN(const Params &params, const int isteps) {
         //    gmem_dv.move_to(newloop + 1);
         //}
 
-    }  // new loop (newloop) over the other sequence lenght
+    }  // new loop (newloop) over the other sequence length
 }
 
 template<typename Kernel_traits, typename Kernel_traits_fp16, typename Params>
@@ -905,7 +904,7 @@ inline __device__ void compute_dq_dk_1xN(const Params &params, const int isteps)
             //    gmem_q.load( smem_q );
             //}
 
-            // 7. Accumulate (S * D)' * dout' for next k-slice
+            // 7. Accumulate (S * D)' * d_out' for next k-slice
             static_assert(Mma_tile_dk::MMAS_K == 1);  // DEBUG
 
 #pragma unroll

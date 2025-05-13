@@ -172,7 +172,7 @@ class CircularBufferReader {
         }
     }
 
-    /* Simplification of complete and advance for cases 
+    /* Simplification of complete and advance for cases
        where they don't need to be reordered/separated for performance
     */
     inline __device__ void pop(int tid0) {

@@ -9,13 +9,12 @@
 # its affiliates is strictly prohibited.
 
 import os
-import sys
 import subprocess
-import numpy as np
-import math
-from collections import namedtuple, OrderedDict
+from collections import namedtuple
 from enum import IntEnum
 from itertools import product
+
+import numpy as np
 
 sm2name = {
     70: 'volta',
@@ -176,7 +175,8 @@ kernel_spec.__new__.__defaults__ = (
     None,  # sage_block_sizes
     None)  # output_dtype, same as dtype by default.
 
-generate_cu_trtllm = os.environ.get('GENERATE_CU_TRTLLM', 'False').lower() == 'true'
+generate_cu_trtllm = os.environ.get('GENERATE_CU_TRTLLM',
+                                    'False').lower() == 'true'
 
 ns_open = r"""
 namespace tensorrt_llm
@@ -1940,8 +1940,7 @@ def get_hopper_instruction_traits(instruction_traits, kernel_spec):
     instruction_traits_p = f'{instruction_traits}<{", ".join([str(x) for x in gmma_shape_p])}, false, false>'
 
     gmma_shape_o = get_GMMA_shape(instruction_traits, kernel_spec.loop_step,
-                                  kernel_spec.head_size, kernel_spec.seq_len,
-                                  1)
+                                  kernel_spec.head_size, kernel_spec.seq_len, 1)
     instruction_traits_o = f'{instruction_traits}<{", ".join([str(x) for x in gmma_shape_o])}, true, false>'
 
     return instruction_traits_p, instruction_traits_o
@@ -2025,8 +2024,8 @@ def get_kernel_code(kspec, kname, lname):
     launcher_name = lname
     causal_kernel_name = kname.replace('__placeholder__', '_causal')
     custom_mask_kernel_name = kname.replace('__placeholder__', '_custom_mask')
-    sliding_window_causal_kernel_name = kname.replace(
-        '__placeholder__', '_sliding_window_causal')
+    sliding_window_causal_kernel_name = kname.replace('__placeholder__',
+                                                      '_sliding_window_causal')
     kernel_name = kname.replace('__placeholder__', '')
 
     # FIXME: use separate parameters when generating cubins for trtllm.
@@ -2450,16 +2449,14 @@ if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && sm == 
             if kspec.version == 2 and kspec.cross_mha == 0
     ]
 
-    calls_v2 = 'else '.join(calls_v2) if len(
-        calls_v2) > 0 else 'if( false ) {}'
+    calls_v2 = 'else '.join(calls_v2) if len(calls_v2) > 0 else 'if( false ) {}'
 
     calls_v1 = [
         gen_call(kspec, lname) for kspec, fname, lname, kname in specs_names
         if kspec.version == 1 and kspec.cross_mha == 0
     ]
 
-    calls_v1 = 'else '.join(calls_v1) if len(
-        calls_v1) > 0 else 'if( false ) {}'
+    calls_v1 = 'else '.join(calls_v1) if len(calls_v1) > 0 else 'if( false ) {}'
 
     calls_mhca = [
         gen_call_fmhca(kspec, lname)
@@ -2683,9 +2680,7 @@ inline void get_grid_size(int &heads_per_wave,
     }}
 }}
 
-'''.format(**locals(),
-           copyright=copyright,
-           MAX_STGS_PER_LOOP=MAX_STGS_PER_LOOP)
+'''.format(**locals(), copyright=copyright, MAX_STGS_PER_LOOP=MAX_STGS_PER_LOOP)
     return api_code
 
 
@@ -2963,8 +2958,8 @@ def get_kernel_traits_code(specs_names):
                 {unroll_threshold});
         }}'''.format(**tmp)
             snippet = snippet_template.replace('__placeholder__', '')
-            snippet_causal = snippet_template.replace(
-                '__placeholder__', '_sliding_window_causal')
+            snippet_causal = snippet_template.replace('__placeholder__',
+                                                      '_sliding_window_causal')
             snippet_sliding_window_causal = snippet_template.replace(
                 '__placeholder__', '_causal')
             snippet_nl = snippet_nl_template.replace('__placeholder__', '')
@@ -3203,16 +3198,20 @@ def get_cubin_header(kernel_traits, specs_names):
                 unroll_config_v1.append(unroll_spec)
         elif 'v2' in kname:
             if generate_cu_trtllm:
+
                 def get_lname_from_kname(kname: str) -> str:
                     if 'sage' in kname and 'sm90' in kname:
                         return 'nullptr'
                     lname = kname.replace('_kernel', '')
-                    mask_types = ['_sliding_window_causal', '_custom_mask', '_causal']
+                    mask_types = [
+                        '_sliding_window_causal', '_custom_mask', '_causal'
+                    ]
                     for mask_type in mask_types:
                         lname = lname.replace(mask_type, '')
                     lname = 'run_' + lname
 
                     return lname
+
                 lname = get_lname_from_kname(kname)
                 code = '''\
 {{ DATA_TYPE_{prec}, DATA_TYPE_{output_prec}, {seq_len}, {q_step}, {kv_step}, {head_size}, {head_size_v}, \
@@ -3236,7 +3235,8 @@ def get_cubin_header(kernel_traits, specs_names):
             if '_nl' in kname:
                 unroll_config_v2.append(unroll_spec)
             if generate_cu_trtllm and lname != 'nullptr':
-                launcher = 'extern void {lname}(Fused_multihead_attention_params_v2& params, const Launch_params& launch_params, cudaStream_t stream);'.format(lname=lname)
+                launcher = 'extern void {lname}(Fused_multihead_attention_params_v2& params, const Launch_params& launch_params, cudaStream_t stream);'.format(
+                    lname=lname)
                 if int(sm) in cubins_dict:
                     if launcher not in cubins_dict[int(sm)]:
                         cubins_dict[int(sm)].append(launcher)
@@ -3401,7 +3401,8 @@ def generate_files(specs_names):
         # add valid specs names
         valid_specs_names.append((kspec, fname, lname, kname))
         if kspec.sm == 90 and kspec.sage_block_sizes is not None:
-            continue; # not generating cu files for Hopper with Sage attention
+            continue
+            # not generating cu files for Hopper with Sage attention
         path = os.path.join('./generated', fname)
         # HACK: do not overwrite kernel file in case of collision; kernel selection logic can still be flaky
         # TODO: allow profiling multiple kernel implementations satisfying the given problem size
@@ -4629,8 +4630,8 @@ def enumerate_hmma_flash_kernels_base(specs,
                     has_scale_max=False,
                     ctas_per_head=1,
                     input_layout=input_layout,
-                    enable_attn_logit_softcapping=enable_attn_logit_softcapping
-                ))
+                    enable_attn_logit_softcapping=enable_attn_logit_softcapping)
+            )
 
     for head_size in [
             16, 32, 40, 48, 64, 72, 80, 96, 104, 128, 160, 192, 256, 512
@@ -4703,8 +4704,8 @@ def enumerate_hmma_flash_kernels_base(specs,
                     has_scale_max=False,
                     ctas_per_head=1,
                     input_layout=input_layout,
-                    enable_attn_logit_softcapping=enable_attn_logit_softcapping
-                ))
+                    enable_attn_logit_softcapping=enable_attn_logit_softcapping)
+            )
         elif head_size <= 128:
             # q_step = 64, kv_step = 32
             specs.append(
@@ -4734,8 +4735,8 @@ def enumerate_hmma_flash_kernels_base(specs,
                     has_scale_max=False,
                     ctas_per_head=1,
                     input_layout=input_layout,
-                    enable_attn_logit_softcapping=enable_attn_logit_softcapping
-                ))
+                    enable_attn_logit_softcapping=enable_attn_logit_softcapping)
+            )
 
 
 def enumerate_qgmma_kernels(specs, sm=90):

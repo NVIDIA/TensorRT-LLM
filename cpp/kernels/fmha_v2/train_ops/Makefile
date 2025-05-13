@@ -65,10 +65,10 @@ CXX_FLAGS  += $(PREPROCESSOR_FLAGS)
 NVCC_FLAGS += $(PREPROCESSOR_FLAGS)
 
 # The include directories.
-INCLUDE_DIRS += -I../src 
+INCLUDE_DIRS += -I../src
 
 GENCODE_SM75 = -gencode=arch=compute_75,code=\"sm_75\"
-GENCODE_SM80 = -gencode=arch=compute_80,code=\"sm_80\" 
+GENCODE_SM80 = -gencode=arch=compute_80,code=\"sm_80\"
 
 # #################################################################################################
 # The object files.
@@ -83,7 +83,7 @@ OBJECTS += obj/fmha_dgrad_v2_fp16_256_64_kernel.sm80.cu.o
 OBJECTS += obj/fmha_dgrad_v2_fp16_384_64_kernel.sm80.cu.o
 OBJECTS += obj/fmha_dgrad_v2_fp16_512_64_kernel.sm80.cu.o
 
-GENCODES = $(GENCODE_SM75) $(GENCODE_SM80) 
+GENCODES = $(GENCODE_SM75) $(GENCODE_SM80)
 
 # #################################################################################################
 # R U L E S
@@ -98,13 +98,12 @@ dirs:
 	if [ ! -d obj ]; then mkdir -p obj; fi
 
 clean:
-	rm -rf obj 
+	rm -rf obj
 
 ###################################################################################################
 
 obj/%.sm75.cu.o: ./%.sm75.cu ./*.h ../src/*.h ../src/fmha/*.h
 	$(NVCC) $(NVCC_FLAGS) $(GENCODE_SM75) $(INCLUDE_DIRS) -c -o $@ $<
-obj/%.sm80.cu.o: ./%.sm80.cu ./*.h ../src/*.h ../src/fmha/*.h 
+obj/%.sm80.cu.o: ./%.sm80.cu ./*.h ../src/*.h ../src/fmha/*.h
 	$(NVCC) $(NVCC_FLAGS) $(GENCODE_SM80) $(INCLUDE_DIRS) -c -o $@ $<
 ###################################################################################################
-

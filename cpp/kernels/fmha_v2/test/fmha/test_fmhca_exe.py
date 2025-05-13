@@ -9,8 +9,8 @@
 # its affiliates is strictly prohibited.
 
 import pytest
-from utils import *
 from filter_rules import *
+from utils import *
 
 fmha_exe_path = 'bin/fmhca.exe'
 

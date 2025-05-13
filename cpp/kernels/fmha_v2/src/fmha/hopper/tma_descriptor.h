@@ -13,7 +13,6 @@
 #pragma once
 #include <fmha/hopper/tma_types.h>
 
-
 namespace fmha {
 
 // manage TMA descriptor host code.

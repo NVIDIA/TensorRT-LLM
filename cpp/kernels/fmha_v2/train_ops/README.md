@@ -10,7 +10,7 @@ cd train_ops
 git clone https://github.com/NVIDIA/apex.git
 cd apex
 git submodule update --init --recursive
-cd .. 
+cd ..
 ```
 
 from the project root, launch the build container:
@@ -26,7 +26,7 @@ Then inside the container, /repo is the repository mount point:
 export TORCH_CUDA_ARCH_LIST="8.0;9.0"
 cd /repo/train_ops
 python train_setup.py
-mkdir -p build && cd build && cmake .. && make -j 
+mkdir -p build && cd build && cmake .. && make -j
 ```
 Note that we use flash attention by default.
 

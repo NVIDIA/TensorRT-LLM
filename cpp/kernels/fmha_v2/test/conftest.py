@@ -8,7 +8,9 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-import pytest, subprocess
+import subprocess
+
+import pytest
 
 
 def pytest_addoption(parser):

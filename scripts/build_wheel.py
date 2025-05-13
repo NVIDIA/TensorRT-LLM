@@ -156,6 +156,7 @@ def setup_conan(scripts_dir, venv_python):
 
     return venv_conan
 
+
 def generate_fmha_cu(project_dir):
     fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
     fmha_v2_cu_dir.mkdir(parents=True, exist_ok=True)
@@ -186,6 +187,7 @@ def generate_fmha_cu(project_dir):
         build_run(f"mv {cu_file} {fmha_v2_cu_dir}")
 
     os.chdir(project_dir)
+
 
 def main(*,
          build_type: str = "Release",

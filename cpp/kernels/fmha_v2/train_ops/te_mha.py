@@ -8,17 +8,15 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-import torch
-from torch.nn.parameter import Parameter
-import transformer_engine.pytorch.cpp_extensions as ext
-import transformer_engine_extensions as tex
-import transformer_engine.pytorch.fp8 as fp8
-from transformer_engine.pytorch import fp8_autocast
-from transformer_engine.pytorch.module import TransformerEngineBaseModule
-from transformer_engine.common import recipe
-from typing import Union, Dict, Any, Tuple
-import fmhalib as fmha
+from typing import Any, Dict, Tuple, Union
+
 import fp8_mha_api
+import torch
+import transformer_engine.pytorch.cpp_extensions as ext
+import transformer_engine.pytorch.fp8 as fp8
+import transformer_engine_extensions as tex
+from torch.nn.parameter import Parameter
+from transformer_engine.pytorch.module import TransformerEngineBaseModule
 
 _CUBLASLT_WORKSPACE_SIZE_BYTES = 33_554_432  # 32MiB
 _2X_ACC_FPROP = False
@@ -44,8 +42,7 @@ for name in tex.FP8Tensors.__entries:
     if val >= 10:
         print(name, val)
 assert all([
-    int(tex.FP8Tensors.__dict__[name]) < 10
-    for name in tex.FP8Tensors.__entries
+    int(tex.FP8Tensors.__dict__[name]) < 10 for name in tex.FP8Tensors.__entries
 ])
 # Map names to make it easier to read.
 META_QKV = tex.FP8Tensors.GEMM1_OUTPUT
@@ -170,7 +167,7 @@ class _MHA(torch.autograd.Function):
 
         if npad < 256:
             context = torch.nn.functional.pad(context, (0, 0, 0, npad))
-        # unfortunatly cant get rid of this transpose as this is needed for bwd.
+        # unfortunately can't get rid of this transpose as this is needed for bwd.
         context_t = tex.fp8_transpose(
             context,
             fp8_dtype_forward,
@@ -222,10 +219,8 @@ class _MHA(torch.autograd.Function):
             #TODO remove duplicates.
             fp8_meta["scaling"].scale_inv[META_QKV].clone().detach(
             ),  # d_scale_qkv
-            fp8_meta["scaling"].scale_inv[META_S].clone().detach(
-            ),  # d_scale_s
-            fp8_meta["scaling"].scale_inv[META_O].clone().detach(
-            ),  # d_scale_o
+            fp8_meta["scaling"].scale_inv[META_S].clone().detach(),  # d_scale_s
+            fp8_meta["scaling"].scale_inv[META_O].clone().detach(),  # d_scale_o
             fp8_meta["scaling"].scale[META_S].clone().detach(),  # q_scale_s
         )
         ctx.fp8_meta = fp8_meta
@@ -242,8 +237,8 @@ class _MHA(torch.autograd.Function):
 
     @staticmethod
     def backward(
-            ctx, grad_output: torch.Tensor
-    ) -> Tuple[Union[torch.Tensor, None], ...]:
+            ctx,
+            grad_output: torch.Tensor) -> Tuple[Union[torch.Tensor, None], ...]:
         (
             inputmat_t,
             qkv_weight,

@@ -144,4 +144,3 @@ bin/fmha.exe -v 0 -runs 1 -int8 -s 256 -d 64 -v1 -b 128
 
 bin/fmha.exe -v 0 -runs 1 -int8 -s 128 -d 64 -v1 -b 1
 bin/fmha.exe -v 0 -runs 1 -int8 -s 128 -d 64 -v1 -b 128
-

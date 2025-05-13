@@ -116,7 +116,7 @@ fwd_cuda(const torch::Tensor &qkv, const torch::Tensor &pad_mask, float dropout_
 }
 
 std::vector<torch::Tensor> bwd_cuda(int heads,
-                                    torch::Tensor const &output_lin_grads,   //dout
+                                    torch::Tensor const &output_lin_grads,   //d_out
                                     torch::Tensor const &matmul2_results,    //S.*D*V ?
                                     torch::Tensor const &dropout_results,    //S.*D ?
                                     torch::Tensor const &bmm1_results,       //QxK'
@@ -165,7 +165,7 @@ std::vector<torch::Tensor> bwd_cuda(int heads,
 
     TORCH_CUDABLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
 
-    // MatMul2 Dgrad1          dout x V'
+    // MatMul2 Dgrad1          d_out x V'
     gemm_switch_fp32accum(a_layout_t,
                           b_layout_n,
                           k_seq_len,
@@ -184,7 +184,7 @@ std::vector<torch::Tensor> bwd_cuda(int heads,
                           k_seq_len * q_seq_len,
                           attn_batches);
 
-    // Matmul2 Dgrad2          (S * D)' x dout
+    // Matmul2 Dgrad2          (S * D)' x d_out
     gemm_switch_fp32accum(a_layout_n,
                           b_layout_t,
                           head_dim,

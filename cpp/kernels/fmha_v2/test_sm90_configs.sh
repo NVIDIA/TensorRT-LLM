@@ -3,17 +3,17 @@
 set -e
 set -x
 
-#bin/fmha.exe -v 0 -runs 1 -s 256 -d 64 -min-s 64 -b 3 -v 2 -h 2 
+#bin/fmha.exe -v 0 -runs 1 -s 256 -d 64 -min-s 64 -b 3 -v 2 -h 2
 #bin/fmha.exe -v 0 -runs 1 -s 256 -d 64 -min-s 64 -b 3 -v 2 -h 2 -scale-bmm1 0.25
 #bin/fmha.exe -v 0 -runs 1 -s 256 -d 64 -min-s 64 -b 3 -v 2 -h 2 -use-tma
 #bin/fmha.exe -v 0 -runs 1 -s 256 -d 64 -min-s 64 -b 3 -v 2 -h 2 -scale-bmm1 0.25 -use-tma
 
 ####################################################################################################
 # H G M M A  F P 1 6 . F P 1 6
-bin/fmha.exe -v 0 -runs 1 -s 512 -d 64 -min-s 1 -b 1 -h 1 
-bin/fmha.exe -v 0 -runs 1 -s 384 -d 64 -min-s 1 -b 1 -h 1 
-bin/fmha.exe -v 0 -runs 1 -s 256 -d 64 -min-s 1 -b 1 -h 1 
-bin/fmha.exe -v 0 -runs 1 -s 128 -d 64 -min-s 1 -b 1 -h 1 
+bin/fmha.exe -v 0 -runs 1 -s 512 -d 64 -min-s 1 -b 1 -h 1
+bin/fmha.exe -v 0 -runs 1 -s 384 -d 64 -min-s 1 -b 1 -h 1
+bin/fmha.exe -v 0 -runs 1 -s 256 -d 64 -min-s 1 -b 1 -h 1
+bin/fmha.exe -v 0 -runs 1 -s 128 -d 64 -min-s 1 -b 1 -h 1
 
 bin/fmha.exe -v 0 -runs 1 -s 512 -d 64 -min-s 1 -b 1 -h 1 -ignore-b1opt
 bin/fmha.exe -v 0 -runs 1 -s 384 -d 64 -min-s 1 -b 1 -h 1 -ignore-b1opt

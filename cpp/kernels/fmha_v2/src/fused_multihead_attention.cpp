@@ -1899,7 +1899,7 @@ int main(int argc, char **argv) {
                     false, // S
                     false, // V
                     s, // m
-                    d, // n 
+                    d, // n
                     s, // k
                     b * h * s, // ld S
                     b * h * 3 * d, // ld V

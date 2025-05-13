@@ -1382,8 +1382,8 @@ struct Smem_tile_o_base_8bit_mma {
                 Sts_packed_type row_0, row_1;
                 Regs_to_rows<Traits>::extract(acc[mi * MMAS_M_PER_LOOP + mj][ni], row_0, row_1);
 
-                /* 
-                (32bit acc) Each thread of a quad writes 16B per STS -> 64B per store. 
+                /*
+                (32bit acc) Each thread of a quad writes 16B per STS -> 64B per store.
                             Account for 2 -> 128B.
                 (16bit acc) Each thread of a quad writes 8B per STS -> 32B per store.
                             Account for 2 -> 64B.

@@ -23,12 +23,13 @@ if my_path not in sys.path:
 #    sys.path.insert(0, my_path)
 
 import math
-import numpy as np
-import torch
-import bert_mha_train as mha
-#import fmhalib as mha
 
 import apex_mha
+import bert_mha_train as mha
+import numpy as np
+import torch
+
+#import fmhalib as mha
 
 torch.manual_seed(1234)
 torch.cuda.manual_seed(1234)

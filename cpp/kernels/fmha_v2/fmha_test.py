@@ -1,6 +1,7 @@
 import subprocess
-from cuda import cuda, nvrtc
+
 import pytest
+from cuda import cuda, nvrtc
 
 
 def ASSERT_DRV(err):
@@ -37,8 +38,7 @@ def getSMVersion():
 
 
 # The default test cases for flash attention fmha that will be used in TRTLLM.
-@pytest.mark.parametrize('d',
-                         [32, 40, 64, 72, 80, 96, 104, 128, 160, 192, 256])
+@pytest.mark.parametrize('d', [32, 40, 64, 72, 80, 96, 104, 128, 160, 192, 256])
 @pytest.mark.parametrize('s', [1024])
 @pytest.mark.parametrize('dtype', ["-fp16", "-bf16", "-fp16-fp32", "-e4m3"])
 @pytest.mark.parametrize('flag', [

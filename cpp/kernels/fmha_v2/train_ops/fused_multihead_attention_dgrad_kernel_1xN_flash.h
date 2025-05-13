@@ -180,7 +180,7 @@ compute_dq_dk_dv_1xN_kv_inner_loop_(const Params &params, Prng &ph, int kv_offse
 
     // The mask.
     fmha::Mask<Traits, Cta_tile_p, Kernel_traits::MASK_VERSION> mask(params, binfo, tidx);
-    // Determine whether causal mask is appllied or not.
+    // Determine whether causal mask is applied or not.
     const bool causal_mask = Kernel_traits::MASK_VERSION == 3;
 
     static_assert(Cta_tile_p::N % Cta_tile_p::M == 0);
@@ -464,7 +464,7 @@ compute_dq_dk_dv_1xN_kv_inner_loop_(const Params &params, Prng &ph, int kv_offse
 
         const float scale_softmax_rp_droput =
             reinterpret_cast<const float &>(params.scale_softmax) * params.rp_dropout;
-        //double check the accuray and performance.
+        //double check the accuracy and performance.
         auto pointwise_mult = [](float p, float dp, float softmax_sum, float scale, bool drop) {
             return p * ((!drop) || p >= 0.f ? dp : softmax_sum) * scale;
         };

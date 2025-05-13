@@ -8,8 +8,9 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-import pytest
 import os
+
+import pytest
 
 
 # The host softmax reference kernel has limited set of supported sizes
@@ -219,8 +220,8 @@ def v1(fmha_arg, **kwargs):
 def _non_sm90_rule(fmha_arg):
     if fmha_arg.use_tma or not fmha_arg.force_non_warp_specialization:
         pytest.skip(
-            reason=
-            f'rule: tma/use_warp_specialization not supported. {fmha_arg}')
+            reason=f'rule: tma/use_warp_specialization not supported. {fmha_arg}'
+        )
     if fmha_arg.force_non_flash_attention and \
         (fmha_arg.head_dim not in [16, 32, 64] or fmha_arg.seq_len > 512):
         pytest.skip(
@@ -261,8 +262,7 @@ def _sm90_rule(fmha_arg):
     if 'ENABLE_SM90' not in os.environ:
         pytest.skip(reason=f'sm90_rule: kernels not generated. {fmha_arg}')
     if 'SM90_USE_HMMA' not in os.environ and fmha_arg.precision in ['bf16']:
-        pytest.skip(
-            reason=f'sm90_rule: HMMA kernels not generated. {fmha_arg}')
+        pytest.skip(reason=f'sm90_rule: HMMA kernels not generated. {fmha_arg}')
     if 'SM90_USE_IMMA' not in os.environ and fmha_arg.precision == 'int8' and \
         (fmha_arg.head_dim != 64 or fmha_arg.seq_len not in [64, 128, 256, 384, 512]):
         pytest.skip(
@@ -281,8 +281,7 @@ def _sm90_rule(fmha_arg):
         and fmha_arg.force_non_warp_specialization \
         and (fmha_arg.head_dim not in [32, 64] or fmha_arg.seq_len not in [64, 128, 256, 384, 512]):
         pytest.skip(
-            reason=
-            f'sm90_rule: cases not supported for this head_size/seq_len;. \
+            reason=f'sm90_rule: cases not supported for this head_size/seq_len;. \
             {fmha_arg}')
 
     if (fmha_arg.force_non_warp_specialization or fmha_arg.force_non_flash_attention) \

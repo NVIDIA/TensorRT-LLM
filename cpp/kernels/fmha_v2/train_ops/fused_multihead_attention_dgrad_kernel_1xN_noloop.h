@@ -136,7 +136,7 @@ inline __device__ void compute_dv_1xN_nl(const Params &params) {
     fmha::Mask<Traits, Cta_tile_p, Kernel_traits::VERSION> mask(params, binfo, tidx);
 
     // Allocate the global memory tile loader for Q.
-    Gmem_tile_do gmem_q(params, binfo, tidx);  // treating dout as Q
+    Gmem_tile_do gmem_q(params, binfo, tidx);  // treating d_out as Q
     // Allocate the shared memory tile loader for Q.
     Smem_tile_q smem_q(&smem_[0], tidx);
     Smem_tile_qt smem_qt(&smem_[0], tidx);
@@ -322,7 +322,7 @@ inline __device__ void compute_dv_1xN_nl(const Params &params) {
         static_assert(Mma_tile_dv::MMAS_K == 1);
         smem_qt.load(frag_qt[0], 0);
 
-        // 7. Accumulate (S * D)' * dout' for next k-slice
+        // 7. Accumulate (S * D)' * d_out' for next k-slice
         static_assert(Mma_tile_dv::MMAS_K == 1);  // DEBUG
 #pragma unroll
         for( int ki = 1; ki < Mma_tile_dv::MMAS_K; ++ki ) {
@@ -360,7 +360,7 @@ inline __device__ void compute_dv_1xN_nl(const Params &params) {
 
     }  // Outer loop over the sequence length.
 
-    // Epilogue for dV = (S * D)' * dout'. We're fully exposed to this!
+    // Epilogue for dV = (S * D)' * d_out'. We're fully exposed to this!
 
     // Epilogue swizzle for dV
     Smem_tile_dv smem_dv(&smem_[Kernel_traits::Smem_tile_q::BYTES_PER_TILE], tidx);
@@ -616,7 +616,7 @@ inline __device__ void compute_dq_dk_1xN_nl(const Params &params) {
         __syncthreads();
         // 6. load Q from smem, but transposed.
 
-        // 7. Accumulate (S * D)' * dout' for next k-slice
+        // 7. Accumulate (S * D)' * d_out' for next k-slice
         static_assert(Mma_tile_dk::MMAS_K == 1);  // DEBUG
         // Trigger the load for the next Q values.
         if( loop + Cta_tile_p::M < Cta_tile_p::N ) {

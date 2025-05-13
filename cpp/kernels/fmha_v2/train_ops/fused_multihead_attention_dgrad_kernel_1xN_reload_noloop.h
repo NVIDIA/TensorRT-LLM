@@ -103,7 +103,7 @@ inline __device__ void compute_dv_1xN_nl(const Params &params) {
     static_assert(Smem_tile_dv::NUM_LDS == Gmem_tile_dv::LDGS);
     static_assert(Smem_tile_dv::THREADS_PER_ROW == Gmem_tile_dv::THREADS_PER_ROW);
 
-    // The global memory tile for dout (treated here like Q)
+    // The global memory tile for d_out (treated here like Q)
     using Gmem_tile_do = Gmem_tile_dout<Traits, Cta_tile_p>;
 
     // The global memory tile for the softmax matrix (will be overwritten with dP)
@@ -141,7 +141,7 @@ inline __device__ void compute_dv_1xN_nl(const Params &params) {
     fmha::Mask<Traits, Cta_tile_p, Kernel_traits::VERSION> mask(params, binfo, tidx);
 
     // Allocate the global memory tile loader for Q.
-    Gmem_tile_do gmem_q(params, binfo, tidx);  // treating dout as Q
+    Gmem_tile_do gmem_q(params, binfo, tidx);  // treating d_out as Q
     // Allocate the shared memory tile loader for Q.
     Smem_tile_q smem_q(&smem_[0], tidx);
     Smem_tile_qt smem_qt(&smem_[0], tidx);
@@ -324,7 +324,7 @@ inline __device__ void compute_dv_1xN_nl(const Params &params) {
         gmem_s.move();
 
         // 6. Reload Q from smem, but transposed.
-        // 7. Accumulate (S * D)' * dout' for next k-slice
+        // 7. Accumulate (S * D)' * d_out' for next k-slice
         static_assert(Mma_tile_dv::MMAS_K == 1);  // DEBUG
 #pragma unroll
         for( int ki = 1; ki < Mma_tile_dv::MMAS_K; ++ki ) {
@@ -359,7 +359,7 @@ inline __device__ void compute_dv_1xN_nl(const Params &params) {
 
     }  // Outer loop over the sequence length.
 
-    // Epilogue for dV = (S * D)' * dout'. We're fully exposed to this!
+    // Epilogue for dV = (S * D)' * d_out'. We're fully exposed to this!
 
     // Epilogue swizzle for dV
     Smem_tile_dv smem_dv(&smem_[Kernel_traits::Smem_tile_q::BYTES_PER_TILE], tidx);
@@ -623,7 +623,7 @@ inline __device__ void compute_dq_dk_1xN_nl(const Params &params) {
         typename Smem_tile_st::Fragment frag_s[Mma_tile_dk::MMAS_K][Mma_tile_dk::MMAS_M];
         smem_s.load(frag_s);
 
-        // 7. Accumulate (S * D)' * dout' for next k-slice
+        // 7. Accumulate (S * D)' * d_out' for next k-slice
         static_assert(Mma_tile_dk::MMAS_K == 1);  // DEBUG
 
 #pragma unroll

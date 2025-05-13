@@ -8,10 +8,14 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-import pytest, subprocess, functools, copy
+import copy
+import functools
+import subprocess
 from collections import namedtuple
 from itertools import product
 from typing import Callable, List
+
+import pytest
 
 field2arg = {
     'seq_len': '-s',
@@ -153,8 +157,8 @@ def combinations_int8():
 
     # base combination
     fmha_args = [
-        FmhaArgs(*combo) for combo in product(
-            seq_lens, min_seq_lens, head_dims, batches, num_heads, precision)
+        FmhaArgs(*combo) for combo in product(seq_lens, min_seq_lens, head_dims,
+                                              batches, num_heads, precision)
     ]
 
     # + min_seq_len = seq_len
@@ -176,8 +180,8 @@ def combinations_fp16_bench():
 
     # base combination
     fmha_args = [
-        FmhaArgs(*combo) for combo in product(
-            seq_lens, min_seq_lens, head_dims, batches, num_heads, precision)
+        FmhaArgs(*combo) for combo in product(seq_lens, min_seq_lens, head_dims,
+                                              batches, num_heads, precision)
     ]
 
     # + min_seq_len = seq_len
@@ -211,8 +215,8 @@ def combinations_fp16_sd_bench():
 
     # base combination
     fmha_args = [
-        FmhaArgs(*combo) for combo in product(
-            seq_lens, min_seq_lens, head_dims, batches, num_heads, precision)
+        FmhaArgs(*combo) for combo in product(seq_lens, min_seq_lens, head_dims,
+                                              batches, num_heads, precision)
     ]
 
     # + min_seq_len = seq_len
@@ -309,8 +313,8 @@ def combinations_e4m3():
 
     # base combination
     fmha_args = [
-        FmhaArgs(*combo) for combo in product(
-            seq_lens, min_seq_lens, head_dims, batches, num_heads, precision)
+        FmhaArgs(*combo) for combo in product(seq_lens, min_seq_lens, head_dims,
+                                              batches, num_heads, precision)
     ]
 
     # + min_seq_len = seq_len
@@ -378,8 +382,8 @@ def combinations_small():
 
     # base combination
     fmha_args = [
-        FmhaArgs(*combo) for combo in product(
-            seq_lens, min_seq_lens, head_dims, batches, num_heads, precision)
+        FmhaArgs(*combo) for combo in product(seq_lens, min_seq_lens, head_dims,
+                                              batches, num_heads, precision)
     ]
 
     return fmha_args

@@ -10,12 +10,13 @@
 #
 # testing fixed sequence length
 
-import sys
 import math
-import torch
-import numpy as np
-from time import time
 import os
+import sys
+from time import time
+
+import numpy as np
+import torch
 
 current_script_dir = os.path.dirname(os.path.abspath(__file__))
 my_path = current_script_dir + os.path.sep + 'build'
@@ -89,7 +90,7 @@ def run_test(s, d, heads_interleaved=False, seqs_interleaved=False):
     if (has_alibi):
         alibi_bias = build_alibi_tensor(s, h, b).to(dtype=dtype, device=device)
 
-    slens = [s] * b  # fixed sequence lenghts, full mask
+    slens = [s] * b  # fixed sequence lengths, full mask
 
     a = torch.tensor(np.array([0] + slens), dtype=torch.int32)
     amask = torch.ones(b, h, s, s, dtype=dtype, device=device)
@@ -117,8 +118,8 @@ def run_test(s, d, heads_interleaved=False, seqs_interleaved=False):
     is_nl = True
 
     for _ in range(runs):
-        ctx, lse, random_seed, S_mma = mha.fwd(qkv_vs, cu_seqlens, p_dropout,
-                                               s, is_training, is_nl,
+        ctx, lse, random_seed, S_mma = mha.fwd(qkv_vs, cu_seqlens, p_dropout, s,
+                                               is_training, is_nl,
                                                seqs_interleaved, is_causal,
                                                has_alibi, None)
 
@@ -126,8 +127,8 @@ def run_test(s, d, heads_interleaved=False, seqs_interleaved=False):
     time0 = time()
 
     for _ in range(runs):
-        ctx, lse, random_seed, S_mma = mha.fwd(qkv_vs, cu_seqlens, p_dropout,
-                                               s, is_training, is_nl,
+        ctx, lse, random_seed, S_mma = mha.fwd(qkv_vs, cu_seqlens, p_dropout, s,
+                                               is_training, is_nl,
                                                seqs_interleaved, is_causal,
                                                has_alibi, None)
 
@@ -143,8 +144,8 @@ def run_test(s, d, heads_interleaved=False, seqs_interleaved=False):
         ctx = pad(ctx, cu_seqlens, s)
     S, D = reshape_softmax(S_mma, b, s, h, d, warps_m, warps_n, True)
 
-    ctx_ref, Pref, Sref, lse_ref = mha_ref(qkv, amask, D, b, s, h, d,
-                                           p_dropout, is_causal, alibi_bias)
+    ctx_ref, Pref, Sref, lse_ref = mha_ref(qkv, amask, D, b, s, h, d, p_dropout,
+                                           is_causal, alibi_bias)
 
     print("= Testing Fused Forward =")
     print("[Softmax_lse] AC: {}; MAE: {:.4e}; PERR: {:.4e}".format(
@@ -221,8 +222,7 @@ def run_test(s, d, heads_interleaved=False, seqs_interleaved=False):
 
     torch.cuda.synchronize()
     time1 = time()
-    print("Average %f ms for backward pass\n" %
-          ((time1 - time0) / runs * 1000))
+    print("Average %f ms for backward pass\n" % ((time1 - time0) / runs * 1000))
 
     #Convert sum_sxhx3xd => sum_sx3xhxd if heads_interleaved
     if heads_interleaved:
@@ -230,9 +230,8 @@ def run_test(s, d, heads_interleaved=False, seqs_interleaved=False):
 
     #Convert sum_sx3xhxd => sum_sxhx3xd
     if seqs_interleaved:
-        dqkv2 = dqkv2.reshape(s, b, 3, h,
-                              d).permute(1, 0, 3, 2,
-                                         4).reshape(b * s, h, 3, d)
+        dqkv2 = dqkv2.reshape(s, b, 3, h, d).permute(1, 0, 3, 2,
+                                                     4).reshape(b * s, h, 3, d)
     else:
         dqkv2 = dqkv2.permute(0, 2, 1, 3)
 

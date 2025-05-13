@@ -383,9 +383,9 @@ mha_fwd(const at::Tensor &qkv,  // total x num_heads x 3 x head_size, total := \
 }
 
 std::vector<at::Tensor> mha_bwd(
-    const at::Tensor &dout,  // total x num_heads, x head_size
-    const at::Tensor &out,   // total x num_head, x hea_szie
-    const at::Tensor &qkv,   // total x num_heads x 3 x head_size, total := \sum_{i=0}^{b} s_i
+    const at::Tensor &d_out,  // total x num_heads, x head_size
+    const at::Tensor &out,    // total x num_head, x hea_szie
+    const at::Tensor &qkv,    // total x num_heads x 3 x head_size, total := \sum_{i=0}^{b} s_i
     //at::Tensor &softmax,           // b x h x s x s softmax and dmask - will be overwritten with dP
     const at::Tensor &softmax_lse,  // b x h x s
     const at::Tensor &random_seed,  // 2 elements, seed and offset
@@ -415,9 +415,9 @@ std::vector<at::Tensor> mha_bwd(
     const auto sizes = qkv.sizes();
 
     {
-        const auto size_dout = dout.sizes();
+        const auto size_dout = d_out.sizes();
         const auto size_out = out.sizes();
-        TORCH_CHECK(dout.dim() == 4);
+        TORCH_CHECK(d_out.dim() == 4);
         for( int i = 0; i < 4; i++ ) {
             TORCH_CHECK(size_dout[i] == size_out[i]);
         }
@@ -515,7 +515,7 @@ std::vector<at::Tensor> mha_bwd(
                    qkv.data_ptr(),
                    cu_seqlens.data_ptr(),
                    out.data_ptr(),      // o_ptr = out
-                   dout.data_ptr(),     // do_ptr = dout
+                   d_out.data_ptr(),    // do_ptr = d_out
                    softmax.data_ptr(),  // softmax gets overwritten by dP!
                    softmax_lse.data_ptr(),
                    softmax_sum.data_ptr(),
@@ -547,9 +547,9 @@ std::vector<at::Tensor> mha_bwd(
                    total,
                    qkv.data_ptr(),
                    cu_seqlens.data_ptr(),
-                   out.data_ptr(),   // o_ptr = out
-                   dout.data_ptr(),  // do_ptr = dout
-                   nullptr,          // softmax gets overwritten by dP!
+                   out.data_ptr(),    // o_ptr = out
+                   d_out.data_ptr(),  // do_ptr = d_out
+                   nullptr,           // softmax gets overwritten by dP!
                    softmax_lse.data_ptr(),
                    softmax_sum.data_ptr(),
                    dq_acc.data_ptr(),
@@ -588,7 +588,7 @@ std::vector<at::Tensor> mha_bwd(
 }
 
 std::vector<at::Tensor> mha_bwd_noloop(
-    const at::Tensor &dout,        // total x num_heads, x head_size
+    const at::Tensor &d_out,       // total x num_heads, x head_size
     const at::Tensor &qkv,         // total x num_heads x 3 x head_size, total := \sum_{i=0}^{b} s_i
     at::Tensor &softmax,           // b x h x s x s softmax and dmask - will be overwritten with dP
     const at::Tensor &cu_seqlens,  // b+1
@@ -651,7 +651,7 @@ std::vector<at::Tensor> mha_bwd_noloop(
                qkv.data_ptr(),
                cu_seqlens.data_ptr(),
                nullptr,             // o_ptr = out
-               dout.data_ptr(),     // do_ptr = dout
+               d_out.data_ptr(),    // do_ptr = d_out
                softmax.data_ptr(),  // softmax gets overwritten by dP!
                nullptr,             // softmax lse
                nullptr,             // softmax sum reduce_sum (dO * O)

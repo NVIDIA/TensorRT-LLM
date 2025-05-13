@@ -194,9 +194,9 @@ struct Gmem_tile_qkv {
                 idx += (num_heads + kv_head_id) * VALID_BYTES_PER_ROW;
             } else if( qkv_offset == 2 ) {  // V tensor
                 /*  When qkv_offset == 2, this is an instance of Gmem_tile_v defined in Kernel_traits:
-                        using Gmem_tile_v = Gmem_tile_v_<Traits_o, 
-                                Cta_tile_o, 
-                                Traits_o::BITS_PER_ELEMENT_B, 
+                        using Gmem_tile_v = Gmem_tile_v_<Traits_o,
+                                Cta_tile_o,
+                                Traits_o::BITS_PER_ELEMENT_B,
                                 CTA_O_TILE_K,
                                 CTA_O_TILE_N,
                                 VALID_DV,   // instead of VALID_D

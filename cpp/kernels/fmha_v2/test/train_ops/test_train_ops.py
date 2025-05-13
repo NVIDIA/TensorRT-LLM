@@ -9,8 +9,8 @@
 # its affiliates is strictly prohibited.
 
 import pytest
-from fmha.utils import *
 from fmha.filter_rules import *
+from fmha.utils import *
 from train_ops.fmha_unit_test import run_test
 
 

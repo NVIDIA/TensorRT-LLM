@@ -689,7 +689,7 @@ struct Dgrad_4x1 {
 #if 0
                 uint32_t *ptr_s = reinterpret_cast<uint32_t*>(params_.print_buf);
                 uint32_t *ptr_dp = ptr_s + 64 * 32;
-                // DEBUG Store the transposed FP16 tile 
+                // DEBUG Store the transposed FP16 tile
                 int r = warp * 16 + quad;
                 int c = ni   *  8 + qid;
 

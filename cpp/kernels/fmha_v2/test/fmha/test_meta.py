@@ -11,8 +11,8 @@
 # test of tests
 
 import pytest
-from utils import *
 from filter_rules import *
+from utils import *
 
 fmha_exe_path = 'bin/fmha.exe'
 

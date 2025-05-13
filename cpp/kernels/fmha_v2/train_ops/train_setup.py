@@ -10,10 +10,7 @@
 
 import os
 import sys
-import subprocess
-import numpy as np
-import math
-from collections import namedtuple, OrderedDict
+from collections import namedtuple
 
 sys.path.append("../")
 from setup import get_effective_sm_and_name, get_kernel_code

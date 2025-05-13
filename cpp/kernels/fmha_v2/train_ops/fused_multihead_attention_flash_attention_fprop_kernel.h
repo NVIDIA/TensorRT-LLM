@@ -28,13 +28,13 @@ namespace fused_multihead_attention {
  * S:        8KB
  * O:       16KB
  * Softmax: 256B
- * TOTAL:  
+ * TOTAL:
  *
  * In this kernel we store D in the sign bit of S, and we do not swizzle the S matrix, since we want
  * to load it in the exact same register layout in the dgrad kernel.
- * 
+ *
  * Shared Memory Layout:
- * |0 |2                           |18K           |26K  |30K   |34K   
+ * |0 |2                           |18K           |26K  |30K   |34K
  * ------------------------------------------------------------------
  * |Q |                          K                             |
  * |Q |                          V                             |
@@ -42,7 +42,7 @@ namespace fused_multihead_attention {
  *
  *
  * If we want to perform the epilogue swizzle of S and D, the layout would be
- * |0 |2                           |18K           |26K  |30K   |34K   
+ * |0 |2                           |18K           |26K  |30K   |34K
  * |Q |            O               |       S      |  D  | Softmax
  *
  */
@@ -481,7 +481,7 @@ inline __device__ void device_flash_attention_(const Params &params,
 
                     // 32 means the number of thread per warp
                     unsigned int warp_idx = threadIdx.x / 32;
-                    // 16 means each warp will handle 16 x 16 elements in current MMA computaion.
+                    // 16 means each warp will handle 16 x 16 elements in current MMA computation.
                     unsigned int block_col_idx = kv_loop * Cta_tile_p::N / 16;
                     unsigned long long philox_subsequence =
                         ((begin + q_loop) * Cta_tile_p::M / 16 + warp_idx) *
@@ -525,7 +525,7 @@ inline __device__ void device_flash_attention_(const Params &params,
             // make sure packing frag_p is done
             __syncthreads();
 
-            // can only be commited after softmax as they share the smem
+            // can only be committed after softmax as they share the smem
             if( kv_loop + 1 < kv_loop_bound ) {
                 gmem_v.commit(smem_v);
             }

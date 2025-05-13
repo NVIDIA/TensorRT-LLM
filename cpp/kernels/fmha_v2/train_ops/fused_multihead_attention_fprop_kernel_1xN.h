@@ -28,13 +28,13 @@ namespace fused_multihead_attention {
  * S:        8KB
  * O:       16KB
  * Softmax: 256B
- * TOTAL:  
+ * TOTAL:
  *
  * In this kernel we store D in the sign bit of S, and we do not swizzle the S matrix, since we want
  * to load it in the exact same register layout in the dgrad kernel.
- * 
+ *
  * Shared Memory Layout:
- * |0 |2                           |18K           |26K  |30K   |34K   
+ * |0 |2                           |18K           |26K  |30K   |34K
  * ------------------------------------------------------------------
  * |Q |                          K                             |
  * |Q |                          V                             |
@@ -42,7 +42,7 @@ namespace fused_multihead_attention {
  *
  *
  * If we want to perform the epilogue swizzle of S and D, the layout would be
- * |0 |2                           |18K           |26K  |30K   |34K   
+ * |0 |2                           |18K           |26K  |30K   |34K
  * |Q |            O               |       S      |  D  | Softmax
  *
  */
