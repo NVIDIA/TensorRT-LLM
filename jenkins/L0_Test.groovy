@@ -1580,7 +1580,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
             def fullWheelPath = "${cpu_arch}/${wheelPath}${wheelName}"
 
-            // TODO: Re-enable sanity check.
+            // TODO: Re-enable the sanity check after updating GPU testers' driver version.
             // sanityRunner("Sanity check") {
             //     runPackageSanityCheck(pipeline, fullWheelPath, values[3], cpver)
             // }
