@@ -1065,7 +1065,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     ]
 
     // TODO: use cpu pod to launch slurm job
-    parallelSlurmJobs = turtleSlurmConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10", "amd64", values[4] ?: 1, key.contains("Perf")), {
+    parallelSlurmJobs = turtleSlurmConfigs.collectEntries{key, values -> [key, [trtllm_utils.createKubernetesPodConfig(image: LLM_DOCKER_IMAGE, type: values[0], gpuCount: values[4] ?: 1, perfMode: key.contains("Perf"), gpuType: KubernetesManager.selectGPU(values[0]), driverVersion: DEFAULT_DRIVER), {
     def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
