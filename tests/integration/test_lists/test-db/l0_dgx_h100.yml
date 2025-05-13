@@ -119,7 +119,7 @@ l0_dgx_h100:
   - cpp/test_multi_gpu.py::test_llama_executor[llama-orchestrator-90]
   - cpp/test_multi_gpu.py::test_llama_executor[llama-leader-90]
   - cpp/test_multi_gpu.py::test_llama_executor_guided_decoding[llama-90]
-  - cpp/test_multi_gpu.py::test_llama_logits_proc[llama-90]
+  - cpp/test_multi_gpu.py::test_llama_executor_logits_proc[llama-90]
   - cpp/test_multi_gpu.py::test_trt_gpt_real_decoder[llama-90]
   - cpp/test_multi_gpu.py::test_disagg[llama-90]
 - condition:
