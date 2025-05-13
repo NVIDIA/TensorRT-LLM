@@ -1202,8 +1202,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     ]
     fullSet += slurmX86Configs.keySet()
 
-    parallelSlurmJobs = slurmX86Configs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "amd64"), {
-        def config = VANILLA_CONFIG
+    parallelSlurmJobs = turtleSlurmConfigs.collectEntries{key, values -> [key, [trtllm_utils.createKubernetesPodConfig(image: LLM_DOCKER_IMAGE, type: "slurm", gpuCount: values[4] ?: 1, perfMode: key.contains("Perf"), gpuType: KubernetesManager.selectGPU(values[0]), driverVersion: DEFAULT_DRIVER), {
+    def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
         }
