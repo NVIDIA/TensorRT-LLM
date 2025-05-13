@@ -22,7 +22,6 @@
 #include <fmha/smem_tile_qkv.h>
 #include <fmha/smem_tile_v.h>
 #include <fmha/softmax.h>
-#include <fmha/utils.h>
 #include <fused_multihead_attention.h>
 #include <fused_multihead_cross_attention.h>
 

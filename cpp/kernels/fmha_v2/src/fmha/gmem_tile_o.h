@@ -12,6 +12,9 @@
 
 #pragma once
 
+#include <fmha/traits.h>
+#include <fmha/utils.h>
+
 namespace fmha
 {
 namespace v1
