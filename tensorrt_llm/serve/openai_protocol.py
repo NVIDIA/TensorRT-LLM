@@ -156,7 +156,7 @@ class CompletionRequest(OpenAIBaseModel):
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: Optional[int] = None
-    max_tokens: Optional[int] = 16
+    max_tokens: Optional[int] = None
     n: int = 1
     presence_penalty: Optional[float] = 0.0
     seed: Optional[int] = Field(default=None)
@@ -426,7 +426,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: Optional[int] = None
     top_logprobs: Optional[int] = 0
-    max_completion_tokens: int = Field(default=16,
+    max_completion_tokens: int = Field(default=None,
                                        validation_alias='max_tokens')
     n: Optional[int] = 1
     presence_penalty: Optional[float] = 0.0
