@@ -521,7 +521,7 @@ def fused_mla(
 
 @torch.library.custom_op("deepseek::mla", mutates_args=())
 def mla(
-    q_nope: torch.Tensor,  # Down projected/pre-processed q_nope
+    q_nope: torch.Tensor,  # Down projected q_nope
     q_pe: torch.Tensor,  # q_pe after applying rope
     kv: torch.Tensor,  # compressed kv after passing through layernorm
     pe: torch.Tensor,  # k_pe after applying rope
@@ -529,8 +529,7 @@ def mla(
     softmax_scale: float,  # softmax scale
 ) -> torch.Tensor:
     """
-    Reference implementation for Fused MLA with KV cache support.
-    This implementation flattens the inputs and can be used as a reference to debug the triton kernels.
+    Reference implementation for MLA style attention that handles compressed kv.
     """
     scores = (
         torch.einsum("bhsc,btc->bsht", q_nope, kv) + torch.einsum("bhsr,btr->bsht", q_pe, pe)
@@ -544,12 +543,12 @@ def mla(
 
 @mla.register_fake
 def mla(
-    q_nope: torch.Tensor,  # Down projected/pre-processed q_nope
+    q_nope: torch.Tensor,  # Down projected q_nope
     q_pe: torch.Tensor,  # q_pe after applying rope
     kv: torch.Tensor,  # compressed kv after passing through layernorm
     k_pe: torch.Tensor,  # k_pe after applying rope
     attention_mask: torch.Tensor,  # attention mask
     softmax_scale: float,  # softmax scale
 ) -> torch.Tensor:
-    """Attention that can handle compressed kv."""
+    """MLA style attention that handles compressed kv."""
     return torch.empty_like(q_nope)
