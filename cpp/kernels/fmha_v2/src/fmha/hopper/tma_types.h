@@ -12,6 +12,8 @@
 
 #pragma once
 
+#include <fmha/numeric_types.h>
+
 namespace fmha
 {
 

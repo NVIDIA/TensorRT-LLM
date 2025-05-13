@@ -640,7 +640,6 @@ struct Compute
             {                                                                                                          \
                 warpgroup_commit();                                                                                    \
                 warpgroup_wait<0>();                                                                                   \
-                float _scale = last_scale_v / _scale_v;                                                                \
             }                                                                                                          \
             last_scale_v = _scale_v;                                                                                   \
         }                                                                                                              \

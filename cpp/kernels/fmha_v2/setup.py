@@ -14,8 +14,6 @@ from collections import namedtuple
 from enum import IntEnum
 from itertools import product
 
-import numpy as np
-
 sm2name = {
     70: 'volta',
     72: 'volta',
@@ -1530,7 +1528,6 @@ void {kernel_name}(
 
     if( warp_group == NUM_COMPUTE_GROUPS ) {{  // dma + sched
 
-        const int DMA_REG_COUNT = {dma_reg_count};
         {setmaxnreg_dma_str}
         uint32_t elect_one = tidx == 0;
 
@@ -1547,7 +1544,6 @@ void {kernel_name}(
 
     }} else {{  // math
 
-        const int COMPUTE_REG_COUNT = {compute_reg_count};
         {setmaxnreg_compute_str}
         fmha::ws::Compute<fmha::{instruction_traits}, Ktraits> compute;
         compute.run(warp_group, tidx, shared, params);
@@ -1580,7 +1576,6 @@ void {causal_kernel_name}(
 
     if( warp_group == NUM_COMPUTE_GROUPS ) {{  // dma + sched
 
-        const int DMA_REG_COUNT = {dma_reg_count};
         {setmaxnreg_dma_str}
         uint32_t elect_one = tidx == 0;
 
@@ -1597,7 +1592,6 @@ void {causal_kernel_name}(
 
     }} else {{  // math
 
-        const int COMPUTE_REG_COUNT = {compute_reg_count};
         {setmaxnreg_compute_str}
 
         fmha::ws::Compute<fmha::{instruction_traits}, Ktraits_causal> compute;
@@ -1632,7 +1626,6 @@ void {sliding_window_causal_kernel_name}(
 
     if( warp_group == NUM_COMPUTE_GROUPS ) {{  // dma + sched
 
-        const int DMA_REG_COUNT = {dma_reg_count};
         {setmaxnreg_dma_str}
         uint32_t elect_one = tidx == 0;
 
@@ -1649,7 +1642,6 @@ void {sliding_window_causal_kernel_name}(
 
     }} else {{  // math
 
-        const int COMPUTE_REG_COUNT = {compute_reg_count};
         {setmaxnreg_compute_str}
 
         fmha::ws::Compute<fmha::{instruction_traits}, Ktraits_sliding_window_causal> compute;
@@ -1684,7 +1676,6 @@ void {custom_mask_kernel_name}(
 
     if( warp_group == NUM_COMPUTE_GROUPS ) {{  // dma + sched
 
-        const int DMA_REG_COUNT = {dma_reg_count};
         {setmaxnreg_dma_str}
         uint32_t elect_one = tidx == 0;
 
@@ -1701,7 +1692,6 @@ void {custom_mask_kernel_name}(
 
     }} else {{  // math
 
-        const int COMPUTE_REG_COUNT = {compute_reg_count};
         {setmaxnreg_compute_str}
 
         fmha::ws::Compute<fmha::{instruction_traits}, Ktraits_custom_mask> compute;
@@ -1893,7 +1883,7 @@ def get_GMMA_shape(instruction_traits, m, n, k, warps_n):
     gmma_m = 64
     gmma_n = 0
     # find the largest supported n
-    n_supported = (((np.arange(32)) + 1) * 8)[::-1]
+    n_supported = [(i + 1) * 8 for i in range(32)][::-1]
     n_target = n // warps_n
     assert n_target * warps_n == n
     assert n_supported[0] == 256 and n_supported[-1] == 8
@@ -2172,18 +2162,26 @@ def get_kernel_code(kspec, kname, lname):
     const_fused_multihead_attention_params_v2_str = 'Fused_multihead_attention_params_v2' if generate_cu_trtllm else f'const {params_type}'
     setmaxnreg_dma_str = r'''
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
-        asm volatile("{setmaxnreg.dec.sync.aligned.u32  %0; \n\t}" ::"n"(DMA_REG_COUNT));
+        const int DMA_REG_COUNT = {dma_reg_count};
+        asm volatile("{{setmaxnreg.dec.sync.aligned.u32  %0; \n\t}}" ::"n"(DMA_REG_COUNT));
 #else
         asm volatile("trap;\n");
 #endif
-''' if generate_cu_trtllm else r'''asm volatile("{setmaxnreg.dec.sync.aligned.u32  %0; \n\t}" ::"n"(DMA_REG_COUNT));'''
+'''.format(dma_reg_count=dma_reg_count) if generate_cu_trtllm else r'''
+        const int DMA_REG_COUNT = {dma_reg_count};
+        asm volatile("{{setmaxnreg.dec.sync.aligned.u32  %0; \n\t}}" ::"n"(DMA_REG_COUNT));'''.format(
+        dma_reg_count=dma_reg_count)
     setmaxnreg_compute_str = r'''
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
-        asm volatile("{setmaxnreg.inc.sync.aligned.u32 %0; \n\t}" ::"n"(COMPUTE_REG_COUNT));
+        const int COMPUTE_REG_COUNT = {compute_reg_count};
+        asm volatile("{{setmaxnreg.inc.sync.aligned.u32 %0; \n\t}}" ::"n"(COMPUTE_REG_COUNT));
 #else
         asm volatile("trap;\n");
 #endif
-''' if generate_cu_trtllm else r'''asm volatile("{setmaxnreg.inc.sync.aligned.u32 %0; \n\t}" ::"n"(COMPUTE_REG_COUNT));'''
+'''.format(compute_reg_count=compute_reg_count) if generate_cu_trtllm else r'''
+        const int COMPUTE_REG_COUNT = {compute_reg_count};
+        asm volatile("{{setmaxnreg.inc.sync.aligned.u32 %0; \n\t}}" ::"n"(COMPUTE_REG_COUNT));'''.format(
+        compute_reg_count=compute_reg_count)
     local_ns_open = ns_open if generate_cu_trtllm else ''
     local_ns_close = ns_close if generate_cu_trtllm else ''
 
@@ -3400,9 +3398,6 @@ def generate_files(specs_names):
             continue
         # add valid specs names
         valid_specs_names.append((kspec, fname, lname, kname))
-        if kspec.sm == 90 and kspec.sage_block_sizes is not None:
-            continue
-            # not generating cu files for Hopper with Sage attention
         path = os.path.join('./generated', fname)
         # HACK: do not overwrite kernel file in case of collision; kernel selection logic can still be flaky
         # TODO: allow profiling multiple kernel implementations satisfying the given problem size
