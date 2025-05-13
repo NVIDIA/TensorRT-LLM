@@ -6,6 +6,7 @@ import platform
 import signal
 import subprocess
 import sys
+import tempfile
 
 import psutil
 
@@ -157,8 +158,8 @@ def call(*popenargs,
 
     running_log = None
     if "running_log" in kwargs:
-        if isinstance(kwargs["running_log"], str):
-            running_log = open(kwargs["running_log"], "wt")
+        if isinstance(kwargs["running_log"], tempfile._TemporaryFileWrapper):
+            running_log = kwargs["running_log"]
         kwargs.pop("running_log", 'Not Found')
     with Popen(*popenargs,
                start_new_session=start_new_session,

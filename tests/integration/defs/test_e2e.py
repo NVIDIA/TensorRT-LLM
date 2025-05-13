@@ -46,7 +46,7 @@ _MEM_FRACTION_90 = 0.90
 _MEM_FRACTION_95 = 0.95
 
 
-def _get_mem_info_from_log(file_name, ranks_num):
+def _get_mem_info_from_log(file, ranks_num):
     import re
 
     # Peak memory size, model memory size and extra memory size are printed
@@ -55,15 +55,15 @@ def _get_mem_info_from_log(file_name, ranks_num):
     fraction_pattern = re.compile(r"fraction is set ([\d]+\.[\d]+), ")
     fraction = 0.90
     kv_mem_size = []
-    with open(file_name, mode='r') as f:
-        lines = f.readlines()
-        for line in lines:
-            match = pattern.findall(line)
-            if len(match) > 0:
-                kv_mem_size.append(float(match[0]))
-            match = fraction_pattern.findall(line)
-            if len(match) > 0:
-                fraction = float(match[0])
+    file.seek(0)
+    lines = file.readlines()
+    for line in lines:
+        match = pattern.findall(line)
+        if len(match) > 0:
+            kv_mem_size.append(float(match[0]))
+        match = fraction_pattern.findall(line)
+        if len(match) > 0:
+            fraction = float(match[0])
     assert len(kv_mem_size) % 2 == 0, ""
     kv_mem_size = kv_mem_size[len(kv_mem_size) // 2:]
     return 0, 0, sum(kv_mem_size) / ranks_num, 0, fraction
@@ -75,12 +75,12 @@ def _get_kv_mem_size_candidate(used_Gib, fraction):
     return (total / (1 << 30)) * fraction - used_Gib
 
 
-def _check_mem_usage(file_name, mem_info, ranks_num=1):
-    if file_name is None and not TEST_MEM_USAGE:
+def _check_mem_usage(file, mem_info, ranks_num=1):
+    if file is None or not TEST_MEM_USAGE:
         return
     delta = 0.2  # 0.2 GB as buffer
     peak, model_size, kv_mem_size, extra, fraction = _get_mem_info_from_log(
-        file_name, ranks_num)
+        file, ranks_num)
 
     e_peak, e_model_size, e_kv_mem_size, e_extra = mem_info
     e_kv_mem_size = _get_kv_mem_size_candidate(e_peak, fraction)
@@ -532,20 +532,19 @@ def test_trtllm_bench_pytorch_backend_sanity(llm_root, llm_venv,
     if use_extra_config:
         benchmark_cmd += f" --extra_llm_api_options {temp_extra_llm_api_options_file}"
 
-    running_log = None
-    try:
-        model_id = llama_model_root.split(r"/")[-1]
-        if "nvfp4-quantized" in llama_model_root:
-            model_id += "-NVFP4"
-        running_log = tempfile.mkstemp(dir="./", suffix=f".{model_id}.log")[1]
+    model_id = llama_model_root.split(r"/")[-1]
+    if "nvfp4-quantized" in llama_model_root:
+        model_id += "-NVFP4"
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_id}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
         check_call(benchmark_cmd, shell=True, running_log=running_log)
         if model_id in mapping and not use_extra_config:
             # extra config defines max kv cache tokens number to be 40000 which makes the checking
             # the checking process not unified.
             _check_mem_usage(running_log, [mapping[model_id], 0, 0, 0])
-    finally:
-        if running_log:
-            os.remove(running_log)
 
 
 def test_trtllm_bench_mgmn(llm_root, llm_venv):
@@ -567,15 +566,14 @@ def test_trtllm_bench_mgmn(llm_root, llm_venv):
             f"throughput " \
             f"--dataset {str(dataset_path)} --backend pytorch --tp 2"
 
-    running_log = None
-    try:
-        model_name = model_name.split(r"/")[-1]
-        running_log = tempfile.mkstemp(dir="./", suffix=f".{model_name}.log")[1]
+    model_name = model_name.split(r"/")[-1]
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_name}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
         check_call(benchmark_cmd, shell=True, running_log=running_log)
         _check_mem_usage(running_log, [30, 0, 0, 0])
-    finally:
-        if running_log:
-            os.remove(running_log)
 
 
 @pytest.mark.parametrize("model_subdir", [
@@ -687,7 +685,6 @@ def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
     '''
     iteration_log = None
     engine_dir = None
-    running_log = None
 
     try:
         skip_engine_build = backend is not None
@@ -721,10 +718,14 @@ def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
 
         if skip_engine_build:
             model_name = model_name.split("/")[-1]
-            running_log = tempfile.mkstemp(
-                dir="./", suffix=f".{model_name}_{streaming}.log")[1]
-            check_call(benchmark_cmd, shell=True, running_log=running_log)
-            _check_mem_usage(running_log, [19.4, 0, 0, 0])
+            with tempfile.NamedTemporaryFile(
+                    mode='w+b',
+                    suffix=f".{model_name}_{streaming}.log",
+                    dir="./",
+                    delete=True,
+                    delete_on_close=True) as running_log:
+                check_call(benchmark_cmd, shell=True, running_log=running_log)
+                _check_mem_usage(running_log, [19.4, 0, 0, 0])
         else:
             check_call(benchmark_cmd, shell=True)
 
@@ -737,8 +738,6 @@ def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
     finally:
         if iteration_log:
             shutil.rmtree(iteration_log, ignore_errors=True)
-        if running_log:
-            os.remove(running_log)
         if engine_dir:
             shutil.rmtree(engine_dir, ignore_errors=True)
 
@@ -1311,23 +1310,21 @@ def test_build_time_benchmark_sanity(llm_root, llm_venv):
 
 ### Pivot-To-Python examples
 def test_ptp_quickstart(llm_root, llm_venv):
-    running_log = None
-    try:
-        example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
 
-        src = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
-        dst = f"{llm_venv.get_working_directory()}/meta-llama/Llama-3.1-8B-Instruct"
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        os.symlink(src, dst, target_is_directory=True)
+    src = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
+    dst = f"{llm_venv.get_working_directory()}/meta-llama/Llama-3.1-8B-Instruct"
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    os.symlink(src, dst, target_is_directory=True)
 
-        running_log = tempfile.mkstemp(dir="./",
-                                       suffix=".Llama-3.1-8B-Instruct.log")[1]
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=".Llama-3.1-8B-Instruct.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
         venv_check_call(llm_venv, [str(example_root / "quickstart.py")],
                         running_log=running_log)
         _check_mem_usage(running_log, [4.60, 0, 0, 0])
-    finally:
-        if running_log:
-            os.remove(running_log)
 
 
 @pytest.mark.parametrize("model_name,model_path", [
@@ -1361,10 +1358,11 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
             "Llama3.1-8B-FP8": 13.05,
             "Llama3.1-8B-NVFP4": 10.2
         }
-        running_log = None
-        try:
-            running_log = tempfile.mkstemp(dir="./",
-                                           suffix=f".{model_name}.log")[1]
+        with tempfile.NamedTemporaryFile(mode='w+t',
+                                         suffix=f".{model_name}.log",
+                                         dir="./",
+                                         delete=True,
+                                         delete_on_close=True) as running_log:
             llm_venv.run_cmd([
                 str(example_root / "quickstart_advanced.py"),
                 "--enable_overlap_scheduler",
@@ -1375,9 +1373,6 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
                              running_log=running_log)
             if model_name in mapping:
                 _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0])
-        finally:
-            if running_log:
-                os.remove(running_log)
 
 
 @pytest.mark.parametrize("model_name,model_path", [
@@ -1387,9 +1382,11 @@ def test_ptq_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
                                      model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
-    running_log = None
-    try:
-        running_log = tempfile.mkstemp(dir="./", suffix=f".{model_name}.log")[1]
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_name}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
         llm_venv.run_cmd(
             [
                 str(example_root / "quickstart_advanced.py"),
@@ -1404,9 +1401,6 @@ def test_ptq_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
             ],
             running_log=running_log)
         _check_mem_usage(running_log, [54.50, 0, 0, 0])
-    finally:
-        if running_log:
-            os.remove(running_log)
 
 
 @pytest.mark.skip_less_device_memory(80000)
@@ -1419,9 +1413,11 @@ def test_ptp_quickstart_advanced_deepseek_v3_2nodes_8gpus(
     # "RCCA https://nvbugs/5163844"
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
-    running_log = None
-    try:
-        running_log = tempfile.mkstemp(dir="./", suffix=f".{model_name}.log")[1]
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_name}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
             "--enable_overlap_scheduler",
@@ -1436,9 +1432,6 @@ def test_ptp_quickstart_advanced_deepseek_v3_2nodes_8gpus(
         ],
                          running_log=running_log)
         # _check_mem_usage(running_log, [56.30, 0, 0, 0])
-    finally:
-        if running_log:
-            os.remove(running_log)
 
 
 @pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
@@ -1449,9 +1442,11 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
                                         model_path, eagle_model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
-    running_log = None
-    try:
-        running_log = tempfile.mkstemp(dir="./", suffix=f".{model_name}.log")[1]
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_name}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
             "--spec_decode_nextn",
@@ -1466,9 +1461,6 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
         ],
                          running_log=running_log)
         _check_mem_usage(running_log, [25.2, 0, 0, 0])
-    finally:
-        if running_log:
-            os.remove(running_log)
 
 
 @skip_post_blackwell
@@ -1482,9 +1474,11 @@ def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
                                                    model_name, model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
-    running_log = None
-    try:
-        running_log = tempfile.mkstemp(dir="./", suffix=f".{model_name}.log")[1]
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_name}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
             "--enable_overlap_scheduler",
@@ -1502,9 +1496,6 @@ def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
         ],
                          running_log=running_log)
         _check_mem_usage(running_log, [106.3, 0, 0, 0], 8)
-    finally:
-        if running_log:
-            os.remove(running_log)
 
 
 @pytest.mark.skip_less_device_memory(110000)
@@ -1517,9 +1508,11 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
         llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
-    running_log = None
-    try:
-        running_log = tempfile.mkstemp(dir="./", suffix=f".{model_name}.log")[1]
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_name}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
             "--enable_overlap_scheduler",
@@ -1543,9 +1536,6 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
         ],
                          running_log=running_log)
         _check_mem_usage(running_log, [85.6, 0, 0, 0], 8)
-    finally:
-        if running_log:
-            os.remove(running_log)
     # TODO: relaxed acceptance is incompatible with attention dp
     # "--enable_attention_dp"
 
@@ -1574,7 +1564,6 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
                                        model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
-    running_log = None
     mapping = {
         "Llama3.1-70B-BF16": 21.0,
         "Mixtral-8x7B-BF16": 16.5,
@@ -1583,9 +1572,11 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
         "Mixtral-8x7B-NVFP4": 9.9,
         "Nemotron-Ultra-253B": 72.3
     }
-
-    try:
-        running_log = tempfile.mkstemp(dir="./", suffix=f".{model_name}.log")[1]
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_name}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
             "--enable_overlap_scheduler",
@@ -1597,18 +1588,17 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
                          running_log=running_log)
         if model_name in mapping:
             _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0], 8)
-    finally:
-        if running_log:
-            os.remove(running_log)
 
 
 @skip_pre_blackwell
 def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
     model_path = "Llama-3_1-8B-Instruct_fp8_nvfp4_hf"
-    running_log = None
-    try:
-        running_log = tempfile.mkstemp(dir="./", suffix=f".{model_path}.log")[1]
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_path}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
             "--model_dir",
@@ -1616,9 +1606,6 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
         ],
                          running_log=running_log)
         _check_mem_usage(running_log, [12.0, 0, 0, 0])
-    finally:
-        if running_log:
-            os.remove(running_log)
 
 
 @pytest.mark.parametrize("modality", ["image", "video"])
@@ -1826,9 +1813,12 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
     mapping = {
         "NVILA-8B-FP16": [72.3, 0.6],
     }
-    running_log = None
-    try:
-        running_log = tempfile.mkstemp(dir="./", suffix=f".{model_name}.log")[1]
+
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_name}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
         llm_venv.run_cmd([
             str(example_root / "quickstart_multimodal.py"),
             "--model_dir",
@@ -1845,9 +1835,6 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         if model_name in mapping:
             peak, fraction = mapping[model_name]
             _check_mem_usage(running_log, [peak, 0, 0, 0])
-    finally:
-        if running_log:
-            os.remove(running_log)
 
 
 @pytest.mark.parametrize("model_name,model_path", [
