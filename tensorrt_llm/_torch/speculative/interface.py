@@ -48,7 +48,7 @@ class SpeculativeDecodingMode(IntEnum):
     def need_load_draft_weights(self):
         """
         Whether the draft model and target model are in the same model engine,
-        and the draft model needs to load weights from the separate checkpoint.
+        and the draft model needs to load weights from the sepagit arate checkpoint.
         """
         return self.is_eagle3_one_model()
 

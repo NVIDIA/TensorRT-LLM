@@ -12,6 +12,8 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization.utils.fp4_utils import (
+    reorder_rows_for_gated_act_gemm, shuffle_matrix_a)
 
 from ...models.modeling_utils import QuantConfig
 from ..utils import Fp4QuantizedTensor
@@ -160,7 +162,8 @@ class Linear(nn.Module):
         use_custom_cublas_mm: bool = False,
         lora: Optional[LoraLayer] = None,
         use_llama4_qkv: bool = False,
-        use_llama4_fc_swiglu: bool = False,
+        use_llama4_fc_swiglu_kernel: bool = False,
+        previous_gate_up_proj: nn.Module = None,
     ):
         from ..distributed import AllReduce
 
@@ -208,12 +211,22 @@ class Linear(nn.Module):
         self.use_llama4_qkv = use_llama4_qkv and self.in_features == 5120 and self.out_features == 896
         # Llama4 FC13+SwiGLU kernel has hard requirement of hidden_size = 5120
         # and targets output_features = 2048 or 4096.
-        self.use_llama4_fc_swiglu = use_llama4_fc_swiglu and self.in_features == 5120 and (
+        self.use_llama4_fc_swiglu_kernel = use_llama4_fc_swiglu_kernel and self.in_features == 5120 and (
             self.out_features == 2048 or self.out_features == 4096)
 
         self.combined_scale = torch.randn(1, dtype=torch.float32, device='cuda')
         if not skip_create_weights_in_init:
             self.create_weights()
+
+        # Record the previous linear layer.
+        # We need this in llama4, where the previous layer, gate up projection,
+        # is custom kernel is outputting fp8 precision. In this case, we want to feed
+        # inv_input_scale from this current layer to our previous to offset the
+        # quantization. Due to current workflow problem, the weight initrialization
+        # happens during load_weights. From gate_up_proj perspective, it doesn't want
+        # combined_scale * down_proj.inv_input_scale to happen during runtime.
+        # Such initialization will be done in the current layer with this object linked.
+        self.previous_gate_up_proj = previous_gate_up_proj
 
     def create_weights(self):
         if self._weights_created:
@@ -336,7 +349,6 @@ class Linear(nn.Module):
         bias,
         lora_params: Optional[dict] | None = None,
         layer_idx: Optional[int] | None = None,
-        inv_input_scale: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         if self.has_any_quant:
@@ -351,12 +363,33 @@ class Linear(nn.Module):
                     # Kernel is only supported when M <= 8
                     output = torch.ops.trtllm.llama4_qkv_gemm(
                         qinput, weight.t(), self.combined_scale, position_ids)
-                elif self.use_llama4_fc_swiglu and inv_input_scale is not None:
+                elif self.use_llama4_fc_swiglu_kernel and qinput.shape[0] <= 4:
+                    # outputting fp8 even though self.dtype is bfloat16
+                    # That is why we need inv_input_scale from next linear layer to
+                    # offset the quantization.
                     output = torch.ops.trtllm.llama4_fc_swiglu_tiled_fp8(
                         qinput,
                         weight.t(),
                         self.combined_scale,
-                        inv_input_scale,
+                        self.next_gate_down_inv_input_scale,
+                    )
+                elif self.use_llama4_fc_swiglu_kernel and (4 < qinput.shape[0]
+                                                           <= 16):
+                    if not hasattr(self, "trtllm_gen_global_scale"):
+                        raise ValueError(
+                            'Expect trtllm_gen_global_scale to be set')
+                    # outputting fp8 even though self.dtype is bfloat16
+                    # That is why we need inv_input_scale from next linear layer to
+                    # offset the quantization.
+                    # Assume always low latency mode for now.
+                    output = torch.ops.trtllm.fp8_per_tensor_scaling_tllmg_gemm(
+                        qinput,
+                        weight,
+                        global_scale=self.trtllm_gen_global_scale,
+                        global_scale_gate=self.combined_scale,
+                        out_dtype=torch.float8_e4m3fn,
+                        low_latency_kernel=True,
+                        gated_silu=True,
                     )
                 else:
                     # This op does not support bias now.
@@ -456,7 +489,6 @@ class Linear(nn.Module):
         input: Union[torch.Tensor, Fp4QuantizedTensor],
         *,
         all_reduce_params: Optional[AllReduceParams] = None,
-        inv_input_scale: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         lora_params: Optional[dict] = None,
         layer_idx: Optional[int] = None,
@@ -479,31 +511,38 @@ class Linear(nn.Module):
                 output = self.apply_linear(input, self.weight, bias,
                                            lora_params, layer_idx)
         elif self.tp_mode == TensorParallelMode.COLUMN:
-            if self.use_llama4_fc_swiglu and self.has_fp8_qdq and input.shape[
-                    0] <= 4:
-                # We are passing the input_scale's inverse of the next layer to the current layer
-                # Caller (gated_mlp.py) guards the feeding of inv_input_scale with
-                # "if self.is_llama4 and self.down_proj.has_fp8_qdq and x.shape[0] <= 4".
-                # If the statement is not satisfied, inv_input_scale is None.
+            if self.use_llama4_qkv and position_ids is not None:
                 output = self.apply_linear(input,
                                            self.weight,
                                            self.bias,
+                                           position_ids=position_ids,
                                            lora_params,
-                                           layer_idx,
-                                           inv_input_scale=inv_input_scale)
-            elif self.use_llama4_qkv and position_ids is not None:
-                output = self.apply_linear(input,
-                                           self.weight,
-                                           self.bias,
-                                           position_ids=position_ids)
+                                           layer_idx)
+            elif self.use_llama4_fc_swiglu_kernel:
+                if 4 < input.shape[0] <= 16:
+                    output = self.apply_linear(input, self.trtllm_gen_weight,
+                                               self.bias, lora_params,
+                                               layer_idx)
+                else:
+                    output = self.apply_linear(input, self.weight, self.bias,
+                                               lora_params, layer_idx)
             else:
                 output = self.apply_linear(input, self.weight, self.bias,
                                            lora_params, layer_idx)
             if self.gather_output:
                 output = allgather(output, self.mapping)
         else:
-            output = self.apply_linear(input, self.weight, self.bias,
-                                       lora_params, layer_idx)
+            if self.use_llama4_fc_swiglu_kernel:
+                if 4 < input.shape[0] <= 16:
+                    output = self.apply_linear(input, self.trtllm_gen_weight,
+                                               self.bias, lora_params,
+                                               layer_idx)
+                else:
+                    output = self.apply_linear(input, self.weight, self.bias,
+                                               lora_params, layer_idx)
+            else:
+                output = self.apply_linear(input, self.weight, self.bias,
+                                           lora_params, layer_idx)
 
         return output
 
@@ -542,6 +581,15 @@ class Linear(nn.Module):
                     _copy(self.weight_scale, weight_scale[0])
                     self.inv_input_scale.data = 1.0 / self.input_scale
                     self.combined_scale = self.input_scale * self.weight_scale
+                    if self.previous_gate_up_proj is not None:
+                        if hasattr(self.previous_gate_up_proj,
+                                   "combined_scale"):
+                            self.previous_gate_up_proj.trtllm_gen_global_scale = self.previous_gate_up_proj.combined_scale * self.inv_input_scale
+                            self.previous_gate_up_proj.next_gate_down_inv_input_scale = self.inv_input_scale
+                        else:
+                            raise ValueError(
+                                'Unexpected weight load sequence. Gate down proj weight is loaded before gate up proj weight.'
+                            )
                 elif quant_mode.has_nvfp4():
                     input_scale, weight_scale, alpha = load_weight_scales_nvfp4(
                         weights,
@@ -653,7 +701,11 @@ class Linear(nn.Module):
                     _copy(self.weight_scale, max(weight_scale))
                     gate_weight = gate_weight.to(self.dtype) * weight_scale[0]
                     up_weight = up_weight.to(self.dtype) * weight_scale[1]
-                    self.combined_scale = self.input_scale * self.weight_scale
+                    if hasattr(self, "next_gate_down_inv_input_scale"):
+                        self.combined_scale = self.input_scale * self.weight_scale
+                        self.trtllm_gen_global_scale = self.combined_scale * self.next_gate_down_inv_input_scale
+                    else:
+                        self.combined_scale = self.input_scale * self.weight_scale
                 elif quant_mode.has_nvfp4():
                     input_scale, weight_scale, alpha = load_weight_scales_nvfp4(
                         weights,
@@ -681,12 +733,31 @@ class Linear(nn.Module):
                     _copy(self.weight_scale, fused_scale)
 
             fused_weight = torch.cat((gate_weight, up_weight))
+            if self.use_llama4_fc_swiglu_kernel:
+                # trtllm-gen kernel has gate as lower half
+                # cublas / llama4_fc_swiglu has gate as upper half
+                up_gate_weight = torch.cat((up_weight, gate_weight))
+
+                up_gate_weight = reorder_rows_for_gated_act_gemm(up_gate_weight)
+                # Shuffling is needed for low latency mode. Assuming always low latency mode for now.
+                # epilogue_tile_m is hardcoded as 128 for now.
+                epilogue_tile_m = 128
+                up_gate_weight = shuffle_matrix_a(up_gate_weight,
+                                                  epilogue_tile_m)
+
+            gate_up_weight = torch.cat((gate_weight, up_weight))
 
             if quant_mode and quant_mode.has_fp8_qdq():
-                fused_weight = (fused_weight / self.weight_scale).to(
+                gate_up_weight = (gate_up_weight / self.weight_scale).to(
                     torch.float8_e4m3fn)
+                if self.use_llama4_fc_swiglu_kernel:
+                    up_gate_weight = (up_gate_weight / self.weight_scale).to(
+                        torch.float8_e4m3fn)
 
-            _copy(self.weight, fused_weight)
+            _copy(self.weight, gate_up_weight)
+
+            if self.use_llama4_fc_swiglu_kernel:
+                self.trtllm_gen_weight = up_gate_weight
 
             if self.bias is not None:
                 gate_bias = load_weight_shard(weights[0]['bias'], self.tp_size,
