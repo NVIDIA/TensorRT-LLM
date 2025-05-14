@@ -1100,9 +1100,10 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
 
+        self.is_eagle3_one_model = model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
+        )
         self.draft_model = None
-        if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
-        ):
+        if self.is_eagle3_one_model:
             draft_config = ModelConfig.from_pretrained(
                 model_config.spec_config.draft_model_path,
                 trust_remote_code=True,
@@ -1139,8 +1140,7 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        one_model_impl = True
-        if one_model_impl:
+        if self.is_eagle3_one_model:
             if self._supports_pp and self.pp_size > 1:
                 output = self.model(
                     input_ids=input_ids,
