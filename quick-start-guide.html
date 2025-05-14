@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -63,7 +63,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.20.0rc0" />
+  <meta name="docsearch:version" content="0.20.0rc2" />
 
 
   </head>
@@ -330,19 +330,19 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1 has-children"><a class="reference internal" href="examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference.html">Generate text</a></li>
-<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
-<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
-<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_customize.html">Generate text with customization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_quantization.html">Generation with Quantization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference.html">Generate text</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
@@ -351,19 +351,19 @@
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="examples/customization.html">LLM Common Customizations</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference.html">Generate text</a></li>
-<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
-<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
-<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_customize.html">Generate text with customization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_quantization.html">Generation with Quantization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference.html">Generate text</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
@@ -374,6 +374,7 @@
 <li class="toctree-l2"><a class="reference internal" href="examples/curl_chat_client.html">Curl Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/genai_perf_client.html">Genai Perf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/openai_chat_client.html">OpenAI Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
@@ -608,7 +609,7 @@ You can run inference such as the following example:</p>
 </section>
 <section id="compile-the-model-into-a-tensorrt-engine">
 <span id="quick-start-guide-compile"></span><h3>Compile the Model into a TensorRT Engine<a class="headerlink" href="#compile-the-model-into-a-tensorrt-engine" title="Link to this heading">#</a></h3>
-<p>Use the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">Llama model definition</a> from the <code class="docutils literal notranslate"><span class="pre">examples/llama</span></code> directory of the GitHub repository.
+<p>Use the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama">Llama model definition</a> from the <code class="docutils literal notranslate"><span class="pre">examples/models/core/llama</span></code> directory of the GitHub repository.
 The model definition is a minimal example that shows some of the optimizations available in TensorRT-LLM.</p>
 <div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp"># </span>From<span class="w"> </span>the<span class="w"> </span>root<span class="w"> </span>of<span class="w"> </span>the<span class="w"> </span>cloned<span class="w"> </span>repository,<span class="w"> </span>start<span class="w"> </span>the<span class="w"> </span>TensorRT-LLM<span class="w"> </span>container
 <span class="go">make -C docker release_run LOCAL_USER=1</span>
@@ -618,7 +619,7 @@ The model definition is a minimal example that shows some of the optimizations a
 <span class="go">huggingface-cli login --token *****</span>
 
 <span class="gp"># </span>Convert<span class="w"> </span>the<span class="w"> </span>model<span class="w"> </span>into<span class="w"> </span>TensorRT-LLM<span class="w"> </span>checkpoint<span class="w"> </span>format
-<span class="go">cd examples/llama</span>
+<span class="go">cd examples/models/core/llama</span>
 <span class="go">pip install -r requirements.txt</span>
 <span class="go">pip install --upgrade transformers # Llama 3.1 requires transformer 4.43.0+ version.</span>
 <span class="go">python3 convert_checkpoint.py --model_dir Meta-Llama-3.1-8B-Instruct --output_dir llama-3.1-8b-ckpt</span>
@@ -630,7 +631,7 @@ The model definition is a minimal example that shows some of the optimizations a
 </pre></div>
 </div>
 <p>When you create a model definition with the TensorRT-LLM API, you build a graph of operations from <a class="reference external" href="https://developer.nvidia.com/tensorrt">NVIDIA TensorRT</a> primitives that form the layers of your neural network. These operations map to specific kernels; prewritten programs for the GPU.</p>
-<p>In this example, we included the <code class="docutils literal notranslate"><span class="pre">gpt_attention</span></code> plugin, which implements a FlashAttention-like fused attention kernel, and the <code class="docutils literal notranslate"><span class="pre">gemm</span></code> plugin, that performs matrix multiplication with FP32 accumulation. We also called out the desired precision for the full model as FP16, matching the default precision of the weights that you downloaded from Hugging Face. For more information about plugins and quantizations, refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">Llama example</a> and <a class="reference internal" href="reference/precision.html#precision"><span class="std std-ref">Numerical Precision</span></a> section.</p>
+<p>In this example, we included the <code class="docutils literal notranslate"><span class="pre">gpt_attention</span></code> plugin, which implements a FlashAttention-like fused attention kernel, and the <code class="docutils literal notranslate"><span class="pre">gemm</span></code> plugin, that performs matrix multiplication with FP32 accumulation. We also called out the desired precision for the full model as FP16, matching the default precision of the weights that you downloaded from Hugging Face. For more information about plugins and quantizations, refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama">Llama example</a> and <a class="reference internal" href="reference/precision.html#precision"><span class="std std-ref">Numerical Precision</span></a> section.</p>
 </section>
 <section id="run-the-model">
 <h3>Run the Model<a class="headerlink" href="#run-the-model" title="Link to this heading">#</a></h3>

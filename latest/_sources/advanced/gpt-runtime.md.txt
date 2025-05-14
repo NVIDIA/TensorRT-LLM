@@ -17,7 +17,7 @@ LLaMA, for example.
 
 Complete support of encoder-decoder models, like T5, will be added to
 TensorRT-LLM in a future release. An experimental version, only in Python for
-now, can be found in the [`examples/enc_dec`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec) folder.
+now, can be found in the [`examples/models/core/enc_dec`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/enc_dec) folder.
 
 ## Overview
 
