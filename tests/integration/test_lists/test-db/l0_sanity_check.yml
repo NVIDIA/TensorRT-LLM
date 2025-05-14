@@ -54,3 +54,17 @@ l0_sanity_check:
         linux_distribution_name: ubuntu*
     tests:
       - llmapi/test_llm_examples.py::test_llmapi_example_medusa_decoding_use_modelopt
+  - condition:
+      ranges:
+        system_gpu_count:
+          gte: 1
+          lte: 1
+      wildcards:
+        gpu:
+          - '*b100*'
+          - '*h100*'
+        linux_distribution_name: ubuntu*
+    tests:
+      - unittest/llmapi/test_llm_pytorch.py
+      - test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-False-False]
+      - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP8-llama-3.1-model/Llama-3.1-8B-Instruct-FP8]
