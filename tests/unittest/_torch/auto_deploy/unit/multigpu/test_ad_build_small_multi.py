@@ -55,7 +55,7 @@ from utils.llm_data import llm_models_root
             },
         ),
         # small deepseek-v3 model with world_size 2
-         (
+        (
             2,
             {
                 "model": _hf_model_dir_or_hub_id(

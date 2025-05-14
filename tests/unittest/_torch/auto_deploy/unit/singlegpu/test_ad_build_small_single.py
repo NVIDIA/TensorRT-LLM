@@ -68,6 +68,20 @@ from utils.llm_data import llm_models_root
                 "model_kwargs": {"num_hidden_layers": 2},
             },
         ),
+        # small deepseek-v3 model with world_size 1
+        (
+            1,
+            {
+                "model": _hf_model_dir_or_hub_id(
+                    f"{llm_models_root()}/DeepSeek-V3",
+                    "deepseek-ai/DeepSeek-V3",
+                ),
+                "runtime": "demollm",
+                "attn_backend": "TritonWithFlattenedInputs",
+                "compile_backend": "torch-simple",
+                "model_kwargs": {"num_hidden_layers": 4},
+            },
+        ),
     ],
 )
 def test_build_ad(world_size: Optional[int], config: Dict):
