@@ -6,7 +6,6 @@ import groovy.json.JsonSlurper
 import groovy.json.JsonOutput
 import com.nvidia.bloom.KubernetesManager
 import com.nvidia.bloom.Constants
-import com.nvidia.bloom.CloudManager
 import com.nvidia.bloom.KubernetesManager
 import com.nvidia.bloom.SlurmConfig
 import com.nvidia.bloom.SlurmCluster
@@ -85,6 +84,47 @@ TESTER_MEMORY = "96Gi"
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
 
+def isNodeOnline(String nodeName) {
+    def node = Jenkins.instance.getNode(nodeName)
+    return node?.toComputer()?.isOnline() ?: false
+}
+
+def destroyNode(String nodeName) {
+    Node node = Jenkins.instance.getNode(nodeName)
+    hudson.model.Hudson.instance.removeNode(node)
+}
+
+def createNode(String nodeName) {
+    // Create simple agent
+    def jnlpLauncher = new JNLPLauncher("", null)
+    jnlpLauncher.setWebSocket(true)
+    def retentionStrategy = new RetentionStrategy.Always()
+    def ll = new LinkedList()
+    Slave slave = new DumbSlave(
+        nodeName,
+        "On-demand Jenkins agent for TensorRT Blossom",
+        "/tmp/jenkins",
+        "1",
+        Node.Mode.NORMAL,
+        nodeName,
+        jnlpLauncher,
+        retentionStrategy,
+        ll
+    )
+
+    // Add default env properties
+    List<Entry> env = new ArrayList<Entry>();
+    EnvironmentVariablesNodeProperty envProp = new EnvironmentVariablesNodeProperty(env);
+    slave.getNodeProperties().add(envProp)
+
+    // Add agent to Jenkins instance
+    Jenkins.instance.addNode(slave)
+
+    Node node = Jenkins.instance.getNode(nodeName)
+
+    return node.getComputer().getJnlpMac()
+}
+
 def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName){
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
         def remote = [
@@ -148,7 +188,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
 
     def nodeName = "${cluster.host}-test-${UUID.randomUUID().toString()}"
-    def nodeSecret = CloudManager.createNode(nodeName)
+    def nodeSecret = createNode(nodeName)
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
@@ -184,7 +224,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             }
         }
 
-        if (!CloudManager.isNodeOnline(nodeName)){
+        if (!isNodeOnline(nodeName)){
             catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
                 error "Cannot find a node that is idle to run the test for ${stageName}"
             }
@@ -196,7 +236,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
         executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
     } finally {
         cleanUpNodeResources(pipeline, cluster, nodeName)
-        CloudManager.destroyNode(nodeName)
+        destroyNode(nodeName)
     }
 }
 
