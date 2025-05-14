@@ -12,7 +12,7 @@ For more information on KV cache reuse see [KV cache reuse](kv-cache-reuse.md).
 
 ### **Block**
 - **Definition:** The smallest unit of KV cache allocation. A `KVCacheBlock` holds metadata (not the actual data) for a chunk of KV cache.
-- **Purpose:** Each block represents a fixed number of tokens' worth of KV data (see `tokensPerBlock`).
+- **Purpose:** Each block represents a fixed number of tokens' worth of KV data (can be specified by `tokens_per_block` parameter).
 - **Usage:** Blocks are allocated, reused, or evicted as sequences are processed.
 
 ### **Page**
@@ -46,9 +46,9 @@ only a *single* pool will be created within the structure described below.
 
 **Hierarchy Summary:**
 - **Pool** (memory buffer for KV data)
-  - contains many →
-- **Blocks** (metadata for a chunk of the pool, each block = N tokens)
-    - (optionally, blocks can be swapped between primary/secondary pools)
+  - Contains many blocks.
+- **Blocks** (metadata for a chunk of the pool, each block = `tokens_per_block` tokens)
+    - (Optionally, blocks can be swapped between primary/secondary pools.)
 - **BlockManager/WindowBlockManager**: Manage pools and blocks, handle allocation, reuse, and eviction.
 
 ---
