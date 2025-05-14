@@ -33,6 +33,16 @@ def run_cmd(cmd):
     return result
 
 
+def handle_check_failure(error_msg):
+    """Helper function to handle check failures with consistent messaging"""
+
+    print(f"\nError: {error_msg}")
+    print(
+        "Please refer to our coding style guidelines at: https://github.com/NVIDIA/TensorRT-LLM/blob/main/CONTRIBUTING.md#coding-style to fix this issue"
+    )
+    sys.exit(1)
+
+
 def main():
     # Install pre-commit and bandit from requirements-dev.txt
     with open("requirements-dev.txt") as f:
@@ -47,7 +57,10 @@ def main():
     run_cmd("pre-commit install")
 
     # Run pre-commit on all files
-    run_cmd("pre-commit run -a --show-diff-on-failure")
+    try:
+        run_cmd("pre-commit run -a --show-diff-on-failure")
+    except SystemExit:
+        handle_check_failure("pre-commit checks failed")
 
     # Run bandit security checks
     bandit_output = run_cmd(
@@ -56,12 +69,10 @@ def main():
 
     # Check bandit results
     if "Total lines skipped (#nosec): 0" not in bandit_output:
-        print("Error: Found #nosec annotations in code")
-        sys.exit(1)
+        handle_check_failure("Found #nosec annotations in code")
 
     if "Issue:" in bandit_output:
-        print("Error: Bandit found security issues")
-        sys.exit(1)
+        handle_check_failure("Bandit found security issues")
 
     print("pre-commit and bandit checks passed")
 

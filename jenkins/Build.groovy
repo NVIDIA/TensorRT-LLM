@@ -16,7 +16,7 @@ AARCH64_TRIPLE = "aarch64-linux-gnu"
 
 LLM_DOCKER_IMAGE = env.dockerImage
 
-AGENT_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-x86_64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202505121727-4049"
+AGENT_IMAGE = env.dockerImage
 
 POD_TIMEOUT_SECONDS = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
 
@@ -192,7 +192,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                     claimName: sw-tensorrt-pvc
     """
     if (arch == "arm64") {
-        // WAR: PVC mount is not setup on GH200 machines, use a small local cache as a WAR
+        // PVC mount isn't supported on aarch64 platform. Use NFS as a WAR.
         pvcVolume = """
                 - name: sw-tensorrt-pvc
                   nfs:
@@ -612,7 +612,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(pipeline, globalVars[ACTION_INFO])
     }
 
-    def wheelDockerImage = env.wheelDockerImage
+    def wheelDockerImage = env.wheelDockerImagePy310
     if (!wheelDockerImage && cpu_arch == AARCH64_TRIPLE) {
         wheelDockerImage = env.dockerImage
     }
