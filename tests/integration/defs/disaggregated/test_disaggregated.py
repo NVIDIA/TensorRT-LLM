@@ -155,7 +155,8 @@ def run_disaggregated_test(example_dir,
         client_cmd = [
             'python3', f'{client_dir}/disagg_client.py', '-c',
             f'{example_dir}/disagg_config.yaml', '-p',
-            f'{client_dir}/prompts.json', '--server-start-timeout',
+            f'{client_dir}/prompts.json', '--ignore-eos',
+            '--server-start-timeout',
             str(server_start_timeout)
         ]
         subprocess.run(client_cmd, check=True, env=env)
