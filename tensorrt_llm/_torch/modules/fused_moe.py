@@ -246,12 +246,6 @@ class FusedMoE(nn.Module):
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         apply_router_weight_on_input: bool = False,
-        # The min-latency fused MoE FC13 kernel applies the sigmoid score
-        # scaling to the input, so we must use the input scale before the score
-        # scaling as the input scale for the MoE layer.
-        # Therefore, pass a reference to the shared expert to the MoE layer so that it can access the input scale
-        # before the score scaling.
-        shared_expert: Optional[GatedMLP] = None,
     ):
         from ..distributed import AllReduce
 
@@ -316,9 +310,6 @@ class FusedMoE(nn.Module):
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
-
-        self.shared_expert = shared_expert
-        self.min_latency_quant_scales = None
 
     def setup_quant_scales(self):
         self.quant_scales = None
@@ -591,25 +582,8 @@ class FusedMoE(nn.Module):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         min_latency_mode: bool = False,
-        llama4_tp8ep1_min_latency_mode: bool = False,
         output_dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
-        # When running tp8ep1 on fp8 128 experts llama4, we use min latency gemv kernels to run moe.
-        if llama4_tp8ep1_min_latency_mode:
-            # Quantize input if it is not already in fp8.
-            if x.dtype != torch.float8_e4m3fn:
-                x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                    x, self.fc31_input_dequant)
-
-            # If min_latency_input_scale is provided and the input tensor is already in fp8
-            # we should use rescaled quant scales.
-            quant_scales = self.min_latency_quant_scales if self.min_latency_quant_scales is not None and x.dtype == torch.float8_e4m3fn else self.quant_scales
-
-            outputs = torch.ops.trtllm.llama4_moe_tp8ep1_min_latency(
-                x, router_logits, self.w3_w1_weight, self.w2_weight,
-                quant_scales)
-            return outputs
-
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
             output_dtype = output_dtype
@@ -710,13 +684,11 @@ class FusedMoE(nn.Module):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         min_latency_mode: bool = False,
-        llama4_tp8ep1_min_latency_mode: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
         if self.is_cutlass():
             return self.forward_cutlass(x, router_logits, min_latency_mode,
-                                        llama4_tp8ep1_min_latency_mode,
                                         output_dtype, all_rank_num_tokens)
         elif self.is_trtllm():
             assert not self.apply_router_weight_on_input, "TRTLLM backend does not support applying router weight on input yet."
@@ -731,7 +703,6 @@ class FusedMoE(nn.Module):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         min_latency_mode: bool = False,
-        llama4_tp8ep1_min_latency_mode: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
@@ -754,7 +725,6 @@ class FusedMoE(nn.Module):
 
         if num_chunks == 1:
             outputs = self.forward_chunk(x, router_logits, min_latency_mode,
-                                         llama4_tp8ep1_min_latency_mode,
                                          output_dtype)
             outputs = self.reducescatter_or_allreduce(outputs)
         else:
@@ -970,17 +940,6 @@ class FusedMoE(nn.Module):
                 )
             # Re-setup quant scales after loading weights as the tensors may have been modified.
             self.setup_quant_scales()
-
-        # If the reference to the shared expert is provided, read the pre-score scaling input scale from the shared
-        # expert. This assumes that shared expert is loaded before the MoE layer.
-        if self.shared_expert is not None and hasattr(self.shared_expert.gate_up_proj, "input_scale"):
-            pre_score_scaling_input_scale = self.shared_expert.gate_up_proj.input_scale
-            self.min_latency_quant_scales = FusedMoEQuantScalesFP8(
-                fc1_dequant=self.fc31_dequant.data / self.fc31_input_dequant.data * pre_score_scaling_input_scale,
-                fc2_quant=self.fc2_quant,
-                fc2_dequant=self.fc2_dequant,
-                fc1_input_dequant=pre_score_scaling_input_scale,
-            )
 
     def _load_fp8_block_scales_scales(self, weights: Dict):
         all_w2_scales = [

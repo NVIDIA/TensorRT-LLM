@@ -61,7 +61,6 @@ class Attention(nn.Module):
         use_qk_norm: bool = False,
         aux_stream: Optional[torch.cuda.Stream] = None,
         attn_temperature_tuning: bool = False,
-        is_llama4: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -113,7 +112,6 @@ class Attention(nn.Module):
         else:
             self.qk_norm = None
 
-        self.is_llama4 = is_llama4
         self.qkv_proj = Linear(
             self.hidden_size,
             tp_size * self.q_size + 2 * tp_size * self.kv_size,
@@ -125,11 +123,7 @@ class Attention(nn.Module):
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
             quant_config=config.get_quant_config(),
             skip_create_weights=config.skip_create_weights,
-            use_llama4_qkv=is_llama4,
         )
-        # o_proj is not feasible for trtllm-gen kernel because tileK in the kernel is 512.
-        # The kernel requires K to be multiple of 512.
-        # hidden_size is 5120, with TP8 we have local in_features (K) = 640.
         self.o_proj = Linear(
             self.hidden_size,
             self.hidden_size,
@@ -196,14 +190,8 @@ class Attention(nn.Module):
         lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
-        num_tokens = hidden_states.fp4_tensor.size(0) if isinstance(
-            hidden_states, Fp4QuantizedTensor) else hidden_states.size(0)
-        if self.attn_temperature_tuning and self.qkv_proj.use_llama4_qkv and num_tokens <= 8:
-            assert position_ids is not None, "attn_temperature_tuning requires position_ids"
-            assert self.floor_scale == 8192.0 and self.attn_scale == 0.1, "floor_scale and attn_scale should be 8192.0 and 0.1"
-            qkv = self.qkv_proj(hidden_states, position_ids=position_ids)
-        else:
-            qkv = self.qkv_proj(hidden_states)
+
+        qkv = self.qkv_proj(hidden_states)
 
         is_fused_qkv = False
         if isinstance(self.attn, TrtllmAttention):
@@ -241,8 +229,7 @@ class Attention(nn.Module):
                 k = self.qk_norm(k).reshape(-1, self.kv_size)
             qkv = torch.concat([q, k, v], dim=-1)
 
-        if self.attn_temperature_tuning and (not self.qkv_proj.use_llama4_qkv
-                                             or num_tokens > 8):
+        if self.attn_temperature_tuning:
             # this must be a nope layer
             assert position_ids is not None, "attn_temperature_tuning requires position_ids"
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
