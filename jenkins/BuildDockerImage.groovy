@@ -1,10 +1,15 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@emma_move_funcs']) _
 
 import java.lang.Exception
 import groovy.transform.Field
 
 // Docker image registry
 IMAGE_NAME = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging"
+
+BUILD_CORES_REQUESTED = "16"
+BUILD_CORES_LIMIT = "16"
+BUILD_MEMORY_REQUESTED = "72Gi"
+BUILD_MEMORY_LIMIT = "256Gi"
 
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
@@ -396,7 +401,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
 
 pipeline {
     agent {
-        kubernetes trtllm_utils.createKubernetesPodConfig("", "agent")
+        kubernetes trtllm_utils.createKubernetesPodConfig(type: "agent")
     }
 
     parameters {
