@@ -195,7 +195,7 @@ class TestFunctional(unittest.TestCase):
                 # the kernel to control ssm_state dtype. Just cast to test dtype here
                 ssm_state = ssm_state.to(dtype=torch_dtype)
 
-            outputs = (out, rearrange(ssm_state, "... p n -> ... n p"))
+            outputs = (out, ssm_state)
 
         else:
             y = selective_state_update(
@@ -210,7 +210,7 @@ class TestFunctional(unittest.TestCase):
                 dt_bias=dt_bias,
                 dt_softplus=delta_softplus,
             )
-            outputs = (y, rearrange(state, "... p n -> ... n p"))
+            outputs = (y, state)
 
         # pytorch run
         if req_type == 'context':
@@ -282,6 +282,7 @@ class TestFunctional(unittest.TestCase):
                                                  z=z_ref,
                                                  dt_bias=dt_bias_ref,
                                                  dt_softplus=delta_softplus)
+        state_ref = rearrange(state_ref, "... n p-> ... p n")
 
         atol = {"float16": 2e-2, "float32": 1e-2, "bfloat16": 1e-1}
 
