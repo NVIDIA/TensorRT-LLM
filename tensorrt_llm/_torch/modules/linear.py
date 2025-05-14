@@ -364,18 +364,18 @@ class Linear(nn.Module):
                     qinput = input
                 if self.use_llama4_qkv and (qinput.shape[0] <= 4):
                     # Kernel is only supported when M <= 8
-                    output = torch.ops.trtllm.llama4_qkv_gemm(
+                    output = torch.ops.trtllm.llama4_fp8_bf16_gemm(
                         qinput,
-                        weight.t(),
+                        weight,
                         self.combined_scale,
                         position_ids,
                     )
                 elif self.use_llama4_qkv and (4 < qinput.shape[0] <= 8):
                     if position_ids is not None:
                         # Kernel is only supported when M <= 8
-                        output = torch.ops.trtllm.llama4_qkv_gemm(
+                        output = torch.ops.trtllm.llama4_fp8_bf16_gemm(
                             qinput,
-                            weight.t(),
+                            weight,
                             self.combined_scale,
                             position_ids,
                         )
@@ -394,9 +394,9 @@ class Linear(nn.Module):
                     # offset the quantization.
                     if not hasattr(self, "next_gate_down_inv_input_scale"):
                         raise ValueError('Expect next_gate_down_inv_input_scale to be set')
-                    output = torch.ops.trtllm.llama4_fc_swiglu_tiled_fp8(
+                    output = torch.ops.trtllm.llama4_fp8_fp8_gemm_swiglu(
                         qinput,
-                        weight.t(),
+                        weight,
                         self.combined_scale,
                         self.next_gate_down_inv_input_scale,
                     )
@@ -490,8 +490,8 @@ class Linear(nn.Module):
         # This magic number 4 is empircal choice, and can be changed later.
         # The router gemm is currently only available for 128 experts (and not 16).
         if input.shape[0] <= 8 and self.global_out_features == 128:
-            return torch.ops.trtllm.llama4_router_gemm(
-                input, torch.transpose(self.weight, 0, 1))
+            return torch.ops.trtllm.llama4_bf16_bf16_gemm(
+                input, self.weight)
         else:
             return self.forward(input)
 

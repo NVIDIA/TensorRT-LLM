@@ -14,43 +14,20 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/llama4Fp8Bf16GemmPerBlockTemplate.cuh"
-#include "tensorrt_llm/kernels/llama4Fp8Bf16GemmAttnScalingPerBlockTemplate.cuh"
-#include "tensorrt_llm/kernels/llama4Fp8Bf16GemmPerWarpTemplate.cuh"
-#include "tensorrt_llm/kernels/llama4QKVGemm.h"
+#include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Fp8Bf16Gemm.h"
+#include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Fp8Bf16GemmAttnScalingPerBlockTemplate.cuh"
+#include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Fp8Bf16GemmPerBlockTemplate.cuh"
+#include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Fp8Bf16GemmPerWarpTemplate.cuh"
+#include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Utils.cuh"
 #include <stdexcept>
 
-namespace tensorrt_llm::kernels::llama4_qkv_gemm
+namespace tensorrt_llm::kernels::llama4_min_latency::llama4_fp8_bf16_gemm
 {
 
 DEFINE_GET_PER_BLOCK_FUNC_PTR(/*HIDDEN_IN=*/5120, /*ALIGNED=*/true);
 DEFINE_GET_PER_BLOCK_ATTN_SCALING_FUNC_PTR(/*HIDDEN_IN=*/5120, /*ALIGNED=*/true);
 
-// Function to launch kernel using FDL(Flexible Dispatch Layer)
-void launch_kernel_fdl(
-    dim3 grid_dim, dim3 block_dim, cudaStream_t stream, void* kernel_func, void* args[], int num_args)
-{
-    cudaLaunchConfig_t config;
-    config.gridDim = grid_dim;
-    config.blockDim = block_dim;
-    config.dynamicSmemBytes = 0;
-    config.stream = stream;
-
-    cudaLaunchAttribute attrs[1];
-    config.attrs = attrs;
-    config.numAttrs = 1;
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
-
-    cudaLaunchKernelExC(&config, (void const*) kernel_func, args);
-}
-
-inline int div_up(int x, int y)
-{
-    return (x + y - 1) / y;
-}
-
-void llama4_qkv_gemv_kernel_launcher(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B, __nv_bfloat16* C,
+void llama4_fp8_bf16_gemm_launcher(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B, __nv_bfloat16* C,
     float const* scaling_factor, int num_tokens, int hidden_in, int hidden_out, cudaStream_t stream)
 {
     void* args[] = {(void*) &A, (void*) &B, (void*) &C, (void*) &scaling_factor, (void*) &num_tokens,
@@ -58,56 +35,56 @@ void llama4_qkv_gemv_kernel_launcher(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const
     if (num_tokens == 1)
     {
         // When num_tokens == 1, the best tiling size is tile_token == 1 and tile_out == 1.
-        const dim3 grid_size = dim3(div_up(hidden_out, 1), div_up(num_tokens, 1), 1);
+        dim3 const grid_size = dim3(div_up(hidden_out, 1), div_up(num_tokens, 1), 1);
         void* kernel_func = get_per_block_func_ptr_aligned_true_5120_(1, 1);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 7);
     }
     else if (num_tokens == 2)
     {
         // When num_tokens == 2, the best tiling size is tile_token == 2 and tile_out == 1.
-        const dim3 grid_size = dim3(div_up(hidden_out, 1), div_up(num_tokens, 2), 1);
+        dim3 const grid_size = dim3(div_up(hidden_out, 1), div_up(num_tokens, 2), 1);
         void* kernel_func = get_per_block_func_ptr_aligned_true_5120_(2, 1);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 7);
     }
     else if (num_tokens == 3)
     {
         // When num_tokens == 3, the best tiling size is tile_token == 1 and tile_out == 4.
-        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
+        dim3 const grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
         void* kernel_func = get_per_block_func_ptr_aligned_true_5120_(1, 4);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 7);
     }
     else if (num_tokens == 4)
     {
         // When num_tokens == 4, the best tiling size is tile_token == 2 and tile_out == 2.
-        const dim3 grid_size = dim3(div_up(hidden_out, 2), div_up(num_tokens, 2), 1);
+        dim3 const grid_size = dim3(div_up(hidden_out, 2), div_up(num_tokens, 2), 1);
         void* kernel_func = get_per_block_func_ptr_aligned_true_5120_(2, 2);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 7);
     }
     else if (num_tokens == 5)
     {
         // When num_tokens == 5, the best tiling size is tile_token == 1 and tile_out == 4.
-        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
+        dim3 const grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
         void* kernel_func = get_per_block_func_ptr_aligned_true_5120_(1, 4);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 7);
     }
     else if (num_tokens == 6)
     {
         // When num_tokens == 6, the best tiling size is tile_token == 3 and tile_out == 4.
-        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 3), 1);
+        dim3 const grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 3), 1);
         void* kernel_func = get_per_block_func_ptr_aligned_true_5120_(3, 4);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 7);
     }
     else if (num_tokens == 7)
     {
         // When num_tokens == 7, the best tiling size is tile_token == 1 and tile_out == 4.
-        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
+        dim3 const grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
         void* kernel_func = get_per_block_func_ptr_aligned_true_5120_(1, 4);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 7);
     }
     else if (num_tokens == 8)
     {
         // When num_tokens == 8, the best tiling size is tile_token == 2 and tile_out == 4.
-        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 2), 1);
+        dim3 const grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 2), 1);
         void* kernel_func = get_per_block_func_ptr_aligned_true_5120_(2, 4);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 7);
     }
@@ -117,78 +94,76 @@ void llama4_qkv_gemv_kernel_launcher(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const
     }
 }
 
-void llama4_qkv_gemv_attn_scaling_kernel_launcher(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B, __nv_bfloat16* C,
-    float const* scaling_factor, int64_t const* pos_ids, float floor_scale, float attn_scale,
-    int num_tokens, int hidden_in, int hidden_out, int q_hidden_out, cudaStream_t stream)
+void llama4_fp8_bf16_gemm_attn_scaling_launcher(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B, __nv_bfloat16* C,
+    float const* scaling_factor, int64_t const* pos_ids, float floor_scale, float attn_scale, int num_tokens,
+    int hidden_in, int hidden_out, int q_hidden_out, cudaStream_t stream)
 {
-    void* args[] = {(void*) &A, (void*) &B, (void*) &C, (void*) &scaling_factor,
-                    (void*) &pos_ids, (void*) &floor_scale, (void*) &attn_scale,
-                    (void*) &num_tokens, (void*) &hidden_in, (void*) &hidden_out, (void*) &q_hidden_out};
+    void* args[] = {(void*) &A, (void*) &B, (void*) &C, (void*) &scaling_factor, (void*) &pos_ids, (void*) &floor_scale,
+        (void*) &attn_scale, (void*) &num_tokens, (void*) &hidden_in, (void*) &hidden_out, (void*) &q_hidden_out};
     if (num_tokens == 1)
     {
         // When num_tokens == 1, the best tiling size is tile_token == 1 and tile_out == 1.
-        const dim3 grid_size = dim3(div_up(hidden_out, 1), div_up(num_tokens, 1), 1);
+        dim3 const grid_size = dim3(div_up(hidden_out, 1), div_up(num_tokens, 1), 1);
         void* kernel_func = get_per_block_attn_scaling_func_ptr_aligned_true_5120_(1, 1);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 11);
     }
     else if (num_tokens == 2)
     {
         // When num_tokens == 2, the best tiling size is tile_token == 2 and tile_out == 2.
-        const dim3 grid_size = dim3(div_up(hidden_out, 2), div_up(num_tokens, 2), 1);
+        dim3 const grid_size = dim3(div_up(hidden_out, 2), div_up(num_tokens, 2), 1);
         void* kernel_func = get_per_block_attn_scaling_func_ptr_aligned_true_5120_(2, 2);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 11);
     }
     else if (num_tokens == 3)
     {
         // When num_tokens == 3, the best tiling size is tile_token == 1 and tile_out == 4.
-        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
+        dim3 const grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
         void* kernel_func = get_per_block_attn_scaling_func_ptr_aligned_true_5120_(1, 4);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 11);
     }
     else if (num_tokens == 4)
     {
         // When num_tokens == 4, the best tiling size is tile_token == 2 and tile_out == 2.
-        const dim3 grid_size = dim3(div_up(hidden_out, 2), div_up(num_tokens, 2), 1);
+        dim3 const grid_size = dim3(div_up(hidden_out, 2), div_up(num_tokens, 2), 1);
         void* kernel_func = get_per_block_attn_scaling_func_ptr_aligned_true_5120_(2, 2);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 11);
     }
     else if (num_tokens == 5)
     {
         // When num_tokens == 5, the best tiling size is tile_token == 1 and tile_out == 4.
-        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
+        dim3 const grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
         void* kernel_func = get_per_block_attn_scaling_func_ptr_aligned_true_5120_(1, 4);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 11);
     }
     else if (num_tokens == 6)
     {
         // When num_tokens == 6, the best tiling size is tile_token == 2 and tile_out == 4.
-        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 2), 1);
+        dim3 const grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 2), 1);
         void* kernel_func = get_per_block_attn_scaling_func_ptr_aligned_true_5120_(2, 4);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 11);
     }
     else if (num_tokens == 7)
     {
         // When num_tokens == 7, the best tiling size is tile_token == 1 and tile_out == 4.
-        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
+        dim3 const grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
         void* kernel_func = get_per_block_attn_scaling_func_ptr_aligned_true_5120_(1, 4);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 11);
     }
     else if (num_tokens == 8)
     {
         // When num_tokens == 8, the best tiling size is tile_token == 2 and tile_out == 4.
-        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 2), 1);
+        dim3 const grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 2), 1);
         void* kernel_func = get_per_block_attn_scaling_func_ptr_aligned_true_5120_(2, 4);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 11);
     }
     else
     {
-        throw std::runtime_error("llama4QKVGemm: num_tokens > 8 are not supported.");
+        throw std::runtime_error("llama4_fp8_bf16_gemm: num_tokens > 8 are not supported.");
     }
 }
 
-void llama4_qkv_gemm_op(
-    void const* A, void const* B, void* C, void const* scaling_factor,
-    void const* pos_ids, int num_tokens, int hidden_in, int hidden_out, cudaStream_t stream)
+void llama4_fp8_bf16_gemm_op(void const* A, void const* B, void* C, void const* scaling_factor, void const* pos_ids,
+    int num_tokens, int hidden_in, int hidden_out, cudaStream_t stream)
 {
     __nv_fp8_e4m3 const* A_fp8 = static_cast<__nv_fp8_e4m3 const*>(A);
     __nv_fp8_e4m3 const* B_fp8 = static_cast<__nv_fp8_e4m3 const*>(B);
@@ -198,16 +173,14 @@ void llama4_qkv_gemm_op(
     if (pos_ids != nullptr)
     {
         int64_t const* pos_ids_int64 = reinterpret_cast<int64_t const*>(pos_ids);
-        llama4_qkv_gemv_attn_scaling_kernel_launcher(
-            A_fp8, B_fp8, C_bf16, scaling_factor_float,
-            pos_ids_int64, FLOOR_SCALE, ATTN_SCALE,
-            num_tokens, hidden_in, hidden_out, Q_HIDDEN_OUT, stream);
+        llama4_fp8_bf16_gemm_attn_scaling_launcher(A_fp8, B_fp8, C_bf16, scaling_factor_float, pos_ids_int64,
+            FLOOR_SCALE, ATTN_SCALE, num_tokens, hidden_in, hidden_out, Q_HIDDEN_OUT, stream);
     }
     else
     {
-        llama4_qkv_gemv_kernel_launcher(
+        llama4_fp8_bf16_gemm_launcher(
             A_fp8, B_fp8, C_bf16, scaling_factor_float, num_tokens, hidden_in, hidden_out, stream);
     }
 }
 
-} // namespace tensorrt_llm::kernels::llama4_qkv_gemm
+} // namespace tensorrt_llm::kernels::llama4_min_latency::llama4_fp8_bf16_gemm

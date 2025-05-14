@@ -605,7 +605,7 @@ class FusedMoE(nn.Module):
             # we should use rescaled quant scales.
             quant_scales = self.min_latency_quant_scales if self.min_latency_quant_scales is not None and x.dtype == torch.float8_e4m3fn else self.quant_scales
 
-            outputs = torch.ops.trtllm.fused_moe_llama4_tp8ep1_min_latency(
+            outputs = torch.ops.trtllm.llama4_moe_tp8ep1_min_latency(
                 x, router_logits, self.w3_w1_weight, self.w2_weight,
                 quant_scales)
             return outputs

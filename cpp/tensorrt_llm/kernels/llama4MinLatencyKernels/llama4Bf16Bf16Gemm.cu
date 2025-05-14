@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/llama4RouterGemm.h"
-#include "tensorrt_llm/kernels/llama4Utils.cuh"
+#include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Bf16Bf16Gemm.h"
+#include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Utils.cuh"
 
-namespace tensorrt_llm::kernels::llama4_router_gemm
+namespace tensorrt_llm::kernels::llama4_min_latency::llama4_bf16_bf16_gemm
 {
 
 struct __align__(8) aligned_bf16x4
@@ -25,8 +25,7 @@ struct __align__(8) aligned_bf16x4
     __align__(8) __nv_bfloat16 data[VEC_SIZE];
 };
 
-// This is the hand-optimized kernel by Po-Han.
-__global__ void gemv_kernel(int num_tokens,
+__global__ void llama4_bf16_bf16_gemm_kernel(int num_tokens,
     __nv_bfloat16 const* __restrict__ A, // Input vector [num_tokens][5120]
     __nv_bfloat16 const* __restrict__ B, // Input matrix [128][5120]
     __nv_bfloat16* __restrict__ C        // Output vector [num_tokens][128]
@@ -56,7 +55,10 @@ __global__ void gemv_kernel(int num_tokens,
         // Load 4 elements at once
         b_vec[chunk] = reinterpret_cast<aligned_bf16x4 const*>(B)[row * GEMM_K / VEC_SIZE + base_idx];
     }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
 
     // Process 5 chunks of 4 elements each
 #pragma unroll
@@ -74,12 +76,7 @@ __global__ void gemv_kernel(int num_tokens,
             float2 a_val = make_float2(a_vec.data[i], a_vec.data[i + 1]);
             float2 b_val = make_float2(b_vec[chunk].data[i], b_vec[chunk].data[i + 1]);
 
-#if __CUDA_ARCH__ >= 1000
-            thread_sum = __ffma2_rn(a_val, b_val, thread_sum);
-#else
-            thread_sum.x += a_val.x * b_val.x;
-            thread_sum.y += a_val.y * b_val.y;
-#endif
+            thread_sum = ffma2(a_val, b_val, thread_sum);
         }
     }
 
@@ -109,42 +106,23 @@ __global__ void gemv_kernel(int num_tokens,
     }
 }
 
-// Function to launch kernel using FDL (Flexible Dispatch Layer)
-void launch_kernel_fdl(
-    dim3 grid_dim, dim3 block_dim, cudaStream_t stream, void* kernel_func, void* args[], int num_args)
-{
-    cudaLaunchConfig_t config;
-    config.gridDim = grid_dim;
-    config.blockDim = block_dim;
-    config.dynamicSmemBytes = 0;
-    config.stream = stream;
-
-    cudaLaunchAttribute attrs[1];
-    config.attrs = attrs;
-    config.numAttrs = 0;
-    attrs[config.numAttrs].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[config.numAttrs++].val.programmaticStreamSerializationAllowed = 1;
-
-    cudaLaunchKernelExC(&config, (void const*) kernel_func, args);
-}
-
-void gemv_kernel_launcher(
+void llama4_bf16_bf16_gemm_launcher(
     int num_tokens, __nv_bfloat16 const* A, __nv_bfloat16 const* B, __nv_bfloat16* C, cudaStream_t stream)
 {
 
     int const grid_size = NUM_EXPERTS * num_tokens;
 
     void* args[] = {(void*) &num_tokens, (void*) &A, (void*) &B, (void*) &C};
-    launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, (void*) gemv_kernel, args, 4);
+    launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, (void*) llama4_bf16_bf16_gemm_kernel, args, 4);
 }
 
-void llama4_router_gemm_op(int num_tokens, void const* A, void const* B, void* C, cudaStream_t stream)
+void llama4_bf16_bf16_gemm_op(int num_tokens, void const* A, void const* B, void* C, cudaStream_t stream)
 {
     __nv_bfloat16 const* A_bf16 = static_cast<__nv_bfloat16 const*>(A);
     __nv_bfloat16 const* B_bf16 = static_cast<__nv_bfloat16 const*>(B);
     __nv_bfloat16* C_bf16 = static_cast<__nv_bfloat16*>(C);
 
-    gemv_kernel_launcher(num_tokens, A_bf16, B_bf16, C_bf16, stream);
+    llama4_bf16_bf16_gemm_launcher(num_tokens, A_bf16, B_bf16, C_bf16, stream);
 }
 
-} // namespace tensorrt_llm::kernels::llama4_router_gemm
+} // namespace tensorrt_llm::kernels::llama4_min_latency::llama4_bf16_bf16_gemm

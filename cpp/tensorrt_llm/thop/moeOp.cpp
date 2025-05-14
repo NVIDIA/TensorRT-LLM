@@ -18,7 +18,6 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_gemm_kernels.h"
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h"
-#include "tensorrt_llm/kernels/llama4MinLatencyMoEOp.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -569,65 +568,6 @@ private:
     }
 };
 
-torch::Tensor fused_moe_llama4_tp8ep1_min_latency(torch::Tensor const& input, torch::Tensor const& router_logits,
-    torch::Tensor const& fc1_expert_weights, torch::Tensor const& fc2_expert_weights,
-    torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales)
-{
-    CHECK_INPUT(input, c10::ScalarType::Float8_e4m3fn)
-    CHECK_INPUT(router_logits, c10::ScalarType::BFloat16)
-    CHECK_INPUT(fc1_expert_weights, c10::ScalarType::Float8_e4m3fn)
-    CHECK_INPUT(fc2_expert_weights, c10::ScalarType::Float8_e4m3fn)
-
-    TORCH_CHECK(input.dim() == 2, "input must be 2D.");
-    TORCH_CHECK(router_logits.dim() == 2, "router_logits must be 2D.");
-    TORCH_CHECK(input.sizes()[0] == router_logits.sizes()[0], "input and router_logits must have the same num tokens.");
-
-    TORCH_CHECK(fc1_expert_weights.dim() == 3, "fc1_expert_weights must be 3D.");
-    TORCH_CHECK(fc2_expert_weights.dim() == 3, "fc2_expert_weights must be 3D.");
-    TORCH_CHECK(fc1_expert_weights.sizes()[0] == fc2_expert_weights.sizes()[0],
-        "fc1_expert_weights and fc2_expert_weights must have the same number of experts.");
-    TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * 2,
-        "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
-
-    int64_t num_rows = input.sizes()[0];
-    int64_t hidden_size = fc2_expert_weights.sizes()[1];
-    int64_t inter_size = fc2_expert_weights.sizes()[2];
-    int64_t num_experts = fc2_expert_weights.sizes()[0];
-
-    TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for fp8 quantization");
-    TORCH_CHECK(quant_scales.value().size() == 4, "Expecting 4 quant scales for fp8 quantization");
-
-    auto const fc1_dequant = quant_scales.value()[0];
-    auto const fc2_quant = quant_scales.value()[1];
-    auto const fc2_dequant = quant_scales.value()[2];
-
-    CHECK_INPUT(fc1_dequant, c10::ScalarType::Float);
-    CHECK_INPUT(fc2_quant, c10::ScalarType::Float);
-    CHECK_INPUT(fc2_dequant, c10::ScalarType::Float);
-    TORCH_CHECK(fc1_dequant.dim() == 1, "fc1 dequant must be 1D");
-    TORCH_CHECK(fc2_quant.dim() == 0, "fc2 quant must be a scalar tensor");
-    TORCH_CHECK(fc2_dequant.dim() == 1, "fc2 dequant must be 1D");
-    TORCH_CHECK(fc1_dequant.sizes()[0] == num_experts, "fc1 dequant size must be (num_experts,)");
-    TORCH_CHECK(fc2_dequant.sizes()[0] == num_experts, "fc2 dequant size must be (num_experts,)");
-
-    auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-
-    std::vector<int64_t> fc2_input_shape = {num_rows, inter_size};
-    auto fc2_input = torch::empty(fc2_input_shape, input.options().dtype(c10::ScalarType::Float8_e4m3fn));
-    std::vector<int64_t> exp_idx_shape = {num_rows};
-    auto exp_idx = torch::empty(exp_idx_shape, input.options().dtype(c10::ScalarType::Int));
-    std::vector<int64_t> output_shape = {num_rows, hidden_size};
-    auto output = torch::empty(output_shape, input.options().dtype(c10::ScalarType::BFloat16));
-
-    tensorrt_llm::kernels::run_moe_llama4_tp8ep1_min_latency(num_rows, num_experts, input.const_data_ptr(),
-        router_logits.const_data_ptr(), fc1_expert_weights.const_data_ptr(), fc2_expert_weights.const_data_ptr(),
-        static_cast<float const*>(fc1_dequant.data_ptr()), static_cast<float const*>(fc2_quant.data_ptr()),
-        static_cast<float const*>(fc2_dequant.data_ptr()), fc2_input.data_ptr(), static_cast<int*>(exp_idx.data_ptr()),
-        output.data_ptr(), stream);
-
-    return output;
-}
-
 } // namespace torch_ext
 
 TORCH_LIBRARY(trtllm, m)
@@ -638,17 +578,4 @@ TORCH_LIBRARY(trtllm, m)
         .def("get_tactic_num", &torch_ext::FusedMoeRunner::getTacticNum)
         .def("run_moe", &torch_ext::FusedMoeRunner::runMoe)
         .def("run_moe_min_latency", &torch_ext::FusedMoeRunner::runMoeMinLantency);
-}
-
-TORCH_LIBRARY_FRAGMENT(trtllm, m)
-{
-    m.def(
-        "fused_moe_llama4_tp8ep1_min_latency(Tensor input, Tensor router_logits, "
-        "Tensor fc1_expert_weights, Tensor fc2_expert_weights, "
-        "Tensor[]? quant_scales=None) -> Tensor");
-}
-
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
-{
-    m.impl("fused_moe_llama4_tp8ep1_min_latency", &torch_ext::fused_moe_llama4_tp8ep1_min_latency);
 }
