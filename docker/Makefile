@@ -35,8 +35,9 @@ ifeq ($(PLATFORM),arm64)
   BUILD_ARCH_ARGS = -a '90-real;100-real;120-real'
 endif
 
+SHARED_CCACHE_DIR  ?=
 BUILD_WHEEL_OPTS   ?=
-BUILD_WHEEL_ARGS   ?= $(shell grep 'ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))$(if $(BUILD_ARCH_ARGS), $(BUILD_ARCH_ARGS))
+BUILD_WHEEL_ARGS   ?= $(shell grep 'ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))$(if $(BUILD_ARCH_ARGS), $(BUILD_ARCH_ARGS))$(if $(SHARED_CCACHE_DIR), --use_ccache)
 TORCH_INSTALL_TYPE ?= skip
 CUDA_VERSION       ?=
 CUDNN_VERSION      ?=
