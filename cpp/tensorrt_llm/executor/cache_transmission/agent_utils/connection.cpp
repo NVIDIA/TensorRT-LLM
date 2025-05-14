@@ -86,13 +86,15 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
     TLLM_LOG_DEBUG(
         "send dstDesc: %p, size: %ld ,validSegmentIdx: %ld", dstDesc.getAddr(), size, mSenderState.valideSegmentIdx);
     MemoryDescs dstDescs{MemoryType::kVRAM, {dstDesc}};
-    std::stringstream ss;
+    TransferRequest request{TransferOp::kWRITE, srcDescs, dstDescs, mRemoteAgentName};
+    auto status = mAgentConnectionManager->getAgent()->submitTransferRequests(request);
     NotificationSyncInfo syncInfo{mRemoteAgentName, ctx};
     NotificationInfo notificationInfo{syncInfo};
+    std::stringstream ss;
     NotificationInfo::serialize(notificationInfo, ss);
-    TransferRequest request{TransferOp::kWRITE, srcDescs, dstDescs, mRemoteAgentName, ss.str()};
-    auto status = mAgentConnectionManager->getAgent()->submitTransferRequests(request);
     status->wait();
+    // TODO: there is a bug in request_with_notify https://github.com/ai-dynamo/nixl/pull/252
+    mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
 }
 
 void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) const
@@ -139,6 +141,17 @@ void AgentConnection::setSenderState(MemoryDesc mReceiverBufferDesc, int valideS
 {
     mSenderState.mReceiverBufferDesc = mReceiverBufferDesc;
     mSenderState.valideSegmentIdx = valideSegmentIdx;
+}
+
+void AgentConnection::setHasLoadRemoteAgent(bool hasLoadRemoteAgent)
+{
+
+    mHasLoadRemoteAgent = hasLoadRemoteAgent;
+}
+
+bool AgentConnection::hasLoadRemoteAgent() const
+{
+    return mHasLoadRemoteAgent;
 }
 
 AgentConnectionManager::AgentConnectionManager(
@@ -318,25 +331,42 @@ AgentConnection* AgentConnectionManager::connect(
     std::string const& remoteAgentName, std::string const& connecitonInfo, std::optional<std::string> metadata)
 {
 
+    TLLM_CHECK_WITH_INFO(mAgentName != remoteAgentName, "should not connect to self with nixl");
+    TLLM_LOG_DEBUG(
+        mpi::MpiComm::world().getRank(), "mAgentName: %s connect to %s", mAgentName.c_str(), remoteAgentName.c_str());
     std::scoped_lock lock(mConnectionsMutex);
     auto it = mConnections.find(remoteAgentName);
     if (it != mConnections.end())
     {
         TLLM_CHECK_WITH_INFO(!metadata.has_value(), "should not send metadata twice");
+        if (!it->second->hasLoadRemoteAgent() && metadata.has_value())
+        {
+            m_Agent->invalidateRemoteAgent(remoteAgentName);
+            it->second->setHasLoadRemoteAgent(true);
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "set has load remote agent to true");
+            m_Agent->loadRemoteAgent(remoteAgentName, AgentDesc{metadata.value()});
+        }
         return it->second.get();
     }
+    bool hasLoadRemoteAgent = false;
+
     if (metadata.has_value())
     {
-
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "mAgentName: %s connect to %s with loadRemoteAgent",
+            mAgentName.c_str(), remoteAgentName.c_str());
         m_Agent->loadRemoteAgent(remoteAgentName, AgentDesc{metadata.value()});
+        hasLoadRemoteAgent = true;
     }
     else
     {
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "mAgentName: %s connect to %s with connectRemoteAgent",
+            mAgentName.c_str(), remoteAgentName.c_str());
         m_Agent->connectRemoteAgent(remoteAgentName, connecitonInfo);
     }
 
     auto connection = std::make_shared<AgentConnection>(mAgentName, remoteAgentName, this);
     mConnections[remoteAgentName] = connection;
+    connection->setHasLoadRemoteAgent(hasLoadRemoteAgent);
     return connection.get();
 }
 
@@ -422,9 +452,12 @@ AgentConnectionManager::~AgentConnectionManager()
 
     m_Agent->deregisterMemory(mRegMemDescs);
 
-    // for (auto& [agent, connection] : mConnections)
-    // {
-    //     m_Agent->invalidateRemoteAgent(agent);
-    // }
+    for (auto& [agent, connection] : mConnections)
+    {
+        if (connection->hasLoadRemoteAgent())
+        {
+            m_Agent->invalidateRemoteAgent(agent);
+        }
+    }
 }
 } // namespace tensorrt_llm::executor::kv_cache

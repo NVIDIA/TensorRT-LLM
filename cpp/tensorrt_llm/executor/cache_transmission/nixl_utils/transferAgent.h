@@ -84,6 +84,8 @@ public:
 
     void connectRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo) override;
 
+    bool checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs) override;
+
 private:
     std::unique_ptr<nixlAgent> mRawAgent;
     nixlBackendH* mRawBackend{};

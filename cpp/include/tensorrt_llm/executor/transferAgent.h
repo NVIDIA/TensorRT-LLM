@@ -218,6 +218,7 @@ public:
 
     virtual ConnectionInfoType getConnectionInfo() = 0;
     virtual void connectRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo) = 0;
+    virtual bool checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs) = 0;
 };
 
 class DynLibLoader final

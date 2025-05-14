@@ -78,6 +78,12 @@ TEST_F(TransferAgentTest, Basic)
     // nixlAgent0->loadRemoteAgent(agent1);
     auto connectionInfo = nixlAgent1->getConnectionInfo();
     nixlAgent0->connectRemoteAgent(agent1, connectionInfo);
+    bool checked = false;
+    do
+    {
+        checked = nixlAgent0->checkRemoteDescs(agent1, regMem1.getDescs());
+        // wait for regMem is unpacked by nixlAgent0
+    } while (!checked);
 
     TransferRequest writeReq{TransferOp::kWRITE, regMem0.getDescs(), regMem1.getDescs(), agent1};
     auto status = nixlAgent0->submitTransferRequests(writeReq);
@@ -108,6 +114,11 @@ TEST_F(TransferAgentTest, Basic2)
     // nixlAgent0->loadRemoteAgent(agent1);
     auto connectionInfo = nixlAgent1->getConnectionInfo();
     nixlAgent0->connectRemoteAgent(agent1, connectionInfo);
+    bool checked = false;
+    do
+    {
+        checked = nixlAgent0->checkRemoteDescs(agent1, regMem1.getDescs());
+    } while (!checked);
 
     TransferRequest readReq{TransferOp::kREAD, regMem0.getDescs(), regMem1.getDescs(), agent1};
     auto status = nixlAgent0->submitTransferRequests(readReq);
@@ -146,6 +157,11 @@ TEST_F(TransferAgentTest, DeviceMemory)
     // nixlAgent0->loadRemoteAgent(agent1);
     auto connectionInfo = nixlAgent1->getConnectionInfo();
     nixlAgent0->connectRemoteAgent(agent1, connectionInfo);
+    bool checked = false;
+    do
+    {
+        checked = nixlAgent0->checkRemoteDescs(agent1, regMem1.getDescs());
+    } while (!checked);
     TransferRequest writeReq{TransferOp::kWRITE, regMem0.getDescs(), regMem1.getDescs(), agent1};
     auto status = nixlAgent0->submitTransferRequests(writeReq);
     status->wait();
@@ -183,12 +199,22 @@ TEST_F(TransferAgentTest, Connect)
     // nixlAgent0->loadRemoteAgent(agent1);
     auto connectionInfo = nixlAgent1->getConnectionInfo();
     nixlAgent0->connectRemoteAgent(agent1, connectionInfo);
+    bool checked = false;
+    do
+    {
+        checked = nixlAgent0->checkRemoteDescs(agent1, memDescs1);
+    } while (!checked);
     TransferRequest writeReq{TransferOp::kWRITE, memDescs0, memDescs1, agent1};
     auto status = nixlAgent0->submitTransferRequests(writeReq);
     status->wait();
 
     TLLM_CHECK(memory0 == memory1);
     nixlAgent2->connectRemoteAgent(agent1, connectionInfo);
+    checked = false;
+    do
+    {
+        checked = nixlAgent2->checkRemoteDescs(agent1, memDescs1);
+    } while (!checked);
     TransferRequest writeReq2{TransferOp::kWRITE, memDescs0, memDescs1, agent1};
     auto status2 = nixlAgent2->submitTransferRequests(writeReq2);
     status2->wait();
@@ -223,7 +249,11 @@ TEST_F(TransferAgentTest, SyncMessage)
     // nixlAgent0->loadRemoteAgent(agent1);
     auto connectionInfo = nixlAgent1->getConnectionInfo();
     nixlAgent0->connectRemoteAgent(agent1, connectionInfo);
-
+    bool checked = false;
+    do
+    {
+        checked = nixlAgent0->checkRemoteDescs(agent1, regMem3.getDescs());
+    } while (!checked);
     auto syncMessage = std::string("agent_sync_message");
     TransferRequest writeReq{TransferOp::kWRITE, regMem0.getDescs(), regMem3.getDescs(), agent1, syncMessage};
     auto status = nixlAgent0->submitTransferRequests(writeReq);
@@ -265,6 +295,11 @@ TEST_F(TransferAgentTest, SyncMessage)
             break;
         }
     }
+    bool checked2 = false;
+    do
+    {
+        checked2 = nixlAgent0->checkRemoteDescs(agent1, regMem1.getDescs());
+    } while (!checked2);
 
     std::string syncMessage4 = "four_agent_sync_message";
     TransferRequest writeReq1{TransferOp::kWRITE, regMem2.getDescs(), regMem1.getDescs(), agent0, syncMessage4};

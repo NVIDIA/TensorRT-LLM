@@ -346,6 +346,14 @@ void NixlTransferAgent::connectRemoteAgent(std::string const& name, ConnectionIn
         connectionInfo.c_str(), name.c_str(), nixlEnumStrings::statusStr(status).c_str());
 }
 
+bool NixlTransferAgent::checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs)
+{
+    auto status = mRawAgent->checkRemoteMD(name, NixlHelper::convertXferDist(memoryDescs));
+    TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS || status == NIXL_ERR_NOT_FOUND, "checkRemoteMD failed with status: %s",
+        nixlEnumStrings::statusStr(status).c_str());
+    return status == NIXL_SUCCESS;
+}
+
 NixlTransferAgent::~NixlTransferAgent()
 {
     TLLM_LOG_DEBUG("NixlTransferAgent::~NixlTransferAgent");

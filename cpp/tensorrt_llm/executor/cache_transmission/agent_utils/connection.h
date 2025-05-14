@@ -177,6 +177,8 @@ public:
         batch_manager::RequestInfo& requestInfo, std::optional<size_t> cacheBufferId, int validConnectionIdx);
     void setSenderState(MemoryDesc mReceiverBufferDesc, int valideSegmentIdx);
     [[nodiscard]] std::optional<size_t> getCacheBufferId() const;
+    void setHasLoadRemoteAgent(bool hasLoadRemoteAgent);
+    [[nodiscard]] bool hasLoadRemoteAgent() const;
 
 private:
     std::string mAgentName;
@@ -195,6 +197,7 @@ private:
     std::optional<size_t> mCacheBufferId;
     SenderState mSenderState;
     bool mNeedSendMetadata{true};
+    bool mHasLoadRemoteAgent{false};
 };
 
 class AgentConnectionManager : public ConnectionManager
