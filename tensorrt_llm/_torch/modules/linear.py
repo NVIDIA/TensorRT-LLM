@@ -562,30 +562,21 @@ class Linear(nn.Module):
                     output = self.apply_linear(input, self.weight, bias,
                                                lora_params, layer_idx)
         elif self.tp_mode == TensorParallelMode.COLUMN:
-            if self.use_llama4_qkv and position_ids is not None:
-                output = self.apply_linear(input,
-                                           self.weight,
-                                           self.bias,
-                                           lora_params,
-                                           layer_idx,
-                                           position_ids=position_ids)
-                if self.use_llama4_qkv:
-                    if input.shape[0] <= 8 and position_ids is not None:
-                        output = self.apply_linear(input,
-                                                   self.weight,
-                                                   self.bias,
-                                                   lora_params,
-                                                   layer_idx,
-                                                   position_ids=position_ids)
-                    elif 4 < input.shape[0] <= 8 and position_ids is None:
-                        output = self.apply_linear(input,
-                                                   self.trtllm_gen_weight,
-                                                   self.bias, lora_params,
-                                                   layer_idx)
-                    else:
-                        output = self.apply_linear(input, self.weight,
-                                                   self.bias, lora_params,
-                                                   layer_idx)
+            if self.use_llama4_qkv:
+                if input.shape[0] <= 8 and position_ids is not None:
+                    output = self.apply_linear(input,
+                                               self.weight,
+                                               self.bias,
+                                               lora_params,
+                                               layer_idx,
+                                               position_ids=position_ids)
+                elif 4 < input.shape[0] <= 8 and position_ids is None:
+                    output = self.apply_linear(input, self.trtllm_gen_weight,
+                                               self.bias, lora_params,
+                                               layer_idx)
+                else:
+                    output = self.apply_linear(input, self.weight, self.bias,
+                                               lora_params, layer_idx)
             elif self.use_llama4_fc_swiglu_kernel:
                 if 4 <= input.shape[
                         0] <= 16 and not self.use_llama4_gemv_for_fc_swiglu:

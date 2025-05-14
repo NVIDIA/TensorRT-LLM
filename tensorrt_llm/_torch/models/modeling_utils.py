@@ -629,8 +629,8 @@ def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
 
 def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        weights: Dict,
-                       params_map: Optional[Dict[str, str]] = None,
-                       skip_modules: List[str] = []):
+                       skip_modules: List[str] = [],
+                       params_map: Optional[Dict[str, str]] = None):
     if not hasattr(model, 'model_config') or not isinstance(
             model.model_config, ModelConfig):
         raise ValueError("model must have a model_config attribute")
