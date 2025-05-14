@@ -98,6 +98,7 @@ AutoDeploy supports multiple backends for compiling the exported Torch graph:
 
 - **torch-simple:** Exports the graph without additional optimizations. Enable with `"compile_backend": "torch-simple"` in the configuration.
 - **torch-compile:** Applies `torch.compile` to the graph after all AutoDeploy transformations have been completed. Enable with  `"compile_backend": "torch-compile"` in the configuration.
+- **torch-cudagraph:**: Performs CUDA graph capture (without torch.compile). Enable with  `"compile_backend": "torch-cudagraph"` in the configuration.
 - **torch-opt:** Uses `torch.compile` along with CUDA Graph capture to enhance inference performance. Enable with `"compile_backend": "torch-opt"` in the configuration.
 
 ### Attention backends
