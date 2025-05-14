@@ -107,7 +107,7 @@ l0_a10:
   - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=False-typical_acceptance=False] # 5 mins
   - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=True-typical_acceptance=False] # 5 mins
   - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=False-typical_acceptance=True] # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[cuda_graph=False-chunked_context=False] # 5 mins
   - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[cuda_graph] # 5 mins
   - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[cuda_graph-chunked_context] # 5 mins
   - accuracy/test_cli_flow.py::TestLlama2_7B::test_auto_dtype
