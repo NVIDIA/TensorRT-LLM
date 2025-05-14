@@ -412,6 +412,9 @@ public:
     // a plugin field or a constructor parameter
     int32_t mNbMultiBlockSemaphores = 0;
 
+    // See [Chunked Attention] in _torch/modules/attention.py
+    std::optional<int64_t> mAttentionChunkSize = std::nullopt;
+
     [[nodiscard]] auto data() const
     {
         return std::make_tuple(mLayerIdx, mNumHeads, mVisionStart, mVisionLength, mNumKVHeads, mHeadSize,
