@@ -90,21 +90,11 @@ def lift_to_meta(model: nn.Module, strict_missing: bool = True, strict_unexpecte
         )
 
 
-def named_graphmodules(
-    gm: fx.GraphModule, prefix: str = ""
-) -> Iterator[Tuple[str, fx.GraphModule]]:
-    """
-    Yield (name, GraphModule) for every fx.GraphModule inside gm (including gm itself)
-    in a post-order recursive traversal with children visited in reverse order.
-    """
-    # recurse into children in reverse order
-    for name, child in reversed(list(gm.named_children())):
-        if isinstance(child, fx.GraphModule):
-            sub_prefix = f"{prefix}.{name}" if prefix else name
-            yield from named_graphmodules(child, sub_prefix)
-
-    # finally, yield the current GraphModule
-    yield prefix, gm
+def named_graphmodules(gm: fx.GraphModule) -> Iterator[Tuple[str, fx.GraphModule]]:
+    """Yield (name, submodule) for every fx.GraphModule inside gm (including gm itself)."""
+    for name, m in gm.named_modules():
+        if isinstance(m, fx.GraphModule):
+            yield name, m
 
 
 def _move_single_gm_to_device(
@@ -144,7 +134,8 @@ def move_to_device(gm: fx.GraphModule, device: DeviceLikeType) -> fx.GraphModule
     # get device
     device = torch.device(device)
 
-    for _, subgm in named_graphmodules(gm):
+    for _, subgm in reversed(list(named_graphmodules(gm))):
+        # recompile graph to update self generated codes in subgraph
         _move_single_gm_to_device(subgm, device, subgm is not gm)
 
 
@@ -221,7 +212,7 @@ def canonicalize_graph(
     """
     ad_logger.debug(f"Before canonicalizing: {gm}")
 
-    for _, subgm in named_graphmodules(gm):
+    for _, subgm in reversed(list(named_graphmodules(gm))):
         _canonicalize_single_gm(
             subgm, shape_prop=shape_prop, args_static=args_static if subgm is gm else None
         )
