@@ -52,9 +52,15 @@ struct BatchedGemmData {
     // Either mBatchedM or mBatchedN must be set when mNumTokens == 0, otherwise not used.
     // The number of tokens in each batch on the M dimension if batchM,
     // otherwise not used.
+    // The number of elements in the array is mNumBatches.
+    // E.g. to implement a BMM with each batch having M tokens, one needs to set mBatchedM to
+    // {M, M, M, .. mNumBatches times ..}
     std::vector<int32_t> mBatchedM{};
     // The number of tokens in each batch on the N dimension if batchN,
     // otherwise not used.
+    // The number of elements in the array is mNumBatches.
+    // E.g. to implement a BMM with each batch having N tokens, one needs to set mBatchedN to
+    // {N, N, N, .. mNumBatches times ..}
     std::vector<int32_t> mBatchedN{};
 
     // The M dimension.
@@ -69,7 +75,7 @@ struct BatchedGemmData {
     int32_t mK{0};
     // The rank id of the current device in the multi-gpu space.
     int32_t mRank{0};
-    // The number of peer devices in tensor-parallel group.
+    // The number of devices in tensor-parallel group.
     int32_t mWorldSize{1};
   };
 
@@ -106,7 +112,7 @@ struct BatchedGemmData {
     //  Where paddedM is M if (routeAct == true && batchM), or
     //  sum(divUpMul(M[bi], tileM) for bi in B) if batchM,
     //  otherwise divUpMul(M, tileM) * B.
-    //  Dtype is Dtype::E4m3.
+    //  Dtype is Dtype::Fp32 if DeepSeek FP8 recipe is used, otherwise Dtype::E4m3.
     //
     // Otherwise should be set to nullptr.
     void const* mPtrSfA{nullptr};
@@ -169,7 +175,7 @@ struct BatchedGemmData {
     // or sum(divUpMul(N[bi], tileN) for bi in B) if batchN,
     // otherwise divUpMul(N, TileN) * B.
     //
-    //  Dtype is Dtype::E4m3.
+    // Dtype is Dtype::Fp32 if DeepSeek FP8 recipe is used, otherwise Dtype::E4m3.
     //
     // Otherwise should be set to nullptr.
     void const* mPtrSfB{nullptr};
@@ -189,12 +195,12 @@ struct BatchedGemmData {
     //     Logical shape is [sum(divUpMul(N[bi], tileN) for bi in B)]
     void const* mPtrPerTokenSfB{nullptr};
 
-    // The output tensor scaling factor for MxFp{4,8}, Fp8, NvFp4 and DeepSeek FP8 quantization.
+    // The output tensor scaling factor for MxFp{4,8}, Fp8 and NvFp4 quantization.
     // TensorRT-LLM API requires a scaling factor on the device.
     // Shape is [B].
     float const* mPtrScaleC{nullptr};
 
-    // The output gate scale for MxFp{4,8}, NvFp4 and DeepSeek FP8 quantization.
+    // The output gate scale for MxFp{4,8} and NvFp4 quantization.
     // TensorRT-LLM API requires a scaling factor on the device.
     // Shape is [B].
     float const* mPtrScaleGate{nullptr};
@@ -208,8 +214,7 @@ struct BatchedGemmData {
     // Map of expanded token index (counting the previous padded tokens) to the batch index
     // the token belongs to.
     // The shape is
-    // [sum(divUpMul(M[bi], tileM) for bi in B)] for batchM
-    // [sum(divUpMul(N[bi], tileN) for bi in B)] for batchN
+    // [numTokens + numBatches * (tileM/N - 1)]
     // The dtype is int32_t.
     //
     // There are 3 tokens [0, 1, 2] such that [0, 1] belong to batch [B0] and [2] to batch [B1].
@@ -549,9 +554,11 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config,
   }
 
   int32_t numCtaXy{0};
-  for (int32_t bi = 0; bi < options.mNumBatches; ++bi) {
-    numCtaXy += batchM ? gemm::divUp(options.mBatchedM[bi], options.mTileM)
-                       : gemm::divUp(options.mBatchedN[bi], options.mTileN);
+  if (options.mIsStaticBatch) {
+    for (int32_t bi = 0; bi < options.mNumBatches; ++bi) {
+      numCtaXy += batchM ? gemm::divUp(options.mBatchedM[bi], options.mTileM)
+                        : gemm::divUp(options.mBatchedN[bi], options.mTileN);
+    }
   }
 
   int32_t maxNumCtasInBatchDim{numCtaXy};
@@ -597,7 +604,6 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config,
   CUfunction cuFunction;
   cuModuleLoadData(&cuModule, config.mData);
   cuModuleGetFunction(&cuFunction, cuModule, config.mFunctionName);
-  std::cout << "cuFunction: " << config.mFunctionName << std::endl;
 
   // Prepare the grid/block.
   dim3 block3{static_cast<uint32_t>(config.mNumThreadsPerCTA),

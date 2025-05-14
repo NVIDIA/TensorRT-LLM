@@ -20,7 +20,7 @@ import torch.nn.functional as F
 import pytest
 import torch
 from utils.util import getSMVersion
-from tensorrt_llm.quantization.utils.fp4_utils import (reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)
+from tensorrt_llm.quantization.utils.fp4_utils import (shuffle_matrix_a, shuffle_matrix_sf_a)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -34,7 +34,6 @@ class BatchedGemmTestCase:
     k: int
     dtype_c: torch.dtype
     low_latency: bool
-    gated_act: bool
     tile_size: int
     use_deep_seek_fp8: bool = False
 
@@ -78,8 +77,7 @@ def fp8_bmm_reference(
     global_dq_a: torch.Tensor,
     global_dq_b: torch.Tensor,
     dtype_c: torch.dtype,
-    use_deep_seek_fp8: bool,
-    gated_act: bool
+    use_deep_seek_fp8: bool
 ) -> torch.Tensor:
     b, m, k = a_fp8.shape
     n = b_fp8.shape[1]
@@ -113,14 +111,6 @@ def fp8_bmm_reference(
         c_fp8fp8 = torch.bmm(a_fp8_host, b_fp8_host.transpose(1, 2))
         c_fp8fp8 *= scaling_factor_host
         c_fp32 = c_fp8fp8
-
-    if gated_act:
-        c_fp32_batched = []
-        for bi in range(b):
-            x1 = c_fp32[bi, :, :n//2]
-            x2 = c_fp32[bi, :, n//2:]
-            c_fp32_batched.append(F.silu(x2) * x1)
-        c_fp32 = torch.stack(c_fp32_batched)
 
     if dtype_c == torch.float8_e4m3fn:
         if use_deep_seek_fp8:
@@ -203,7 +193,6 @@ def quant_fp8(x_fp32: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
                                    dtype_c=torch.float8_e4m3fn,
                                    use_deep_seek_fp8=False,
                                    low_latency=True,
-                                   gated_act=False,
                                    tile_size=8),
             id="num_batches_4_8x256x512_ll_e4m3_ts8",
         ),
@@ -215,33 +204,8 @@ def quant_fp8(x_fp32: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
                                    dtype_c=torch.float8_e4m3fn,
                                    use_deep_seek_fp8=True,
                                    low_latency=True,
-                                   gated_act=False,
                                    tile_size=8),
             id="num_batches_4_128x256x512_ll_e4m3_ds_ts8",
-        ),
-        pytest.param(
-            BatchedGemmTestCase(b=4,
-                                   m=8,
-                                   n=256,
-                                   k=512,
-                                   dtype_c=torch.float8_e4m3fn,
-                                   use_deep_seek_fp8=False,
-                                   low_latency=True,
-                                   gated_act=True,
-                                   tile_size=8),
-            id="num_batches_4_8x256x512_ll_e4m3_gated_act_ts8",
-        ),
-        pytest.param(
-            BatchedGemmTestCase(b=4,
-                                   m=128,
-                                   n=256,
-                                   k=512,
-                                   dtype_c=torch.float8_e4m3fn,
-                                   use_deep_seek_fp8=True,
-                                   low_latency=True,
-                                   gated_act=True,
-                                   tile_size=8),
-            id="num_batches_4_128x256x512_ll_e4m3_gated_act_ds_ts8",
         ),
         pytest.param(
             BatchedGemmTestCase(b=4,
@@ -251,7 +215,6 @@ def quant_fp8(x_fp32: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
                                    dtype_c=torch.bfloat16,
                                    use_deep_seek_fp8=False,
                                    low_latency=True,
-                                   gated_act=False,
                                    tile_size=8),
             id="num_batches_4_128x256x512_ll_bf16_ts8",
         ),
@@ -263,7 +226,6 @@ def quant_fp8(x_fp32: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
                                    dtype_c=torch.bfloat16,
                                    use_deep_seek_fp8=True,
                                    low_latency=True,
-                                   gated_act=False,
                                    tile_size=8),
             id="num_batches_4_128x256x512_ll_bf16_ds_ts8",
         ),
@@ -275,7 +237,6 @@ def quant_fp8(x_fp32: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
                                    dtype_c=torch.float8_e4m3fn,
                                    use_deep_seek_fp8=True,
                                    low_latency=True,
-                                   gated_act=False,
                                    tile_size=8),
             id="num_batches_4_128x2x512_ll_e4m3_ds_ts8",
         ),
@@ -291,7 +252,6 @@ def test_fp8_batched_gemm_trtllmgen(test_case: BatchedGemmTestCase) -> None:
     use_deep_seek_fp8 = test_case.use_deep_seek_fp8
     dtype_c = test_case.dtype_c
     low_latency = test_case.low_latency
-    gated_act = test_case.gated_act
     tile_size = test_case.tile_size
 
     a_fp32 = torch.randn((b, m, k), device="cuda", dtype=torch.float32)
@@ -308,7 +268,6 @@ def test_fp8_batched_gemm_trtllmgen(test_case: BatchedGemmTestCase) -> None:
     global_dq_a = None
     global_dq_b = None
     out_global_scaling_factor = None
-    out_global_gate_scaling_factor = None
 
     if use_deep_seek_fp8:
         a_fp8, dq_sf_a = quant_ds_fp8(a_fp32, activations=True)
@@ -319,30 +278,21 @@ def test_fp8_batched_gemm_trtllmgen(test_case: BatchedGemmTestCase) -> None:
         a_fp8, global_dq_a = quant_fp8(a_fp32)
         b_fp8, global_dq_b = quant_fp8(b_fp32)
         out_global_scaling_factor = global_dq_a * global_dq_b
-        out_global_gate_scaling_factor = out_global_scaling_factor.clone()
 
     # Compute reference batched matrix multiplication
-    output = fp8_bmm_reference(a_fp8, b_fp8, dq_sf_a, dq_sf_b, global_dq_a, global_dq_b, dtype_c, use_deep_seek_fp8, gated_act)
+    output = fp8_bmm_reference(a_fp8, b_fp8, dq_sf_a, dq_sf_b, global_dq_a, global_dq_b, dtype_c, use_deep_seek_fp8)
 
     c_dq_sf_ref = None
     if dtype_c == torch.float8_e4m3fn:
         if use_deep_seek_fp8:
             c_ref, c_dq_sf_ref = output
-            output_n = n // 2 if gated_act else n
-            c_dq_sf_ref = c_dq_sf_ref.reshape(output_n // 128, -1)
+            c_dq_sf_ref = c_dq_sf_ref.reshape(n // 128, -1)
         else:
             c_ref, c_scale = output
             out_global_scaling_factor /= c_scale.cuda()
     else:
         c_ref = output
 
-    if gated_act:
-        b_fp8_shuffled = []
-        for bi in range(b):
-            b_fp8_shuffled.append(
-                reorder_rows_for_gated_act_gemm(b_fp8[bi].view(torch.uint8).clone()))
-        b_fp8 = torch.stack(b_fp8_shuffled).view(torch.float8_e4m3fn)
-        
     epilogue_tile_m = 64 if use_deep_seek_fp8 else 128
     if low_latency:
         b_fp8_shuffled = []
@@ -356,7 +306,6 @@ def test_fp8_batched_gemm_trtllmgen(test_case: BatchedGemmTestCase) -> None:
 
     if not use_deep_seek_fp8:
         out_global_scaling_factor = out_global_scaling_factor.contiguous().to(torch.float32)
-        out_global_gate_scaling_factor = out_global_gate_scaling_factor.contiguous().to(torch.float32)
     
     ds_quantization_tile_size = 128
     c_actual, c_dq_sf = torch.ops.trtllm.fp8_batched_gemm_trtllmgen(
@@ -366,12 +315,10 @@ def test_fp8_batched_gemm_trtllmgen(test_case: BatchedGemmTestCase) -> None:
         epilogue_tile_m=epilogue_tile_m,
         use_deep_seek_fp8=use_deep_seek_fp8,
         low_latency=low_latency,
-        gated_act=gated_act,
         out_dtype=dtype_c,
         dq_sfs_a=dq_sf_a,
         dq_sfs_b=dq_sf_b,
-        scale_c=out_global_scaling_factor,
-        scale_gate_c=out_global_gate_scaling_factor,
+        scale_c=out_global_scaling_factor
     )
 
     c_actual = c_actual.detach().cpu()

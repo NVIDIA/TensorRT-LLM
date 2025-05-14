@@ -72,7 +72,7 @@ TLLM_ACT_TYPE_FUNCTION(Silu)
 
 struct GemmGatedActOptions : public gemm::GemmOptions {
   GemmGatedActOptions() = default;
-  GemmGatedActOptions(gemm::GemmOptions const& options, ActType actType)
+  GemmGatedActOptions(gemm::GemmOptions options, ActType actType)
     : gemm::GemmOptions(options)
     , mActType(actType) {}
 

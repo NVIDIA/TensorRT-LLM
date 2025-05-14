@@ -20,6 +20,7 @@
 #include <optional>
 
 #include "tensorrt_llm/kernels/trtllmGenKernels/common/Dtype.h"
+#include "trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 
 namespace tensorrt_llm
 {
@@ -28,8 +29,8 @@ namespace kernels
 
 struct TrtllmGenBatchedGemmRunnerOptions
 {
-    Dtype eltType;
-    Dtype outputType;
+    trtllm::gen::Dtype eltType;
+    trtllm::gen::Dtype outputType;
     bool deepSeekFp8{false};
     bool fusedAct{false};
     bool routeAct{false};
@@ -48,7 +49,7 @@ public:
 
     void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, 
         int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim, void const* a, void const* sfA,
-        void const* b, void const* sfB, float const* scaleC, float const* scaleGateC, void* c, void* outSfC, 
+        void const* b, void const* sfB, void const* perTokensSfA, void const* perTokensSfB, float const* scaleC, float const* scaleGateC, void* c, void* outSfC, 
         int32_t const* routeMap, int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx, 
         int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace, CUstream stream,
         int device);

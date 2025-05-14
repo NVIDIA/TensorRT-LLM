@@ -29,19 +29,19 @@
 
 namespace
 {
-
-template <tensorrt_llm::kernels::Dtype outDtype>
+namespace tg = trtllm::gen;
+template <tg::Dtype outDtype>
 void runBatchedGemm(at::Tensor& out, at::Tensor& outSfC, at::Tensor const& mat1, at::Tensor const& mat2,
     std::optional<at::Tensor> dDqSfsA, std::optional<at::Tensor> dDqSfsB, std::optional<at::Tensor> scaleC,
-    std::optional<at::Tensor> scaleGateC, int64_t m, int64_t n, int64_t k, int32_t tileSize, int32_t epilogueTileM,
-    std::vector<int32_t> const& batchedTokens, bool useDeepSeekFp8, bool lowLatencyKernel, bool gatedAct)
+    int64_t m, int64_t n, int64_t k, int32_t tileSize, int32_t epilogueTileM,
+    std::vector<int32_t> const& batchedTokens, bool useDeepSeekFp8, bool lowLatencyKernel)
 {
-    auto eltType = tensorrt_llm::kernels::Dtype::E4m3;
+    auto eltType = tg::Dtype::E4m3;
 
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {.eltType = eltType,
         .outputType = outDtype,
         .deepSeekFp8 = useDeepSeekFp8,
-        .fusedAct = gatedAct,
+        .fusedAct = false,
         .routeAct = false,
         .staticBatch = true,
         .transposeMmaOutput = lowLatencyKernel,
@@ -62,7 +62,7 @@ void runBatchedGemm(at::Tensor& out, at::Tensor& outSfC, at::Tensor const& mat1,
 
     if (useDeepSeekFp8)
     {
-        float* outSfCPtr = outDtype == tensorrt_llm::kernels::Dtype::E4m3 ? outSfC.data_ptr<float>() : nullptr;
+        float* outSfCPtr = outDtype == tg::Dtype::E4m3 ? outSfC.data_ptr<float>() : nullptr;
         runner.run(m, n, k, batchedTokens, mat1.const_data_ptr(), dDqSfsA.value().const_data_ptr(),
             mat2.const_data_ptr(), dDqSfsB.value().const_data_ptr(), out.data_ptr(), outSfCPtr, workspace.data_ptr(),
             stream.stream(), mat1.get_device());
@@ -70,15 +70,15 @@ void runBatchedGemm(at::Tensor& out, at::Tensor& outSfC, at::Tensor const& mat1,
     else
     {
         runner.run(m, n, k, batchedTokens, mat1.const_data_ptr(), mat2.const_data_ptr(),
-            scaleC.value().const_data_ptr<float>(), gatedAct ? scaleGateC.value().const_data_ptr<float>() : nullptr,
+            scaleC.value().const_data_ptr<float>(), nullptr,
             out.data_ptr(), workspace.data_ptr(), stream.stream(), mat1.get_device());
     }
 }
 
 std::tuple<at::Tensor, at::Tensor> fp8_batched_gemm_sm100(at::Tensor const& mat1, at::Tensor const& mat2,
-    int32_t tileSize, bool useDeepSeekFp8, bool lowLatencyKernel, bool gatedAct, int64_t epilogueTileM,
+    int32_t tileSize, bool useDeepSeekFp8, bool lowLatencyKernel, int64_t epilogueTileM,
     std::optional<at::Tensor> dDqSfsA, std::optional<at::Tensor> dDqSfsB, std::optional<at::Tensor> scaleC,
-    std::optional<at::Tensor> scaleGateC, std::optional<c10::ScalarType> outDtype)
+    std::optional<c10::ScalarType> outDtype)
 {
     auto const dimsA = mat1.sizes();
     auto const dimsB = mat2.sizes();
@@ -141,21 +141,9 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_gemm_sm100(at::Tensor const& mat1
         TORCH_CHECK(scaleC.value().scalar_type() == at::ScalarType::Float, "Scale dtype must be FP32.");
         TORCH_CHECK(scaleC.value().dim() == 1, "outScalingFactor must be a 1D matrix of size B");
         TORCH_CHECK(scaleC.value().sizes()[0] == b, "outScalingFactor must be a 1D matrix of size B");
-
-        if (gatedAct)
-        {
-            TORCH_CHECK(scaleGateC.has_value(), "scaleGateC must be provided for gated act.");
-            TORCH_CHECK(scaleGateC.value().scalar_type() == at::ScalarType::Float, "Scale dtype must be FP32.");
-            TORCH_CHECK(scaleGateC.value().dim() == 1, "outScalingFactor must be a 1D matrix of size B");
-            TORCH_CHECK(scaleGateC.value().sizes()[0] == b, "outScalingFactor must be a 1D matrix of size B");
-        }
     }
 
     int64_t outputN = n;
-    if (gatedAct)
-    {
-        outputN = n / 2;
-    }
 
     // Create output tensor.
     at::Tensor out = at::detail::empty_cuda({b, m, outputN}, outDtype.value(), mat1.device(), std::nullopt);
@@ -171,16 +159,16 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_gemm_sm100(at::Tensor const& mat1
     switch (outDtype.value())
     {
     case at::ScalarType::Half:
-        runBatchedGemm<tensorrt_llm::kernels::Dtype::Fp16>(out, outSfC, mat1, mat2, dDqSfsA, dDqSfsB, scaleC,
-            scaleGateC, m, n, k, tileSize, epilogueTileM, batchedTokens, useDeepSeekFp8, lowLatencyKernel, gatedAct);
+        runBatchedGemm<tg::Dtype::Fp16>(out, outSfC, mat1, mat2, dDqSfsA, dDqSfsB, scaleC,
+            m, n, k, tileSize, epilogueTileM, batchedTokens, useDeepSeekFp8, lowLatencyKernel);
         break;
     case at::ScalarType::BFloat16:
-        runBatchedGemm<tensorrt_llm::kernels::Dtype::Bfloat16>(out, outSfC, mat1, mat2, dDqSfsA, dDqSfsB, scaleC,
-            scaleGateC, m, n, k, tileSize, epilogueTileM, batchedTokens, useDeepSeekFp8, lowLatencyKernel, gatedAct);
+        runBatchedGemm<tg::Dtype::Bfloat16>(out, outSfC, mat1, mat2, dDqSfsA, dDqSfsB, scaleC,
+            m, n, k, tileSize, epilogueTileM, batchedTokens, useDeepSeekFp8, lowLatencyKernel);
         break;
     case at::ScalarType::Float8_e4m3fn:
-        runBatchedGemm<tensorrt_llm::kernels::Dtype::E4m3>(out, outSfC, mat1, mat2, dDqSfsA, dDqSfsB, scaleC,
-            scaleGateC, m, n, k, tileSize, epilogueTileM, batchedTokens, useDeepSeekFp8, lowLatencyKernel, gatedAct);
+        runBatchedGemm<tg::Dtype::E4m3>(out, outSfC, mat1, mat2, dDqSfsA, dDqSfsB, scaleC,
+            m, n, k, tileSize, epilogueTileM, batchedTokens, useDeepSeekFp8, lowLatencyKernel);
         break;
     default: C10_THROW_ERROR(NotImplementedError, "outDtype must be one of fp16/bf16/e4m3.");
     }
@@ -193,17 +181,17 @@ namespace torch_ext
 {
 
 extern std::tuple<at::Tensor, at::Tensor> fp8_batched_gemm_trtllmgen(at::Tensor const& mat1, at::Tensor const& mat2,
-    int64_t tileSize, bool useDeepSeekFp8, bool lowLatency, bool gatedAct, int64_t epilogueTileM,
+    int64_t tileSize, bool useDeepSeekFp8, bool lowLatency, int64_t epilogueTileM,
     std::optional<at::Tensor> dDqSfsA, std::optional<at::Tensor> dDqSfsB, std::optional<at::Tensor> scaleC,
-    std::optional<at::Tensor> scaleGateC, std::optional<c10::ScalarType> outDtype)
+    std::optional<c10::ScalarType> outDtype)
 {
     auto const smVersion = tensorrt_llm::common::getSMVersion();
     switch (smVersion)
     {
     case tensorrt_llm::kernels::kSM_100:
     {
-        return fp8_batched_gemm_sm100(mat1, mat2, tileSize, useDeepSeekFp8, lowLatency, gatedAct, epilogueTileM,
-            dDqSfsA, dDqSfsB, scaleC, scaleGateC, outDtype);
+        return fp8_batched_gemm_sm100(mat1, mat2, tileSize, useDeepSeekFp8, lowLatency, epilogueTileM,
+            dDqSfsA, dDqSfsB, scaleC, outDtype);
     }
     default: TLLM_THROW("Unsupported or unimplemented compute capability for fp8 batched gemm: %i", smVersion);
     }
@@ -214,9 +202,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "fp8_batched_gemm_trtllmgen(Tensor a, Tensor b, int tile_size,"
-        "bool use_deep_seek_fp8=False, bool low_latency=False, bool gated_act=False, "
+        "bool use_deep_seek_fp8=False, bool low_latency=False, "
         "int epilogue_tile_m=0, Tensor? dq_sfs_a=None, Tensor? dq_sfs_b=None, "
-        "Tensor? scale_c=None, Tensor? scale_gate_c=None, "
+        "Tensor? scale_c=None, "
         "ScalarType? out_dtype=None) -> (Tensor, Tensor)");
 }
 

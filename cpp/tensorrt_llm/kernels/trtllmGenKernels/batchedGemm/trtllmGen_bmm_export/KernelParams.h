@@ -643,16 +643,15 @@ struct KernelParams {
     // Compute totalNumPaddedTokens, ctaIdxXyToBatchIdx and ctaIdxXyToMnLimit if the batch dims are
     // known at kernel launch time. Otherwise, these parameters are defined in the device buffers:
     // ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx and ptrCtaIdxXyToMnLimit respectively.
-    std::cout << "isStaticBatch " << isStaticBatch << std::endl;
+
     if (isStaticBatch) {
       params.totalNumPaddedTokens = 0;
       for (int b = 0; b < numBatches; b++) {
 
         int mM = batchM ? batchedM[b] : n;
         int mN = batchM ? m : batchedN[b];
-        std::cout << mM << " " << mN << std::endl;
 
-         // Skip Tma descriptor creation if expert isn't used
+        // Skip Tma descriptor creation if expert isn't used
         if (mM == 0 || mN == 0) {
           continue;
         }
@@ -923,24 +922,6 @@ struct KernelParams {
     // Set the per-token scale factors for MetaFP8 or scale inputs
     params.ptrPerTokenSfA = ptrPerTokenSfA;
     params.ptrPerTokenSfB = ptrPerTokenSfB;
-
-    std::cout << "totalNumPaddedTokens " << params.totalNumPaddedTokens << std::endl;
-    std::cout << "ptrA: " << params.ptrA << std::endl;
-    std::cout << "ptrB: " << params.ptrB << std::endl;
-    std::cout << "ptrC: " << params.ptrC << std::endl;
-    std::cout << "dSfA: " << params.ptrSfA << std::endl;
-    std::cout << "dSfB: " << params.ptrSfB << std::endl;
-    std::cout << "ptrPerTokenSfA: " << params.ptrPerTokenSfA << std::endl;
-    std::cout << "ptrPerTokenSfB: " << params.ptrPerTokenSfB << std::endl;
-    std::cout << "dSfC: " << params.ptrDqSfsC << std::endl;
-    std::cout << "ptrSfC: " << params.ptrSfC << std::endl;
-    std::cout << "ptrScaleC: " << params.ptrScaleC << std::endl;
-    std::cout << "ptrScaleGate: " << params.ptrScaleGate << std::endl;
-    std::cout << "ptrRouteMap: " << params.ptrRouteMap << std::endl;
-    std::cout << "ptrNumNonExitingCtas: " << params.ptrNumNonExitingCtas << std::endl;
-    std::cout << "ptrTotalNumPaddedTokens: " << params.ptrTotalNumPaddedTokens << std::endl;
-    std::cout << "ptrCtaIdxXyToBatchIdx: " << params.ptrCtaIdxXyToBatchIdx << std::endl;
-    std::cout << "ptrCtaIdxXyToMnLimit: " << params.ptrCtaIdxXyToMnLimit << std::endl;
 
     return params;
   }

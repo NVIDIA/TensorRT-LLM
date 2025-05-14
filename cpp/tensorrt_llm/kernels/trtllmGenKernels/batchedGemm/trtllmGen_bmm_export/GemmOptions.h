@@ -76,6 +76,118 @@ struct GemmOptions {
   virtual ~GemmOptions() = default;
 #endif
 
+  GemmOptions() = default;
+  GemmOptions(
+                    AllReduceAlgo allReduceAlgo,
+                    int clusterDimX,
+                    int clusterDimY,
+                    int clusterDimZ,
+                    tg::Dtype dtypeAcc,
+                    tg::Dtype dtypeElt,
+                    tg::Dtype dtypeC,
+                    bool enablesEarlyExit,
+                    bool enablesDelayedEarlyExit,
+                    bool enablesGlobalPtxKnobs,
+                    int  epilogueTileM,
+                    int  epilogueTileN,
+                    bool gridTriggerSecondaryA,
+                    bool gridTriggerSecondaryB,
+                    bool gridWaitForPrimaryEarlyExit,
+                    bool gridWaitForPrimaryA,
+                    bool gridWaitForPrimaryB,
+                    bool hoistLoadTaskInit,
+                    bool hoistMmaTaskTryWaits,
+                    int k,
+                    KernelTraits kernelTraits,
+                    int  m,
+                    int  mmaK,
+                    int  mmaM,
+                    int  mmaN,
+                    bool mockAllReduce,
+                    int n,
+                    int numSlicesForSplitK,
+                    int numSlicesForSliceK,
+                    int numStages,
+                    int numStagesMma,
+                    int numStagesMmaWithinWorkTile,
+                    int numStagesMmaAcrossWorkTile,
+                    int numStagesWorkId,
+                    bool outputDebugTensors,
+                    bool useShuffledMatrixA,
+                    bool sliceK,
+                    SplitK splitK,
+                    bool transposeMmaOutput,
+                    int  tileM,
+                    int  tileN,
+                    int  tileK,
+                    bool useUnrollLoop2xForMma,
+                    bool useCustomMmaSchedule,
+                    bool useDeepSeekFp8,
+                    bool usePerTokenSfA,
+                    bool usePerTokenSfB,
+                    bool useTmaStore,
+                    bool useTwoTmaLoadWarps,
+                    bool useTwoMmaWarps,
+                    tg::SfLayout sfLayoutA,
+                    tg::SfLayout sfLayoutB,
+                    tg::SfLayout sfLayoutC,
+                    TileScheduler tileScheduler) 
+: mAllReduceAlgo{allReduceAlgo}
+, mClusterDimX{clusterDimX}
+, mClusterDimY{clusterDimY}
+, mClusterDimZ{clusterDimZ}
+, mDtypeAcc{dtypeAcc}
+, mDtypeElt{dtypeElt}
+, mDtypeC{dtypeC}
+, mEnablesEarlyExit{enablesEarlyExit}
+, mEnablesDelayedEarlyExit{enablesDelayedEarlyExit}
+, mEnablesGlobalPtxKnobs{enablesGlobalPtxKnobs}
+, mEpilogueTileM{epilogueTileM}
+, mEpilogueTileN{epilogueTileN}
+, mGridTriggerSecondaryA{gridTriggerSecondaryA}
+, mGridTriggerSecondaryB{gridTriggerSecondaryB}
+, mGridWaitForPrimaryEarlyExit{gridWaitForPrimaryEarlyExit}
+, mGridWaitForPrimaryA{gridWaitForPrimaryA}
+, mGridWaitForPrimaryB{gridWaitForPrimaryB}
+, mHoistLoadTaskInit{hoistLoadTaskInit}
+, mHoistMmaTaskTryWaits{hoistMmaTaskTryWaits}
+, mK{k}
+, mKernelTraits{kernelTraits}
+, mM{m}
+, mMmaK{mmaK}
+, mMmaM{mmaM}
+, mMmaN{mmaN}
+, mMockAllReduce{mockAllReduce}
+, mN{n}
+, mNumSlicesForSplitK{numSlicesForSplitK}
+, mNumSlicesForSliceK{numSlicesForSliceK}
+, mNumStages{numStages}
+, mNumStagesMma{numStagesMma}
+, mNumStagesMmaWithinWorkTile{numStagesMmaWithinWorkTile}
+, mNumStagesMmaAcrossWorkTile{numStagesMmaAcrossWorkTile}
+, mNumStagesWorkId{numStagesWorkId}
+, mOutputDebugTensors{outputDebugTensors}
+, mUseShuffledMatrixA{useShuffledMatrixA}
+, mSliceK{sliceK}
+, mSplitK{splitK}
+, mTransposeMmaOutput{transposeMmaOutput}
+, mTileM{tileM}
+, mTileN{tileN}
+, mTileK{tileK}
+, mUseUnrollLoop2xForMma{useUnrollLoop2xForMma}
+, mUseCustomMmaSchedule{useCustomMmaSchedule}
+, mUseDeepSeekFp8{useDeepSeekFp8}
+, mUsePerTokenSfA{usePerTokenSfA}
+, mUsePerTokenSfB{usePerTokenSfB}
+, mUseTmaStore{useTmaStore}
+, mUseTwoTmaLoadWarps{useTwoTmaLoadWarps}
+, mUseTwoMmaWarps{useTwoMmaWarps}
+, mSfLayoutA{sfLayoutA}
+, mSfLayoutB{sfLayoutB}
+, mSfLayoutC{sfLayoutC}
+, mTileScheduler{tileScheduler}
+{}
+
   // The all-reduce algorithm.
   AllReduceAlgo mAllReduceAlgo{AllReduceAlgo::None};
 
@@ -93,7 +205,8 @@ struct GemmOptions {
   tg::Dtype mDtypeC{tg::Dtype::Void};
   // Whether to enable early exit.
   bool mEnablesEarlyExit{false};
-  // Whether to enable early exit.
+  // Whether to enable delayed early exit to overlap
+  // numNonExitingCtas loading with the other instructions.
   bool mEnablesDelayedEarlyExit{false};
   // Whether to enable the global PTX knobs for guiding the compiler optimizations.
   bool mEnablesGlobalPtxKnobs{true};
@@ -111,6 +224,8 @@ struct GemmOptions {
   bool mGridWaitForPrimaryA{true};
   // Whether the load of B should wait on a grid dependency.
   bool mGridWaitForPrimaryB{true};
+  // Whether to hoist the initialization of the loading tasks.
+  bool mHoistLoadTaskInit{false};
   // Whether to hoist the mbarrier try_waits (e.g., mma.prodAcq, smemAb.consWait) in the MMA task.
   bool mHoistMmaTaskTryWaits{false};
   // The K dimension of GEMM.
@@ -255,6 +370,7 @@ inline std::string dumpOptions(GemmOptions const& options) {
   ss << "mGridWaitForPrimaryEarlyExit=" << options.mGridWaitForPrimaryEarlyExit << "," << std::endl;
   ss << "mGridWaitForPrimaryA=" << options.mGridWaitForPrimaryA << "," << std::endl;
   ss << "mGridWaitForPrimaryB=" << options.mGridWaitForPrimaryB << "," << std::endl;
+  ss << "mHoistLoadTaskInit=" << options.mHoistLoadTaskInit << "," << std::endl;
   ss << "mHoistMmaTaskTryWaits=" << options.mHoistMmaTaskTryWaits << "," << std::endl;
   ss << "mK=" << options.mK << "," << std::endl;
   ss << "mKernelTraits={}" << "," << std::endl;
@@ -617,15 +733,27 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options,
   // If ( m, -1) -> (m, numStagesMma / m)
   // If (-1,  n) -> (numStagesMma / n, n)
   if (options.mNumStagesMmaWithinWorkTile == -1 && options.mNumStagesMmaAcrossWorkTile == -1) {
-    options.mNumStagesMmaAcrossWorkTile = std::min(2, options.mNumStagesMma);
-    options.mNumStagesMmaWithinWorkTile =
-      options.mNumStagesMma / options.mNumStagesMmaAcrossWorkTile;
+    if (updateOptions) {
+      options.mNumStagesMmaAcrossWorkTile = std::min(2, options.mNumStagesMma);
+      options.mNumStagesMmaWithinWorkTile =
+        options.mNumStagesMma / options.mNumStagesMmaAcrossWorkTile;
+    } else {
+      return false;
+    }
   } else if (options.mNumStagesMmaWithinWorkTile == -1) {
-    options.mNumStagesMmaWithinWorkTile =
-      options.mNumStagesMma / options.mNumStagesMmaAcrossWorkTile;
+    if (updateOptions) {
+      options.mNumStagesMmaWithinWorkTile =
+        options.mNumStagesMma / options.mNumStagesMmaAcrossWorkTile;
+    } else {
+      return false;
+    }
   } else if (options.mNumStagesMmaAcrossWorkTile == -1) {
-    options.mNumStagesMmaAcrossWorkTile =
-      options.mNumStagesMma / options.mNumStagesMmaWithinWorkTile;
+    if (updateOptions) {
+      options.mNumStagesMmaAcrossWorkTile =
+        options.mNumStagesMma / options.mNumStagesMmaWithinWorkTile;
+    } else {
+      return false;
+    }
   }
   // Check mma stages.
   TLLM_CHECK_ERROR_FMT(options.mNumStagesMmaWithinWorkTile * options.mNumStagesMmaAcrossWorkTile ==

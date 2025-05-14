@@ -186,7 +186,7 @@ torch::Tensor fp8_block_scale_moe_runner(torch::Tensor const& routing_logits, to
     args.output = output.data_ptr();
     args.output_scale = nullptr;
 
-    tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner moe_runner;
+    tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner moe_runner(args.mDtypeElt, args.mUseDeepSeekFp8);
     auto workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args);
     at::Tensor workspace_fc1 = at::detail::empty_cuda({std::get<0>(workspace_sizes)}, at::ScalarType::Char, hidden_states.device(), std::nullopt);
     at::Tensor workspace_fc2 = at::detail::empty_cuda({std::get<1>(workspace_sizes)}, at::ScalarType::Char, hidden_states.device(), std::nullopt);
