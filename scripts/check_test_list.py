@@ -92,7 +92,7 @@ def verify_waive_list(llm_src):
         processed_lines.append(line)
 
     # Write the processed lines to a tmp file
-    tmp_waives_file = "processed_waive_list.txt"
+    tmp_waives_file = f"{llm_src}/processed_waive_list.txt"
     with open(tmp_waives_file, "w") as f:
         f.writelines(f"{line}\n" for line in processed_lines)
 
