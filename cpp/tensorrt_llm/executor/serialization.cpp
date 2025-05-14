@@ -1727,6 +1727,42 @@ size_t Serialization::serializedSize(InflightBatchingStats const& inflightBatchi
     return totalSize;
 }
 
+// SpecDecStats
+SpecDecStats Serialization::deserializeSpecDecStats(std::istream& is)
+{
+    auto numDraftTokens = su::deserialize<SizeType64>(is);
+    auto numAcceptedTokens = su::deserialize<SizeType64>(is);
+    auto numRequestsWithDraftTokens = su::deserialize<SizeType64>(is);
+    auto acceptanceLength = su::deserialize<double>(is);
+    auto iterLatencyMS = su::deserialize<double>(is);
+    auto draftOverhead = su::deserialize<double>(is);
+
+    return SpecDecStats{
+        numDraftTokens, numAcceptedTokens, numRequestsWithDraftTokens, acceptanceLength, iterLatencyMS, draftOverhead};
+}
+
+void Serialization::serialize(SpecDecStats const& specDecStats, std::ostream& os)
+{
+    su::serialize(specDecStats.numDraftTokens, os);
+    su::serialize(specDecStats.numAcceptedTokens, os);
+    su::serialize(specDecStats.numRequestsWithDraftTokens, os);
+    su::serialize(specDecStats.acceptanceLength, os);
+    su::serialize(specDecStats.iterLatencyMS, os);
+    su::serialize(specDecStats.draftOverhead, os);
+}
+
+size_t Serialization::serializedSize(SpecDecStats const& specDecStats)
+{
+    size_t totalSize = 0;
+    totalSize += su::serializedSize(specDecStats.numDraftTokens);
+    totalSize += su::serializedSize(specDecStats.numAcceptedTokens);
+    totalSize += su::serializedSize(specDecStats.numRequestsWithDraftTokens);
+    totalSize += su::serializedSize(specDecStats.acceptanceLength);
+    totalSize += su::serializedSize(specDecStats.iterLatencyMS);
+    totalSize += su::serializedSize(specDecStats.draftOverhead);
+    return totalSize;
+}
+
 // IterationStats
 
 IterationStats Serialization::deserializeIterationStats(std::istream& is)
@@ -1754,12 +1790,13 @@ IterationStats Serialization::deserializeIterationStats(std::istream& is)
     auto crossKvCacheStats = su::deserialize<std::optional<KvCacheStats>>(is);
     auto staticBatchingStats = su::deserialize<std::optional<StaticBatchingStats>>(is);
     auto inflightBatchingStats = su::deserialize<std::optional<InflightBatchingStats>>(is);
+    auto specdecStats = su::deserialize<std::optional<SpecDecStats>>(is);
 
     return IterationStats{timestamp, iter, iterLatencyMS, newActiveRequestsQueueLatencyMS, numNewActiveRequests,
         numActiveRequests, numQueuedRequests, numCompletedRequests, maxNumActiveRequests, maxBatchSizeStatic,
         maxBatchSizeTunerRecommended, maxBatchSizeRuntime, maxNumTokensStatic, maxNumTokensTunerRecommended,
         maxNumTokensRuntime, gpuMemUsage, cpuMemUsage, pinnedMemUsage, kvCacheStats, crossKvCacheStats,
-        staticBatchingStats, inflightBatchingStats};
+        staticBatchingStats, inflightBatchingStats, specdecStats};
 }
 
 IterationStats Serialization::deserializeIterationStats(std::vector<char>& buffer)
@@ -1797,6 +1834,7 @@ size_t Serialization::serializedSize(IterationStats const& iterStats)
     totalSize += su::serializedSize(iterStats.crossKvCacheStats);
     totalSize += su::serializedSize(iterStats.staticBatchingStats);
     totalSize += su::serializedSize(iterStats.inflightBatchingStats);
+    totalSize += su::serializedSize(iterStats.specDecStats);
 
     return totalSize;
 }
@@ -1825,6 +1863,7 @@ void Serialization::serialize(IterationStats const& iterStats, std::ostream& os)
     su::serialize(iterStats.crossKvCacheStats, os);
     su::serialize(iterStats.staticBatchingStats, os);
     su::serialize(iterStats.inflightBatchingStats, os);
+    su::serialize(iterStats.specDecStats, os);
 }
 
 std::vector<char> Serialization::serialize(IterationStats const& iterStats)

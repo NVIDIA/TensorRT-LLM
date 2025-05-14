@@ -1,12 +1,12 @@
 # TRT-LLM with PyTorch
 
-Run the quick start script:
+## Run the quick start script:
 
 ```bash
 python3 quickstart.py
 ```
 
-Run the advanced usage example script:
+## Run the advanced usage example script:
 
 ```bash
 # BF16
@@ -29,8 +29,9 @@ python3 quickstart_advanced.py --model_dir nvidia/Llama-3_1-Nemotron-Ultra-253B-
 
 # Nemotron-H requires disabling cache reuse in kv cache
 python3 quickstart_advanced.py --model_dir nvidia/Nemotron-H-8B-Base-8K --disable_kv_cache_reuse --max_batch_size 8
+```
 
-Run the multimodal example script:
+## Run the multimodal example script:
 
 ```bash
 # default inputs
@@ -43,7 +44,7 @@ python3 quickstart_multimodal.py --model_dir Efficient-Large-Model/NVILA-8B --mo
 # Note: media should be either image or video. Mixing image and video is not supported.
 python3 quickstart_multimodal.py --model_dir Efficient-Large-Model/NVILA-8B --modality video --prompt "Tell me what you see in the video briefly." "Describe the scene in the video briefly." --media "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4" "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/world.mp4" --max_tokens 128 [--use_cuda_graph]
 ```
-## Supported Models
+### Supported Models
 | Architecture | Model | HuggingFace Example | Modality |
 |--------------|-------|---------------------|----------|
 | `BertForSequenceClassification` | BERT-based | `textattack/bert-base-uncased-yelp-polarity` | L |
@@ -69,3 +70,12 @@ Note:
 - L: Language only
 - L + V: Language and Vision multimodal support
 - Llama 3.2 accepts vision input, but our support currently limited to text only.
+
+## Run the speculative decoding script:
+
+```bash
+# NGram drafter
+python3 examples/pytorch/quickstart_advanced.py \
+    --max_matching_ngram_size=2 \
+    --spec_decode_nextn=4
+```
