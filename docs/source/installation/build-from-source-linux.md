@@ -150,7 +150,7 @@ Refer to the {ref}`support-matrix-hardware` section for a list of architectures.
 
 #### Building the Python Bindings for the C++ Runtime
 
-The C++ Runtime, in particular, `GptSession` can be exposed to Python via bindings. This feature can be turned on through the default build options.
+The C++ Runtime can be exposed to Python via bindings. This feature can be turned on through the default build options.
 
 ```bash
 python3 ./scripts/build_wheel.py

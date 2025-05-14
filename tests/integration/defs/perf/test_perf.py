@@ -366,9 +366,9 @@ class PerfTestConfig:
         # First, add the model name.
         entries = [self.model_name]
 
-        if self.runtime == "cpp":  # gptSessionBenchmark or berBenchmark runtime
+        if self.runtime == "cpp":  # bertBenchmark runtime
             entries.append(f"cpp")
-        elif self.runtime == "cppmanager":  # gptMananberBenchmark runtime
+        elif self.runtime == "cppmanager":  # gptManagerBenchmark runtime
             entries.append(f"cppmanager")
             if self.api == "exe":  # executor
                 entries.append(f"exe")
@@ -764,9 +764,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def set_runtime_configs(self, llm_root, working_dir,
                             perf_cache_fpath) -> None:
         if self._config.runtime == "cpp":
-            cpp_benchmark_name = "bertBenchmark" if self._config.is_bert_like(
-            ) else "gptSessionBenchmark"
-            benchmark_script = get_cpp_benchmark(cpp_benchmark_name, llm_root)
+            if not self._config.is_bert_like():
+                raise ValueError(
+                    f"Invalid config: '{self._config.runtime}' is only supported for bert-like models!"
+                )
+            benchmark_script = get_cpp_benchmark("bertBenchmark", llm_root)
         elif self._config.runtime == "cppmanager":
             benchmark_script = get_cpp_benchmark("gptManagerBenchmark",
                                                  llm_root)

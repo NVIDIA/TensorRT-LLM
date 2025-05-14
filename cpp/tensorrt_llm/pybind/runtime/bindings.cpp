@@ -298,11 +298,6 @@ void initBindings(pybind11::module_& m)
         .def(py::init())
         .def_readwrite("cache_indirection", &tr::decoder_batch::Output::cacheIndirection);
 
-    py::class_<tr::decoder::Input>(m, "Input")
-        .def(py::init<tr::ITensor::SharedPtr>(), py::arg("logits"))
-        .def_readwrite("logits", &tr::decoder::Input::logits)
-        .def_readwrite("cache_indirection", &tr::decoder::Input::cacheIndirection);
-
     py::class_<tr::LookaheadDecodingBuffers>(m, "LookaheadDecodingBuffers")
         .def(py::init<tr::SizeType32, tr::SizeType32, tr::BufferManager const&>(), py::arg("max_num_sequences"),
             py::arg("max_tokens_per_step"), py::arg("buffer_manager"))

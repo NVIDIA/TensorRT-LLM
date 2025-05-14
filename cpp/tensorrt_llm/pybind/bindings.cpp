@@ -24,7 +24,6 @@
 #include <vector>
 
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
-#include "tensorrt_llm/batch_manager/trtGptModel.h"
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/pybind/batch_manager/algorithms.h"
@@ -503,11 +502,6 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .value("DISAGG_GENERATION_TRANS_IN_PROGRESS", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS)
         .value("DISAGG_GENERATION_TRANS_COMPLETE", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE)
         .value("DISAGG_CONTEXT_INIT_AND_TRANS", tb::LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
-
-    py::enum_<tb::TrtGptModelType>(m, "TrtGptModelType")
-        .value("V1", tb::TrtGptModelType::V1)
-        .value("InflightBatching", tb::TrtGptModelType::InflightBatching)
-        .value("InflightFusedBatching", tb::TrtGptModelType::InflightFusedBatching);
 
     auto gptModelParamsGetState = [&kvCacheConfigGetState](tb::TrtGptModelOptionalParams const& params)
     {
