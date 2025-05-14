@@ -66,20 +66,6 @@ def createKubernetesPodConfig(type, arch = "amd64")
         break
     }
 
-    def pvcVolume = """
-                - name: sw-tensorrt-pvc
-                  persistentVolumeClaim:
-                    claimName: sw-tensorrt-pvc
-    """
-    if (arch == "arm64") {
-        // WAR: PVC mount is not setup on GH200 machines, use a small local cache as a WAR
-        pvcVolume = """
-                - name: sw-tensorrt-pvc
-                  nfs:
-                    server: 10.117.145.13
-                    path: /vol/scratch1/scratch.svc_tensorrt_blossom
-        """
-    }
     def podConfig = [
         cloud: targetCould,
         namespace: "sw-tensorrt",
@@ -106,8 +92,6 @@ def createKubernetesPodConfig(type, arch = "amd64")
                         cpu: '2'
                         memory: 10Gi
                         ephemeral-storage: 25Gi
-                volumes:
-                ${pvcVolume}
         """.stripIndent(),
     ]
 
@@ -242,7 +226,7 @@ pipeline {
                     }
                     steps
                     {
-                        buildImage("trtllm", "push", "skip", "", LLM_BRANCH_TAG + "-x86_64")
+                        buildImage("trtllm_x86_64", "push", "skip", "", LLM_BRANCH_TAG + "-x86_64")
                     }
                 }
                 stage("Build trtllm release-sbsa") {

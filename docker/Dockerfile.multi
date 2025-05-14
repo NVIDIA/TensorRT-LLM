@@ -117,9 +117,9 @@ FROM ${DEVEL_IMAGE} AS release
 # Create a cache directory for pip
 RUN mkdir -p /root/.cache/pip
 
-ARG BUILD_ARCH="x86_64"
+ARG PLATFORM="x86_64"
 RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "$BUILD_ARCH" = "aarch64" ]; then \
+    if [ "$PLATFORM" = "arm64" ]; then \
         pip install torch==2.6.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126; \
     fi
 
