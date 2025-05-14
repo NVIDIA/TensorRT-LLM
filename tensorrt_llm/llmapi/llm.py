@@ -542,12 +542,14 @@ class LLM:
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
             gather_generation_logits=self.args.gather_generation_logits)
-        if max_seq_len is None and self.args.backend is None:
-            # also set executor_config.max_seq_len in TRT backend, to deduce default max_tokens
-            engine_config = EngineConfig.from_json_file(self._engine_dir /
-                                                        "config.json")
-            if bc_msl := engine_config.build_config.max_seq_len:
-                executor_config.max_seq_len = bc_msl
+        if self.args.backend is None:
+            # also set executor_config.max_seq_len in TRT workflow, to deduce default max_tokens
+            if max_seq_len is not None:
+                executor_config.max_seq_len = max_seq_len
+            else:
+                engine_config = EngineConfig.from_json_file(self._engine_dir /
+                                                            "config.json")
+                executor_config.max_seq_len = engine_config.build_config.max_seq_len
         if self.args.kv_cache_config is not None:
             executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
                 self.args.kv_cache_config)
