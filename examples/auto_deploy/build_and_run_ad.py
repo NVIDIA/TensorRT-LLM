@@ -39,7 +39,7 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
 
     # setup AD config
     ad_config = AutoDeployConfig(
-        # Both torch-opt and torch-compile invoke cudagraphs
+        # Both torch-opt and torch-cudagraph invoke cudagraphs
         use_cuda_graph=config.compile_backend in ["torch-opt", "torch-cudagraph"],
         # Both torch-opt and torch-compile invoke torch.compile
         torch_compile_enabled=config.compile_backend in ["torch-opt", "torch-compile"],
