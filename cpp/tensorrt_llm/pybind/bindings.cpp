@@ -114,8 +114,14 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def("get_device", &tr::CudaStream::getDevice);
 
     // Create submodule for executor bindings.
-    py::module_ executor_submodule = m.def_submodule("executor", "Executor bindings");
-    tensorrt_llm::pybind::executor::initBindings(executor_submodule);
+    auto mExecutor = m.def_submodule("executor", "Executor bindings");
+    auto mInternal = m.def_submodule("internal", "Internal submodule of TRTLLM runtime");
+    auto mInternalRuntime = mInternal.def_submodule("runtime", "Runtime internal bindings");
+    auto mInternalTesting = mInternal.def_submodule("testing", "Testing internal bindings");
+    auto mInternalBatchManager = mInternal.def_submodule("batch_manager", "Batch manager internal bindings");
+
+    tensorrt_llm::pybind::executor::initBindings(mExecutor);
+    tensorrt_llm::pybind::runtime::initBindingsEarly(mInternalRuntime);
 
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = py::int_(ENABLE_MULTI_DEVICE);
@@ -328,6 +334,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("hidden_size", &tr::ModelConfig::getHiddenSize)
         .def_property_readonly("size_per_head", &tr::ModelConfig::getSizePerHead)
         .def_property_readonly("data_type", &tr::ModelConfig::getDataType)
+        .def_property_readonly("speculative_decoding_mode", &tr::ModelConfig::getSpeculativeDecodingMode)
         .def_property("head_size", &tr::ModelConfig::getSizePerHead, &tr::ModelConfig::setSizePerHead)
         .def_property(
             "num_kv_heads_per_layer", &tr::ModelConfig::getNumKvHeadsPerLayer, &tr::ModelConfig::setNumKvHeadsPerLayer)
@@ -455,10 +462,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("num_return_sequences", &tr::SamplingConfig::numReturnSequences)
         .def_readwrite("min_p", &tr::SamplingConfig::minP)
         .def_readwrite("beam_width_array", &tr::SamplingConfig::beamWidthArray)
+        .def_readwrite("normalize_log_probs", &tr::SamplingConfig::normalizeLogProbs)
         .def(py::pickle(SamplingConfigGetState, SamplingConfigSetState))
         .def("__eq__", &tr::SamplingConfig::operator==);
-
-    py::bind_vector<std::vector<tr::SamplingConfig>>(m, "VectorSamplingConfig");
 
     m.def("make_sampling_config", &makeSamplingConfig, py::arg("configs"));
 
@@ -547,15 +553,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("pinned", &tr::MemoryCounters::getPinned)
         .def_property_readonly("uvm", &tr::MemoryCounters::getUVM);
 
-    auto mInternal = m.def_submodule("internal", "Internal submodule of TRTLLM runtime");
-
-    auto mInternalRuntime = mInternal.def_submodule("runtime", "Runtime internal bindings");
     tensorrt_llm::pybind::runtime::initBindings(mInternalRuntime);
-
-    auto mInternalTesting = mInternal.def_submodule("testing", "Testing internal bindings");
     tensorrt_llm::pybind::testing::initBindings(mInternalTesting);
 
-    auto mInternalBatchManager = mInternal.def_submodule("batch_manager", "Batch manager internal bindings");
     tpb::initBindings(mInternalBatchManager);
     tb::kv_cache_manager::KVCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::BasePeftCacheManagerBindings::initBindings(mInternalBatchManager);

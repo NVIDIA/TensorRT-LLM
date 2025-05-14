@@ -215,23 +215,6 @@ void initBindings(pybind11::module_& m)
         .def(py::init<tr::BufferManager::CudaStreamPtr, bool>(), py::arg("stream"), py::arg("trim_pool") = false)
         .def_property_readonly("stream", &tr::BufferManager::getStream);
 
-    py::class_<tr::SpeculativeDecodingMode>(m, "SpeculativeDecodingMode")
-        .def(py::init<tr::SpeculativeDecodingMode::UnderlyingType>(), py::arg("state"))
-        .def_static("NoneType", &tr::SpeculativeDecodingMode::None)
-        .def_static("DraftTokensExternal", &tr::SpeculativeDecodingMode::DraftTokensExternal)
-        .def_static("Medusa", &tr::SpeculativeDecodingMode::Medusa)
-        .def_static("LookaheadDecoding", &tr::SpeculativeDecodingMode::LookaheadDecoding)
-        .def_static("ExplicitDraftTokens", &tr::SpeculativeDecodingMode::ExplicitDraftTokens)
-        .def_property_readonly("is_none", &tr::SpeculativeDecodingMode::isNone)
-        .def_property_readonly("is_draft_tokens_external", &tr::SpeculativeDecodingMode::isDraftTokensExternal)
-        .def_property_readonly("is_medusa", &tr::SpeculativeDecodingMode::isMedusa)
-        .def_property_readonly("is_lookahead_decoding", &tr::SpeculativeDecodingMode::isLookaheadDecoding)
-        .def_property_readonly("is_explicit_draft_tokens", &tr::SpeculativeDecodingMode::isExplicitDraftTokens)
-        .def_property_readonly("needs_kv_cache_rewind", &tr::SpeculativeDecodingMode::needsKVCacheRewind)
-        .def_property_readonly("needs_decoder_prologue", &tr::SpeculativeDecodingMode::needsDecoderPrologue)
-        .def_property_readonly("predicts_draft_tokens", &tr::SpeculativeDecodingMode::predictsDraftTokens)
-        .def_property_readonly("needs_kv_cache_rewind", &tr::SpeculativeDecodingMode::needsKVCacheRewind);
-
     py::classh<tr::TllmRuntime>(m, "TllmRuntime")
         .def(py::init(
             [](std::filesystem::path engine_path, float gpu_weights_percent = 1.0f, bool use_shape_inference = true)
@@ -281,7 +264,6 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("medusa_paths", &tr::decoder_batch::Request::medusaPaths)
         .def_readwrite("medusa_tree_ids", &tr::decoder_batch::Request::medusaTreeIds)
         .def_readwrite("lookahead_runtime_config", &tr::decoder_batch::Request::lookaheadRuntimeConfig);
-    py::bind_vector<std::vector<tr::decoder_batch::Request>>(m, "VectorRequest");
 
     py::class_<tr::decoder_batch::Input>(m, "DecoderBatchInput")
         .def(py::init<std::vector<std::vector<tr::ITensor::SharedConstPtr>>, tr::SizeType32>(), py::arg("logits"),
@@ -415,4 +397,25 @@ void initBindings(pybind11::module_& m)
         .value("TWOSHOT", tensorrt_llm::kernels::AllReduceStrategyType::TWOSHOT);
 }
 
+void initBindingsEarly(py::module_& m)
+{
+    py::class_<tr::SpeculativeDecodingMode>(m, "SpeculativeDecodingMode")
+        .def(py::init<tr::SpeculativeDecodingMode::UnderlyingType>(), py::arg("state"))
+        .def_static("NoneType", &tr::SpeculativeDecodingMode::None)
+        .def_static("DraftTokensExternal", &tr::SpeculativeDecodingMode::DraftTokensExternal)
+        .def_static("Medusa", &tr::SpeculativeDecodingMode::Medusa)
+        .def_static("Eagle", &tr::SpeculativeDecodingMode::Eagle)
+        .def_static("LookaheadDecoding", &tr::SpeculativeDecodingMode::LookaheadDecoding)
+        .def_static("ExplicitDraftTokens", &tr::SpeculativeDecodingMode::ExplicitDraftTokens)
+        .def_property_readonly("is_none", &tr::SpeculativeDecodingMode::isNone)
+        .def_property_readonly("is_draft_tokens_external", &tr::SpeculativeDecodingMode::isDraftTokensExternal)
+        .def_property_readonly("is_medusa", &tr::SpeculativeDecodingMode::isMedusa)
+        .def_property_readonly("is_eagle", &tr::SpeculativeDecodingMode::isEagle)
+        .def_property_readonly("is_lookahead_decoding", &tr::SpeculativeDecodingMode::isLookaheadDecoding)
+        .def_property_readonly("is_explicit_draft_tokens", &tr::SpeculativeDecodingMode::isExplicitDraftTokens)
+        .def_property_readonly("needs_kv_cache_rewind", &tr::SpeculativeDecodingMode::needsKVCacheRewind)
+        .def_property_readonly("needs_decoder_prologue", &tr::SpeculativeDecodingMode::needsDecoderPrologue)
+        .def_property_readonly("predicts_draft_tokens", &tr::SpeculativeDecodingMode::predictsDraftTokens)
+        .def_property_readonly("needs_kv_cache_rewind", &tr::SpeculativeDecodingMode::needsKVCacheRewind);
+}
 } // namespace tensorrt_llm::pybind::runtime

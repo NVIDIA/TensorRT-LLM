@@ -43,8 +43,6 @@
 // Opaque bindings
 PYBIND11_MAKE_OPAQUE(tensorrt_llm::batch_manager::ReqIdsSet)
 PYBIND11_MAKE_OPAQUE(std::vector<tensorrt_llm::batch_manager::SlotDecoderBuffers>)
-PYBIND11_MAKE_OPAQUE(std::vector<tensorrt_llm::runtime::decoder_batch::Request>)
-PYBIND11_MAKE_OPAQUE(std::vector<tensorrt_llm::runtime::SamplingConfig>)
 
 // Custom casters
 namespace PYBIND11_NAMESPACE
@@ -201,6 +199,61 @@ public:
     static handle cast(tensorrt_llm::executor::Tensor const& src, return_value_policy /* policy */, handle /* parent */)
     {
         return THPVariable_Wrap(tensorrt_llm::runtime::Torch::tensor(tensorrt_llm::executor::detail::toITensor(src)));
+    }
+};
+
+template <>
+struct type_caster<tensorrt_llm::runtime::ITensor::SharedPtr>
+{
+public:
+    PYBIND11_TYPE_CASTER(tensorrt_llm::runtime::ITensor::SharedPtr, _("torch.Tensor"));
+
+    // Convert PyObject(torch.Tensor) -> tensorrt_llm::runtime::ITensor::SharedPtr
+    bool load(handle src, bool)
+    {
+        PyObject* obj = src.ptr();
+        if (THPVariable_Check(obj))
+        {
+            at::Tensor const& t = THPVariable_Unpack(obj);
+            value = std::move(tensorrt_llm::runtime::TorchView::of(t));
+            return true;
+        }
+        return false;
+    }
+
+    // Convert tensorrt_llm::runtime::ITensor::SharedPtr -> PyObject(torch.Tensor)
+    static handle cast(
+        tensorrt_llm::runtime::ITensor::SharedPtr const& src, return_value_policy /* policy */, handle /* parent */)
+    {
+        return THPVariable_Wrap(tensorrt_llm::runtime::Torch::tensor(src));
+    }
+};
+
+template <>
+struct type_caster<tensorrt_llm::runtime::ITensor::SharedConstPtr>
+{
+public:
+    PYBIND11_TYPE_CASTER(tensorrt_llm::runtime::ITensor::SharedConstPtr, _("torch.Tensor"));
+
+    // Convert PyObject(torch.Tensor) -> tensorrt_llm::runtime::ITensor::SharedConstPtr
+    bool load(handle src, bool)
+    {
+        PyObject* obj = src.ptr();
+        if (THPVariable_Check(obj))
+        {
+            at::Tensor const& t = THPVariable_Unpack(obj);
+            value = std::move(tensorrt_llm::runtime::TorchView::of(t));
+            return true;
+        }
+        return false;
+    }
+
+    // Convert tensorrt_llm::runtime::ITensor::SharedConstPtr -> PyObject(torch.Tensor)
+    static handle cast(tensorrt_llm::runtime::ITensor::SharedConstPtr const& src, return_value_policy /* policy */,
+        handle /* parent */)
+    {
+        return THPVariable_Wrap(tensorrt_llm::runtime::Torch::tensor(
+            reinterpret_cast<tensorrt_llm::runtime::ITensor::SharedPtr const&>(src)));
     }
 };
 

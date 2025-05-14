@@ -10,8 +10,8 @@ from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import (
-    CreateNewDecoderRequests, GenerateRequestOptions, HandleContextLogits,
-    HandleGenerationLogits, MakeDecodingBatchInputOutput)
+    CreateNewDecoderRequests, HandleContextLogits, HandleGenerationLogits,
+    MakeDecodingBatchInputOutput)
 from tensorrt_llm.bindings.internal.batch_manager import (DecoderBuffers,
                                                           DecoderInputBuffers)
 from tensorrt_llm.bindings.internal.runtime import (BufferManager,
@@ -20,6 +20,7 @@ from tensorrt_llm.bindings.internal.runtime import (BufferManager,
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.mapping import Mapping
 
+from .generate_request_options import GenerateRequestOptions
 from .llm_request import LlmRequest, LlmRequestState
 from .scheduler import ScheduledRequests
 
@@ -459,6 +460,7 @@ class TRTLLMDecoder(Decoder):
 
         self.model_datatype = torch_dtype_to_binding(model_dtype)
         self.logits_datatype = DataType.FLOAT
+        self.py_logits_datatype = torch.float32
         self.decoding_mode = decoding_mode
         self.executor_config = executor_config
         self.decoding_config = self.executor_config.decoding_config if self.executor_config.decoding_config else DecodingConfig(
@@ -545,7 +547,7 @@ class TRTLLMDecoder(Decoder):
     def setup_decoder_step(self, requests):
         batch_slots, decoder_requests, sampling_configs = self.algs.generate_request_options(
             self.model_config, self.world_config, self.decoding_config,
-            requests, self.store["buffer_manager"], self.logits_datatype,
+            requests, self.py_logits_datatype,
             self.store["decoder_input_buffers"])
 
         if len(decoder_requests):

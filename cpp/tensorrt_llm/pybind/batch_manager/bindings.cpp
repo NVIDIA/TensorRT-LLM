@@ -109,114 +109,15 @@ void initBindings(pybind11::module_& m)
         .def("set_generated_tokens", &GenLlmReq::setGeneratedTokens, py::arg("generated_beam_tokens"))
         .def("pause", &GenLlmReq::pause, py::arg("max_input_len"))
         .def_property("max_sent_token_len", &GenLlmReq::getMaxSentTokenLen, &GenLlmReq::setMaxSentTokenLen)
-        .def("prompt_embedding_table",
-            [](GenLlmReq& self)
-            {
-                std::optional<at::Tensor> value{std::nullopt};
-                auto tensor = self.getPromptEmbeddingTable();
-                if (tensor)
-                {
-                    value = tr::Torch::tensor(*tensor);
-                }
-                return value;
-            })
-        .def("multimodal_embedding",
-            [](GenLlmReq& self)
-            {
-                std::optional<at::Tensor> value{std::nullopt};
-                auto tensor = self.getMultimodalEmbedding();
-                if (tensor)
-                {
-                    value = tr::Torch::tensor(*tensor);
-                }
-                return value;
-            })
-        .def("get_mrope_rotary_cos_sin",
-            [](GenLlmReq& self)
-            {
-                std::optional<at::Tensor> value{std::nullopt};
-                auto tensor = self.getMropeRotaryCosSin();
-                if (tensor)
-                {
-                    value = tr::Torch::tensor(*tensor);
-                }
-                return value;
-            })
-        .def("bad_words_list",
-            [](GenLlmReq& self)
-            {
-                std::optional<at::Tensor> value{std::nullopt};
-                auto tensor = self.getBadWordsList();
-                if (tensor)
-                {
-                    value = tr::Torch::tensor(*tensor);
-                }
-                return value;
-            })
-        .def_property(
-            "draft_logits",
-            [](GenLlmReq& self)
-            {
-                std::optional<at::Tensor> value{std::nullopt};
-                auto tensor = self.getDraftLogits();
-                if (tensor)
-                {
-                    value = tr::Torch::tensor(*tensor);
-                }
-                return value;
-            },
-            [](GenLlmReq& self, at::Tensor& logits)
-            { self.setDraftLogits(std::make_optional<GenLlmReq::TensorPtr>(tr::TorchView::of(logits))); })
-        .def("embedding_bias",
-            [](GenLlmReq& self)
-            {
-                std::optional<at::Tensor> value{std::nullopt};
-                auto tensor = self.getEmbeddingBias();
-                if (tensor)
-                {
-                    value = tr::Torch::tensor(*tensor);
-                }
-                return value;
-            })
-        .def_property(
-            "lora_config",
-            [](GenLlmReq& self)
-            {
-                std::optional<at::Tensor> value{std::nullopt};
-                auto tensor = self.getLoraConfig();
-                if (tensor)
-                {
-                    value = tr::Torch::tensor(*tensor);
-                }
-                return value;
-            },
-            [](GenLlmReq& self, at::Tensor& loraConfig)
-            { self.setLoraConfig(static_cast<GenLlmReq::TensorPtr>(tr::TorchView::of(loraConfig))); })
-        .def_property(
-            "lora_weights",
-            [](GenLlmReq& self)
-            {
-                std::optional<at::Tensor> value{std::nullopt};
-                auto tensor = self.getLoraWeights();
-                if (tensor)
-                {
-                    value = tr::Torch::tensor(*tensor);
-                }
-                return value;
-            },
-            [](GenLlmReq& self, at::Tensor& loraWeights)
-            { self.setLoraWeights(static_cast<GenLlmReq::TensorPtr>(tr::TorchView::of(loraWeights))); })
-        .def("stop_words_list",
-            [](GenLlmReq& self)
-            {
-                std::optional<at::Tensor> value{std::nullopt};
-                auto tensor = self.getStopWordsList();
-                if (tensor)
-                {
-                    value = tr::Torch::tensor(*tensor);
-                }
-                return value;
-            })
+        .def_property_readonly("prompt_embedding_table", &GenLlmReq::getPromptEmbeddingTable)
+        .def_property_readonly("multimodal_embedding", &GenLlmReq::getMultimodalEmbedding)
+        .def_property_readonly("mrope_rotary_cos_sin", &GenLlmReq::getMropeRotaryCosSin)
+        .def_property_readonly("bad_words_list", &GenLlmReq::getBadWordsList)
+        .def_property("draft_logits", &GenLlmReq::getDraftLogits, &GenLlmReq::setDraftLogits)
+        .def_property_readonly("embedding_bias", &GenLlmReq::getEmbeddingBias)
+        .def_property("lora_config", &GenLlmReq::getLoraConfig, &GenLlmReq::setLoraConfig)
+        .def_property("lora_weights", &GenLlmReq::getLoraWeights, &GenLlmReq::setLoraWeights)
+        .def_property_readonly("stop_words_list", &GenLlmReq::getStopWordsList)
         .def_property_readonly("prompt_vocab_size", &GenLlmReq::getPromptVocabSize)
         .def_property_readonly("mrope_position_deltas", &GenLlmReq::getMropePositionDeltas)
         .def_property_readonly("lora_task_id", &GenLlmReq::getLoraTaskId)

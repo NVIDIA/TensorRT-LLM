@@ -53,10 +53,24 @@ public:
     {
     }
 
+    /**
+     * @brief Generate decoding requests for the given context requests.
+     *        The logic of this function is replicated in `generate_request_options.py`.
+     *
+     * @param modelConfig The model configuration.
+     * @param worldConfig The world configuration.
+     * @param decodingConfig The decoding configuration.
+     * @param contextRequests The context requests.
+     * @param bufferManager The buffer manager.
+     * @param logitsType The logits type.
+     * @param inputBuffers The input buffers.
+     * @param buffers The runtime buffers.
+     * @return A tuple containing the logits, requests, and sampling configurations.
+     */
     std::tuple<ITensor::SharedPtr, std::vector<tr::decoder_batch::Request>, std::vector<tr::SamplingConfig>> operator()(
         tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
         executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
-        BufferManager const& bufferManager, nvinfer1::DataType logitsType, DecoderInputBuffers const& inputBuffers,
+        BufferManager const& bufferManager, nvinfer1::DataType logitsType, DecoderInputBuffers& inputBuffers,
         OptionalRef<RuntimeBuffers const> buffers = std::nullopt) const;
 
 private:

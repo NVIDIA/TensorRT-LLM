@@ -35,24 +35,20 @@ namespace tensorrt_llm::batch_manager
 std::tuple<ITensor::SharedPtr, std::vector<decoder_batch::Request>, std::vector<SamplingConfig>>
 GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
     te::DecodingConfig const& decodingConfig, RequestVector const& contextRequests, BufferManager const& bufferManager,
-    nvinfer1::DataType logitsType, DecoderInputBuffers const& inputBuffers,
-    OptionalRef<RuntimeBuffers const> buffers) const
+    nvinfer1::DataType logitsType, DecoderInputBuffers& inputBuffers, OptionalRef<RuntimeBuffers const> buffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(GenerateRequestOptions);
 
     SizeType32 batchSize{0};
     unsigned decoderInputSize{0};
-    if (!contextRequests.empty())
+    for (auto const& llmReq : contextRequests)
     {
-        for (auto const& llmReq : contextRequests)
+        auto const& reqTokens = llmReq->getTokens(0);
+        if (llmReq->isLastContextChunk())
         {
-            auto const& reqTokens = llmReq->getTokens(0);
-            if (llmReq->isLastContextChunk())
-            {
-                decoderInputSize += reqTokens.size();
-                ++batchSize;
-            }
+            decoderInputSize += reqTokens.size();
+            ++batchSize;
         }
     }
     inputBuffers.inputsIds->resize(decoderInputSize);
