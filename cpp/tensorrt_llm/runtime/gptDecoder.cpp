@@ -214,13 +214,13 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
         auto& requests = requestsOpt.value();
         lookaheadParams->prompt.resize(0);
         lookaheadParams->prompt.reserve(batchSize);
-        lookaheadParams->algoConfigs.resize(0);
-        lookaheadParams->algoConfigs.reserve(batchSize);
+        lookaheadParams->lookaheadConfigs.resize(0);
+        lookaheadParams->lookaheadConfigs.reserve(batchSize);
         for (size_t bi = 0; bi < batchSize; bi++)
         {
             lookaheadParams->prompt.emplace_back(ITensor::slice(requests[bi].ids, 0, requests[bi].inputLen));
             TLLM_CHECK(requests[bi].lookaheadRuntimeConfig);
-            lookaheadParams->algoConfigs.emplace_back(requests[bi].lookaheadRuntimeConfig.value());
+            lookaheadParams->lookaheadConfigs.emplace_back(requests[bi].lookaheadRuntimeConfig.value());
         }
         lookaheadParams->generationLengths = output->lookaheadOutputs->generationLengths;
         lookaheadParams->positionOffsets = output->lookaheadOutputs->positionOffsets;
@@ -383,14 +383,12 @@ void prepareExplicitDraftTokensInput(DecodingInput const& inputs, std::shared_pt
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void prepareLookaheadInputs(
-    DecodingInput const& inputs, size_t maxBatchSize, std::shared_ptr<tl::DecodingInputs>& baseInputs)
+void prepareLookaheadInputs(DecodingInput const& inputs, std::shared_ptr<tl::DecodingInputs>& baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto inputParams = std::dynamic_pointer_cast<tl::LookaheadDecodingInputs>(baseInputs);
-    auto const& lookaheadInputs = inputs.lookaheadInputs.value();
-    inputParams->curTokensPerStep = lookaheadInputs.tokensPerStep;
+    auto lookaheadDecodingInputs = std::dynamic_pointer_cast<tl::LookaheadDecodingInputs>(baseInputs);
+    lookaheadDecodingInputs->curTokensPerStep = inputs.lookaheadInputs.value().tokensPerStep;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -527,7 +525,7 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
     }
     else if (decodingMode.isLookahead() && input.lookaheadInputs)
     {
-        prepareLookaheadInputs(input, maxBatchSize, forwardParams);
+        prepareLookaheadInputs(input, forwardParams);
         forwardParams->localBatchSize = input.batchSize;
     }
     else if (decodingMode.isExternalDraftTokens())

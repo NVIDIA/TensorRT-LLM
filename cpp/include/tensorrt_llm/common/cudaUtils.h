@@ -663,7 +663,7 @@ __host__ __device__ inline void print_elements(T const* ptr, int nRow, int nCol,
     {
         if (iRow >= 0)
         {
-            printf("%07d|", iRow);
+            printf("%7d|", iRow);
         }
         else
         {
@@ -686,22 +686,23 @@ __host__ __device__ inline void print_elements(T const* ptr, int nRow, int nCol,
 }
 
 template <typename T>
-inline void printMatrix(T const* ptr, int nRow, int nCol, int nStride)
+inline void printMatrix(char const* name, T const* ptr, int const nRow, int const nCol, int nStride = 0)
 {
     // `nRow` is length of row dimension
     // `nStride` is length of column dimension
     // `nCol` (<= nStride) is length for print per row
     if (ptr == nullptr)
     {
-        TLLM_LOG_WARNING("Nullptr, skip!\n");
+        TLLM_LOG_DEBUG("%s is nullptr, skip!\n", name);
         return;
     }
     cudaDeviceSynchronize();
     check_cuda_error(cudaGetLastError());
 
     bool const isDevicePtr = (getPtrCudaMemoryType(ptr) == cudaMemoryTypeDevice);
+    nStride = (nStride == 0) ? nCol : nStride;
     size_t sizeInByte = sizeof(T) * nRow * nStride;
-    TLLM_LOG_TRACE("addr=%p, location=%s, sizeof(T)=%lu, nRow=%d, nStride=%d, sizeInByte=%lu\n", ptr,
+    TLLM_LOG_DEBUG("name=%s, addr=%p, location=%s, sizeof(T)=%lu, nRow=%d, nStride=%d, sizeInByte=%lu", name, ptr,
         (isDevicePtr ? "Device" : "Host"), sizeof(T), nRow, nStride, sizeInByte);
     if (isDevicePtr)
     {
@@ -717,23 +718,25 @@ inline void printMatrix(T const* ptr, int nRow, int nCol, int nStride)
     {
         print_elements(ptr, nRow, nCol, nStride);
     }
+    cudaDeviceSynchronize();
 }
 
-template void printMatrix(float const* ptr, int nRow, int nCol, int nStride);
-template void printMatrix(half const* ptr, int nRow, int nCol, int nStride);
+template void printMatrix(char const* name, float const* ptr, int nRow, int nCol, int nStride);
+template void printMatrix(char const* name, half const* ptr, int nRow, int nCol, int nStride);
 #ifdef ENABLE_BF16
-template void printMatrix(__nv_bfloat16 const* ptr, int nRow, int nCol, int nStride);
+template void printMatrix(char const* name, __nv_bfloat16 const* ptr, int nRow, int nCol, int nStride);
 #endif
 #ifdef ENABLE_FP8
-template void printMatrix(__nv_fp8_e4m3 const* ptr, int nRow, int nCol, int nStride);
+template void printMatrix(char const* name, __nv_fp8_e4m3 const* ptr, int nRow, int nCol, int nStride);
 #endif
-template void printMatrix(uint32_t const* ptr, int nRow, int nCol, int nStride);
-template void printMatrix(uint64_t const* ptr, int nRow, int nCol, int nStride);
-template void printMatrix(int const* ptr, int nRow, int nCol, int nStride);
-template void printMatrix(uint8_t const* ptr, int nRow, int nCol, int nStride);
+template void printMatrix(char const* name, uint32_t const* ptr, int nRow, int nCol, int nStride);
+template void printMatrix(char const* name, uint64_t const* ptr, int nRow, int nCol, int nStride);
+template void printMatrix(char const* name, int const* ptr, int nRow, int nCol, int nStride);
+template void printMatrix(char const* name, uint8_t const* ptr, int nRow, int nCol, int nStride);
 
 template <typename T>
-__device__ inline void printMatrixDevice(T const* ptr, int nRow, int nCol, int nStride)
+__device__ inline void printMatrixDevice(
+    char const* name, T const* ptr, int const nRow, int const nCol, int nStride = 0)
 {
     // `nRow` is length of row dimension
     // `nStride` is length of column dimension
@@ -741,26 +744,28 @@ __device__ inline void printMatrixDevice(T const* ptr, int nRow, int nCol, int n
     // Can be called inside kernels by one single thread
     if (ptr == nullptr)
     {
-        printf("Nullptr, skip!\n");
+        printf("%s is nullptr, skip!\n", name);
         return;
     }
+    nStride = (nStride == 0) ? nCol : nStride;
     size_t sizeInByte = sizeof(T) * nRow * nStride;
-    printf("addr=%p, sizeof(T)=%lu, nRow=%d, nStride=%d, sizeInByte=%lu\n", ptr, sizeof(T), nRow, nStride, sizeInByte);
+    printf("name=%s, addr=%p, sizeof(T)=%lu, nRow=%d, nStride=%d, sizeInByte=%lu\n", name, ptr, sizeof(T), nRow,
+        nStride, sizeInByte);
     print_elements(ptr, nRow, nCol, nStride);
 }
 
-template __device__ void printMatrixDevice(float const* ptr, int nRow, int nCol, int nStride);
-template __device__ void printMatrixDevice(half const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(char const* name, float const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(char const* name, half const* ptr, int nRow, int nCol, int nStride);
 #ifdef ENABLE_BF16
-template __device__ void printMatrixDevice(__nv_bfloat16 const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(char const* name, __nv_bfloat16 const* ptr, int nRow, int nCol, int nStride);
 #endif
 #ifdef ENABLE_FP8
-template __device__ void printMatrixDevice(__nv_fp8_e4m3 const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(char const* name, __nv_fp8_e4m3 const* ptr, int nRow, int nCol, int nStride);
 #endif
-template __device__ void printMatrixDevice(uint32_t const* ptr, int nRow, int nCol, int nStride);
-template __device__ void printMatrixDevice(uint64_t const* ptr, int nRow, int nCol, int nStride);
-template __device__ void printMatrixDevice(int const* ptr, int nRow, int nCol, int nStride);
-template __device__ void printMatrixDevice(uint8_t const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(char const* name, uint32_t const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(char const* name, uint64_t const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(char const* name, int const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(char const* name, uint8_t const* ptr, int nRow, int nCol, int nStride);
 
 #ifndef CUDA_CALL
 #define CUDA_CALL(answer)                                                                                              \

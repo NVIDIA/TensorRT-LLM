@@ -29,6 +29,7 @@ class LookaheadDecodingBuffers
 {
 public:
     using TensorPtr = ITensor::SharedPtr;
+
     LookaheadDecodingBuffers(
         SizeType32 maxNumSequences, SizeType32 maxTokensPerStep, BufferManager const& bufferManager);
     TensorPtr generationLengths; // [mMaxNumRequests]
@@ -60,24 +61,26 @@ public:
     void disableLookaheadDecoding();
 
 public:
-    TensorPtr cumSumLength;            // [1] the cumulative sum of generation length, on pinned
-    TensorPtr packedMasksDevice;       // [forwardBatchSize, tokensPerStep, numPackedMasks], on gpu
-    TensorPtr generationLengthsDevice; // [forwardBatchSize], on gpu
-    TensorPtr positionOffsetsDevice;   // [forwardBatchSize, tokensPerStep], on gpu
-    TensorPtr positionIdsDevice;       // [forwardBatchSize, tokensPerStep], on gpu
+    //! The cumulative sum of generation length, [1], on pinned
+    TensorPtr cumSumLength;
 
-    TensorPtr packedMaskHost;
-    TensorPtr generationLengthsHost;
-    TensorPtr positionOffsetsHost;
-    TensorPtr positionIdsHost;
+    TensorPtr packedMasksDevice;         // [batchSize, tokensPerStep, numPackedMasks], on gpu
+    TensorPtr generationLengthsDevice;   // [batchSize], on gpu
+    TensorPtr positionOffsetsDevice;     // [batchSize, tokensPerStep], on gpu
+    TensorPtr positionIdsDevice;         // [batchSize, tokensPerStep], on gpu
 
-    TensorPtr packedMaskHostCopy;
-    TensorPtr generationLengthsHostCopy;
-    TensorPtr positionOffsetsHostCopy;
-    TensorPtr positionIdsHostCopy;
-    TensorPtr useSpecDecoding;
+    TensorPtr packedMaskHost;            // [batchSize, tokensPerStep, numPackedMasks], on cpu
+    TensorPtr generationLengthsHost;     // [batchSize], on cpu
+    TensorPtr positionOffsetsHost;       // [batchSize, tokensPerStep], on cpu
+    TensorPtr positionIdsHost;           // [batchSize, tokensPerStep], on cpu
 
-    TensorPtr batchSlotsHostCopy;
+    TensorPtr packedMaskHostCopy;        // [batchSize, tokensPerStep, numPackedMasks], on cpu
+    TensorPtr generationLengthsHostCopy; // [batchSize], on cpu
+    TensorPtr positionOffsetsHostCopy;   // [batchSize, tokensPerStep], on cpu
+    TensorPtr positionIdsHostCopy;       // [batchSize, tokensPerStep], on cpu
+
+    TensorPtr batchSlotsHostCopy;        // [batchSize], on cpu
+    TensorPtr useSpecDecoding;           // [1], on cpu
 };
 
 } // namespace tensorrt_llm::runtime

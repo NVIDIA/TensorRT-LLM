@@ -209,10 +209,10 @@ TEST(LookaheadRandomllm, gpuSampling)
     kernelParams.logitsHasProbs = false;
     kernelParams.returnAllSelectedTokens = false;
 
-    PRINT_TOKENS(mEndIds);
-    PRINT_VALUES(mTokensPerStep);
-    PRINT_VALUES(mBatchSlots);
-    PRINT_VALUES(mTopKs);
+    PRINT_TOKEN(mEndIds);
+    PRINT_VALUE(mTokensPerStep);
+    PRINT_VALUE(mBatchSlots);
+    PRINT_VALUE(mTopKs);
     tensorrt_llm::kernels::invokeBatchTopKSampling(kernelParams, mStream->get());
 
     mStream->synchronize();

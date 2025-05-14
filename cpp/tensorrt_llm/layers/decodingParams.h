@@ -218,8 +218,8 @@ struct LookaheadSetupParams : public DecodingSetupParams
 {
     using TensorPtr = runtime::ITensor::SharedPtr;
 
-    std::vector<runtime::ITensor::SharedConstPtr> prompt;       // [batchSize][maxSeqLen], on cpu
-    std::vector<executor::LookaheadDecodingConfig> algoConfigs; // [1] or [batchSize]
+    std::vector<runtime::ITensor::SharedConstPtr> prompt;            // [batchSize][maxSeqLen], on cpu
+    std::vector<executor::LookaheadDecodingConfig> lookaheadConfigs; // [1] or [batchSize]
 
     //! see class LookaheadDecodingOutputs
     TensorPtr generationLengths;    // [maxBatchSize], on gpu
@@ -600,11 +600,13 @@ public:
     {
     }
 
-    //! for TLLM engine input "spec_decoding_generation_lengths", indicating how many tokens to be generated.
-    //! currently, the 1st step of generation is 1, set at `setup`, others are maxDecodingTokens, set at `forward`.
+    //! for TLLM engine input "spec_decoding_generation_lengths", number of tokens to be generated.
+    //! 1 for context phase setting in `setup()`, `maxDecodingTokens` for others setting at `forward()`.
     TensorPtr generationLengths; //  [maxBatchSize]
+
     //! for TLLM engine input "spec_decoding_position_offsets",
-    //! indicating each token position offset base on the last golden token = 0.
+    //! Position offset base on the last golden token = 0.
+    //! e.g.
     //! ABC<D>efgxyz--- // sequence tokens, ABCD: golden; efg, xyz: draft; ---: padding.
     //! ***<0>123123--- // positionOffsets.
     //! 012<3>456456--- // positionIds.

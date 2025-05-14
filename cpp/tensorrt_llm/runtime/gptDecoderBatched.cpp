@@ -90,6 +90,7 @@ void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 max
     WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     TLLM_CHECK(maxBatchSize > 0);
     TLLM_CHECK(maxBeamWidth > 0);
     TLLM_CHECK(maxTokensPerEngineStep > 0);
