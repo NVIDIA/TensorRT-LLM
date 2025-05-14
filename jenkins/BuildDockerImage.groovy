@@ -25,91 +25,8 @@ BUILD_JOBS = "32"
 BUILD_JOBS_RELEASE_X86_64 = "16"
 BUILD_JOBS_RELEASE_SBSA = "8"
 
-<<<<<<< HEAD
-def createKubernetesPodConfig(type, arch = "amd64")
-{
-    def targetCould = "kubernetes-cpu"
-    def containerConfig = ""
-
-    switch(type)
-    {
-    case "agent":
-        containerConfig = """
-                  - name: alpine
-                    image: urm.nvidia.com/docker/alpine:latest
-                    command: ['cat']
-                    tty: true
-                    resources:
-                      requests:
-                        cpu: '2'
-                        memory: 10Gi
-                        ephemeral-storage: 25Gi
-                      limits:
-                        cpu: '2'
-                        memory: 10Gi
-                        ephemeral-storage: 25Gi
-                    imagePullPolicy: Always"""
-        break
-    case "build":
-        containerConfig = """
-                  - name: docker
-                    image: urm.nvidia.com/docker/docker:dind
-                    tty: true
-                    resources:
-                      requests:
-                        cpu: 16
-                        memory: 72Gi
-                        ephemeral-storage: 200Gi
-                      limits:
-                        cpu: 16
-                        memory: 256Gi
-                        ephemeral-storage: 200Gi
-                    imagePullPolicy: Always
-                    securityContext:
-                      privileged: true
-                      capabilities:
-                        add:
-                        - SYS_ADMIN"""
-        break
-    }
-
-    def podConfig = [
-        cloud: targetCould,
-        namespace: "sw-tensorrt",
-        yaml: """
-            apiVersion: v1
-            kind: Pod
-            spec:
-                qosClass: Guaranteed
-                nodeSelector:
-                  nvidia.com/node_type: builder
-                  kubernetes.io/os: linux
-                  kubernetes.io/arch: ${arch}
-                containers:
-                  ${containerConfig}
-                  - name: jnlp
-                    image: urm.nvidia.com/docker/jenkins/inbound-agent:4.11-1-jdk11
-                    args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
-                    resources:
-                      requests:
-                        cpu: '2'
-                        memory: 10Gi
-                        ephemeral-storage: 25Gi
-                      limits:
-                        cpu: '2'
-                        memory: 10Gi
-                        ephemeral-storage: 25Gi
-        """.stripIndent(),
-    ]
-
-    return podConfig
-}
-
 
 def buildImage(target, action="build", torchInstallType="skip", args="", custom_tag="", post_tag="", is_sbsa=false)
-=======
-def buildImage(target, action="build", torchInstallType="skip", args="", custom_tag="", post_tag="")
->>>>>>> bc6e5ce2 (Move some function to trtllm_utils)
 {
     def arch = is_sbsa ? "sbsa" : "x86_64"
     def tag = "${arch}-${target}-torch_${torchInstallType}${post_tag}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
@@ -235,12 +152,12 @@ pipeline {
                 stage("Build trtllm release") {
                     agent {
                         kubernetes trtllm_utils.createKubernetesPodConfig(
-                            image = DOCKER_DIND_IMAGE,
-                            type = "build",
-                            cpuRequest = BUILD_CORES_REQUESTED,
-                            cpuLimit = BUILD_CORES_LIMIT,
-                            memoryRequest = BUILD_MEMORY_REQUESTED,
-                            memoryLimit = BUILD_MEMORY_LIMIT
+                            image: DOCKER_DIND_IMAGE,
+                            type: "build",
+                            cpuRequest: BUILD_CORES_REQUESTED,
+                            cpuLimit: BUILD_CORES_LIMIT,
+                            memoryRequest: BUILD_MEMORY_REQUESTED,
+                            memoryLimit: BUILD_MEMORY_LIMIT,
                         )
                     }
                     steps
@@ -251,12 +168,12 @@ pipeline {
                 stage("Build x86_64-skip") {
                     agent {
                         kubernetes trtllm_utils.createKubernetesPodConfig(
-                            image = DOCKER_DIND_IMAGE,
-                            type = "build",
-                            cpuRequest = BUILD_CORES_REQUESTED,
-                            cpuLimit = BUILD_CORES_LIMIT,
-                            memoryRequest = BUILD_MEMORY_REQUESTED,
-                            memoryLimit = BUILD_MEMORY_LIMIT
+                            image: DOCKER_DIND_IMAGE,
+                            type: "build",
+                            cpuRequest: BUILD_CORES_REQUESTED,
+                            cpuLimit: BUILD_CORES_LIMIT,
+                            memoryRequest: BUILD_MEMORY_REQUESTED,
+                            memoryLimit: BUILD_MEMORY_LIMIT,
                         )
                     }
                     steps
@@ -267,6 +184,7 @@ pipeline {
                 stage("Build trtllm release-sbsa") {
                     {
                         kubernetes trtllm_utils.createKubernetesPodConfig(
+<<<<<<< HEAD
                             image = DOCKER_DIND_IMAGE,
                             type = "build",
                             arch = "arm64"
@@ -274,22 +192,50 @@ pipeline {
                             cpuLimit = BUILD_CORES_LIMIT,
                             memoryRequest = BUILD_MEMORY_REQUESTED,
                             memoryLimit = BUILD_MEMORY_LIMIT
+=======
+                            image: DOCKER_DIND_IMAGE,
+                            type: "build",
+                            cpuRequest: BUILD_CORES_REQUESTED,
+                            cpuLimit: BUILD_CORES_LIMIT,
+                            memoryRequest: BUILD_MEMORY_REQUESTED,
+                            memoryLimit: BUILD_MEMORY_LIMIT,
+>>>>>>> 4e95dba5 (Try to fix errors when build docker image)
                         )
                     }
                     steps
                     {
+<<<<<<< HEAD
                         buildImage("trtllm", env.JOB_NAME ==~ /.*PostMerge.*/ ? "push" : params.action, "skip", "", LLM_BRANCH_TAG + "-sbsa", "", true)
+=======
+                        buildImage("devel", params.action, "src_non_cxx11_abi")
+                    }
+                }
+                stage("Build x86_64-cxx11_abi") {
+                    agent {
+                        kubernetes trtllm_utils.createKubernetesPodConfig(
+                            image: DOCKER_DIND_IMAGE,
+                            type: "build",
+                            cpuRequest: BUILD_CORES_REQUESTED,
+                            cpuLimit: BUILD_CORES_LIMIT,
+                            memoryRequest: BUILD_MEMORY_REQUESTED,
+                            memoryLimit: BUILD_MEMORY_LIMIT,
+                        )
+                    }
+                    steps
+                    {
+                        buildImage("devel", params.action, "src_cxx11_abi")
+>>>>>>> 4e95dba5 (Try to fix errors when build docker image)
                     }
                 }
                 stage("Build rockylinux8 x86_64-skip-py3.10") {
                     agent {
                         kubernetes trtllm_utils.createKubernetesPodConfig(
-                            image = DOCKER_DIND_IMAGE,
-                            type = "build",
-                            cpuRequest = BUILD_CORES_REQUESTED,
-                            cpuLimit = BUILD_CORES_LIMIT,
-                            memoryRequest = BUILD_MEMORY_REQUESTED,
-                            memoryLimit = BUILD_MEMORY_LIMIT
+                            image: DOCKER_DIND_IMAGE,
+                            type: "build",
+                            cpuRequest: BUILD_CORES_REQUESTED,
+                            cpuLimit: BUILD_CORES_LIMIT,
+                            memoryRequest: BUILD_MEMORY_REQUESTED,
+                            memoryLimit: BUILD_MEMORY_LIMIT,
                         )
                     }
                     steps
@@ -300,12 +246,12 @@ pipeline {
                 stage("Build rockylinux8 x86_64-skip-py3.12") {
                     agent {
                         kubernetes trtllm_utils.createKubernetesPodConfig(
-                            image = DOCKER_DIND_IMAGE,
-                            type = "build",
-                            cpuRequest = BUILD_CORES_REQUESTED,
-                            cpuLimit = BUILD_CORES_LIMIT,
-                            memoryRequest = BUILD_MEMORY_REQUESTED,
-                            memoryLimit = BUILD_MEMORY_LIMIT
+                            image: DOCKER_DIND_IMAGE,
+                            type: "build",
+                            cpuRequest: BUILD_CORES_REQUESTED,
+                            cpuLimit: BUILD_CORES_LIMIT,
+                            memoryRequest: BUILD_MEMORY_REQUESTED,
+                            memoryLimit: BUILD_MEMORY_LIMIT,
                         )
                     }
                     steps
