@@ -134,7 +134,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                              ids=["tp4", "tp2pp2", "pp4"])
     def test_fp8_4gpus(self, tp_size, pp_size, fp8kv, attn_backend,
                        torch_compile):
-        if pp_size > 1:
+        if pp_size > 1 and torch_compile:
             pytest.skip(
                 "Pipeline parallel with torch.compile is not supported yet.\n"
                 "Issue: Unfusing flashinfer_fused_add_rmsnorm causes outputs to be "
@@ -245,6 +245,16 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
 class TestMistral7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-7B-v0.1"
     MODEL_PATH = f"{llm_models_root()}/mistral-7b-v0.1"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "google/gemma-3-1b-it"
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
 
     def test_auto_dtype(self):
         with LLM(self.MODEL_PATH) as llm:
@@ -773,6 +783,54 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                   moe_expert_parallel_size=ep_size,
                   pytorch_backend_config=pytorch_config,
                   enable_attention_dp=attention_dp)
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
+        [(1, 1, 1, True, True, True)],
+        ids=["latency"])
+    def test_fp8(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
+                 overlap_scheduler):
+        pytorch_config = PyTorchConfig(
+            enable_overlap_scheduler=overlap_scheduler,
+            use_cuda_graph=cuda_graph)
+
+        llm = LLM(
+            f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf",
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            moe_expert_parallel_size=ep_size,
+            pytorch_backend_config=pytorch_config,
+            enable_attention_dp=attention_dp)
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
+        [(1, 1, 1, True, True, True)],
+        ids=["latency"])
+    def test_nvfp4(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
+                   overlap_scheduler):
+        pytorch_config = PyTorchConfig(
+            enable_overlap_scheduler=overlap_scheduler,
+            use_cuda_graph=cuda_graph)
+
+        llm = LLM(
+            f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf",
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            moe_expert_parallel_size=ep_size,
+            pytorch_backend_config=pytorch_config,
+            enable_attention_dp=attention_dp)
         with llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)

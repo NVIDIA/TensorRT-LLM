@@ -71,7 +71,6 @@ from utils.llm_data import llm_models_root
     ],
 )
 def test_build_ad(world_size: Optional[int], config: Dict):
-    pytest.skip("https://nvbugs/5271004")
     simple_config = SimpleConfig(**config)
     simple_config.world_size = world_size
     main(simple_config)

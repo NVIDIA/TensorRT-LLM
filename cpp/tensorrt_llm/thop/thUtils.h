@@ -89,4 +89,5 @@ int nextPowerOfTwo(int v);
 std::optional<float> getFloatEnv(char const* name);
 
 cudaDataType_t convert_torch_dtype(torch::ScalarType dtype);
+
 } // namespace torch_ext

@@ -142,6 +142,8 @@ l0_dgx_h100:
   - accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2_manage_weights
   - accuracy/test_cli_flow.py::TestQwen2_57B_A14B::test_tp4
   - accuracy/test_llm_api.py::TestQwen2_7BInstruct::test_tp2
+  - accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_cp2
+  - accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_tp2cp2
   - examples/test_llama.py::test_llm_llama_long_alpaca_8gpu_summary[pg64317-tp4pp2-nb:4]
   - examples/test_llama.py::test_llm_llama_v2_lora_benchmark_2gpu[chinese_lora-llama-v2-13b-hf]
   - examples/test_mixtral.py::test_llm_mixtral_moe_plugin_lora_4gpus[Mixtral-8x7B-v0.1-chinese-mixtral-lora]
