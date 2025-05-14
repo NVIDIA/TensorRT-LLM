@@ -53,7 +53,6 @@ class Llama4Attention(Attention):
         attention_chunk_size: Optional[int] = None,
     ):
         config = model_config.pretrained_config
-
         self.use_rope = not nope_layer
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gptj,
@@ -175,6 +174,7 @@ class Llama4Attention(Attention):
                 mrope_config=mrope_config,
                 all_reduce_params=all_reduce_params,
                 lora_params=lora_params,
+                attention_chunk_size=self.attention_chunk_size,
                 **kwargs,
             )
         else:
@@ -857,9 +857,9 @@ class Llama4ForCausalLM(DecoderModelForCausalLM[Llama4Model, Llama4Config]):
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
 
-    def infer_max_seq_len(self):
-        # TODO: implement chunked attention to support 10M context length
-        return 8192
+    # def infer_max_seq_len(self):
+    #     # TODO: implement chunked attention to support 10M context length
+    #     return 8192
 
     def load_weights(self, weights: Dict):
         new_weights = {}
