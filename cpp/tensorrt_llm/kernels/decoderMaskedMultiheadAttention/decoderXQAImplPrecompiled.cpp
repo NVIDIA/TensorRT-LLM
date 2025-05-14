@@ -438,7 +438,7 @@ void DecoderXQAImplPrecompiled::runDispatchBuffer(
 
 #define SUPPORT_RETURN_FALSE(X)                                                                                        \
     {                                                                                                                  \
-        TLLM_LOG_WARNING("XQA is not used. Reason: %s", X);                                                            \
+        TLLM_LOG_DEBUG("XQA is not used. Reason: %s", X);                                                              \
         return false;                                                                                                  \
     }
 

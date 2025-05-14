@@ -99,7 +99,7 @@ bool DecoderXQAImplJIT::shouldUse(XQAParams const& umbrellaXQAParams, bool forCo
                 return true;
             }
         }
-        TLLM_LOG_WARNING("JIT XQA is not used: no supported configuration found for any beam_width");
+        TLLM_LOG_DEBUG("JIT XQA is not used: no supported configuration found for any beam_width");
         return false;
     }
     else
@@ -108,13 +108,13 @@ bool DecoderXQAImplJIT::shouldUse(XQAParams const& umbrellaXQAParams, bool forCo
         bool isConfigSupported = supportConfig(xqaParams, forConfigurePlugin);
         if (!isConfigSupported)
         {
-            TLLM_LOG_WARNING("JIT XQA is not used: unsupported configuration");
+            TLLM_LOG_DEBUG("JIT XQA is not used: unsupported configuration");
             return false;
         }
         bool hasPerfGain = mayHavePerfGain(xqaParams);
         if (!hasPerfGain)
         {
-            TLLM_LOG_WARNING("JIT XQA is not used: no performance gain");
+            TLLM_LOG_DEBUG("JIT XQA is not used: no performance gain");
             return false;
         }
         return true;
