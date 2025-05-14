@@ -481,11 +481,9 @@ class PerfTestConfig:
         labels = test_param_labels.split("-")
 
         self.model_name = labels.pop(0)
-        self.runtime = "python" if labels[0] not in [
-            "cpp",
-            "cppmanager",
-            "bench",
-        ] else labels.pop(0)
+        assert labels[0] in ["cpp", "cppmanager", "bench"], \
+            f"Invalid runtime {labels[0]}!"
+        self.runtime = labels.pop(0)
         self.api = labels.pop(0) if labels[0] == "exe" else ""
         self.backend = labels.pop(0) if labels[0] == "pytorch" else ""
         self.streaming = labels.pop(0) if labels[0] == "streaming" else ""
@@ -592,7 +590,7 @@ class PerfTestConfig:
             assert self.model_name in allowed_models, f"model_name {self.model_name} is not in allowed_models!"
 
         # Validate runtime type.
-        VALID_RUNTIMES = ["cpp", "cppmanager", "python", "bench"]
+        VALID_RUNTIMES = ["cpp", "cppmanager", "bench"]
         assert self.runtime in VALID_RUNTIMES, f"Invalid runtime {self.runtime}!"
 
         # Validate plugin mode.
@@ -608,8 +606,8 @@ class PerfTestConfig:
         # Validate quantization mode.
         if self.model_name in MODEL_PATH_DICT.keys():
             VALID_QUANTS = [
-                "", "nvfp4", "fp8", "int8_sq", "int4_awq", "w4a8_awq",
-                "w4a16_awq", "int8_wo", "int4_wo", "full_prec"
+                "", "nvfp4", "fp8", "int8", "int4_awq", "w4a8_awq", "w4a16_awq",
+                "int4_wo", "full_prec"
             ]
         else:
             VALID_QUANTS = [
@@ -625,6 +623,8 @@ class PerfTestConfig:
                 "int4_weight_only_gptq",
             ]
         assert self.quantization in VALID_QUANTS, f"Invalid quantization {self.quantization}!"
+        if self.backend == "pytorch":
+            assert self.quantization == "", f"Not support passing quantization {self.quantization} for pytorch backend!"
         assert self.num_beams >= 1, f"Invalid num_beams: {self.num_beams}!"
         assert self.num_loras >= 0, f"Invalid num_loras: {self.num_loras}!"
         assert self.num_reqs >= 1, f"Invalid num_reqs: {self.num_reqs}!"
@@ -773,8 +773,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         elif self._config.runtime == "bench":
             benchmark_script = "trtllm-bench"
         else:
-            benchmark_script = os.path.join(llm_root, "benchmarks", "python",
-                                            "benchmark.py")
+            raise RuntimeError(f"Invalid runtime {self._config.runtime}.")
         allowed_configs = import_allowed_perf_config()
         allowed_models = allowed_configs.get_allowed_models()
         if self._config.runtime == "bench":
@@ -803,8 +802,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         if self._config.quantization != "":
             command, checkpoint_dir = quantize_data(
                 llm_venv=None,
-                example_root=os.path.join(get_llm_root(), "examples",
-                                          example_name),
+                example_root=os.path.join(get_llm_root(), "examples", "models",
+                                          "core", example_name),
                 model_dir=model_dir,
                 calib_dataset=os.path.join(llm_models_root(), "datasets",
                                            "cnn_dailymail"),
@@ -816,8 +815,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         else:
             command, checkpoint_dir = convert_weights(
                 llm_venv=None,
-                example_root=os.path.join(get_llm_root(), "examples",
-                                          example_name),
+                example_root=os.path.join(get_llm_root(), "examples", "models",
+                                          "core", example_name),
                 cmodel_dir=engine_dir,
                 model=self._config.model_name,
                 model_path=model_dir,
@@ -1393,7 +1392,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         Run through the commands and parse multiple perf metrics from the logs.
         """
         #print info to separate cases
-        print_info(f"Running perf test for case: {self._short_test_name_body}")
+        print_info(f"Running perf test for case: {self._short_test_name}")
         self._current_cmd_idx = 0
         metrics = self._get_metrics()
         outputs = {}

@@ -418,7 +418,7 @@ class DecoderModelForCausalLM(nn.Module,
                     if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
                         for n, q in quant_config_dict.items():
                             # gate_proj and up_proj share the same quant config
-                            if prefix_name + '.gate_proj' in n:
+                            if prefix_name + '.gate_proj' in n or prefix_name + '.gate_up_proj' in n:
                                 module.quant_config = q
                                 break
                     elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
@@ -438,7 +438,13 @@ class DecoderModelForCausalLM(nn.Module,
                         if name + '.q_proj' in n:
                             module.quant_config = q
                             break
-                # TODO: support MLA
+                elif hasattr(module, 'fused_a'):
+                    # DeepseekV3Attention
+                    for n, q in quant_config_dict.items():
+                        # reuse q_proj quant config as the attention quant config
+                        if name + '.fused_a' in n:
+                            module.quant_config = q
+                            break
 
         # 2. skip quant for modules in QuantConfig.exclude_modules.
         # kv_cache_quant_algo takes precedence over exclude_modules.

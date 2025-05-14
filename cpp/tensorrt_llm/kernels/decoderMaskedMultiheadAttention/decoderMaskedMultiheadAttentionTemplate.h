@@ -1498,6 +1498,8 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // The actual kv cache length.
     // tlength is the past length actually.
     int const kv_loop_length = min(tlength, cyclic_kv_cache_len);
+    // The bound of the kv token idx (kv_loop_length = 0 should not happen ideally, but add here for safety).
+    int const kv_token_idx_bound = max(kv_loop_length - 1, 0);
     // The shared context length for beam searching optimization (all points to beam 0).
     // TODO: with cyclic kv cache, we set it 0 for now (will optimize in the future)
     // as context kv cache might be overwritten by the new kv cache
@@ -1962,7 +1964,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 // Dh OOB values will be handled by zero_q.
                 // Seq OOB values will be masked out when storing back to smem.
                 auto const jj = min(k_idx.y + k_vec_i * K_ELTS_PER_CHUNK, Dh - K_VEC_SIZE);
-                int valid_time_now = min(time_now + k_loop * K_PER_ITER, kv_loop_length - 1);
+                int valid_time_now = min(time_now + k_loop * K_PER_ITER, kv_token_idx_bound);
                 // The beam offset is always 0 either when beam_width = 1
                 // or the time_idx < kv_loop_length (all beams share the same context kv cache).
                 int beam_offset
@@ -2329,7 +2331,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             {
                 // Fetch offset based on cache_indir when beam sampling
                 int time_idx = ti + v_loop * V_PER_ITER + (MULTI_BLOCK_FLAG ? c_tile_times_timesteps_per_block : 0);
-                time_idx = min(time_idx, kv_loop_length - 1);
+                time_idx = min(time_idx, kv_token_idx_bound);
                 // The beam offset is always 0 either when beam_width = 1
                 // or the time_idx < kv_loop_length (all beams share the same context kv cache).
                 int beam_offset = (HAS_BEAMS && time_idx >= beam0_context_length) ? beam_indices[time_idx] : 0;

@@ -162,10 +162,6 @@ def create_py_executor(executor_config: ExecutorConfig,
         resources[KV_CACHE_MANAGER_KEY] = kv_cache_manager
         resources[DRAFT_KV_CACHE_MANAGER_KEY] = draft_kv_cache_manager
 
-    # KVCacheManager modifies these fields, update them to executor_config
-    if kv_cache_manager is not None:
-        executor_config.max_seq_len = kv_cache_manager.max_seq_len
-
     # resource managers for speculative decoding
     if spec_config is not None:
         spec_resource_manager = get_spec_resource_manager(

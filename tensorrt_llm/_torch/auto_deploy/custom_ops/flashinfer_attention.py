@@ -210,20 +210,21 @@ def prepare_flashinfer_metadata(
     )
 
 
+# TODO: Move the truncation of seq_len out of this custom op
+# As SequenceInfo._get_sanitized_num_sequences could break in fake mode
 @prepare_flashinfer_metadata.register_fake
 def prepare_flashinfer_metadata_fake(
     input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
 ):
+    seq_len = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
     qo_indptr = torch.empty(len(seq_len) + 1, dtype=seq_len.dtype, device=seq_len.device)
-    batch_indices = torch.empty_like(cache_loc)
-    positions = torch.empty_like(cache_loc)
     return (
         qo_indptr,  # qo_indptr
         torch.empty_like(qo_indptr),  # paged_kv_indptr
         torch.empty_like(cache_loc),  # paged_kv_indices
         torch.empty_like(seq_len),  # paged_kv_last_page_len
-        batch_indices,  # batch_indices
-        positions,  # positions
+        torch.empty_like(seq_len),  # batch_indices
+        torch.empty_like(seq_len),  # positions
     )
 
 

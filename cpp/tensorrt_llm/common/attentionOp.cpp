@@ -187,8 +187,8 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.paged_kv_cache = mPagedKVCache;
     xqaParams.tokens_per_block = mTokensPerBlock;
     xqaParams.kv_cache_quant_mode = mKVCacheQuantMode;
-    xqaParams.tp_size = mTpSize;
-    xqaParams.tp_rank = mTpRank;
+    xqaParams.tp_size = mAttnTpSize;
+    xqaParams.tp_rank = mAttnTpRank;
     xqaParams.qkv_bias_enabled = mQKVBiasEnabled;
     xqaParams.cross_attention = mCrossAttention;
     xqaParams.max_distance = mMaxDistance;
@@ -223,6 +223,15 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.host_context_lengths = generationsParams.host_context_lengths;
     xqaParams.semaphores = generationsParams.semaphores;
     xqaParams.workspaces = generationsParams.workspace;
+    if (mCpSize > 1)
+    {
+        size_t const batch_beam = generationsParams.beam_width * generationsParams.num_requests;
+        size_t const cpMaxPaddedSequenceLength = (batch_beam + mCpSize - 1) / mCpSize * mCpSize;
+        size_t const cpWorkspaceSize
+            = 2 * sizeof(T) * cpMaxPaddedSequenceLength * (mNumHeads + 2 * mNumKVHeads) * mHeadSize;
+        xqaParams.workspaces
+            = reinterpret_cast<void*>(reinterpret_cast<int8_t*>(xqaParams.workspaces) + cpWorkspaceSize);
+    }
     xqaParams.batch_size = generationsParams.num_requests;
     xqaParams.beam_width = generationsParams.beam_width;
     // Speculative decoding mode has generation input_length > 1.
@@ -254,7 +263,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.mrope_position_deltas = generationsParams.mrope_position_deltas;
 
     xqaParams.logn_scaling_ptr = generationsParams.logn_scaling_ptr;
-    xqaParams.total_num_input_tokens = generationsParams.num_tokens;
+    xqaParams.total_num_input_tokens = mCpSize > 1 ? generationsParams.num_requests : generationsParams.num_tokens;
     xqaParams.is_fp8_output = mFP8ContextFMHA;
     xqaParams.fp8_out_scale = (mFP8ContextFMHA ? generationsParams.attention_output_orig_quant : nullptr);
     // Parameters required for FP4 output.
@@ -802,9 +811,11 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
     }
 
     size_t generation_workspace_size = 0;
-
+    // The minimum number of sequence length tiles (limited by the shared memory size).
+    int minSeqLenTile
+        = estimate_min_multi_block_count(max_attention_window_size, mMaxSharedMemoryPerBlockOptin - 2048, size);
     int32_t const maxSeqLenTile
-        = std::max(getMaxNumSeqLenTile(batch_beam), (int) tc::divUp(mMultiProcessorCount, mNumHeads));
+        = std::max({minSeqLenTile, getMaxNumSeqLenTile(batch_beam), (int) tc::divUp(mMultiProcessorCount, mNumHeads)});
 
     size_t const partial_out_size = size * batch_beam * mNumHeads * mHeadSize * maxSeqLenTile;
     size_t const partial_sum_size = sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile;
@@ -2041,7 +2052,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     int timestep = params.max_past_kv_length;
     int const max_timesteps = std::min(timestep, params.cyclic_attention_window_size);
     int estimated_min_multi_block_count
-        = estimate_min_multi_block_count<T>(max_timesteps, mMaxSharedMemoryPerBlockOptin - 2048);
+        = estimate_min_multi_block_count(max_timesteps, mMaxSharedMemoryPerBlockOptin - 2048, sizeof(T));
 
     if (!mMultiBlockMode && !mForceMultiBlockWarned && estimated_min_multi_block_count > 1)
     {
@@ -2172,6 +2183,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         Cross_multihead_attention_params<DataType> mmhca_params;
         fusedQKV_masked_attention_dispatch(mmhca_params, dispatch_params, stream);
     }
+    sync_check_cuda_error(stream);
 
     if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
     {

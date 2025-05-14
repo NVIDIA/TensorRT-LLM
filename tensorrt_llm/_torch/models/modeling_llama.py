@@ -440,7 +440,9 @@ class Llama4DecoderLayer(DecoderLayer):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
                                                       hidden_states, residual)
 
-        if self.fusion_config.POST_MOE_FUSION or self.fusion_config.POST_MLP_FUSION:
+        if (self.fusion_config.POST_MOE_FUSION
+                or self.fusion_config.POST_MLP_FUSION
+            ) and self.next_layer_layernorm is not None:
             if cutlass_min_latency_mode:
                 shared_output = hidden_states[0]
                 hidden_states_activated_experts = hidden_states[1]
@@ -849,12 +851,7 @@ class Llama4ForCausalLM(DecoderModelForCausalLM[Llama4Model, Llama4Config]):
                          vocab_size=model_config.pretrained_config.vocab_size)
 
     def infer_max_seq_len(self):
-        # TODO: increase to support 10M context length. There are two blockers
-        # right now:
-        # 1. We need to implement chunked attention.
-        # 2. CUDA graph warmup will crash when the cached context is that long.
-        # This only affects the TRTLLM backend; flashinfer is fine. It is
-        # most likely an issue with the kernel.
+        # TODO: implement chunked attention to support 10M context length
         return 8192
 
     def load_weights(self, weights: Dict):
@@ -950,6 +947,7 @@ class Llama4ForConditionalGeneration(Llama4ForCausalLM):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: Optional[bool] = False,
         spec_metadata: Optional[SpecMetadata] = None,
+        pipeline_interface: Optional[PipelineInterface] = None,
         **kwargs,
     ) -> torch.Tensor:
         mm_embed = kwargs.get("multi_modal_data", [])
@@ -960,7 +958,8 @@ class Llama4ForConditionalGeneration(Llama4ForCausalLM):
                                  position_ids,
                                  inputs_embeds,
                                  spec_metadata=spec_metadata,
-                                 return_context_logits=return_context_logits)
+                                 return_context_logits=return_context_logits,
+                                 pipeline_interface=pipeline_interface)
         return logits
 
 
