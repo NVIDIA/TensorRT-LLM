@@ -6,11 +6,6 @@ import groovy.transform.Field
 // Docker image registry
 IMAGE_NAME = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging"
 
-BUILD_CORES_REQUESTED = "16"
-BUILD_CORES_LIMIT = "16"
-BUILD_MEMORY_REQUESTED = "72Gi"
-BUILD_MEMORY_LIMIT = "256Gi"
-
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
     LLM_REPO = env.gitlabSourceRepoHttpUrl ? env.gitlabSourceRepoHttpUrl : "${DEFAULT_LLM_REPO}"
