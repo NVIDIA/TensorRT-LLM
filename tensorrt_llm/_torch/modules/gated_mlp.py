@@ -37,8 +37,7 @@ class GatedMLP(nn.Module):
                  config: Optional[ModelConfig] = None,
                  overridden_tp_size: Optional[int] = None,
                  reduce_output: bool = True,
-                 layer_idx: Optional[int] = None,
-                 is_llama4: bool = False):
+                 layer_idx: Optional[int] = None):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
@@ -63,8 +62,6 @@ class GatedMLP(nn.Module):
             tp_size=tp_size,
             pp_size=pp_size,
         )
-
-        self.is_llama4 = is_llama4
         self.gate_up_proj = Linear(
             self.hidden_size,
             self.intermediate_size * 2,
@@ -76,9 +73,7 @@ class GatedMLP(nn.Module):
                 weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
             quant_config=config.get_quant_config(),
             reduce_output=reduce_output,
-            skip_create_weights_in_init=config.skip_create_weights_in_init,
-            # In Llama4, we are using the custom kernel that performs FC+SwiGLU
-            use_llama4_fc_swiglu_kernel=is_llama4)
+            skip_create_weights_in_init=config.skip_create_weights_in_init)
         self.down_lora = LoraLayer([LoraModuleType.MLP_4H_TO_H],
                                    [self.hidden_size])
 
@@ -92,13 +87,7 @@ class GatedMLP(nn.Module):
             quant_config=config.get_quant_config(),
             reduce_output=reduce_output,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            # In llama4, the custom kernel (triggered by use_llama4_fc_swiglu_kernel)
-            # is outputting fp8. The current setting is assuming bf16 out, so we need
-            # to provide the inv_input_scale of this layer to it to offset the un-needed
-            # quantization.
-            previous_gate_up_proj=self.gate_up_proj,
             lora=self.down_lora,
-            use_llama4_trtllm_gen=is_llama4,
         )
 
         # These two modules are mutually exclusive - either splitted_gate_up_lora or fused_gate_up_lora will be used,
@@ -126,15 +115,9 @@ class GatedMLP(nn.Module):
                                      final_all_reduce_params, lora_params)
 
         if self.activation == F.silu:
-            if self.gate_up_proj.use_llama4_fc_swiglu_kernel and self.down_proj.has_fp8_qdq and x.shape[
-                    0] <= 16:
-                # In Llama4, we have two custom kernels for FC+SwiGLU. The first one is a
-                # gemv kernel that is efficient for small input sizes (token_length <= 4).
-                # The second one is the trtllm-gen kernel that is efficient for (4 < token_length <= 16).
-                h2 = self.gate_up_proj(x)
-            else:
-                h1 = self.gate_up_proj(x)
-                h2 = swiglu(h1)
+            h1 = self.gate_up_proj(x)
+
+            h2 = swiglu(h1)
             output = self.down_proj(h2,
                                     all_reduce_params=final_all_reduce_params,
                                     layer_idx=self.layer_idx)

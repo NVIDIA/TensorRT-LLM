@@ -15,16 +15,17 @@
  */
 
 #pragma once
-#include <cuda.h>
+
 #include <cuda_fp8.h>
-#include <cuda_runtime.h>
 
-namespace tensorrt_llm::kernels::llama4_fc_swiglu
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace tensorrt_llm::kernels::llama4_min_latency::llama4_fp8_fp8_gemm_swiglu
 {
-void llama4_fc_swiglu_fp8_op(int num_tokens, int hidden_out, void const* A, void const* B, void* C,
+
+void llama4_fp8_fp8_gemm_swiglu_op(int num_tokens, int hidden_in, int hidden_out, void const* A, void const* B, void* C,
     void const* in_scale, void const* out_scale_inv, cudaStream_t stream);
 
-void llama4_fc_swiglu_bf16_op(int num_tokens, int hidden_out, void const* A, void const* B, void* C,
-    void const* in_scale, void const* out_scale_inv, cudaStream_t stream);
-
-} // namespace tensorrt_llm::kernels::llama4_fc_swiglu
+} // namespace tensorrt_llm::kernels::llama4_min_latency::llama4_fp8_fp8_gemm_swiglu

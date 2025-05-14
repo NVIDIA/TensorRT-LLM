@@ -41,6 +41,7 @@ class Attention(nn.Module):
         num_key_value_heads: int,
         max_position_embeddings: int,
         bias: bool,
+        aux_stream: Optional[torch.cuda.Stream] = None,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
         layer_idx: Optional[int] = None,
         dtype: torch.dtype = None,
@@ -48,7 +49,6 @@ class Attention(nn.Module):
         config: Optional[ModelConfig] = None,
         qk_norm_type: QkNormType = QkNormType.none,
         q_scaling: float = 1.0,
-        is_llama4: bool = False,
     ):
         """
         Initialize the Attention module.
@@ -118,7 +118,6 @@ class Attention(nn.Module):
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            use_llama4_qkv=is_llama4,
         )
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])

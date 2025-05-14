@@ -61,8 +61,6 @@ class RuntimeConfig(BaseModel):
             True,
             "kv_cache_config":
             self.settings_config.get_kvcache_config(),
-            "enable_chunked_prefill":
-            self.settings_config.chunking,
             "extended_runtime_perf_knob_config":
             self.performance_options.get_perf_config(),
             "decoding_config":

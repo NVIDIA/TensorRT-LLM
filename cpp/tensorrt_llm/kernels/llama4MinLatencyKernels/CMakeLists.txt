@@ -18,8 +18,8 @@
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
-add_library(llama4_fc_swiglu_tiled_fp8 OBJECT ${SRC_CPP} ${SRC_CU})
-set_property(TARGET llama4_fc_swiglu_tiled_fp8
+add_library(llama4_min_latency_kernels OBJECT ${SRC_CPP} ${SRC_CU})
+set_property(TARGET llama4_min_latency_kernels
              PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET llama4_fc_swiglu_tiled_fp8
+set_property(TARGET llama4_min_latency_kernels
              PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
