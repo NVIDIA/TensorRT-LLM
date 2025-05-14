@@ -4,6 +4,8 @@
 
 This document provides an overview of the internal hierarchy and event system for paged KV cache management, as implemented in the TensorRT-LLM codebase.
 
+For more information on KV cache reuse see [KV cache reuse](kv-cache-reuse.md).
+
 ---
 
 ## Hierarchy: Pool, Block, and Page
