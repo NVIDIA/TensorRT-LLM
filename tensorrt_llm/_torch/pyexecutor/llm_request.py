@@ -244,7 +244,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
-        self.is_dummy = False
         self.py_lora_task_layer_module_configs = None
 
         self.py_return_log_probs = return_log_probs
