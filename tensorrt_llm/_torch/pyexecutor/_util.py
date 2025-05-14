@@ -99,8 +99,8 @@ def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
                         alloc_kv_tokens * kv_size_per_token) * fraction
     logger.info(
         f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
-        f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB"
-    )
+        f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
+        f"fraction is set {fraction}, kv size is {kv_size_per_token}")
     max_tokens = int((available_kv_mem) // kv_size_per_token)
     max_tokens = max(max_tokens, 0)
     return max_tokens
