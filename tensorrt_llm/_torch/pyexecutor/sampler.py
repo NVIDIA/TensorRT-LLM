@@ -448,6 +448,7 @@ class SampleStateTensorsHostTRTLLM(SampleStateTensors):
     sequence_lengths: torch.Tensor
 
 
+@dataclass(frozen=True, kw_only=True)
 class SampleStateTRTLLM(SampleState):
     host: SampleStateTensorsHostTRTLLM
     device: SampleStateTensors

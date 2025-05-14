@@ -14,11 +14,13 @@ from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 
 
+@dataclass(frozen=True, kw_only=True)
 class SampleStateTensorsMTP(SampleStateTensors):
     new_tokens_lens: torch.Tensor
     next_draft_tokens: torch.Tensor
 
 
+@dataclass(frozen=True, kw_only=True)
 class SampleStateMTP(SampleState):
     device: SampleStateTensorsMTP
     host: SampleStateTensorsMTP
