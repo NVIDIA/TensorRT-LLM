@@ -2,6 +2,8 @@ import argparse
 import os
 import subprocess
 
+kVALID_TEST_LIST_MARKERS = ["XFAIL", "SKIP", "UNSTABLE"]
+
 
 def install_python_dependencies(llm_src):
     subprocess.run(
@@ -64,6 +66,43 @@ def verify_qa_test_lists(llm_src):
             check=True)
 
 
+def verify_waive_list(llm_src):
+    waives_list_path = f"{llm_src}/tests/integration/test_lists/waives.txt"
+    # Remove prefix and markers in wavies.txt
+    processed_lines = []
+    with open(waives_list_path, "r") as f:
+        lines = f.readlines()
+
+    for line in lines:
+        line = line.strip()
+
+        if not line:
+            continue
+
+        # Check for kVALID_TEST_LIST_MARKERS and split by the first occurrence
+        for marker in kVALID_TEST_LIST_MARKERS:
+            if marker in line:
+                line = line.split(marker, 1)[0].strip()
+                break
+
+        # If the line starts with 'full:', process it
+        if line.startswith("full:"):
+            line = line.split(":", 1)[1].lstrip("/")
+
+        processed_lines.append(line)
+
+    # Write the processed lines to a tmp file
+    tmp_waives_file = "processed_waive_list.txt"
+    with open(tmp_waives_file, "w") as f:
+        f.writelines(f"{line}\n" for line in processed_lines)
+
+    subprocess.run(
+        f"cd {llm_src}/tests/integration/defs && "
+        f"pytest --apply-test-list-correction --test-list={tmp_waives_file} --co -q",
+        shell=True,
+        check=True)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Check test lists for L0 and QA.")
@@ -73,8 +112,12 @@ def main():
     parser.add_argument("--qa",
                         action="store_true",
                         help="Enable QA test list verification.")
+    parser.add_argument("--waive",
+                        action="store_true",
+                        help="Enable test list verification for waive file.")
     args = parser.parse_args()
-    llm_src = os.path.realpath("TensorRT-LLM/src")
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    llm_src = os.path.abspath(os.path.join(script_dir, "../"))
 
     install_python_dependencies(llm_src)
     # Verify L0 test lists
@@ -83,10 +126,10 @@ def main():
     else:
         print("Skipping L0 test list verification.")
     # Verify QA test lists
-    if args.qa:
-        verify_qa_test_lists(llm_src)
+    if args.waive:
+        verify_waive_list(llm_src)
     else:
-        print("Skipping QA test list verification.")
+        print("Skipping waive list verification.")
 
 
 if __name__ == "__main__":
