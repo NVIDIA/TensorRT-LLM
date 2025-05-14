@@ -159,6 +159,8 @@ class TrtllmAttentionWrapper:
         latent_cache: Optional[torch.Tensor] = None,
         q_pe: Optional[torch.Tensor] = None,
         mrope_config: Optional[dict] = None,
+        mla_context_paged_kv: Optional[torch.Tensor] = None,
+        mla_context_kv_cache_block_offsets: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """
@@ -189,6 +191,8 @@ class TrtllmAttentionWrapper:
             out_scale (torch.Tensor): The tensor to store the scaling factor to quantize output, with shape (1) on GPU.
             use_paged_context_fmha (bool): Sets the mPagedContextFMHA attribute in the op runner.
             mrope_config (dict): The dictionary containing the mRope configuration.
+            mla_context_paged_kv (torch.Tensor): The paged KV cache for MLA context, for kv cache reuse/chunked context.
+            mla_context_kv_cache_block_offsets (torch.Tensor): The block offsets for the paged KV cache for MLA context, for kv cache reuse/chunked context.
         """
         self.tokens_per_block = tokens_per_block
         self.max_num_requests = max_num_requests
@@ -219,6 +223,8 @@ class TrtllmAttentionWrapper:
         self.mrope_position_deltas = mrope_config.get(
             'mrope_position_deltas') if mrope_config is not None else None
         self.block_ids_per_seq = block_ids_per_seq
+        self.mla_context_paged_kv = mla_context_paged_kv
+        self.mla_context_kv_cache_block_offsets = mla_context_kv_cache_block_offsets
 
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
@@ -236,9 +242,6 @@ class TrtllmAttentionWrapper:
         is_fused_qkv: bool = True,
         update_kv_cache: bool = True,
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
-        *,
-        mla_context_paged_kv: Optional[torch.Tensor] = None,
-        mla_context_kv_cache_block_offsets: Optional[torch.Tensor] = None,
     ):
         """
         Run the attention operation.
@@ -250,8 +253,6 @@ class TrtllmAttentionWrapper:
             is_fused_qkv (bool): Whether QKV tensor is provided.
             update_kv_cache (bool): Whether KV cache is updated.
             attention_mask (AttentionMask): Attention mask. See definition of AttentionMask for accepted types. Defaults to predefined causal mask.
-            mla_context_paged_kv (Optional[torch.Tensor]): The paged KV cache for MLA context, for kv cache reuse/chunked context.
-            mla_context_kv_cache_block_offsets (Optional[torch.Tensor]): The block offsets for the paged KV cache for MLA context, for kv cache reuse/chunked context.
         Returns:
             torch.Tensor with shape (num_tokens, num_heads * head_dim).
         """
@@ -295,8 +296,8 @@ class TrtllmAttentionWrapper:
             assert is_fused_qkv
             if self.attention_input_type == AttentionInputType.context_only:
                 if self.use_paged_context_fmha:
-                    assert mla_context_paged_kv is not None
-                    assert mla_context_kv_cache_block_offsets is not None
+                    assert self.mla_context_paged_kv is not None
+                    assert self.mla_context_kv_cache_block_offsets is not None
                     qkv_hidden_size = self.num_heads * (self.qk_nope_head_dim +
                                                         self.qk_rope_head_dim)
                 else:
@@ -385,8 +386,8 @@ class TrtllmAttentionWrapper:
             self.v_head_dim,
             self.mrope_rotary_cos_sin,
             self.mrope_position_deltas,
-            mla_context_paged_kv,
-            mla_context_kv_cache_block_offsets,
+            self.mla_context_paged_kv,
+            self.mla_context_kv_cache_block_offsets,
         )
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
@@ -792,6 +793,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             latent_cache=latent_cache,
             q_pe=q_pe,
             mrope_config=mrope_config,
+            mla_context_paged_kv=mla_context_paged_kv,
+            mla_context_kv_cache_block_offsets=
+            mla_context_kv_cache_block_offsets,
         )
         out_dtype = None
         if out_scale is not None:
@@ -800,17 +804,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 # TODO(qijun): revisit fp8_context_fmha logic
                 out_dtype = torch.float8_e4m3fn
 
-        output = self.wrapper.run(
-            q,
-            k,
-            v,
-            out_dtype=out_dtype,
-            is_fused_qkv=not metadata.is_cross and k is None,
-            update_kv_cache=not metadata.is_cross or k is not None,
-            attention_mask=attention_mask,
-            mla_context_paged_kv=mla_context_paged_kv,
-            mla_context_kv_cache_block_offsets=mla_context_kv_cache_block_offsets
-        )
+        output = self.wrapper.run(q,
+                                  k,
+                                  v,
+                                  out_dtype=out_dtype,
+                                  is_fused_qkv=not metadata.is_cross
+                                  and k is None,
+                                  update_kv_cache=not metadata.is_cross
+                                  or k is not None,
+                                  attention_mask=attention_mask)
         return output
 
     @classmethod

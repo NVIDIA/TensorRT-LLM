@@ -43,8 +43,8 @@ from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
 from ..pipeline_interface import PipelineInterface
 from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
 from ..utils import set_torch_compiling, with_model_extra_attrs
-from ._config_utils import is_mla
 from .config import LoadFormat, PyTorchConfig
+from .config_utils import is_mla
 from .cuda_graph_runner import DecodingCUDAGraphRunner
 from .guided_decoder import GuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker

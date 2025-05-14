@@ -12,11 +12,11 @@ from tensorrt_llm.quantization import KV_CACHE_QUANT_ALGO_LIST
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist
 from ..speculative import Eagle3Config, get_spec_resource_manager
-from ._config_utils import is_mla
-from ._utils import (create_kv_cache_manager, create_py_executor_instance,
-                     estimate_max_kv_cache_tokens, get_token_num_for_estimation,
-                     instantiate_decoder)
+from ._util import (create_kv_cache_manager, create_py_executor_instance,
+                    estimate_max_kv_cache_tokens, get_token_num_for_estimation,
+                    instantiate_decoder)
 from .config import PyTorchConfig
+from .config_utils import is_mla
 from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
                            PyTorchModelEngine)
 

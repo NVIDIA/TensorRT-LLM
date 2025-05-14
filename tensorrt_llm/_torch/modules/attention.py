@@ -771,12 +771,12 @@ class MLA(nn.Module):
 
         mla_context_kv_cache_block_offsets = trtllm_attention.set_paged_kv_cache_v2_for_mla(
             full_kv,
-            past_k_nope.contiguous(),
-            past_v.contiguous(),
-            past_k_pe.contiguous(),
-            k_nope.contiguous(),
-            v.contiguous(),
-            k_pe.contiguous(),
+            past_k_nope,
+            past_v,
+            past_k_pe,
+            k_nope,
+            v,
+            k_pe,
             attn_metadata,
         )
 

@@ -15,7 +15,7 @@ from tensorrt_llm.lora_manager import (LoraConfig,
 from tensorrt_llm.mapping import Mapping
 
 from ..speculative import get_num_spec_layers, get_spec_decoder
-from ._config_utils import is_mla, is_nemotron_hybrid
+from .config_utils import is_mla, is_nemotron_hybrid
 from .decoder import (EarlyStopDecoder, TorchDecoder, TorchStarAttentionDecoder,
                       TRTLLMDecoder)
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
