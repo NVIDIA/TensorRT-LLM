@@ -111,7 +111,7 @@ input [
     optional: true
   },
   {
-    name: "min_length"
+    name: "min_tokens"
     data_type: TYPE_INT32
     dims: [ 1 ]
     optional: true
@@ -129,7 +129,7 @@ input [
     optional: true
   },
   {
-    name: "random_seed"
+    name: "seed"
     data_type: TYPE_UINT64
     dims: [ 1 ]
     optional: true
@@ -498,8 +498,8 @@ ensemble_scheduling {
           value: "repetition_penalty"
       }
       input_map {
-          key: "min_length"
-          value: "min_length"
+          key: "min_tokens"
+          value: "min_tokens"
       }
       input_map {
           key: "presence_penalty"
@@ -510,8 +510,8 @@ ensemble_scheduling {
           value: "frequency_penalty"
       }
       input_map {
-          key: "random_seed"
-          value: "random_seed"
+          key: "seed"
+          value: "seed"
       }
       input_map {
           key: "return_log_probs"

@@ -77,7 +77,7 @@ class Request:
     temperature: Optional[np.ndarray] = None
     length_penalty: Optional[np.ndarray] = None
     repetition_penalty: Optional[np.ndarray] = None
-    min_length: Optional[np.ndarray] = None
+    min_tokens: Optional[np.ndarray] = None
     return_log_probs: Optional[np.ndarray] = None
     prompt_embedding_table: Optional[np.ndarray] = None
     prompt_vocab_size: Optional[np.ndarray] = None
@@ -90,7 +90,7 @@ class Request:
     beam_width: Optional[np.ndarray] = None
     return_context_logits: Optional[np.ndarray] = None
     return_generation_logits: Optional[np.ndarray] = None
-    random_seed: Optional[np.ndarray] = None
+    seed: Optional[np.ndarray] = None
     presence_penalty: Optional[np.ndarray] = None
     frequency_penalty: Optional[np.ndarray] = None
     lora_task_id: Optional[np.ndarray] = None
@@ -320,7 +320,7 @@ class Decoder:
 
             draft_request = None
             if num_draft_tokens > 0:
-                request.min_length = np.array([num_draft_tokens],
+                request.min_tokens = np.array([num_draft_tokens],
                                               dtype=np.int32)
                 draft_response: GenerationResponse = self._draft_generate_non_streaming(
                     cur_preproc, request, num_draft_tokens)
@@ -343,7 +343,7 @@ class Decoder:
                             draft_logits[-len(input_draft_tokens):], 0)
                 else:
                     draft_request = DraftRequest()
-                request.min_length = None
+                request.min_tokens = None
             else:
                 draft_request = DraftRequest()
             target_response = self._generate_non_streaming(

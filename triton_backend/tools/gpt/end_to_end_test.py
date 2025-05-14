@@ -192,7 +192,7 @@ if __name__ == '__main__':
             np.float32)
         repetition_penalty = 1.0 * np.ones([input0_data.shape[0], 1]).astype(
             np.float32)
-        random_seed = 0 * np.ones([input0_data.shape[0], 1]).astype(np.uint64)
+        seed = 0 * np.ones([input0_data.shape[0], 1]).astype(np.uint64)
         output_log_probs = True * np.ones([input0_data.shape[0], 1
                                            ]).astype(bool)
         beam_width = (FLAGS.beam_width *
@@ -201,7 +201,7 @@ if __name__ == '__main__':
             np.ones([input0_data.shape[0], 1]).astype(np.int32)
         end_ids = end_id * \
             np.ones([input0_data.shape[0], 1]).astype(np.int32)
-        min_length = 1 * \
+        min_tokens = 1 * \
             np.ones([input0_data.shape[0], 1]).astype(np.int32)
         presence_penalty = 0.0 * \
             np.ones([input0_data.shape[0], 1]).astype(np.float32)
@@ -221,12 +221,12 @@ if __name__ == '__main__':
             utils.prepare_tensor("length_penalty", len_penalty, FLAGS.protocol),
             utils.prepare_tensor("repetition_penalty", repetition_penalty,
                                  FLAGS.protocol),
-            utils.prepare_tensor("min_length", min_length, FLAGS.protocol),
+            utils.prepare_tensor("min_tokens", min_tokens, FLAGS.protocol),
             utils.prepare_tensor("presence_penalty", presence_penalty,
                                  FLAGS.protocol),
             utils.prepare_tensor("frequency_penalty", frequency_penalty,
                                  FLAGS.protocol),
-            utils.prepare_tensor("random_seed", random_seed, FLAGS.protocol),
+            utils.prepare_tensor("seed", seed, FLAGS.protocol),
             utils.prepare_tensor("output_log_probs", output_log_probs,
                                  FLAGS.protocol),
         ]

@@ -199,11 +199,11 @@ def get_sampling_config_from_request(request, batch_size=1, batch_index=0):
                                                batch_size, batch_index)
     kwargs['top_p'] = None if kwargs['top_p'] is None or kwargs[
         'top_p'] <= 0 else kwargs['top_p']
-    kwargs['random_seed'] = get_input_scalar_by_name(request, 'random_seed',
-                                                     batch_size, batch_index)
+    kwargs['seed'] = get_input_scalar_by_name(request, 'seed', batch_size,
+                                              batch_index)
     kwargs['temperature'] = get_input_scalar_by_name(request, 'temperature',
                                                      batch_size, batch_index)
-    kwargs['min_length'] = get_input_scalar_by_name(request, 'min_length',
+    kwargs['min_tokens'] = get_input_scalar_by_name(request, 'min_tokens',
                                                     batch_size, batch_index)
     kwargs['repetition_penalty'] = get_input_scalar_by_name(
         request, 'repetition_penalty', batch_size, batch_index)
@@ -541,9 +541,10 @@ def convert_request(request,
             input_length = len(input_token_ids)
         # Trim input token ids with input_lengths
         inputs['input_token_ids'] = input_token_ids[0:input_length]
-        inputs['max_new_tokens'] = get_input_scalar_by_name(
-            request, 'request_output_len', batch_size, batch_index)
-        if inputs['max_new_tokens'] is None:
+        inputs['max_tokens'] = get_input_scalar_by_name(request,
+                                                        'request_output_len',
+                                                        batch_size, batch_index)
+        if inputs['max_tokens'] is None:
             raise pb_utils.TritonModelException(
                 "A value is required for request_output_len")
         inputs['streaming'] = get_input_scalar_by_name(request, 'streaming',

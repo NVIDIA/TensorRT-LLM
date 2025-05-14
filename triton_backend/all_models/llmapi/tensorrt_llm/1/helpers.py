@@ -24,14 +24,14 @@ def get_sampling_params_from_request(request, batch_size=1, batch_index=0):
     Used in llmapi/tensorrt_llm
     """
     sampling_params_args = [
-        'beam_width', 'temperature', 'top_k', 'top_p', 'frequency_penalty',
+        'best_of', 'temperature', 'top_k', 'top_p', 'frequency_penalty',
         'presence_penalty', 'max_tokens', 'seed', 'exclude_input_from_output'
     ]
     param_mappings = {}
     for arg in sampling_params_args:
         param_mappings[f"sampling_param_{arg}"] = arg
     default_values = {
-        'sampling_param_beam_width': 1,
+        'sampling_param_best_of': 1,
         'sampling_param_exclude_input_from_output': False,
     }
     kwargs = convert_request_input_to_dict(request, param_mappings,

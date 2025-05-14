@@ -269,6 +269,18 @@ executor::ParallelConfig ModelInstanceState::getParallelConfigFromParams()
     {
         TLLM_THROW("Spawning of processes was disabled in orchestrator mode, but participant IDs is missing.");
     }
+
+    executor::SizeType32 numNodes = 1;
+    try
+    {
+        numNodes = model_state_->GetParameter<int32_t>("num_nodes");
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_INFO("num_nodes is not specified, will be set to 1");
+    }
+    parallelConfig.setNumNodes(numNodes);
+
     return parallelConfig;
 }
 

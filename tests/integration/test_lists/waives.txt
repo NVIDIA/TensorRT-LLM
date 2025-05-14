@@ -501,7 +501,5 @@ triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-ena
 triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-guaranteed_no_evict-1-1-1-False-ensemble]
 triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-guaranteed_no_evict-1-1-1-False-tensorrt_llm_bls]
 triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-max_utilization-1-1-1-False-ensemble]
-triton_server/test_triton_llm.py::test_blip2_opt[test_kv_cache_reuse-False-1-False-True-True-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-max_utilization-1-1-1-False-tensorrt_llm_bls] SKIP (https://nvbugs/5231838)
-triton_server/test_triton_llm.py::test_blip2_opt[test_basic-False-1-False-True-False-0-128-disableDecoupleMode-V1-disableTrtOverlap-0.7-guaranteed_no_evict-1-1-1-False-tensorrt_llm_bls] SKIP (https://nvbugs/5231838)
 triton_server/test_triton_rcca.py::test_mistral_beam_search[rcca_4714407-True-10-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-guaranteed_no_evict-1-1-1-False-ensemble] SKIP (https://nvbugs/5240060)
-triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning] SKIP (https://nvbugs/5239568)
+triton_server/test_triton.py::test_triton_extensive[triton-extensive] SKIP

@@ -220,7 +220,7 @@ input [
     optional: true
   },
   {
-    name: "min_length"
+    name: "min_tokens"
     data_type: TYPE_INT32
     dims: [ 1 ]
     reshape: { shape: [ ] }
@@ -248,7 +248,7 @@ input [
     optional: true
   },
   {
-    name: "random_seed"
+    name: "seed"
     data_type: TYPE_UINT64
     dims: [ 1 ]
     reshape: { shape: [ ] }
@@ -727,6 +727,12 @@ parameters: {
   key: "participant_ids"
   value: {
     string_value: "${participant_ids}"
+  }
+}
+parameters: {
+  key: "num_nodes"
+  value: {
+    string_value: "${num_nodes}"
   }
 }
 parameters: {

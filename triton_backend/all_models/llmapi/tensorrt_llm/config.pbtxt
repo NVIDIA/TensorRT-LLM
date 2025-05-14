@@ -59,7 +59,7 @@ input [
   },
   ## SamplingParams Arguments for Each Request ##
   {
-    name: "sampling_param_beam_width"
+    name: "sampling_param_best_of"
     data_type: TYPE_INT32
     dims: [ 1 ]
     optional: true

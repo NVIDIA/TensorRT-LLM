@@ -24,7 +24,7 @@
 cmake_minimum_required(VERSION 3.17)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules/set_ifndef.cmake)
 
-set_ifndef(TRTLLM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../)
+set_ifndef(TRTLLM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../tensorrt_llm)
 
 include_directories(${TRTLLM_DIR} ${TRTLLM_DIR}/cpp/include)
 
@@ -62,6 +62,9 @@ if(TRITON_ENABLE_METRICS AND NOT TRITON_ENABLE_STATS)
     FATAL_ERROR "TRITON_ENABLE_METRICS=ON requires TRITON_ENABLE_STATS=ON")
 endif()
 
+set(TRITON_REPO_ORGANIZATION
+    "https://github.com/triton-inference-server"
+    CACHE STRING "Git repository to pull from")
 set(TRITON_COMMON_REPO_TAG
     "main"
     CACHE STRING "Tag for triton-inference-server/common repo")
@@ -113,17 +116,17 @@ include(FetchContent)
 
 FetchContent_Declare(
   repo-common
-  GIT_REPOSITORY https://github.com/triton-inference-server/common.git
+  GIT_REPOSITORY ${TRITON_REPO_ORGANIZATION}/common.git
   GIT_TAG ${TRITON_COMMON_REPO_TAG}
   GIT_SHALLOW ON)
 FetchContent_Declare(
   repo-core
-  GIT_REPOSITORY https://github.com/triton-inference-server/core.git
+  GIT_REPOSITORY ${TRITON_REPO_ORGANIZATION}/core.git
   GIT_TAG ${TRITON_CORE_REPO_TAG}
   GIT_SHALLOW ON)
 FetchContent_Declare(
   repo-backend
-  GIT_REPOSITORY https://github.com/triton-inference-server/backend.git
+  GIT_REPOSITORY ${TRITON_REPO_ORGANIZATION}/backend.git
   GIT_TAG ${TRITON_BACKEND_REPO_TAG}
   GIT_SHALLOW ON)
 FetchContent_MakeAvailable(repo-common repo-core repo-backend)
@@ -149,19 +152,22 @@ find_library(
   tensorrt_llm libtensorrt_llm.so REQUIRED
   PATHS ${Python3_SITEARCH}/tensorrt_llm/libs
         ${TRTLLM_DIR}/cpp/build/tensorrt_llm
-        ${CMAKE_CURRENT_SOURCE_DIR}/../cpp/build/tensorrt_llm)
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tensorrt_llm/cpp/build/tensorrt_llm)
 
 find_library(
   nvinfer_plugin_tensorrt_llm libnvinfer_plugin_tensorrt_llm.so REQUIRED
-  PATHS ${Python3_SITEARCH}/tensorrt_llm/libs
-        ${TRTLLM_DIR}/cpp/build/tensorrt_llm/plugins
-        ${CMAKE_CURRENT_SOURCE_DIR}/../cpp/build/tensorrt_llm/plugins)
+  PATHS
+    ${Python3_SITEARCH}/tensorrt_llm/libs
+    ${TRTLLM_DIR}/cpp/build/tensorrt_llm/plugins
+    ${CMAKE_CURRENT_SOURCE_DIR}/../tensorrt_llm/cpp/build/tensorrt_llm/plugins)
 
 find_program(
   TRTLLM_EXECUTOR_WORKER executorWorker REQUIRED
-  PATHS ${Python3_SITEARCH}/tensorrt_llm/bin
-        ${TRTLLM_DIR}/cpp/build/tensorrt_llm/executor_worker
-        ${CMAKE_CURRENT_SOURCE_DIR}/../cpp/build/tensorrt_llm/executor_worker)
+  PATHS
+    ${Python3_SITEARCH}/tensorrt_llm/bin
+    ${TRTLLM_DIR}/cpp/build/tensorrt_llm/executor_worker
+    ${CMAKE_CURRENT_SOURCE_DIR}/../tensorrt_llm/cpp/build/tensorrt_llm/executor_worker
+)
 install(
   PROGRAMS ${TRTLLM_EXECUTOR_WORKER}
   DESTINATION ${CMAKE_BINARY_DIR}

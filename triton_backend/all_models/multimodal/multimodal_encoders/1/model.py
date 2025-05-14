@@ -367,7 +367,7 @@ class TritonPythonModel:
                                                          dtype=torch.bool,
                                                          device='cpu')
                     # prepare cross_attention_mask
-                    # [bs, seq_len, num_tiles] to [bs, seq_len+max_new_tokens, encoder_length]
+                    # [bs, seq_len, num_tiles] to [bs, seq_len+max_tokens, encoder_length]
                     cross_attention_mask = pb_utils.get_input_tensor_by_name(
                         request, "cross_attention_mask")
                     if cross_attention_mask != None:

@@ -4,9 +4,6 @@ import os
 import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-sys.path.append(
-    os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.realpath(__file__)))))
 
 import argparse
 import json
@@ -16,7 +13,7 @@ from datetime import datetime
 from functools import partial
 
 import numpy as np
-from tools.inflight_batcher_llm.end_to_end_test import \
+from end_to_end_test import \
     test_performance as test_performance_with_text_prompts
 from transformers import AutoTokenizer
 from utils import utils

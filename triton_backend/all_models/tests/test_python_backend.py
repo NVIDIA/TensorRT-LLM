@@ -139,9 +139,9 @@ def triton_request() -> MockTritonRequest:
         "beam_width": [2],
         "runtime_top_k": [1],
         "runtime_top_p": [0.],
-        "random_seed": [4],
+        "seed": [4],
         "temperature": [1.],
-        "min_length": [3],
+        "min_tokens": [3],
         "repetition_penalty": [1.0],
         "presence_penalty": [2.0],
         "frequency_penalty": [4.0],
@@ -198,9 +198,9 @@ def batched_triton_request() -> MockTritonRequest:
         "beam_width": [2, 3],
         "runtime_top_k": [1, 2],
         "runtime_top_p": [0., 1.],
-        "random_seed": [4, 7],
+        "seed": [4, 7],
         "temperature": [1., 0.5],
-        "min_length": [3, 10],
+        "min_tokens": [3, 10],
         "repetition_penalty": [1.0, 1.1],
         "presence_penalty": [2.0, 2.1],
         "frequency_penalty": [4.0, 4.1],
@@ -358,7 +358,7 @@ def test_parse_medusa_choices():
 def check_converted_request(converted):
     assert isinstance(converted, trtllm.Request)
     assert converted.input_token_ids == [28524, 287, 5093, 12]
-    assert converted.max_new_tokens == 16
+    assert converted.max_tokens == 16
     assert converted.streaming == True
     assert converted.end_id == 50256
     assert converted.pad_id == 50256
@@ -402,9 +402,9 @@ def check_converted_request(converted):
     assert converted.sampling_config.top_p_min == 1.0
     assert converted.sampling_config.top_p_reset_ids == 1
     assert converted.sampling_config.top_p_decay == 1.0
-    assert converted.sampling_config.random_seed == 4
+    assert converted.sampling_config.seed == 4
     assert converted.sampling_config.temperature == 1.0
-    assert converted.sampling_config.min_length == 3
+    assert converted.sampling_config.min_tokens == 3
     assert converted.sampling_config.beam_search_diversity_rate == 1.0
     assert converted.sampling_config.repetition_penalty == 1.0
     assert converted.sampling_config.presence_penalty == 2.0
@@ -430,7 +430,7 @@ def test_convert_batched_request(batched_triton_request: MockTritonRequest):
 
     assert isinstance(converted, trtllm.Request)
     assert converted.input_token_ids == [1, 2]
-    assert converted.max_new_tokens == 3
+    assert converted.max_tokens == 3
     assert converted.streaming == False
     assert converted.end_id == 50257
     assert converted.pad_id == 50257
@@ -464,9 +464,9 @@ def test_convert_batched_request(batched_triton_request: MockTritonRequest):
     assert converted.sampling_config.top_p_min == 0.5
     assert converted.sampling_config.top_p_reset_ids == 3
     assert converted.sampling_config.top_p_decay == pytest.approx(0.1)
-    assert converted.sampling_config.random_seed == 7
+    assert converted.sampling_config.seed == 7
     assert converted.sampling_config.temperature == 0.5
-    assert converted.sampling_config.min_length == 10
+    assert converted.sampling_config.min_tokens == 10
     assert converted.sampling_config.beam_search_diversity_rate == pytest.approx(
         0.7)
     assert converted.sampling_config.repetition_penalty == pytest.approx(1.1)
@@ -497,7 +497,7 @@ def test_convert_request_minimal(triton_request_minimal: MockTritonRequest):
     assert len(converted_reqs) == 1
     converted = converted_reqs[0]
     assert converted.input_token_ids == [28524, 287, 5093, 12]
-    assert converted.max_new_tokens == 16
+    assert converted.max_tokens == 16
     assert converted.streaming == False
     assert converted.end_id is None
     assert converted.pad_id is None
@@ -516,9 +516,9 @@ def test_convert_request_minimal(triton_request_minimal: MockTritonRequest):
     assert converted.sampling_config.top_p_min is None
     assert converted.sampling_config.top_p_reset_ids is None
     assert converted.sampling_config.top_p_decay is None
-    assert converted.sampling_config.random_seed is None
+    assert converted.sampling_config.seed is None
     assert converted.sampling_config.temperature is None
-    assert converted.sampling_config.min_length is None
+    assert converted.sampling_config.min_tokens is None
     assert converted.sampling_config.beam_search_diversity_rate is None
     assert converted.sampling_config.repetition_penalty is None
     assert converted.sampling_config.presence_penalty is None

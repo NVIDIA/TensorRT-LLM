@@ -126,8 +126,8 @@ def triton_request(request) -> MockTritonRequest:
     input_names = [
         "text_input", "max_tokens", "bad_words", "stop_words", "end_id",
         "pad_id", "top_k", "top_p", "temperature", "length_penalty",
-        "repetition_penalty", "min_length", "presence_penalty",
-        "frequency_penalty", "random_seed", "return_log_probs",
+        "repetition_penalty", "min_tokens", "presence_penalty",
+        "frequency_penalty", "seed", "return_log_probs",
         "return_context_logits", "return_generation_logits", "beam_width",
         "stream", "prompt_embedding_table", "prompt_vocab_size",
         "embedding_bias_words", "embedding_bias_weights", "num_draft_tokens",

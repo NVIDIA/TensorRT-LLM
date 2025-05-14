@@ -384,11 +384,11 @@ std::optional<tensorrt_llm::executor::Request> getRequest(
     pushTensor<float>(inputsTensors, InputFieldsNames::lengthPenalty, nvinfer1::DataType::kFLOAT, {1}, {0.4});
     pushTensor<int32_t>(inputsTensors, InputFieldsNames::earlyStopping, nvinfer1::DataType::kINT32, {1}, {4});
     pushTensor<float>(inputsTensors, InputFieldsNames::repetitionPenalty, nvinfer1::DataType::kFLOAT, {1}, {0.8});
-    pushTensor<int32_t>(inputsTensors, InputFieldsNames::minLength, nvinfer1::DataType::kINT32, {1}, {45});
+    pushTensor<int32_t>(inputsTensors, InputFieldsNames::minTokens, nvinfer1::DataType::kINT32, {1}, {45});
     pushTensor<float>(inputsTensors, InputFieldsNames::beamSearchDiversityRate, nvinfer1::DataType::kFLOAT, {1}, {0.1});
     pushTensor<float>(inputsTensors, InputFieldsNames::presencePenalty, nvinfer1::DataType::kFLOAT, {1}, {0.2});
     pushTensor<float>(inputsTensors, InputFieldsNames::frequencyPenalty, nvinfer1::DataType::kFLOAT, {1}, {0.3});
-    pushTensor<uint64_t>(inputsTensors, InputFieldsNames::randomSeed, nvinfer1::DataType::kINT64, {1}, {3456});
+    pushTensor<uint64_t>(inputsTensors, InputFieldsNames::seed, nvinfer1::DataType::kINT64, {1}, {3456});
 
     // PromptTuningConfig
     pushTensor<float>(inputsTensors, InputFieldsNames::promptEmbeddingTable, nvinfer1::DataType::kFLOAT, {1, 2, 2},
@@ -517,7 +517,7 @@ void checkRequest(tensorrt_llm::executor::Request const& request,
             }
         }
     }
-    EXPECT_EQ(request.getMaxNewTokens(), 8);
+    EXPECT_EQ(request.getMaxTokens(), 8);
     EXPECT_EQ(request.getEndId().value(), 11);
     if (padId)
     {
@@ -581,11 +581,11 @@ void checkRequest(tensorrt_llm::executor::Request const& request,
     EXPECT_EQ(samplingConfig.getLengthPenalty().value(), 0.4f);
     EXPECT_EQ(samplingConfig.getEarlyStopping().value(), 4);
     EXPECT_EQ(samplingConfig.getRepetitionPenalty().value(), 0.8f);
-    EXPECT_EQ(samplingConfig.getMinLength().value(), 45);
+    EXPECT_EQ(samplingConfig.getMinTokens().value(), 45);
     EXPECT_EQ(samplingConfig.getBeamSearchDiversityRate().value(), 0.1f);
     EXPECT_EQ(samplingConfig.getPresencePenalty().value(), 0.2f);
     EXPECT_EQ(samplingConfig.getFrequencyPenalty().value(), 0.3f);
-    EXPECT_EQ(samplingConfig.getRandomSeed().value(), 3456);
+    EXPECT_EQ(samplingConfig.getSeed().value(), 3456);
     EXPECT_EQ(samplingConfig.getNumReturnSequences().value(), 29);
 
     // getGuidedDecodingParams
@@ -686,7 +686,7 @@ TEST(UtilsTest, splitBatchInputsTensorsBS1)
 
             EXPECT_EQ(requests.size(), 1);
             EXPECT_EQ(requests.at(0).getInputTokenIds(), inputTokens);
-            EXPECT_EQ(requests.at(0).getMaxNewTokens(), 8);
+            EXPECT_EQ(requests.at(0).getMaxTokens(), 8);
         }
     }
 }
@@ -760,7 +760,7 @@ TEST(UtilsTest, splitBatchInputsTensorsBS3)
             EXPECT_EQ(request.getInputTokenIds(),
                 std::vector<int32_t>(
                     inputTokens.begin() + batchId * 3, inputTokens.begin() + batchId * 3 + inputLengths[batchId]));
-            EXPECT_EQ(request.getMaxNewTokens(), maxTokens[batchId]);
+            EXPECT_EQ(request.getMaxTokens(), maxTokens[batchId]);
         }
     }
 }

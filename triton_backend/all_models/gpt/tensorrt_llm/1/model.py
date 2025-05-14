@@ -119,14 +119,13 @@ class TritonPythonModel:
                     request, 'len_penalty')
                 inputs['repetition_penalty'] = get_input_scalar_by_name(
                     request, 'repetition_penalty')
-                inputs['min_length'] = get_input_scalar_by_name(
-                    request, 'min_length')
+                inputs['min_tokens'] = get_input_scalar_by_name(
+                    request, 'min_tokens')
                 inputs['presence_penalty'] = get_input_scalar_by_name(
                     request, 'presence_penalty')
                 inputs['frequency_penalty'] = get_input_scalar_by_name(
                     request, 'frequency_penalty')
-                inputs['random_seed'] = get_input_scalar_by_name(
-                    request, 'random_seed')
+                inputs['seed'] = get_input_scalar_by_name(request, 'seed')
                 inputs['output_log_probs'] = get_input_scalar_by_name(
                     request, 'output_log_probs')
 
@@ -150,13 +149,13 @@ class TritonPythonModel:
             if inputs['repetition_penalty'] is not None:
                 sampling_config.repetition_penalty = inputs[
                     'repetition_penalty']
-            if inputs['min_length'] is not None:
-                sampling_config.min_length = inputs['min_length']
+            if inputs['min_tokens'] is not None:
+                sampling_config.min_tokens = inputs['min_tokens']
             if inputs['presence_penalty'] is not None:
                 sampling_config.presence_penalty = inputs['presence_penalty']
             if inputs['frequency_penalty'] is not None:
                 sampling_config.frequency_penalty = inputs['frequency_penalty']
-            sampling_config.random_seed = inputs['random_seed']
+            sampling_config.seed = inputs['seed']
             sampling_config.output_log_probs = inputs['output_log_probs']
             sampling_config.return_dict = True
 

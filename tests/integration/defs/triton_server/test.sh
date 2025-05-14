@@ -967,6 +967,9 @@ if [ "$MODEL" = "gpt-ib-ptuning" ]; then
     ENABLE_CONTEXT_FMHA_FP32_ACC="True"
 
     for BATCHING_STRATEGY in "${BATCHING_STRATEGIES[@]}"; do
+        if [[ "${BATCHING_STRATEGY}" == "v1" ]]; then
+            continue
+        fi
 
         launch_triton_server
 

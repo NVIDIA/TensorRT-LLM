@@ -67,6 +67,7 @@ struct InputFieldsNames
     static constexpr char const* contextPhaseParams = "context_phase_params";
     static constexpr char const* crossAttentionMask = "cross_attention_mask";
     static constexpr char const* skipCrossAttnBlocks = "skip_cross_attn_blocks";
+    static constexpr char const* multimodalEmbedding = "multimodal_embedding";
 
     // OutputConfig
     static constexpr char const* returnLogProbs = "return_log_probs";
@@ -89,11 +90,11 @@ struct InputFieldsNames
     static constexpr char const* lengthPenalty = "len_penalty";
     static constexpr char const* earlyStopping = "early_stopping";
     static constexpr char const* repetitionPenalty = "repetition_penalty";
-    static constexpr char const* minLength = "min_length";
+    static constexpr char const* minTokens = "min_tokens";
     static constexpr char const* beamSearchDiversityRate = "beam_search_diversity_rate";
     static constexpr char const* presencePenalty = "presence_penalty";
     static constexpr char const* frequencyPenalty = "frequency_penalty";
-    static constexpr char const* randomSeed = "random_seed";
+    static constexpr char const* seed = "seed";
 
     // PromptTuningConfig
     static constexpr char const* promptEmbeddingTable = "prompt_embedding_table";

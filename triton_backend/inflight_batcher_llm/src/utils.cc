@@ -583,8 +583,8 @@ executor::SamplingConfig getSamplingConfigFromTensors(InputTensors const& inputs
     std::optional<float> repetitionPenalty{std::nullopt};
     extractOptionalSingleton<float>(inputsTensors, InputFieldsNames::repetitionPenalty, repetitionPenalty);
 
-    std::optional<int32_t> minLength{std::nullopt};
-    extractOptionalSingleton<int32_t>(inputsTensors, InputFieldsNames::minLength, minLength);
+    std::optional<int32_t> minTokens{std::nullopt};
+    extractOptionalSingleton<int32_t>(inputsTensors, InputFieldsNames::minTokens, minTokens);
 
     std::optional<float> beamSearchDiversityRate{std::nullopt};
     extractOptionalSingleton<float>(inputsTensors, InputFieldsNames::beamSearchDiversityRate, beamSearchDiversityRate);
@@ -595,8 +595,8 @@ executor::SamplingConfig getSamplingConfigFromTensors(InputTensors const& inputs
     std::optional<float> frequencyPenalty{std::nullopt};
     extractOptionalSingleton<float>(inputsTensors, InputFieldsNames::frequencyPenalty, frequencyPenalty);
 
-    std::optional<uint64_t> randomSeed{std::nullopt};
-    extractOptionalSingleton<uint64_t>(inputsTensors, InputFieldsNames::randomSeed, randomSeed);
+    std::optional<uint64_t> seed{std::nullopt};
+    extractOptionalSingleton<uint64_t>(inputsTensors, InputFieldsNames::seed, seed);
 
     std::optional<int32_t> noRepeatNgramSize{std::nullopt};
     extractOptionalSingleton<int32_t>(inputsTensors, InputFieldsNames::noRepeatNgramSize, noRepeatNgramSize);
@@ -604,8 +604,8 @@ executor::SamplingConfig getSamplingConfigFromTensors(InputTensors const& inputs
     std::optional<int32_t> numReturnSequences{std::nullopt};
     extractOptionalSingleton<int32_t>(inputsTensors, InputFieldsNames::numReturnSequences, numReturnSequences);
 
-    return executor::SamplingConfig(beamWidth, topK, topP, topPMin, topPResetIds, topPDecay, randomSeed, temperature,
-        minLength, beamSearchDiversityRate, repetitionPenalty, presencePenalty, frequencyPenalty, lengthPenalty,
+    return executor::SamplingConfig(beamWidth, topK, topP, topPMin, topPResetIds, topPDecay, seed, temperature,
+        minTokens, beamSearchDiversityRate, repetitionPenalty, presencePenalty, frequencyPenalty, lengthPenalty,
         earlyStopping, noRepeatNgramSize, numReturnSequences);
 }
 
@@ -1017,6 +1017,15 @@ std::vector<executor::Request> createRequestsFromInputTensors(std::vector<InputT
 
         auto pTuningConfig = utils::getPromptTuningConfigFromTensors(inputTensors, inputTokens.size());
 
+        std::optional<executor::Tensor> multimodalEmbedding{std::nullopt};
+        if (inputTensors.count(InputFieldsNames::multimodalEmbedding))
+        {
+            std::shared_ptr<runtime::ITensor> originalTensor
+                = inputTensors.at(InputFieldsNames::multimodalEmbedding).tensor;
+            utils::squeezeTensor(originalTensor, 2);
+            multimodalEmbedding = executor::detail::ofITensor(originalTensor);
+        }
+
         auto mropeConfig = utils::getMropeConfigFromTensors(inputTensors);
 
         auto loraConfig = utils::getLoraConfigFromTensors(inputTensors);
@@ -1030,9 +1039,9 @@ std::vector<executor::Request> createRequestsFromInputTensors(std::vector<InputT
 
         auto request = executor::Request(inputTokens, maxNewTokens, streaming, samplingConfig, outConfig, endId, padId,
             /*positionIds*/ std::nullopt, badWords, stopWords, embeddingBias, externalDraftTokensConfig,
-            /*PromptTuningConfig*/ pTuningConfig, /*MropeConfig*/ mropeConfig, loraConfig, requestLookaheadConfig,
-            kvCacheRetentionConfig, /*logitsPostProcessorName*/ std::nullopt, /*logitsPostProcessor*/ std::nullopt,
-            encoderInputTokens);
+            /*PromptTuningConfig*/ pTuningConfig, /*multimodalEmbedding*/ multimodalEmbedding,
+            /*MropeConfig*/ mropeConfig, loraConfig, requestLookaheadConfig, kvCacheRetentionConfig,
+            /*logitsPostProcessorName*/ std::nullopt, /*logitsPostProcessor*/ std::nullopt, encoderInputTokens);
 
         if (encoderInputFeatures.has_value())
         {
