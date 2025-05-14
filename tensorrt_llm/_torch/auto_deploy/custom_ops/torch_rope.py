@@ -35,7 +35,7 @@ def torch_apply_rope_with_explicit_cos_sin(
 def torch_apply_rope_with_explicit_cos_sin_fake(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    return q, k
+    return torch.empty_like(q), torch.empty_like(k)
 
 
 @torch.library.custom_op("rope::torch_apply_rope_with_complex_freqs", mutates_args=())
@@ -66,7 +66,7 @@ def torch_apply_rope_with_complex_freqs_fake(
     freqs_cis: torch.Tensor,  # shape [B, S, head_dim//2]
     unsqueeze_dim: int = 2,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    return xq, xk
+    return torch.empty_like(xq), torch.empty_like(xk)
 
 
 @torch.library.custom_op("rope::torch_apply_rope_with_qk_interleaving", mutates_args=())
@@ -97,4 +97,4 @@ def torch_apply_rope_with_qk_interleaving(
 def torch_apply_rope_with_qk_interleaving_fake(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    return q, k
+    return torch.empty_like(q), torch.empty_like(k)

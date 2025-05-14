@@ -21,7 +21,7 @@ def apply_rope_with_input_pos_flashinfer(
         Tensors of shape [batch, seq_len, n_head, head_dim] (or a 3D variant)
         in half precision. Note: head_dim must be a multiple of 64.
     - position_ids (torch.Tensor):
-        Precomputed tensor of positional indices; it is shared across calls in the graph.
+        Precomputed tensor of positional indices; Shape [batch, seq_len]
     - cos_sin_cache (torch.Tensor):
         Precomputed fused tensor created by concatenating the first half of the cosine and sine
         components derived from the inv_freq. Shape [batch, seq_len, head_dim]. Must be float32.
@@ -44,9 +44,7 @@ def apply_rope_with_input_pos_flashinfer(
 
     # flatten cos_sin_cache in case cos/sin is different across batches
     cos_sin_cache = cos_sin_cache.view(batch_size * seq_len, -1)
-    # postition_ids should be initialized as:
-    # position_ids = torch.arange(batch_size * seq_len, device=q.device)
-    position_ids = position_ids.to(q.device)
+    position_ids = position_ids.view(batch_size * seq_len, -1).to(q.device)
 
     query_rotated_flash, key_rotated_flash = flashinfer.rope.apply_rope_with_cos_sin_cache(
         position_ids, q_flat, k_flat, head_dim, cos_sin_cache, is_neox=is_neox
