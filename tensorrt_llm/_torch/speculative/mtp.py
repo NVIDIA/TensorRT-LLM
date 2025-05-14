@@ -232,6 +232,8 @@ class MTPSampler(TorchSampler):
             request.set_finished_reason(FinishReason.LENGTH, beam_idx)
 
     def update_requests(self, state: SampleStateMTP) -> None:
+        assert isinstance(state, SampleStateMTP)
+
         state.sampler_event.synchronize()
         new_tokens_list = state.host.new_tokens.tolist()
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()

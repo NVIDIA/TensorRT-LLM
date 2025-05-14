@@ -1652,7 +1652,8 @@ class PyExecutor:
             self._update_request_states_tp(scheduled_requests)
 
     @nvtx_range("_sample_async")
-    def _sample_async(self, scheduled_batch, batch_outputs) -> SampleState:
+    def _sample_async(self, scheduled_batch,
+                      batch_outputs) -> SampleState | None:
         try:
             if batch_outputs is not None:
                 return self.sampler.sample_async(scheduled_batch, batch_outputs)

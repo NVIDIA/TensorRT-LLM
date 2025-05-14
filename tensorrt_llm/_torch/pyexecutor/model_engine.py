@@ -1067,8 +1067,8 @@ class PyTorchModelEngine(ModelEngine):
             new_tokens_device = new_tensors_device.new_tokens
             if self.is_mtp:
                 assert isinstance(new_tensors_device, SampleStateTensorsMTP)
-                new_tokens_lens_device = new_tensors_device.new_tokens_lens_device  # [batch]
-                next_draft_tokens_device = new_tensors_device.next_draft_tokens_device  # [batch, draft_len]
+                new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
+                next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
 
         # Requests with draft tokens are treated like extend requests.
         extend_requests = []

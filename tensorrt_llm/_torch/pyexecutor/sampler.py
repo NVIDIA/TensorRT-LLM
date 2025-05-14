@@ -646,13 +646,15 @@ class TRTLLMSampler(Sampler):
         sampler_event = torch.cuda.Event()
         sampler_event.record()
 
-        return SampleState(scheduled_requests=scheduled_requests,
-                           logits=logits,
-                           device=device,
-                           host=host,
-                           sampler_event=sampler_event)
+        return SampleStateTRTLLM(scheduled_requests=scheduled_requests,
+                                 logits=logits,
+                                 device=device,
+                                 host=host,
+                                 sampler_event=sampler_event)
 
     def update_requests(self, state: SampleStateTRTLLM):
+        assert isinstance(state, SampleStateTRTLLM)
+
         scheduled_requests = state.scheduled_requests
         assert scheduled_requests.batch_size > 0
         beam_width = self.beam_width(scheduled_requests)
