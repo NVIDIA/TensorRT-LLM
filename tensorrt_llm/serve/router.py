@@ -158,6 +158,13 @@ class Router(ABC):
         self._session = None
         self._health_check_timeout = 5.0  # Default timeout in seconds
 
+    def _on_servers_updated(self, old_servers, new_servers):
+        """Called when the server list changes. Override in subclasses to handle index resets.
+        Args:
+            old_servers: The previous server list
+            new_servers: The new server list
+        """
+
     @abstractmethod
     async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
         '''Select server by request and return some intermediate information'''
@@ -228,11 +235,16 @@ class Router(ABC):
                     # Update server list
                     async with self._lock:
                         if final_servers != self._servers:
-                            old_count = len(self._servers)
+                            num_old_servers = len(self._servers)
+                            old_servers = self._servers.copy()
                             self._servers = final_servers
-                            new_count = len(self._servers)
+                            num_new_servers = len(self._servers)
+
+                            # Call handler for server list changes
+                            self._on_servers_updated(old_servers, self._servers)
+
                             logger.info(
-                                f"Updated {self._server_role} server list: {old_count} -> {new_count} servers"
+                                f"Updated {self._server_role} server list: {num_old_servers} -> {num_new_servers} servers"
                             )
                             if logger.level == "debug" and self._servers:
                                 for server in self._servers:
@@ -316,9 +328,11 @@ class Router(ABC):
                                 )
 
             if server_key_map:
-                logger.info(f"Using {len(server_key_map)} servers from ETCD")
+                logger.info(
+                    f"Using {len(server_key_map)} servers from metadata service"
+                )
             else:
-                logger.warning("No servers found in ETCD")
+                logger.warning("No servers found in metadata service")
 
         except Exception as e:
             logger.error(f"Error fetching servers from metadata service: {e}")
@@ -404,16 +418,30 @@ class RoundRobinRouter(Router):
         super().__init__(server_role, servers, metadata_server)
         self._server_idx = 0
 
+    def _on_servers_updated(self, old_servers, new_servers):
+        """Reset the index when servers are removed to prevent index out of bounds errors."""
+        if len(new_servers) < len(old_servers):
+            # Servers were removed, reset the index
+            self._server_idx = 0
+        elif self._server_idx >= len(new_servers):
+            # Safety check: ensure index is always within bounds
+            self._server_idx = 0
+
     async def get_next_server(
             self, request: OpenAIRequest) -> str:
         if not self._servers:
             if self._metadata_server:
                 raise ValueError(
-                    f"No {self._server_role} servers available in ETCD")
+                    f"No {self._server_role} servers available in metadata service"
+                )
             else:
                 raise ValueError(f"No {self._server_role} servers available")
 
         async with self._lock:
+            # Safety check: ensure index is within bounds
+            if self._server_idx >= len(self._servers):
+                self._server_idx = 0
+
             server = self._servers[self._server_idx]
             self._server_idx = (self._server_idx + 1) % len(self._servers)
         return server
@@ -441,6 +469,25 @@ class LoadBalancingRouter(Router):
         self._use_tokens = use_tokens
         self._init_heap()
 
+    def _on_servers_updated(self, old_servers, new_servers):
+        """Rebuild the heap when the server list changes."""
+        # Keep the state for servers that still exist
+        current_state = {}
+        for server in new_servers:
+            if server in self._server_state:
+                # Keep existing state
+                current_state[server] = self._server_state[server]
+            else:
+                # Initialize new server state
+                current_state[server] = ServerState(server, self._use_tokens)
+
+        # Update state and rebuild heap
+        self._server_state = current_state
+        self._server_load_heap = []
+        for server in new_servers:
+            heapq.heappush(self._server_load_heap,
+                           (self._get_server_load(server), server))
+
     def _init_heap(self):
         for server in self._servers:
             self._server_state[server] = ServerState(server, self._use_tokens)
@@ -452,7 +499,8 @@ class LoadBalancingRouter(Router):
         if not self._servers:
             if self._metadata_server:
                 raise ValueError(
-                    f"No {self._server_role} servers available in ETCD")
+                    f"No {self._server_role} servers available in metadata service"
+                )
             else:
                 raise ValueError(f"No {self._server_role} servers available")
 
