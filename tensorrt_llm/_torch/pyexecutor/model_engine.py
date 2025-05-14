@@ -1109,25 +1109,30 @@ class PyTorchModelEngine(ModelEngine):
         previous_pos_indices = []
         for request in extend_requests:
             if next_draft_tokens_device is None or request.py_batch_idx is None:
+                # get token ids, including input token ids and draft token ids
+                if next_draft_tokens_device is None:
+                    # skip dummy generation requests
+                    # if next_draft_tokens_device is not None, but the batch index is None,
+                    # it means the generation requests are dummy requests. For such cases,
+                    # we do not update the input_ids and draft_tokens and just use the tokens
+                    # from the previous batch.
+                    input_ids.append(request.get_last_tokens(0))
+                    input_ids.extend(request.py_draft_tokens)
+                    draft_tokens.extend(request.py_draft_tokens)
+                # get other ids and lengths
                 num_draft_tokens = len(request.py_draft_tokens)
-                input_ids.append(request.get_last_tokens(0))
-                gather_ids.append(len(input_ids) - 1)
-                sequence_lengths.append(1 + num_draft_tokens)
                 past_seen_token_num = request.max_beam_num_tokens - 1
-                position_ids.append(past_seen_token_num)
                 draft_lens.append(num_draft_tokens)
-                prompt_lengths.append(num_draft_tokens + 1)
-                # draft tokens
-                input_ids.extend(request.py_draft_tokens)
+                prompt_lengths.append(1 + num_draft_tokens)
+                sequence_lengths.append(1 + num_draft_tokens)
                 gather_ids.extend(
                     list(
-                        range(
-                            len(input_ids) - num_draft_tokens, len(input_ids))))
+                        range(len(position_ids),
+                              len(position_ids) + 1 + self.max_draft_len)))
                 position_ids.extend(
                     list(
-                        range(past_seen_token_num + 1,
+                        range(past_seen_token_num,
                               past_seen_token_num + 1 + num_draft_tokens)))
-                draft_tokens.extend(request.py_draft_tokens)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 request.py_batch_idx = batch_idx
                 batch_idx += 1
