@@ -4,7 +4,8 @@ from typing import Dict, List, Optional
 import pytest
 import torch
 import torch.nn as nn
-from utils.util import skip_pre_blackwell, skip_pre_hopper
+from utils.util import (skip_neither_ada_nor_hopper_unittest,
+                        skip_pre_blackwell, skip_pre_hopper)
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -265,6 +266,136 @@ def test_fused_moe_nvfp4(dtype):
     with torch.inference_mode():
         output = fused_moe.forward(x, router_logits)
         ref_output = ref_fused_moe.forward(x, router_logits)
+
+    # compare
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
+
+
+@skip_neither_ada_nor_hopper_unittest
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fused_moe_w4afp8(dtype):
+
+    SEQ_LEN = 4
+    HIDDEN_SIZE = 768
+    INTERMEDIATE_SIZE = 640
+    SCALING_GROUP_SIZE = 128
+    NUM_EXPERTS = 3
+    TOP_K = 2
+    routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+    x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
+    router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS), dtype=dtype).cuda()
+
+    affine_coeff = 0.005
+
+    weights = {}
+    for expert_id in range(NUM_EXPERTS):
+        w1_weight = torch.randint(-128,
+                                  127, (INTERMEDIATE_SIZE, HIDDEN_SIZE // 2),
+                                  dtype=torch.int8).cuda()
+        w2_weight = torch.randint(-128,
+                                  127, (HIDDEN_SIZE, INTERMEDIATE_SIZE // 2),
+                                  dtype=torch.int8).cuda()
+        w3_weight = torch.randint(-128,
+                                  127, (INTERMEDIATE_SIZE, HIDDEN_SIZE // 2),
+                                  dtype=torch.int8).cuda()
+
+        w1_scale = torch.randn(
+            (INTERMEDIATE_SIZE, HIDDEN_SIZE // SCALING_GROUP_SIZE),
+            dtype=dtype).cuda() * affine_coeff
+        w2_scale = torch.randn(
+            (HIDDEN_SIZE, INTERMEDIATE_SIZE // SCALING_GROUP_SIZE),
+            dtype=dtype).cuda() * affine_coeff
+        w3_scale = torch.randn(
+            (INTERMEDIATE_SIZE, HIDDEN_SIZE // SCALING_GROUP_SIZE),
+            dtype=dtype).cuda() * affine_coeff
+
+        w1_input = torch.randn(1, dtype=torch.float32).cuda() * 0.02
+        w2_input = w1_input
+        w3_input = w1_input
+
+        weights[f"{expert_id}.w1.weight"] = w1_weight
+        weights[f"{expert_id}.w2.weight"] = w2_weight
+        weights[f"{expert_id}.w3.weight"] = w3_weight
+        weights[f"{expert_id}.w1.weight_scale_inv"] = w1_scale
+        weights[f"{expert_id}.w2.weight_scale_inv"] = w2_scale
+        weights[f"{expert_id}.w3.weight_scale_inv"] = w3_scale
+        weights[f"{expert_id}.w1.input_scale"] = w1_input
+        weights[f"{expert_id}.w2.input_scale"] = w2_input
+        weights[f"{expert_id}.w3.input_scale"] = w3_input
+
+    quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_AWQ)
+    fused_moe = FusedMoE(num_experts=NUM_EXPERTS,
+                         routing_method=routing_method,
+                         hidden_size=HIDDEN_SIZE,
+                         intermediate_size=INTERMEDIATE_SIZE,
+                         dtype=dtype,
+                         reduce_results=False,
+                         model_config=ModelConfig(quant_config=quant_config))
+    fused_moe.load_weights([weights])
+    fused_moe.cuda()
+
+    def ref():
+        results = torch.zeros_like(x)
+        selected_experts, final_scales = routing_method.apply(router_logits)
+        unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
+        for e_idx in range(NUM_EXPERTS):
+            mask = selected_experts == e_idx
+            activated_tokens = mask.sum(1).bool()
+            act = x[activated_tokens, :]
+            if act.shape[0] == 0:
+                continue
+            final_scale = (final_scales *
+                           mask).sum(1)[activated_tokens].unsqueeze(1)
+
+            # weights
+            w1 = weights[f"{e_idx}.w1.weight"]
+            w1 = unpacker(w1.cpu()).T.contiguous().cuda()
+            w2 = weights[f"{e_idx}.w2.weight"]
+            w2 = unpacker(w2.cpu()).T.contiguous().cuda()
+            w3 = weights[f"{e_idx}.w3.weight"]
+            w3 = unpacker(w3.cpu()).T.contiguous().cuda()
+            w3_w1 = torch.cat([w3, w1], dim=-1)
+
+            # scales
+            s1 = weights[f"{e_idx}.w1.weight_scale_inv"].T.contiguous().cuda()
+            s2 = weights[f"{e_idx}.w2.weight_scale_inv"].T.contiguous().cuda()
+            s3 = weights[f"{e_idx}.w3.weight_scale_inv"].T.contiguous().cuda()
+            s3_s1 = torch.cat([s3, s1], dim=-1)
+
+            # prequant / alpha
+            p1 = weights[f"{e_idx}.w1.input_scale"].cuda()
+            p2 = weights[f"{e_idx}.w2.input_scale"].cuda()
+            p3 = weights[f"{e_idx}.w3.input_scale"].cuda()
+            p3_p1 = max(p1, p3)
+
+            act = torch.clamp((act / p3_p1), -448.0,
+                              448.0).to(torch.float8_e4m3fn).to(dtype)
+            w3_w1 = (w3_w1.float() *
+                     s3_s1.repeat_interleave(128, dim=0).float()).to(dtype)
+            fc1 = torch.matmul(act, w3_w1) * p3_p1
+            fc1, gate = fc1.chunk(2, dim=-1)
+            fc1 = fc1 * torch.nn.functional.silu(gate)
+
+            act = torch.clamp((fc1 / p2), -448.0,
+                              448.0).to(torch.float8_e4m3fn).to(dtype)
+            w2 = (w2.float() *
+                  s2.repeat_interleave(128, dim=0).float()).to(dtype)
+            fc2 = torch.matmul(act, w2) * p2
+            results[activated_tokens, :] += (fc2 * final_scale).to(
+                results.dtype)
+        return results
+
+    AutoTuner.get().clear_cache()
+    with torch.inference_mode(), autotune():
+        fused_moe.forward(x, router_logits)
+
+    torch.cuda.synchronize()
+    with torch.inference_mode():
+        output = fused_moe.forward(x, router_logits)
+        ref_output = ref()
 
     # compare
     torch.cuda.synchronize()
