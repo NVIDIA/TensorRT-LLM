@@ -51,9 +51,6 @@ ifndef GENERATE_CUBIN
 	NVCC_FLAGS += -g -lineinfo
 endif
 
-# Special compiler arguments if we enable JETFIRE.
-NVCC_FLAGS += -DJETFIRE_ENABLED=1
-
 # Google Test
 GTEST_DIR ?= /usr
 GTEST_LIB = -lgtest -lgtest_main

@@ -177,6 +177,8 @@ def generate_fmha_cu(project_dir, venv_python):
     })
 
     build_run("rm -rf generated")
+    build_run("rm -rf temp")
+    build_run("rm -rf obj")
     build_run("python3 setup.py", env=env)
 
     # Copy generated header file when cu path is active and cubins are deleted.

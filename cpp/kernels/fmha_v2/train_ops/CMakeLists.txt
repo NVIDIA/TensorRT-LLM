@@ -16,7 +16,6 @@ set(CMAKE_CUDA_FLAGS
 -Wno-deprecated-declarations \
 --resource-usage \
 -use_fast_math \
--DJETFIRE_ENABLED=1 \
 -Xcicc --uumn -Xptxas -uumn \
 -Xptxas=-v \
 ")

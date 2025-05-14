@@ -37,15 +37,6 @@ CXX_FLAGS = $(CXXFLAGS) -O3 -std=c++14 -g -DSAMPLES
 #NVCC_FLAGS = $(CUDAFLAGS) -O3 -std=c++14 -g -lineinfo -ccbin $(CXX) -Xptxas=-v -use_fast_math
 NVCC_FLAGS = $(CUDAFLAGS) -O3 -std=c++14 -g -lineinfo -ccbin $(CXX)  -use_fast_math
 
-# Special compiler arguments if we enable JETFIRE.
-ifndef JETFIRE_ENABLED
-  NVCC_FLAGS += -DJETFIRE_ENABLED=1
-  NVCC_FLAGS += -Xptxas="-knob SchedReadSBBaseLatency=24"
-  NVCC_FLAGS += -Xptxas="--ext-desc-file $(CUDA)/bin/ptxExtDesc.txt"
-  NVCC_FLAGS += -Xptxas="-v"
-  NVCC_FLAGS += -Xcicc --uumn -Xptxas -uumn
-endif
-
 # The different preprocessor definitions.
 PREPROCESSOR_FLAGS = -DMYGEN
 
