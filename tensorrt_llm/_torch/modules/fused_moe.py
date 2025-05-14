@@ -1389,7 +1389,7 @@ class FusedMoE(nn.Module):
 
         # If the reference to the shared expert is provided, read the pre-score scaling input scale from the shared
         # expert. This assumes that shared expert is loaded before the MoE layer.
-        if self.shared_expert is not None:
+        if self.shared_expert is not None and hasattr(self.shared_expert.gate_up_proj, "input_scale"):
             pre_score_scaling_input_scale = self.shared_expert.gate_up_proj.input_scale
             self.min_latency_quant_scales = FusedMoEQuantScalesFP8(
                 fc1_dequant=self.fc31_dequant.data /
