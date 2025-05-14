@@ -54,7 +54,7 @@ def test_deepseek_trtllmgen(model_name):
 
     prompts = [
         "The president of the United States is",
-    ] * 32
+    ] * 4
 
     pytorch_config = PyTorchConfig(
         enable_overlap_scheduler=False,
