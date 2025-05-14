@@ -28,14 +28,14 @@ For more information on KV cache reuse see [KV cache reuse](kv-cache-reuse.md).
 ### **WindowBlockManager/BlockManager**
 
 TRT-LLM supports 2 complex features related to KV cache management:
-1. **Variable GQA** - i.e. a different `num_kv_heads` value for different layers.
-2. **Variable SWA** - i.e. a different `attention_window_size` value for different layers.
+1. **Variable Group-Query Attention (VGQA)** - i.e. a different `num_kv_heads` value for different layers.
+2. **Variable Sliding Window Attention (VSWA)** - i.e. a different `attention_window_size` value for different layers.
 
 In order to support both of these features, the pool management works as described below.
 
 But in the simple, *most common case*, for most models, where
-1. MHA/MQA/Non-variable GQA, i.e., same `num_kv_heads` value for all layers,
-2. Global attention/SWA, i.e., same `attention_window_size` value for all layers,
+1. [MHA/MQA/Non-variable GQA](gpt-attention.md#multi-head-multi-query-and-group-query-attention), i.e., same `num_kv_heads` value for all layers,
+2. Global attention/[SWA](gpt-attention.md#sliding-window-attention-cyclic-rolling-buffer-kv-cache), i.e., same `attention_window_size` value for all layers,
 
 only a *single* pool will be created within the structure described below.
 
