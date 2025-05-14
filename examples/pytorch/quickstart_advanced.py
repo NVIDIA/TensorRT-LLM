@@ -6,12 +6,12 @@ from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
                                  MTPDecodingConfig)
 
-example_prompts = [
-    "Hello, my name is",
-    "The president of the United States is",
-    "The capital of France is",
-    "The future of AI is",
-]
+# example_prompts = [
+#     "Hello, my name is",
+#     "The president of the United States is",
+#     "The capital of France is",
+#     "The future of AI is",
+# ]
 
 # testing for enable_chunked_prefill
 # example_prompts = [
@@ -19,20 +19,20 @@ example_prompts = [
 #     "The library had no address and no map could lead you there. It appeared only when truly needed. Its hallways stretched endlessly, lined with books that whispered as you passed. Titles changed when you blinked. Some books glowed faintly; others dripped ink onto the marble floors. In the center of the grand atrium stood an old man, faceless beneath his wide-brimmed hat. He rasped. You opened your mouth to answer—but your voice betrayed a question you didn't even know you carried in your heart.The moon fractured into seven shards overnight, casting strange shadows across the earth. With each passing hour, gravity bent and twisted in unfamiliar ways. Birds flew backward, rivers climbed hills, and people's dreams bled into waking life. Governments scrambled to explain it, but deep underground, secret councils whispered of an ancient pact finally broken. Somewhere in the chaos, a teenage astronomer, clutching a cracked telescope, noticed a pattern hidden in the falling starlight—a map written for those brave enough to follow it into the unknown."
 # ]
 
-## testing for prompt length 16k
-# example_prompts = []
-# import os
+# testing for prompt length 16k
+example_prompts = []
+import os
 
-# chunk_files = [
-#     f for f in os.listdir('/my_scratch_space_1/opensource/')
-#     if f.startswith('chunk_')
-# ]
-# print(chunk_files)
-# for chunk_file in chunk_files:
-#     print("Reading chunk file: ", chunk_file)
-#     with open(chunk_file, "r", encoding="utf-8") as f:
-#         chunk_text = f.read()
-#         example_prompts.append(chunk_text)
+chunk_files = [
+    f for f in os.listdir('/my_scratch_space_1/opensource/')
+    if f.startswith('chunk_')
+]
+print(chunk_files)
+for chunk_file in chunk_files:
+    print("Reading chunk file: ", chunk_file)
+    with open(chunk_file, "r", encoding="utf-8") as f:
+        chunk_text = f.read()
+        example_prompts.append(chunk_text)
 
 
 def add_llm_args(parser):
