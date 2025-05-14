@@ -252,6 +252,11 @@ public:
     static void serialize(InflightBatchingStats const& inflightBatchingStats, std::ostream& os);
     static size_t serializedSize(InflightBatchingStats const& inflightBatchingStats);
 
+    // SpecDecStats
+    static SpecDecStats deserializeSpecDecStats(std::istream& is);
+    static void serialize(SpecDecStats const& specDecStats, std::ostream& os);
+    static size_t serializedSize(SpecDecStats const& specDecStats);
+
     // IterationStats
     static IterationStats deserializeIterationStats(std::vector<char>& buffer);
     static IterationStats deserializeIterationStats(std::istream& is);

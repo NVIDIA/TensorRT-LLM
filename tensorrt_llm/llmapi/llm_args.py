@@ -194,7 +194,8 @@ class DecodingBaseConfig(BaseModel):
             "MTP": MTPDecodingConfig,
             "Medusa": MedusaDecodingConfig,
             "Eagle": EagleDecodingConfig,
-            "Lookahead": LookaheadDecodingConfig
+            "Lookahead": LookaheadDecodingConfig,
+            "NGram": NGramDecodingConfig,
         }
 
         config_class = config_classes.get(decoding_type)
@@ -233,6 +234,20 @@ class EagleDecodingConfig(DecodingBaseConfig):
         return cls(**data)
 
     decoding_type: ClassVar[str] = "Eagle"
+
+
+class NGramDecodingConfig(DecodingBaseConfig):
+    prompt_lookup_num_tokens: int = 2
+    max_matching_ngram_size: int = 4
+    is_keep_all: bool = True
+    is_use_oldest: bool = True
+    is_public_pool: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    decoding_type: ClassVar[str] = "NGram"
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
@@ -870,8 +885,8 @@ class LlmArgs(BaseModel):
     # Speculative decoding parameters
     speculative_config: Optional[Union[
         LookaheadDecodingConfig, MedusaDecodingConfig, EagleDecodingConfig,
-        MTPDecodingConfig]] = Field(default=None,
-                                    description="Speculative decoding config.")
+        MTPDecodingConfig, NGramDecodingConfig]] = Field(
+            default=None, description="Speculative decoding config.")
 
     batching_type: Optional[BatchingType] = Field(default=None,
                                                   description="Batching type.")
@@ -1201,7 +1216,21 @@ class LlmArgs(BaseModel):
                         max_draft_tokens=self.speculative_config.max_draft_len,
                         eagle_weights_path=self.speculative_config.
                         pytorch_eagle_weights_path)
-
+            elif isinstance(self.speculative_config, NGramDecodingConfig):
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.NGRAM
+                assert self.backend == 'pytorch'
+                assert self.speculative_config.prompt_lookup_num_tokens > 0 and self.speculative_config.max_matching_ngram_size > 0
+                self.build_config.max_draft_len = self.speculative_config.max_draft_len
+                from tensorrt_llm._torch.speculative import NGramConfig
+                self.speculative_config = NGramConfig(
+                    prompt_lookup_num_tokens=self.speculative_config.
+                    prompt_lookup_num_tokens,
+                    max_matching_ngram_size=self.speculative_config.
+                    max_matching_ngram_size,
+                    is_keep_all=self.speculative_config.is_keep_all,
+                    is_use_oldest=self.speculative_config.is_use_oldest,
+                    is_public_pool=self.speculative_config.is_public_pool,
+                )
             elif isinstance(self.speculative_config, MTPDecodingConfig):
                 from tensorrt_llm._torch.speculative import MTPConfig
                 self.speculative_config = MTPConfig(

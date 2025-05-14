@@ -24,12 +24,14 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
                                             RequestStage, RequestStats,
-                                            RequestType, StaticBatchingStats)
+                                            RequestType, SpecDecStats,
+                                            StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.logger import logger
 
 from ..distributed import Distributed
+from ..speculative import PLDPool
 from .decoder import Decoder, DecoderState
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
@@ -168,6 +170,7 @@ class PyExecutor:
                  max_draft_tokens: int = 0,
                  kv_cache_transceiver: KvCacheTransceiver = None,
                  draft_model_engine: Optional[ModelEngine] = None,
+                 pld_pool: Optional[PLDPool] = None,
                  start_worker: bool = True):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
@@ -191,6 +194,8 @@ class PyExecutor:
 
         # Draft model for certain spec decode algorithms, e.g. EAGLE3
         self.draft_model_engine = draft_model_engine
+        # PLDPool for ngram spec decode algorithm
+        self.pld_pool = pld_pool
 
         # enqueue and _fetch_new_requests used data
         self.enqueue_lock = threading.Lock()
@@ -512,6 +517,8 @@ class PyExecutor:
         stats.inflight_batching_stats = InflightBatchingStats()
         # staticBatchingStats is not used in pytorch path
         stats.static_batching_stats = StaticBatchingStats()
+        if self.pld_pool is not None:
+            stats.specdec_stats = SpecDecStats()
         return stats
 
     def _populate_req_stats(
@@ -611,6 +618,9 @@ class PyExecutor:
             scheduled_batch.paused_requests)
         stats.inflight_batching_stats.avg_num_decoded_tokens_per_iter = 0
         stats.inflight_batching_stats.micro_batch_id = 0
+        if stats.specdec_stats is not None:
+            stats.specdec_stats.draft_overhead = 0.0 if iter_latency_ms <= 0.0 else float(
+                stats.specdec_stats.iter_latency_ms) / float(iter_latency_ms)
         return stats
 
     def _append_iter_stats(self,
@@ -817,7 +827,7 @@ class PyExecutor:
                 if num_dummy_request > 0:
                     self._merge_dummy_request(num_dummy_request)
 
-                if self.draft_model_engine is not None:
+                if self.draft_model_engine is not None or self.pld_pool is not None:
                     self._prepare_draft_requests()
 
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
@@ -852,6 +862,9 @@ class PyExecutor:
                     self.resource_manager.prepare_resources(scheduled_batch)
                     if self.draft_model_engine is not None:
                         self._prepare_draft_tokens(scheduled_batch)
+                    if self.pld_pool is not None:
+                        self._generate_ngram_draft_tokens(
+                            scheduled_batch, iter_stats)
 
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -878,6 +891,11 @@ class PyExecutor:
 
                     self._handle_cancelled_requests()
                     finished_requests = self._handle_responses()
+                    if self.pld_pool is not None:
+                        [
+                            self.pld_pool.remove_pool(request.request_id)
+                            for request in finished_requests
+                        ]
                     self.resource_manager.update_resources(scheduled_batch)
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
@@ -904,7 +922,7 @@ class PyExecutor:
             # Set draft tokens here to make the KV cache manager
             # and scheduler aware of them.
             for req in self.active_requests:
-                if req.state != LlmRequestState.GENERATION_IN_PROGRESS:
+                if req.state != LlmRequestState.GENERATION_IN_PROGRESS and self.pld_pool is None:
                     continue
                 req.py_last_draft_tokens = req.py_draft_tokens
                 max_draft_len = self.model_engine.spec_config.max_draft_tokens
@@ -1677,6 +1695,83 @@ class PyExecutor:
     def _update_requests(self, decoder_state: DecoderState):
         try:
             self.decoder.update_requests(decoder_state)
+        except Exception as e:
+            traceback.print_exc()
+            error_msg = str(e)
+            logger.error(f"Encountered an error in decode: {error_msg}")
+            self._handle_errors(error_msg)
+
+    @nvtx_range("_generate_ngram_draft_tokens")
+    def _generate_ngram_draft_tokens(
+        self, scheduled_requests: ScheduledRequests, iter_stats: IterationStats
+    ) -> Tuple[ScheduledRequests, Dict[int, LlmRequest]]:
+        """
+        Generate draft tokens for generation requests using ngram lookup table.
+        """
+        try:
+            if iter_stats is not None:
+                before = time.time()
+                total_num_draft_tokens = 0
+                total_num_accepted_tokens = 0
+                num_requests_with_draft_tokens = 0
+            for request in chain(scheduled_requests.context_requests,
+                                 scheduled_requests.generation_requests):
+                if request.py_draft_pages_allocated == 0:
+                    # No space for draft tokens.
+                    continue
+
+                num_draft_tokens = len(
+                    request.py_last_draft_tokens
+                ) if request.py_last_draft_tokens is not None else 0
+
+                num_accepted_tokens = getattr(request,
+                                              "py_num_accepted_draft_tokens", 0)
+                num_rejected_tokens = num_draft_tokens - num_accepted_tokens
+                assert num_rejected_tokens >= 0
+                request.py_draft_tokens = []
+
+                if iter_stats is not None and num_draft_tokens > 0:
+                    total_num_draft_tokens = total_num_draft_tokens + num_draft_tokens
+                    total_num_accepted_tokens = total_num_accepted_tokens + num_accepted_tokens
+                    num_requests_with_draft_tokens = num_requests_with_draft_tokens + 1
+
+                spec_config = self.model_engine.spec_config
+                beam_idx = 0
+                input_tokens = spec_config.get_draft_model_prompt(
+                    request.get_tokens()[beam_idx])
+
+                # Generate draft tokens
+                draft_tokens = self.pld_pool.get_draft_tokens(
+                    input_tokens,
+                    request.request_id,
+                    request.py_end_id,
+                    request.py_prompt_len + request.py_max_new_tokens,
+                )
+                max_draft_tokens = self.pld_pool.prompt_lookup_num_tokens
+                num_draft_tokens = len(draft_tokens)
+                # Pad to max_draft_tokens
+                if num_draft_tokens > 1 or draft_tokens[0] != request.py_end_id:
+                    if num_draft_tokens < max_draft_tokens:
+                        draft_tokens.extend(0 for _ in range(max_draft_tokens -
+                                                             num_draft_tokens))
+                    request.py_draft_tokens = draft_tokens
+            if iter_stats is not None:
+                if num_requests_with_draft_tokens > 0:
+                    iter_stats.specdec_stats.iter_latency_ms = (time.time() -
+                                                                before) * 1e3
+                    iter_stats.specdec_stats.num_draft_tokens = total_num_draft_tokens
+                    iter_stats.specdec_stats.num_accepted_tokens = total_num_accepted_tokens
+                    iter_stats.specdec_stats.num_requests_with_draft_tokens = num_requests_with_draft_tokens
+                    iter_stats.specdec_stats.acceptance_length = float(
+                        (total_num_accepted_tokens +
+                         num_requests_with_draft_tokens
+                         )) / float(num_requests_with_draft_tokens)
+                else:
+                    iter_stats.specdec_stats.iter_latency_ms = 0.0
+                    iter_stats.specdec_stats.num_draft_tokens = 0
+                    iter_stats.specdec_stats.num_accepted_tokens = 0
+                    iter_stats.specdec_stats.num_requests_with_draft_tokens = 0
+                    iter_stats.specdec_stats.acceptance_length = 1.0
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
