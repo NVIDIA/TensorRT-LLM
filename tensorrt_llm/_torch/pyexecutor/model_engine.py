@@ -534,11 +534,8 @@ class PyTorchModelEngine(ModelEngine):
                 yield result
             finally:
                 if result is not None:
-                    for req in result.generation_requests:
-                        kv_cache_manager.free_resources(req)
-                        if spec_resource_manager is not None:
-                            spec_resource_manager.free_resources(req)
-                    for req in result.context_requests:
+                    for req in itertools.chain(result.generation_requests,
+                                               result.context_requests):
                         kv_cache_manager.free_resources(req)
                         if spec_resource_manager is not None:
                             spec_resource_manager.free_resources(req)
@@ -1720,11 +1717,7 @@ class PyTorchModelEngine(ModelEngine):
         lora_params = {}
         tmp_lora_params = {}
 
-        request_list = []
-        for request in scheduled_requests.context_requests:
-            request_list.append(request)
-        for request in scheduled_requests.generation_requests:
-            request_list.append(request)
+        request_list = scheduled_requests.context_requests + scheduled_requests.generation_requests
 
         # trace all requests to get the union set of the lora params
         for request in request_list:
