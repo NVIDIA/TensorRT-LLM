@@ -667,6 +667,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         latent_cache: Optional[torch.Tensor] = None,
         q_pe: Optional[torch.Tensor] = None,
         mrope_config: Optional[dict] = None,
+        attention_window_size: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         assert isinstance(
@@ -687,7 +688,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             max_sequence_length=metadata.max_seq_len,
             max_context_length=min(metadata.max_seq_len - 1,
                                    metadata.max_num_tokens),
-            attention_window_size=None,
+            attention_window_size=attention_window_size,
             sink_token_length=0,
             beam_width=1,
             sequence_length=metadata.kv_lens_cuda_runtime,
