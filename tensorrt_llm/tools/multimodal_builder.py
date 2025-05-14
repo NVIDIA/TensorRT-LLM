@@ -1275,6 +1275,7 @@ def build_cosmos_8b_engine(args):
         args.model_path,
         use_flash_attn=False,
         trust_remote_code=True,
+        dtype=torch.float16,
     )
 
     class RadioWithNeck(torch.nn.Module):
