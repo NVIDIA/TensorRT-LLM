@@ -41,7 +41,6 @@ if TEST_MEM_USAGE:
     os.environ['TLLM_LOG_LEVEL'] = 'INFO'
 
 _MEM_FRACTION_50 = 0.5
-_MEM_FRACTION_90 = 0.90
 _MEM_FRACTION_95 = 0.95
 
 
@@ -72,7 +71,7 @@ def _get_mem_info_from_log(file, ranks_num):
 def _get_kv_mem_size_candidate(used_Gib, fraction):
     import torch
     _, total = torch.cuda.mem_get_info()
-    return (total / (1 << 30)) * fraction - used_Gib
+    return (total / (1 << 30) - used_Gib) * fraction
 
 
 def _check_mem_usage(file, mem_info, ranks_num=1):
