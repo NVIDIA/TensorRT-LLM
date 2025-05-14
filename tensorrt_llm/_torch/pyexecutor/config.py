@@ -57,7 +57,7 @@ class PyTorchConfig:
     mixed_decoder: bool = False
     # If true, will use the TRTLLM decoder instead of the PyTorch decoder.
     # The TRTLLM decoder has a wide coverage of decoding strategies.
-    enable_trtllm_decoder: bool = False
+    enable_trtllm_decoder: bool = True
     kv_cache_dtype: str = "auto"
     use_kv_cache: bool = True
     enable_iter_perf_stats: bool = False
