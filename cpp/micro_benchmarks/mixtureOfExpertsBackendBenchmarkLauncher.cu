@@ -616,7 +616,7 @@ void help()
            "    \"dtypes\": [string, ...], (optional)\n"
            "    \"routing_name\": string, (optional)\n"
            "    \"selected_experts\": [int, ...], or string, (optional, length is a multiple of k)\n"
-           "    \"expert_distribtuion\": [float, ...], or string, (optional, length is num_experts)\n"
+           "    \"expert_distribution\": [float, ...], or string, (optional, length is num_experts)\n"
            "  },\n"
            "  ...\n"
            "]\n"
