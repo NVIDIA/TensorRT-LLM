@@ -64,7 +64,8 @@ def _get_mem_info_from_log(file, ranks_num):
         match = fraction_pattern.findall(line)
         if len(match) > 0:
             fraction = float(match[0])
-    assert len(kv_mem_size) % 2 == 0, ""
+    assert len(
+        kv_mem_size) % 2 == 0, "no enough memory usage information in log"
     kv_mem_size = kv_mem_size[len(kv_mem_size) // 2:]
     return 0, 0, sum(kv_mem_size) / ranks_num, 0, fraction
 
@@ -719,7 +720,7 @@ def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
         if skip_engine_build:
             model_name = model_name.split("/")[-1]
             with tempfile.NamedTemporaryFile(
-                    mode='w+b',
+                    mode='w+t',
                     suffix=f".{model_name}_{streaming}.log",
                     dir="./",
                     delete=True,
