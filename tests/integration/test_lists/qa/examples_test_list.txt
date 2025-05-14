@@ -415,6 +415,7 @@ accuracy/test_llm_api.py::TestQwen2_7BInstruct::test_fp8
 accuracy/test_llm_api.py::TestQwen2_5_0_5BInstruct::test_fp8
 accuracy/test_llm_api.py::TestQwen2_5_1_5BInstruct::test_fp8
 accuracy/test_llm_api.py::TestQwen2_5_7BInstruct::test_fp8
+accuracy/test_llm_api.py::TestQwen2_5_7BInstruct::test_fp8_kvcache
 accuracy/test_llm_api.py::TestMistral7B_0_3::test_quant_tp4[int4]
 accuracy/test_llm_api.py::TestMistral7B_0_3::test_quant_tp4[int4_awq]
 accuracy/test_llm_api.py::TestMistral7B_0_3::test_quant_tp4[int8_awq]
