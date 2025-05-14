@@ -15,7 +15,8 @@ from tensorrt_llm._torch.pipeline_interface import PipelineInterface
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
-from ...inputs import ExtraProcessedInputs, InputProcessor, TextPrompt
+from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
+                       register_input_processor)
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
@@ -1082,7 +1083,68 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
         self.draft_model.load_weights_from_target_model(self)
 
 
+class Llama4InputProcessor(InputProcessor):
+
+    def __init__(self, model_path, model_config, tokenizer):
+        self.processor = AutoProcessor.from_pretrained(model_path,
+                                                       use_fast=True)
+        self.model_config = model_config
+        self.tokenizer = tokenizer
+        self.vocab_size = model_config.text_config.vocab_size
+        self.image_token_index = model_config.image_token_index
+
+        self.encoder = nn.ModuleDict({
+            "vision_model":
+            Llama4VisionModel(model_config.vision_config),
+            "multi_modal_projector":
+            Llama4MultiModalProjector(model_config)
+        }).cuda()
+        load_sharded_checkpoint(self.encoder, model_path, strict=False)
+
+    @torch.inference_mode()
+    def __call__(
+        self, inputs: TextPrompt, sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        text_prompt, mm_data = inputs.get("prompt"), inputs.get(
+            "multi_modal_data")
+        images, do_rescale = None, True
+
+        if mm_data and mm_data.get("image"):
+            images = mm_data["image"]
+            img_type = type(mm_data["image"][0])
+            do_rescale = (img_type == Image)
+            assert all(isinstance(img, img_type) for img in mm_data["image"])
+
+        truncate_kwargs = {}
+        if sampling_params.truncate_prompt_tokens is not None:
+            truncate_kwargs[
+                "max_length"] = sampling_params.truncate_prompt_tokens
+            truncate_kwargs["truncation"] = True
+
+        # preprocess images and insert image tokens
+        processed = self.processor(
+            text=text_prompt,
+            images=images,
+            return_tensors="pt",
+            device="cuda",
+            do_rescale=do_rescale,
+            add_special_tokens=sampling_params.add_special_tokens,
+            **truncate_kwargs)
+        if images:
+            token_ids, pixel_values = processed["input_ids"].squeeze(
+            ), processed["pixel_values"]
+            mm_embeds = self.encoder.vision_model(
+                pixel_values.float().cuda()).last_hidden_state.flatten(0, 1)
+            mm_embeds = self.encoder.multi_modal_projector(mm_embeds)
+            # for fuse_input_embeds
+            token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
+            return token_ids.tolist(), {"mm_embedding": mm_embeds}
+        else:
+            return processed["input_ids"].squeeze().tolist(), {}
+
+
 @register_auto_model("Llama4ForConditionalGeneration")
+@register_input_processor(Llama4InputProcessor)
 class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
                                                              Llama4Config]):
 
@@ -1232,66 +1294,6 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
     def load_draft_weights(self, weights: Dict):
         self.draft_model.load_weights(weights)
         self.draft_model.load_weights_from_target_model(self)
-
-
-class Llama4InputProcessor(InputProcessor):
-
-    def __init__(self, model_path, model_config, tokenizer):
-        self.processor = AutoProcessor.from_pretrained(model_path,
-                                                       use_fast=True)
-        self.model_config = model_config
-        self.tokenizer = tokenizer
-        self.vocab_size = model_config.text_config.vocab_size
-        self.image_token_index = model_config.image_token_index
-
-        self.encoder = nn.ModuleDict({
-            "vision_model":
-            Llama4VisionModel(model_config.vision_config),
-            "multi_modal_projector":
-            Llama4MultiModalProjector(model_config)
-        }).cuda()
-        load_sharded_checkpoint(self.encoder, model_path, strict=False)
-
-    @torch.inference_mode()
-    def __call__(
-        self, inputs: TextPrompt, sampling_params: SamplingParams
-    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        text_prompt, mm_data = inputs.get("prompt"), inputs.get(
-            "multi_modal_data")
-        images, do_rescale = None, True
-
-        if mm_data and mm_data.get("image"):
-            images = mm_data["image"]
-            img_type = type(mm_data["image"][0])
-            do_rescale = (img_type == Image)
-            assert all(isinstance(img, img_type) for img in mm_data["image"])
-
-        truncate_kwargs = {}
-        if sampling_params.truncate_prompt_tokens is not None:
-            truncate_kwargs[
-                "max_length"] = sampling_params.truncate_prompt_tokens
-            truncate_kwargs["truncation"] = True
-
-        # preprocess images and insert image tokens
-        processed = self.processor(
-            text=text_prompt,
-            images=images,
-            return_tensors="pt",
-            device="cuda",
-            do_rescale=do_rescale,
-            add_special_tokens=sampling_params.add_special_tokens,
-            **truncate_kwargs)
-        if images:
-            token_ids, pixel_values = processed["input_ids"].squeeze(
-            ), processed["pixel_values"]
-            mm_embeds = self.encoder.vision_model(
-                pixel_values.float().cuda()).last_hidden_state.flatten(0, 1)
-            mm_embeds = self.encoder.multi_modal_projector(mm_embeds)
-            # for fuse_input_embeds
-            token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
-            return token_ids.tolist(), {"mm_embedding": mm_embeds}
-        else:
-            return processed["input_ids"].squeeze().tolist(), {}
 
 
 @register_auto_model("MistralForCausalLM")
