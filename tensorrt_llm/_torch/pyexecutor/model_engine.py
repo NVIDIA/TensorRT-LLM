@@ -43,6 +43,7 @@ from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
 from ..pipeline_interface import PipelineInterface
 from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
 from ..utils import set_torch_compiling, with_model_extra_attrs
+from ._config_utils import is_mla
 from .config import LoadFormat, PyTorchConfig
 from .cuda_graph_runner import DecodingCUDAGraphRunner
 from .guided_decoder import GuidedDecoder
@@ -690,9 +691,9 @@ class PyTorchModelEngine(ModelEngine):
                             torch.cuda.empty_cache()
 
     def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
-        enable_paged_context_mla = hasattr(
-            self.model.model_config.pretrained_config,
-            "kv_lora_rank") and self.attn_runtime_features.cache_reuse
+        enable_paged_context_mla = is_mla(
+            self.model.model_config.pretrained_config
+        ) and self.attn_runtime_features.cache_reuse
         if kv_cache_manager is None:
             return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,

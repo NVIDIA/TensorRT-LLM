@@ -1,7 +1,6 @@
 import math
 import random
 from collections.abc import Iterable
-from functools import lru_cache
 
 import torch
 
@@ -16,6 +15,7 @@ from tensorrt_llm.lora_manager import (LoraConfig,
 from tensorrt_llm.mapping import Mapping
 
 from ..speculative import get_num_spec_layers, get_spec_decoder
+from ._config_utils import is_mla, is_nemotron_hybrid
 from .decoder import (EarlyStopDecoder, TorchDecoder, TorchStarAttentionDecoder,
                       TRTLLMDecoder)
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
@@ -26,38 +26,6 @@ from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
-
-
-def is_nemotron_hybrid(config):
-    if hasattr(config, "hybrid_override_pattern"):
-        return True
-    return False
-
-
-def is_mla(config):
-    if hasattr(config, "kv_lora_rank"):
-        assert hasattr(
-            config, "qk_rope_head_dim"
-        ), "both of kv_lora_rank and qk_rope_head_dim are required."
-        return True
-    return False
-
-
-@lru_cache(maxsize=1)
-def get_cuda_arch():
-    try:
-        return torch.cuda.get_device_capability()
-    except Exception:
-        return None
-
-
-def is_sm90():
-    return get_cuda_arch() == (9, 0)
-
-
-def is_sm100():
-    return get_cuda_arch() == (10, 0)
-
 
 GB = 1 << 30
 

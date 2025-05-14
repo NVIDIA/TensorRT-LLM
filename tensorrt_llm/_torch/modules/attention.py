@@ -762,7 +762,7 @@ class MLA(nn.Module):
         # paged kv cache should be initialized to 0 to avoid NaN
         full_kv = torch.zeros([
             attn_metadata.num_contexts, 2,
-            (attn_metadata.max_ctx_full_seq_len + tokens_per_block - 1) //
+            (attn_metadata.max_ctx_kv_len + tokens_per_block - 1) //
             tokens_per_block, self.num_heads, tokens_per_block,
             max(self.qk_nope_head_dim + self.qk_rope_head_dim, self.v_head_dim)
         ],
@@ -812,12 +812,8 @@ class MLA(nn.Module):
             if trtllm_attention.has_cached_kv_for_mla_context(attn_metadata):
                 return self.forward_context_with_cached_kv(
                     q, compressed_kv, k_pe, attn_metadata, position_ids)
-            else:
-                return self.forward_context_default(q, compressed_kv, k_pe,
-                                                    attn_metadata, latent_cache)
-        else:
-            return self.forward_context_default(q, compressed_kv, k_pe,
-                                                attn_metadata, latent_cache)
+        return self.forward_context_default(q, compressed_kv, k_pe,
+                                            attn_metadata, latent_cache)
 
     def forward_generation(
         self,
