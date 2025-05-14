@@ -22,14 +22,17 @@
 #include <NvInferRuntime.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cassert>
-#include <nccl.h>
 #include <set>
 #include <string>
 #include <torch/extension.h>
 #include <vector>
+#if ENABLE_MULTI_DEVICE
+#include <nccl.h>
+#endif // ENABLE_MULTI_DEVICE
 
 namespace torch_ext
 {
+#if ENABLE_MULTI_DEVICE
 
 namespace
 {
@@ -112,8 +115,11 @@ private:
 
 } // namespace
 
+#endif // ENABLE_MULTI_DEVICE
+
 torch::Tensor allgather(torch::Tensor input, torch::optional<torch::List<int64_t>> sizes, torch::List<int64_t> group_)
 {
+#if ENABLE_MULTI_DEVICE
     std::set<int> group;
     for (int64_t rank : group_)
     {
@@ -123,11 +129,15 @@ torch::Tensor allgather(torch::Tensor input, torch::optional<torch::List<int64_t
     op.initialize();
     auto output = op.run(input, sizes);
     return output;
+#else
+    return input;
+#endif // ENABLE_MULTI_DEVICE
 }
 
 std::vector<torch::Tensor> allgather_list(
     torch::TensorList input_list, torch::optional<torch::List<int64_t>> sizes, torch::List<int64_t> group_)
 {
+#if ENABLE_MULTI_DEVICE
     std::set<int> group;
     for (int64_t rank : group_)
     {
@@ -137,6 +147,9 @@ std::vector<torch::Tensor> allgather_list(
     op.initialize();
     auto output_list = op.run_list(input_list, sizes);
     return output_list;
+#else
+    return input_list.vec();
+#endif // ENABLE_MULTI_DEVICE
 }
 
 } // namespace torch_ext

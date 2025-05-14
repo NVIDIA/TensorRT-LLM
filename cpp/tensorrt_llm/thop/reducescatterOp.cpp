@@ -21,8 +21,10 @@
 
 #include <NvInferRuntime.h>
 #include <c10/cuda/CUDAStream.h>
-#include <nccl.h>
 #include <torch/extension.h>
+#if ENABLE_MULTI_DEVICE
+#include <nccl.h>
+#endif // ENABLE_MULTI_DEVICE
 
 #include <cassert>
 #include <set>
@@ -30,6 +32,7 @@
 
 namespace torch_ext
 {
+#if ENABLE_MULTI_DEVICE
 
 namespace
 {
@@ -122,9 +125,12 @@ private:
 
 } // namespace
 
+#endif // ENABLE_MULTI_DEVICE
+
 extern torch::Tensor reducescatter(
     torch::Tensor input, torch::optional<torch::List<int64_t>> sizes, torch::List<int64_t> group_)
 {
+#if ENABLE_MULTI_DEVICE
     std::set<int> group;
     for (int64_t rank : group_)
     {
@@ -134,11 +140,15 @@ extern torch::Tensor reducescatter(
     op.initialize();
     auto output = op.run(input, sizes);
     return output;
+#else
+    return input;
+#endif // ENABLE_MULTI_DEVICE
 }
 
 extern std::vector<torch::Tensor> reducescatter_list(
     torch::TensorList input_list, torch::optional<torch::List<int64_t>> sizes, torch::List<int64_t> group_)
 {
+#if ENABLE_MULTI_DEVICE
     std::set<int> group;
     for (int64_t rank : group_)
     {
@@ -148,6 +158,9 @@ extern std::vector<torch::Tensor> reducescatter_list(
     op.initialize();
     auto output_list = op.run_list(input_list, sizes);
     return output_list;
+#else
+    return input_list.vec();
+#endif // ENABLE_MULTI_DEVICE
 }
 
 } // namespace torch_ext
