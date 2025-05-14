@@ -458,7 +458,6 @@ public:
         // ...
         // Softmax ends
         // Make sure barrier is not moving around
-        asm volatile(".pragma \"next knob FenceCode\";\n" : : : "memory");
         if (_id == 0)
         {
             named_barrier_wait(_barrier_id, 256);
@@ -468,7 +467,6 @@ public:
     inline __device__ void named_bar_wait()
     {
         // Make sure barrier is not moving around
-        asm volatile(".pragma \"next knob FenceCode\";\n" : : : "memory");
         if (_id == 1)
         {
             named_barrier_wait(_barrier_id, 256);
