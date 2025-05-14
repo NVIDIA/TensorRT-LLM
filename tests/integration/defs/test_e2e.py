@@ -25,13 +25,13 @@ import pytest
 import yaml
 from defs.common import convert_weights
 from defs.trt_test_alternative import (check_call, check_call_negative_test,
-                                       check_output, exists, makedirs)
+                                       check_output)
 
 from .common import (PluginOptions, convert_weights, prune_checkpoint,
                      quantize_data, refit_model, venv_check_call)
 from .conftest import (llm_models_root, skip_nvlink_inactive,
-                       skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
-                       skip_pre_hopper, tests_path, unittest_path)
+                       skip_post_blackwell, skip_pre_blackwell, skip_pre_hopper,
+                       tests_path, unittest_path)
 
 sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
 
@@ -740,79 +740,6 @@ def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
             shutil.rmtree(iteration_log, ignore_errors=True)
         if engine_dir:
             shutil.rmtree(engine_dir, ignore_errors=True)
-
-
-@pytest.mark.parametrize("model_name", [
-    "gpt_350m", "gpt_350m_sq_per_tensor", "llama_70b", "bert_base",
-    "falcon_40b", "t5_base", "roberta_base"
-],
-                         ids=lambda x: x.strip("-"))
-def test_benchmark_sanity(llm_root, llm_venv, model_name, engine_dir):
-    '''
-    sanity check on the benchmark script to make sure it works
-    - gpt_350m for gpt baseline.
-    - gpt_350m_sq_per_tensor for testing SQ
-    - llama_70b for GQA (num_kv_heads < num_heads) in gpt benchmark script.
-    - bert_base for bert baseline.
-    - t5_base for t5 baseline.
-    '''
-    build_script_root = os.path.join(llm_root, "tests/integration/defs/perf")
-    benchmark_root = os.path.join(llm_root, "benchmarks", "python")
-    engine_dir = os.path.join(engine_dir, model_name, "benchmark-sanity")
-    if not exists(engine_dir):
-        makedirs(engine_dir)
-
-    # max batch size 256 (default) is OOM on A30, changing to a smaller one to just test sanity
-    build_args = f"-m {model_name} --force_num_layer_1 --max_input_len 512 --max_batch_size 8"
-    # test OOTB path in one of the model
-    if model_name == "gpt_350m":
-        build_args += " --mode ootb"
-    build_cmd = f'{build_script_root}/build.py --output_dir {engine_dir} {build_args}'.split(
-        " ")
-
-    benchmark_args = f"--batch_size 1;2 --duration 0 --num_runs 1"
-    if 'bert' in model_name:
-        benchmark_args += " --input_len 20;60"
-        benchmark_args += " --m enc"
-    else:
-        benchmark_args += " --input_output_len 20,60;60,20"
-        if 't5' in model_name or 'roberta' in model_name:
-            benchmark_args += " --m enc-dec"
-    load_cmd = f'{benchmark_root}/benchmark.py --engine_dir {engine_dir} {benchmark_args}'.split(
-        " ")
-
-    venv_check_call(llm_venv, build_cmd)
-    venv_check_call(llm_venv, load_cmd)
-
-
-@skip_pre_ada
-@pytest.mark.parametrize("model_name",
-                         ["llama_7b", "gptj_6b", "gpt_350m", "falcon_40b"],
-                         ids=lambda x: x.strip("-"))
-def test_benchmark_sanity_enable_fp8(llm_root, llm_venv, model_name,
-                                     engine_dir):
-    '''
-    sanity check on the benchmark script to make sure it works
-    '''
-    build_script_root = os.path.join(llm_root, "tests/integration/defs/perf")
-    benchmark_root = os.path.join(llm_root, "benchmarks", "python")
-    engine_dir = os.path.join(engine_dir, model_name, "benchmark-sanity")
-    if not exists(engine_dir):
-        makedirs(engine_dir)
-    build_args = f"-m {model_name} --force_num_layer_1 --quantization fp8"
-    build_cmd = f'{build_script_root}/build.py --output_dir {engine_dir} {build_args}'.split(
-        " ")
-
-    benchmark_args = f"--batch_size 1;2 --duration 0 --num_runs 1 --quantization fp8"
-    if 'bert' in model_name:
-        benchmark_args += " --input_len 20;60"
-        benchmark_args += " --m enc"
-    else:
-        benchmark_args += " --input_output_len 20,60;60,20"
-    load_cmd = f'{benchmark_root}/benchmark.py --engine_dir {engine_dir} {benchmark_args}'.split(
-        " ")
-    venv_check_call(llm_venv, build_cmd)
-    venv_check_call(llm_venv, load_cmd)
 
 
 def test_chatglm_6b_sanity(chatglm_6b_example_root, llm_venv, cmodel_dir,

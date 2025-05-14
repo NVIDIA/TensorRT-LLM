@@ -481,11 +481,9 @@ class PerfTestConfig:
         labels = test_param_labels.split("-")
 
         self.model_name = labels.pop(0)
-        self.runtime = "python" if labels[0] not in [
-            "cpp",
-            "cppmanager",
-            "bench",
-        ] else labels.pop(0)
+        assert labels[0] in ["cpp", "cppmanager", "bench"], \
+            f"Invalid runtime {labels[0]}!"
+        self.runtime = labels.pop(0)
         self.api = labels.pop(0) if labels[0] == "exe" else ""
         self.backend = labels.pop(0) if labels[0] == "pytorch" else ""
         self.streaming = labels.pop(0) if labels[0] == "streaming" else ""
@@ -592,7 +590,7 @@ class PerfTestConfig:
             assert self.model_name in allowed_models, f"model_name {self.model_name} is not in allowed_models!"
 
         # Validate runtime type.
-        VALID_RUNTIMES = ["cpp", "cppmanager", "python", "bench"]
+        VALID_RUNTIMES = ["cpp", "cppmanager", "bench"]
         assert self.runtime in VALID_RUNTIMES, f"Invalid runtime {self.runtime}!"
 
         # Validate plugin mode.
@@ -775,8 +773,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         elif self._config.runtime == "bench":
             benchmark_script = "trtllm-bench"
         else:
-            benchmark_script = os.path.join(llm_root, "benchmarks", "python",
-                                            "benchmark.py")
+            raise RuntimeError(f"Invalid runtime {self._config.runtime}.")
         allowed_configs = import_allowed_perf_config()
         allowed_models = allowed_configs.get_allowed_models()
         if self._config.runtime == "bench":
