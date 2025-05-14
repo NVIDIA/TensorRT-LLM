@@ -23,4 +23,3 @@ set_property(TARGET trtllm_gen_fp8_block_scale_moe
              PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET trtllm_gen_fp8_block_scale_moe
              PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-

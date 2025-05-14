@@ -16,9 +16,9 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "DevKernel.h"
 #include "RoutingKernel.h"
+#include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 #include <string>
@@ -63,8 +63,7 @@ inline int32_t getMaxNumCtasInBatchDim(int32_t numTokens, int32_t topK, int32_t 
     return maxNumCtasInBatchDim;
 }
 
-inline int32_t getMaxNumCtas(
-    int32_t numTokens, int32_t numExperts, int32_t padding)
+inline int32_t getMaxNumCtas(int32_t numTokens, int32_t numExperts, int32_t padding)
 {
     return (numTokens + padding - 1) / padding * numExperts;
 }
@@ -78,9 +77,9 @@ public:
         int32_t nGroups, int32_t topkGroups, int32_t localExpertOffset, int32_t localNumExperts,
         float routedScalingFactor, int32_t* routingExpertIndexes, int32_t* expertCountHistogram,
         int32_t* permutedIdxSize, int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx,
-        int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* numTokensPerExpert,
-        int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas,
-        trtllm::gen::Dtype dtypeElt, bool useRoutingScalesOnInput, bool useDeepSeekFp8, cudaStream_t stream);
+        int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx,
+        int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas, trtllm::gen::Dtype dtypeElt,
+        bool useRoutingScalesOnInput, bool useDeepSeekFp8, cudaStream_t stream);
 };
 } // namespace Routing
 
@@ -91,14 +90,15 @@ class Runner
 public:
     explicit Runner(trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8);
 
-    size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens);
+    size_t getWorkspaceSizeInBytes(
+        int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens);
 
     void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale, void* expertWeights,
         float* outputScalesScalar, float* outputScalesGateScalar, void* output, void* outputScale, int32_t topK,
         int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens,
         int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
-        int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
-        int device, cudaStream_t stream);
+        int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace,
+        bool useRoutingScalesOnInput, int device, cudaStream_t stream);
 
 private:
     int32_t mTileTokensDim{8};
@@ -114,13 +114,14 @@ class Runner
 public:
     explicit Runner(trtllm::gen::Dtype dtypeElt, trtllm::gen::Dtype outputDtype, bool useDeepSeekFp8);
 
-    size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens);
+    size_t getWorkspaceSizeInBytes(
+        int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens);
 
     void run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight, void* weightScale,
         float* outputScalesScalar, void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
         int32_t intermediateSize, int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
-        int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace,
-        int device, cudaStream_t stream);
+        int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit,
+        void* bmm2Workspace, int device, cudaStream_t stream);
 
 private:
     int32_t mTileTokensDim{8};

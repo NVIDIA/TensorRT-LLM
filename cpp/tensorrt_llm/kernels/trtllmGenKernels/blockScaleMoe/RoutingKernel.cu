@@ -1232,19 +1232,21 @@ void run(Data const& data, void* stream)
     TLLM_CHECK_WITH_INFO(!data.mUseRoutingSoftmax, "Routing with softmax not implemented yet");
     TLLM_CHECK_WITH_INFO(
         data.mNumLimitedGroups == NumTopGroups, "Routing kernel expects %d groups (for now)", NumTopGroups);
-    TLLM_CHECK_WITH_INFO(data.mTopK == NumTopExperts, "Routing kernel expects %d topK experts (for now)", NumTopExperts);
+    TLLM_CHECK_WITH_INFO(
+        data.mTopK == NumTopExperts, "Routing kernel expects %d topK experts (for now)", NumTopExperts);
     TLLM_CHECK_WITH_INFO(data.mTopK <= WarpSize, "Routing kernel expects top K <= warp size, got %d", data.mTopK);
     TLLM_CHECK_WITH_INFO(data.mTopK * data.mNumLimitedGroups <= WarpSize,
         "Routing kernel expects top K * top groups <= warp size (for now), got %d * %d", data.mTopK,
         data.mNumLimitedGroups);
-    TLLM_CHECK_WITH_INFO(data.mNumExperts >= NumTopExperts, "Routing kernel expects %d to be at most #experts %d", NumTopExperts,
-        data.mNumExperts);
-    TLLM_CHECK_WITH_INFO(data.mNumExperts <= NumThreads, "Routing kernel expects #experts %d <= #threads %d", data.mNumExperts,
-        NumThreads);
+    TLLM_CHECK_WITH_INFO(data.mNumExperts >= NumTopExperts, "Routing kernel expects %d to be at most #experts %d",
+        NumTopExperts, data.mNumExperts);
+    TLLM_CHECK_WITH_INFO(data.mNumExperts <= NumThreads, "Routing kernel expects #experts %d <= #threads %d",
+        data.mNumExperts, NumThreads);
     TLLM_CHECK_WITH_INFO(data.mNumExpertGroups <= NumWarps, "Routing kernel expects #experts groups %d <= #warps %d",
         data.mNumExpertGroups, NumWarps);
-    TLLM_CHECK_WITH_INFO(data.mNumExperts % data.mNumExpertGroups == 0, "Routing kernel expects #experts %d to be a multiple of #expert groups %d",
-        data.mNumExperts, data.mNumExpertGroups);
+    TLLM_CHECK_WITH_INFO(data.mNumExperts % data.mNumExpertGroups == 0,
+        "Routing kernel expects #experts %d to be a multiple of #expert groups %d", data.mNumExperts,
+        data.mNumExpertGroups);
     TLLM_CHECK_WITH_INFO(data.mNumExperts / data.mNumExpertGroups <= WarpSize,
         "Routing kernel expects #experts per group <= warp size, got %d", data.mNumExperts / data.mNumExpertGroups);
     TLLM_CHECK_WITH_INFO(
@@ -2538,8 +2540,10 @@ void run(Data const& data, void* stream)
     TLLM_CHECK_WITH_INFO(data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr
             && data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr,
         "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers");
-    TLLM_CHECK_WITH_INFO(data.mTopK == NumTopExperts, "Routing kernel expects %d topK experts (for now)", NumTopExperts);
-    TLLM_CHECK_WITH_INFO(data.mNumExperts <= MaxNumExperts, "Routing kernel expects #experts %d to be at most max #experts %d", data.mNumExperts, MaxNumExperts);
+    TLLM_CHECK_WITH_INFO(
+        data.mTopK == NumTopExperts, "Routing kernel expects %d topK experts (for now)", NumTopExperts);
+    TLLM_CHECK_WITH_INFO(data.mNumExperts <= MaxNumExperts,
+        "Routing kernel expects #experts %d to be at most max #experts %d", data.mNumExperts, MaxNumExperts);
     static_assert(MaxNumExperts <= NumThreads, "#experts must be bounded by #threads");
     static_assert(MaxNumExperts <= NumThreadsHist, "#experts must be bounded by #threads");
     TLLM_CHECK_WITH_INFO(
@@ -2563,7 +2567,8 @@ void run(Data const& data, void* stream)
         = data.mNumTokens <= (data.mPtrScores != nullptr ? MaxNumTokensSingleClusterScores : MaxNumTokensSingleCluster);
     if (!useSingleCluster)
     {
-        TLLM_CHECK_WITH_INFO(data.mPtrExpertIdx != nullptr, "When #tokens is large, `mPtrExpertIdx` is a required input.");
+        TLLM_CHECK_WITH_INFO(
+            data.mPtrExpertIdx != nullptr, "When #tokens is large, `mPtrExpertIdx` is a required input.");
         TLLM_CHECK_WITH_INFO(
             data.mPtrExpertCounts != nullptr, "When #tokens is large, `mPtrExpertCounts` is a required input.");
         // Reset the global histograms (not used in single-cluster code path).

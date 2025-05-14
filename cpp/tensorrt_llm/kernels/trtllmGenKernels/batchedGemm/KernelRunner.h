@@ -45,27 +45,25 @@ class TrtllmGenBatchedGemmRunner
 public:
     explicit TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunnerOptions const& options);
 
-    [[nodiscard]] size_t getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim);
+    [[nodiscard]] size_t getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k,
+        std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim);
 
-    void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, 
-        int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim, void const* a, void const* sfA,
-        void const* b, void const* sfB, void const* perTokensSfA, void const* perTokensSfB, float const* scaleC, float const* scaleGateC, void* c, void* outSfC, 
-        int32_t const* routeMap, int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx, 
-        int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace, CUstream stream,
-        int device);
-    
-    void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, 
-        void const* a, void const* sfA,
-        void const* b, void const* sfB, 
-        void* c, void* outSfC, 
+    void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,
+        int32_t numBatches, int32_t maxNumCtasInBatchDim, void const* a, void const* sfA, void const* b,
+        void const* sfB, void const* perTokensSfA, void const* perTokensSfB, float const* scaleC,
+        float const* scaleGateC, void* c, void* outSfC, int32_t const* routeMap, int32_t const* totalNumPaddedTokens,
+        int32_t const* ctaIdxXyToBatchIdx, int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
         void* workspace, CUstream stream, int device);
 
-    void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, 
-        void const* a, void const* b, float const* scaleC, float const* scaleGateC, void* c,
-        void* workspace, CUstream stream, int device);
+    void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a, void const* sfA,
+        void const* b, void const* sfB, void* c, void* outSfC, void* workspace, CUstream stream, int device);
+
+    void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a, void const* b,
+        float const* scaleC, float const* scaleGateC, void* c, void* workspace, CUstream stream, int device);
 
 private:
-    void selectGemmConfig(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim);
+    void selectGemmConfig(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,
+        int32_t numBatches, int32_t maxNumCtasInBatchDim);
 
 private:
     TrtllmGenBatchedGemmRunnerOptions mOptions;
@@ -74,4 +72,3 @@ private:
 };
 } // namespace kernels
 } // namespace tensorrt_llm
-

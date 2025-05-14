@@ -17,9 +17,9 @@
 #pragma once
 
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
-#include <tensorrt_llm/common/cudaUtils.h>
 #include <cuda.h>
 #include <cuda_runtime_api.h>
+#include <tensorrt_llm/common/cudaUtils.h>
 
 namespace moe::dev
 {

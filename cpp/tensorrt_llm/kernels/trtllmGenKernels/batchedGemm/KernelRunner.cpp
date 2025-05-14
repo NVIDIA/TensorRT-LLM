@@ -40,16 +40,14 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
         auto const options = configs[i].mOptions;
         auto const tileSize = mOptions.transposeMmaOutput ? options.mTileN : options.mTileM;
         // When we include low-latency kernels we can set transposeMmaOutput via constructor
-        if (options.mDtypeElt == mOptions.eltType
-            && options.mDtypeC == mOptions.outputType
+        if (options.mDtypeElt == mOptions.eltType && options.mDtypeC == mOptions.outputType
             && options.mUseDeepSeekFp8 == mOptions.deepSeekFp8
-            && options.mTransposeMmaOutput == mOptions.transposeMmaOutput
-            && options.mRouteAct == mOptions.routeAct
-            && options.mFusedAct == mOptions.fusedAct
-            && options.mIsStaticBatch == mOptions.staticBatch
+            && options.mTransposeMmaOutput == mOptions.transposeMmaOutput && options.mRouteAct == mOptions.routeAct
+            && options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch
             && tileSize == mOptions.tileSize)
         {
-            if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
+            if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM)
+            {
                 mPassingConfigIndices.push_back(i);
             }
         }
@@ -58,7 +56,8 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
     TLLM_CHECK_WITH_INFO(mPassingConfigIndices.size() != 0, "No kernel found for the given output type");
 }
 
-size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim)
+size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k,
+    std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim)
 {
     batchedGemm::BatchedGemmData gemmData;
     gemmData.mProblemDimensions.mNumBatches = numBatches;
@@ -74,7 +73,7 @@ size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n,
     gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
 
     selectGemmConfig(m, n, k, batchedTokens, numTokens, numBatches, maxNumCtasInBatchDim);
-    
+
     auto bmm = batchedGemm::BatchedGemmInterface();
     auto const configs = bmm.getBatchedGemmConfigs();
     TLLM_CHECK_WITH_INFO(
@@ -83,12 +82,12 @@ size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n,
     return bmm.getWorkspaceSizeInBytes(config, gemmData);
 }
 
-void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, 
-    int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim, void const* a, void const* sfA,
-    void const* b, void const* sfB, void const* perTokensSfA, void const* perTokensSfB, float const* scaleC, float const* scaleGateC, void* c, void* outSfC, 
-    int32_t const* routeMap, int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx, 
-    int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace, CUstream stream,
-    int device)
+void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
+    int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim, void const* a, void const* sfA, void const* b,
+    void const* sfB, void const* perTokensSfA, void const* perTokensSfB, float const* scaleC, float const* scaleGateC,
+    void* c, void* outSfC, int32_t const* routeMap, int32_t const* totalNumPaddedTokens,
+    int32_t const* ctaIdxXyToBatchIdx, int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
+    void* workspace, CUstream stream, int device)
 {
     auto bmm = batchedGemm::BatchedGemmInterface();
 
@@ -100,22 +99,26 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     auto const& config = configs[mSelectedConfigIndex.value()];
 
     TLLM_CHECK_WITH_INFO(numBatches > 0, "Batched GEMM requires numBatches > 0");
-    if (!mOptions.staticBatch) {
+    if (!mOptions.staticBatch)
+    {
         TLLM_CHECK_WITH_INFO(totalNumPaddedTokens, "Batched GEMM with dynamic batching requires totalNumPaddedTokens");
         TLLM_CHECK_WITH_INFO(ctaIdxXyToBatchIdx, "Batched GEMM with dynamic batching requires ctaIdxXyToBatchIdx");
         TLLM_CHECK_WITH_INFO(ctaIdxXyToMnLimit, "Batched GEMM with dynamic batching requires ctaIdxXyToMnLimit");
         TLLM_CHECK_WITH_INFO(numNonExitingCtas, "Batched GEMM with dynamic batching requires numNonExitingCtas");
     }
 
-    if (!mOptions.staticBatch && numTokens != 0) {
-        TLLM_CHECK_WITH_INFO(maxNumCtasInBatchDim > 0, "Batched GEMM with dynamic batching requires maxNumCtasInBatchDim > 0");
+    if (!mOptions.staticBatch && numTokens != 0)
+    {
+        TLLM_CHECK_WITH_INFO(
+            maxNumCtasInBatchDim > 0, "Batched GEMM with dynamic batching requires maxNumCtasInBatchDim > 0");
     }
 
-    if (mOptions.routeAct) {
+    if (mOptions.routeAct)
+    {
         TLLM_CHECK_WITH_INFO(routeMap, "Batched GEMM with routeAct requires routeMap");
         TLLM_CHECK_WITH_INFO(numTokens > 0, "Batched GEMM with routeAct requires numTokens > 0");
     }
-    
+
     // Dims
     gemmData.mProblemDimensions.mNumBatches = numBatches;
     gemmData.mProblemDimensions.mNumTokens = numTokens;
@@ -163,34 +166,34 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     TLLM_CHECK_WITH_INFO(err == 0, "Error occurred when running GEMM!");
 }
 
-void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, 
-    void const* a, void const* sfA,
-    void const* b, void const* sfB, void* c, void* outSfC, 
-    void* workspace, CUstream stream, int device)
+void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
+    void const* a, void const* sfA, void const* b, void const* sfB, void* c, void* outSfC, void* workspace,
+    CUstream stream, int device)
 {
     // Dispatch with block scaling factors and with static batching.
-    run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0, 
-        a, sfA, b, sfB, /* perTokensSfA */ nullptr, /* perTokensSfB */ nullptr,
-        /* scaleC */ nullptr, /* scaleGateC */ nullptr, c, outSfC, 
-        /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr, 
-        /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr, 
+    run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0, a, sfA, b, sfB,
+        /* perTokensSfA */ nullptr, /* perTokensSfB */ nullptr,
+        /* scaleC */ nullptr, /* scaleGateC */ nullptr, c, outSfC,
+        /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr,
+        /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr,
         /* numNonExitingCtas */ nullptr, workspace, stream, device);
 }
 
-void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, 
-    void const* a, void const* b, float const* scaleC, float const* scaleGateC, void* c,
-    void* workspace, CUstream stream, int device)
+void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
+    void const* a, void const* b, float const* scaleC, float const* scaleGateC, void* c, void* workspace,
+    CUstream stream, int device)
 {
     // Dispatch with block scaling factors and with static batching.
-    run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0, 
-        a, /* sfA */ nullptr, b, /* sfB */ nullptr, /* perTokensSfA */ nullptr, /* perTokensSfB */ nullptr,
-        scaleC, scaleGateC, c, /* outSfC */ nullptr, 
-        /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr, 
-        /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr, 
+    run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0, a,
+        /* sfA */ nullptr, b, /* sfB */ nullptr, /* perTokensSfA */ nullptr, /* perTokensSfB */ nullptr, scaleC,
+        scaleGateC, c, /* outSfC */ nullptr,
+        /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr,
+        /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr,
         /* numNonExitingCtas */ nullptr, workspace, stream, device);
 }
 
-void TrtllmGenBatchedGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim)
+void TrtllmGenBatchedGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k,
+    std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim)
 {
     auto const bmm = batchedGemm::BatchedGemmInterface();
     auto const configs = bmm.getBatchedGemmConfigs();
@@ -225,4 +228,3 @@ void TrtllmGenBatchedGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t 
 
 } // namespace kernels
 } // namespace tensorrt_llm
-
