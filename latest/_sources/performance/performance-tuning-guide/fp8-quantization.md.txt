@@ -52,7 +52,7 @@ if __name__ == '__main__':
     main()
 ```
 
-For an example of how to build an fp8 engine using the [TensorRT-LLM CLI workflow](./benchmarking-default-performance.md#building-and-saving-engines-via-cli) flow see [TensorRT-LLM LLaMA examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama). In short you first run [`examples/quantization/quantize.py`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/quantization) to quantize and convert the model checkpoint to TensorRT-LLM format and then use `trtllm-build`.
+For an example of how to build an fp8 engine using the [TensorRT-LLM CLI workflow](./benchmarking-default-performance.md#building-and-saving-engines-via-cli) flow see [TensorRT-LLM LLaMA examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama). In short you first run [`examples/quantization/quantize.py`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/quantization) to quantize and convert the model checkpoint to TensorRT-LLM format and then use `trtllm-build`.
 
 > ***Note: While quantization aims to preserve model accuracy this is not guaranteed and it is extremely important you check that the quality of outputs remains sufficient after quantization.***
 
