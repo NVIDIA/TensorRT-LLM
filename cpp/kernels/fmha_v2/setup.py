@@ -3047,6 +3047,9 @@ def get_cubin_header(kernel_traits, specs_names):
     cubins_dict = {}
     cubin_lens_dict = {}
     for kspec, fname, lname, kname in specs_names:
+        # only generate hopper sage cubin header
+        if generate_cu_trtllm and not ('sage' in kname and 'sm90' in kname):
+            continue
         name = fname.replace('.', '_')
         data = 'extern unsigned char cubin_{name}_cubin[];'.format(name=name)
         size = 'extern uint32_t cubin_{name}_cubin_len;'.format(name=name)
@@ -3266,7 +3269,8 @@ def get_cubin_header(kernel_traits, specs_names):
         macro_begin = f"#ifndef EXCLUDE_SM_{sm}"
         macro_end = f"#endif\n"
         cubins.extend([macro_begin] + cubins_dict[sm] + [macro_end])
-        cubin_lens.extend([macro_begin] + cubin_lens_dict[sm] + [macro_end])
+        if sm in cubin_lens_dict:
+            cubin_lens.extend([macro_begin] + cubin_lens_dict[sm] + [macro_end])
 
     unroll_config_v1 = ',\n'.join(unroll_config_v1)
     unroll_config_v2 = ',\n'.join(unroll_config_v2)

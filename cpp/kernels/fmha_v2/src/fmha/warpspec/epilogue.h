@@ -311,28 +311,6 @@ struct Softmax_base
     inline __device__ void compute_and_update_scale(
         float (&global_max)[Mma_tile_p::CORES_M], float (&global_sum)[Mma_tile_p::CORES_M])
     {
-
-        // Internal knob to WAR exposed 17 clk MUFU latency for Hopper and possibly all prev archs
-        //
-        // For instance, in a typical softmax loop there are MUFU.EX2 (expf) and FADD (sum) interleaved
-        // together as follows. The /*0000*/ MUFU writes to SB3 and is waited by /*0030*/ FADD 8 cycles
-        // later.
-        //
-        // We cannot achieve softmax SOL as no MUFU is scheduled in the 17 - 8 = 9 clk bubble.
-        //
-        // MUFU is a decoupled instruction with IPC of 16 and a latency of 17 on Hopper. Reducing
-        // the schedule interval from 8 to 1 compensate for exposed SB latency by greedily issuing
-        // MUFUs to avoid draining the instruction queue. Downside is the risk of MIO throttle when
-        // queue is full.
-        //
-        // /*0000*/  MUFU.EX2 R61, R61          &wr=0x3   ?WAIT1;
-        // /*0010*/  FADD.FTZ R111, R108, R59   &req={2}  ?WAIT7_END_GROUP;
-        // /*0020*/  MUFU.EX2 R64, R64          &wr=0x2   ?WAIT1;
-        // /*0030*/  FADD.FTZ R109, R110, R61   &req={3}  ?WAIT7_END_GROUP;
-#if defined(JETFIRE_ENABLED)
-        asm volatile(".pragma \"set knob SchedResBusyXU64=1\";\n" : : : "memory");
-#endif // JETFIRE_ENABLED
-
         float const scale = reinterpret_cast<float const&>(scale_bmm1_);
 
 // Row-wise max of current tile.
@@ -865,28 +843,6 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
     inline __device__ void compute_and_update_scale(
         float (&global_max)[Mma_tile_p::CORES_M], float (&global_sum)[Mma_tile_p::CORES_M])
     {
-
-        // Internal knob to WAR exposed 17 clk MUFU latency for Hopper and possibly all prev archs
-        //
-        // For instance, in a typical softmax loop there are MUFU.EX2 (expf) and FADD (sum) interleaved
-        // together as follows. The /*0000*/ MUFU writes to SB3 and is waited by /*0030*/ FADD 8 cycles
-        // later.
-        //
-        // We cannot achieve softmax SOL as no MUFU is scheduled in the 17 - 8 = 9 clk bubble.
-        //
-        // MUFU is a decoupled instruction with IPC of 16 and a latency of 17 on Hopper. Reducing
-        // the schedule interval from 8 to 1 compensate for exposed SB latency by greedily issuing
-        // MUFUs to avoid draining the instruction queue. Downside is the risk of MIO throttle when
-        // queue is full.
-        //
-        // /*0000*/  MUFU.EX2 R61, R61          &wr=0x3   ?WAIT1;
-        // /*0010*/  FADD.FTZ R111, R108, R59   &req={2}  ?WAIT7_END_GROUP;
-        // /*0020*/  MUFU.EX2 R64, R64          &wr=0x2   ?WAIT1;
-        // /*0030*/  FADD.FTZ R109, R110, R61   &req={3}  ?WAIT7_END_GROUP;
-#if defined(JETFIRE_ENABLED)
-        asm volatile(".pragma \"set knob SchedResBusyXU64=1\";\n" : : : "memory");
-#endif // JETFIRE_ENABLED
-
         float const scale = reinterpret_cast<float const&>(this->scale_bmm1_);
         float(&local_max_)[Mma_tile_p::CORES_M] = this->local_max_;
         float(&local_sum_)[Mma_tile_p::CORES_M] = this->local_sum_;

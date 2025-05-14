@@ -58,12 +58,6 @@
 #define FMHA_PTX_MBARRIER_TRYWAIT_NOSLEEP_INTERNAL_SUPPORT_ENABLED 0
 #endif
 
-#if defined(JETFIRE_ENABLED)
-#define DisableWar_SW254906_MACRO asm volatile(" .pragma \"global knob DisableWar_SW2549067\";\n");
-#else
-#define DisableWar_SW254906_MACRO
-#endif
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace fmha
@@ -208,10 +202,6 @@ public:
 
     inline __device__ void bar_wait(int id, unsigned int bar_phase)
     {
-#ifdef JETFIRE_ENABLED
-        asm volatile(".pragma \"set knob DontInsertYield\";\n" : : : "memory");
-#endif
-
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
         uint64_t* bar_ptr = reinterpret_cast<uint64_t*>(bar_base_ + id);
         unsigned smem_ptr = __nvvm_get_smem_pointer(bar_ptr);
@@ -259,10 +249,6 @@ public:
             "}"
             :
             : "r"(smem_ptr), "r"(bar_phase));
-#endif
-
-#ifdef JETFIRE_ENABLED
-        asm volatile(".pragma \"reset knob DontInsertYield\";\n" : : : "memory");
 #endif
     }
 
