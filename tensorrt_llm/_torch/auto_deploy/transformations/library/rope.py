@@ -169,7 +169,7 @@ def _get_default_unsqueeze_dim(op):
 
 def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphModule:
     """
-    Match and transform input and output of rope ops to the layout specified.
+    Match and transform input and output of rope ops to the layout specified to meet requirements of optimized ops.
     Supported layout is 'bsnd' (batch, seq, head, dim).
     """
     supported = {"bsnd", "bnsd"}
@@ -256,18 +256,20 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
         node.args = new_args
 
         with graph.inserting_after(q_rope_old):
-            new_q = graph.call_function(torch.ops.aten.transpose, args=(q_rope_old, 1, 2))
+            q_rope_new = graph.call_function(torch.ops.aten.transpose, args=(q_rope_old, 1, 2))
         with graph.inserting_after(k_rope_old):
-            new_k = graph.call_function(torch.ops.aten.transpose, args=(k_rope_old, 1, 2))
+            k_rope_new = graph.call_function(torch.ops.aten.transpose, args=(k_rope_old, 1, 2))
 
         # Preserve fake tensor in meta["val"] for the transposed inputs
-        new_q.meta["val"] = q_rope_old.meta["val"].transpose(1, 2)
-        new_k.meta["val"] = k_rope_old.meta["val"].transpose(1, 2)
+        q_rope_new.meta["val"] = q_rope_old.meta["val"]
+        q_rope_old.meta["val"] = q_rope_old.meta["val"].transpose(1, 2)
+        k_rope_new.meta["val"] = k_rope_old.meta["val"]
+        k_rope_old.meta["val"] = k_rope_old.meta["val"].transpose(1, 2)
 
-        q_rope_old.replace_all_uses_with(new_q)
-        k_rope_old.replace_all_uses_with(new_k)
-        new_q.args = (q_rope_old, 1, 2)
-        new_k.args = (k_rope_old, 1, 2)
+        q_rope_old.replace_all_uses_with(q_rope_new)
+        k_rope_old.replace_all_uses_with(k_rope_new)
+        q_rope_new.args = (q_rope_old, 1, 2)
+        k_rope_new.args = (k_rope_old, 1, 2)
 
     if need_transpose:
         gm = canonicalize_graph(gm)
@@ -368,14 +370,14 @@ def _optimize_explicit(
         )
 
     with graph.inserting_after(flash_node):
-        new_q = graph.call_function(operator.getitem, args=(flash_node, 0))
-        new_k = graph.call_function(operator.getitem, args=(flash_node, 1))
+        q_rope_new = graph.call_function(operator.getitem, args=(flash_node, 0))
+        k_rope_new = graph.call_function(operator.getitem, args=(flash_node, 1))
 
-    new_q.meta["val"] = q_rope_old.meta.get("val", None)
-    new_k.meta["val"] = k_rope_old.meta.get("val", None)
+    q_rope_new.meta["val"] = q_rope_old.meta.get("val", None)
+    k_rope_new.meta["val"] = k_rope_old.meta.get("val", None)
 
-    q_rope_old.replace_all_uses_with(new_q)
-    k_rope_old.replace_all_uses_with(new_k)
+    q_rope_old.replace_all_uses_with(q_rope_new)
+    k_rope_old.replace_all_uses_with(k_rope_new)
 
     graph.erase_node(q_rope_old)
     graph.erase_node(k_rope_old)
