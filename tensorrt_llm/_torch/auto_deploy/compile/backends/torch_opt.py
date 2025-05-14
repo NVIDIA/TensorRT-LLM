@@ -18,13 +18,14 @@ class CompiledGraph(nn.Module):
         self,
         model: GraphModule,
         max_batch_size: int,
+        enable_torch_compile: bool = True,
         cuda_graph_batch_sizes: List[int] = None,
         num_batched_inputs: Optional[int] = 1,  # number of batched, dynamic inputs...
     ):
         super().__init__()
         self._in_spec: TreeSpec = model._in_spec
         self._out_spec: TreeSpec = model._out_spec
-        self.gm_compiled = torch.compile(model, dynamic=True)
+        self.gm_compiled = torch.compile(model, dynamic=True) if enable_torch_compile else model
         self.max_batch_size = max_batch_size
         self.num_batched_inputs = num_batched_inputs if num_batched_inputs is not None else 1
         self.graphs: Dict[Tuple[int, ...], CUDAGraph] = {}
@@ -170,13 +171,27 @@ class CompiledGraph(nn.Module):
         return self._out_spec.unflatten(out_flat)
 
 
-@BackendRegistry.register("torch-opt")
-class TorchOptCompiler(BackendCompiler):
+class BaseCudaGraphCompiler(BackendCompiler):
+    """Base class for compilers that use CUDA graphs."""
+
+    enable_torch_compile: bool = False
+
+    def __init__(
+        self,
+        gm: GraphModule,
+        args: Tuple[Any, ...],
+        kwargs: Optional[Dict[str, Any]] = None,
+        dynamic_shapes=None,
+        compiler_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(gm, args, kwargs, dynamic_shapes, compiler_kwargs)
+
     @torch.inference_mode()
     def compile(self) -> CompiledGraph:
         compiled_gm = CompiledGraph(
             self.gm,
             max_batch_size=self.max_batch_size,
+            enable_torch_compile=self.enable_torch_compile,
             cuda_graph_batch_sizes=self.compiler_kwargs.get("cuda_graph_batch_sizes"),
             num_batched_inputs=self.compiler_kwargs.get("num_batched_inputs"),
         )
@@ -186,3 +201,17 @@ class TorchOptCompiler(BackendCompiler):
             compiled_gm.capture_graph(*self.args, **self.kwargs)
 
         return compiled_gm
+
+
+@BackendRegistry.register("torch-opt")
+class TorchOptCompiler(BaseCudaGraphCompiler):
+    """Compiler that uses both torch.compile and CUDA graphs."""
+
+    enable_torch_compile = True
+
+
+@BackendRegistry.register("torch-cudagraph")
+class TorchCudagraphCompiler(BaseCudaGraphCompiler):
+    """Compiler that uses only CUDA graphs."""
+
+    enable_torch_compile = False

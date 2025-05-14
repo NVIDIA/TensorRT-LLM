@@ -49,10 +49,13 @@ class InferenceOptimizer:
         self.mla_backend = ad_config.mla_backend
 
         self.ad_config = ad_config
-        if ad_config.torch_compile_enabled:
-            compile_backend = "torch-compile"
-        elif ad_config.use_cuda_graph:
+        # Map Pytorch config to AutoDeploy compile backends.
+        if ad_config.use_cuda_graph and ad_config.torch_compile_enabled:
             compile_backend = "torch-opt"
+        elif ad_config.use_cuda_graph:
+            compile_backend = "torch-cudagraph"
+        elif ad_config.torch_compile_enabled:
+            compile_backend = "torch-compile"
         else:
             compile_backend = "torch-simple"
         self.compile_backend = compile_backend
