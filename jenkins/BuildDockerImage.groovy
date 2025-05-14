@@ -296,6 +296,33 @@ pipeline {
                         buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.12.3 STAGE=tritondevel", "", "-py312")
                     }
                 }
+                stage("Build NGC x86_64") {
+                    agent {
+                        kubernetes createKubernetesPodConfig("build")
+                    }
+                    steps
+                    {
+                        buildImage("devel", params.action, "skip")
+                    }
+                }
+                // stage("Build NGC SBSA") {
+                //     agent {
+                //         kubernetes createKubernetesPodConfig("build")
+                //     }
+                //     steps
+                //     {
+                //         buildImage("devel", params.action, "skip")
+                //     }
+                // }
+                stage("Build NGC release x86_64") {
+                    agent {
+                        kubernetes createKubernetesPodConfig("build")
+                    }
+                    steps
+                    {
+                        buildImage("devel", params.action, "skip")
+                    }
+                }
             }
         }
     } // stages
