@@ -1610,6 +1610,10 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.stream = stream;
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
 
+        if (mAttentionChunkSize) {
+          fmhaParams.chunkedAttentionSize = *mAttentionChunkSize;
+        }
+
         // Run the fmha kernel.
         mFmhaDispatcher->run(fmhaParams);
         sync_check_cuda_error(stream);

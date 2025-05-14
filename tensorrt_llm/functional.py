@@ -730,7 +730,7 @@ class PositionEmbeddingType(IntEnum):
 class AttentionMaskType(IntEnum):
     padding = 0
     causal = 1
-    sliding_window_causal = 2
+    sliding_or_chunked_causal = 2
     bidirectional = 3
     bidirectionalglm = 4  # TODO: merge this mask into bidirectional
     blocksparse = 5
