@@ -705,8 +705,6 @@ def create_genai_perf_command(model_name,
         model_name,
         "--tokenizer",
         model_path,
-        "--service-kind",
-        "openai",
         "--endpoint-type",
         "completions",
         "--random-seed",
@@ -1054,8 +1052,9 @@ def extract_stress_test_metrics(artifacts_dir="./artifacts",
                                             {}).get("avg", 0)
                 tokThroughput = results.get("output_token_throughput",
                                             {}).get("avg", 0)
-                conCurrency = results.get("input_config",
-                                          {}).get("concurrency", 0)
+                conCurrency = results.get("input_config", {}).get(
+                    "perf_analyzer", {}).get("stimulus",
+                                             {}).get("concurrency", 0)
 
                 # Try to determine model name from directory structure first
                 if first_dir in model_name_map:
