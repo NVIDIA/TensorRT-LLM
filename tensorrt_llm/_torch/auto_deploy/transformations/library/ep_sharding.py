@@ -12,7 +12,7 @@ The sharding process consists of:
 1. Identify MoE nodes in the FX graph
 2. Compute local sharding parameters (`selected_experts` and `final_scales`) to update the routing tensors.
 3. Partition expert weight lists according to the current rank and world size,
-    and replace the MoE node’s arguments with these sharded versions.
+    and replace the MoE node's arguments with these sharded versions.
 4. Append an all_reduce node after each MoE node to aggregate outputs across devices,
     then canonicalize the modified graph.
 
@@ -38,7 +38,10 @@ def ep_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
     num_moe_patterns = 0
     for node in list(gm.graph.nodes):
-        if not is_op(node, torch.ops.auto_deploy.torch_moe):
+        if not is_op(
+            node,
+            (torch.ops.auto_deploy.torch_moe, torch.ops.moe.torch_fp8_moe, torch.ops.moe.torch_fp4_moe),
+        ):
             continue
         _insert_sharded_moe(gm, node, rank, world_size)
         num_moe_patterns += 1
@@ -60,6 +63,8 @@ def _insert_sharded_moe(
     sharded `selected_experts` and `final_scales(router_logics)`.
     Add an all_reduce node after the moe node.
     """
+    is_fp8 = is_op(node, torch.ops.moe.torch_fp8_moe)
+    is_fp4 = is_op(node, torch.ops.moe.torch_fp4_moe)
     num_experts = len(node.args[3])
     args = list(node.args)
 
@@ -115,6 +120,13 @@ def _insert_sharded_moe(
     args[3] = w1_list_sharded
     args[4] = w2_list_sharded
     args[5] = w3_list_sharded
+
+    if is_fp8:
+        for i in range(6):
+            args[6 + i] = get_partition(args[6 + i], world_size, rank)
+    elif is_fp4:
+        for i in range(9):
+            args[6 + i] = get_partition(args[6 + i], world_size, rank)
 
     ad_logger.debug(
         f"Updated node {node}: replaced original arguments {node.args} with sharded arguments {args}."
