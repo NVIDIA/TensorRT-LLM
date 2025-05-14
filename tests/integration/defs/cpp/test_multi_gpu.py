@@ -211,49 +211,81 @@ def run_trt_gpt_model_real_decoder_multi_gpu_tests(build_dir: _pl.Path,
                      timeout=timeout)  # expecting ~ 1200s
 
 
-def run_disagg_multi_gpu_tests(build_dir: _pl.Path):
-
+def run_disagg_symmetric_executor_tests(build_dir: _pl.Path,
+                                        model: str,
+                                        use_ucx_kvcache=False,
+                                        timeout=1500):
     tests_dir = build_dir / "tests"
     cpp_env = {**_os.environ}
 
+    match model:
+        case "llama":
+            prefix = "Llama"
+        case "gpt":
+            prefix = "Gpt"
+        case _:
+            raise ValueError(f"Unsupported model: {model}")
+
     new_env = copy.copy(cpp_env)
-    new_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
+    if use_ucx_kvcache:
+        new_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    else:
+        new_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
+
     xml_output_file = build_dir / "results-multi-gpu-disagg-executor-2-process.xml"
     trt_model_test = _cpp.produce_mpirun_command(
         global_commands=["mpirun", "--allow-run-as-root"],
         nranks=2,
         local_commands=[
             "executor/disaggExecutorTest",
-            "--gtest_filter=*DisaggSymmetricExecutorTest*"
+            f"--gtest_filter=*{prefix}*DisaggSymmetricExecutorTest*"
         ],
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
     _cpp.run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
 
     mgpu_env = copy.copy(cpp_env)
     mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
-    mgpu_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
+
+    if use_ucx_kvcache:
+        mgpu_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    else:
+        mgpu_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
+
     xml_output_file = build_dir / "results-multi-gpu-disagg-executor-4-process.xml"
     trt_model_test = _cpp.produce_mpirun_command(
         global_commands=["mpirun", "--allow-run-as-root"],
         nranks=4,
         local_commands=[
             "executor/disaggExecutorTest",
-            "--gtest_filter=*DisaggSymmetricExecutorTest*"
+            f"--gtest_filter=*{prefix}*DisaggSymmetricExecutorTest*"
         ],
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-    # https://nvbugspro.nvidia.com/bug/5026255 disable below tests for now.
     _cpp.run_command(trt_model_test, cwd=tests_dir, env=mgpu_env, timeout=1500)
 
-    xml_output_file = build_dir / "results-multi-gpu-disagg-executor-8-process.xml"
-    trt_model_test = _cpp.produce_mpirun_command(
-        global_commands=["mpirun", "--allow-run-as-root"],
-        nranks=8,
-        local_commands=[
-            "executor/disaggExecutorTest",
-            "--gtest_filter=*LlamaTP2PP2DisaggSymmetricExecutorTest*"
-        ],
-        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-    _cpp.run_command(trt_model_test, cwd=tests_dir, env=mgpu_env, timeout=1500)
+    if model == "llama":
+        xml_output_file = build_dir / "results-multi-gpu-disagg-executor-8-process.xml"
+        trt_model_test = _cpp.produce_mpirun_command(
+            global_commands=["mpirun", "--allow-run-as-root"],
+            nranks=8,
+            local_commands=[
+                "executor/disaggExecutorTest",
+                "--gtest_filter=*LlamaTP2PP2DisaggSymmetricExecutorTest*"
+            ],
+            leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+        _cpp.run_command(trt_model_test,
+                         cwd=tests_dir,
+                         env=mgpu_env,
+                         timeout=1500)
+
+
+def run_disagg_multi_gpu_tests(build_dir: _pl.Path):
+
+    tests_dir = build_dir / "tests"
+    cpp_env = {**_os.environ}
+
+    mgpu_env = copy.copy(cpp_env)
+    mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
+    mgpu_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
 
     xml_output_file = build_dir / "results-multi-gpu-disagg-asymmetric-executor-4-process.xml"
     trt_model_test = _cpp.produce_mpirun_command(
@@ -299,45 +331,9 @@ def run_disagg_multi_gpu_tests(build_dir: _pl.Path):
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
     _cpp.run_command(trt_model_test, cwd=tests_dir, env=mgpu_env, timeout=1500)
 
-    # UCX transceiver tests, the test may not be built if ENABLE_UCX is 0
-    new_env = copy.copy(cpp_env)
-    new_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    xml_output_file = build_dir / "results-multi-gpu-disagg-executor-2-process.xml"
-    trt_model_test = _cpp.produce_mpirun_command(
-        global_commands=["mpirun", "--allow-run-as-root"],
-        nranks=2,
-        local_commands=[
-            "executor/disaggExecutorTest",
-            "--gtest_filter=*DisaggSymmetricExecutorTest*"
-        ],
-        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-    _cpp.run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
-
     mgpu_env = copy.copy(cpp_env)
     mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
     mgpu_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    xml_output_file = build_dir / "results-multi-gpu-disagg-executor-4-process.xml"
-    trt_model_test = _cpp.produce_mpirun_command(
-        global_commands=["mpirun", "--allow-run-as-root"],
-        nranks=4,
-        local_commands=[
-            "executor/disaggExecutorTest",
-            "--gtest_filter=*DisaggSymmetricExecutorTest*"
-        ],
-        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-    # https://nvbugspro.nvidia.com/bug/5026255 disable below tests for now.
-    _cpp.run_command(trt_model_test, cwd=tests_dir, env=mgpu_env, timeout=1500)
-
-    xml_output_file = build_dir / "results-multi-gpu-disagg-executor-8-process.xml"
-    trt_model_test = _cpp.produce_mpirun_command(
-        global_commands=["mpirun", "--allow-run-as-root"],
-        nranks=8,
-        local_commands=[
-            "executor/disaggExecutorTest",
-            "--gtest_filter=*LlamaTP2PP2DisaggSymmetricExecutorTest*"
-        ],
-        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-    _cpp.run_command(trt_model_test, cwd=tests_dir, env=mgpu_env, timeout=1500)
 
     xml_output_file = build_dir / "results-multi-gpu-disagg-asymmetric-executor-4-process.xml"
     trt_model_test = _cpp.produce_mpirun_command(
@@ -440,6 +436,39 @@ def prepare_model_multi_gpu(python_exe, root_dir, cpp_resources_dir,
     return _prepare
 
 
+@pytest.fixture(scope="session")
+def gpt_single_gpu_model(prepare_model):
+    prepare_model("gpt")
+    return "gpt"
+
+
+@pytest.fixture(scope="session")
+def llama_single_gpu_model(prepare_model):
+    prepare_model("llama")
+    return "llama"
+
+
+@pytest.fixture(scope="session")
+def llama_multi_gpu_model(prepare_model_multi_gpu):
+    prepare_model_multi_gpu("llama")
+    return "llama"
+
+
+# Allow us to dynamically choose a fixture at runtime
+# Combined with session scope to ensure that the model is built only once
+# per pytest session
+@pytest.fixture
+def run_fixture(request):
+
+    def _run(fixture_name):
+        fixture = request.getfixturevalue(fixture_name)
+        if fixture is None:
+            raise ValueError(f"Fixture {fixture_name} not found")
+        return fixture
+
+    return _run
+
+
 # Use indirect parameterization to ensure that the model is built
 # only once per pytest session
 @pytest.fixture(scope="session")
@@ -530,7 +559,7 @@ def test_trt_gpt_real_decoder(build_google_tests, multi_gpu_model, lora_setup,
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
 @pytest.mark.parametrize("multi_gpu_model", ["llama"], indirect=True)
-def test_disagg(prepare_model, multi_gpu_model, build_google_tests, build_dir):
+def test_disagg(build_google_tests, prepare_model, multi_gpu_model, build_dir):
 
     if platform.system() != "Windows":
         # Disagg tests need single + multi GPU llama models.
@@ -540,3 +569,26 @@ def test_disagg(prepare_model, multi_gpu_model, build_google_tests, build_dir):
         prepare_model("gpt")
 
         run_disagg_multi_gpu_tests(build_dir=build_dir)
+
+
+@pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
+                         indirect=True)
+@pytest.mark.parametrize("use_ucx_kvcache", [False, True],
+                         ids=["mpi_kvcache", "ucx_kvcache"])
+@pytest.mark.parametrize("model", ["gpt", "llama"])
+def test_disagg_symmetric_executor(build_google_tests, model, use_ucx_kvcache,
+                                   run_fixture, build_dir):
+
+    if platform.system() != "Windows":
+        # Disagg tests need single + multi GPU llama models.
+        # Disagg tests need only single GPU gpt model.
+
+        if model == "llama":
+            run_fixture("llama_single_gpu_model")
+            run_fixture("llama_multi_gpu_model")
+        elif model == "gpt":
+            run_fixture("gpt_single_gpu_model")
+
+        run_disagg_symmetric_executor_tests(build_dir=build_dir,
+                                            model="gpt",
+                                            use_ucx_kvcache=use_ucx_kvcache)
