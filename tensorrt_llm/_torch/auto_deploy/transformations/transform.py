@@ -229,6 +229,4 @@ class InferenceOptimizer:
 
         torch.cuda.empty_cache()
         gc.collect()
-        print("DEBUG LOG: egm_compiled")
-        print(egm_compiled.graph.print_tabular())
         return egm_compiled
