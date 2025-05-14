@@ -196,7 +196,7 @@ def flattened_mha_with_cache(
     # 2. b==1, s > 0: this indicates a mixed context+generate phase. The actual number of sequences
     #    and number of tokens per sequence are encoded in seq_len and seq_start.
     num_kv_heads, head_dim = k_cache.shape[-2:]
-    q_shape = q.shape
+    v_head_dim = v_cache.shape[-1]
     b, s = q.shape[:2]
 
     # check for num_heads
@@ -210,10 +210,10 @@ def flattened_mha_with_cache(
 
     q = q.contiguous().view(*bs_view, num_heads, head_dim)
     k = k.contiguous().view(*bs_view, num_kv_heads, head_dim)
-    v = v.contiguous().view(*bs_view, num_kv_heads, head_dim)
+    v = v.contiguous().view(*bs_view, num_kv_heads, v_head_dim)
 
     # run attention
-    y = torch.empty_like(q)
+    y = torch.empty(*bs_view, num_heads, v_head_dim, dtype=q.dtype, device=q.device).contiguous()
     if s == 1:
         # generate-only phase
         _generate_mha(q, k, v, k_cache, v_cache, cache_loc, input_pos, y)
@@ -232,7 +232,9 @@ def flattened_mha_with_cache(
             y,
         )
 
-    return y.view(q_shape)  # [bsnd] in the original view (might have some dims flattened)
+    return y.view(
+        *bs_view, num_heads, v_head_dim
+    )  # [bsnd] in the original view (might have some dims flattened)
 
 
 @flattened_mha_with_cache.register_fake
@@ -248,7 +250,9 @@ def flattened_mha_fake(
     v_cache: torch.Tensor,
     scale: Optional[float],
 ):
-    return torch.empty_like(q.contiguous())
+    b, n, s, _ = q.shape
+    v_head_dim = v.shape[-1]
+    return torch.empty(b, n, s, v_head_dim, dtype=q.dtype, device=q.device).contiguous()
 
 
 @torch.library.custom_op("attention::prepare_fused_mha_metadata", mutates_args=())
@@ -322,21 +326,34 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
     ) -> CacheInitializerDict:
         # source op is [bsnd] layout already
         k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
+        v_fake: FakeTensor = source_attn_node.args[2].meta["val"]
         num_kv_heads = k_fake.shape[2]
-        head_dim = k_fake.shape[3]
+        k_head_dim = k_fake.shape[3]
+        v_head_dim = v_fake.shape[3]
 
-        def _get_cache(si: SequenceInfo):
+        def _get_k_cache(si: SequenceInfo):
             assert not si.is_paged, "Paged cache not supported for TritonWithFlattenedInputs"
             return torch.empty(
                 si.num_pages,
                 si.page_size,
                 num_kv_heads,
-                head_dim,
+                k_head_dim,
                 device=si.device,
                 dtype=cache_config.dtype or k_fake.dtype,
             )
 
-        return {"k_cache": _get_cache, "v_cache": _get_cache}
+        def _get_v_cache(si: SequenceInfo):
+            assert not si.is_paged, "Paged cache not supported for TritonWithFlattenedInputs"
+            return torch.empty(
+                si.num_pages,
+                si.page_size,
+                num_kv_heads,
+                v_head_dim,
+                device=si.device,
+                dtype=cache_config.dtype or v_fake.dtype,
+            )
+
+        return {"k_cache": _get_k_cache, "v_cache": _get_v_cache}
 
     @classmethod
     def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
