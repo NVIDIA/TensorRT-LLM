@@ -278,6 +278,16 @@ def get_model(ckpt_path: str,
                                                       device_map="cuda",
                                                       torch_dtype=torch_dtype,
                                                       trust_remote_code=True)
+    elif hf_config.model_type == "NVLM_D":
+        from transformers import AutoModel
+        model = AutoModel.from_pretrained(
+            ckpt_path,
+            device_map="cuda",
+            torch_dtype="auto",
+            use_flash_attn=False,
+            trust_remote_code=True,
+        )
+        model = model.language_model
     else:
         model = model_cls.from_pretrained(
             ckpt_path,
