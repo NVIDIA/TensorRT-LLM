@@ -199,13 +199,12 @@ public:
         FlakyTestInfo flakyTestInfo);
 
     void validateContextLogits(bool getContextLogits, SizeType32 inputLength, SizeType32 beamWidth,
-        std::optional<executor::Tensor> const& contextLogits, SizeType32 vocabSizePadded, SizeType32 batchId,
-        executor::BatchingType batchingType);
+        std::optional<executor::Tensor> const& contextLogits, SizeType32 vocabSizePadded, SizeType32 batchId);
 
     void validateGenerationLogits(bool getGenLogits, bool isFinal, bool streaming, bool excludeInputFromOutput,
         SizeType32 inputLength, SizeType32 maxOutputLen, SizeType32 beamWidth, executor::BeamTokens const& beamTokens,
         std::optional<executor::Tensor> const& genLogits, SizeType32 vocabSizePadded, SizeType32 batchId,
-        executor::BatchingType batchingType, bool returnAllGeneratedTokens);
+        bool returnAllGeneratedTokens);
 
     SizeType32 nbGivenInputs{};
     SizeType32 beamWidth{};

@@ -277,7 +277,5 @@ l0_h100:
   - examples/test_gpt.py::test_llm_minitron_fp8_with_pseudo_loras[4b]
   - examples/test_chatglm.py::test_llm_glm_4_9b_single_gpu_summary[glm-4-9b-disable_weight_only]
   - unittest/trt/model_api/test_model_quantization.py # 20 mins on H100
-  - test_e2e.py::test_benchmark_sanity_enable_fp8[llama_7b] # 55.77s H100 only
-  - test_e2e.py::test_benchmark_sanity_enable_fp8[gpt_350m] # 34.07s H100 only
   - unittest/bindings # 8 mins on H100
   - test_e2e.py::test_build_time_benchmark_sanity

@@ -455,14 +455,6 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8_block_scales[laten
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8B::test_auto_dtype[False]
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8B::test_auto_dtype[True]
 
-test_e2e.py::test_benchmark_sanity[bert_base] # 127.18s
-test_e2e.py::test_benchmark_sanity[gpt_350m] # 64.06s
-test_e2e.py::test_benchmark_sanity[gpt_350m_sq_per_tensor] # 97.04s
-test_e2e.py::test_benchmark_sanity[llama_70b] # 91.93s
-test_e2e.py::test_benchmark_sanity[roberta_base]
-test_e2e.py::test_benchmark_sanity[t5_base]
-test_e2e.py::test_benchmark_sanity_enable_fp8[gpt_350m]
-test_e2e.py::test_benchmark_sanity_enable_fp8[llama_7b]
 test_e2e.py::test_llama_e2e[use_cpp_session-remove_input_padding-]
 test_e2e.py::test_llama_e2e[use_py_session-remove_input_padding-]
 test_e2e.py::test_llama_e2e[use_py_session--]
