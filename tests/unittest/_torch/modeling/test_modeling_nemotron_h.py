@@ -138,7 +138,8 @@ class TestNemotronH(unittest.TestCase):
         model_config = ModelConfig(pretrained_config=nemotron_h_config)
         nemotron_h = NemotronHForCausalLM(model_config).to(device)
 
-        weights = load_weights(model_dir)
+        mapping = Mapping(world_size=1, tp_size=1, rank=0)
+        weights = load_weights(model_dir, mapping=mapping)
         nemotron_h.load_weights(weights)
 
         text_prompt = "The future of AI is"
@@ -153,7 +154,6 @@ class TestNemotronH(unittest.TestCase):
         max_seq_len = num_blocks * tokens_per_block
         max_batch_size = 1
 
-        mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
                                         tokens_per_block,
                                         enable_block_reuse=False)
