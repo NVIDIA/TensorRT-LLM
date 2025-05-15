@@ -1261,7 +1261,7 @@ class PyExecutor:
         self.num_fetch_requests_cur_rank = self.num_fetch_requests_cur_rank + len(
             new_requests_cur_rank)
 
-        if len(new_requests) == 1 and new_requests[0] == None:
+        if len(new_requests) == 1 and new_requests[0] is None:
             new_requests_cur_rank = new_requests
         return new_requests_cur_rank
 
