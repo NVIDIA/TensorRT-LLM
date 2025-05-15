@@ -199,7 +199,7 @@ class Qwen3MoEModel(DecoderModel):
             # When attention_dp is enabled, we cannot do all_reduce since
             # the problem size of different ranks are different.
             # So, we don't do parallelism here.
-            self.embed_tokens = nn.Embedding(
+            self.embed_tokens = Embedding(
                 config.pretrained_config.vocab_size,
                 config.pretrained_config.hidden_size,
                 dtype=config.pretrained_config.torch_dtype)

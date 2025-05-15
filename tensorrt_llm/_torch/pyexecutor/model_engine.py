@@ -35,12 +35,12 @@ from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
 from ..compilation.utils import set_enable_piecewise_cuda_graph_capture_flag
 from ..distributed import MPIDist
+from ..distributed.communicator import init_pp_comm
 from ..metadata import KVCacheParams
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      timing)
-from ..pipeline_interface import PipelineInterface
 from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
 from ..utils import set_torch_compiling, with_model_extra_attrs
 from .config import LoadFormat, PyTorchConfig
@@ -292,7 +292,7 @@ class PyTorchModelEngine(ModelEngine):
 
         self.mapping = mapping
         if mapping.has_pp():
-            PipelineInterface.init_pp_comm(mapping)
+            init_pp_comm(mapping)
         self.dist = dist
         self.pytorch_backend_config = pytorch_backend_config
         self.spec_config = spec_config
@@ -855,13 +855,8 @@ class PyTorchModelEngine(ModelEngine):
         else:
             spec_metadata = None
 
-        pipeline_interface = None
-        if not self.mapping.is_first_pp_rank():
-            pipeline_interface = self.model.create_pipeline_interface(
-                batch_size)
         self._cuda_graphs[batch_size] = DecodingCUDAGraphRunner(
-            batch_size, "cuda", attn_metadata, spec_metadata,
-            pipeline_interface, self.mapping.has_pp())
+            batch_size, "cuda", attn_metadata, spec_metadata)
         return self._cuda_graphs[batch_size]
 
     def __del__(self) -> None:
@@ -978,7 +973,7 @@ class PyTorchModelEngine(ModelEngine):
         """
         Return the maximum number of sequences that the model supports. PyExecutor need this to compute max_num_active_requests
         """
-        num_batches = self.mapping.pp_size if self.mapping.has_pp() else 1
+        num_batches = self.mapping.pp_size
         return num_batches * self.batch_size
 
     def _preprocess_inputs(self, inputs: Dict[str, Any]):
@@ -1328,13 +1323,6 @@ class PyTorchModelEngine(ModelEngine):
                     attn_metadata.num_tokens)
                 attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
-        if self.mapping.has_pp():
-            pipeline_interface = None
-            if not self.mapping.is_first_pp_rank():
-                pipeline_interface = self.model.create_pipeline_interface(
-                    inputs['input_ids'].shape[0])
-            inputs['pipeline_interface'] = pipeline_interface
-
         num_generation_tokens = len(generation_requests) + len(
             extend_requests) + sum(draft_lens)
         self.iter_states['num_ctx_requests'] = num_ctx_requests
@@ -1463,13 +1451,6 @@ class PyTorchModelEngine(ModelEngine):
                 all_rank_num_tokens = self.dist.tp_allgather(
                     attn_metadata.num_tokens)
                 attn_metadata.all_rank_num_tokens = all_rank_num_tokens
-
-        if self.mapping.has_pp():
-            pipeline_interface = None
-            if self.mapping.pp_rank > 0:
-                pipeline_interface = self.model.create_pipeline_interface(
-                    inputs['input_ids'].shape[0])
-            inputs['pipeline_interface'] = pipeline_interface
 
         return inputs, None
 
@@ -1826,8 +1807,6 @@ class PyTorchModelEngine(ModelEngine):
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
             cp_type = self.mapping.cp_config['cp_type']
             if 'star_attention' == cp_type:
-                assert not self.mapping.has_pp(
-                ), "Star attention does not support pipeline parallel yet"
                 return self._prepare_star_attention_inputs(
                     scheduled_requests, kv_cache_manager, attn_metadata)
             else:
@@ -1865,15 +1844,7 @@ class PyTorchModelEngine(ModelEngine):
                 inputs.update(extra_model_inputs)
             self.last_spec_metadata = spec_metadata
 
-            if not self.mapping.is_first_pp_rank():
-                inputs['pipeline_interface'].recv()
-            if not self.mapping.is_last_pp_rank():
-                pp_interface = self._forward_step_intermediate(inputs)
-                pp_interface.send()
-                return self._post_forward_intermediate(inputs, pp_interface,
-                                                       gather_ids)
-            else:
-                return self._forward_step(inputs, gather_ids)
+            return self._forward_step(inputs, gather_ids)
 
         with self._maybe_pad_batch(scheduled_requests,
                                    kv_cache_manager) as scheduled_requests:
@@ -1900,38 +1871,18 @@ class PyTorchModelEngine(ModelEngine):
             self.iter_counter += 1
 
             if maybe_graph is None:
-                if not self.mapping.is_first_pp_rank():
-                    inputs['pipeline_interface'].recv()
-                if not self.mapping.is_last_pp_rank():
-                    pp_interface = self._forward_step_intermediate(inputs)
-                    pp_interface.send()
-                    outputs = self._post_forward_intermediate(
-                        inputs, pp_interface, gather_ids)
-                else:
-                    outputs = self._forward_step(inputs, gather_ids)
+                outputs = self._forward_step(inputs, gather_ids)
             else:
                 if maybe_graph.needs_capture():
-                    if not self.mapping.is_last_pp_rank():
-                        capture_fn = lambda inputs: self._forward_step_intermediate(
-                            inputs)
-                    else:
-                        capture_fn = lambda inputs: self._forward_step(
-                            inputs, gather_ids=gather_ids)
-
-                    pool = maybe_graph.capture(capture_fn,
-                                               self._cuda_graph_mem_pool,
-                                               extra_model_inputs)
+                    pool = maybe_graph.capture(
+                        lambda inputs: self._forward_step(
+                            inputs, gather_ids=gather_ids),
+                        self._cuda_graph_mem_pool,
+                        extra_model_inputs,
+                    )
                     self._cuda_graph_mem_pool = pool
 
-                if not self.mapping.is_first_pp_rank():
-                    inputs['pipeline_interface'].recv()
                 outputs = maybe_graph.run(inputs, extra_model_inputs)
-                if not self.mapping.is_last_pp_rank():
-                    pp_interface = PipelineInterface(*outputs)
-                    pp_interface.send()
-                    outputs = self._post_forward_intermediate(inputs,
-                                                              pp_interface,
-                                                              gather_ids=None)
 
             # Note: To overlap the CPU and GPU computation as much as possible,
             # guided_decoder.build should be called immediately after the launch of the single step;
@@ -1973,40 +1924,6 @@ class PyTorchModelEngine(ModelEngine):
             return {'logits': logits[gather_ids]}
         else:
             return {'logits': logits}
-
-    @nvtx_range("_forward_step_intermediate")
-    def _forward_step_intermediate(self, inputs: Dict[str, Any]):
-        pipeline_interface = self.model_forward(**inputs)
-        return pipeline_interface
-
-    @nvtx_range("_post_forward_intermediate")
-    def _post_forward_intermediate(self, inputs: Dict[str, Any],
-                                   pipeline_interface: PipelineInterface,
-                                   gather_ids: Optional[torch.Tensor]):
-        """
-        Instead of returning the logits for intermediate pipeline stages, we return the hidden states at last tokens.
-        This is useful to allocate the new tokens to recv from previous pipeline stage.
-        """
-        attn_metadata = inputs['attn_metadata']
-        hidden_states = pipeline_interface['hidden_states']
-        if len(hidden_states.shape) == 1:  # During run without KV cache
-            hidden_states = hidden_states.unsqueeze(0)
-
-        if gather_ids is None:
-            if attn_metadata is not None:
-                last_tokens = torch.cumsum(
-                    attn_metadata.seq_lens_cuda,
-                    dim=0,
-                    dtype=torch.long,
-                ) - 1
-                hidden_states = hidden_states[last_tokens]
-            else:
-                hidden_states = hidden_states[-1]
-
-        if gather_ids is not None:
-            return {'hidden_states': hidden_states[gather_ids]}
-        else:
-            return {'hidden_states': hidden_states}
 
     def _init_userbuffers(self, hidden_size):
         if self.mapping.tp_size <= 1:
