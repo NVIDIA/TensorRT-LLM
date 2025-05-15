@@ -63,7 +63,7 @@ struct AdaBlockwiseGemmKernel
         int const M = params.problem_size.m();
         int const N = params.problem_size.n();
         int const K = params.problem_size.k();
-        int const ScaleM = (M + KT::ScaleGranularityM - 1) / KT::ScaleGranularityM;
+        int const ScaleM = (((M + 3) >>  2) << 2); // align 4
         int const ScaleN = (N + KT::ScaleGranularityN - 1) / KT::ScaleGranularityN;
         int const ScaleK = (K + KT::ScaleGranularityK - 1) / KT::ScaleGranularityK;
 
