@@ -21,25 +21,27 @@ from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
                          ids=["enable_graph", "disable_graph"])
 @pytest.mark.parametrize("ep_size", [4, 1], ids=["ep4", "ep1"])
 @pytest.mark.parametrize("pp_size", [1, 8], ids=["pp1", "pp8"])
-def test_llama4(model_name, backend, tp_size, use_cuda_graph, ep_size, pp_size):
+@pytest.mark.parametrize("multimodal", [True, False],
+                         ids=["multimodal", "text_only"])
+def test_llama4(model_name, backend, tp_size, use_cuda_graph, ep_size, pp_size,
+                multimodal):
     if pp_size > 1 and (ep_size > 1 or tp_size > 1):
         return
 
     if pp_size == 1 and tp_size == 1:
         return
 
-    prompts = [{
-        "prompt": "The president of the United States is"
-    }, {
-        "prompt": "<|image|>This image is of color",
-        "multi_modal_data": {
-            "image": [torch.ones(3, 1024, 1024)]
-        }
-    }]
-
-    expected_outputs = [
-        " the head of state and head of government of the", " solid white"
-    ]
+    if multimodal:
+        prompts = [{
+            "prompt": "<|image|>This image is of color",
+            "multi_modal_data": {
+                "image": [torch.ones(3, 1024, 1024)]
+            }
+        }]
+        expected_outputs = [" white. What is the color of the background of"]
+    else:
+        prompts = [{"prompt": "The president of the United States is"}]
+        expected_outputs = [" the head of state and head of government of the"]
 
     pytorch_config = PyTorchConfig(attn_backend=backend,
                                    use_cuda_graph=use_cuda_graph)
