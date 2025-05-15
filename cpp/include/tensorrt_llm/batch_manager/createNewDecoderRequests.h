@@ -27,8 +27,9 @@ namespace tensorrt_llm::runtime
 {
 class DecodingInput;
 class DecodingOutput;
-class SpeculativeDecodingMode;
 class GptDecoderBatched;
+class SamplingConfig;
+class SpeculativeDecodingMode;
 } // namespace tensorrt_llm::runtime
 
 namespace tensorrt_llm::batch_manager
