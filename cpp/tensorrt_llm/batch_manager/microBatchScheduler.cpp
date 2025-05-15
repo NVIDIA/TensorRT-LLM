@@ -310,6 +310,14 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         }
     }
 
+    if (!allContextRequestsFit)
+    {
+        // Move context requests that reached the last context chunk to the end of the vector.
+        // This order is required for moveFinishedContextRequestsToGeneration.
+        std::partition(contextRequests.begin(), contextRequests.end(),
+            [](auto const& llmReq) { return !llmReq->isLastContextChunk(); });
+    }
+
     TLLM_LOG_DEBUG(
         "batchSize (num ctx/enc requests + num gen requests): %u", contextRequests.size() + generationRequests.size());
     TLLM_LOG_DEBUG("batchNumTokens (num ctx/enc input tokens + num gen input tokens) / maxNumTokens: %d / %d",
