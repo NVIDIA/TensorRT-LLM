@@ -84,20 +84,20 @@ class ModelFactory(ABC):
         """Try prefetching checkpoint."""
         pass
 
-    def load_or_random_init(self, model: nn.Module, **kwargs):
+    def load_or_random_init(self, model: nn.Module, device: DeviceLikeType):
         """Load the checkpoint into the model or randomly initialize the model.
 
         Args:
             model: The model to load the checkpoint into. Note that the model does not need to be
                 the same model that is built above but it needs to have a state dict compatible with
                 the model built above.
-            **kwargs: Keyword arguments that will be passed to torch.load.
+            device: The device to load the model on.
         """
         ad_logger.info("Loading and initializing weights.")
         if self.skip_loading_weights:
-            self._load_random_init(model, **kwargs)
+            self._load_random_init(model, device)
         else:
-            self._load_checkpoint(model, **kwargs)
+            self._load_checkpoint(model, device)
 
     @staticmethod
     def _to_maybe_empty(model: nn.Module, device: DeviceLikeType):
@@ -114,25 +114,25 @@ class ModelFactory(ABC):
         )
 
     @classmethod
-    def _load_random_init(cls, model: nn.Module, **kwargs):
+    def _load_random_init(cls, model: nn.Module, device: DeviceLikeType):
         """Randomly initialize model."""
-        cls._to_maybe_empty(model, kwargs.get("map_location"))
+        cls._to_maybe_empty(model, device)
         state_dict = model.state_dict()
         for k in state_dict:
-            state_dict[k] = torch.normal(
-                0.0, 1.0, size=state_dict[k].shape, device=kwargs.get("map_location")
-            ).to(state_dict[k].dtype)
-        model.load_state_dict(state_dict, strict=True)
+            state_dict[k] = torch.normal(0.0, 1.0, size=state_dict[k].shape, device=device).to(
+                state_dict[k].dtype
+            )
+        model.load_state_dict(state_dict, strict=True, assign=True)
 
     @abstractmethod
-    def _load_checkpoint(self, model: nn.Module, **kwargs):
+    def _load_checkpoint(self, model: nn.Module, device: DeviceLikeType):
         """Load the checkpoint into the model.
 
         Args:
             model: The model to load the checkpoint into. Note that the model does not need to be
                 the same model that is built above but it needs to have a state dict compatible with
                 the model built above.
-            **kwargs: Keyword arguments that will be passed to torch.load.
+            device: The device to load the model on.
         """
 
 
