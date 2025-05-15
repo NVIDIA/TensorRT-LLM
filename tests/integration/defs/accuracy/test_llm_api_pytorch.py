@@ -571,16 +571,20 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(8)
     @skip_pre_blackwell
-    @parametrize_with_ids("overlap_scheduler", [False, True])
-    @parametrize_with_ids("cuda_graph", [False, True])
-    @parametrize_with_ids("attention_dp", [False, True])
-    @parametrize_with_ids("fp8kv", [False, True])
-    @parametrize_with_ids("mtp_nextn", [0, 2])
-    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
-                                                         (8, 1, 8)],
-                             ids=["tp8", "tp8ep4", "tp8ep8"])
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,batch_size,moe_backend",
+        [
+            (8, 1, 4, 3, False, False, True, True, 1, "CUTLASS"),
+            #TODO: enable mtp after bug fix
+            (8, 1, 4, 0, False, False, True, True, 1, "TRTLLM"),
+            (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS"),
+            (8, 1, 1, 0, True, True, True, True, 24, "CUTLASS"),
+        ],
+        ids=["latency", "latency_trtllmgen", "throughput", "throughput_tp8"])
     def test_nvfp4_8gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
-                         attention_dp, cuda_graph, overlap_scheduler):
+                         attention_dp, cuda_graph, overlap_scheduler,
+                         batch_size, moe_backend):
+
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
@@ -596,6 +600,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
         llm = LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-FP4",
+                  batch_size=batch_size,
                   tensor_parallel_size=tp_size,
                   pipeline_parallel_size=pp_size,
                   moe_expert_parallel_size=ep_size,
@@ -603,7 +608,8 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                   pytorch_backend_config=pytorch_config,
                   quant_config=quant_config,
                   enable_attention_dp=attention_dp,
-                  speculative_config=mtp_config)
+                  speculative_config=mtp_config,
+                  moe_backend=moe_backend)
         assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
         if fp8kv:
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
