@@ -1259,6 +1259,7 @@ def test_ptp_quickstart(llm_root, llm_venv):
     ("Llama3.2-11B-BF16", "llama-3.2-models/Llama-3.2-11B-Vision"),
     ("Nemotron4_4B-BF16", "nemotron/Minitron-4B-Base"),
     ("Nemotron-H-8B", "Nemotron-H-8B-Base-8K"),
+    ("Qwen3-30B-A3B", "Qwen3/Qwen3-30B-A3B"),
     pytest.param('Llama3.1-8B-NVFP4',
                  'nvfp4-quantized/Meta-Llama-3.1-8B',
                  marks=skip_pre_blackwell),
@@ -1299,10 +1300,12 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
                                          dir="./",
                                          delete=True,
                                          delete_on_close=True) as running_log:
+            kv_cache_fraction = 0.6 if "Qwen3" in model_name else None
             llm_venv.run_cmd([
                 str(example_root / "quickstart_advanced.py"),
                 "--enable_overlap_scheduler",
                 "--enable_chunked_prefill",
+                f"--kv_cache_fraction={kv_cache_fraction}",
                 "--model_dir",
                 f"{llm_models_root()}/{model_path}",
             ],
