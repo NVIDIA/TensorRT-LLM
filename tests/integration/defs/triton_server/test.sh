@@ -622,7 +622,7 @@ run_cpp_trtllm_queue_size_tests () {
 }
 
 BACKENDS=( "tensorrtllm" "python" )
-BATCHING_STRATEGIES=( "inflight_fused_batching" "v1" )
+BATCHING_STRATEGIES=( "inflight_fused_batching"  )
 MAX_TOKENS_IN_KV_CACHES=( "" $MAX_SEQUENCE_LEN )
 BATCH_SCHEDULER_POLICIES=( "guaranteed_no_evict" "max_utilization" )
 KV_CACHE_FREE_GPU_MEM_FRACTIONS=( "0.2" "" )

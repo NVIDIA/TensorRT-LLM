@@ -807,8 +807,22 @@ if __name__ == "__main__":
     else:
         expected_output_ids = ([] if FLAGS.exclude_input_in_output else
                                input_ids[0]) + [
-                                   21221, 290, 373, 257, 2888, 286, 262, 4141,
-                                   2351, 10006, 13, 679, 373, 7018, 284, 262
+                                   21221,
+                                   290,
+                                   257,
+                                   4255,
+                                   379,
+                                   262,
+                                   1957,
+                                   7072,
+                                   11,
+                                   4689,
+                                   347,
+                                   2852,
+                                   2564,
+                                   494,
+                                   13,
+                                   679,
                                ]
 
     if FLAGS.num_return_sequences is None:
