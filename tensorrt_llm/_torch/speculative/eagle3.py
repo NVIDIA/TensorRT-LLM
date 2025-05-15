@@ -236,6 +236,8 @@ class Eagle3OneModelWorker(nn.Module):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
+        raw_logits = logits
+
         # Sample and accept tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             logits, attn_metadata, spec_metadata, main_model_lm_head)
@@ -325,7 +327,14 @@ class Eagle3OneModelWorker(nn.Module):
         next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
                                        dim=1)
 
-        return accepted_tokens, num_accepted_tokens, next_draft_tokens, next_new_tokens
+        # return accepted_tokens, num_accepted_tokens, next_draft_tokens, next_new_tokens
+        return {
+            'logits': raw_logits,
+            'new_tokens': accepted_tokens,
+            'new_tokens_lens': num_accepted_tokens,
+            'next_draft_tokens': next_draft_tokens,
+            'next_new_tokens': next_new_tokens,
+        }
 
     def sample_and_accept_draft_tokens(
         self,

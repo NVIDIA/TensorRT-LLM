@@ -43,6 +43,7 @@ class Attention(nn.Module):
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
         qk_norm_type: QkNormType = QkNormType.none,
+        q_scaling: float = 1.0,
         is_llama4: bool = False,
     ):
         super().__init__()

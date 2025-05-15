@@ -946,7 +946,8 @@ class PyTorchModelEngine(ModelEngine):
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
-                    weights = load_weights(self.spec_config.draft_model_path)
+                    weights = load_weights(self.spec_config.draft_model_path,
+                                           self.mapping)
                     model.load_draft_weights(weights)
 
             elif load_format == LoadFormat.DUMMY:

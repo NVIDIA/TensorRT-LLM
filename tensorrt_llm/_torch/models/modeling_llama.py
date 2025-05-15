@@ -32,7 +32,7 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..speculative import Eagle3SpecMetadata, SpecMetadata, get_spec_worker
+from ..speculative import SpecMetadata, get_spec_worker
 from ..utils import Fp4QuantizedTensor
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
@@ -781,7 +781,7 @@ class Eagle3LlamaDecoderLayer(DecoderLayer):
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
 
-        assert isinstance(spec_metadata, Eagle3SpecMetadata)
+        # assert isinstance(spec_metadata, Eagle3SpecMetadata)
         # We save the hidden states in the spec metadata here. In _prepare_draft_tokens,
         # PyExecutor will extract these from the draft model engine's spec metadata.
         # They will be passed to the draft model engine on the next iteration.
