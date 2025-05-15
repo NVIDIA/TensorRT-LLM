@@ -464,7 +464,7 @@ class TRTLLMSampler(Sampler):
         model_dtype,
         mapping: Mapping,
         decoding_mode: DecodingMode,
-        enable_overlap_scheduler: bool,
+        disable_overlap_scheduler: bool,
     ):
 
         vocab_size = model.config.vocab_size
@@ -482,7 +482,7 @@ class TRTLLMSampler(Sampler):
         self.max_attention_window = max_attn_window if max_attn_window is not None else executor_config.max_seq_len
         self.max_num_sequences = mapping.pp_size * self.executor_config.max_batch_size
         self.max_seq_idle_microseconds = 180 * 1000 * 1000
-        self.is_trt_overlap = enable_overlap_scheduler
+        self.is_trt_overlap = not disable_overlap_scheduler
 
         self.world_config = WorldConfig.mpi(mapping.gpus_per_node,
                                             mapping.tp_size, mapping.pp_size)

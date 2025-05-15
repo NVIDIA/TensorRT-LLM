@@ -57,7 +57,7 @@ def test_deepseek_trtllmgen(model_name):
     ] * 4
 
     pytorch_config = PyTorchConfig(
-        enable_overlap_scheduler=False,
+        disable_overlap_scheduler=True,
         use_cuda_graph=False,
         kv_cache_dtype="auto",
         attn_backend="TRTLLM",

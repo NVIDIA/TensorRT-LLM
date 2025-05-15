@@ -492,7 +492,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
             rope_config.rope_scaling['beta_slow'],
             rope_config.rope_scaling['mscale'],
             rope_config.rope_scaling['mscale_all_dim'],
-        ),
+        )[1],
         dtype=torch.float32,
         device=device,
     ).reshape(rope_config.max_position_embeddings, -1, 2).transpose(-2, -1)

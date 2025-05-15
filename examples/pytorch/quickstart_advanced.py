@@ -72,7 +72,7 @@ def add_llm_args(parser):
     parser.add_argument("--kv_cache_fraction", type=float, default=None)
 
     # Runtime
-    parser.add_argument('--enable_overlap_scheduler',
+    parser.add_argument('--disable_overlap_scheduler',
                         default=False,
                         action='store_true')
     parser.add_argument('--enable_chunked_prefill',
@@ -124,7 +124,7 @@ def parse_arguments():
 
 def setup_llm(args):
     pytorch_config = PyTorchConfig(
-        enable_overlap_scheduler=args.enable_overlap_scheduler,
+        disable_overlap_scheduler=args.disable_overlap_scheduler,
         kv_cache_dtype=args.kv_cache_dtype,
         attn_backend=args.attention_backend,
         use_cuda_graph=args.use_cuda_graph,

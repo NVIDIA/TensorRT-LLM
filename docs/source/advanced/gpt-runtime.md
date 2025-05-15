@@ -192,39 +192,9 @@ beam width will be 20 for the first step, 40 for second step, 80 for the later a
 TensorRT-LLM, it is not possible to specify a different width for each input
 sequence. This limitation is likely to be removed in a future release.
 
-## The Session
-
-*The runtime session is deprecated in favor of the {ref}`executor`.
- It will be removed in a future release of TensorRT-LLM.*
-
-An example of how to use the `GptSession` to run a GPT-like auto-regressive model can be found in
-[`cpp/tests/runtime/gptSessionTest.cpp`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tests/runtime/gptSessionTest.cpp).
-
 ### Internal Components
 
-The `GptSession` class encapsulates two main components. The
-[`TllmRuntime`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/runtime/tllmRuntime.h) is in charge of the
-execution of the TensorRT engine. The
-[`GptDecoder`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/gptDecoder.h)
-does the generation of the tokens from the logits.  The `TllmRuntime` class is
-an internal component and you are not expected to use that class directly.
-The `GptDecoder` can be used directly to implement custom generation loop
-and for use cases that cannot be satisfied by the implementation in
-`GptSession`.
-
-## In-flight Batching Support
-
-In-flight batching is supported using separate decoders per
-request. The biggest difference compared to using a single decoder is in how
-the token generation from logits is managed. A batch is split into `batchSize`
-individual requests and kernels are issued using separated CUDA streams.
-This behavior may be revisited in a future release to maintain the structure
-of the batch and improve efficiency.
-
-## Know Issues and Future Changes
-
- * In the current release of TensorRT-LLM, the C++ and Python runtimes are two
-   separate software components and the C++ runtime is being more actively
-   developed (with features like in-flight batching). An objective, for a
-   future release, could be to rebuild the Python runtime on top of the C++
-   one.
+The [`TllmRuntime`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/runtime/tllmRuntime.h) is in charge of the execution of the TensorRT engine.
+The `TllmRuntime` class is an internal component and you are not expected to use that class directly.
+The [`GptDecoder`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/gptDecoder.h) generates tokens from the logits.
+The `GptDecoder` can be used directly to implement a custom generation loop and for use cases that cannot be satisfied by the TRT-LLM implementation.

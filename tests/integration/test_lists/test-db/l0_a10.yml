@@ -146,8 +146,6 @@ l0_a10:
   - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_cpp_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb8-bs8]
   - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_py_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb5-bs8]
   - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_py_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb8-bs8]
-  - test_e2e.py::test_benchmark_sanity[bert_base]
-  - test_e2e.py::test_benchmark_sanity[roberta_base]
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-130m-float16-disable_gemm_plugin] # 3 mins
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba2-130m-float16-disable_gemm_plugin]
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-codestral-7B-v0.1-float16-disable_gemm_plugin] # 4 mins
@@ -162,7 +160,6 @@ l0_a10:
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-130m-float16-enable_gemm_plugin] # 2 mins
   - llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command[llama-codellama/CodeLlama-7b-Instruct-hf] # 5min
   - llmapi/test_llm_e2e.py::test_llmapi_load_ckpt_from_convert_command # 5min
-  - test_e2e.py::test_benchmark_sanity[t5_base]
   - examples/test_openai.py::test_llm_openai_triton_1gpu
   - examples/test_openai.py::test_llm_openai_triton_plugingen_1gpu
   - test_e2e.py::test_build_time_benchmark_sanity
