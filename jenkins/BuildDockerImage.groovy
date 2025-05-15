@@ -23,6 +23,18 @@ BUILD_JOBS_RELEASE_SBSA = "8"
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 
+@Field
+def GITHUB_PR_API_URL = "github_pr_api_url"
+@Field
+def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
+@Field
+def ACTION_INFO = "action_info"
+def globalVars = [
+    (GITHUB_PR_API_URL): null,
+    (CACHED_CHANGED_FILE_LIST): null,
+    (ACTION_INFO): null,
+]
+
 def createKubernetesPodConfig(type, arch = "amd64")
 {
     def targetCould = "kubernetes-cpu"
@@ -215,11 +227,6 @@ pipeline {
             defaultValue: "main",
             description: "Branch to launch job."
         )
-        string(
-            name: "commit",
-            defaultValue: "",
-            description: "Gitlab commit to launch job."
-        )
         choice(
             name: "action",
             choices: ["build", "push"],
@@ -239,6 +246,18 @@ pipeline {
         PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
     }
     stages {
+        stage("Setup environment") {
+            steps {
+                script {
+                    echo "branch is: ${LLM_BRANCH}"
+                    echo "env.gitlabCommit is: ${env.gitlabCommit}"
+                    echo "LLM_REPO is: ${LLM_REPO}"
+                    echo "env.globalVars is: ${env.globalVars}"
+                    globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
+                    globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
+                }
+            }
+        }
         stage("Build")
         {
             parallel {
