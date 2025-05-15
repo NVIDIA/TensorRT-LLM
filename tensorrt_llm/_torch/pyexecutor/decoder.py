@@ -449,7 +449,7 @@ class TRTLLMDecoder(Decoder):
         model_dtype,
         mapping: Mapping,
         decoding_mode: DecodingMode,
-        enable_overlap_scheduler: bool,
+        disable_overlap_scheduler: bool,
     ):
 
         vocab_size = model.config.vocab_size
@@ -468,7 +468,7 @@ class TRTLLMDecoder(Decoder):
         self.max_num_sequences = mapping.pp_size * self.executor_config.max_batch_size
         self.max_seq_idle_microseconds = 180 * 1000 * 1000
         self.max_decoding_tokens = 1  # It must be 1 when not in speculative decoding
-        self.is_trt_overlap = enable_overlap_scheduler
+        self.is_trt_overlap = not disable_overlap_scheduler
 
         self.world_config = WorldConfig.mpi(mapping.gpus_per_node,
                                             mapping.tp_size, mapping.pp_size)

@@ -22,11 +22,11 @@ def model_path():
     return llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-def create_llm(model_dir, enable_overlap_scheduler, enable_trtllm_decoder):
+def create_llm(model_dir, disable_overlap_scheduler, enable_trtllm_decoder):
     """Create LLM with specific overlap scheduler setting"""
     pytorch_config = PyTorchConfig(
         use_cuda_graph=True,
-        enable_overlap_scheduler=enable_overlap_scheduler,
+        disable_overlap_scheduler=disable_overlap_scheduler,
         enable_trtllm_decoder=enable_trtllm_decoder)
 
     trt_kv_cache_config = TRT_KvCacheConfig(enable_block_reuse=False)
@@ -62,7 +62,7 @@ def test_overlap_scheduler_consistency(model_path, test_case,
 
     # Test with overlap scheduler enabled
     llm = create_llm(model_path,
-                     enable_overlap_scheduler=True,
+                     disable_overlap_scheduler=False,
                      enable_trtllm_decoder=enable_trtllm_decoder)
     outputs_with_overlap = llm.generate(prompts,
                                         sampling_params=sampling_config,
@@ -74,7 +74,7 @@ def test_overlap_scheduler_consistency(model_path, test_case,
 
     # Test with overlap scheduler disabled
     llm = create_llm(model_path,
-                     enable_overlap_scheduler=False,
+                     disable_overlap_scheduler=True,
                      enable_trtllm_decoder=enable_trtllm_decoder)
     outputs_without_overlap = llm.generate(prompts,
                                            sampling_params=sampling_config,
