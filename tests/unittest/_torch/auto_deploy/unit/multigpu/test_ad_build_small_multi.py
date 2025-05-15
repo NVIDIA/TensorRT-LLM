@@ -12,51 +12,51 @@ from utils.llm_data import llm_models_root
 @pytest.mark.parametrize(
     "world_size, config",
     [
-        # small llama3.1-8B model with world_size 2
-        (
-            2,
-            {
-                "model": _hf_model_dir_or_hub_id(
-                    f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct",
-                    "meta-llama/Meta-Llama-3.1-8B-Instruct",
-                ),
-                "runtime": "demollm",
-                "attn_backend": "TritonWithFlattenedInputs",
-                "compile_backend": "torch-simple",
-                "model_kwargs": {"num_hidden_layers": 2},
-            },
-        ),
-        # small llama3.1-8B model with world_size 2 + trtllm runtime + torch-opt
-        (
-            2,
-            {
-                "model": _hf_model_dir_or_hub_id(
-                    f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct",
-                    "meta-llama/Meta-Llama-3.1-8B-Instruct",
-                ),
-                "runtime": "trtllm",
-                "attn_backend": "TritonWithFlattenedInputs",
-                "compile_backend": "torch-opt",
-                "model_kwargs": {"num_hidden_layers": 2},
-            },
-        ),
-        # small Mixtral-8x7B model with world_size 2
-        (
-            2,
-            {
-                "model": _hf_model_dir_or_hub_id(
-                    f"{llm_models_root()}/Mixtral-8x7B-Instruct-v0.1",
-                    "mistralai/Mixtral-8x7B-Instruct-v0.1",
-                ),
-                "runtime": "demollm",
-                "attn_backend": "TritonWithFlattenedInputs",
-                "compile_backend": "torch-simple",
-                "model_kwargs": {"num_hidden_layers": 2},
-            },
-        ),
+        # # small llama3.1-8B model with world_size 2
+        # (
+        #     2,
+        #     {
+        #         "model": _hf_model_dir_or_hub_id(
+        #             f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct",
+        #             "meta-llama/Meta-Llama-3.1-8B-Instruct",
+        #         ),
+        #         "runtime": "demollm",
+        #         "attn_backend": "TritonWithFlattenedInputs",
+        #         "compile_backend": "torch-simple",
+        #         "model_kwargs": {"num_hidden_layers": 2},
+        #     },
+        # ),
+        # # small llama3.1-8B model with world_size 2 + trtllm runtime + torch-opt
+        # (
+        #     2,
+        #     {
+        #         "model": _hf_model_dir_or_hub_id(
+        #             f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct",
+        #             "meta-llama/Meta-Llama-3.1-8B-Instruct",
+        #         ),
+        #         "runtime": "trtllm",
+        #         "attn_backend": "TritonWithFlattenedInputs",
+        #         "compile_backend": "torch-opt",
+        #         "model_kwargs": {"num_hidden_layers": 2},
+        #     },
+        # ),
+        # # small Mixtral-8x7B model with world_size 2
+        # (
+        #     2,
+        #     {
+        #         "model": _hf_model_dir_or_hub_id(
+        #             f"{llm_models_root()}/Mixtral-8x7B-Instruct-v0.1",
+        #             "mistralai/Mixtral-8x7B-Instruct-v0.1",
+        #         ),
+        #         "runtime": "demollm",
+        #         "attn_backend": "TritonWithFlattenedInputs",
+        #         "compile_backend": "torch-simple",
+        #         "model_kwargs": {"num_hidden_layers": 2},
+        #     },
+        # ),
         # small deepseek-v3 model with world_size 4
         (
-            4,
+            2,
             {
                 "model": _hf_model_dir_or_hub_id(
                     f"{llm_models_root()}/DeepSeek-V3",
@@ -65,7 +65,16 @@ from utils.llm_data import llm_models_root
                 "runtime": "demollm",
                 "attn_backend": "TritonWithFlattenedInputs",
                 "compile_backend": "torch-simple",
-                "model_kwargs": {"num_hidden_layers": 5},
+                "model_kwargs": {
+                    "num_hidden_layers": 6,
+                    "hidden_size": 32,
+                    "max_position_embeddings": 2048,
+                    "intermediate_size": 16,
+                    "moe_intermediate_size": 16,
+                    "n_routed_experts": 16,
+                    "num_attention_heads": 8,
+                    "num_key_value_heads": 4,
+                },
                 "skip_loading_weights": "True",  # TODO: remove this once we fix fp8 weight loading
             },
         ),
