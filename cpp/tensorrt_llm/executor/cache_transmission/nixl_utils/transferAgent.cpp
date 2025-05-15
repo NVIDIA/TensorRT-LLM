@@ -18,6 +18,7 @@
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/transferAgent.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/executor/transferAgent.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <arpa/inet.h>
@@ -214,6 +215,10 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     }
     mExtraParams.backends.push_back(mRawBackend);
     TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent mAddress: %s", mAddress.c_str());
+    mDRamSrcBuffer.resize(16);
+    mDRamDstBuffer.resize(16);
+    MemoryDescs descs{MemoryType::kDRAM, {MemoryDesc{mDRamSrcBuffer}, MemoryDesc{mDRamDstBuffer}}};
+    registerMemory(descs);
 }
 
 void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
@@ -283,8 +288,10 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         request.getRemoteName(), handle, &mExtraParams);
     // } while (status == NIXL_ERR_NOT_FOUND);
 
-    TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS, " rank: %d createXferReq failed with status: %s remoteAgent name: %s",
-        mpi::MpiComm::world().getRank(), nixlEnumStrings::statusStr(status).c_str(), request.getRemoteName().c_str());
+    TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS,
+        " rank: %d createXferReq failed with status: %s selfname: %s remoteAgent name: %s",
+        mpi::MpiComm::world().getRank(), nixlEnumStrings::statusStr(status).c_str(), mName.c_str(),
+        request.getRemoteName().c_str());
 
     status = mRawAgent->postXferReq(handle, &mExtraParams);
     return std::make_unique<NixlTransferStatus>(mRawAgent.get(), handle);
@@ -292,9 +299,21 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 
 void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage const& syncMessage)
 {
-    auto status = mRawAgent->genNotif(name, syncMessage);
-    TLLM_CHECK_WITH_INFO(
-        status == NIXL_SUCCESS, "genNotif failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+    if (name == mName)
+    {
+        // FIXME: nixl does not support gen notif to itself ,but support local transfer. we use local transfer to notify
+        // itself
+        MemoryDescs descs{MemoryType::kDRAM, {MemoryDesc{mDRamSrcBuffer}, MemoryDesc{mDRamDstBuffer}}};
+        TransferRequest request{TransferOp::kWRITE, descs, descs, name, syncMessage};
+        auto request_status = submitTransferRequests(request);
+        request_status->wait();
+    }
+    else
+    {
+        auto status = mRawAgent->genNotif(name, syncMessage);
+        TLLM_CHECK_WITH_INFO(
+            status == NIXL_SUCCESS, "genNotif failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+    }
 }
 
 [[nodiscard]] std::unordered_map<std::string, std::vector<SyncMessage>> NixlTransferAgent::getNotifiedSyncMessages()

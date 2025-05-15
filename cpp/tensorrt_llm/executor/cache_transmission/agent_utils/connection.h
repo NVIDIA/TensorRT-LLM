@@ -213,7 +213,7 @@ public:
     void updateUnhandledNotifications();
     [[nodiscard]] BaseTransferAgent* getAgent() const;
     AgentConnection* connect(std::string const& remoteAgentName, std::string const& address,
-        std::optional<std::string> metadata = std::nullopt);
+        std::optional<std::string> metadata = std::nullopt, bool isSender = false);
     int getDeviceId() const;
     [[nodiscard]] std::string const& getAgentName() const;
     void waitForSyncInfo(std::string const& remoteAgentName, NotificationSyncInfo const& syncInfo);

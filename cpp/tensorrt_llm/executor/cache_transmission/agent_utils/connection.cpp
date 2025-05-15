@@ -259,7 +259,7 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
                     auto validConnectionIdx = requestAndBufferInfo.mValidConnectionIdx;
                     auto remoteAgentName = requestAndBufferInfo.mAgentName;
                     TLLM_LOG_DEBUG(" recv Address:%s", address.c_str());
-                    auto connection = connect(remoteAgentName, address, metadataOpt);
+                    auto connection = connect(remoteAgentName, address, metadataOpt, true);
                     connection->setSenderState(bufferDesc, validConnectionIdx);
                     it2 = notifs.erase(it2);
                     if (notifs.empty())
@@ -327,18 +327,23 @@ batch_manager::kv_cache_manager::CacheTransBufferManager* AgentConnectionManager
     return mCacheTransBufferManager;
 }
 
-AgentConnection* AgentConnectionManager::connect(
-    std::string const& remoteAgentName, std::string const& connecitonInfo, std::optional<std::string> metadata)
+AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentName, std::string const& connecitonInfo,
+    std::optional<std::string> metadata, bool isSender)
 {
 
-    TLLM_CHECK_WITH_INFO(mAgentName != remoteAgentName, "should not connect to self with nixl");
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "mAgentName: %s connect to %s", mAgentName.c_str(), remoteAgentName.c_str());
     std::scoped_lock lock(mConnectionsMutex);
     auto it = mConnections.find(remoteAgentName);
     if (it != mConnections.end())
     {
-        TLLM_CHECK_WITH_INFO(!metadata.has_value(), "should not send metadata twice");
+        if (isSender)
+        {
+            if (!it->second->hasLoadRemoteAgent())
+            {
+                TLLM_CHECK_WITH_INFO(metadata.has_value(), "should get metadata for sender loadRemtoeAgent");
+            }
+        }
         if (!it->second->hasLoadRemoteAgent() && metadata.has_value())
         {
             m_Agent->invalidateRemoteAgent(remoteAgentName);
@@ -349,19 +354,26 @@ AgentConnection* AgentConnectionManager::connect(
         return it->second.get();
     }
     bool hasLoadRemoteAgent = false;
-
-    if (metadata.has_value())
+    if (remoteAgentName != mAgentName)
     {
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "mAgentName: %s connect to %s with loadRemoteAgent",
-            mAgentName.c_str(), remoteAgentName.c_str());
-        m_Agent->loadRemoteAgent(remoteAgentName, AgentDesc{metadata.value()});
-        hasLoadRemoteAgent = true;
+        if (metadata.has_value())
+        {
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "mAgentName: %s connect to %s with loadRemoteAgent",
+                mAgentName.c_str(), remoteAgentName.c_str());
+            m_Agent->loadRemoteAgent(remoteAgentName, AgentDesc{metadata.value()});
+            hasLoadRemoteAgent = true;
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(!isSender, "Sender shouldn't call connectRemoteAgent");
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "mAgentName: %s connect to %s with connectRemoteAgent",
+                mAgentName.c_str(), remoteAgentName.c_str());
+            m_Agent->connectRemoteAgent(remoteAgentName, connecitonInfo);
+        }
     }
     else
     {
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "mAgentName: %s connect to %s with connectRemoteAgent",
-            mAgentName.c_str(), remoteAgentName.c_str());
-        m_Agent->connectRemoteAgent(remoteAgentName, connecitonInfo);
+        hasLoadRemoteAgent = true;
     }
 
     auto connection = std::make_shared<AgentConnection>(mAgentName, remoteAgentName, this);
@@ -452,12 +464,12 @@ AgentConnectionManager::~AgentConnectionManager()
 
     m_Agent->deregisterMemory(mRegMemDescs);
 
-    for (auto& [agent, connection] : mConnections)
-    {
-        if (connection->hasLoadRemoteAgent())
-        {
-            m_Agent->invalidateRemoteAgent(agent);
-        }
-    }
+    // for (auto& [agent, connection] : mConnections)
+    // {
+    //     if (connection->hasLoadRemoteAgent())
+    //     {
+    //         m_Agent->invalidateRemoteAgent(agent);
+    //     }
+    // }
 }
 } // namespace tensorrt_llm::executor::kv_cache

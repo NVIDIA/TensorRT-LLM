@@ -92,6 +92,9 @@ private:
     nixl_opt_args_t mExtraParams;
     std::string mName;
     std::string mAddress;
+
+    std::vector<char> mDRamSrcBuffer;
+    std::vector<char> mDRamDstBuffer;
 };
 
 #if defined(__clang__)
