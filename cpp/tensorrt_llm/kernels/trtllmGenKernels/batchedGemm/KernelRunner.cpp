@@ -211,12 +211,24 @@ void TrtllmGenBatchedGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t 
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
     gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
+    // Sort configs by options
+    std::vector<int32_t> sortedIndices = mPassingConfigIndices;
+    std::sort(sortedIndices.begin(), sortedIndices.end(), [&configs](int32_t idx0, int32_t idx1) {
+        auto const& optionsA = configs[idx0].mOptions;
+        auto const& optionsB = configs[idx1].mOptions;
+        
+        // Sort by tileK sizes first
+        if (optionsA.mTileK != optionsB.mTileK) {
+            return optionsA.mTileK > optionsB.mTileK;
+        } 
+        
+        // Then by unroll loop 2x for mma
+        return optionsA.mUseUnrollLoop2xForMma;
+    });
 
-    for (auto const& configIndex : mPassingConfigIndices)
+    for (auto const& configIndex : sortedIndices)
     {
         auto const& config = configs[configIndex];
-        // FIXME: We select the first valid config,
-        // but must instead choose the "best" config based on some heruistics.
         auto isValidConfig = bmm.isValidConfig(config, gemmData);
         if (isValidConfig)
         {

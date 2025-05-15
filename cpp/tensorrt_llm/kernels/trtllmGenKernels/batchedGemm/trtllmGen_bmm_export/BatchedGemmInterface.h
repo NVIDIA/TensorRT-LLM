@@ -218,7 +218,7 @@ struct BatchedGemmData
         // Map of expanded token index (counting the previous padded tokens) to the batch index
         // the token belongs to.
         // The shape is
-        // [numTokens + numBatches * (tileM/N - 1)]
+        // [divUpMul(numTokens + numBatches * (tileM/N - 1), tileM/N)]
         // The dtype is int32_t.
         //
         // There are 3 tokens [0, 1, 2] such that [0, 1] belong to batch [B0] and [2] to batch [B1].
@@ -265,6 +265,8 @@ struct BatchedGemmData
         // ctaIdxXyToBatchIdx = [0, 1, 1, 2]
         // If isStaticBatch == true, ptrCtaIdxXyToBatchIdx should be set to nullptr and
         // ctaIdxXyToBatchIdx is used.
+        // The shape is
+        // [divUp(numTokens + numBatches * (tileM/N - 1), tileM/N)]
         int32_t const* mPtrCtaIdxXyToBatchIdx;
 
         // Pointer from the CTA index X/Y to the expanded tile index where the expanded tile index is
@@ -277,6 +279,8 @@ struct BatchedGemmData
         // expandIdx += <index in the batch>
         // E.g. with numTokens = [128,255,32] and tileM = 128, should be equal to
         // ptrCtaIdxXyToMnLimit = [128, 256, 383, 416]
+        // The shape is
+        // [divUp(numTokens + numBatches * (tileM/N - 1), tileM/N)]
         int32_t const* mPtrCtaIdxXyToMnLimit;
     };
 
@@ -548,6 +552,7 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
     auto workspaceSizes = getWorkspaceSizesInBytes(config, batchedGemmData);
     float* dPtrRowMax{nullptr};
     uint32_t* dPtrRowMaxBars{nullptr};
+
     // Set the completion barriers to 0 if needed.
     if (useDeepSeekFp8 && options.mFusedAct)
     {
@@ -577,7 +582,7 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
     // For MoE, mNumTokens != 0 and the number of CTAs is known only at runtime.
     // We launch maximally possible number of CTAs and use ptrNumNonExitingCtas to determine
     // the actual number of CTAs to run.
-    if (options.mEnablesEarlyExit && options.mNumTokens != 0)
+    if ((options.mEnablesEarlyExit || options.mEnablesDelayedEarlyExit) && options.mNumTokens != 0)
     {
         // Get maximum number of CTAs in batch dim.
         maxNumCtasInBatchDim = batchedGemmData.mProblemDimensions.mMaxNumCtasInTokenDim;
@@ -587,6 +592,7 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
     auto const numCtaY = batchM ? gemm::divUp(options.mN, options.mTileN) : maxNumCtasInBatchDim;
     auto const numCtaZ = options.mNumSlicesForSplitK;
     mNumCtas = numCtaX * numCtaY * numCtaZ;
+
     auto kernelParams = KernelParams::setKernelParams(options, batchM, batchedGemmData.mInputBuffers.mPtrA,
         batchedGemmData.mInputBuffers.mPtrB, batchedGemmData.mOutputBuffers.mPtrC,
         batchedGemmData.mInputBuffers.mPtrSfA, batchedGemmData.mInputBuffers.mPtrSfB,

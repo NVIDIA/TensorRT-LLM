@@ -77,7 +77,7 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
 
     BatchedGemmOptions() = default;
 
-    // FIXME We enumerate all the options here for to WAR stubgen issue in TRT-LLM.
+    // FIXME We create explicit constructor with all options to WAR stubgen issue in TRT-LLM.
     BatchedGemmOptions(gemm::AllReduceAlgo allReduceAlgo, int clusterDimX, int clusterDimY, int clusterDimZ,
         tg::Dtype dtypeAcc, tg::Dtype dtypeElt, tg::Dtype dtypeC, bool enablesEarlyExit, bool enablesDelayedEarlyExit,
         bool enablesGlobalPtxKnobs, int epilogueTileM, int epilogueTileN, bool gridTriggerSecondaryA,
@@ -87,12 +87,13 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
         int numSlicesForSplitK, int numSlicesForSliceK, int numStages, int numStagesMma, int numStagesMmaWithinWorkTile,
         int numStagesMmaAcrossWorkTile, int numStagesWorkId, bool outputDebugTensors, bool useShuffledMatrixA,
         bool sliceK, gemm::SplitK splitK, bool transposeMmaOutput, int tileM, int tileN, int tileK,
-        bool useUnrollLoop2xForMma, bool useCustomMmaSchedule, bool useDeepSeekFp8, bool usePerTokenSfA,
-        bool usePerTokenSfB, bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps, tg::SfLayout sfLayoutA,
-        tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC, gemm::TileScheduler tileScheduler,
-        gemmGatedAct::ActType actType, std::vector<int> batchedM, std::vector<int> batchedN, BatchMode batchMode,
-        int numBatches, bool isStaticBatch, int numTokens, bool routeAct, bool gridWaitForPrimaryRouting, bool fusedAct,
-        int numRegsPerThreadNonEpilogueWarp, int numRegsPerThreadEpilogueWarp)
+        bool useUnrollLoop2xForMma, bool useCustomMmaSchedule, bool useHoistTryWaitForCustomMmaSchedule,
+        bool useDeepSeekFp8, bool usePerTokenSfA, bool usePerTokenSfB, bool useTmaStore, bool useTwoTmaLoadWarps,
+        bool useTwoMmaWarps, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC,
+        gemm::TileScheduler tileScheduler, gemmGatedAct::ActType actType, std::vector<int> batchedM,
+        std::vector<int> batchedN, BatchMode batchMode, int numBatches, bool isStaticBatch, int numTokens,
+        bool routeAct, bool gridWaitForPrimaryRouting, bool fusedAct, int numRegsPerThreadNonEpilogueWarp,
+        int numRegsPerThreadEpilogueWarp)
         : gemmGatedAct::GemmGatedActOptions(
             gemm::GemmOptions(allReduceAlgo, clusterDimX, clusterDimY, clusterDimZ, dtypeAcc, dtypeElt, dtypeC,
                 enablesEarlyExit, enablesDelayedEarlyExit, enablesGlobalPtxKnobs, epilogueTileM, epilogueTileN,
@@ -101,8 +102,9 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
                 mockAllReduce, n, numSlicesForSplitK, numSlicesForSliceK, numStages, numStagesMma,
                 numStagesMmaWithinWorkTile, numStagesMmaAcrossWorkTile, numStagesWorkId, outputDebugTensors,
                 useShuffledMatrixA, sliceK, splitK, transposeMmaOutput, tileM, tileN, tileK, useUnrollLoop2xForMma,
-                useCustomMmaSchedule, useDeepSeekFp8, usePerTokenSfA, usePerTokenSfB, useTmaStore, useTwoTmaLoadWarps,
-                useTwoMmaWarps, sfLayoutA, sfLayoutB, sfLayoutC, tileScheduler),
+                useCustomMmaSchedule, useHoistTryWaitForCustomMmaSchedule, useDeepSeekFp8, usePerTokenSfA,
+                usePerTokenSfB, useTmaStore, useTwoTmaLoadWarps, useTwoMmaWarps, sfLayoutA, sfLayoutB, sfLayoutC,
+                tileScheduler),
             actType)
         , mBatchedM(batchedM)
         , mBatchedN(batchedN)

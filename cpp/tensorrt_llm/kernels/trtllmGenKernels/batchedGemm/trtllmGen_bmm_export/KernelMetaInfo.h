@@ -25,7 +25,7 @@ namespace kernels
 {
 // clang-format off
 
-#define TLLM_GEN_COMMIT "5a7281be-dirty"
+#define TLLM_GEN_COMMIT "2a3144fd"
 #define TLLM_GEN_EXPORT_VERSION "5.0.2.0.1.0"
 
 static constexpr size_t tllmGenBatchedGemmListLen = 32;
@@ -147,6 +147,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 256
 , /* mUseUnrollLoop2xForMma */ 0
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -214,6 +215,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 256
 , /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -281,6 +283,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 0
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -348,6 +351,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 0
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -415,6 +419,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -482,6 +487,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -549,6 +555,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 0
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -616,6 +623,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 0
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -683,6 +691,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -750,6 +759,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -817,6 +827,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 0
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -884,6 +895,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -951,6 +963,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 128
 , /* mUseUnrollLoop2xForMma */ 0
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 1
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -1018,6 +1031,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 128
 , /* mUseUnrollLoop2xForMma */ 0
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 1
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -1085,6 +1099,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 128
 , /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 1
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -1152,6 +1167,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 128
 , /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 1
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -1219,6 +1235,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 0
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -1286,6 +1303,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 0
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -1353,6 +1371,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -1420,6 +1439,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -1487,6 +1507,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 128
 , /* mUseUnrollLoop2xForMma */ 0
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 1
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -1554,6 +1575,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 128
 , /* mUseUnrollLoop2xForMma */ 0
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 1
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -1621,6 +1643,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 128
 , /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 1
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -1688,6 +1711,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 128
 , /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 1
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -1755,6 +1779,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 0
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 1
@@ -1822,6 +1847,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 0
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -1889,6 +1915,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 1
@@ -1956,6 +1983,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -2023,6 +2051,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 128
 , /* mUseUnrollLoop2xForMma */ 0
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 1
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -2090,6 +2119,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 128
 , /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 1
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -2157,6 +2187,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 0
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
@@ -2224,6 +2255,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0

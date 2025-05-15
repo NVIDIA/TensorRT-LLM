@@ -71,8 +71,8 @@ void runBatchedGemm(at::Tensor& out, at::Tensor& outSfC, at::Tensor const& mat1,
     else
     {
         runner.run(m, n, k, batchedTokens, mat1.const_data_ptr(), mat2.const_data_ptr(),
-            scaleC.value().const_data_ptr<float>(), nullptr, out.data_ptr(), workspace.data_ptr(), stream.stream(),
-            mat1.get_device());
+            reinterpret_cast<float const*>(scaleC.value().const_data_ptr()), nullptr, out.data_ptr(),
+            workspace.data_ptr(), stream.stream(), mat1.get_device());
     }
 }
 

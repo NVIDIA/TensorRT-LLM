@@ -19,6 +19,7 @@
 #include "DevKernel.h"
 #include "RoutingKernel.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 #include <string>
@@ -37,13 +38,13 @@ inline int32_t getMaxPermutedPaddedCount(
 {
     auto const expandedRowCount = numTokens * expertsPerToken;
     auto const maxPaddingRequired = (padding - 1) * numExperts;
-    return expandedRowCount + maxPaddingRequired;
+    return common::roundUp(expandedRowCount + maxPaddingRequired, padding);
 }
 
 inline int32_t getMaxNumCtasInBatchDim(int32_t numTokens, int32_t topK, int32_t numExperts, int32_t tileTokensDim)
 {
     // Get maximum number of CTAs in batch dim per expert.
-    auto const maxCtasInBatchDimPerExpert = (numTokens + tileTokensDim - 1) / tileTokensDim;
+    auto const maxCtasInBatchDimPerExpert = common::ceilDiv(numTokens, tileTokensDim);
     // Get maximum enabled experts.
     auto const maxEnabledExperts = std::min(numTokens * topK, numExperts);
     // Get maximum number of CTAs in batch dim.
@@ -52,20 +53,14 @@ inline int32_t getMaxNumCtasInBatchDim(int32_t numTokens, int32_t topK, int32_t 
     // For large token counts, the above bound can be pessimistic since not all the tokens can
     // be routed to all the enabled experts. Instead we can essentially bound the number of CTAs
     // by permuted buffer size. However, this method will be overly pessimistic for low-token
-    // counts Get the number of "full" tiles by truncating
-    auto const fullTiles = numTokens * topK / tileTokensDim;
-    // Get the number of CTAs required to handle any partial tiles
-    auto const partialTiles = numExperts;
+    // counts
+    auto const tilesForPermutedBuffer
+        = common::ceilDiv(getMaxPermutedPaddedCount(numTokens, topK, numExperts, tileTokensDim), tileTokensDim);
 
     // Set maxNumCtasInBatchDim to be the minimum of the two methods
-    maxNumCtasInBatchDim = std::min(maxNumCtasInBatchDim, fullTiles + partialTiles);
+    maxNumCtasInBatchDim = std::min(maxNumCtasInBatchDim, tilesForPermutedBuffer);
 
     return maxNumCtasInBatchDim;
-}
-
-inline int32_t getMaxNumCtas(int32_t numTokens, int32_t numExperts, int32_t padding)
-{
-    return (numTokens + padding - 1) / padding * numExperts;
 }
 
 class Runner

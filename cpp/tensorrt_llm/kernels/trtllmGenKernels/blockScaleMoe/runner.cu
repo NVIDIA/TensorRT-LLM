@@ -63,8 +63,6 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     {
         // FIXME: hardcoded for now
         int32_t tileN = 8;
-        auto maxNumCtas = Routing::getMaxNumCtas(numTokens, numExperts, tileN);
-        cudaMemsetAsync(ctaIdxXyToBatchIdx, 0, maxNumCtas * sizeof(int32_t), stream);
 
         moe::dev::routing::Data routingData;
         routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
@@ -109,9 +107,6 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     {
         // FIXME: hardcoded for now
         int32_t tileN = 8;
-
-        auto maxNumCtas = Routing::getMaxNumCtas(numTokens, numExperts, tileN);
-        cudaMemsetAsync(ctaIdxXyToBatchIdx, 0, maxNumCtas * sizeof(int32_t), stream);
 
         moe::dev::routingLlama4::Data routingData;
         // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
@@ -325,6 +320,7 @@ std::tuple<int32_t, int32_t> Runner::getWorkspaceSizeInBytes(MoERunnerArgs const
 
 void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device, cudaStream_t stream)
 {
+    std::cout << "here" << std::endl;
     // Setup all operation data
     moe::dev::activation::Data activationData;
     moe::dev::finalize::Data finalizeData;

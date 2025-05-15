@@ -94,9 +94,9 @@ struct GemmOptions
         int numStages, int numStagesMma, int numStagesMmaWithinWorkTile, int numStagesMmaAcrossWorkTile,
         int numStagesWorkId, bool outputDebugTensors, bool useShuffledMatrixA, bool sliceK, SplitK splitK,
         bool transposeMmaOutput, int tileM, int tileN, int tileK, bool useUnrollLoop2xForMma, bool useCustomMmaSchedule,
-        bool useDeepSeekFp8, bool usePerTokenSfA, bool usePerTokenSfB, bool useTmaStore, bool useTwoTmaLoadWarps,
-        bool useTwoMmaWarps, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC,
-        TileScheduler tileScheduler)
+        bool useHoistTryWaitForCustomMmaSchedule, bool useDeepSeekFp8, bool usePerTokenSfA, bool usePerTokenSfB,
+        bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB,
+        tg::SfLayout sfLayoutC, TileScheduler tileScheduler)
         : mAllReduceAlgo{allReduceAlgo}
         , mClusterDimX{clusterDimX}
         , mClusterDimY{clusterDimY}
@@ -141,6 +141,7 @@ struct GemmOptions
         , mTileK{tileK}
         , mUseUnrollLoop2xForMma{useUnrollLoop2xForMma}
         , mUseCustomMmaSchedule{useCustomMmaSchedule}
+        , mUseHoistTryWaitForCustomMmaSchedule{useHoistTryWaitForCustomMmaSchedule}
         , mUseDeepSeekFp8{useDeepSeekFp8}
         , mUsePerTokenSfA{usePerTokenSfA}
         , mUsePerTokenSfB{usePerTokenSfB}
@@ -248,6 +249,10 @@ struct GemmOptions
     bool mUseUnrollLoop2xForMma{true};
     // Use custom MMA schedule optimized for low-latency.
     bool mUseCustomMmaSchedule{false};
+    // The purpose of hoisting trywaits is to opportunistically peek at the availability of the next
+    // k-block. It benefits when the next k-block is already available and thus sustaining the
+    // momentum, but it adds latency to the first k-block for smaller k-loop.
+    bool mUseHoistTryWaitForCustomMmaSchedule{false};
     // Use DeepSeek Fp8.
     bool mUseDeepSeekFp8{false};
     // Apply per-token scales from A
@@ -380,6 +385,7 @@ inline std::string dumpOptions(GemmOptions const& options)
     ss << "mTileK=" << options.mTileK << "," << std::endl;
     ss << "mUseUnrollLoop2xForMma=" << options.mUseUnrollLoop2xForMma << "," << std::endl;
     ss << "mUseCustomMmaSchedule=" << options.mUseCustomMmaSchedule << "," << std::endl;
+    ss << "mUseHoistTryWaitForCustomMmaSchedule=" << options.mUseHoistTryWaitForCustomMmaSchedule << "," << std::endl;
     ss << "mUseDeepSeekFp8=" << options.mUseDeepSeekFp8 << "," << std::endl;
     ss << "mUsePerTokenSfA=" << options.mUsePerTokenSfA << "," << std::endl;
     ss << "mUsePerTokenSfB=" << options.mUsePerTokenSfB << "," << std::endl;
