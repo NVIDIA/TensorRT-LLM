@@ -287,6 +287,16 @@ def launchBuildJobs(pipeline) {
             arch: "arm64",
         ],
     ]
+    def dependencies = [
+        "Build NGC devel and release(x86_64)": [
+            "Build NGC devel(x86_64)",
+            "Build NGC release(x86_64)",
+        ],
+        "Build NGC devel and release(aarch64)": [
+            "Build NGC devel(aarch64)",
+            "Build NGC release(aarch64)",
+        ],
+    ]
     // Override all fields in build config with default values
     buildConfigs.each { key, config ->
         defaultConfig.each { defaultKey, defaultValue ->
@@ -311,8 +321,26 @@ def launchBuildJobs(pipeline) {
             }
         }]
     }
-    echo "Build jobs:"
-    println buildJobs
+    // 处理stage依赖关系
+    def parallelStages = [:]
+    
+    // 添加独立stage（不在依赖列表中的）
+    buildConfigs.keySet().findAll { stageName ->
+        !dependencies.values().flatten().contains(stageName)
+    }.each { stageName ->
+        parallelStages[stageName] = buildJobs[stageName]
+    }
+    
+    // 添加合并stage
+    dependencies.each { depName, depList ->
+        parallelStages[depName] = {
+            stage(depName) {
+                depList.each { stageName -> buildJobs[stageName]() }
+            }
+        }
+    }
+    
+    pipeline.parallel parallelStages
 
 }
 
@@ -359,94 +387,10 @@ pipeline {
                 }
             }
         }
-        stage("Build")
+        stage("Build") {
             steps{
                 script{
                     launchBuildJobs(this)
-                }
-            }
-        {
-            parallel {
-                stage("Build trtllm release") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("trtllm_x86_64", "push", "skip", "", LLM_BRANCH_TAG + "-x86_64")
-                    }
-                }
-                stage("Build trtllm release-sbsa") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build", "arm64")
-                    }
-                    steps
-                    {
-                        buildImage("trtllm_sbsa", "push", "skip", "", LLM_BRANCH_TAG + "-sbsa", "", true)
-                    }
-                }
-                stage("Build x86_64-skip") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("tritondevel", params.action, "skip")
-                    }
-                }
-                stage("Build SBSA-skip") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("agent")
-                    }
-                    steps
-                    {
-                        buildImage("tritondevel", params.action, "skip", "", "", "", true)
-                    }
-                }
-                stage("Build rockylinux8 x86_64-skip-py3.10") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.10.12 STAGE=tritondevel", "", "-py310")
-                    }
-                }
-                stage("Build rockylinux8 x86_64-skip-py3.12") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.12.3 STAGE=tritondevel", "", "-py312")
-                    }
-                }
-                stage("Build NGC x86_64") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("devel", params.action, "skip")
-                    }
-                }
-                stage("Build NGC SBSA") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build", "arm64")
-                    }
-                    steps
-                    {
-                        buildImage("devel", params.action, "skip", "", "", "", true)
-                    }
-                }
-                stage("Build NGC release x86_64") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("devel", params.action, "skip")
-                    }
                 }
             }
         }

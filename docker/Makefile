@@ -185,7 +185,7 @@ ubuntu22_%: BASE_TAG = 12.9.0-devel-ubuntu22.04
 trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0
 trtllm_x86_64_%: DEVEL_IMAGE = $(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
-trtllm_sbsa_%: DEVEL_IMAGE = $(shell grep 'LLM_SBSA_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
+trtllm_aarch64_%: DEVEL_IMAGE = $(shell grep 'LLM_SBSA_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 trtllm_%: IMAGE_NAME = $(shell grep 'IMAGE_NAME = ' ../jenkins/BuildDockerImage.groovy | grep -o '".*"' | tr -d '"')
 trtllm_%: IMAGE_TAG = $(shell git rev-parse --abbrev-ref HEAD | tr '/' '_')-$(PLATFORM)
 trtllm_run: WORK_DIR = /app/tensorrt_llm
