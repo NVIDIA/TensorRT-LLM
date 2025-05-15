@@ -87,7 +87,7 @@ def verify_waive_list(llm_src):
 
         # If the line starts with 'full:', process it
         if line.startswith("full:"):
-            line = line.split(":", 1)[1].lstrip("/")
+            line = line.split("/", 1)[1].lstrip("/")
 
         processed_lines.append(line)
 
