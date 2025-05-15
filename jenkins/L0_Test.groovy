@@ -1013,7 +1013,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             extraInternalEnv,
             "pytest",
             "-v",
-            "-s",
             "--timeout-method=thread",
             "--apply-test-list-correction",
             "--splitting-algorithm least_duration",
@@ -1124,7 +1123,7 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
         sh """
             ls -all ${stageName}/
             if ! grep -q '<testcase' ${stageName}/results.xml; then
-                rm ${stageName}/results.xml
+                rm ${stageName}/results.xml || true
             fi
         """
         def llmPath = sh (script: "realpath .", returnStdout: true).trim()
