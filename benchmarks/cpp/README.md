@@ -316,35 +316,8 @@ For detailed usage, you can do the following
 cd cpp/build
 
 # You can directly execute the binary for help information
-./benchmarks/gptSessionBenchmark --help
 ./benchmarks/bertBenchmark --help
 ```
-
-Take GPT-350M as an example for single GPU
-
-```
-./benchmarks/gptSessionBenchmark \
-    --engine_dir "../../benchmarks/gpt_350m/" \
-    --batch_size "1" \
-    --input_output_len "60,20"
-
-# Expected output:
-# [BENCHMARK] batch_size 1 input_length 60 output_length 20 latency(ms) 40.81
-```
-Take GPT-175B as an example for multiple GPUs
-```
-mpirun -n 8 ./benchmarks/gptSessionBenchmark \
-    --engine_dir "../../benchmarks/gpt_175b/" \
-    --batch_size "1" \
-    --input_output_len "60,20"
-
-# Expected output:
-# [BENCHMARK] batch_size 1 input_length 60 output_length 20 latency(ms) 792.14
-```
-
-If you want to obtain context and generation logits, you could build an enigne with `--gather_context_logits` and `--gather_generation_logits`, respectively. Enable `--gather_all_token_logits` will enable both of them.
-
-If you want to get the logits, you could run gptSessionBenchmark with `--print_all_logits`. This will print a large number of logit values and has a certain impact on performance.
 
 *Please note that the expected outputs in that document are only for reference, specific performance numbers depend on the GPU you're using.*
 

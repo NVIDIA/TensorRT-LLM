@@ -162,5 +162,4 @@ l0_a30:
       stage: post_merge
       backend: cpp
   tests:
-  - cpp/test_e2e.py::test_model[-gpt_session-80]
   - cpp/test_e2e.py::test_benchmarks[gpt-80]

@@ -144,16 +144,16 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.skip_device_not_contain(["H100"])
-    @pytest.mark.parametrize("overlap_scheduler", [False, True])
-    def test_auto_dtype(self, overlap_scheduler):
+    @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+    def test_auto_dtype(self, disable_overlap_scheduler):
         ctx_server_config = {
             "pytorch_backend_config": {
-                "enable_overlap_scheduler": False
+                "disable_overlap_scheduler": True
             }
         }
         gen_server_config = {
             "pytorch_backend_config": {
-                "enable_overlap_scheduler": overlap_scheduler
+                "disable_overlap_scheduler": disable_overlap_scheduler
             }
         }
         disaggregated_server_config = {

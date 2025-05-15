@@ -135,7 +135,6 @@ YOUR_DATA_PATH=<your dataset file following the format>
 
 cat >./extra-llm-api-config.yml<<EOF
 pytorch_backend_config:
-    enable_overlap_scheduler: true
     use_cuda_graph: true
     moe_backend: TRTLLM
 speculative_config:
@@ -218,7 +217,6 @@ pytorch_backend_config:
     - 256
     - 384
     print_iter_log: true
-    enable_overlap_scheduler: true
 enable_attention_dp: true
 EOF
 
@@ -260,7 +258,6 @@ YOUR_DATA_PATH=<your dataset file following the format>
 
 cat >./extra-llm-api-config.yml<<EOF
 pytorch_backend_config:
-    enable_overlap_scheduler: true
     use_cuda_graph: true
 speculative_config:
     decoding_type: MTP
@@ -314,7 +311,6 @@ pytorch_backend_config:
     use_cuda_graph: true
     cuda_graph_batch_sizes:
     - 128
-    enable_overlap_scheduler: true
 enable_attention_dp: true
 EOF
 

@@ -511,3 +511,38 @@ def fused_mla(
 ) -> torch.Tensor:
     v_head_dim = kv.shape[-1] - q_nope.shape[-1]
     return torch.empty_like(kv[..., -v_head_dim:])
+
+
+@torch.library.custom_op("deepseek::mla", mutates_args=())
+def mla(
+    q_nope: torch.Tensor,  # Down projected q_nope
+    q_pe: torch.Tensor,  # q_pe after applying rope
+    kv: torch.Tensor,  # compressed kv after passing through layernorm
+    pe: torch.Tensor,  # k_pe after applying rope
+    attention_mask: torch.Tensor,  # attention mask
+    softmax_scale: float,  # softmax scale
+) -> torch.Tensor:
+    """
+    Reference implementation for MLA style attention that handles compressed kv.
+    """
+    scores = (
+        torch.einsum("bhsc,btc->bsht", q_nope, kv) + torch.einsum("bhsr,btr->bsht", q_pe, pe)
+    ) * softmax_scale
+    if attention_mask is not None:
+        scores += attention_mask.unsqueeze(1)
+    scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(q_nope)
+    attn_output = torch.einsum("bsht,btc->bshc", scores, kv)
+    return attn_output
+
+
+@mla.register_fake
+def mla(
+    q_nope: torch.Tensor,  # Down projected q_nope
+    q_pe: torch.Tensor,  # q_pe after applying rope
+    kv: torch.Tensor,  # compressed kv after passing through layernorm
+    k_pe: torch.Tensor,  # k_pe after applying rope
+    attention_mask: torch.Tensor,  # attention mask
+    softmax_scale: float,  # softmax scale
+) -> torch.Tensor:
+    """MLA style attention that handles compressed kv."""
+    return torch.empty_like(q_nope)

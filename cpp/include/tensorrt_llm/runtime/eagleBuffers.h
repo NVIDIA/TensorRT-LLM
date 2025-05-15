@@ -67,6 +67,9 @@ public:
         //! [maxBatchSize, maxNumPaths, maxPathLen]
         //! or [numSequences, maxNumPaths, maxPathLen]
         TensorPtr draftPaths;
+        //! [maxBatchSize, maxNumPaths, maxPathLen]
+        //! or [numSequences, maxNumPaths, maxPathLen]
+        TensorPtr draftPathsHost;
         //! [maxBatchSize] or [numGenSequences]
         TensorPtr specDecodingGenerationLengths;
         //! [maxBatchSize] or [numGenSequences]

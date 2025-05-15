@@ -73,8 +73,11 @@ def buildImage(action, type)
             stage ("Perform '${action}' action on image") {
                 retry(3)
                 {
-                    sh "cd ${LLM_ROOT} && make -C docker ${stage_docker}_${action} IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${tag} TORCH_INSTALL_TYPE=${type} BUILD_TRITON=1" +
-                    " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
+                    sh """cd ${LLM_ROOT} && make -C docker ${stage_docker}_${action} \
+                        IMAGE_NAME=${IMAGE_NAME} \
+                        IMAGE_TAG=${tag} \
+                        TORCH_INSTALL_TYPE=${type} \
+                        GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"""
                 }
             }
         } catch (Exception ex) {

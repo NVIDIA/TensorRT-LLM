@@ -35,7 +35,6 @@ namespace tensorrt_llm::batch_manager
 {
 enum class TrtGptModelType
 {
-    V1,
     InflightBatching,
     InflightFusedBatching
 };

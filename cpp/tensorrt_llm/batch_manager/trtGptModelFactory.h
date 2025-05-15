@@ -23,7 +23,6 @@
 #include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include "trtGptModelInflightBatching.h"
-#include "trtGptModelV1.h"
 
 #include <NvInferPlugin.h>
 
@@ -68,20 +67,7 @@ public:
         TLLM_LOG_INFO("Rank %d is using GPU %d", rank, device);
         TLLM_CUDA_CHECK(cudaSetDevice(device));
 
-        if (modelType == TrtGptModelType::V1)
-        {
-            TLLM_LOG_WARNING(
-                "TrtGptModelType::V1 is deprecated and will be removed in a future release."
-                " Please use TrtGptModelType::InflightBatching or TrtGptModelType::InflightFusedBatching instead.");
-
-            TrtGptModelOptionalParams const& fixedOptionalParams
-                = TrtGptModelV1::optionalParamsAreValid(modelConfig, optionalParams)
-                ? optionalParams
-                : TrtGptModelV1::fixOptionalParams(modelConfig, optionalParams);
-            return std::make_shared<TrtGptModelV1>(logger, modelConfig, worldConfig, rawEngine, fixedOptionalParams);
-        }
-        else if ((modelType == TrtGptModelType::InflightBatching)
-            || (modelType == TrtGptModelType::InflightFusedBatching))
+        if ((modelType == TrtGptModelType::InflightBatching) || (modelType == TrtGptModelType::InflightFusedBatching))
         {
             TrtGptModelOptionalParams const& fixedOptionalParams
                 = TrtGptModelInflightBatching::optionalParamsAreValid(modelConfig, optionalParams)
@@ -90,10 +76,8 @@ public:
             return std::make_shared<TrtGptModelInflightBatching>(logger, modelConfig, worldConfig, rawEngine,
                 (modelType == TrtGptModelType::InflightFusedBatching), fixedOptionalParams);
         }
-        else
-        {
-            throw std::runtime_error("Invalid modelType in trtGptModelFactory");
-        }
+
+        throw std::runtime_error("Invalid modelType in trtGptModelFactory");
     }
 
 private:

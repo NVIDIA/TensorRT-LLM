@@ -35,8 +35,8 @@ linuxPkgName = ( env.targetArch == AARCH64_TRIPLE ? "tensorrt-llm-sbsa-release-s
 // available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
 // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
 LLM_DOCKER_IMAGE = env.dockerImage
-LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py310-trt10.10.0.31-skip-tritondevel-202505121727-4049"
-LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py312-trt10.10.0.31-skip-tritondevel-202505121727-4049"
+LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
+LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 
 // DLFW torch image
 DLFW_IMAGE = "nvcr.io/nvidia/pytorch:25.04-py3"
@@ -481,7 +481,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     claimName: sw-tensorrt-pvc
     """
     if (arch == "arm64") {
-        // WAR: PVC mount is not setup on aarch64 platform, use nfs as a WAR
+        // PVC mount isn't supported on aarch64 platform. Use NFS as a WAR.
         pvcVolume = """
                 - name: sw-tensorrt-pvc
                   nfs:
@@ -1147,8 +1147,6 @@ def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, whe
     sh "ccache -sv"
     sh "cat ${CCACHE_DIR}/ccache.conf"
     sh "bash -c 'pip3 show tensorrt || true'"
-
-    // If the image is pre-installed with cxx11-abi pytorch, using non-cxx11-abi requires reinstallation.
     if (reinstall_dependencies == true) {
         sh "#!/bin/bash \n" + "pip3 uninstall -y torch"
         sh "#!/bin/bash \n" + "yum remove -y libcudnn*"
@@ -1207,10 +1205,9 @@ def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, whe
     }
     buildArgs = "--clean"
     if (cpu_arch == AARCH64_TRIPLE) {
-        buildArgs = "-a '90-real;100-real;120-real'"
-    } else if  (reinstall_dependencies == true) {
-        buildArgs = "-a '80-real;86-real;89-real;90-real'"
+        buildArgs += " -a '90-real;100-real;120-real'"
     }
+
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${buildArgs}")
     }
@@ -1470,7 +1467,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     docBuildSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10")
     docBuildConfigs = [
-        "A10-Build_TRT-LLM_Doc": [docBuildSpec, {
+        "A10-Build_Docs": [docBuildSpec, {
             sh "rm -rf **/*.xml *.tar.gz"
             runLLMDocBuild(pipeline, config=VANILLA_CONFIG)
         }],
@@ -1488,52 +1485,62 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         }
     }]]}
 
+    // Python version and OS for sanity check
     sanityCheckConfigs = [
-        "DLFW": [
-            LLM_DOCKER_IMAGE,
+        "PY312-DLFW": [
+            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
             "B200_PCIe",
             X86_64_TRIPLE,
-            false,
-            "cxx11/",
+            true,
+            "dlfw/",
             DLFW_IMAGE,
+            false,
         ],
-        "manylinux-py310": [
+        "PY310-UB2204": [
             LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
             "A10",
             X86_64_TRIPLE,
             true,
             "",
             UBUNTU_22_04_IMAGE,
+            false,
         ],
-        "manylinux-py312": [
+        "PY312-UB2404": [
             LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
-            "A10",
+            "RTX5090",
             X86_64_TRIPLE,
             true,
             "",
             UBUNTU_24_04_IMAGE,
+            true, // Extra PyTorch CUDA 12.8 install
         ],
     ]
 
-    def toStageName = { gpuType, key -> "${gpuType}-PackageSanityCheck-${key}".toString() }
-
-    fullSet += sanityCheckConfigs.collectEntries{ key, values -> [toStageName(values[1], key), null] }.keySet()
-
     if (env.targetArch == AARCH64_TRIPLE) {
         sanityCheckConfigs = [
-            "DLFW": [
+            "PY312-UB2404": [
                 LLM_DOCKER_IMAGE,
                 "GH200",
                 AARCH64_TRIPLE,
                 false,
                 "",
-                // TODO: Change to UBUNTU_24_04_IMAGE after https://nvbugs/5161461 is fixed
+                UBUNTU_24_04_IMAGE,
+                true, // Extra PyTorch CUDA 12.8 install
+            ],
+            "PY312-DLFW": [
+                LLM_DOCKER_IMAGE,
+                "GH200",
+                AARCH64_TRIPLE,
+                false,
+                "dlfw/",
                 DLFW_IMAGE,
+                false,
             ],
         ]
     }
 
-    fullSet += [toStageName("GH200", "DLFW")]
+    def toStageName = { gpuType, key -> "${gpuType}-PackageSanityCheck-${key}".toString() }
+    fullSet += sanityCheckConfigs.collectEntries{ key, values -> [toStageName(values[1], key), null] }.keySet()
 
     sanityCheckJobs = sanityCheckConfigs.collectEntries {key, values -> [toStageName(values[1], key), {
         cacheErrorAndUploadResult(toStageName(values[1], key), {
@@ -1541,6 +1548,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             def gpu_type = values[1].toLowerCase()
             if (values[1] == "B200_PCIe") {
                 gpu_type = "b100-ts2"
+            }
+            if (values[1] == "RTX5090") {
+                gpu_type = "rtx-5090"
             }
 
             def k8s_arch = "amd64"
@@ -1563,7 +1573,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             def wheelName = ""
             def cpver = "cp312"
             def pyver = "3.12"
-            if (key.contains("py310")) {
+            if (key.contains("PY310")) {
                 cpver = "cp310"
                 pyver = "3.10"
             }
@@ -1607,10 +1617,13 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
-                        if ((values[5] != DLFW_IMAGE) && (cpu_arch == AARCH64_TRIPLE)) {
-                            echo "###### Extra prerequisites on aarch64 Start ######"
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.6.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126")
+
+                        // Extra PyTorch CUDA 12.8 install
+                        if (values[6]) {
+                            echo "###### Extra PyTorch CUDA 12.8 install Start ######"
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128")
                         }
+
                         def libEnv = []
                         if (env.alternativeTRT) {
                             stage("Replace TensorRT") {

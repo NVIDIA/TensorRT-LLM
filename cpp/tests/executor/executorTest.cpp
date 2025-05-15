@@ -571,7 +571,7 @@ using ParamType = std::tuple<bool, bool, int>;
 using ParamCancelReqType = std::tuple<bool, bool, int, int, std::string>;
 using LeaderApiUsageType = std::tuple<bool, std::string>;
 using ParamStatsType = std::tuple<int, bool>;
-using AllParamsType = std::tuple<BatchingType, bool, int, bool, bool, bool, bool, std::string, bool, bool, int>;
+using AllParamsType = std::tuple<bool, int, bool, bool, bool, bool, std::string, bool, bool, int>;
 using LogitsProcParamsType = std::tuple<std::string, bool, bool>;
 using GuidedDecodingParamsType = std::tuple<std::string>;
 using TimeoutTestParamsType = std ::tuple<std::string, bool, int>;
@@ -702,26 +702,18 @@ std::string generateTestNameStats(testing::TestParamInfo<ParamStatsType> const& 
 
 std::string generateTestNameAllParams(testing::TestParamInfo<AllParamsType> const& info)
 {
-    auto const batchingType = std::get<0>(info.param);
-    auto const streaming = std::get<1>(info.param);
-    auto const& beamWidth = std::get<2>(info.param);
-    auto const& computeLogProbs = std::get<3>(info.param);
-    auto const& excludeInputInOutput = std::get<4>(info.param);
-    auto const& returnContextLogits = std::get<5>(info.param);
-    auto const& returnGenerationLogits = std::get<6>(info.param);
-    auto const modelName = std::get<7>(info.param);
-    auto const& useOrchestratorMode = std::get<8>(info.param);
-    auto const& returnAllGeneratedTokens = std::get<9>(info.param);
-    auto const& numReturnSequences = std::get<10>(info.param);
+    auto const streaming = std::get<0>(info.param);
+    auto const& beamWidth = std::get<1>(info.param);
+    auto const& computeLogProbs = std::get<2>(info.param);
+    auto const& excludeInputInOutput = std::get<3>(info.param);
+    auto const& returnContextLogits = std::get<4>(info.param);
+    auto const& returnGenerationLogits = std::get<5>(info.param);
+    auto const modelName = std::get<6>(info.param);
+    auto const& useOrchestratorMode = std::get<7>(info.param);
+    auto const& returnAllGeneratedTokens = std::get<8>(info.param);
+    auto const& numReturnSequences = std::get<9>(info.param);
 
     std::string name = "ExecutorTest_";
-
-    switch (batchingType)
-    {
-    case BatchingType::kSTATIC: name.append("Static"); break;
-    case BatchingType::kINFLIGHT: name.append("Ifb"); break;
-    default: name.append("DefaultModel"); break;
-    }
 
     if (streaming)
     {
@@ -1913,8 +1905,8 @@ namespace
 
 void runTest(Executor& executor, fs::path const& inputPath, ModelIds const& modelIds,
     FlakyTestInfo const& flakyTestInfo, bool streaming, SizeType32 const vocabSizePadded, BeamResult const& beamResult,
-    OutputConfig const& outConfig, bool isSpeculativeDecoding, int maxWaitMs, BatchingType batchingType,
-    bool returnAllGeneratedTokens, SizeType32 const numReturnSequences, bool isNonGreedySampling)
+    OutputConfig const& outConfig, bool isSpeculativeDecoding, int maxWaitMs, bool returnAllGeneratedTokens,
+    SizeType32 const numReturnSequences, bool isNonGreedySampling)
 {
     auto const beamWidth = beamResult.beamWidth;
 
@@ -2017,7 +2009,7 @@ void runTest(Executor& executor, fs::path const& inputPath, ModelIds const& mode
 
                         reqTokens.insert(reqTokens.end(), newTokens.begin(), newTokens.end());
                         // FinishReason is only supported for bw=1 and inflight batching.
-                        if (beamWidth == 1 && batchingType == BatchingType::kINFLIGHT)
+                        if (beamWidth == 1)
                         {
                             EXPECT_EQ(result.finishReasons.at(beam),
                                 result.isSequenceFinal ? FinishReason::kLENGTH : FinishReason::kNOT_FINISHED);
@@ -2035,11 +2027,11 @@ void runTest(Executor& executor, fs::path const& inputPath, ModelIds const& mode
                             givenInputLengths.at(batchId), beamWidth, beamTokens, cumLogProbs, logProbs, batchId,
                             flakyTestInfo);
                         testData.validateContextLogits(outConfig.returnContextLogits, givenInputLengths.at(batchId),
-                            beamWidth, contextLogits, vocabSizePadded, batchId, batchingType);
+                            beamWidth, contextLogits, vocabSizePadded, batchId);
                         testData.validateGenerationLogits(outConfig.returnGenerationLogits, result.isSequenceFinal,
                             streaming, outConfig.excludeInputFromOutput, givenInputLengths.at(batchId),
                             reqMaxNewTokens.at(batchId), beamWidth, beamTokens, genLogits, vocabSizePadded, batchId,
-                            batchingType, returnAllGeneratedTokens);
+                            returnAllGeneratedTokens);
                     }
 
                     // Ignore first iteration as it doesn't use draft tokens
@@ -2079,12 +2071,11 @@ void runTest(fs::path const& modelPath, ExecutorConfig const& executorConfig, fs
     auto executor = Executor{modelPath, ModelType::kDECODER_ONLY, executorConfig};
 
     runTest(executor, inputPath, modelIds, flakyTestInfo, streaming, vocabSizePadded, beamResult, outConfig,
-        isSpeculativeDecoding, maxWaitMs, executorConfig.getBatchingType(), returnAllGeneratedTokens,
-        numReturnSequences, isNonGreedySampling);
+        isSpeculativeDecoding, maxWaitMs, returnAllGeneratedTokens, numReturnSequences, isNonGreedySampling);
 }
 
-ExecutorConfig createExecutorConfig(BatchingType batchingType, SizeType32 maxBeamWidth, bool useOrchestratorMode,
-    bool gatherGenerationLogits, std::optional<std::vector<SizeType32>> deviceIds = std::nullopt,
+ExecutorConfig createExecutorConfig(SizeType32 maxBeamWidth, bool useOrchestratorMode, bool gatherGenerationLogits,
+    std::optional<std::vector<SizeType32>> deviceIds = std::nullopt,
     std::optional<std::vector<SizeType32>> participantIds = std::nullopt)
 {
     // Note: we reduce memory fraction for cases that return context/generation logits which require more free
@@ -2092,7 +2083,6 @@ ExecutorConfig createExecutorConfig(BatchingType batchingType, SizeType32 maxBea
     FloatType constexpr freeGpuMemoryFraction{0.5F};
     KvCacheConfig kvCacheConfig(false, std::nullopt, std::nullopt, std::nullopt, freeGpuMemoryFraction);
     auto executorConfig = ExecutorConfig(maxBeamWidth);
-    executorConfig.setBatchingType(batchingType);
     executorConfig.setKvCacheConfig(kvCacheConfig);
     executorConfig.setNormalizeLogProbs(false);
     executorConfig.setGatherGenerationLogits(gatherGenerationLogits);
@@ -2114,22 +2104,17 @@ ExecutorConfig createExecutorConfig(BatchingType batchingType, SizeType32 maxBea
 
 TEST_P(AllParamsTest, TokenComparison)
 {
-    auto const batchingType = std::get<0>(GetParam());
-    auto const streaming = std::get<1>(GetParam());
-    auto const& beamWidth = std::get<2>(GetParam());
+    auto const streaming = std::get<0>(GetParam());
+    auto const& beamWidth = std::get<1>(GetParam());
     OutputConfig outConfig;
-    outConfig.returnLogProbs = std::get<3>(GetParam());
-    outConfig.excludeInputFromOutput = std::get<4>(GetParam());
-    outConfig.returnContextLogits = std::get<5>(GetParam());
-    outConfig.returnGenerationLogits = std::get<6>(GetParam());
-    auto const modelName = std::get<7>(GetParam());
-    auto const useOrchestratorMode = std::get<8>(GetParam());
-    auto const returnAllGeneratedTokens = std::get<9>(GetParam());
-    auto const numReturnSequences = std::get<10>(GetParam());
-    if (returnAllGeneratedTokens && batchingType == BatchingType::kSTATIC)
-    {
-        GTEST_SKIP() << "Test does not support returnAllGeneratedTokens with static batching";
-    }
+    outConfig.returnLogProbs = std::get<2>(GetParam());
+    outConfig.excludeInputFromOutput = std::get<3>(GetParam());
+    outConfig.returnContextLogits = std::get<4>(GetParam());
+    outConfig.returnGenerationLogits = std::get<5>(GetParam());
+    auto const modelName = std::get<6>(GetParam());
+    auto const useOrchestratorMode = std::get<7>(GetParam());
+    auto const returnAllGeneratedTokens = std::get<8>(GetParam());
+    auto const numReturnSequences = std::get<9>(GetParam());
     if (returnAllGeneratedTokens && !streaming)
     {
         GTEST_SKIP() << "Test does not support returnAllGeneratedTokens without streaming";
@@ -2137,10 +2122,6 @@ TEST_P(AllParamsTest, TokenComparison)
     if (returnAllGeneratedTokens && outConfig.returnLogProbs)
     {
         GTEST_SKIP() << "Skip returnAllGeneratedTokens with outConfig.returnLogProbs to reduce number of tests";
-    }
-    if (numReturnSequences > 1 && batchingType == BatchingType::kSTATIC)
-    {
-        GTEST_SKIP() << "Test does not support numReturnSequences with static batching";
     }
 
     std::optional<std::vector<SizeType32>> participantIds = std::nullopt;
@@ -2261,18 +2242,8 @@ TEST_P(AllParamsTest, TokenComparison)
             modelPath = GLM_MODEL_PATH;
         }
         resultsPath /= (beamWidth == 1) ? "sampling" : "beam_search_" + std::to_string(beamWidth);
-        if (batchingType == BatchingType::kSTATIC)
-        {
-            ModelSpec modelSpec{"input_tokens.npy", nvinfer1::DataType::kHALF};
-            modelSpec.useGptAttentionPlugin();
-            beamResult.resultsFile = resultsPath / modelSpec.getResultsFile();
-            modelPath /= modelSpec.getModelPath() + "/tp1-pp1-cp1-gpu";
-        }
-        else
-        {
-            beamResult.resultsFile = resultsPath / PathUtil::FP16_PLUGIN_PACKED_PAGED_RESULT_FILE();
-            modelPath = modelPath / PathUtil::FP16_GPT_ATTENTION_PACKED_PAGED_DIR() / "tp1-pp1-cp1-gpu";
-        }
+        beamResult.resultsFile = resultsPath / PathUtil::FP16_PLUGIN_PACKED_PAGED_RESULT_FILE();
+        modelPath = modelPath / PathUtil::FP16_GPT_ATTENTION_PACKED_PAGED_DIR() / "tp1-pp1-cp1-gpu";
 
         char versionChatglm{0};
         if (size_t index = modelPath.string().find("chatglm"); index != std::string::npos)
@@ -2386,8 +2357,8 @@ TEST_P(AllParamsTest, TokenComparison)
         mMaxWaitMs = 20000;
     }
 
-    auto executorConfig = createExecutorConfig(batchingType, beamWidth, useOrchestratorMode,
-        outConfig.returnGenerationLogits, std::move(deviceIds), std::move(participantIds));
+    auto executorConfig = createExecutorConfig(beamWidth, useOrchestratorMode, outConfig.returnGenerationLogits,
+        std::move(deviceIds), std::move(participantIds));
 
     runTest(modelPath, executorConfig, inputPath, modelIds, flakyTestInfo, streaming, vocabSizePadded, beamResult,
         outConfig, isSpeculativeDecoding, mMaxWaitMs, returnAllGeneratedTokens, numReturnSequences, false);
@@ -2491,7 +2462,7 @@ void doTokenComparisonChangeBeamWidth(bool enableReuse, SizeType32 maxWaitMs)
         beamResult.genLogitsFile = resultsPath / PathUtil::FP16_PLUGIN_PACKED_PAGED_GENERATION_LOGITS_FILE();
 
         runTest(executor, inputPath, modelIds, flakyTestInfo, streaming, vocabSizePadded, beamResult, outConfig,
-            isSpeculativeDecoding, maxWaitMs, executorConfig.getBatchingType(), false, 1, false);
+            isSpeculativeDecoding, maxWaitMs, false, 1, false);
     }
 }
 
@@ -2533,7 +2504,7 @@ TEST_F(GptExecutorTest, NReturnRandomness)
     beamResult.genLogitsFile = resultsPath / PathUtil::FP16_PLUGIN_PACKED_PAGED_GENERATION_LOGITS_FILE();
 
     runTest(executor, inputPath, modelIds, flakyTestInfo, streaming, vocabSizePadded, beamResult, outConfig,
-        isSpeculativeDecoding, mMaxWaitMs, executorConfig.getBatchingType(), false, 1, true);
+        isSpeculativeDecoding, mMaxWaitMs, false, 1, true);
 }
 
 TEST_F(GptExecutorTest, TimedOut)
@@ -4501,65 +4472,125 @@ INSTANTIATE_TEST_SUITE_P(LlamaExecutorTest, LeaderApiUsageTest,
     generateTestNameLeaderApiUsage);
 
 INSTANTIATE_TEST_SUITE_P(GptExecutorTest, AllParamsTest,
-    testing::Combine(testing::Values(BatchingType::kSTATIC, BatchingType::kINFLIGHT), testing::Values(false, true),
-        testing::Values(1, 2), testing::Values(false, true), testing::Values(false, true), testing::Values(false, true),
-        testing::Values(false, true), testing::Values("gpt"), testing::Values(false, true),
-        testing::Values(false, true), testing::Values(1, 2)),
+    testing::Combine(                 //
+        testing::Values(false, true), // streaming
+        testing::Values(1, 2),        // beamWidth
+        testing::Values(false, true), // computeLogProbs
+        testing::Values(false, true), // excludeInputInOutput
+        testing::Values(false, true), // returnContextLogits
+        testing::Values(false, true), // returnGenerationLogits
+        testing::Values("gpt"),       // modelName
+        testing::Values(false, true), // useOrchestratorMode
+        testing::Values(false, true), // returnAllGeneratedTokens
+        testing::Values(1, 2)         // numReturnSequences
+        ),
     generateTestNameAllParams);
 
 INSTANTIATE_TEST_SUITE_P(LlamaExecutorTest, AllParamsTest,
-    testing::Combine(testing::Values(BatchingType::kINFLIGHT), testing::Values(false, true), testing::Values(1, 2),
-        testing::Values(false, true), testing::Values(false, true), testing::Values(false, true),
-        testing::Values(false, true), testing::Values("llama_tp1_pp4_cp1", "llama_tp4_pp1_cp1", "llama_tp2_pp2_cp1"),
-        testing::Values(false, true), testing::Values(false), testing::Values(1)),
+    testing::Combine(                                                                   //
+        testing::Values(false, true),                                                   // streaming
+        testing::Values(1, 2),                                                          // beamWidth
+        testing::Values(false, true),                                                   // computeLogProbs
+        testing::Values(false, true),                                                   // excludeInputInOutput
+        testing::Values(false, true),                                                   // returnContextLogits
+        testing::Values(false, true),                                                   // returnGenerationLogits
+        testing::Values("llama_tp1_pp4_cp1", "llama_tp4_pp1_cp1", "llama_tp2_pp2_cp1"), // modelName
+        testing::Values(false, true),                                                   // useOrchestratorMode
+        testing::Values(false),                                                         // returnAllGeneratedTokens
+        testing::Values(1)                                                              // numReturnSequences
+        ),
     generateTestNameAllParams);
 
 INSTANTIATE_TEST_SUITE_P(LlamaMultiExecutorTest, AllParamsTest,
-    testing::Combine(testing::Values(BatchingType::kINFLIGHT), testing::Values(false, true), testing::Values(1, 2),
-        testing::Values(false), testing::Values(false, true), testing::Values(false), testing::Values(false),
-        testing::Values("llama_tp1_pp2_cp1"), testing::Values(false), testing::Values(false), testing::Values(1)),
+    testing::Combine(                         //
+        testing::Values(false, true),         // streaming
+        testing::Values(1, 2),                // beamWidth
+        testing::Values(false),               // computeLogProbs
+        testing::Values(false, true),         // excludeInputInOutput
+        testing::Values(false),               // returnContextLogits
+        testing::Values(false),               // returnGenerationLogits
+        testing::Values("llama_tp1_pp2_cp1"), // modelName
+        testing::Values(false),               // useOrchestratorMode
+        testing::Values(false),               // returnAllGeneratedTokens
+        testing::Values(1)                    // numReturnSequences
+        ),
     generateTestNameAllParams);
 
 INSTANTIATE_TEST_SUITE_P(MedusaExecutorTest, AllParamsTest,
-    testing::Combine(testing::Values(BatchingType::kINFLIGHT), // batchingType
-        testing::Values(false, true),                          // streaming
-        testing::Values(1),                                    // beamWidth
-        testing::Values(false),                                // computeLogProbs
-        testing::Values(false, true),                          // excludeInputInOutput
-        testing::Values(false),                                // returnContextLogits
-        testing::Values(false),                                // returnGenerationLogits
-        testing::Values("medusa"),                             // modelName
-        testing::Values(false, true),                          // useOrchestratorMode
-        testing::Values(false),                                // returnAllGeneratedTokens
-        testing::Values(1)                                     // numReturnSequences
+    testing::Combine(                 //
+        testing::Values(false, true), // streaming
+        testing::Values(1),           // beamWidth
+        testing::Values(false),       // computeLogProbs
+        testing::Values(false, true), // excludeInputInOutput
+        testing::Values(false),       // returnContextLogits
+        testing::Values(false),       // returnGenerationLogits
+        testing::Values("medusa"),    // modelName
+        testing::Values(false, true), // useOrchestratorMode
+        testing::Values(false),       // returnAllGeneratedTokens
+        testing::Values(1)            // numReturnSequences
         ),
     generateTestNameAllParams);
 
 // Disable some of ChatGLM's tests since they are the same as gpt's.
 INSTANTIATE_TEST_SUITE_P(ChatGlmExecutorTest, AllParamsTest,
-    testing::Combine(testing::Values(BatchingType::kSTATIC, BatchingType::kINFLIGHT), testing::Values(false),
-        testing::Values(1, 2), testing::Values(false), testing::Values(false), testing::Values(false),
-        testing::Values(false), testing::Values("chatglm"), testing::Values(false), testing::Values(false),
-        testing::Values(1, 2)),
+    testing::Combine(               //
+        testing::Values(false),     // streaming
+        testing::Values(1, 2),      // beamWidth
+        testing::Values(false),     // computeLogProbs
+        testing::Values(false),     // excludeInputInOutput
+        testing::Values(false),     // returnContextLogits
+        testing::Values(false),     // returnGenerationLogits
+        testing::Values("chatglm"), // modelName
+        testing::Values(false),     // useOrchestratorMode
+        testing::Values(false),     // returnAllGeneratedTokens
+        testing::Values(1, 2)       // numReturnSequences
+        ),
     generateTestNameAllParams);
 
 // ChatGlm0 Test is for glm-10b.
 INSTANTIATE_TEST_SUITE_P(ChatGlm0ExecutorTest, AllParamsTest,
-    testing::Combine(testing::Values(BatchingType::kINFLIGHT), testing::Values(false), testing::Values(1),
-        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false),
-        testing::Values("glm"), testing::Values(false), testing::Values(false), testing::Values(1)),
+    testing::Combine(           //
+        testing::Values(false), // streaming
+        testing::Values(1),     // beamWidth
+        testing::Values(false), // computeLogProbs
+        testing::Values(false), // excludeInputInOutput
+        testing::Values(false), // returnContextLogits
+        testing::Values(false), // returnGenerationLogits
+        testing::Values("glm"), // modelName
+        testing::Values(false), // useOrchestratorMode
+        testing::Values(false), // returnAllGeneratedTokens
+        testing::Values(1)      // numReturnSequences
+        ),
     generateTestNameAllParams);
 
 INSTANTIATE_TEST_SUITE_P(ChatGlm2ExecutorTest, AllParamsTest,
-    testing::Combine(testing::Values(BatchingType::kSTATIC), testing::Values(false), testing::Values(1),
-        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false),
-        testing::Values("chatglm2"), testing::Values(false), testing::Values(false), testing::Values(1)),
+    testing::Combine(                //
+        testing::Values(false),      // streaming
+        testing::Values(1),          // beamWidth
+        testing::Values(false),      // computeLogProbs
+        testing::Values(false),      // excludeInputInOutput
+        testing::Values(false),      // returnContextLogits
+        testing::Values(false),      // returnGenerationLogits
+        testing::Values("chatglm2"), // modelName
+        testing::Values(false),      // useOrchestratorMode
+        testing::Values(false),      // returnAllGeneratedTokens
+        testing::Values(1)           // numReturnSequences
+        ),
     generateTestNameAllParams);
 
 INSTANTIATE_TEST_SUITE_P(ChatGlm3ExecutorTest, AllParamsTest,
-    testing::Combine(testing::Values(BatchingType::kSTATIC), testing::Values(false), testing::Values(1),
-        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false),
-        testing::Values("chatglm3"), testing::Values(false), testing::Values(false), testing::Values(1)),
+    testing::Combine(                //
+        testing::Values(false),      // streaming
+        testing::Values(1),          // beamWidth
+        testing::Values(false),      // computeLogProbs
+        testing::Values(false),      // excludeInputInOutput
+        testing::Values(false),      // returnContextLogits
+        testing::Values(false),      // returnGenerationLogits
+        testing::Values("chatglm3"), // modelName
+        testing::Values(false),      // useOrchestratorMode
+        testing::Values(false),      // returnAllGeneratedTokens
+        testing::Values(1)           // numReturnSequences
+        ),
     generateTestNameAllParams);
 
 INSTANTIATE_TEST_SUITE_P(LlamaExecutorTest, LogitsProcParamsTest,

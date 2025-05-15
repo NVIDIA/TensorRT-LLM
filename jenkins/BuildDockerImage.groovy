@@ -137,7 +137,6 @@ def buildImage(target, action="build", torchInstallType="skip", args="", custom_
                   TORCH_INSTALL_TYPE=${torchInstallType} \
                   IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${tag} \
                   BUILD_WHEEL_OPTS='-j ${BUILD_JOBS}' ${args} \
-                  BUILD_TRITON=1 \
                   GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote
                   """
                 }
@@ -150,7 +149,6 @@ def buildImage(target, action="build", torchInstallType="skip", args="", custom_
                   TORCH_INSTALL_TYPE=${torchInstallType} \
                   IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${custom_tag} \
                   BUILD_WHEEL_OPTS='-j ${BUILD_JOBS}' ${args} \
-                  BUILD_TRITON=1 \
                   GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote
                   """
                }
@@ -299,25 +297,24 @@ pipeline {
                         triggerSBSARemoteJob(params.action, "skip")
                     }
                 }
-                // Waived due to a pytorch issue: https://github.com/pytorch/pytorch/issues/141083
-                // stage("Build SBSA-pre_cxx11_abi") {
-                //     agent {
-                //         kubernetes createKubernetesPodConfig("agent")
-                //     }
-                //     steps
-                //     {
-                //         triggerSBSARemoteJob(params.action, "src_non_cxx11_abi")
-                //     }
-                // }
-                // stage("Build SBSA-cxx11_abi") {
-                //     agent {
-                //         kubernetes createKubernetesPodConfig("agent")
-                //     }
-                //     steps
-                //     {
-                //         triggerSBSARemoteJob(params.action, "src_cxx11_abi")
-                //     }
-                // }
+                stage("Build SBSA-pre_cxx11_abi") {
+                    agent {
+                        kubernetes createKubernetesPodConfig("agent")
+                    }
+                    steps
+                    {
+                        triggerSBSARemoteJob(params.action, "src_non_cxx11_abi")
+                    }
+                }
+                stage("Build SBSA-cxx11_abi") {
+                    agent {
+                        kubernetes createKubernetesPodConfig("agent")
+                    }
+                    steps
+                    {
+                        triggerSBSARemoteJob(params.action, "src_cxx11_abi")
+                    }
+                }
             }
         }
     } // stages

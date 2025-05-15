@@ -6,6 +6,7 @@ import platform
 import signal
 import subprocess
 import sys
+import tempfile
 
 import psutil
 
@@ -154,7 +155,16 @@ def call(*popenargs,
          **kwargs):
     if not suppress_output_info:
         print(f"Start subprocess with call({popenargs}, {kwargs})")
-    with Popen(*popenargs, start_new_session=start_new_session, **kwargs) as p:
+
+    running_log = None
+    if "running_log" in kwargs:
+        if isinstance(kwargs["running_log"], tempfile._TemporaryFileWrapper):
+            running_log = kwargs["running_log"]
+        kwargs.pop("running_log", 'Not Found')
+    with Popen(*popenargs,
+               start_new_session=start_new_session,
+               stdout=running_log,
+               **kwargs) as p:
         try:
             retcode = p.wait(timeout=timeout)
             if retcode and start_new_session:

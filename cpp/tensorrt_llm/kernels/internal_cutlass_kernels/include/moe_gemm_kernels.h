@@ -211,10 +211,32 @@ struct TmaWarpSpecializedGroupedGemmInput
     LayoutScalingFactorsA* fp4_block_scaling_factors_stride_A = nullptr;
     LayoutScalingFactorsB* fp4_block_scaling_factors_stride_B = nullptr;
 
+    struct INT4GroupwiseParams
+    {
+        constexpr static int group_size = 128; // Unused, hard-coded to 128
+        bool enabled = false;
+        using SFA = __nv_bfloat16;
+        using SFB = __nv_bfloat16;
+        using ProblemShapeInt = cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
+        using LayoutSFA = typename cutlass::layout::ColumnMajor;
+        using LayoutSFB = typename cutlass::layout::ColumnMajor;        // Unused
+        using StrideSFA = cute::Stride<cute::Int<1>, int64_t, int64_t>;
+        using StrideSFB = cute::Stride<cute::Int<1>, int64_t, int64_t>; // Unused
+        StrideSFA* stride_s_a = nullptr;
+        StrideSFB* stride_s_b = nullptr;                                // Unused
+        const SFA** ptr_s_a = nullptr;
+        const SFA** ptr_z_a = nullptr;                                  // Unused
+        const SFB** ptr_s_b = nullptr;                                  // Unused
+        const SFB** ptr_z_b = nullptr;                                  // Unused
+        ProblemShapeInt shape{};
+    };
+
+    INT4GroupwiseParams int4_groupwise_params;
+
     uint8_t* gemm_workspace = nullptr;
     size_t gemm_workspace_size = 0;
 
-    static std::array<size_t, 14> workspaceBuffers(int num_experts);
+    static std::array<size_t, 17> workspaceBuffers(int num_experts);
 
     static size_t workspaceSize(int num_experts);
 
@@ -248,9 +270,13 @@ public:
     MoeGemmRunner();
 
 #if defined(ENABLE_FP8)
-    static constexpr bool use_fp8 = std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, __nv_fp8_e5m2>;
+    static constexpr bool use_fp8 = (std::is_same_v<T, __nv_fp8_e4m3>
+        || std::is_same_v<T, __nv_fp8_e5m2>) &&!std::is_same_v<WeightType, cutlass::uint4b_t>;
+    static constexpr bool use_w4afp8
+        = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, cutlass::uint4b_t>;
 #else
     static constexpr bool use_fp8 = false;
+    static constexpr bool use_w4afp8 = false;
 #endif
 
 #if defined(ENABLE_FP4)

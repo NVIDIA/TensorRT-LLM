@@ -9,7 +9,7 @@ context_servers:
   pipeline_parallel_size: 1
   pytorch_backend_config:
     use_cuda_graph: False
-    enable_overlap_scheduler: False
+    disable_overlap_scheduler: True
   urls:
       - "localhost:8001"
 generation_servers:
@@ -18,6 +18,6 @@ generation_servers:
   pipeline_parallel_size: 1
   pytorch_backend_config:
     use_cuda_graph: True
-    enable_overlap_scheduler: True
+    disable_overlap_scheduler: False
   urls:
       - "localhost:8002"

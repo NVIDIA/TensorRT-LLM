@@ -16,11 +16,15 @@
 
 #pragma once
 
-#include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+
+namespace tensorrt_llm::kernels
+{
+class KVCacheIndex;
+} // namespace tensorrt_llm::kernels
 
 namespace tensorrt_llm::runtime::kernels
 {
@@ -39,33 +43,9 @@ void invokeGatherBatch(IBuffer& buffer, IBuffer const& values, IBuffer const& sl
 void invokeCopyBatch(IBuffer const& srcBuffer, IBuffer& dstBuffer, IBuffer const& srcOffsets, IBuffer const& dstOffsets,
     IBuffer const& sizes, std::size_t maxStride, CudaStream const& stream);
 
-template <typename T>
-void invokeAdd(IBuffer& buffer, T value, CudaStream const& stream);
-
-void reduce(IBuffer& output, IBuffer const& input, CudaStream const& stream);
-
-void invokeTransposeWithOutputOffset(
-    ITensor& output, ITensor const& input, SizeType32 outputOffset, CudaStream const& stream);
-
-void invokeInclusiveSum(IBuffer& output, IBuffer const& input, BufferManager const& manager, CudaStream const& stream);
-
-void invokeBuildAttentionMask(ITensor& attentionMask, TokenIdType padId, CudaStream const& stream);
-
-void invokeExtendAttentionMask(ITensor& newMask, ITensor const& oldMask, CudaStream const& stream);
-
-void invokeCopyInputToOutput(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputLengths, SizeType32 padId,
-    CudaStream const& stream);
-
-void initOutputIds(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputLengths,
-    ITensor const& inputOffsets, TokenIdType padId, TokenIdType endId, SizeType32 maxInputLength, bool inputPacked,
-    CudaStream const& stream);
-
 void scatterTensor(ITensor& output, ITensor const& input, SizeType32 beamWidth, CudaStream const& stream);
 
 void tileTensor(ITensor& output, ITensor const& input, SizeType32 beamWidth, CudaStream const& stream);
-
-void gatherLastTokenLogits(
-    ITensor& output, ITensor const& input, ITensor const& lastTokenIds, CudaStream const& stream);
 
 void mergeLogitsFragments(BufferManager const& bufferManager, ITensor& output,
     std::vector<TensorPtr> const& inputVector, ITensor& cachePointerDevice, ITensor& cachePointerHost,
@@ -79,4 +59,5 @@ void invokeUpdateKVBlockArrayDraftTokenLocation(ITensor const& seqAcceptedDraftT
     SizeType32 const* rewindDraftTokenSeparateAdjustments, ITensor const& seqSlotRemapping, ITensor const& batchSlots,
     SizeType32 maxKVCacheLen, SizeType32 maxBlocksPerSeq, SizeType32 tokensPerBlock, bool canUseOneMoreBlock,
     cudaStream_t stream);
+
 } // namespace tensorrt_llm::runtime::kernels
