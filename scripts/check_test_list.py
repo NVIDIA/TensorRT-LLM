@@ -69,7 +69,7 @@ def verify_qa_test_lists(llm_src):
 def verify_waive_list(llm_src):
     waives_list_path = f"{llm_src}/tests/integration/test_lists/waives.txt"
     # Remove prefix and markers in wavies.txt
-    processed_lines = []
+    processed_lines = set()
     with open(waives_list_path, "r") as f:
         lines = f.readlines()
 
@@ -93,12 +93,12 @@ def verify_waive_list(llm_src):
         if line.startswith("full:"):
             line = line.split("/", 1)[1].lstrip("/")
 
-        processed_lines.append(line)
+        processed_lines.add(line)
 
     # Write the processed lines to a tmp file
     tmp_waives_file = f"{llm_src}/processed_waive_list.txt"
     with open(tmp_waives_file, "w") as f:
-        f.writelines(f"{line}\n" for line in processed_lines)
+        f.writelines(f"{line}\n" for line in sorted(processed_lines))
 
     subprocess.run(
         f"cd {llm_src}/tests/integration/defs && "
