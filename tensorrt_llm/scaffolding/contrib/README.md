@@ -1,10 +1,10 @@
-# Contrib Examples
+# Contribute Guide
 
-We create this directory to store the community contributed projects.
+Community adopt a flexible approach for contributors as most of workers are extending Controller/Task/Worker.
 
-Contributors can develop inference time compute methods with various Controller/Task/Worker.
+Contributors can create a new project to develop various Controller/Task/Worker. And a project can import Controller/Task/Worker from other projects. This approach can reduce the difficulty and threshold of code merge, and also help the community discover generic and important requirements.
 
-We will continue to move some generic works on this directory back to the main code.
+Community will continue to reorganize the projects and move some generic units to core directory.
 
 ### How to create a new project?
 
