@@ -43,6 +43,7 @@ class Attention(nn.Module):
         config: Optional[ModelConfig] = None,
         qk_norm_type: QkNormType = QkNormType.none,
         q_scaling: float = 1.0,
+        attention_chunk_size: Optional[int] = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -59,6 +60,8 @@ class Attention(nn.Module):
         self.qk_norm_type = qk_norm_type
         self.dense_bias = dense_bias
         self.q_scaling = q_scaling
+
+        self.attention_chunk_size = attention_chunk_size
 
         if dense_bias is None:
             self.dense_bias = bias
@@ -142,6 +145,7 @@ class Attention(nn.Module):
             quant_config=self.quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             q_scaling=self.q_scaling,
+            attention_chunk_size=self.attention_chunk_size,
         )
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
