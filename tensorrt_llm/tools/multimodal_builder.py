@@ -1765,6 +1765,7 @@ def build_florence2_engine(args):
             self.image_feature_source = image_feature_source
 
         def forward(self, pixel_values):
+            assert len(pixel_values.shape) == 4, f"invalid image shape {pixel_values.shape}"
             batch_size, _, _, _ = pixel_values.shape
             T = 1
             x = self.vision_tower.forward_features_unpool(pixel_values)
