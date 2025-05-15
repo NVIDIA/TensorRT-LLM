@@ -197,11 +197,13 @@ def flattened_mha_with_cache(
     #    and number of tokens per sequence are encoded in seq_len and seq_start.
     num_kv_heads, head_dim = k_cache.shape[-2:]
     v_head_dim = v_cache.shape[-1]
-    q_ndim = q.ndim
     b, s = q.shape[:2]
 
     # check for num_heads
     num_heads = q.shape[2] // head_dim if q.ndim == 3 else q.shape[2]
+
+    # Define output shape
+    output_shape = (b, s, num_heads * v_head_dim) if q.ndim == 3 else (b, s, num_heads, v_head_dim)
 
     # reshapes with head_dim
     if s == 1:
@@ -214,7 +216,7 @@ def flattened_mha_with_cache(
     v = v.contiguous().view(*bs_view, num_kv_heads, v_head_dim)
 
     # run attention
-    y = torch.empty(*bs_view, num_heads, v_head_dim, dtype=q.dtype, device=q.device).contiguous()
+    y = q.new_empty(*bs_view, num_heads, v_head_dim).contiguous()
     if s == 1:
         # generate-only phase
         _generate_mha(q, k, v, k_cache, v_cache, cache_loc, input_pos, y)
@@ -233,9 +235,7 @@ def flattened_mha_with_cache(
             y,
         )
 
-    return (
-        y.view(b, s, num_heads * v_head_dim) if q_ndim == 3 else y.view(b, s, num_heads, v_head_dim)
-    )  # [bsnd] in the original view (might have some dims flattened)
+    return y.view(*output_shape)
 
 
 @flattened_mha_with_cache.register_fake
@@ -251,9 +251,7 @@ def flattened_mha_fake(
     v_cache: torch.Tensor,
     scale: Optional[float],
 ):
-    b, n, s, _ = q.shape
-    v_head_dim = v.shape[-1]
-    return torch.empty(b, n, s, v_head_dim, dtype=q.dtype, device=q.device).contiguous()
+    return q.new_empty(*q.shape[:3], v.shape[-1]).contiguous()
 
 
 @torch.library.custom_op("attention::prepare_fused_mha_metadata", mutates_args=())
