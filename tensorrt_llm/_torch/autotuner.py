@@ -251,7 +251,7 @@ class AutoTuner:
 
     @classmethod
     def get(cls):
-        if cls._instance == None:
+        if cls._instance is None:
             cls._instance = AutoTuner()
         return cls._instance
 
