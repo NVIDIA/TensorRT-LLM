@@ -6,8 +6,7 @@ from tensorrt_llm.llmapi import KvCacheConfig
 
 
 def main():
-    pytorch_config = PyTorchConfig(enable_overlap_scheduler=True,
-                                   autotuner_enabled=False,
+    pytorch_config = PyTorchConfig(autotuner_enabled=False,
                                    kv_cache_dtype='auto')
 
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",

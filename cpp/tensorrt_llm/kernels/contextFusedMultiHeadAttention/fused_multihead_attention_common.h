@@ -426,6 +426,10 @@ struct Fused_multihead_attention_params_v2
             float* scales;
         } q, k, v;
     } sage;
+
+    // Separate TMA descriptor for V when d != dv in packed qkv input layout, e.g. MLA + 192/128 dims
+    // We need to add this parameter in the tail of the struct for cubin compatibility
+    cudaTmaDesc tma_desc_v;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
