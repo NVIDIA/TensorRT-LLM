@@ -41,9 +41,12 @@ class Result(GenerationResultBase):
 
 class OpenAIServerClient:
 
-    def __init__(self, disaggregated_server_config: Dict[str, Any],
+    def __init__(self,
+                 disaggregated_server_config: Dict[str, Any],
                  ctx_server_config: Dict[str, Any],
-                 gen_server_config: Dict[str, Any], model_name: str):
+                 gen_server_config: Dict[str, Any],
+                 model_name: str,
+                 tensor_parallel_size: int = 1):
         self.temp_dir = tempfile.mkdtemp()
         self.disaggregated_serving_config_path = os.path.join(
             self.temp_dir, "disaggregated_serving_config.yaml")
@@ -58,8 +61,14 @@ class OpenAIServerClient:
         with open(gen_server_config_path, "w") as f:
             yaml.dump(gen_server_config, f)
 
-        with LLM(model_name) as llm:
+        with LLM(model_name, tensor_parallel_size=tensor_parallel_size) as llm:
             self.args = llm.args
+
+        cuda_device_idx = 0
+        cuda_devices = []
+        for i in range(tensor_parallel_size):
+            cuda_devices.append(f"{cuda_device_idx}")
+            cuda_device_idx += 1
 
         trtllm_serve_path = "trtllm-serve"
         # Common arguments for both servers
@@ -67,9 +76,11 @@ class OpenAIServerClient:
             trtllm_serve_path, model_name, "--host", "localhost", "--backend",
             "pytorch"
         ]
+        if tensor_parallel_size > 1:
+            common_args.append(f"--tp_size={tensor_parallel_size}")
         env_ctx = os.environ.copy()
         env_ctx["TRTLLM_USE_UCX_KVCACHE"] = "1"
-
+        env_ctx["CUDA_VISIBLE_DEVICES"] = ",".join(cuda_devices)
         # Start the context server
         self._ctx_server = subprocess.Popen(common_args + [
             "--port", "8001", "--extra_llm_api_options", ctx_server_config_path
@@ -78,6 +89,11 @@ class OpenAIServerClient:
         # Start the generation server
         env_gen = os.environ.copy()
         env_gen["TRTLLM_USE_UCX_KVCACHE"] = "1"
+        cuda_devices = []
+        for i in range(tensor_parallel_size):
+            cuda_devices.append(f"{cuda_device_idx}")
+            cuda_device_idx += 1
+        env_gen["CUDA_VISIBLE_DEVICES"] = ",".join(cuda_devices)
         self._gen_server = subprocess.Popen(common_args + [
             "--port", "8002", "--extra_llm_api_options", gen_server_config_path
         ],
@@ -86,7 +102,8 @@ class OpenAIServerClient:
         # Start the disaggregated server
         self._disaggregated_server = subprocess.Popen([
             trtllm_serve_path, "disaggregated", "-c",
-            self.disaggregated_serving_config_path
+            self.disaggregated_serving_config_path, "--server_start_timeout",
+            "3600"
         ])
         self.model_name = model_name
 
@@ -127,7 +144,10 @@ class OpenAIServerClient:
         setattr(requested_output, "result", result.result)
         return requested_output
 
-    def __del__(self):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
         shutil.rmtree(self.temp_dir)
         self._ctx_server.terminate()
         self._gen_server.terminate()
@@ -169,8 +189,47 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                 "urls": ["localhost:8002"]
             }
         }
-        client = OpenAIServerClient(disaggregated_server_config,
-                                    ctx_server_config, gen_server_config,
-                                    self.MODEL_PATH)
-        task = MMLU(self.MODEL_NAME)
-        task.evaluate(client)
+        with OpenAIServerClient(disaggregated_server_config, ctx_server_config,
+                                gen_server_config, self.MODEL_PATH) as client:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(client)
+
+
+class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct"
+
+    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.skip_device_not_contain(["H100"])
+    @pytest.mark.parametrize("overlap_scheduler", [False, True])
+    def test_auto_dtype(self, overlap_scheduler):
+        ctx_server_config = {
+            "pytorch_backend_config": {
+                "enable_overlap_scheduler": False
+            }
+        }
+        gen_server_config = {
+            "pytorch_backend_config": {
+                "enable_overlap_scheduler": overlap_scheduler
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with OpenAIServerClient(disaggregated_server_config,
+                                ctx_server_config,
+                                gen_server_config,
+                                self.MODEL_PATH,
+                                tensor_parallel_size=4) as client:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(client)
