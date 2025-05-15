@@ -471,3 +471,25 @@ unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)" SKIP (https://nv
 examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-disable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] SKIP (https://nvbugs/5244570)
 unittest/_torch/speculative/test_eagle3.py SKIP (https://nvbugs/5280806)
 test_e2e.py::test_ptp_quickstart_multimodal[qwen2-vl-7b-instruct-Qwen2-VL-7B-Instruct-image] SKIP (https://nvbugs/5226211)
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-max_utilization-1-1-1-False-tensorrt_llm_bls] SKIP (https://nvbugs/4931591)
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-disableDecoupleMode-V1-disableTrtOverlap-0.7-guaranteed_no_evict-1-1-1-False-ensemble]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-disableDecoupleMode-V1-disableTrtOverlap-0.7-guaranteed_no_evict-1-1-1-False-tensorrt_llm_bls]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-disableDecoupleMode-V1-disableTrtOverlap-0.7-max_utilization-1-1-1-False-ensemble]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-disableDecoupleMode-V1-disableTrtOverlap-0.7-max_utilization-1-1-1-False-tensorrt_llm_bls]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-guaranteed_no_evict-1-1-1-False-ensemble]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-guaranteed_no_evict-1-1-1-False-tensorrt_llm_bls]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-max_utilization-1-1-1-False-ensemble]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-max_utilization-1-1-1-False-tensorrt_llm_bls]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-enableDecoupleMode-V1-disableTrtOverlap-0.7-guaranteed_no_evict-1-1-1-False-ensemble]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-enableDecoupleMode-V1-disableTrtOverlap-0.7-guaranteed_no_evict-1-1-1-False-tensorrt_llm_bls]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-enableDecoupleMode-V1-disableTrtOverlap-0.7-max_utilization-1-1-1-False-ensemble]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-enableDecoupleMode-V1-disableTrtOverlap-0.7-max_utilization-1-1-1-False-tensorrt_llm_bls]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-guaranteed_no_evict-1-1-1-False-ensemble]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-guaranteed_no_evict-1-1-1-False-tensorrt_llm_bls]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-max_utilization-1-1-1-False-ensemble]
+triton_server/test_triton_rcca.py::test_mistral_beam_search[rcca_4714407-True-10-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-guaranteed_no_evict-1-1-1-False-ensemble] SKIP (https://nvbugs/5240060)
+triton_server/test_triton.py::test_triton_extensive[triton-extensive] SKIP
+triton_server/test_triton.py::test_gpt_speculative_decoding[gpt-speculative-decoding] SKIP
+triton_server/test_triton.py::test_qwen2_vl[qwen2_vl] SKIP
+triton_server/test_triton.py::test_gpt_ib_speculative_decoding_bls[gpt-ib-speculative-decoding-bls] SKIP
+triton_server/test_triton_llm.py::test_mistral_v1_multi_models[False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-max_utilization-4096-1-1-1-False-ensemble] SKIP
