@@ -4,7 +4,7 @@
     // Please also modify the .env file accordingly
     "terminal.integrated.env.linux": {
         "OMPI_MCA_opal_cuda_support": "true",
-        "LD_LIBRARY_PATH": "/lib/x86_64-linux-gnu:${env:HOME}/miniconda3/envs/tekit/lib:${env:LD_LIBRARY_PATH}",
+        "LD_LIBRARY_PATH": "/lib/x86_64-linux-gnu:<PATH-TO-CONDA-ENV>/lib:${env:LD_LIBRARY_PATH}",
     },
     // STANDARD SETTINGS, DO NOT MODIFY ////////////////////////////////////////////////////////////
     "python.envFile": "${workspaceFolder}/.vscode/.env",
@@ -23,7 +23,7 @@
     // https://code.visualstudio.com/updates/v1_81#_python
     // When that happens, we can remove the --ignore-glob flag and the gpu tests will be skipped
     "python.testing.pytestArgs": [
-        "./tests",
+        "./tests/unittest/_torch/auto_deploy",
         "--no-cov",
     ],
     "files.exclude": {
