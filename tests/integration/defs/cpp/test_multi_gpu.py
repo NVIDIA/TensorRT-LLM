@@ -478,18 +478,30 @@ def llama_multi_gpu_model(prepare_model_multi_gpu):
 
 
 # Allow us to dynamically choose a fixture at runtime
-# Combined with session scope to ensure that the model is built only once
-# per pytest session
+# Combined with session scope fixtures above to ensure
+# that the model is built only once per pytest session
 @pytest.fixture
-def run_fixture(request):
+def prepare_models_disagg(request):
 
-    def _run(fixture_name):
-        fixture = request.getfixturevalue(fixture_name)
-        if fixture is None:
-            raise ValueError(f"Fixture {fixture_name} not found")
-        return fixture
+    def _prepare(model_name: str):
+        if model_name == "llama":
+            fixture_names = [
+                "llama_single_gpu_model",
+                "llama_multi_gpu_model",
+            ]
+        elif model_name == "gpt":
+            fixture_names = [
+                "gpt_single_gpu_model",
+            ]
+        else:
+            raise ValueError(f"Disagg tests don't support model: {model_name}")
 
-    return _run
+        print(f"Preparing models for disagg tests: {fixture_names}")
+        # Run the fixtures
+        for fixture_name in fixture_names:
+            request.getfixturevalue(fixture_name)
+
+    return _prepare
 
 
 # Use indirect parameterization to ensure that the model is built
@@ -583,87 +595,61 @@ def test_trt_gpt_real_decoder(build_google_tests, multi_gpu_model, lora_setup,
 
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
-@pytest.mark.parametrize("use_ucx_kvcache", [False, True],
-                         ids=["mpi_kvcache", "ucx_kvcache"])
-@pytest.mark.parametrize("model", ["gpt", "llama"])
-def test_disagg_symmetric_executor(build_google_tests, model, use_ucx_kvcache,
-                                   run_fixture, build_dir):
+class TestDisagg:
 
-    if platform.system() != "Windows":
-        # Disagg tests need single + multi GPU llama models.
-        # Disagg tests need only single GPU gpt model.
+    @pytest.mark.parametrize("use_ucx_kvcache", [False, True],
+                             ids=["mpi_kvcache", "ucx_kvcache"])
+    @pytest.mark.parametrize("model", ["gpt", "llama"])
+    def test_symmetric_executor(self, build_google_tests, model,
+                                use_ucx_kvcache, prepare_models_disagg,
+                                build_dir):
 
-        if model == "llama":
-            run_fixture("llama_single_gpu_model")
-            run_fixture("llama_multi_gpu_model")
-        elif model == "gpt":
-            run_fixture("gpt_single_gpu_model")
-        else:
-            raise ValueError(f"Unsupported model: {model}")
+        if platform.system() != "Windows":
+            prepare_models_disagg(model)
 
-        run_disagg_symmetric_executor_tests(build_dir=build_dir,
-                                            model=model,
-                                            use_ucx_kvcache=use_ucx_kvcache)
+            run_disagg_symmetric_executor_tests(build_dir=build_dir,
+                                                model=model,
+                                                use_ucx_kvcache=use_ucx_kvcache)
 
+    @pytest.mark.parametrize("use_ucx_kvcache", [False, True],
+                             ids=["mpi_kvcache", "ucx_kvcache"])
+    @pytest.mark.parametrize("model", ["llama"])
+    def test_asymmetric_executor(self, build_google_tests, model,
+                                 use_ucx_kvcache, prepare_models_disagg,
+                                 build_dir):
 
-@pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
-                         indirect=True)
-@pytest.mark.parametrize("use_ucx_kvcache", [False, True],
-                         ids=["mpi_kvcache", "ucx_kvcache"])
-@pytest.mark.parametrize("model", ["llama"])
-def test_disagg_asymmetric_executor(build_google_tests, model, use_ucx_kvcache,
-                                    run_fixture, build_dir):
+        if platform.system() != "Windows":
+            prepare_models_disagg(model_name=model)
 
-    if platform.system() != "Windows":
-        # Disagg tests need single + multi GPU llama models.
+            run_disagg_asymmetric_executor_tests(
+                build_dir=build_dir,
+                model=model,
+                use_ucx_kvcache=use_ucx_kvcache)
 
-        if model == "llama":
-            run_fixture("llama_single_gpu_model")
-            run_fixture("llama_multi_gpu_model")
-        else:
-            raise ValueError(f"Unsupported model: {model}")
+    @pytest.mark.parametrize("use_ucx_kvcache", [False, True],
+                             ids=["mpi_kvcache", "ucx_kvcache"])
+    @pytest.mark.parametrize("model", ["llama"])
+    def test_orchestrator_params(self, build_google_tests, model,
+                                 use_ucx_kvcache, prepare_models_disagg,
+                                 build_dir):
 
-        run_disagg_asymmetric_executor_tests(build_dir=build_dir,
-                                             model=model,
-                                             use_ucx_kvcache=use_ucx_kvcache)
+        if platform.system() != "Windows":
+            prepare_models_disagg(model)
 
+            run_disagg_orchestrator_params_tests(
+                build_dir=build_dir,
+                model=model,
+                use_ucx_kvcache=use_ucx_kvcache)
 
-@pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
-                         indirect=True)
-@pytest.mark.parametrize("use_ucx_kvcache", [False, True],
-                         ids=["mpi_kvcache", "ucx_kvcache"])
-@pytest.mark.parametrize("model", ["llama"])
-def test_disagg_orchestrator_params(build_google_tests, model, use_ucx_kvcache,
-                                    run_fixture, build_dir):
+    @pytest.mark.parametrize("use_ucx_kvcache", [True], ids=["ucx_kvcache"])
+    @pytest.mark.parametrize("model", ["llama"])
+    def test_spawn_orchestrator(self, build_google_tests, model,
+                                use_ucx_kvcache, prepare_models_disagg,
+                                build_dir):
 
-    if platform.system() != "Windows":
-        # Disagg tests need single + multi GPU llama models.
-        if model == "llama":
-            run_fixture("llama_single_gpu_model")
-            run_fixture("llama_multi_gpu_model")
-        else:
-            raise ValueError(f"Unsupported model: {model}")
+        if platform.system() != "Windows":
+            prepare_models_disagg(model)
 
-        run_disagg_orchestrator_params_tests(build_dir=build_dir,
-                                             model=model,
-                                             use_ucx_kvcache=use_ucx_kvcache)
-
-
-@pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
-                         indirect=True)
-@pytest.mark.parametrize("use_ucx_kvcache", [True], ids=["ucx_kvcache"])
-@pytest.mark.parametrize("model", ["llama"])
-def test_disagg_spawn_orchestrator(build_google_tests, model, use_ucx_kvcache,
-                                   run_fixture, build_dir):
-
-    if platform.system() != "Windows":
-        # Disagg tests need single + multi GPU llama models.
-        if model == "llama":
-            run_fixture("llama_single_gpu_model")
-            run_fixture("llama_multi_gpu_model")
-        else:
-            raise ValueError(f"Unsupported model: {model}")
-
-        run_disagg_spawn_orchestrator_tests(build_dir=build_dir,
-                                            model=model,
-                                            use_ucx_kvcache=use_ucx_kvcache)
+            run_disagg_spawn_orchestrator_tests(build_dir=build_dir,
+                                                model=model,
+                                                use_ucx_kvcache=use_ucx_kvcache)
