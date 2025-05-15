@@ -16,6 +16,7 @@ from .export import torch_export_to_gm
 from .library import (
     check_in_out_nodes,
     column_row_shard,
+    dp_bmm_shard,
     eliminate_redundant_transposes,
     ep_shard,
     fuse_allreduce_residual_rmsnorm,
@@ -145,6 +146,9 @@ class InferenceOptimizer:
 
         # run EP sharding across ranks
         egm = ep_shard(egm, local_rank, world_size)
+
+        # run BMM sharding across ranks
+        egm = dp_bmm_shard(egm, local_rank, world_size)
 
         # let's run a shape propagation pass to update the graph with correct meta values for
         # subsequent optimization passes
