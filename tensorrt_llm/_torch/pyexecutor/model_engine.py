@@ -44,6 +44,7 @@ from ..pipeline_interface import PipelineInterface
 from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
 from ..utils import set_torch_compiling, with_model_extra_attrs
 from .config import LoadFormat, PyTorchConfig
+from .config_utils import is_mla
 from .cuda_graph_runner import DecodingCUDAGraphRunner
 from .guided_decoder import GuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
@@ -331,7 +332,7 @@ class PyTorchModelEngine(ModelEngine):
             layerwise_nvtx_marker.register_hooks(self.model, module_prefix)
 
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
-        self._enable_overlap_scheduler = self.pytorch_backend_config.enable_overlap_scheduler
+        self._disable_overlap_scheduler = self.pytorch_backend_config.disable_overlap_scheduler
         self._torch_compile_backend = None
         self.dtype = self.model.config.torch_dtype
         self._init_model_capacity()
@@ -690,6 +691,9 @@ class PyTorchModelEngine(ModelEngine):
                             torch.cuda.empty_cache()
 
     def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
+        enable_paged_context_mla = is_mla(
+            self.model.model_config.pretrained_config
+        ) and self.attn_runtime_features.cache_reuse
         if kv_cache_manager is None:
             return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,
@@ -697,7 +701,8 @@ class PyTorchModelEngine(ModelEngine):
                 kv_cache_manager=None,
                 mapping=self.mapping,
                 runtime_features=self.attn_runtime_features,
-                enable_flash_mla=self.model.model_config.enable_flash_mla)
+                enable_flash_mla=self.model.model_config.enable_flash_mla,
+                enable_paged_context_mla=enable_paged_context_mla)
 
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -711,7 +716,8 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager=kv_cache_manager,
             mapping=self.mapping,
             runtime_features=self.attn_runtime_features,
-            enable_flash_mla=self.model.model_config.enable_flash_mla)
+            enable_flash_mla=self.model.model_config.enable_flash_mla,
+            enable_paged_context_mla=enable_paged_context_mla)
         return self.attn_metadata
 
     def _set_up_spec_metadata(
@@ -982,7 +988,7 @@ class PyTorchModelEngine(ModelEngine):
         """
         Make some changes to the device inputs and avoid block the async data transfer
         """
-        if self.is_spec_decode and self._enable_overlap_scheduler:
+        if self.is_spec_decode and not self._disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
             # be prepared in advance by using the max_draft_len. But we need to use
             # new_tokens_lens_device to get the real past kv lengths and the
@@ -1086,7 +1092,7 @@ class PyTorchModelEngine(ModelEngine):
                                  dtype=torch.int32).to('cuda',
                                                        non_blocking=True))
 
-        if self._enable_overlap_scheduler and self.is_spec_decode:
+        if not self._disable_overlap_scheduler and self.is_spec_decode:
             spec_dec_mode = self.spec_config.spec_dec_mode
             assert spec_dec_mode.support_overlap_scheduler(
             ), f"{self.spec_config.spec_dec_name} does not support overlap scheduler"

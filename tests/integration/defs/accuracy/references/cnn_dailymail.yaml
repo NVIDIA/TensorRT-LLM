@@ -1,3 +1,5 @@
+google/gemma-3-1b-it:
+  - accuracy: 22.988
 gpt2:
   - accuracy: 18.408
   - quant_algo: W8A16

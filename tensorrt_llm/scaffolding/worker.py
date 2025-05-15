@@ -136,11 +136,11 @@ class TRTLLMWorker(Worker):
         max_batch_size: int = 32,
         max_num_tokens: int = 4096,
         kv_cache_free_gpu_memory_fraction: float = 0.9,
-        enable_overlap_scheduler: bool = True,
+        disable_overlap_scheduler: bool = False,
     ):
         pytorch_backend_config = PyTorchConfig(
             mixed_decoder=True,
-            enable_overlap_scheduler=enable_overlap_scheduler,
+            disable_overlap_scheduler=disable_overlap_scheduler,
         )
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction, )
