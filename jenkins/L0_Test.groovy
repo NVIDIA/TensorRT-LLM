@@ -184,16 +184,22 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             }
         }
 
-        if (!CloudManager.isNodeOnline(nodeName)){
-            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-                error "Cannot find a node that is idle to run the test for ${stageName}"
+        stage('Checking if the Node is Online') {
+            def counter = 0
+            while (!CloudManager.isNodeOnline(nodeName) && counter < 12) {
+                sleep(time: 10, unit: 'MINUTES')  // Wait 10 minutes to check status of the node again
+                counter++
+            }
+
+            if (CloudManager.isNodeOnline(nodeName)) {
+                // TODO: pass in the gpu numbers instead of hard code it to 1
+                def dockerArgs = "--gpus 1 --cap-add=SYS_ADMIN --ipc=host --security-opt seccomp=unconfined  -u root:root -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
+                slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, false)
+                executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
+            } else {
+                echo "The node does not come online in 2 hours, terminating the job"
             }
         }
-
-        // TODO: pass in the gpu numbers instead of hard code it to 1
-        def dockerArgs = "--gpus 1 --cap-add=SYS_ADMIN --ipc=host --security-opt seccomp=unconfined  -u root:root -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
-        slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, false)
-        executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
     } finally {
         cleanUpNodeResources(pipeline, cluster, nodeName)
         CloudManager.destroyNode(nodeName)
