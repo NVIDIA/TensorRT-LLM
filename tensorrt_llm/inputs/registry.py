@@ -150,9 +150,9 @@ def create_input_processor_with_hash(
                 num_mm_tokens=
                 num_mm_tokens,  # list of lengths of each chunk of visual tokens
             )
-            # flatten the hashes to a single list
+            # flatten the hashes from dict to a single list
             mm_hashes = [h for hashes in mm_hashes.values() for h in hashes]
-            validate_mm_inputs(mm_hashes, prompt_token_ids, start_positions,
+            validate_mm_inputs(prompt_token_ids, mm_hashes, start_positions,
                                num_mm_tokens)
             mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes
                                ]  # nested list w/ multiple int32 per hash

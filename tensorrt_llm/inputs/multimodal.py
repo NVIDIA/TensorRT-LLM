@@ -16,6 +16,8 @@ default_hasher = blake3
 @dataclass
 class MultimodalInput:
     multimodal_hashes: List[List[int]]
+    # multimodal_positions contains only the start position of each chunk
+    # This is different from mm_positions elsewhere which contains all positions of multimodal tokens
     multimodal_positions: List[int]
     multimodal_lengths: List[int]
 
@@ -209,7 +211,7 @@ def find_mm_token_positions(input_ids, vocab_size, num_mm_tokens):
     return start_positions
 
 
-def validate_mm_inputs(mm_hashes, prompt_token_ids, start_positions,
+def validate_mm_inputs(prompt_token_ids, mm_hashes, start_positions,
                        num_mm_tokens):
     """Validates multimodal inputs for consistency and correctness."""
     # Validate number of hashes matches number of chunks
@@ -225,7 +227,11 @@ def validate_mm_inputs(mm_hashes, prompt_token_ids, start_positions,
             f"number of multimodal chunks ({len(num_mm_tokens)})")
     # Validate each chunk's position and length
     prompt_len = len(prompt_token_ids)
-    # assume start_positions are sorted when generated
+    # Verify start_positions are sorted
+    if not all(start_positions[i] < start_positions[i + 1]
+               for i in range(len(start_positions) - 1)):
+        raise AssertionError(
+            "start_positions must be sorted in ascending order")
     for chunk_idx, (start_pos,
                     chunk_len) in enumerate(zip(start_positions,
                                                 num_mm_tokens)):
