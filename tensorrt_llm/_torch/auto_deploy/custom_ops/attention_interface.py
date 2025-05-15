@@ -34,6 +34,9 @@ class SequenceInfo:
 
     - input_ids: [id_0, ..., id_{s_total-1}]
       flattened sequence of [b, 1] or [1, s_total]. We use [b, 1] to denote generate-only batches.
+    - position_ids: [pos_0, ..., pos_{s_total-1}]
+      flattened sequence of [b, 1] or [1, s_total] indicating absolute position ids for every token
+      in the input_ids sequence. We use [b, 1] to denote generate-only batches.
     - seq_len: [s_0, s_1, ..., s_{b-1}] such that s_total = sum(s_i)
       Describes how long each sequence is. For example,
       input_ids[:s_0] will correspond to sequence 0 in the batch and input_ids[s_0:s_1] will
@@ -118,6 +121,9 @@ class SequenceInfo:
         # keep a list-like object of sequence lengths for simplicity as well
         self._sequence_lengths = [0] * self.max_batch_size
 
+        # indicator if extra args are activated
+        self._extra_args_activated = False
+
         # call reset once to initialize the tensors
         self.reset()
 
@@ -132,23 +138,20 @@ class SequenceInfo:
             val = getattr(self, f.name)
             if isinstance(val, torch.Tensor):
                 args.append(val)
+            if len(args) >= self._num_original_args and not self._extra_args_activated:
+                break
         return tuple(args)
 
     @property
-    def num_original_args(self) -> int:
+    def _num_original_args(self) -> int:
         """Return the number of original graph arguments expected by the model."""
         return 2
 
     @property
-    def args_original(self) -> Tuple[torch.Tensor, ...]:
-        """Return the original graph arguments expected by the model."""
-        return self.args[: self.num_original_args]
-
-    @property
-    def extra_arg_names(self) -> List[str]:
+    def _extra_arg_names(self) -> List[str]:
         """Return extra arg names for the prepare_metadata op beyond input_ids and position_ids."""
         return [f.name for f in fields(self) if isinstance(getattr(self, f.name), torch.Tensor)][
-            self.num_original_args :
+            self._num_original_args :
         ]
 
     @property
@@ -166,14 +169,10 @@ class SequenceInfo:
             # set up shape for position_ids (same as input_ids)
             dynamic_shapes[1].update(dynamic_shapes[0])
             # set up shape for extra args
-            dynamic_shapes += ({},) * len(self.extra_arg_names)
+            if self._extra_args_activated:
+                dynamic_shapes += ({},) * len(self._extra_arg_names)
             self._dynamic_shapes = dynamic_shapes
         return self._dynamic_shapes
-
-    @property
-    def original_dynamic_shapes(self) -> Tuple[Dict[str, Dim]]:
-        """Return the dynamic shapes of the original graph arguments."""
-        return self.dynamic_shapes[: self.num_original_args]
 
     @property
     def num_sequences(self) -> int:
@@ -270,6 +269,12 @@ class SequenceInfo:
         else:
             num_seq = b
         return num_seq
+
+    def activate_extra_args(self) -> List[str]:
+        """Activate the extra arguments."""
+        assert not self._extra_args_activated, "Extra arguments already activated"
+        self._extra_args_activated = True
+        return self._extra_arg_names
 
     def to(self, *args, **kwargs) -> None:
         for f in fields(self):

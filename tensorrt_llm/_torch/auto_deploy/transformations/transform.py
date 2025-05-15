@@ -14,7 +14,6 @@ from ..utils.logger import ad_logger
 from ._graph import canonicalize_graph, move_to_device
 from .export import torch_export_to_gm
 from .library import (
-    check_in_out_nodes,
     column_row_shard,
     dp_bmm_shard,
     eliminate_redundant_transposes,
@@ -36,6 +35,7 @@ from .library import (
     optimize_rope,
     quantize,
     resize_kv_cache,
+    update_in_out_nodes,
 )
 
 
@@ -92,9 +92,7 @@ class InferenceOptimizer:
         ############################################################################################
 
         cm.info._set_example_sequence()
-        egm = torch_export_to_gm(
-            model, args=cm.args_original, dynamic_shapes=cm.original_dynamic_shapes
-        )
+        egm = torch_export_to_gm(model, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
         del model
         ad_logger.debug("original graph: " + str(egm))
         local_rank, world_size = dist_ad.get_rank_world_size()
@@ -198,13 +196,11 @@ class InferenceOptimizer:
         # HANDLE CACHES
         ############################################################################################
 
-        input_nodes = check_in_out_nodes(egm)
+        egm = update_in_out_nodes(egm, cm)
 
         # detect attention op and replace with cache-aware op
         for attn_descriptor in [self.attention_op, self.mla_op]:
-            egm = insert_cached_attention(
-                egm, cm, attn_descriptor, self.factory.get_cache_config(), input_nodes
-            )
+            egm = insert_cached_attention(egm, cm, attn_descriptor, self.factory.get_cache_config())
 
         # initialize cache on correct device
         cm.initialize_caches()
