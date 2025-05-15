@@ -119,7 +119,7 @@ class SimpleConfig:
         # use min instead of max to avoid OOM for large batch size
         self.model_kwargs["max_position_embeddings"] = min(
             self.max_seq_len,
-            self.model_kwargs["max_position_embeddings"],
+            self.model_kwargs.get("max_position_embeddings", self.max_seq_len),
         )
 
         if isinstance(self.prompt, str):
