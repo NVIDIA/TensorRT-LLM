@@ -146,9 +146,9 @@ def create_input_processor_with_hash(
                 inputs, sampling_params)
             start_positions = find_mm_token_positions(
                 input_ids=prompt_token_ids,  # token sequence
-                vocab_size=input_processor.model_config.vocab_size,
                 num_mm_tokens=
                 num_mm_tokens,  # list of lengths of each chunk of visual tokens
+                vocab_size=input_processor.model_config.vocab_size,
             )
             # flatten the hashes from dict to a single list
             mm_hashes = [h for hashes in mm_hashes.values() for h in hashes]
