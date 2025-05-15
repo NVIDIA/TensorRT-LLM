@@ -21,7 +21,9 @@ class SimpleConfig:
     # If no `model` argument is provided, the checkpoint directory is used to infer the model
     # architecture.
     model: Optional[str] = None
-    model_factory: Literal["AutoModelForCausalLM"] = "AutoModelForCausalLM"
+    model_factory: Literal["AutoModelForCausalLM", "AutoModelForImageTextToText"] = (
+        "AutoModelForCausalLM"
+    )
     skip_loading_weights: bool = False  # only load the architecture, not the weights
     customize_tokenizer: bool = False  # True: tokenizer from the model factory, False: from LLM api
 

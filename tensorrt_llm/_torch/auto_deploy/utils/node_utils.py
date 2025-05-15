@@ -294,7 +294,7 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     # sanity check: we expect at most two users for any residual node
     res_nodes_more_users = [n for n in boundary_nodes[2:] if len(n.users) > 2]
     if res_nodes_more_users:
-        ad_logger.warning(f"Unexpected # of users for residuals: {res_nodes_more_users}")
+        ad_logger.debug(f"Unexpected # of users for residuals: {res_nodes_more_users}")
 
     # add output node to boundary nodes
     boundary_nodes.append(output_node)
