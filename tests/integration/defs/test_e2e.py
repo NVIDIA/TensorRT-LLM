@@ -1349,24 +1349,22 @@ def test_ptp_quickstart_advanced_deepseek_v3_2nodes_8gpus(
     # "RCCA https://nvbugs/5163844"
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_name}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        llm_venv.run_cmd([
-            str(example_root / "quickstart_advanced.py"),
-            "--model_dir",
-            f"{llm_models_root()}/{model_path}",
-            "--moe_ep_size=8",
-            "--tp_size=16",
-            "--use_cuda_graph",
-            f"--kv_cache_fraction={_MEM_FRACTION_50}",
-            "--max_batch_size=32",
-            "--max_num_tokens=2048",
-        ],
-                         running_log=running_log)
-        # _check_mem_usage(running_log, [56.30, 0, 0, 0])
+    run_cmd = [
+        "trtllm-llmapi-launch",
+        "python3",
+        str(example_root / "quickstart_advanced.py"),
+        "--enable_overlap_scheduler",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--moe_ep_size=8",
+        "--tp_size=16",
+        "--use_cuda_graph",
+        f"--kv_cache_fraction={_MEM_FRACTION_50}",
+        "--max_batch_size=32",
+        "--max_num_tokens=2048",
+        "--disable_kv_cache_reuse",
+    ]
+    check_call(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
 
 
 @pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
