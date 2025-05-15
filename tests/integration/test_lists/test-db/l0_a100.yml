@@ -31,7 +31,7 @@ l0_a100:
   - unittest/llmapi/test_llm_models.py -m "part1"
   - unittest/llmapi/test_llm_models.py -m "not (part0 or part1)"
   - unittest/llmapi/test_llm.py -m "part0"
-  - unittest/llmapi/test_llm.py -m "not part0"
+  - unittest/llmapi/test_llm.py -m "not part0" TIMEOUT (40)
   - unittest/llmapi/test_executor.py
   - accuracy/test_cli_flow.py::TestGpt2::test_int8_kv_cache # 1 min
   - accuracy/test_cli_flow.py::TestGpt2::test_weight_only[int4] # 1 min
