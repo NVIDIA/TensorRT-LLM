@@ -756,6 +756,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                         residual=residual,
                         norm_weight=self.post_attention_layernorm.weight,
                         eps=self.post_attention_layernorm.variance_epsilon,
+                        trigger_completion_at_end=False,
                     ))
             else:
                 # No fusion
@@ -772,6 +773,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
                         eps=self.next_layer_layernorm.variance_epsilon,
+                        trigger_completion_at_end=False,
                     ))
             else:
                 if self.next_layer_layernorm is not None:
