@@ -109,7 +109,7 @@ set(TRTLLM_VERSION_DIR ${PROJECT_SOURCE_DIR}/../tensorrt_llm)
 set_directory_properties(PROPERTIES CMAKE_CONFIGURE_DEPENDS
                                     ${TRTLLM_VERSION_DIR}/version.py)
 execute_process(
-  COMMAND python3 -c "import version; print(version.__version__)"
+  COMMAND ${Python_EXECUTABLE} -c "import version; print(version.__version__)"
   WORKING_DIRECTORY ${TRTLLM_VERSION_DIR}
   OUTPUT_VARIABLE TRTLLM_VERSION
   RESULT_VARIABLE TRTLLM_VERSION_RESULT

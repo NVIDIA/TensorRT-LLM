@@ -82,9 +82,9 @@ def test_llm_reward_model():
 
     from tensorrt_llm._torch import LLM as LLM_torch
     from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-    llm = LLM_torch(
-        model=rm_model_path,
-        pytorch_backend_config=PyTorchConfig(attn_backend="VANILLA"))
+    llm = LLM_torch(model=rm_model_path,
+                    pytorch_backend_config=PyTorchConfig(
+                        attn_backend="VANILLA", disable_overlap_scheduler=True))
 
     sampling_params = SamplingParams(return_context_logits=True)
 

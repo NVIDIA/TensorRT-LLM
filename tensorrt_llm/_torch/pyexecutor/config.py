@@ -45,7 +45,7 @@ class PyTorchConfig:
     # If true, batches are rounded up to the nearest cuda_graph_batch_size.
     # This is usually a net win for performance.
     cuda_graph_padding_enabled: bool = False
-    enable_overlap_scheduler: bool = False
+    disable_overlap_scheduler: bool = False
     # If set, at most moe_max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time.
     # If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used.
     moe_max_num_tokens: Optional[int] = None

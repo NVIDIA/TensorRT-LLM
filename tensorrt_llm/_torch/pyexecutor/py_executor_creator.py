@@ -49,9 +49,7 @@ def create_py_executor(executor_config: ExecutorConfig,
             )
             executor_config.kv_cache_config.enable_block_reuse = False
 
-    if pytorch_backend_config.attn_backend in [
-            "FLASHINFER", "FLASHINFER_STAR_ATTENTION"
-    ] and executor_config.enable_chunked_context:
+    if pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION" and executor_config.enable_chunked_context:
         logger.warning(
             f"Disabling chunked context for {pytorch_backend_config.attn_backend} backend"
         )
@@ -109,7 +107,7 @@ def create_py_executor(executor_config: ExecutorConfig,
     # PyTorchModelEngine modifies these fields, update them to executor_config
     max_seq_len = model_engine.max_seq_len
     origin_seq_len = max_seq_len
-    if pytorch_backend_config.enable_overlap_scheduler:
+    if not pytorch_backend_config.disable_overlap_scheduler:
         max_seq_len = model_engine.max_seq_len + 1
         if spec_config is not None:
             max_seq_len += spec_config.max_draft_tokens
