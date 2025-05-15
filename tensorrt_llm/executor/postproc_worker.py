@@ -91,7 +91,7 @@ class PostprocWorker:
             BASE_ZMQ_CLASSES (Dict): The base classes for ZMQ serialization.
         '''
         # Passed through from the parent process to ensure
-        # that children processes include any classes added at runtime.
+        # that children processes include any classes added at runtime (such as those from `register_approved_ipc_class`).
         serialization.BASE_ZMQ_CLASSES = BASE_ZMQ_CLASSES
         self._records: Dict[int, GenerationResult] = {}
         self._record_creator = record_creator

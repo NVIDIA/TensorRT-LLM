@@ -580,7 +580,7 @@ def worker_main(
     BASE_ZMQ_CLASSES: Dict = serialization.BASE_ZMQ_CLASSES,
 ) -> None:
     # The base classes for ZMQ serialization. Passed through from the parent process to ensure
-    # that children processes include any classes added at runtime.
+    # that children processes include any classes added at runtime (such as those from `register_approved_ipc_class`).
     serialization.BASE_ZMQ_CLASSES = BASE_ZMQ_CLASSES
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
