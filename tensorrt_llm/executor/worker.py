@@ -579,6 +579,8 @@ def worker_main(
     lora_config: Optional[LoraConfig] = None,
     BASE_ZMQ_CLASSES: Dict = serialization.BASE_ZMQ_CLASSES,
 ) -> None:
+    # The base classes for ZMQ serialization. Passed through from the parent process to ensure
+    # that children processes include any classes added at runtime.
     serialization.BASE_ZMQ_CLASSES = BASE_ZMQ_CLASSES
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
