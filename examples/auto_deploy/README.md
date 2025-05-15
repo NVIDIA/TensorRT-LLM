@@ -89,24 +89,30 @@ Additionally, we have officially verified and fully optimized support for the fo
 
 AutoDeploy runs natively with the entire `TRT-LLM` stack via the `LLM` API. In addition, we provide a light-weight wrapper of the `LLM` API for onboarding and debugging new models:
 
-- **TRT-LLM runtime**: A robust, production-grade runtime optimized for high-performance inference. Enable it with `"runtime": "trtllm"` in the configuration.
-- **Lightweight development environment**: A lightweight runtime wrapper designed for development and testing, featuring a naive scheduler and KV-cache manager for simplified debugging and testing. Activate it using `"runtime": "demollm"` in the configuration.
+| `"runtime"` | Description |
+|-------------|-------------|
+| `trtllm`    | A robust, production-grade runtime optimized for high-performance inference. |
+| `demollm`   | A lightweight runtime wrapper designed for development and testing, featuring a naive scheduler and KV-cache manager for simplified debugging and testing. |
 
 ### Compile Backends
 
 AutoDeploy supports multiple backends for compiling the exported Torch graph:
 
-- **torch-simple:** Exports the graph without additional optimizations. Enable with `"compile_backend": "torch-simple"` in the configuration.
-- **torch-compile:** Applies `torch.compile` to the graph after all AutoDeploy transformations have been completed. Enable with  `"compile_backend": "torch-compile"` in the configuration.
-- **torch-cudagraph:**: Performs CUDA graph capture (without torch.compile). Enable with  `"compile_backend": "torch-cudagraph"` in the configuration.
-- **torch-opt:** Uses `torch.compile` along with CUDA Graph capture to enhance inference performance. Enable with `"compile_backend": "torch-opt"` in the configuration.
+| `"compile_backend"` | Description |
+|--------------------|-------------|
+| `torch-simple`     | Exports the graph without additional optimizations. |
+| `torch-compile`    | Applies `torch.compile` to the graph after all AutoDeploy transformations have been completed. |
+| `torch-cudagraph`  | Performs CUDA graph capture (without torch.compile). |
+| `torch-opt`        | Uses `torch.compile` along with CUDA Graph capture to enhance inference performance. |
 
 ### Attention backends
 
 Optimize attention operations using different attention kernel implementations:
 
-- **Triton:** Custom fused multi-head attention (MHA) with KV Cache kernels for efficient attention processing. Enable with `"attn_backend": "TritonWithFlattenedInputs"`.
-- **FlashInfer:** Uses off-the-shelf optimized attention kernels with KV Cache from the [`flashinfer`](https://github.com/flashinfer-ai/flashinfer.git) library. Enable with `"attn_backend": "FlashInfer"`.
+| `"attn_backend"` | Description |
+|----------------------|-------------|
+| `TritonWithFlattenedInputs` | Custom fused multi-head attention (MHA) with KV Cache kernels for efficient attention processing. |
+| `FlashInfer`         | Uses off-the-shelf optimized attention kernels with KV Cache from the [`flashinfer`](https://github.com/flashinfer-ai/flashinfer.git) library. |
 
 ### Precision Support
 
@@ -127,13 +133,25 @@ To build and run AutoDeploy example, use the following command with the [`build_
 
 In the below example:
 
-- `model` is the HF model card or path to a HF checkpoint folder.
-- `world_size` is the number of GPUs for Tensor Parallel, default is `0` .
-- `runtime` specify which type of Engine to use during runtime, default is `demollm` .
-- `compile_backend` specify how to compile the graph from `torch.export`, default is `torch-opt` .
-- `attn_backend` specify kernel implementation for attention, default is `TritonWithFlattenedInputs`.
-- `mla_backend` specify implementation for multi-head latent attention, default is `MultiHeadLatentAttention`.
-- `benchmark` indicates whether to run the built-in benchmark for token generation, default is `False`.
+| Configuration Key | Description |
+|-------------------|-------------|
+| `"model"` | The HF model card or path to a HF checkpoint folder |
+| `"model_factory"` | Choose model factory implementation (`"hf"` or `"llama4"`) |
+| `"skip_loading_weights"` | Only load the architecture, not the weights |
+| `"customize_tokenizer"` | Use tokenizer from model factory (true) or from LLM API (false) |
+| `"model_kwargs"` | Extra kwargs for the model config class to customize the model config |
+| `"tokenizer_kwargs"` | Extra kwargs for the tokenizer class to customize the tokenizer |
+| `"world_size"` | The number of GPUs for Tensor Parallel |
+| `"runtime"` | Specifies which type of Engine to use during runtime |
+| `"compile_backend"` | Specifies how to compile the graph at the end |
+| `"attn_backend"` | Specifies kernel implementation for attention |
+| `"mla_backend"` | Specifies implementation for multi-head latent attention |
+| `"max_seq_len"` | Maximum sequence length for inference/cache |
+| `"max_batch_size"` | Maximum dimension for statically allocated KV cache |
+| `"page_size"` | Page size for attention |
+| `"benchmark"` | Indicates whether to run the built-in benchmark for token generation |
+
+For default values and additional configuration options, refer to the [simple_config.py](./simple_config.py) file.
 
 ```bash
 cd examples/auto_deploy
@@ -214,65 +232,4 @@ Here is an example of how you can build an LLM object with AutoDeploy integratio
 <summary>Click to expand the example</summary>
 
 ```
-from tensorrt_llm import LLM
-from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm._torch.auto_deploy.shim import AutoDeployConfig
-
-# 1. Set up the build configuration
-build_config = BuildConfig(
-    max_seq_len=<MAX_SEQ_LEN>,
-    max_batch_size=<MAX_BS>,
-)
-build_config.plugin_config.tokens_per_block = <PAGE_SIZE>
-# if using "TritonWithFlattenedInputs" as backend, <PAGE_SIZE> should equal to <MAX_SEQ_LEN>
-# Refer to examples/auto_deploy/simple_config.py (line 109) for details.
-
-# 2. Set up AutoDeploy configuration
-# AutoDeploy will use its own cache implementation
-model_kwargs = {"use_cache":False}
-
-ad_config = AutoDeployConfig(
-    use_cuda_graph=True, # set True if using "torch-opt" as compile backend
-    torch_compile_enabled=True, # set True if using "torch-opt" as compile backend
-    model_kwargs=model_kwargs,
-    attn_backend="TritonWithFlattenedInputs", # choose between "TritonWithFlattenedInputs" and "FlashInfer"
-    skip_loading_weights=False,
-)
-
-# 3. Construct the LLM high-level interface object with autodeploy as backend
-llm = LLM(
-    model=<HF_MODEL_CARD_OR_DIR>,
-    backend="autodeploy",
-    build_config=build_config,
-    pytorch_backend_config=ad_config,
-    tensor_parallel_size=<NUM_WORLD_RANK>,
-)
-
 ```
-
-</details>
-
-For more examples on TRT-LLM LLM API, visit [`this page`](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/).
-
-______________________________________________________________________
-
-## Roadmap
-
-1. **Model Coverage:**
-
-   - Expand support for additional LLM variants and features:
-     - LoRA
-     - Speculative Decoding
-     - Model specialization for disaggregated serving
-
-1. **Performance Optimization:**
-
-   - Enhance inference speed and efficiency with:
-     - MoE fusion and all-reduce fusion techniques
-     - Reuse of TRT-LLM PyTorch operators for greater efficiency
-
-______________________________________________________________________
-
-## Disclaimer
-
-This project is in active development and is currently in an early (beta) stage. The code is experimental, subject to change, and may include backward-incompatible updates. While we strive for correctness, we provide no guarantees regarding functionality, stability, or reliability. Use at your own risk.
