@@ -88,7 +88,10 @@ class PostprocWorker:
             tokenizer_dir (str): The directory to load tokenizer.
             record_creator (Callable[["ResponsePostprocessWorker.Input"], Any]): A creator for creating a record for a request.
             result_handler (Optional[Callable[[GenerationResultBase], Any]]): A callback handles the final result.
+            BASE_ZMQ_CLASSES (Dict): The base classes for ZMQ serialization.
         '''
+        # Passed through from the parent process to ensure
+        # that children processes include any classes added at runtime.
         serialization.BASE_ZMQ_CLASSES = BASE_ZMQ_CLASSES
         self._records: Dict[int, GenerationResult] = {}
         self._record_creator = record_creator
