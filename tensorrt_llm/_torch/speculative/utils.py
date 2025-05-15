@@ -1,5 +1,6 @@
 from .eagle3 import Eagle3Sampler, Eagle3SpecMetadata
 from .mtp import MTPHiddenStatesManager, MTPSampler, MTPSpecMetadata
+from .ngram import NGramPoolManager
 
 
 def get_spec_metadata(spec_config,
@@ -34,6 +35,8 @@ def get_spec_resource_manager(spec_config, model_config, max_num_requests):
         return MTPHiddenStatesManager(spec_config, model_config.torch_dtype,
                                       model_config.hidden_size,
                                       max_num_requests)
+    elif spec_config.spec_dec_mode.is_ngram():
+        return NGramPoolManager(spec_config, max_num_requests)
     else:
         return None
 

@@ -31,8 +31,8 @@ from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
 from .llm_args import (CalibConfig, EagleDecodingConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig,
-                       MTPDecodingConfig, _ModelFormatKind, _ModelWrapper,
-                       _ParallelConfig, get_model_format,
+                       MTPDecodingConfig, NGramDecodingConfig, _ModelFormatKind,
+                       _ModelWrapper, _ParallelConfig, get_model_format,
                        update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
 from .mpi_session import MPINodeState, MpiSession
@@ -860,6 +860,7 @@ __all__ = [
     'LookaheadDecodingConfig',
     'MedusaDecodingConfig',
     'MTPDecodingConfig',
+    'NGramDecodingConfig',
     'ContextChunkingPolicy',
     'CapacitySchedulerPolicy',
     'BuildConfig',
