@@ -631,7 +631,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False)
         pytorch_config = PyTorchConfig(
-            enable_overlap_scheduler=overlap_scheduler,
+            disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph)
         mtp_config = None
         if mtp_nextn > 0:
