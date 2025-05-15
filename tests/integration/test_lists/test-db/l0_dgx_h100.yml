@@ -121,7 +121,15 @@ l0_dgx_h100:
   - cpp/test_multi_gpu.py::test_llama_executor_guided_decoding[llama-90]
   - cpp/test_multi_gpu.py::test_llama_executor_logits_proc[llama-90]
   - cpp/test_multi_gpu.py::test_trt_gpt_real_decoder[llama-90]
-  - cpp/test_multi_gpu.py::test_disagg[llama-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[gpt-mpi_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[gpt-ucx_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[llama-mpi_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[llama-ucx_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_asymmetric_executor[llama-mpi_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_asymmetric_executor[llama-ucx_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_orchestrator_params[llama-mpi_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_orchestrator_params[llama-ucx_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_spawn_orchestrator[llama-ucx_kvcache-90]
 - condition:
     ranges:
       system_gpu_count:
