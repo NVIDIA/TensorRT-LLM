@@ -1137,6 +1137,7 @@ class TestQwen2_0_5BInstruct(CliFlowAccuracyTestHarness):
     def test_auto_dtype(self):
         self.run(dtype='auto')
 
+    @pytest.mark.skip(reason="https://nvbugs/5280195")
     @pytest.mark.skip_less_device(4)
     def test_auto_dtype_cp4(self):
         "RCCA: https://nvbugs/5170106"
