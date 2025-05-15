@@ -197,6 +197,7 @@ def flattened_mha_with_cache(
     #    and number of tokens per sequence are encoded in seq_len and seq_start.
     num_kv_heads, head_dim = k_cache.shape[-2:]
     v_head_dim = v_cache.shape[-1]
+    q_ndim = q.ndim
     b, s = q.shape[:2]
 
     # check for num_heads
@@ -232,8 +233,8 @@ def flattened_mha_with_cache(
             y,
         )
 
-    return y.view(
-        b, s, num_heads, v_head_dim
+    return (
+        y.view(b, s, num_heads * v_head_dim) if q_ndim == 3 else y.view(b, s, num_heads, v_head_dim)
     )  # [bsnd] in the original view (might have some dims flattened)
 
 
