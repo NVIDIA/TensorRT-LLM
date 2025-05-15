@@ -86,6 +86,15 @@ def createKubernetesPodConfig(type, arch = "amd64")
                   persistentVolumeClaim:
                     claimName: sw-tensorrt-pvc
     """
+    if (arch == "arm64") {
+        // PVC mount isn't supported on aarch64 platform. Use NFS as a WAR.
+        pvcVolume = """
+                - name: sw-tensorrt-pvc
+                  nfs:
+                    server: 10.117.145.13
+                    path: /vol/scratch1/scratch.svc_tensorrt_blossom
+        """
+    }
     def podConfig = [
         cloud: targetCould,
         namespace: "sw-tensorrt",
@@ -125,10 +134,17 @@ def createKubernetesPodConfig(type, arch = "amd64")
 }
 
 
-def buildImage(target, action="build", torchInstallType="skip", args="", custom_tag="", post_tag="", is_sbsa=false)
+def buildImage(config)
 {
-    def arch = is_sbsa ? "sbsa" : "x86_64"
-    def tag = "${arch}-${target}-torch_${torchInstallType}${post_tag}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
+    def target = config.target
+    def action = config.action
+    def torchInstallType = config.torchInstallType
+    def args = config.args
+    def customTag = config.customTag
+    def postTag = config.postTag
+    def arch = if (config.arch == 'arm64') 'aarch64' else 'x86_64'
+
+    def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
     // Step 1: cloning tekit source code
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
@@ -187,12 +203,12 @@ def buildImage(target, action="build", torchInstallType="skip", args="", custom_
                 }
             }
 
-            if (custom_tag) {
-                stage ("custom tag: ${custom_tag}") {
+            if (customTag) {
+                stage ("custom tag: ${customTag}") {
                   sh """
                   cd ${LLM_ROOT} && make -C docker ${target}_${action} \
                   TORCH_INSTALL_TYPE=${torchInstallType} \
-                  IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${custom_tag} \
+                  IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${customTag} \
                   BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} \
                   SHARED_CCACHE_DIR=${CCACHE_DIR} \
                   GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote
@@ -213,6 +229,91 @@ def buildImage(target, action="build", torchInstallType="skip", args="", custom_
             }
         }
     }
+}
+
+
+def launchBuildJobs(pipeline) {
+    def defaultBuildConfig = [
+        target: "tritondevel",
+        action: params.action,
+        customTag: "",
+        postTag: "",
+        args: "",
+        torchInstallType: "skip",
+        arch: "amd64"
+    ]
+    def buildConfigs = [
+        "Build trtllm release(x86_64)": [
+            target: "trtllm_x86_64",
+            action: "push",
+            customTag: LLM_BRANCH_TAG + "-amd64",
+        ],
+        "Build trtllm release(aarch64)": [
+            target: "trtllm_aarch64",
+            action: "push",
+            customTag: LLM_BRANCH_TAG + "-arm64",
+            arch: "arm64"
+        ],
+        "Build CI image(x86_64)": [],
+        "Build CI image(aarch64)": [
+            arch: "arm64",
+        ],
+        "Build CI image(rockylinux8-py310)": [
+            target: "rockylinux8",
+            args: "PYTHON_VERSION=3.10.12 STAGE=tritondevel",
+            postTag: "-py310",
+        ],
+        "Build CI image(rockylinux8-py312)": [
+            target: "rockylinux8",
+            args: "PYTHON_VERSION=3.12.3 STAGE=tritondevel",
+            postTag: "-py312",
+        ],
+        "Build NGC devel(x86_64)": [
+            target: "devel",
+        ],
+        "Build NGC devel(aarch64)": [
+            target: "devel",
+            arch: "arm64",
+        ],
+        "Build NGC release(x86_64)": [
+            target: "ngc_release",
+            action: "push",
+            customTag: "ngc-" + LLM_BRANCH_TAG + "-amd64",
+        ],
+        "Build NGC release(aarch64)": [
+            target: "ngc_release",
+            action: "push",
+            customTag: "ngc-" + LLM_BRANCH_TAG + "-arm64",
+            arch: "arm64",
+        ],
+    ]
+    // Override all fields in build config with default values
+    buildConfigs.each { key, config ->
+        defaultConfig.each { defaultKey, defaultValue ->
+            if (!config.containsKey(defaultKey)) {
+                config[defaultKey] = defaultValue
+            }
+        }
+    }
+    echo "Build configs:"
+    println buildConfigs
+
+    def buildJobs = buildConfigs.collectEntries { key, config ->
+        [key, {
+            stage(key) {
+                agent {
+                    kubernetes createKubernetesPodConfig("build", config.arch)
+                }
+                steps
+                {
+                    buildImage(config)
+                }
+            }
+        }]
+    }
+    echo "Build jobs:"
+    println buildJobs
+
 }
 
 
@@ -259,6 +360,11 @@ pipeline {
             }
         }
         stage("Build")
+            steps{
+                script{
+                    launchBuildJobs(this)
+                }
+            }
         {
             parallel {
                 stage("Build trtllm release") {
@@ -324,15 +430,15 @@ pipeline {
                         buildImage("devel", params.action, "skip")
                     }
                 }
-                // stage("Build NGC SBSA") {
-                //     agent {
-                //         kubernetes createKubernetesPodConfig("build")
-                //     }
-                //     steps
-                //     {
-                //         buildImage("devel", params.action, "skip")
-                //     }
-                // }
+                stage("Build NGC SBSA") {
+                    agent {
+                        kubernetes createKubernetesPodConfig("build", "arm64")
+                    }
+                    steps
+                    {
+                        buildImage("devel", params.action, "skip", "", "", "", true)
+                    }
+                }
                 stage("Build NGC release x86_64") {
                     agent {
                         kubernetes createKubernetesPodConfig("build")
