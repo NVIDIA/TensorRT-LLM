@@ -33,12 +33,14 @@
 template <typename T, typename... Args>
 void printArgs(T first, Args... args)
 {
+#ifdef TLLM_GEN_DEBUG
     std::cout << first;
     if constexpr (sizeof...(args) > 0)
     {
         std::cout << " ";
         printArgs(args...);
     }
+#endif
 }
 
 #define TLLM_CHECK_ERROR(cond, ...)                                                                                    \
