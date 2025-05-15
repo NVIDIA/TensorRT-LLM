@@ -12,6 +12,7 @@ from ..model_config import ModelConfig
 from ..models.modeling_utils import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
+from ..modules.embedding import Embedding
 from ..modules.fused_moe import FusedMoE, RenormalizeMoeRoutingMethod
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
@@ -153,10 +154,11 @@ class MixtralModel(DecoderModel):
         self.vocab_size = config.vocab_size
         self.aux_stream = torch.cuda.Stream()
 
-        self.embed_tokens = nn.Embedding(config.vocab_size,
-                                         config.hidden_size,
-                                         config.pad_token_id,
-                                         dtype=config.torch_dtype)
+        self.embed_tokens = Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            dtype=config.torch_dtype,
+        )
 
         self.layers = nn.ModuleList([
             MixtralDecoderLayer(model_config, layer_idx, self.aux_stream)

@@ -419,16 +419,13 @@ class Mapping(object):
     def has_moe_ep(self):
         return self.moe_ep_size > 1
 
-    # TODO: Add support of uneven/arbitrary layer segmentation
     def pp_layers(self, num_layers: int) -> List[int]:
-        layers_per_pipeline_stage = num_layers // self.pp_size
-        if self.pp_rank == self.pp_size - 1:
-            layers_range = range(self.pp_rank * layers_per_pipeline_stage,
-                                 num_layers)
-        else:
-            layers_range = range(self.pp_rank * layers_per_pipeline_stage,
-                                 (self.pp_rank + 1) * layers_per_pipeline_stage)
-        return list(layers_range)
+        base_layers = num_layers // self.pp_size
+        extra_layers = num_layers % self.pp_size
+        start_idx = self.pp_rank * base_layers + min(self.pp_rank, extra_layers)
+        layers_in_stage = base_layers + (1
+                                         if self.pp_rank < extra_layers else 0)
+        return list(range(start_idx, start_idx + layers_in_stage))
 
     def ep_experts(self, num_experts: int) -> List[int]:
         assert self.cp_size == 1
