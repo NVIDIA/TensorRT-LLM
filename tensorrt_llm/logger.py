@@ -151,6 +151,7 @@ severity_map = {
     'info': [trt.Logger.INFO, logging.INFO],
     'verbose': [trt.Logger.VERBOSE, logging.DEBUG],
     'debug': [trt.Logger.VERBOSE, logging.DEBUG],
+    'trace': [trt.Logger.VERBOSE, logging.DEBUG],
 }
 
 if G_LOGGER is not None:
@@ -161,6 +162,7 @@ if G_LOGGER is not None:
         'info': G_LOGGER.INFO,
         'verbose': G_LOGGER.SUPER_VERBOSE,
         'debug': G_LOGGER.SUPER_VERBOSE,
+        'trace': G_LOGGER.SUPER_VERBOSE,
     }
     for key, value in g_logger_severity_map.items():
         severity_map[key].append(value)
