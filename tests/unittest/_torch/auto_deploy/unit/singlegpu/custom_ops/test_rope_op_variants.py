@@ -46,8 +46,8 @@ def test_flashinfer_custom_op_and_hf_impl(dtype, atol, rtol, head_dim):
     # For direct FlashInfer call: non-interleaved cache [seq_len, head_dim] (concatenated).
     cos_sin_cache = torch.cat([cos_vals, sin_vals], dim=1)
     cos_sin_cache_expand = (
-        cos_sin_cache.unsqueeze(0).expand(batch, -1, -1).contiguous()
-    )  # [batch, seq_len, head_dim]
+        cos_sin_cache.unsqueeze(0).expand(batch, -1, -1).contiguous().view(batch * seq_len, -1)
+    )  # [batch * seq_len, head_dim]
     # For HF and the custom op: duplicated layout [seq_len, head_dim].
     cos_new = torch.cat([cos_vals, cos_vals], dim=-1)
     sin_new = torch.cat([sin_vals, sin_vals], dim=-1)
@@ -130,8 +130,8 @@ def test_flashinfer_custom_op_and_complex_impl(dtype, atol, rtol, head_dim):
     sin_from_freqs = torch.imag(freqs_cis)  # (B, seq, head_dim//2)
     cos_sin_cache = torch.cat([cos_from_freqs, sin_from_freqs], dim=-1)[0]  # (seq, head_dim))
     cos_sin_cache_expand = (
-        cos_sin_cache.unsqueeze(0).expand(batch, -1, -1).contiguous()
-    )  # [batch, seq_len, head_dim]
+        cos_sin_cache.unsqueeze(0).expand(batch, -1, -1).contiguous().view(batch * seq_len, -1)
+    )  # [batch * seq_len, head_dim]
 
     # q/k of llama4 rope is interleaved
     positions_flat = torch.arange(batch * seq_len, device=device)

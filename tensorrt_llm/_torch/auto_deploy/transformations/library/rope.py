@@ -189,6 +189,7 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
     }
 
     need_transpose = False
+    need_canonicalize_graph = False
     for node in graph.nodes:
         if not is_op(node, rope_ops):
             continue
@@ -217,6 +218,7 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
         if not need_transpose:
             continue
 
+        need_canonicalize_graph = True
         # retrieve q and k output node from node
         q_rope_old, k_rope_old = extract_output_tuple(node, 2)
         if q_rope_old is None or k_rope_old is None:
@@ -271,7 +273,7 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
         q_rope_new.args = (q_rope_old, 1, 2)
         k_rope_new.args = (k_rope_old, 1, 2)
 
-    if need_transpose:
+    if need_canonicalize_graph:
         gm = canonicalize_graph(gm)
     return gm
 
@@ -350,9 +352,18 @@ def _optimize_explicit(
             fused_cos_sin = graph.call_function(
                 torch.ops.aten.cat, args=((cos_prefix, sin_prefix), -1)
             )
-        with graph.inserting_after(fused_cos_sin):
+        with graph.inserting_after(q_node):
+            sym_batch = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 0))
+            sym_seq = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 1))
+        with graph.inserting_after(_get_last_node([sym_batch, sym_seq])):
+            bs_seq = graph.call_function(operator.mul, args=(sym_batch, sym_seq))
+        with graph.inserting_after(_get_last_node([bs_seq, fused_cos_sin])):
+            fused_cos_sin_flat = graph.call_function(
+                torch.ops.aten.view, args=(fused_cos_sin, (bs_seq, -1))
+            )
+        with graph.inserting_after(fused_cos_sin_flat):
             fused_cos_sin_to = graph.call_function(
-                torch.ops.aten.to, args=(fused_cos_sin, torch.float32)
+                torch.ops.aten.to, args=(fused_cos_sin_flat, torch.float32)
             )
         cache[cache_key] = fused_cos_sin_to
 
@@ -419,9 +430,18 @@ def _optimize_complex(
             cos_sin_flash_3d = graph.call_function(
                 torch.ops.aten.cat, args=((real_part, imag_part), -1)
             )
-        with graph.inserting_after(cos_sin_flash_3d):
+        with graph.inserting_after(q_node):
+            sym_batch = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 0))
+            sym_seq = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 1))
+        with graph.inserting_after(_get_last_node([sym_batch, sym_seq])):
+            bs_seq = graph.call_function(operator.mul, args=(sym_batch, sym_seq))
+        with graph.inserting_after(_get_last_node([bs_seq, cos_sin_flash_3d])):
+            fused_cos_sin_flat = graph.call_function(
+                torch.ops.aten.view, args=(cos_sin_flash_3d, (bs_seq, -1))
+            )
+        with graph.inserting_after(fused_cos_sin_flat):
             cos_sin_flash = graph.call_function(
-                torch.ops.aten.to, args=(cos_sin_flash_3d, torch.float32)
+                torch.ops.aten.to, args=(fused_cos_sin_flat, torch.float32)
             )
         cache[inv_freq_node] = cos_sin_flash
 
