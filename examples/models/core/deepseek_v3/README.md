@@ -21,9 +21,14 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
   - [Quick Start](#quick-start)
     - [Run a single inference](#run-a-single-inference)
     - [Multi-Token Prediction (MTP)](#multi-token-prediction-mtp)
+      - [Relaxed acceptance](#relaxed-acceptance)
     - [Long context support](#long-context-support)
+      - [ISL-64k-OSL-1024](#isl-64k-osl-1024)
+      - [ISL-128k-OSL-1024](#isl-128k-osl-1024)
   - [Evaluation](#evaluation)
   - [Serving](#serving)
+    - [Use trtllm-serve](#use-trtllm-serve)
+    - [Use tensorrtllm_backend for triton inference server (Experimental)](#use-tensorrtllm_backend-for-triton-inference-server-experimental)
   - [Advanced Usages](#advanced-usages)
     - [Multi-node](#multi-node)
       - [mpirun](#mpirun)
@@ -33,7 +38,9 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
     - [FlashMLA](#flashmla)
     - [FP8 KV Cache and MLA](#fp8-kv-cache-and-mla)
     - [W4AFP8](#w4afp8)
+    - [KV Cache Reuse](#kv-cache-reuse)
   - [Notes and Troubleshooting](#notes-and-troubleshooting)
+  - [Known Issues](#known-issues)
 
 
 ## Hardware Requirements
@@ -134,7 +141,6 @@ python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
 
 cat <<EOF > /tmp/extra-llm-api-config.yml
 pytorch_backend_config:
-  enable_overlap_scheduler: true
   use_cuda_graph: true
   cuda_graph_padding_enabled: true
   cuda_graph_batch_sizes: [1, 4, 8, 12]
@@ -163,7 +169,6 @@ python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
 
 cat <<EOF > /tmp/extra-llm-api-config.yml
 pytorch_backend_config:
-  enable_overlap_scheduler: true
   use_cuda_graph: true
   cuda_graph_padding_enabled: true
   cuda_graph_batch_sizes: [1, 2]
@@ -190,7 +195,6 @@ Evaluate the model accuracy using `trtllm-eval`.
 cat >./extra-llm-api-config.yml <<EOF
 pytorch_backend_config:
     use_cuda_graph: true
-    enable_overlap_scheduler: true
 enable_attention_dp: true
 EOF
 ```
@@ -226,6 +230,7 @@ trtllm-eval --model  <YOUR_MODEL_DIR> \
 ```
 
 ## Serving
+### Use trtllm-serve
 
 To serve the model using `trtllm-serve`:
 
@@ -246,7 +251,6 @@ pytorch_backend_config:
     - 256
     - 384
     print_iter_log: true
-    enable_overlap_scheduler: true
 enable_attention_dp: true
 EOF
 
@@ -277,6 +281,27 @@ curl http://localhost:8000/v1/completions \
 ```
 
 For DeepSeek-R1, use the model name `deepseek-ai/DeepSeek-R1`.
+
+
+### Use tensorrtllm_backend for triton inference server (Experimental)
+To serve the model using [tensorrtllm_backend](https://github.com/triton-inference-server/tensorrtllm_backend.git), make sure the version is v0.19+ in which the pytorch path is added as an experimental feature.
+
+The model configuration file is located at https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/all_models/llmapi/tensorrt_llm/1/model.yaml
+
+```bash
+model: <replace with the deepseek model or path to the checkpoints>
+backend: "pytorch"
+```
+Additional configs similar to `extra-llm-api-config.yml` can be added to the yaml file and will be used to configure the LLM model. At the minimum, `tensor_parallel_size` needs to be set to 8 on H200 and B200 machines and 16 on H100.
+
+The initial loading of the model can take around one hour and the following runs will take advantage of the weight caching.
+
+To send requests to the server, try:
+```bash
+curl -X POST localhost:8000/v2/models/tensorrt_llm/generate -d '{"text_input": "Hello, my name is", "sampling_param_temperature":0.8, "sampling_param_top_p":0.95}' | sed 's/^data: //' | jq
+```
+Available parameters for the requests are listed in https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/all_models/llmapi/tensorrt_llm/config.pbtxt.
+
 
 ## Advanced Usages
 ### Multi-node
@@ -417,7 +442,6 @@ pytorch_backend_config:
     - 256
     - 384
     print_iter_log: true
-    enable_overlap_scheduler: true
 enable_attention_dp: true
 EOF
 ```
@@ -634,6 +658,8 @@ echo "All processes completed!"
 
 The converted checkpoint could be used as `<YOUR_MODEL_DIR>` and consumed by other commands.
 
+### KV Cache Reuse
+KV cache reuse is supported for MLA on SM90 and SM100. It is enabled by default and does not support FP8 KV cache right now. Due to extra operations like memcpy and GEMMs, GPU memory consumption may be higher and the E2E performance may have regression in some cases. Users could pass `KvCacheConfig(enable_block_reuse=False)` to LLM API to disable it.
 
 ## Notes and Troubleshooting
 

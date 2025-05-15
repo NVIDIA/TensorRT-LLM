@@ -1,0 +1,14 @@
+generated
+bin
+cubin
+obj
+build
+deps
+CMakeFiles
+stateChange.txt
+temp
+.*
+*.log
+*.sass
+*.ncu-rep
+__pycache__
