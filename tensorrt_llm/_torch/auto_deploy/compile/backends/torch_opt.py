@@ -24,6 +24,8 @@ class CompiledGraph(nn.Module):
         super().__init__()
         self._in_spec: TreeSpec = model._in_spec
         self._out_spec: TreeSpec = model._out_spec
+        # Set the default cache size limit to 100 to avoid torch recompilation
+        torch._dynamo.config.cache_size_limit = 100
         self.gm_compiled = torch.compile(model, dynamic=True)
         self.max_batch_size = max_batch_size
         self.num_batched_inputs = num_batched_inputs if num_batched_inputs is not None else 1
