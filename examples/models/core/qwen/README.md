@@ -22,7 +22,7 @@ This document shows how to build and run a [Qwen](https://huggingface.co/Qwen) m
       - [Run a single inference](#run-a-single-inference)
     - [Evaluation](#evaluation)
     - [Serving](#serving)
-    - [Notes and Troubleshooting](#notes-and-troubleshooting)
+  - [Notes and Troubleshooting](#notes-and-troubleshooting)
   - [Credits](#credits)
 
 ## Overview
@@ -668,7 +668,6 @@ pytorch_backend_config:
     - 256
     - 384
     print_iter_log: true
-    enable_overlap_scheduler: true
 enable_attention_dp: true
 EOF
 

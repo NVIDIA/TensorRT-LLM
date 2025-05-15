@@ -3,6 +3,7 @@ import unittest
 from parameterized import parameterized
 
 from tensorrt_llm._torch import LLM
+from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -40,7 +41,9 @@ class TestOutOfTree(unittest.TestCase):
 
         llm = LLM(model=model_dir,
                   kv_cache_config=kv_cache_config,
-                  max_num_tokens=2048)
+                  max_num_tokens=2048,
+                  pytorch_backend_config=PyTorchConfig(
+                      disable_overlap_scheduler=True))
 
         prompts = [
             "Hello, my name is",

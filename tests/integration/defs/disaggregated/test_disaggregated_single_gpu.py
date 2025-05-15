@@ -110,13 +110,13 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
 
     # Context worker
     worker_pytorch_configs.append(
-        PyTorchConfig(enable_overlap_scheduler=False,
+        PyTorchConfig(disable_overlap_scheduler=True,
                       kv_cache_dtype="auto",
                       use_cuda_graph=enable_cuda_graph))
 
     # Generation worker
     worker_pytorch_configs.append(
-        PyTorchConfig(enable_overlap_scheduler=generation_overlap,
+        PyTorchConfig(disable_overlap_scheduler=not generation_overlap,
                       kv_cache_dtype="auto",
                       use_cuda_graph=enable_cuda_graph))
 
@@ -228,13 +228,13 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
 
     # Context worker
     worker_pytorch_configs.append(
-        PyTorchConfig(enable_overlap_scheduler=False,
+        PyTorchConfig(disable_overlap_scheduler=True,
                       kv_cache_dtype="auto",
                       use_cuda_graph=enable_cuda_graph))
 
     # Generation worker
     worker_pytorch_configs.append(
-        PyTorchConfig(enable_overlap_scheduler=generation_overlap,
+        PyTorchConfig(disable_overlap_scheduler=not generation_overlap,
                       kv_cache_dtype="auto",
                       use_cuda_graph=enable_cuda_graph))
 

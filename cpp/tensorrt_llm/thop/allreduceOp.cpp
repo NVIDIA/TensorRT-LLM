@@ -20,7 +20,6 @@
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
-#include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp4_gemm.h"
@@ -178,8 +177,6 @@ public:
         case AllReduceStrategyType::ONESHOT:
         case AllReduceStrategyType::TWOSHOT:
             return runFusionAllReduce(input, residual, norm_weight, scale, bias, workspace, runtime_strategy);
-        case AllReduceStrategyType::LOWPRECISION:
-            return runLowPrecisionAllReduce(input, residual, norm_weight, scale, bias);
         default: TORCH_CHECK(false, "Invalid runtime strategy"); return {};
         }
     }
@@ -297,73 +294,6 @@ private:
 
         // Treat any other patterns as fallback cases.
         return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, reduce_output);
-    }
-
-    std::vector<torch::Tensor> runLowPrecisionAllReduce(torch::Tensor const& input,
-        torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
-        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias) noexcept
-    {
-#ifdef ENABLE_FP8
-        auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-        int size = input.numel();
-        int hidden_size = input.size(-1);
-
-        auto const tp_size = mGroup.size();
-        auto const cur_rank = COMM_SESSION.getRank();
-        int tp_rank = 0;
-
-        for (auto const& currentRank : mGroup)
-        {
-            if (cur_rank == currentRank)
-                break;
-            ++tp_rank;
-        }
-
-        int bytes_per_element = input.element_size();
-
-        int token_num = size / hidden_size;
-
-        auto parts = tensorrt_llm::kernels::splitNumber(size);
-
-        torch::Tensor reduce_output = torch::empty_like(input);
-
-        size_t global_offset = 0;
-        for (size_t i = 0; i < parts.size(); ++i)
-        {
-            size_t tmp_size = parts[i];
-            tensorrt_llm::kernels::LowPrecisionAllReduceParams tmp_param;
-            if (tp_size <= 4)
-            {
-                tmp_param = tensorrt_llm::kernels::LowPrecisionAllReduceParams::deserialize(
-                    tp_size, tp_rank, mType, token_num, hidden_size);
-            }
-            else
-            {
-                tmp_param = tensorrt_llm::kernels::LowPrecisionAllReduceParams::deserialize_hier(
-                    tp_size, tp_rank, mType, token_num, hidden_size);
-            }
-
-            tmp_param.local_input_buffer_ptr = reinterpret_cast<void const*>(
-                reinterpret_cast<char const*>(input.data_ptr()) + global_offset * bytes_per_element);
-            tmp_param.local_output_buffer_ptr = reinterpret_cast<void*>(
-                reinterpret_cast<char*>(reduce_output.mutable_data_ptr()) + global_offset * bytes_per_element);
-            tmp_param.elts_total = tmp_size;
-            tensorrt_llm::kernels::customLowPrecisionAllReduce(tmp_param, mType, stream);
-
-            global_offset += tmp_size;
-        }
-
-        if (mOp == AllReduceFusionOp::NONE)
-        {
-            return {reduce_output};
-        }
-
-        // Treat any other patterns as fallback cases.
-        return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, reduce_output);
-
-#else
-        C10_THROW_ERROR(NotImplementedError, "Can't use LOWPRECISION without compile with ENABLE FP8.");
-#endif
     }
 
     std::vector<torch::Tensor> runFusionAllReduce(torch::Tensor const& input,
@@ -664,11 +594,6 @@ private:
             TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: UB", rank);
             break;
         }
-        case AllReduceStrategyType::LOWPRECISION:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: LOWPRECISION", rank);
-            break;
-        }
         default: break;
         }
     }
@@ -841,21 +766,7 @@ private:
     AllReduceStrategyType selectImplementation(
         size_t seq_len, size_t message_size, int world_size, nvinfer1::DataType type) noexcept
     {
-
-        if (isUsingLowPrecision(message_size))
-        {
-            return AllReduceStrategyType::LOWPRECISION;
-        }
-        else
-        {
-            if (mStrategy == AllReduceStrategyType::LOWPRECISION)
-            {
-                mStrategy = AllReduceStrategyType::AUTO;
-            }
-        }
-
         // Check that heuristic is only applied when AUTO is set.
-        // Use Auto select
         bool const is_auto = (mStrategy == AllReduceStrategyType::AUTO);
         auto const message_size_bytes = message_size * tensorrt_llm::common::getDTypeSize(type);
         auto const max_workspace_size
@@ -934,24 +845,6 @@ private:
             }
         }
         return strategy;
-    }
-
-    bool isUsingLowPrecision(size_t message_size) const noexcept
-    {
-        static char* force_low_precision_allreduce_strategy_char
-            = std::getenv("FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY");
-        bool force_low_precision = (force_low_precision_allreduce_strategy_char != nullptr)
-            || (mStrategy == AllReduceStrategyType::LOWPRECISION);
-
-#ifdef ENABLE_FP8
-        // Use LowPrecision if PCIe and p2p support and message size is larger than 2MB
-        constexpr int LowPrecisionMinMessageSize = 2 * 1024 * 1024;
-        return force_low_precision && !mIsNVLINKSupported && mIsP2PSupported
-            && message_size >= LowPrecisionMinMessageSize;
-#else
-        // Low precision is not available when FP8 is not enabled
-        return false;
-#endif
     }
 
 private:
@@ -1073,22 +966,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int rank,"
         "int nranks,"
         "float eps) -> Tensor[]");
-    m.def("initialize_static_lowprecision_buffers(Tensor workspace, int tp_size) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("allreduce", &torch_ext::allreduce);
     m.impl("moe_allreduce", &torch_ext::moe_allreduce);
-}
-
-TORCH_LIBRARY_IMPL(trtllm, CPU, m)
-{
-    m.impl("initialize_static_lowprecision_buffers",
-        [](at::Tensor const& workspace, int64_t tp_size)
-        {
-            tensorrt_llm::kernels::initialize_static_lowprecision_buffers(
-                reinterpret_cast<int64_t*>(workspace.data_ptr()), (int) tp_size);
-            return std::vector<at::Tensor>{};
-        });
 }
