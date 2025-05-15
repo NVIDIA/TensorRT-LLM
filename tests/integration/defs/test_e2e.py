@@ -425,7 +425,6 @@ def temp_extra_llm_api_options_file(request):
 
             if request.node.callspec.params['pytorch_backend_config']:
                 extra_llm_api_options_dict["pytorch_backend_config"] = {
-                    "enable_overlap_scheduler": True,
                     "use_cuda_graph": True,
                     "cuda_graph_batch_sizes": [1, 2, 3],
                 }
@@ -1259,6 +1258,7 @@ def test_ptp_quickstart(llm_root, llm_venv):
     ("Llama3.2-11B-BF16", "llama-3.2-models/Llama-3.2-11B-Vision"),
     ("Nemotron4_4B-BF16", "nemotron/Minitron-4B-Base"),
     ("Nemotron-H-8B", "Nemotron-H-8B-Base-8K"),
+    ("Qwen3-30B-A3B", "Qwen3/Qwen3-30B-A3B"),
     pytest.param('Llama3.1-8B-NVFP4',
                  'nvfp4-quantized/Meta-Llama-3.1-8B',
                  marks=skip_pre_blackwell),
@@ -1299,10 +1299,11 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
                                          dir="./",
                                          delete=True,
                                          delete_on_close=True) as running_log:
+            kv_cache_fraction = 0.6 if "Qwen3" in model_name else None
             llm_venv.run_cmd([
                 str(example_root / "quickstart_advanced.py"),
-                "--enable_overlap_scheduler",
                 "--enable_chunked_prefill",
+                f"--kv_cache_fraction={kv_cache_fraction}",
                 "--model_dir",
                 f"{llm_models_root()}/{model_path}",
             ],
@@ -1326,7 +1327,6 @@ def test_ptq_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
         llm_venv.run_cmd(
             [
                 str(example_root / "quickstart_advanced.py"),
-                "--enable_overlap_scheduler",
                 "--use_cuda_graph",
                 "--spec_decode_nextn",
                 "1",  # test 1 MTP module
@@ -1349,25 +1349,22 @@ def test_ptp_quickstart_advanced_deepseek_v3_2nodes_8gpus(
     # "RCCA https://nvbugs/5163844"
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_name}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        llm_venv.run_cmd([
-            str(example_root / "quickstart_advanced.py"),
-            "--enable_overlap_scheduler",
-            "--model_dir",
-            f"{llm_models_root()}/{model_path}",
-            "--moe_ep_size=8",
-            "--tp_size=16",
-            "--use_cuda_graph",
-            f"--kv_cache_fraction={_MEM_FRACTION_50}",
-            "--max_batch_size=32",
-            "--max_num_tokens=2048",
-        ],
-                         running_log=running_log)
-        # _check_mem_usage(running_log, [56.30, 0, 0, 0])
+    run_cmd = [
+        "trtllm-llmapi-launch",
+        "python3",
+        str(example_root / "quickstart_advanced.py"),
+        "--enable_overlap_scheduler",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--moe_ep_size=8",
+        "--tp_size=16",
+        "--use_cuda_graph",
+        f"--kv_cache_fraction={_MEM_FRACTION_50}",
+        "--max_batch_size=32",
+        "--max_num_tokens=2048",
+        "--disable_kv_cache_reuse",
+    ]
+    check_call(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
 
 
 @pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
@@ -1394,6 +1391,7 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
             "--eagle_model_dir",
             f"{llm_models_root()}/{eagle_model_path}",
             "--disable_kv_cache_reuse",
+            "--disable_overlap_scheduler",
         ],
                          running_log=running_log)
         _check_mem_usage(running_log, [25.2, 0, 0, 0])
@@ -1417,7 +1415,6 @@ def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
                                      delete_on_close=True) as running_log:
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
-            "--enable_overlap_scheduler",
             "--model_dir",
             f"{llm_models_root()}/{model_path}",
             "--moe_tp_size=1",
@@ -1451,7 +1448,6 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
                                      delete_on_close=True) as running_log:
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
-            "--enable_overlap_scheduler",
             "--model_dir",
             f"{llm_models_root()}/{model_path}",
             "--moe_tp_size=1",
@@ -1515,7 +1511,6 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
                                      delete_on_close=True) as running_log:
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
-            "--enable_overlap_scheduler",
             "--enable_chunked_prefill",
             "--model_dir",
             f"{llm_models_root()}/{model_path}",
@@ -1541,7 +1536,6 @@ def test_ptp_quickstart_advanced_2gpus_sm120(llm_root, llm_venv, model_name,
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
     llm_venv.run_cmd([
         str(example_root / "quickstart_advanced.py"),
-        "--enable_overlap_scheduler",
         "--enable_chunked_prefill",
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
@@ -1786,7 +1780,8 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
     sampling_param = SamplingParams(max_tokens=32, return_context_logits=True)
     with LLM(
             model=model_dir,
-            pytorch_backend_config=PyTorchConfig(attn_backend=backend),
+            pytorch_backend_config=PyTorchConfig(
+                attn_backend=backend, disable_overlap_scheduler=True),
     ) as llm:
 
         outputs = llm.generate(prompts, sampling_params=sampling_param)

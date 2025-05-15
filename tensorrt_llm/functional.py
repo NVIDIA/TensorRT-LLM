@@ -4805,6 +4805,7 @@ class RopeEmbeddingUtils:
             beta_slow: int = 1,
             mscale: float = 1.0,
             mscale_all_dim: float = 1.0,
+            duplicate_data: bool = True,
             dtype=np.float32):
 
         # Copy from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/main/modeling_deepseek.py
@@ -4862,23 +4863,25 @@ class RopeEmbeddingUtils:
         inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high,
                                                     dim // 2).astype(dtype)
         inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
-        t = np.arange(num_pos, dtype=dtype)
-
-        freqs = np.outer(t, inv_freq)
+        sinusoid_inp = np.expand_dims(np.einsum("i , j -> i j",
+                                                np.arange(num_pos, dtype=dtype),
+                                                inv_freq,
+                                                dtype=dtype),
+                                      axis=-1)
 
         _mscale = float(
             yarn_get_mscale(scaling_factor, mscale) /
             yarn_get_mscale(scaling_factor, mscale_all_dim))
 
-        emb = np.concatenate((freqs, freqs), axis=-1)
+        if duplicate_data:
+            emb = np.concatenate((sinusoid_inp, sinusoid_inp), axis=-2)
+        else:
+            emb = sinusoid_inp
 
         concat = np.concatenate((np.cos(emb) * _mscale, np.sin(emb) * _mscale),
                                 axis=-1)
 
-        concat = concat.reshape((num_pos, 2, dim))
-        concat = np.transpose(concat, (0, 2, 1))
-
-        return concat.reshape((1, -1)).astype(dtype)
+        return inv_freq, concat.reshape((1, -1)).astype(dtype)
 
     @staticmethod
     def rotate_every_two(tensor: Tensor) -> Tensor:

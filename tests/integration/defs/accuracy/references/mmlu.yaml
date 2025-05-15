@@ -23,9 +23,13 @@ meta-llama/Llama-3.1-8B-Instruct:
   - quant_algo: FP8
     accuracy: 67.93
   - quant_algo: FP8
+    extra_acc_spec: temperature=0.8,top_p=0.95
+    accuracy: 64.62
+  - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 67.87
 meta-llama/Llama-3.3-70B-Instruct:
+  - accuracy: 81.28
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 79.31
@@ -114,4 +118,4 @@ nvidia/Llama-3_3-Nemotron-Super-49B-v1:
 nvidia/Llama-3.1-Nemotron-Nano-8B-v1:
   - accuracy: 57.97
 nvidia/Nemotron-H-8B-Base-8K:
-  - accuracy: 87.573
+  - accuracy: 69.590
