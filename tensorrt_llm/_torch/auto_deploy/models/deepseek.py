@@ -147,10 +147,12 @@ def deepseek_v3_moe(self, hidden_states):
 
 
 def deepseek_v3_rope(self, x, seq_len=None):
-    """DeepSeekV3 Rotary Embedding forward function rewritten to enable torch export.
+    """
+    DeepSeekV3 Rotary Embedding forward function rewritten to enable torch export.
+
     We return the full cached cos and sin values, instead of slicing them based on seq_len as this
     would cause an issue during the generate phase (when seq_len=1 from input_ids). We also move the cos
-    sin buffers to appropriate device to enable export.
+    and sin buffers to the appropriate device to enable export.
     """
 
     return (
