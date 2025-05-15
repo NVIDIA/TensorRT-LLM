@@ -345,25 +345,6 @@ TEST_P(EncDecParamsTest, Forward)
     }
 }
 
-TEST_P(EncDecParamsTest, ExecutorKVCacheManager)
-{
-    auto const modelName = std::get<0>(GetParam());
-    SizeType32 const beamWidth = std::get<1>(GetParam());
-    SizeType32 const maxNewTokens = std::get<2>(GetParam());
-    SizeType32 const tp = std::get<3>(GetParam());
-    SizeType32 const pp = std::get<4>(GetParam());
-    SizeType32 const cp = std::get<5>(GetParam());
-
-    auto const enginePathName = getEncDecEnginePath(modelName, tp, pp, cp);
-    std::filesystem::path encEnginePath = ENC_DEC_ENGINE_BASE / enginePathName / "encoder";
-    ExecutorConfig executorConfig{};
-
-    executorConfig.setBatchingType(BatchingType::kSTATIC);
-    auto executor = Executor(encEnginePath, ModelType::kENCODER_ONLY, executorConfig);
-
-    EXPECT_EQ(executor.getKVCacheEventManager(), std::nullopt);
-}
-
 INSTANTIATE_TEST_SUITE_P(T5BasicTest, EncDecParamsTest,
     testing::Combine(testing::Values(T5_NAME), testing::Values(1), testing::Values(64), testing::Values(1),
         testing::Values(1), testing::Values(1), testing::Values(0), testing::Values(std::vector<SizeType32>{})),

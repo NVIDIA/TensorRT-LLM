@@ -425,8 +425,6 @@ void CreateNewDecoderRequests::newRequestEagle(SizeType32 batchIdx, runtime::dec
         modelConfig.getSpeculativeDecodingModulePtr());
     std::optional<executor::EagleChoices> eagleChoicesOpt;
 
-    TensorPtr draftPathsSlice = ITensor::slice(jointDecodingOutput.eagleBuffers->draftPaths, batchIdx, 1);
-
     if (request.eagleConfig)
     {
         eagleChoicesOpt = request.eagleConfig->getEagleChoices();
@@ -434,16 +432,18 @@ void CreateNewDecoderRequests::newRequestEagle(SizeType32 batchIdx, runtime::dec
 
     if (!request.eagleConfig || !request.eagleConfig->useDynamicTree())
     {
+        TensorPtr draftPathsHostSlice = ITensor::slice(jointDecodingOutput.eagleBuffers->draftPathsHost, batchIdx, 1);
+        TensorPtr draftPathsSlice = ITensor::slice(jointDecodingOutput.eagleBuffers->draftPaths, batchIdx, 1);
+
         // eagleConfig is nullptr or Eagle-1
         std::vector<SizeType32> topKs;
-        TensorPtr draftPathsHost = manager.pinnedPool(draftPathsSlice->getShape(), nvinfer1::DataType::kINT32);
         auto const depth = utils::initTensorsFromChoices(modelConfig.getSpeculativeDecodingModule(),
             eagleChoicesOpt.value_or(eagleModule->getDefaultEagleChoices()), topKs, nullptr, nullptr, nullptr,
-            draftPathsHost, nullptr, {eagleModule->getMaxNonLeafNodesPerLayer()});
+            draftPathsHostSlice, nullptr, {eagleModule->getMaxNonLeafNodesPerLayer()});
         TLLM_CHECK_WITH_INFO(depth == modelConfig.getSpeculativeDecodingModule().getMaxDraftPathLen(),
             "EAGLE-1 requires Eagle-tree depth being equal to the the number of build-time EAGLE layers.");
 
-        manager.copy(*draftPathsHost, *draftPathsSlice);
+        manager.copy(*draftPathsHostSlice, *draftPathsSlice);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

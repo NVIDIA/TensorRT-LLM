@@ -49,33 +49,37 @@ void EagleBuffers::Inputs::create(SizeType32 maxNumSequences, BufferManager cons
     draftLens = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     draftPaths
         = manager.gpu(ITensor::makeShape({maxNumSequences, maxNumPaths, maxPathLen}), nvinfer1::DataType::kINT32);
+    draftPathsHost = BufferManager::pinnedPool(
+        ITensor::makeShape({maxNumSequences, maxNumPaths, maxPathLen}), nvinfer1::DataType::kINT32);
     specDecodingGenerationLengths = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     specDecodingGenerationLengthsHost
-        = manager.pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     specDecodingPackedMasks
         = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingTokens, common::ceilDiv(maxDecodingTokens, 32)}),
             nvinfer1::DataType::kINT32);
     specDecodingPositionOffsets
         = manager.gpu(ITensor::makeShape({maxNumSequences * maxDecodingTokens}), nvinfer1::DataType::kINT32);
 
-    eagleNetCtxRequestTypesHost = manager.pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
+    eagleNetCtxRequestTypesHost
+        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     eagleNetCtxContextLengthsHost
-        = manager.pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     eagleNetCtxPastKeyValueLengthsHost
-        = manager.pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
-    eagleNetGenRequestTypesHost = manager.pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
+    eagleNetGenRequestTypesHost
+        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     eagleNetGenContextLengthsHost
-        = manager.pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     eagleNetGenPastKeyValueLengthsHost
-        = manager.pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
-    inputGenTokensHost
-        = manager.pinnedPool(ITensor::makeShape({maxNumSequences * maxDecodingTokens}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
+    inputGenTokensHost = BufferManager::pinnedPool(
+        ITensor::makeShape({maxNumSequences * maxDecodingTokens}), nvinfer1::DataType::kINT32);
     chunkedContextNextTokens = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     useSpecDecoding = manager.cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 
     // Eagle-2
-    useDynamicTreeHost = manager.pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
-    dynamicTreeMaxTopKHost = manager.pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    useDynamicTreeHost = BufferManager::pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    dynamicTreeMaxTopKHost = BufferManager::pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
     prevScores = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingDraftTokens}), nvinfer1::DataType::kFLOAT);
     currentExpandIndices = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingDraftTokens}), TRTTokenIdType);
     allLayersScores = manager.gpu(
@@ -115,7 +119,7 @@ EagleBuffers::EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, run
     engineInputs.posteriorThreshold = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
     posteriorAlphaHost = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kFLOAT);
     posteriorThresholdHost = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kFLOAT);
-    greedySamplingHost = manager.pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    greedySamplingHost = BufferManager::pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 
     engineInputs.draftTokens
         = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingDraftTokens}), TRTTokenIdType);
@@ -146,13 +150,14 @@ EagleBuffers::EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, run
         = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
     engineInputs.inputGenTokensHost = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
     engineInputs.chunkedContextNextTokens = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
-    engineInputs.useSpecDecoding = manager.cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    engineInputs.useSpecDecoding = BufferManager::cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
     bufferCast<SizeType32>(*engineInputs.useSpecDecoding)[0] = 1;
     chunkedContextNextTokensHost = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
 
     // Eagle-2
-    engineInputs.useDynamicTreeHost = manager.pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
-    engineInputs.dynamicTreeMaxTopKHost = manager.pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    engineInputs.useDynamicTreeHost = BufferManager::pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    engineInputs.dynamicTreeMaxTopKHost
+        = BufferManager::pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 
     engineInputs.prevScores
         = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingDraftTokens}), nvinfer1::DataType::kFLOAT);
@@ -419,6 +424,9 @@ void EagleBuffers::setFromInputs(RequestVector const& contextRequests, RequestVe
         {
             auto const batchSlot = params.batchSlots[batchIdx];
             setupEagleNetHostBuffers(batchIdx, batchSlot);
+
+            auto draftTokens = ITensor::slice(engineInputs.draftTokens, batchIdx, 1);
+            runtime::kernels::invokeFill(*draftTokens, -1, manager.getStream());
         }
         else
         {
@@ -439,18 +447,18 @@ void EagleBuffers::setFromInputs(RequestVector const& contextRequests, RequestVe
                 = beginCompute + contextChunkSize;
 
             // Setup fake path
-            TensorPtr draftPathsHost = BufferManager::pinnedPool(
-                ITensor::makeShape({1, eagleModule.getMaxPathLen()}), nvinfer1::DataType::kINT32);
+            TensorPtr draftPathsHostSlice = ITensor::at(engineInputs.draftPathsHost, {batchIdx, 1});
+
             for (SizeType32 ti = 0; ti < eagleModule.getMaxPathLen(); ++ti)
             {
-                bufferCast<SizeType32>(*draftPathsHost)[ti] = ti;
+                bufferCast<SizeType32>(*draftPathsHostSlice)[ti] = ti;
             }
 
             TensorPtr draftPathsBatchSlice = ITensor::slice(engineInputs.draftPaths, batchIdx, 1);
             draftPathsBatchSlice->squeeze(0);
             kernels::invokeFill(*draftPathsBatchSlice, -1, manager.getStream());
             TensorPtr draftPathsBatchPathSlice = ITensor::slice(draftPathsBatchSlice, 0, 1);
-            manager.copy(*draftPathsHost, *draftPathsBatchPathSlice);
+            manager.copy(*draftPathsHostSlice, *draftPathsBatchPathSlice);
 
             auto const& reqTokens = llmReq->getTokens(0);
             chunkedContextNextTokensHostPtr[batchIdx] = reqTokens[endCompute];

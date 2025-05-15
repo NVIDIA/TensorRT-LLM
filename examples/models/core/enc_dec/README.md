@@ -18,12 +18,12 @@ This document shows how to build and run an Encoder-Decoder (Enc-Dec) model in T
       - [Run Python runtime](#run-python-runtime)
     - [Benchmark](#benchmark)
       - [Benchmark C++ runtime](#benchmark-c-runtime)
-      - [Benchmark Python runtime](#benchmark-python-runtime)
     - [Run BART with LoRA](#run-bart-with-lora)
     - [Reminders](#reminders)
     - [Attention Scaling Factors](#attention-scaling-factors)
     - [Run FairSeq NMT (Neural Machine Translation) models](#run-fairseq-nmt-neural-machine-translation-models)
     - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
+      - [Get quantized checkpoint with ModelOpt](#get-quantized-checkpoint-with-modelopt)
 
 ## Overview
 
@@ -241,31 +241,6 @@ mpirun --allow-run-as-root -np ${WORLD_SIZE} python3 run.py --engine_dir tmp/trt
 
 The tutorial for encoder-decoder C++ runtime benchmark can be found in [`benchmarks/cpp`](../../benchmarks/cpp/README.md#2-launch-c-benchmarking-inflightv1-batching)
 
-#### Benchmark Python runtime
-
-The benchmark implementation and entrypoint can be found in [`benchmarks/python/benchmark.py`](../../benchmarks/python/benchmark.py). Specifically, [`benchmarks/python/enc_dec_benchmark.py`](../../benchmarks/python/enc_dec_benchmark.py) is the benchmark script for Encoder-Decoder models.
-
-In `benchmarks/python/`:
-
-```bash
-# Example 1: Single-GPU benchmark
-python benchmark.py \
-    -m enc-dec \
-    --batch_size "1;8" \
-    --input_output_len "60,20;128,20" \
-    --engine_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION} \
-    --dtype float32 \
-    --csv # optional
-
-# Example 2: Multi-GPU benchmark
-mpirun --allow-run-as-root -np 4 python benchmark.py \
-    -m enc-dec \
-    --batch_size "1;8" \
-    --input_output_len "60,20;128,20" \
-    --engine_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION} \
-    --dtype float32 \
-    --csv # optional
-```
 
 ### Run BART with LoRA
 

@@ -24,6 +24,8 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
     - [Long context support](#long-context-support)
   - [Evaluation](#evaluation)
   - [Serving](#serving)
+    - [Use trtllm-serve](#use-trtllm-serve)
+    - [Use tensorrtllm_backend for triton inference server (Experimental)](#use-tensorrtllm_backend-for-triton-inference-server-experimental)
   - [Advanced Usages](#advanced-usages)
     - [Multi-node](#multi-node)
       - [mpirun](#mpirun)
@@ -32,21 +34,22 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
     - [DeepGEMM](#deepgemm)
     - [FlashMLA](#flashmla)
     - [FP8 KV Cache and MLA](#fp8-kv-cache-and-mla)
+    - [W4AFP8](#w4afp8)
   - [Notes and Troubleshooting](#notes-and-troubleshooting)
 
 
 ## Hardware Requirements
 
 DeepSeek-v3 has 671B parameters which needs about 671GB GPU memory for FP8 weights, and needs more memories for activation tensors and KV cache.
-The minimum hardware requirements for running DeepSeek V3/R1 FP8&FP4 are listed as follows.
+The minimum hardware requirements for running DeepSeek V3/R1 at FP8/FP4/W4A8 are listed as follows.
 
-| GPU  | DeepSeek-V3/R1 FP8 | DeepSeek-V3/R1 FP4 |
-| -------- | ------- | -- |
-| H100 80GB | 16 | N/A |
-| H20 141GB | 8 | N/A |
-| H20 96GB | 8  | N/A |
-| H200 | 8     | N/A |
-| B200/GB200| Not supported yet, WIP | 4 (8 GPUs is recommended for best perf) |
+| GPU  | DeepSeek-V3/R1 FP8 | DeepSeek-V3/R1 FP4 | DeepSeek-V3/R1 W4A8 |
+| -------- | ------- | -- | -- |
+| H100 80GB | 16 | N/A | 8 |
+| H20 141GB | 8 | N/A | 4 |
+| H20 96GB | 8  | N/A | 4 |
+| H200 | 8     | N/A | 4 |
+| B200/GB200| Not supported yet, WIP | 4 (8 GPUs is recommended for best perf) | Not supported yet, WIP |
 
 Ampere architecture (SM80 & SM86) is not supported.
 
@@ -225,6 +228,7 @@ trtllm-eval --model  <YOUR_MODEL_DIR> \
 ```
 
 ## Serving
+### Use trtllm-serve
 
 To serve the model using `trtllm-serve`:
 
@@ -276,6 +280,27 @@ curl http://localhost:8000/v1/completions \
 ```
 
 For DeepSeek-R1, use the model name `deepseek-ai/DeepSeek-R1`.
+
+
+### Use tensorrtllm_backend for triton inference server (Experimental)
+To serve the model using [tensorrtllm_backend](https://github.com/triton-inference-server/tensorrtllm_backend.git), make sure the version is v0.19+ in which the pytorch path is added as an experimental feature.
+
+The model configuration file is located at https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/all_models/llmapi/tensorrt_llm/1/model.yaml
+
+```bash
+model: <replace with the deepseek model or path to the checkpoints>
+backend: "pytorch"
+```
+Additional configs similar to `extra-llm-api-config.yml` can be added to the yaml file and will be used to configure the LLM model. At the minimum, `tensor_parallel_size` needs to be set to 8 on H200 and B200 machines and 16 on H100.
+
+The initial loading of the model can take around one hour and the following runs will take advantage of the weight caching.
+
+To send requests to the server, try:
+```bash
+curl -X POST localhost:8000/v2/models/tensorrt_llm/generate -d '{"text_input": "Hello, my name is", "sampling_param_temperature":0.8, "sampling_param_top_p":0.95}' | sed 's/^data: //' | jq
+```
+Available parameters for the requests are listed in https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/all_models/llmapi/tensorrt_llm/config.pbtxt.
+
 
 ## Advanced Usages
 ### Multi-node
@@ -565,6 +590,74 @@ pytorch_backend_config:
   kv_cache_dtype: fp8
   # ...
 ```
+
+### W4AFP8
+
+TensorRT-LLM supports W(INT)4-A(FP)8 for DeepSeek on __Hopper__. Activations and weights are quantized at per-tensor and per-group (1x128) granularity respectively for MoE, and FP8 block scaling is preserved for dense layers.
+
+We provide a pre-quantized checkpoint for DeepSeek-R1 W4AFP8 at [HF model hub](https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8).
+
+```bash
+python quickstart_advanced.py --model_dir <W4AFP8 Checkpoint> --tp_size 8
+```
+Or you can follow the steps to generate one by yourselves.
+
+#### Activation calibration
+
+[ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer) is used for calibrating activations of MoE layers. We provide a calibrated file at [HF model hub](https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main/act_scales.safetensors) or you can run the following commands to generate by yourselves.
+
+```bash
+# Make sure for enough GPU resources (8xH200s) to run the following commands
+PATH_OF_DEEPSEEK_R1=/llm-models/DeepSeek-R1/DeepSeek-R1
+
+# Install ModelOpt from source
+git clone https://github.com/NVIDIA/TensorRT-Model-Optimizer/ && cd modelopt
+pip install "nvidia-modelopt[all]" -U --extra-index-url https://pypi.nvidia.com
+
+# Clone DeepSeek-V3 (base model of R1) Github repository for FP8 inference,
+git clone https://github.com/deepseek-ai/DeepSeek-V3.git && cd DeepSeek-V3 && git checkout 1398800
+
+# Convert the HF checkpoint to a specific format for DeepSeek
+python inference/convert.py --hf-ckpt-path $PATH_OF_DEEPSEEK_R1 --save-path ds_r1 --n-experts 256 --model-parallel 8 && cd ..
+
+# Do per-tensor fp8 calibration
+torchrun --nproc-per-node 8 --master_port=12346 ptq.py --model_path DeepSeek-V3/ds_r1 --config DeepSeek-V3/inference/configs/config_671B.json --quant_cfg FP8_DEFAULT_CFG --output_path ds_r1_fp8_per_tensor_calibration && cd ../..
+```
+
+#### Weight quantization and assembling
+
+You can run the following bash to quantize weights and generate the full checkpoint.
+```bash
+#!/bin/bash
+HF_MODEL_DIR=/models/DeepSeek-R1/DeepSeek-R1/
+OUTPUT_DIR=/workspace/ckpt/
+# Safetensors or ModelOpt exported FP8 checkpoint path is accepted
+# e.g. ACT_SCALES=ds_r1_fp8_per_tensor_calibration
+ACT_SCALES=/workspace/act_scales.safetensors
+
+if [ ! -d "convert_logs" ]; then
+    mkdir convert_logs
+fi
+
+pids=()
+for i in 0 1 2 3 4 5 6 7
+do
+    python examples/quantization/quantize_mixed_precision_moe.py --model_dir $HF_MODEL_DIR --output_dir $OUTPUT_DIR --act_scales $ACT_SCALES --parts 9 --rank $i > convert_logs/log_$i 2>&1 &
+    pids+=($!)
+done
+
+python examples/quantization/quantize_mixed_precision_moe.py --model_dir $HF_MODEL_DIR --output_dir $OUTPUT_DIR --act_scales $ACT_SCALES --parts 9 --rank 8 > convert_logs/log_8 2>&1
+pids+=($!)
+
+for pid in ${pids[@]}; do
+    wait $pid
+done
+
+echo "All processes completed!"
+```
+
+The converted checkpoint could be used as `<YOUR_MODEL_DIR>` and consumed by other commands.
+
 
 ## Notes and Troubleshooting
 
