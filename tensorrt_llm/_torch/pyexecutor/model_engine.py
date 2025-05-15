@@ -331,7 +331,7 @@ class PyTorchModelEngine(ModelEngine):
             layerwise_nvtx_marker.register_hooks(self.model, module_prefix)
 
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
-        self._enable_overlap_scheduler = self.pytorch_backend_config.enable_overlap_scheduler
+        self._disable_overlap_scheduler = self.pytorch_backend_config.disable_overlap_scheduler
         self._torch_compile_backend = None
         self.dtype = self.model.config.torch_dtype
         self._init_model_capacity()
@@ -982,7 +982,7 @@ class PyTorchModelEngine(ModelEngine):
         """
         Make some changes to the device inputs and avoid block the async data transfer
         """
-        if self.is_spec_decode and self._enable_overlap_scheduler:
+        if self.is_spec_decode and not self._disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
             # be prepared in advance by using the max_draft_len. But we need to use
             # new_tokens_lens_device to get the real past kv lengths and the
@@ -1086,7 +1086,7 @@ class PyTorchModelEngine(ModelEngine):
                                  dtype=torch.int32).to('cuda',
                                                        non_blocking=True))
 
-        if self._enable_overlap_scheduler and self.is_spec_decode:
+        if not self._disable_overlap_scheduler and self.is_spec_decode:
             spec_dec_mode = self.spec_config.spec_dec_mode
             assert spec_dec_mode.support_overlap_scheduler(
             ), f"{self.spec_config.spec_dec_name} does not support overlap scheduler"

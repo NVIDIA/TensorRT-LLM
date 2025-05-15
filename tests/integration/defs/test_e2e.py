@@ -425,7 +425,6 @@ def temp_extra_llm_api_options_file(request):
 
             if request.node.callspec.params['pytorch_backend_config']:
                 extra_llm_api_options_dict["pytorch_backend_config"] = {
-                    "enable_overlap_scheduler": True,
                     "use_cuda_graph": True,
                     "cuda_graph_batch_sizes": [1, 2, 3],
                 }
@@ -1303,7 +1302,6 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
             kv_cache_fraction = 0.6 if "Qwen3" in model_name else None
             llm_venv.run_cmd([
                 str(example_root / "quickstart_advanced.py"),
-                "--enable_overlap_scheduler",
                 "--enable_chunked_prefill",
                 f"--kv_cache_fraction={kv_cache_fraction}",
                 "--model_dir",
@@ -1329,7 +1327,6 @@ def test_ptq_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
         llm_venv.run_cmd(
             [
                 str(example_root / "quickstart_advanced.py"),
-                "--enable_overlap_scheduler",
                 "--use_cuda_graph",
                 "--spec_decode_nextn",
                 "1",  # test 1 MTP module
@@ -1359,7 +1356,6 @@ def test_ptp_quickstart_advanced_deepseek_v3_2nodes_8gpus(
                                      delete_on_close=True) as running_log:
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
-            "--enable_overlap_scheduler",
             "--model_dir",
             f"{llm_models_root()}/{model_path}",
             "--moe_ep_size=8",
@@ -1397,6 +1393,7 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
             "--eagle_model_dir",
             f"{llm_models_root()}/{eagle_model_path}",
             "--disable_kv_cache_reuse",
+            "--disable_overlap_scheduler",
         ],
                          running_log=running_log)
         _check_mem_usage(running_log, [25.2, 0, 0, 0])
@@ -1420,7 +1417,6 @@ def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
                                      delete_on_close=True) as running_log:
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
-            "--enable_overlap_scheduler",
             "--model_dir",
             f"{llm_models_root()}/{model_path}",
             "--moe_tp_size=1",
@@ -1454,7 +1450,6 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
                                      delete_on_close=True) as running_log:
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
-            "--enable_overlap_scheduler",
             "--model_dir",
             f"{llm_models_root()}/{model_path}",
             "--moe_tp_size=1",
@@ -1518,7 +1513,6 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
                                      delete_on_close=True) as running_log:
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
-            "--enable_overlap_scheduler",
             "--enable_chunked_prefill",
             "--model_dir",
             f"{llm_models_root()}/{model_path}",
@@ -1544,7 +1538,6 @@ def test_ptp_quickstart_advanced_2gpus_sm120(llm_root, llm_venv, model_name,
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
     llm_venv.run_cmd([
         str(example_root / "quickstart_advanced.py"),
-        "--enable_overlap_scheduler",
         "--enable_chunked_prefill",
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
@@ -1789,7 +1782,8 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
     sampling_param = SamplingParams(max_tokens=32, return_context_logits=True)
     with LLM(
             model=model_dir,
-            pytorch_backend_config=PyTorchConfig(attn_backend=backend),
+            pytorch_backend_config=PyTorchConfig(
+                attn_backend=backend, disable_overlap_scheduler=True),
     ) as llm:
 
         outputs = llm.generate(prompts, sampling_params=sampling_param)

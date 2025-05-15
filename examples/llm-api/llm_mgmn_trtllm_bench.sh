@@ -76,7 +76,6 @@ srun -l \
         cat > /tmp/pytorch_extra_args.txt << EOF
 pytorch_backend_config:
     use_cuda_graph: false
-    enable_overlap_scheduler: true
     cuda_graph_padding_enabled: false
     print_iter_log: true
 enable_attention_dp: false
