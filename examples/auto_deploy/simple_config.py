@@ -4,7 +4,7 @@ Modify directly if you want to change settings.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 
 @dataclass
@@ -51,7 +51,9 @@ class SimpleConfig:
     ### CONFIGURE BACKEND, RUNTIME, AND WORLD SIZE ##################################
     world_size: int = 1  # choose from number of GPUs for TP (0--> no TP, no spawned processes)
     runtime: str = "demollm"  # chose from "demollm" or "trtllm" (production-grade runtime)
-    compile_backend: str = "torch-opt"  # choose from "torch-simple", "torch-opt"
+    compile_backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = (
+        "torch-opt"
+    )
     attn_backend: str = "TritonWithFlattenedInputs"  # "TritonWithFlattenedInputs" or "FlashInfer"
     mla_backend: str = "MultiHeadLatentAttention"  # only option for now
     max_seq_len: int = 512  # max sequence length for inference/cache
