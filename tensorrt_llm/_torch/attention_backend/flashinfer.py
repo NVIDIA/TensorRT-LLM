@@ -162,9 +162,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._attention_mask_data_buffer = torch.empty(max_mask_elements,
                                                        dtype=torch.bool,
                                                        device="cuda")
-        ## added for allocation of space for tensors required in create_context_chunk_mask. dumm call with MNT and max_seq_len to reserve memory for this operation.
-        dummy_mask = create_context_chunk_mask(
-            self.kv_cache_manager.max_seq_len, self.max_num_tokens)
 
         self.prompt_lens_cpu = torch.empty((self.max_num_requests, ),
                                            device='cpu',
