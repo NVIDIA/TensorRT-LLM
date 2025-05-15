@@ -524,7 +524,7 @@ def test_trtllm_bench_pytorch_backend_sanity(llm_root, llm_venv,
         f"--dataset {dataset_path} --backend 'pytorch'"
 
     mapping = {
-        "Meta-Llama-3.1-8B": 18.9,
+        "Meta-Llama-3.1-8B": 19.4,
         "Llama-3.1-8B-Instruct-FP8": 12.0,
         "Meta-Llama-3.1-8B-NVFP4": 10.2
     }
