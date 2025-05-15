@@ -54,7 +54,7 @@ from utils.llm_data import llm_models_root
                 "model_kwargs": {"num_hidden_layers": 2},
             },
         ),
-        # small deepseek-v3 model with world_size 2
+        # small deepseek-v3 model with world_size 4
         (
             4,
             {
