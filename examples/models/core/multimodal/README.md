@@ -1150,12 +1150,11 @@ pip install -r requirements-qwen2vl.txt
     export MAX_BEAM_WIDTH=1
     export NUM_VISUAL_FEATURES=577
 
-    python convert_checkpoint.py --model_type ${MODEL_TYPE} \
+    python ../enc_dec/convert_checkpoint.py --model_type ${MODEL_TYPE} \
         --model_dir tmp/hf_models/${MODEL_NAME} \
         --output_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION} \
         --tp_size ${TP_SIZE} \
         --pp_size ${PP_SIZE} \
-        --use_prompt_tuning \
         --dtype ${INFERENCE_PRECISION}
     ```
 

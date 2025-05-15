@@ -1489,7 +1489,7 @@ def get_model(args):
     elif args.model_type == "blip2":
         model = Blip2ForConditionalGeneration.from_pretrained(
             args.model_dir).language_model
-    elif args.model_type == "blip2":
+    elif args.model_type == "florence2":
         model = AutoModelForCausalLM.from_pretrained(
             args.model_dir,
             trust_remote_code=True,
