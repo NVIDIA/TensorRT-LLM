@@ -320,7 +320,6 @@ std::tuple<int32_t, int32_t> Runner::getWorkspaceSizeInBytes(MoERunnerArgs const
 
 void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device, cudaStream_t stream)
 {
-    std::cout << "here" << std::endl;
     // Setup all operation data
     moe::dev::activation::Data activationData;
     moe::dev::finalize::Data finalizeData;
