@@ -317,7 +317,8 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(MoeReductionAl
         // * AR Store
         int access_id = token_id * params.hidden_dim / kElemsPerAccess + access_id_in_token;
         int idx = access_id;
-        float val[4] = {accumulator.packed.x, accumulator.packed.y, accumulator.packed.z, accumulator.packed.w};
+        alignas(16) float val[4]
+            = {accumulator.packed.x, accumulator.packed.y, accumulator.packed.z, accumulator.packed.w};
 
 #pragma unroll
         for (int i = 0; i < 4; ++i)
