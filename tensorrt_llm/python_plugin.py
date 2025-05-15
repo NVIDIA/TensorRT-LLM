@@ -90,7 +90,7 @@ def expr_operation(
     """
     The function to do expr operation with None support
     """
-    if exprBuilder == None or a is None or b is None:
+    if exprBuilder is None or a is None or b is None:
         expr = None
     else:
         expr = exprBuilder.operation(operation, a, b)
