@@ -39,11 +39,11 @@ def main():
         max_batch_size=args.sample_num,
         max_num_tokens=8192,
         kv_cache_free_gpu_memory_fraction=0.2,
-        enable_overlap_scheduler=False)
+        disable_overlap_scheduler=True)
     workers[NativeGenerationController.WorkerTag.GENERATION] = gen_worker
     workers[QwenRewardController.WorkerTag.REWARD] = reward_worker
 
-    gen_controller = NativeGenerationController(custom_sampling_params={
+    gen_controller = NativeGenerationController(sampling_params={
         "max_tokens": 4096,
         "temperature": 0.6,
     })

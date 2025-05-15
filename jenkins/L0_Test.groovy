@@ -6,6 +6,12 @@ import groovy.json.JsonSlurper
 import groovy.json.JsonOutput
 import com.nvidia.bloom.KubernetesManager
 import com.nvidia.bloom.Constants
+import com.nvidia.bloom.CloudManager
+import com.nvidia.bloom.KubernetesManager
+import com.nvidia.bloom.SlurmConfig
+import com.nvidia.bloom.SlurmCluster
+import com.nvidia.bloom.SlurmPartition
+import com.nvidia.bloom.Utils
 import org.jenkinsci.plugins.workflow.cps.CpsThread
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
@@ -29,11 +35,11 @@ linuxPkgName = ( env.targetArch == AARCH64_TRIPLE ? "tensorrt-llm-sbsa-release-s
 // available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
 // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
 LLM_DOCKER_IMAGE = env.dockerImage
-LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py310-trt10.9.0.34-skip-devel-202504250100-3759"
-LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py312-trt10.9.0.34-skip-devel-202504250100-3759"
+LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
+LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 
 // DLFW torch image
-DLFW_IMAGE = "nvcr.io/nvidia/pytorch:25.03-py3"
+DLFW_IMAGE = "nvcr.io/nvidia/pytorch:25.04-py3"
 
 //Ubuntu base image
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
@@ -78,6 +84,121 @@ TESTER_MEMORY = "96Gi"
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
+
+def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName){
+    withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+        def remote = [
+            ip           : cluster.ip,
+            host         : cluster.host,
+            user         : "${pipeline.USERNAME}",
+            passwd       : "${pipeline.PASSWORD}",
+            password     : "${pipeline.PASSWORD}",
+            allowAnyHosts: true,
+        ]
+
+        Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
+        pipeline.stage('Clean up SLURM Agent Resources') {
+            Utils.exec(
+                pipeline,
+                timeout: false,
+                script: Utils.sshUserCmd(
+                    remote,
+                    "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh"
+                )
+            )
+            Utils.exec(pipeline, script: "echo done")
+        }
+    }
+}
+
+def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner)
+{
+    runner {
+        // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
+        cacheErrorAndUploadResult(stageName, {
+            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver)
+        }, {
+            // If the execution test list is null, remove the test result xml
+            sh """
+                ls -all ${stageName}/
+                if ! grep -q '<testcase' ${stageName}/results.xml; then
+                    rm ${stageName}/results.xml
+                fi
+            """
+            def llmPath = sh (script: "realpath .", returnStdout: true).trim()
+            def llmSrc = "${llmPath}/${LLM_ROOT}${config}/TensorRT-LLM/src"
+            // CPP tests will generate test result in ${llmSrc}/cpp/build_backup/, move these files to job result folder
+            sh "ls -all ${llmSrc}/cpp/build_backup/ || true"
+            sh "ls -all ${llmSrc}/cpp/build/ || true"
+            // Sed for CPP test result
+            sh "cd ${llmSrc}/cpp/build_backup/ && sed -i 's/\" classname=\"/\" classname=\"${stageName}./g' *.xml || true"
+            sh "cd ${llmSrc}/cpp/build_backup/ && sed -i 's/testsuite name=\"[^\"]*\"/testsuite name=\"${stageName}\"/g' *.xml || true"
+            // Sed for Pytest result
+            sh "cd ${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
+            // Copy CPP test result
+            sh "cp ${llmSrc}/cpp/build_backup/*.xml ${stageName} || true"
+            sh "ls ${stageName}/ -all"
+        })
+    }
+}
+
+def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
+{
+    SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
+    SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
+
+    def nodeName = "${cluster.host}-test-${UUID.randomUUID().toString()}"
+    def nodeSecret = CloudManager.createNode(nodeName)
+
+    try {
+        // Run ssh command to start node in desired cluster via SLURM
+        withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+            def remote = [
+                    ip           : cluster.ip,
+                    host         : cluster.host,
+                    user         : "${pipeline.USERNAME}",
+                    passwd       : "${pipeline.PASSWORD}",
+                    password     : "${pipeline.PASSWORD}",
+                    allowAnyHosts: true,
+            ]
+
+            Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
+            stage('Request Node via SLURM') {
+                println("Selected Cluster: ${cluster.name}")
+
+                def jenkinsSetupPath = Utils.copyLibraryResource(pipeline, "slurm_jenkins_agent_setup.sh")
+
+                Utils.exec(pipeline, script: "chmod +x ${jenkinsSetupPath}", returnStdout: true)
+
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${jenkinsSetupPath} ${remote.user}@${remote.host}:~/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh",)
+
+                Utils.exec(
+                    pipeline,
+                    timeout: false,
+                    script: Utils.sshUserCmd(
+                            remote,
+                            """${SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl)}"""
+                    )
+                )
+                Utils.exec(pipeline, script: "echo Sleeping to allow agent initialization; sleep 30")
+            }
+        }
+
+        if (!CloudManager.isNodeOnline(nodeName)){
+            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                error "Cannot find a node that is idle to run the test for ${stageName}"
+            }
+        }
+
+        // TODO: pass in the gpu numbers instead of hard code it to 1
+        def dockerArgs = "--gpus 1 --cap-add=SYS_ADMIN --ipc=host --security-opt seccomp=unconfined  -u root:root -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
+        slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, false)
+        executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
+    } finally {
+        cleanUpNodeResources(pipeline, cluster, nodeName)
+        CloudManager.destroyNode(nodeName)
+    }
+}
 
 def trimForStageList(stageNameList)
 {
@@ -360,7 +481,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     claimName: sw-tensorrt-pvc
     """
     if (arch == "arm64") {
-        // WAR: PVC mount is not setup on aarch64 platform, use nfs as a WAR
+        // PVC mount isn't supported on aarch64 platform. Use NFS as a WAR.
         pvcVolume = """
                 - name: sw-tensorrt-pvc
                   nfs:
@@ -727,6 +848,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 {
     // Step 1: create LLM_ROOT dir
     sh "pwd && ls -alh"
+    // TODO: proper way to clean workspace, maybe save in a folder named with BUILD_ID.
+    // So that it can work with multiple job running in same node
+    sh "rm -rf ./*"
     def llmRootConfig = "${LLM_ROOT}${config}"
     sh "mkdir ${llmRootConfig}"
 
@@ -1023,8 +1147,6 @@ def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, whe
     sh "ccache -sv"
     sh "cat ${CCACHE_DIR}/ccache.conf"
     sh "bash -c 'pip3 show tensorrt || true'"
-
-    // If the image is pre-installed with cxx11-abi pytorch, using non-cxx11-abi requires reinstallation.
     if (reinstall_dependencies == true) {
         sh "#!/bin/bash \n" + "pip3 uninstall -y torch"
         sh "#!/bin/bash \n" + "yum remove -y libcudnn*"
@@ -1083,10 +1205,9 @@ def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, whe
     }
     buildArgs = "--clean"
     if (cpu_arch == AARCH64_TRIPLE) {
-        buildArgs = "-a '90-real;100-real;120-real'"
-    } else if  (reinstall_dependencies == true) {
-        buildArgs = "-a '80-real;86-real;89-real;90-real'"
+        buildArgs += " -a '90-real;100-real;120-real'"
     }
+
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${buildArgs}")
     }
@@ -1176,6 +1297,24 @@ def checkStageName(stageNames) {
     invalidStageName = stageNames.findAll { !(it ==~ /[-\+\w\[\]]+/) }
     if (invalidStageName) {
         throw new Exception("Invalid stage name: [${invalidStageName}], we only support chars '-+_[]0-9a-zA-Z' .")
+    }
+}
+
+// TODO: Update existing functions to use runInDockerOnNodeMultiStage and get rid of runInDockerOnNode
+def runInDockerOnNodeMultiStage(image, label, dockerArgs, needToDeleteDir=true)
+{
+    return {
+        runner -> node(label) {
+            if (needToDeleteDir) {
+                deleteDir()
+            }
+            stage('Pull Docker Image') {
+                docker.image(image).pull()
+            }
+            docker.image(image).inside(dockerArgs) {
+                runner()
+            }
+        }
     }
 }
 
@@ -1290,6 +1429,25 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     fullSet = parallelJobs.keySet()
 
+    turtleSlurmConfigs = [
+        "RTXPro6000-PyTorch-[Post-Merge]-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
+    ]
+
+    // TODO: use cpu pod to launch slurm job
+    parallelSlurmJobs = turtleSlurmConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10", "amd64", values[4] ?: 1, key.contains("Perf")), {
+    def config = VANILLA_CONFIG
+        if (key.contains("single-device")) {
+            config = SINGLE_DEVICE_CONFIG
+        }
+        if (key.contains("llvm")) {
+            config = LLVM_CONFIG
+        }
+        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3])
+    }]]}
+
+    fullSet += parallelSlurmJobs.keySet()
+    parallelJobs += parallelSlurmJobs
+
     // Try to match what are being tested on x86 H100_PCIe.
     // The total machine time is scaled proportionally according to the number of each GPU.
     aarch64Configs = [
@@ -1309,7 +1467,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     docBuildSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10")
     docBuildConfigs = [
-        "A10-Build_TRT-LLM_Doc": [docBuildSpec, {
+        "A10-Build_Docs": [docBuildSpec, {
             sh "rm -rf **/*.xml *.tar.gz"
             runLLMDocBuild(pipeline, config=VANILLA_CONFIG)
         }],
@@ -1327,52 +1485,62 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         }
     }]]}
 
+    // Python version and OS for sanity check
     sanityCheckConfigs = [
-        "DLFW": [
-            LLM_DOCKER_IMAGE,
+        "PY312-DLFW": [
+            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
             "B200_PCIe",
             X86_64_TRIPLE,
-            false,
-            "cxx11/",
+            true,
+            "dlfw/",
             DLFW_IMAGE,
+            false,
         ],
-        "manylinux-py310": [
+        "PY310-UB2204": [
             LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
             "A10",
             X86_64_TRIPLE,
             true,
             "",
             UBUNTU_22_04_IMAGE,
+            false,
         ],
-        "manylinux-py312": [
+        "PY312-UB2404": [
             LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
-            "A10",
+            "RTX5090",
             X86_64_TRIPLE,
             true,
             "",
             UBUNTU_24_04_IMAGE,
+            true, // Extra PyTorch CUDA 12.8 install
         ],
     ]
 
-    def toStageName = { gpuType, key -> "${gpuType}-PackageSanityCheck-${key}".toString() }
-
-    fullSet += sanityCheckConfigs.collectEntries{ key, values -> [toStageName(values[1], key), null] }.keySet()
-
     if (env.targetArch == AARCH64_TRIPLE) {
         sanityCheckConfigs = [
-            "DLFW": [
+            "PY312-UB2404": [
                 LLM_DOCKER_IMAGE,
                 "GH200",
                 AARCH64_TRIPLE,
                 false,
                 "",
-                // TODO: Change to UBUNTU_24_04_IMAGE after https://nvbugs/5161461 is fixed
+                UBUNTU_24_04_IMAGE,
+                true, // Extra PyTorch CUDA 12.8 install
+            ],
+            "PY312-DLFW": [
+                LLM_DOCKER_IMAGE,
+                "GH200",
+                AARCH64_TRIPLE,
+                false,
+                "dlfw/",
                 DLFW_IMAGE,
+                false,
             ],
         ]
     }
 
-    fullSet += [toStageName("GH200", "DLFW")]
+    def toStageName = { gpuType, key -> "${gpuType}-PackageSanityCheck-${key}".toString() }
+    fullSet += sanityCheckConfigs.collectEntries{ key, values -> [toStageName(values[1], key), null] }.keySet()
 
     sanityCheckJobs = sanityCheckConfigs.collectEntries {key, values -> [toStageName(values[1], key), {
         cacheErrorAndUploadResult(toStageName(values[1], key), {
@@ -1380,6 +1548,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             def gpu_type = values[1].toLowerCase()
             if (values[1] == "B200_PCIe") {
                 gpu_type = "b100-ts2"
+            }
+            if (values[1] == "RTX5090") {
+                gpu_type = "rtx-5090"
             }
 
             def k8s_arch = "amd64"
@@ -1402,7 +1573,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             def wheelName = ""
             def cpver = "cp312"
             def pyver = "3.12"
-            if (key.contains("py310")) {
+            if (key.contains("PY310")) {
                 cpver = "cp310"
                 pyver = "3.10"
             }
@@ -1419,9 +1590,10 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
             def fullWheelPath = "${cpu_arch}/${wheelPath}${wheelName}"
 
-            sanityRunner("Sanity check") {
-                runPackageSanityCheck(pipeline, fullWheelPath, values[3], cpver)
-            }
+            // TODO: Re-enable the sanity check after updating GPU testers' driver version.
+            // sanityRunner("Sanity check") {
+            //     runPackageSanityCheck(pipeline, fullWheelPath, values[3], cpver)
+            // }
 
             def checkPipStage = false
             if (cpu_arch == X86_64_TRIPLE) {
@@ -1445,10 +1617,13 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
-                        if ((values[5] != DLFW_IMAGE) && (cpu_arch == AARCH64_TRIPLE)) {
-                            echo "###### Extra prerequisites on aarch64 Start ######"
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.6.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126")
+
+                        // Extra PyTorch CUDA 12.8 install
+                        if (values[6]) {
+                            echo "###### Extra PyTorch CUDA 12.8 install Start ######"
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128")
                         }
+
                         def libEnv = []
                         if (env.alternativeTRT) {
                             stage("Replace TensorRT") {

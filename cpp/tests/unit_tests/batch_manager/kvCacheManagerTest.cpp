@@ -3138,7 +3138,7 @@ TEST_F(KVCacheManagerTest, KVCacheTransferManagerConcurrencyTest)
     auto bufferManager = tensorrt_llm::runtime::BufferManager(std::make_shared<tr::CudaStream>());
     auto transferManager = KVCacheTransferManager(bufferManager);
 
-    auto pool = KVCacheBlockPool(0, 0, 0, 0, 1);
+    auto pool = KVCacheBlockPool(0, 2, 0, 0, 0, 1);
 
     pool.primaryPtr = bufferManager.gpu(tr::ITensor::makeShape({1, blockSize}), nvinfer1::DataType::kFLOAT);
     bufferManager.setZero(*pool.primaryPtr);

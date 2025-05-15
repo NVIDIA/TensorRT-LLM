@@ -11,6 +11,9 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.convert_utils import split_matrix_tp
+
 from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantConfig
@@ -240,7 +243,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         input_ids: torch.LongTensor = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        lora_params: Optional = None,  # TODO smor add type hint
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -357,9 +360,9 @@ class DecoderModelForCausalLM(nn.Module,
                 # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
                 # will considering per layer QuantConfig in the future.
 
-                # TODO smor- hack
-                if hasattr(config,
-                           'lora_config') and config.lora_config is not None:
+                if hasattr(config, 'lora_config'
+                           ) and config.lora_config is not None and len(
+                               config.lora_config.lora_dir) == 1:
                     from tensorrt_llm.lora_manager import HfLoraLoader
                     lora_loader = HfLoraLoader(config.lora_config.lora_dir)
                     weight = lora_loader.lm_head
@@ -374,9 +377,16 @@ class DecoderModelForCausalLM(nn.Module,
                     gather_output=True,
                 )
 
-                if hasattr(config,
-                           'lora_config') and config.lora_config is not None:
+                if hasattr(config, 'lora_config'
+                           ) and config.lora_config is not None and len(
+                               config.lora_config.lora_dir) == 1:
                     with torch.no_grad():
+                        if config.mapping.tp_size > 1:
+                            weight = split_matrix_tp(
+                                weight,
+                                config.mapping.tp_size,
+                                config.mapping.tp_rank,
+                                dim=0)  # split by vocabulary dimension
                         x = weight.to(self.lm_head.dtype).cuda()
                         self.lm_head.weight.data.copy_(x)
 
@@ -408,7 +418,7 @@ class DecoderModelForCausalLM(nn.Module,
                     if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
                         for n, q in quant_config_dict.items():
                             # gate_proj and up_proj share the same quant config
-                            if prefix_name + '.gate_proj' in n:
+                            if prefix_name + '.gate_proj' in n or prefix_name + '.gate_up_proj' in n:
                                 module.quant_config = q
                                 break
                     elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
@@ -428,7 +438,13 @@ class DecoderModelForCausalLM(nn.Module,
                         if name + '.q_proj' in n:
                             module.quant_config = q
                             break
-                # TODO: support MLA
+                elif hasattr(module, 'fused_a'):
+                    # DeepseekV3Attention
+                    for n, q in quant_config_dict.items():
+                        # reuse q_proj quant config as the attention quant config
+                        if name + '.fused_a' in n:
+                            module.quant_config = q
+                            break
 
         # 2. skip quant for modules in QuantConfig.exclude_modules.
         # kv_cache_quant_algo takes precedence over exclude_modules.
@@ -475,7 +491,7 @@ class DecoderModelForCausalLM(nn.Module,
         pipeline_interface: Optional[PipelineInterface] = None,
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
-        lora_params: Optional = None,  # TODO smor add type hint
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if self._supports_pp and self.pp_size > 1:
@@ -630,7 +646,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
         weights = rename_weights_with_regex(params_map, weights)
         logger.info(f"Renamed weights with params_map: {params_map}")
 
-    tp_size = model.model_config.mapping.tp_size
+    tp_size = 1 if model.model_config.mapping.enable_attention_dp else model.model_config.mapping.tp_size
     head_dim = getattr(
         model.config, "head_dim",
         model.config.hidden_size // model.config.num_attention_heads)
@@ -657,8 +673,10 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
 
             # Skip loading weights for embedding and lm_head if LoRA is enabled
             if hasattr(model.model_config, 'lora_config'
-                       ) and model.model_config.lora_config is not None and (
-                           name == "model.embed_tokens" or name == "lm_head"):
+                       ) and model.model_config.lora_config is not None and len(
+                           model.model_config.lora_config.lora_dir) == 1 and (
+                               name == "model.embed_tokens"
+                               or name == "lm_head"):
                 continue
 
             # Skip if parameter belongs to a missing layer

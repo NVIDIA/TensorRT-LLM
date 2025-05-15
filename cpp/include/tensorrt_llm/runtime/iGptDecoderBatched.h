@@ -62,6 +62,7 @@ public:
     }
 
     //! Mandatory parameters
+    //! Logits
     // FIXME: remove first dimension of tensors
     //! [maxDecoderSteps][batchSize][1, beamWidth, vocabSizePadded], on gpu
     std::vector<std::vector<TensorConstPtr>> logits;
@@ -74,9 +75,14 @@ public:
     //! Filled with slots in request order, [batchSize]
     TensorPtr batchSlotsRequestOrder;
 
-    //! For beam search
-    //! Indices into KV cache of different rays within one beam
-    TensorPtr cacheIndirection; // [maxBatchSize, maxBeamWidth, maxSeqLen], on gpu
+    //! For Beam Search
+    //! Indices into KV cache of different rays within one beam, [maxBatchSize, maxBeamWidth, maxSeqLen], on gpu
+    TensorPtr cacheIndirection;
+    //! The generation step of each request (for Variable-Beam-Width-Search), [batchSize]
+    std::vector<SizeType32> generationSteps;
+
+    //! For speculative decoding
+    //! Logits of draft
     //! [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]
     std::vector<std::vector<TensorPtr>> predictedDraftLogits;
 
@@ -96,8 +102,8 @@ public:
 
     Output() = default;
 
-    // parameters for beam search
-    TensorPtr cacheIndirection; // [batchSize, maxBeamWidth, maxSeqLen], mandatory in beam search, on gpu
+    //! parameters for beam search, [batchSize, maxBeamWidth, maxSeqLen], on gpu
+    TensorPtr cacheIndirection;
 };
 
 } // namespace decoder_batch

@@ -51,7 +51,7 @@ MODEL_PATH_DICT = {
     "llama_v3.1_405b_instruct_fp4":
     "llm-models/modelopt-hf-model-hub/Llama-3.1-405B-Instruct-fp4",
     "llama_v3.1_70b_instruct": "llama-3.1-model/Meta-Llama-3.1-70B-Instruct",
-    "llama_v3.2_11b": "llama-3.2-models/Llama-3.2-11B-Vision",
+    "llama_v3.2_1b": "llama-3.2-models/Llama-3.2-1B",
     "llama_v3.3_nemotron_49b": "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1/",
     "llama_v3.1_nemotron_nano_8b": "Llama-3.1-Nemotron-Nano-8B-v1",
     # "llama_30b": "llama-models/llama-30b-hf",
@@ -184,7 +184,7 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
     PerfMetricType.INFERENCE_TIME:
     re.compile(r"Total Latency \(ms\):\s+([\d\.]+)"),
     PerfMetricType.TOKEN_THROUGHPUT:
-    re.compile(r"GPU Output Throughput \(tokens\/sec\/gpu\):\s+([\d\.]+)"),
+    re.compile(r"GPU Output Throughput \(tps\/gpu\):\s+([\d\.]+)"),
     PerfMetricType.SEQ_THROUGHPUT:
     re.compile(r"Request Throughput \(req\/sec\):\s+([\d\.]+)"),
     PerfMetricType.FIRST_TOKEN_TIME:
@@ -366,9 +366,9 @@ class PerfTestConfig:
         # First, add the model name.
         entries = [self.model_name]
 
-        if self.runtime == "cpp":  # gptSessionBenchmark or berBenchmark runtime
+        if self.runtime == "cpp":  # bertBenchmark runtime
             entries.append(f"cpp")
-        elif self.runtime == "cppmanager":  # gptMananberBenchmark runtime
+        elif self.runtime == "cppmanager":  # gptManagerBenchmark runtime
             entries.append(f"cppmanager")
             if self.api == "exe":  # executor
                 entries.append(f"exe")
@@ -481,11 +481,9 @@ class PerfTestConfig:
         labels = test_param_labels.split("-")
 
         self.model_name = labels.pop(0)
-        self.runtime = "python" if labels[0] not in [
-            "cpp",
-            "cppmanager",
-            "bench",
-        ] else labels.pop(0)
+        assert labels[0] in ["cpp", "cppmanager", "bench"], \
+            f"Invalid runtime {labels[0]}!"
+        self.runtime = labels.pop(0)
         self.api = labels.pop(0) if labels[0] == "exe" else ""
         self.backend = labels.pop(0) if labels[0] == "pytorch" else ""
         self.streaming = labels.pop(0) if labels[0] == "streaming" else ""
@@ -592,7 +590,7 @@ class PerfTestConfig:
             assert self.model_name in allowed_models, f"model_name {self.model_name} is not in allowed_models!"
 
         # Validate runtime type.
-        VALID_RUNTIMES = ["cpp", "cppmanager", "python", "bench"]
+        VALID_RUNTIMES = ["cpp", "cppmanager", "bench"]
         assert self.runtime in VALID_RUNTIMES, f"Invalid runtime {self.runtime}!"
 
         # Validate plugin mode.
@@ -608,8 +606,8 @@ class PerfTestConfig:
         # Validate quantization mode.
         if self.model_name in MODEL_PATH_DICT.keys():
             VALID_QUANTS = [
-                "", "nvfp4", "fp8", "int8_sq", "int4_awq", "w4a8_awq",
-                "w4a16_awq", "int8_wo", "int4_wo", "full_prec"
+                "", "nvfp4", "fp8", "int8", "int4_awq", "w4a8_awq", "w4a16_awq",
+                "int4_wo", "full_prec"
             ]
         else:
             VALID_QUANTS = [
@@ -625,6 +623,8 @@ class PerfTestConfig:
                 "int4_weight_only_gptq",
             ]
         assert self.quantization in VALID_QUANTS, f"Invalid quantization {self.quantization}!"
+        if self.backend == "pytorch":
+            assert self.quantization == "", f"Not support passing quantization {self.quantization} for pytorch backend!"
         assert self.num_beams >= 1, f"Invalid num_beams: {self.num_beams}!"
         assert self.num_loras >= 0, f"Invalid num_loras: {self.num_loras}!"
         assert self.num_reqs >= 1, f"Invalid num_reqs: {self.num_reqs}!"
@@ -764,17 +764,18 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def set_runtime_configs(self, llm_root, working_dir,
                             perf_cache_fpath) -> None:
         if self._config.runtime == "cpp":
-            cpp_benchmark_name = "bertBenchmark" if self._config.is_bert_like(
-            ) else "gptSessionBenchmark"
-            benchmark_script = get_cpp_benchmark(cpp_benchmark_name, llm_root)
+            if not self._config.is_bert_like():
+                raise ValueError(
+                    f"Invalid config: '{self._config.runtime}' is only supported for bert-like models!"
+                )
+            benchmark_script = get_cpp_benchmark("bertBenchmark", llm_root)
         elif self._config.runtime == "cppmanager":
             benchmark_script = get_cpp_benchmark("gptManagerBenchmark",
                                                  llm_root)
         elif self._config.runtime == "bench":
             benchmark_script = "trtllm-bench"
         else:
-            benchmark_script = os.path.join(llm_root, "benchmarks", "python",
-                                            "benchmark.py")
+            raise RuntimeError(f"Invalid runtime {self._config.runtime}.")
         allowed_configs = import_allowed_perf_config()
         allowed_models = allowed_configs.get_allowed_models()
         if self._config.runtime == "bench":
@@ -803,8 +804,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         if self._config.quantization != "":
             command, checkpoint_dir = quantize_data(
                 llm_venv=None,
-                example_root=os.path.join(get_llm_root(), "examples",
-                                          example_name),
+                example_root=os.path.join(get_llm_root(), "examples", "models",
+                                          "core", example_name),
                 model_dir=model_dir,
                 calib_dataset=os.path.join(llm_models_root(), "datasets",
                                            "cnn_dailymail"),
@@ -816,8 +817,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         else:
             command, checkpoint_dir = convert_weights(
                 llm_venv=None,
-                example_root=os.path.join(get_llm_root(), "examples",
-                                          example_name),
+                example_root=os.path.join(get_llm_root(), "examples", "models",
+                                          "core", example_name),
                 cmodel_dir=engine_dir,
                 model=self._config.model_name,
                 model_path=model_dir,
@@ -982,28 +983,28 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             istdev = 16
             ostdev = 24
             nloras = self._config.num_loras
-            lora_data = os.path.join(engine_dir,
-                                     f"token-norm-dist-lora-{nloras}.json")
-            # with open(lora_data, 'w') as file:
-            #     pass
+            # lora_data = os.path.join(engine_dir,
+            #                          f"token-norm-dist-lora-{nloras}.json")
+            dataset_path = os.path.join(engine_dir, "synthetic_data.json")
             data_cmd += [
-                "python3", prepare_data_script, f"--output={lora_data}",
+                "python3", prepare_data_script, f"--stdout",
                 f"--rand-task-id 0 {nloras-1}", f"--tokenizer={tokenizer_dir}",
                 f"token-norm-dist", f"--num-requests={self._config.num_reqs}",
                 f"--input-mean={input_len}", f"--output-mean={output_len}",
-                f"--input-stdev={istdev}", f"--output-stdev={ostdev}"
+                f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
+                f" > {dataset_path}"
             ]
-            data_cmd += [";"]
-            generate_rand_lora_script = os.path.join(self._llm_root,
-                                                     "benchmarks", "cpp",
-                                                     "utils",
-                                                     "generate_rand_loras.py")
-            checkpoint_dir = os.path.join(engine_dir, "lora_cpp")
-            lora_dir = os.path.join(engine_dir, f"loras")
-            data_cmd += [
-                "python3", generate_rand_lora_script, checkpoint_dir, lora_dir,
-                "16"
-            ]
+            if self._config.runtime == "cppmanager":
+                data_cmd += [";"]
+                generate_rand_lora_script = os.path.join(
+                    self._llm_root, "benchmarks", "cpp", "utils",
+                    "generate_rand_loras.py")
+                checkpoint_dir = os.path.join(engine_dir, "lora_cpp")
+                lora_dir = os.path.join(engine_dir, f"loras")
+                data_cmd += [
+                    "python3", generate_rand_lora_script, checkpoint_dir,
+                    lora_dir, "16"
+                ]
         else:
             istdev = 0
             ostdev = 0
@@ -1392,7 +1393,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         """
         Run through the commands and parse multiple perf metrics from the logs.
         """
-
+        #print info to separate cases
+        print_info(f"Running perf test for case: {self._short_test_name}")
         self._current_cmd_idx = 0
         metrics = self._get_metrics()
         outputs = {}

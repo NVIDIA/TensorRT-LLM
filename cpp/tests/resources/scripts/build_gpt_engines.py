@@ -144,25 +144,6 @@ def build_engines(model_cache: Optional[str] = None,
     tp_pp_cp_dir = f"tp{tp_size}-pp{pp_size}-cp{cp_size}-gpu"
     tp_dir = f"{world_size}-gpu"
 
-    print("\nConverting to fp32")
-    fp32_ckpt_dir = ckpt_dir / 'fp32' / tp_dir
-    convert_ckpt(str(hf_dir),
-                 str(fp32_ckpt_dir),
-                 world_size=tp_size,
-                 dtype='float32')
-
-    input_file = 'input_tokens.npy'
-    print("\nBuilding fp32 engines")
-    model_spec_obj = ModelSpec(input_file, _tb.DataType.FLOAT)
-    build_engine(
-        str(fp32_ckpt_dir),
-        str(engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir))
-    model_spec_obj.use_gpt_plugin()
-    build_engine(
-        str(fp32_ckpt_dir),
-        str(engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir),
-        '--gpt_attention_plugin=float32', '--context_fmha=enable')
-
     print("\nConverting to fp16")
     fp16_ckpt_dir = ckpt_dir / 'fp16' / tp_dir
     convert_ckpt(str(hf_dir),
@@ -171,21 +152,8 @@ def build_engines(model_cache: Optional[str] = None,
                  dtype='float16')
 
     print("\nBuilding fp16 engines")
-    model_spec_obj = ModelSpec(input_file, _tb.DataType.HALF)
-    build_engine(
-        str(fp16_ckpt_dir),
-        str(engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir))
-    model_spec_obj.use_gpt_plugin()
-    build_engine(
-        str(fp16_ckpt_dir),
-        str(engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir),
-        '--gpt_attention_plugin=float16')
-    model_spec_obj.use_packed_input()
-    build_engine(
-        str(fp16_ckpt_dir),
-        str(engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir),
-        '--gpt_attention_plugin=float16', '--remove_input_padding=enable')
 
+    input_file = 'input_tokens.npy'
     # this engine can be use for in-flight batching
     ifb_base_args = [
         '--gpt_attention_plugin=float16',

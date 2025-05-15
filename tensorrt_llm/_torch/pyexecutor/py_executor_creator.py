@@ -1,19 +1,22 @@
 import copy
 
 import tensorrt_llm
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization import KV_CACHE_QUANT_ALGO_LIST
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist
 from ..speculative import Eagle3Config, get_spec_resource_manager
 from ._util import (create_kv_cache_manager, create_py_executor_instance,
                     estimate_max_kv_cache_tokens, get_token_num_for_estimation,
-                    instantiate_decoder, is_mla)
+                    instantiate_decoder)
 from .config import PyTorchConfig
+from .config_utils import is_mla
 from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
                            PyTorchModelEngine)
 
@@ -46,9 +49,7 @@ def create_py_executor(executor_config: ExecutorConfig,
             )
             executor_config.kv_cache_config.enable_block_reuse = False
 
-    if pytorch_backend_config.attn_backend in [
-            "FLASHINFER", "FLASHINFER_STAR_ATTENTION"
-    ] and executor_config.enable_chunked_context:
+    if pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION" and executor_config.enable_chunked_context:
         logger.warning(
             f"Disabling chunked context for {pytorch_backend_config.attn_backend} backend"
         )
@@ -92,7 +93,7 @@ def create_py_executor(executor_config: ExecutorConfig,
             pytorch_backend_config,
             batch_size=executor_config.max_batch_size,
             max_num_tokens=executor_config.max_num_tokens,
-            max_seq_len=executor_config.max_seq_len,
+            max_seq_len=model_engine.max_seq_len,
             mapping=mapping,
             attn_runtime_features=attn_runtime_features,
             dist=dist,
@@ -106,7 +107,7 @@ def create_py_executor(executor_config: ExecutorConfig,
     # PyTorchModelEngine modifies these fields, update them to executor_config
     max_seq_len = model_engine.max_seq_len
     origin_seq_len = max_seq_len
-    if pytorch_backend_config.enable_overlap_scheduler:
+    if not pytorch_backend_config.disable_overlap_scheduler:
         max_seq_len = model_engine.max_seq_len + 1
         if spec_config is not None:
             max_seq_len += spec_config.max_draft_tokens
@@ -140,7 +141,22 @@ def create_py_executor(executor_config: ExecutorConfig,
             logger.info(
                 f"Change tokens_per_block to: {executor_config.tokens_per_block} for using FlashMLA"
             )
-        executor_config.kv_cache_config.enable_block_reuse = False
+
+        if executor_config.kv_cache_config.enable_block_reuse and not (
+                get_sm_version() >= 90 and get_sm_version() <= 100):
+            logger.warning(
+                f"KV cache reuse for MLA only can be enabled on SM90/SM100, "
+                f"disable enable_block_reuse for SM{get_sm_version()}")
+            executor_config.kv_cache_config.enable_block_reuse = False
+
+        kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
+        if executor_config.kv_cache_config.enable_block_reuse and kv_cache_quant_algo in KV_CACHE_QUANT_ALGO_LIST:
+            logger.warning(
+                f"KV cache reuse for MLA only can be enabled without KV cache quantization, "
+                f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
+            )
+            executor_config.kv_cache_config.enable_block_reuse = False
+
         executor_config.enable_chunked_context = False
 
     decoder = instantiate_decoder(model_engine, executor_config,
@@ -161,10 +177,6 @@ def create_py_executor(executor_config: ExecutorConfig,
             executor_config) if draft_model_engine is not None else None
         resources[KV_CACHE_MANAGER_KEY] = kv_cache_manager
         resources[DRAFT_KV_CACHE_MANAGER_KEY] = draft_kv_cache_manager
-
-    # KVCacheManager modifies these fields, update them to executor_config
-    if kv_cache_manager is not None:
-        executor_config.max_seq_len = kv_cache_manager.max_seq_len
 
     # resource managers for speculative decoding
     if spec_config is not None:
