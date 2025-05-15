@@ -4,7 +4,7 @@ Modify directly if you want to change settings.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 
 @dataclass
@@ -21,7 +21,9 @@ class SimpleConfig:
     # If no `model` argument is provided, the checkpoint directory is used to infer the model
     # architecture.
     model: Optional[str] = None
-    model_factory: str = "hf"  # choose from 'hf' or 'llama4' (only 'hf' supported for "trtllm"!)
+    model_factory: Literal["AutoModelForCausalLM", "AutoModelForImageTextToText"] = (
+        "AutoModelForCausalLM"
+    )
     skip_loading_weights: bool = False  # only load the architecture, not the weights
     customize_tokenizer: bool = False  # True: tokenizer from the model factory, False: from LLM api
 
@@ -79,6 +81,7 @@ class SimpleConfig:
     visualize: bool = False
 
     ### BENCHMARKING CONFIG ########################################################################
+    free_mem_ratio: float = 0.8  # specifies the fraction of available memory to occupy for cache
     benchmark: bool = False  # If true, set ISO to 2048 random int and OSL to 128
     benchmark_num: int = 10  # By default run 10 times and get average
     benchmark_isl: int = 2048  # input seq length for benchmarking
