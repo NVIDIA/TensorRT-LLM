@@ -82,7 +82,7 @@ void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector co
 
     for (auto const& llmReq : generationRequests)
     {
-        auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
+        auto const reqBeamWidth = llmReq->getBeamWidthByIter();
         auto const seqSlot = llmReq->mSeqSlot.value();
 
         auto const draftLength = llmReq->getNumDraftTokens();

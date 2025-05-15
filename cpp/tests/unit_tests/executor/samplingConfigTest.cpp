@@ -183,10 +183,6 @@ TEST(SamplingConfigTest, invalidInputs)
         std::vector<SizeType32>{2, 3, 4, -1});
     test(false, 4, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no,
         std::vector<SizeType32>{2, 3, 4, 65536});
-
-    // max(beamWidthArray) != beamWidth
-    test(false, 4, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no,
-        std::vector<SizeType32>{2, 3, 4, 5});
 }
 
 TEST(SamplingConfigTest, getterSetter)

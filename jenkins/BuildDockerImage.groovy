@@ -98,7 +98,7 @@ def createKubernetesPodConfig(type)
 
 def buildImage(target, action="build", torchInstallType="skip", args="", custom_tag="", post_tag="")
 {
-    def tag = "x86_64-${target}-torch_${torchInstallType}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}${post_tag}"
+    def tag = "x86_64-${target}-torch_${torchInstallType}${post_tag}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
     // Step 1: cloning tekit source code
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
@@ -137,7 +137,6 @@ def buildImage(target, action="build", torchInstallType="skip", args="", custom_
                   TORCH_INSTALL_TYPE=${torchInstallType} \
                   IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${tag} \
                   BUILD_WHEEL_OPTS='-j ${BUILD_JOBS}' ${args} \
-                  BUILD_TRITON=1 \
                   GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote
                   """
                 }
@@ -150,7 +149,6 @@ def buildImage(target, action="build", torchInstallType="skip", args="", custom_
                   TORCH_INSTALL_TYPE=${torchInstallType} \
                   IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${custom_tag} \
                   BUILD_WHEEL_OPTS='-j ${BUILD_JOBS}' ${args} \
-                  BUILD_TRITON=1 \
                   GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote
                   """
                }
@@ -251,7 +249,7 @@ pipeline {
                     }
                     steps
                     {
-                        buildImage("devel", params.action, "skip")
+                        buildImage("tritondevel", params.action, "skip")
                     }
                 }
                 stage("Build x86_64-pre_cxx11_abi") {
@@ -278,7 +276,7 @@ pipeline {
                     }
                     steps
                     {
-                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.10.12", "", "-py310")
+                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.10.12 STAGE=tritondevel", "", "-py310")
                     }
                 }
                 stage("Build rockylinux8 x86_64-skip-py3.12") {
@@ -287,7 +285,7 @@ pipeline {
                     }
                     steps
                     {
-                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.12.3", "", "-py312")
+                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.12.3 STAGE=tritondevel", "", "-py312")
                     }
                 }
                 stage("Build SBSA-skip") {
@@ -299,25 +297,24 @@ pipeline {
                         triggerSBSARemoteJob(params.action, "skip")
                     }
                 }
-                // Waived due to a pytorch issue: https://github.com/pytorch/pytorch/issues/141083
-                // stage("Build SBSA-pre_cxx11_abi") {
-                //     agent {
-                //         kubernetes createKubernetesPodConfig("agent")
-                //     }
-                //     steps
-                //     {
-                //         triggerSBSARemoteJob(params.action, "src_non_cxx11_abi")
-                //     }
-                // }
-                // stage("Build SBSA-cxx11_abi") {
-                //     agent {
-                //         kubernetes createKubernetesPodConfig("agent")
-                //     }
-                //     steps
-                //     {
-                //         triggerSBSARemoteJob(params.action, "src_cxx11_abi")
-                //     }
-                // }
+                stage("Build SBSA-pre_cxx11_abi") {
+                    agent {
+                        kubernetes createKubernetesPodConfig("agent")
+                    }
+                    steps
+                    {
+                        triggerSBSARemoteJob(params.action, "src_non_cxx11_abi")
+                    }
+                }
+                stage("Build SBSA-cxx11_abi") {
+                    agent {
+                        kubernetes createKubernetesPodConfig("agent")
+                    }
+                    steps
+                    {
+                        triggerSBSARemoteJob(params.action, "src_cxx11_abi")
+                    }
+                }
             }
         }
     } // stages

@@ -29,17 +29,16 @@ def get_model_yaml_config(model_label: str) -> dict:
     base_config = {
         'enable_attention_dp': True,
         'pytorch_backend_config': {
-            'enable_overlap_scheduler': True,
             'print_iter_log': True,
             'use_cuda_graph': True,
-            'cuda_graph_batch_sizes': [1, 512]
+            'cuda_graph_padding_enabled': True,
+            'cuda_graph_max_batch_size': 4096,
         }
     }
     model_configs = {
         'deepseek_r1-bench-pytorch-float16-maxbs:1-maxnt:8192-input_output_len:1000,2000-quant:fp8-reqs:10-ep:4-gpus:8':
         {
             'pytorch_backend_config': {
-                'enable_overlap_scheduler': True,
                 'use_cuda_graph': True,
             },
             'speculative_config': {
@@ -50,7 +49,6 @@ def get_model_yaml_config(model_label: str) -> dict:
         'deepseek_r1_nvfp4-bench-pytorch-float16-maxbs:1-maxnt:8192-input_output_len:1000,2000-quant:nvfp4-reqs:10-ep:4-tp:8-gpus:8':
         {
             'pytorch_backend_config': {
-                'enable_overlap_scheduler': True,
                 'use_cuda_graph': True,
             },
             'speculative_config': {

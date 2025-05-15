@@ -10,7 +10,7 @@ from transformers.modeling_utils import load_sharded_checkpoint
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, DeepseekAllReduce)
+                                             AllReduceParams, MoEAllReduce)
 from tensorrt_llm._torch.pipeline_interface import PipelineInterface
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.models.convert_utils import split_matrix_tp
@@ -22,7 +22,7 @@ from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
+from ..modules.attention import Attention, QkNormType
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (FusedMoE, Llama4RenormalizeMoeRoutingMethod,
@@ -32,7 +32,6 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..modules.rotary_embedding import RotaryEmbedding
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
@@ -53,86 +52,51 @@ class Llama4Attention(Attention):
         aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         config = model_config.pretrained_config
-        self.aux_stream = aux_stream
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         self.use_rope = not nope_layer
-        self.use_qk_norm = use_qk_norm and not nope_layer
-        if self.use_rope and not self.use_qk_norm:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gptj,
-                rope=RopeParams.from_config(config),
-                is_neox=False,
-            )
-        else:
-            pos_embd_params = None
+        pos_embd_params = PositionalEmbeddingParams(
+            type=PositionEmbeddingType.rope_gptj,
+            rope=RopeParams.from_config(config),
+            is_neox=False,
+        ) if self.use_rope else None
 
-        super().__init__(hidden_size=config.hidden_size,
-                         num_attention_heads=config.num_attention_heads,
-                         num_key_value_heads=config.num_key_value_heads,
-                         max_position_embeddings=config.max_position_embeddings,
-                         bias=config.attention_bias,
-                         pos_embd_params=pos_embd_params,
-                         layer_idx=layer_idx,
-                         dtype=config.torch_dtype,
-                         config=model_config)
+        super().__init__(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            max_position_embeddings=config.max_position_embeddings,
+            bias=config.attention_bias,
+            pos_embd_params=pos_embd_params,
+            layer_idx=layer_idx,
+            dtype=config.torch_dtype,
+            config=model_config,
+            qk_norm_type=QkNormType.post_rope
+            if use_qk_norm else QkNormType.none,
+        )
 
-        if self.use_rope and self.use_qk_norm:
-            # here we must disable rope fusion regardless of attn_backend
-            self.enable_rope_fusion = False
-            self.rotary_emb = RotaryEmbedding(
-                RopeParams.from_config(config),
-                head_dim=self.head_dim,
-                is_neox=False,
-            )
-
-        if self.use_qk_norm:
+        if self.use_rope and use_qk_norm:
             self.head_dim = config.hidden_size // config.num_attention_heads
             self.qk_norm = RMSNorm(hidden_size=self.head_dim,
                                    eps=1e-6,
                                    dtype=config.torch_dtype,
                                    has_weights=False)
-        else:
-            self.qk_norm = None
+            self.aux_stream = aux_stream
+            self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         self.attn_temperature_tuning = attn_temperature_tuning and nope_layer
         self.floor_scale = getattr(config, "floor_scale", 8192.0)
         self.attn_scale = getattr(config, "attn_scale", 0.1)
 
-    def _attn_qkv(
-            self,
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            attn_metadata: AttentionMetadata,
-            attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
-        CAUSAL,
-            mrope_config: Optional[dict] = None,
-            all_reduce_params: Optional[AllReduceParams] = None):
-        out_scale = None
-        if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
-            out_scale = self.o_proj.inv_input_scale
+    def apply_qk_norm(self, q, k):
 
-        q, k, v = self.convert_qkv(q, k, v)
-        attn_output = self.attn.forward(q,
-                                        k,
-                                        v,
-                                        attn_metadata,
-                                        out_scale=out_scale,
-                                        attention_mask=attention_mask,
-                                        mrope_config=mrope_config)
+        def q_l2norm():
+            return self.qk_norm(q.reshape(-1, self.head_dim)).reshape(
+                -1, self.q_size)
 
-        attn_output = self.o_proj(attn_output,
-                                  all_reduce_params=all_reduce_params)
+        def k_l2norm():
+            return self.qk_norm(k.reshape(-1, self.head_dim)).reshape(
+                -1, self.kv_size)
 
-        return attn_output
-
-    def _qk_norm(self, q, k):
-        # TODO: make this more efficient.
-        q_l2norm = lambda: self.qk_norm(q.reshape(-1, self.head_dim)).reshape(
-            -1, self.q_size)
-        k_l2norm = lambda: self.qk_norm(k.reshape(-1, self.head_dim)).reshape(
-            -1, self.kv_size)
         q, k = maybe_execute_in_parallel(
             q_l2norm,
             k_l2norm,
@@ -155,31 +119,6 @@ class Llama4Attention(Attention):
         q = (q * attn_scale).to(q.dtype)
         return q
 
-    def _forward_rope(
-        self,
-        position_ids: Optional[torch.LongTensor],
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
-        CAUSAL,
-        mrope_config: Optional[dict] = None,
-        all_reduce_params: Optional[AllReduceParams] = None,
-    ):
-        if self.use_qk_norm:
-            qkv = self.qkv_proj(hidden_states)
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
-                                dim=-1)
-            assert self.rotary_emb is not None and not self.enable_rope_fusion, "qk_norm requires attention rope fusion disabled"
-            q, k = self.rotary_emb(position_ids, [q, k])
-            q, k = self._qk_norm(q, k)
-            return self._attn_qkv(q, k, v, attn_metadata, attention_mask,
-                                  mrope_config, all_reduce_params)
-        else:
-            # When qk_norm is disabled, use the classic attention path that handles RoPE fusion
-            return super().forward(position_ids, hidden_states, attn_metadata,
-                                   attention_mask, mrope_config,
-                                   all_reduce_params)
-
     def _forward_nope(
         self,
         position_ids: Optional[torch.LongTensor],
@@ -191,11 +130,26 @@ class Llama4Attention(Attention):
         all_reduce_params: Optional[AllReduceParams] = None,
     ):
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = self.split_qkv(qkv)
         if self.attn_temperature_tuning:
             q = self._attention_scaling(q, position_ids)
-        return self._attn_qkv(q, k, v, attn_metadata, attention_mask,
-                              mrope_config, all_reduce_params)
+        out_scale = None
+        if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
+            out_scale = self.o_proj.inv_input_scale
+
+        q, k, v = self.convert_qkv(q, k, v)
+        attn_output = self.attn.forward(q,
+                                        k,
+                                        v,
+                                        attn_metadata,
+                                        out_scale=out_scale,
+                                        attention_mask=attention_mask,
+                                        mrope_config=mrope_config)
+
+        attn_output = self.o_proj(attn_output,
+                                  all_reduce_params=all_reduce_params)
+
+        return attn_output
 
     def forward(
         self,
@@ -211,9 +165,16 @@ class Llama4Attention(Attention):
     ) -> torch.Tensor:
         assert lora_params is None, "LORA is not supported for Llama4Attention"
         if self.use_rope:
-            return self._forward_rope(position_ids, hidden_states,
-                                      attn_metadata, attention_mask,
-                                      mrope_config, all_reduce_params)
+            return super().forward(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                attention_mask=attention_mask,
+                mrope_config=mrope_config,
+                all_reduce_params=all_reduce_params,
+                lora_params=lora_params,
+                **kwargs,
+            )
         else:
             return self._forward_nope(position_ids, hidden_states,
                                       attn_metadata, attention_mask,
@@ -367,8 +328,7 @@ class Llama4DecoderLayer(DecoderLayer):
             use_qk_norm=getattr(config, "use_qk_norm", False),
             nope_layer=config.no_rope_layers[layer_idx] == 0,
             attn_temperature_tuning=config.attn_temperature_tuning > 0,
-            aux_stream=aux_stream,
-        )
+            aux_stream=aux_stream)
 
         is_mlp_layer = (layer_idx + 1) % config.interleave_moe_layer_step != 0
 
@@ -412,7 +372,7 @@ class Llama4DecoderLayer(DecoderLayer):
         self.all_reduce = AllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
 
-        self.deepseek_allreduce = DeepseekAllReduce(self.mapping)
+        self.moe_allreduce = MoEAllReduce(self.mapping)
 
     def forward(
         self,
@@ -480,23 +440,23 @@ class Llama4DecoderLayer(DecoderLayer):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
                                                       hidden_states, residual)
 
-        if self.fusion_config.POST_MOE_FUSION or self.fusion_config.POST_MLP_FUSION:
+        if (self.fusion_config.POST_MOE_FUSION
+                or self.fusion_config.POST_MLP_FUSION
+            ) and self.next_layer_layernorm is not None:
             if cutlass_min_latency_mode:
                 shared_output = hidden_states[0]
                 hidden_states_activated_experts = hidden_states[1]
                 num_activated_experts_per_node = hidden_states[2]
                 experts_to_token_score = hidden_states[3]
-                activated_expert_global_ids = hidden_states[4]
-                hidden_states, residual = self.deepseek_allreduce(
-                    hidden_states_activated_experts,  # not used
-                    [
-                        residual, self.next_layer_layernorm.weight,
-                        num_activated_experts_per_node, experts_to_token_score,
-                        hidden_states_activated_experts, shared_output,
-                        activated_expert_global_ids
-                    ],
-                    self.next_layer_layernorm.variance_epsilon,
-                    AllReduceFusionOp.MOE_ALLREDUCE_RESIDUAL_RMS_NORM,
+
+                hidden_states, residual = self.moe_allreduce(
+                    residual,
+                    self.next_layer_layernorm.weight,
+                    device_num_experts=num_activated_experts_per_node,
+                    scale_input=experts_to_token_score,
+                    active_experts_token_input=hidden_states_activated_experts,
+                    token_input=shared_output,
+                    eps=self.next_layer_layernorm.variance_epsilon,
                 )
             else:
                 hidden_states, residual = self.all_reduce(
@@ -891,12 +851,7 @@ class Llama4ForCausalLM(DecoderModelForCausalLM[Llama4Model, Llama4Config]):
                          vocab_size=model_config.pretrained_config.vocab_size)
 
     def infer_max_seq_len(self):
-        # TODO: increase to support 10M context length. There are two blockers
-        # right now:
-        # 1. We need to implement chunked attention.
-        # 2. CUDA graph warmup will crash when the cached context is that long.
-        # This only affects the TRTLLM backend; flashinfer is fine. It is
-        # most likely an issue with the kernel.
+        # TODO: implement chunked attention to support 10M context length
         return 8192
 
     def load_weights(self, weights: Dict):
@@ -991,13 +946,20 @@ class Llama4ForConditionalGeneration(Llama4ForCausalLM):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: Optional[bool] = False,
+        spec_metadata: Optional[SpecMetadata] = None,
+        pipeline_interface: Optional[PipelineInterface] = None,
         **kwargs,
     ) -> torch.Tensor:
         mm_embed = kwargs.get("multi_modal_data", [])
         input_ids, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
                                                      input_ids, mm_embed)
-        logits = super().forward(attn_metadata, input_ids, position_ids,
-                                 inputs_embeds, return_context_logits)
+        logits = super().forward(attn_metadata,
+                                 input_ids,
+                                 position_ids,
+                                 inputs_embeds,
+                                 spec_metadata=spec_metadata,
+                                 return_context_logits=return_context_logits,
+                                 pipeline_interface=pipeline_interface)
         return logits
 
 

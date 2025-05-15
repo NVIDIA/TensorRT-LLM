@@ -12,23 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import uuid
 from pathlib import Path
 
 import pytest
 from defs.common import (generate_summary_cmd, test_multi_lora_support,
                          venv_check_call)
-from defs.conftest import (evaltool_mmlu_post_process,
-                           evaltool_wikilingua_post_process, get_device_memory,
-                           skip_fp8_pre_ada, skip_post_blackwell,
-                           skip_pre_hopper)
+from defs.conftest import (get_device_memory, skip_fp8_pre_ada,
+                           skip_post_blackwell, skip_pre_hopper)
 from defs.trt_test_alternative import check_call
-from evaltool.constants import (EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT,
-                                EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT,
-                                EVALTOOL_MMLU_CONFIG, EVALTOOL_MMLU_RESULT_FILE,
-                                EVALTOOL_WIKILINGUA_CONFIG,
-                                EVALTOOL_WIKILINGUA_RESULT_FILE)
 
 
 def get_vocab_file(model_path):
@@ -89,7 +80,6 @@ VSWA_MODELS = VSWA_ATTENTION.keys()
 GEMMA2_MODELS = {GEMMA_2_9B_IT, GEMMA_2_27B_IT}
 
 
-@pytest.mark.skip(reason="untested")
 @pytest.mark.parametrize("batch_size", [8])
 @pytest.mark.parametrize("data_type", ['bfloat16'])
 @pytest.mark.parametrize("qformat", ['fp8'])
@@ -173,25 +163,28 @@ def hf_gemma_quantization_1gpu(batch_size,
     if "gemma-7b" in gemma_model_root:
         threshold_score = 18
 
-    window = [
-        "--max_attention_window_size",
-        *max_attention_window,
-    ] if max_attention_window is not None else []
+    window = {
+        'max_attention_window_size': max_attention_window
+    } if max_attention_window is not None else {}
+    summary_cmd = generate_summary_cmd(
+        gemma_example_root,
+        engine_dir=engine_dir,
+        max_ite=40,
+        batch_size=batch_size,
+        tensorrt_llm_rouge1_threshold=threshold_score,
+        dataset_dir=llm_datasets_root,
+        rouge_dir=llm_rouge_root,
+        **window)
 
-    summary_cmd = [
-        f"{gemma_example_root}/../../../summarize.py",
-        "--test_trt_llm",
-        f"--hf_model_dir={gemma_model_root}",
-        f"--tokenizer_dir={gemma_model_root}",
-        f"--engine_dir={engine_dir}",
-        "--check_accuracy",
-        f"--tensorrt_llm_rouge1_threshold={threshold_score}",
-        "--max_ite=40",
-        f"--batch_size={batch_size}",
-        f"--dataset_dir={llm_datasets_root}",
-        f"--rouge_dir={llm_rouge_root}",
-        *window,
-    ]
+    ckpt_type = get_ckpt_type(gemma_model_root)
+    vocab_file = get_vocab_file(gemma_model_root)
+    if ckpt_type == "hf":
+        summary_cmd.extend([
+            f"--hf_model_dir={gemma_model_root}",
+            f"--tokenizer_dir={gemma_model_root}"
+        ])
+    else:
+        summary_cmd.append(f"--vocab_file={vocab_file}")
     venv_check_call(llm_venv, summary_cmd)
 
 
@@ -410,116 +403,12 @@ def test_llm_gemma_1gpu_mmlu(batch_size, data_type, gemma_model_root, llm_venv,
     check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
-@pytest.mark.parametrize("gemma_model_root", ["gemma-2b", "gemma-7b"],
-                         indirect=True)
-def test_llm_gemma_1gpu_evaltool(gemma_model_root, llm_venv, cmodel_dir,
-                                 engine_dir, gemma_example_root, evaltool_root):
-    ckpt_type = get_ckpt_type(gemma_model_root)
-    ckpt_dir = get_ckpt_dir(gemma_model_root)
-    assert ckpt_type == 'hf'
-
-    print("Convert checkpoint ...")
-    data_type = "float16"
-    convert_cmd = [
-        f"{gemma_example_root}/convert_checkpoint.py",
-        f"--ckpt-type={ckpt_type}",
-        f"--model-dir={ckpt_dir}",
-        f"--dtype={data_type}",
-        f"--output-model-dir={cmodel_dir}",
-    ]
-    venv_check_call(llm_venv, convert_cmd)
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={cmodel_dir}",
-        f"--output_dir={engine_dir}",
-        f"--max_batch_size=8",
-        f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}",
-        "--gather_context_logits",
-        "--max_input_len=8000",
-        "--max_seq_len=7048",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print("Lm evaluation harness")
-    # start inference server
-    start_inference_server = [
-        EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT, "-e", engine_dir, "-t",
-        gemma_model_root, "-d", evaltool_root, "-m", "1024"
-    ]
-    check_call(" ".join(start_inference_server), shell=True)
-
-    task_list = ['mmlu', 'wikilingua']
-    try:
-        for task in task_list:
-            project_id = str(uuid.uuid4())
-            if task == "wikilingua":
-                config_file = EVALTOOL_WIKILINGUA_CONFIG
-                result_file = EVALTOOL_WIKILINGUA_RESULT_FILE
-
-            if task == "mmlu":
-                config_file = EVALTOOL_MMLU_CONFIG
-                result_file = EVALTOOL_MMLU_RESULT_FILE
-
-            # Update config dynamically
-            import yaml
-
-            model_name = os.path.basename(gemma_model_root)
-            with open(config_file, 'r') as f:
-                lm_eval_config = yaml.safe_load(f)
-                lm_eval_config['model']['llm_name'] = model_name
-                lm_eval_config['model']['tokenizer_path'] = gemma_model_root
-
-            config_file = os.path.join(llm_venv.get_working_directory(),
-                                       "lm_eval_config.yaml")
-            with open(config_file, 'w') as f:
-                yaml.dump(lm_eval_config, f)
-
-            # launch evaluation
-            run_cmd = [
-                f"cd {evaltool_root}",
-                "&&",
-                "source .venv/bin/activate",
-                "&&",
-                "python3",
-                f"evaltool/interfaces/cli/main.py",
-                "project",
-                "launch",
-                f"--eval_project_config_file '{config_file}'",
-                "--infra_name local",
-                f"--output_dir '{llm_venv.get_working_directory()}'",
-                f"--project_id {project_id}",
-            ]
-            check_call(" ".join(run_cmd), shell=True, executable="/bin/bash")
-
-            # process result
-            result_path = f"{llm_venv.get_working_directory()}/{project_id}/{result_file}"
-            check_call(f"cat {result_path}", shell=True)
-
-            if task == 'mmlu':
-                # Gemma-7b produce 0 accuracy even for HF model.
-                if '7b' in gemma_model_root:
-                    evaltool_mmlu_post_process(result_path, 0.0, 100)
-                elif '2b' in gemma_model_root:
-                    # Gemma-2b HF result 0.3837 and TRTLLM 0.3826.
-                    # evaltool_mmlu_post_process(result_path, 0.4230, 0.006)
-                    evaltool_mmlu_post_process(result_path, 0.3826, 0.006)
-            if task == 'wikilingua':
-                if '7b' in gemma_model_root:
-                    evaltool_wikilingua_post_process(result_path, 0.0, 100)
-                elif '2b' in gemma_model_root:
-                    evaltool_wikilingua_post_process(result_path, 0.1620, 0.003)
-    finally:
-        # stop the server
-        check_call(f"{EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT}", shell=True)
-
-
 @skip_pre_hopper
-@pytest.mark.parametrize("gemma_model_root",
-                         ["gemma-2b", "gemma-7b", *GEMMA2_MODELS],
-                         indirect=True)
+@skip_post_blackwell
+@pytest.mark.parametrize(
+    "gemma_model_root",
+    ["gemma-2b", "gemma-7b", *GEMMA2_MODELS, "gemma-3-1b-it"],
+    indirect=True)
 def test_hf_gemma_fp8_base_bf16_multi_lora(gemma_model_root,
                                            llm_venv,
                                            cmodel_dir,

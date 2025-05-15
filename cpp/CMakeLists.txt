@@ -51,6 +51,10 @@ else()
   message(STATUS "NVTX is enabled")
 endif()
 
+# Add TensorRT-LLM Gen export interface and CUDA support
+add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
+add_compile_definitions("TLLM_ENABLE_CUDA")
+
 set(INTERNAL_CUTLASS_KERNELS_PATH
     ""
     CACHE
@@ -105,7 +109,7 @@ set(TRTLLM_VERSION_DIR ${PROJECT_SOURCE_DIR}/../tensorrt_llm)
 set_directory_properties(PROPERTIES CMAKE_CONFIGURE_DEPENDS
                                     ${TRTLLM_VERSION_DIR}/version.py)
 execute_process(
-  COMMAND python3 -c "import version; print(version.__version__)"
+  COMMAND ${Python_EXECUTABLE} -c "import version; print(version.__version__)"
   WORKING_DIRECTORY ${TRTLLM_VERSION_DIR}
   OUTPUT_VARIABLE TRTLLM_VERSION
   RESULT_VARIABLE TRTLLM_VERSION_RESULT
@@ -369,6 +373,8 @@ print(os.path.dirname(torch.__file__),end='');"
     message(FATAL_ERROR "Torch config Error.")
   endif()
   list(APPEND CMAKE_PREFIX_PATH ${TORCH_DIR})
+  set(USE_SYSTEM_NVTX ON)
+  set(nvtx3_dir ${3RDPARTY_DIR}/NVTX/include)
   find_package(Torch REQUIRED)
 
   message(STATUS "TORCH_CXX_FLAGS: ${TORCH_CXX_FLAGS}")

@@ -70,8 +70,13 @@ class _FlashInferPlanner:
         self.__init__()  # reset all state
 
         self.workspace_buffer = workspace_buffer
+        # NOTE (lucaslie): flashinfer fa3 backend has accuracy issue + illegal memory access issues
+        # on H100 PCIe, see https://github.com/NVIDIA/TensorRT-LLM/pull/3686 and
+        # https://github.com/flashinfer-ai/flashinfer/issues/924
         self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            self.workspace_buffer, "NHD"
+            self.workspace_buffer,
+            "NHD",
+            backend="fa2",
         )
         self.decode_wrapper = self._init_decode_wrapper()
 
@@ -205,20 +210,21 @@ def prepare_flashinfer_metadata(
     )
 
 
+# TODO: Move the truncation of seq_len out of this custom op
+# As SequenceInfo._get_sanitized_num_sequences could break in fake mode
 @prepare_flashinfer_metadata.register_fake
 def prepare_flashinfer_metadata_fake(
     input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
 ):
+    seq_len = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
     qo_indptr = torch.empty(len(seq_len) + 1, dtype=seq_len.dtype, device=seq_len.device)
-    batch_indices = torch.empty_like(cache_loc)
-    positions = torch.empty_like(cache_loc)
     return (
         qo_indptr,  # qo_indptr
         torch.empty_like(qo_indptr),  # paged_kv_indptr
         torch.empty_like(cache_loc),  # paged_kv_indices
         torch.empty_like(seq_len),  # paged_kv_last_page_len
-        batch_indices,  # batch_indices
-        positions,  # positions
+        torch.empty_like(seq_len),  # batch_indices
+        torch.empty_like(seq_len),  # positions
     )
 
 
@@ -383,7 +389,9 @@ class FlashInferAttention(AttentionDescriptor):
     @classmethod
     def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
         def _init_workspace(si: SequenceInfo) -> torch.Tensor:
-            buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=si.device)
+            # NOTE (lucaslie): avoid OOM for many cudagraphs,
+            # see https://github.com/NVIDIA/TensorRT-LLM/pull/3686
+            buffer = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device=si.device)
             cls._get_planner().init_workspace(buffer)
             return buffer
 

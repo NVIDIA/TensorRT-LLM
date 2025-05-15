@@ -55,7 +55,7 @@ def load_weight_shard(
 
         def maybe_convert_to_torch_tensor(tensor: torch.Tensor,
                                           indices: slice = None):
-            if indices == None:
+            if indices is None:
                 # Avoid unnecessary copy
                 return tensor.to(device)
             else:

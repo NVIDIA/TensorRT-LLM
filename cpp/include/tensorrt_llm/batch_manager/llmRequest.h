@@ -1586,6 +1586,35 @@ public:
         return static_cast<float>(getMaxNumGeneratedTokens()) / mDecodingIter;
     }
 
+    /// @brief Get the beam width of the current decoding step.
+    /// @details Return `mSamplingConfig.beamWidth` in decoding modes beside Variable-Beam-Width-Search (VBWS).
+    /// Or returns a scalar value from `mSamplingConfig.beamWidthArray` indexing by `mDecodingIter` in VBWS.
+    ///
+    /// Calling in context phase, it returns the beam width of the first generation step, which is used for copying
+    /// logits (function `copyGenerationLogits` as example).
+    ///
+    /// Calling in generation phase, it returns the beam width of the input tokens in the current generation step, which
+    /// is used for computing I/O tensor shapes for TRT engine (function `RuntimeBuffers::setBufferSizes` as example).
+    ///
+    /// For example, we have a request with beamWidthArray = [2,3,4], the generation process can be:
+    ///
+    /// input_ids[1,inputLength] --->
+    /// ---> [Forward, step == 0] ---> logits[1, 1, vocabSize] ---> [BeamSearchDecoder] ---> tokens[1, 2]
+    ///     Context Phase, getBeamWidthByIter() returns 2 for copying logits
+    ///     Decoder uses beamWidthIn=2, beamWidthOut=2 to get top 2 tokens
+    /// ---> [Forward, step == 1] ---> logits[1, 2, vocabSize] ---> [BeamSearchDecoder] ---> tokens[1, 3]
+    ///     Generation phase, getBeamWidthByIter() returns 2 for computing tensor shapes
+    ///     Decoder uses beamWidthIn=2, beamWidthOut=3 to get top 3 tokens
+    /// ---> [Forward, step == 2] ---> logits[1, 3, vocabSize] ---> [BeamSearchDecoder] ---> tokens[1, 4]
+    ///     Generation phase, getBeamWidthByIter() returns 3 for computing tensor shapes
+    ///     Decoder uses beamWidthIn=3, beamWidthOut=4 to get top 4 tokens
+    /// ---> [Forward, step == 3] ---> logits[1, 4, vocabSize] ---> [BeamSearchDecoder] ---> tokens[1, 4]
+    ///     Generation phase, getBeamWidthByIter() returns 4 for computing tensor shapes
+    ///     Decoder uses beamWidthIn=4, beamWidthOut=4 to get top 4 tokens
+    ///     i.e. the same as normal Beam Search of `beamWidth==4`
+    /// @param: forNextIteration: get beam width for next step rather than current beam width.
+    [[nodiscard]] SizeType32 getBeamWidthByIter(bool forNextIteration = false);
+
     [[nodiscard]] bool isFinished() const noexcept
     {
         return isGenerationCompleteState() || mState == LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS;
@@ -1796,15 +1825,15 @@ public:
 protected:
     bool mIsStreaming;
 
-    // List of tokens generated at the current step, used as the input to the next step.
-    // `mLastTokens[beam] != mTokens.back()[beam]` in streaming + beam search
-    // as `mTokens` will be overwritten by the gathered tokens.
-    VecTokens mLastTokens; // [beamSize]
+    // List of tokens generated at the current step, used as the input tokens to the next step, [beamSize]
+    // `mLastTokens[beam]` is not equal to `mTokens.back()[beam]` in "Streaming + Beam Search" mode
+    // since `mTokens` will be overwritten by the gathered tokens.
+    VecTokens mLastTokens;
 
-    // List of tokens including input prompt and generated part.
-    BeamTokens mTokens; // [beamSize, mPromptLen + getMaxNumGeneratedTokens()]
+    // List of tokens including input prompt and generated part, [beamSize, mPromptLen + getMaxNumGeneratedTokens()]
+    BeamTokens mTokens;
 
-                        // Length of input prompt tokens, never changes during generation process.
+    // Length of input prompt tokens, never changes during generation process.
     SizeType32 mOrigPromptLen;
 
     // List of numbers of pre-deocded tokens on the last PP rank when using pipeline parallelism.

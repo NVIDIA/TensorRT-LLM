@@ -29,27 +29,37 @@ def test_tinyllama_logits_processor():
     tinyllama_logits_processor_test_harness(backend="pytorch")
 
 
-@pytest.mark.parametrize("return_context_logits, use_overlap", [
-    (False, False),
-    (False, True),
-])
-def test_llm_get_stats(return_context_logits, use_overlap):
+@pytest.mark.parametrize(
+    "return_context_logits, use_overlap, enable_iter_req_stats", [
+        (False, False, False),
+        (False, False, True),
+        (False, True, False),
+        (False, True, True),
+    ])
+def test_llm_get_stats(return_context_logits, use_overlap,
+                       enable_iter_req_stats):
     llm_get_stats_test_harness(tp_size=1,
                                return_context_logits=return_context_logits,
                                pytorch_backend=True,
-                               use_overlap=use_overlap)
+                               use_overlap=use_overlap,
+                               enable_iter_req_stats=enable_iter_req_stats)
 
 
-@pytest.mark.parametrize("return_context_logits, use_overlap", [
-    (False, False),
-    (False, True),
-])
-def test_llm_get_stats_async(return_context_logits, use_overlap):
+@pytest.mark.parametrize(
+    "return_context_logits, use_overlap, enable_iter_req_stats", [
+        (False, False, False),
+        (False, False, True),
+        (False, True, False),
+        (False, True, True),
+    ])
+def test_llm_get_stats_async(return_context_logits, use_overlap,
+                             enable_iter_req_stats):
     llm_get_stats_async_test_harness(
         tp_size=1,
         return_context_logits=return_context_logits,
         pytorch_backend=True,
-        use_overlap=use_overlap)
+        use_overlap=use_overlap,
+        enable_iter_req_stats=enable_iter_req_stats)
 
 
 @force_ampere
@@ -72,9 +82,9 @@ def test_llm_reward_model():
 
     from tensorrt_llm._torch import LLM as LLM_torch
     from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-    llm = LLM_torch(
-        model=rm_model_path,
-        pytorch_backend_config=PyTorchConfig(attn_backend="VANILLA"))
+    llm = LLM_torch(model=rm_model_path,
+                    pytorch_backend_config=PyTorchConfig(
+                        attn_backend="VANILLA", disable_overlap_scheduler=True))
 
     sampling_params = SamplingParams(return_context_logits=True)
 

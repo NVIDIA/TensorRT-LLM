@@ -72,7 +72,7 @@ def add_llm_args(parser):
     parser.add_argument("--kv_cache_fraction", type=float, default=None)
 
     # Runtime
-    parser.add_argument('--enable_overlap_scheduler',
+    parser.add_argument('--disable_overlap_scheduler',
                         default=False,
                         action='store_true')
     parser.add_argument('--enable_chunked_prefill',
@@ -83,6 +83,14 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true',
                         help='Print iteration logs during execution')
+    parser.add_argument('--use_torch_compile',
+                        default=False,
+                        action='store_true',
+                        help='Use torch.compile to optimize the model')
+    parser.add_argument('--use_piecewise_cuda_graph',
+                        default=False,
+                        action='store_true',
+                        help='Use piecewise CUDA graph to optimize the model')
 
     # Sampling
     parser.add_argument("--max_tokens", type=int, default=64)
@@ -116,12 +124,14 @@ def parse_arguments():
 
 def setup_llm(args):
     pytorch_config = PyTorchConfig(
-        enable_overlap_scheduler=args.enable_overlap_scheduler,
+        disable_overlap_scheduler=args.disable_overlap_scheduler,
         kv_cache_dtype=args.kv_cache_dtype,
         attn_backend=args.attention_backend,
         use_cuda_graph=args.use_cuda_graph,
         load_format=args.load_format,
         print_iter_log=args.print_iter_log,
+        torch_compile_enabled=args.use_torch_compile,
+        torch_compile_piecewise_cuda_graph=args.use_piecewise_cuda_graph,
         moe_backend=args.moe_backend,
         enable_trtllm_decoder=args.enable_trtllm_decoder)
 
