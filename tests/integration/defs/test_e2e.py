@@ -319,6 +319,67 @@ def test_mistral_e2e(llama_example_root, llama_tokenizer_model_root, llm_venv,
     venv_check_call(llm_venv, run_cmd)
 
 
+@pytest.mark.parametrize("model_name,model_path", [
+    ("DeepSeek-R1-Distill-Qwen-1.5B", "DeepSeek-R1-Distill-Qwen-1.5B"),
+])
+def test_qwen_e2e_cpprunner_large_new_tokens(model_name, model_path, llm_venv,
+                                             qwen_example_root, cmodel_dir,
+                                             engine_dir):
+    "RCCA: https://nvbugs/5238105"
+    model_dir = convert_weights(
+        llm_venv=llm_venv,
+        example_root=qwen_example_root,
+        cmodel_dir=cmodel_dir,
+        model=model_name,
+        model_path=f"{llm_models_root()}/{model_path}",
+    )
+
+    build_cmd = [
+        "trtllm-build", f"--checkpoint_dir={model_dir}",
+        f"--output_dir={engine_dir}", f"--gemm_plugin=float16",
+        "--max_num_tokens=32768"
+    ]
+
+    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+
+    from transformers import AutoTokenizer
+
+    from tensorrt_llm.runtime import PYTHON_BINDINGS
+
+    if PYTHON_BINDINGS:
+        from tensorrt_llm.runtime import ModelRunnerCpp
+    tokenizer = AutoTokenizer.from_pretrained(
+        f"{llm_models_root()}/{model_path}",
+        trust_remote_code=True,
+        use_fast=False)
+
+    message = r"<｜begin▁of▁sentence｜><｜User｜>The operation $\otimes$ is defined for all nonzero numbers by $a \otimes b = \frac{a^{2}}{b}$. Determine $[(1 \otimes 2) \otimes 3] - [1 \otimes (2 \otimes 3)]$. Let's think step by step and output the final answer within \boxed{}.<｜Assistant｜>"
+
+    inputs = tokenizer(message, return_tensors='pt',
+                       add_special_tokens=False)['input_ids']
+
+    runner = ModelRunnerCpp.from_dir(engine_dir=f"{engine_dir}",
+                                     max_input_len=128,
+                                     max_output_len=4096,
+                                     max_batch_size=8)
+
+    outputs = runner.generate(inputs,
+                              end_id=tokenizer.eos_token_id,
+                              pad_id=tokenizer.pad_token_id,
+                              temperature=0.6,
+                              top_p=1.0,
+                              top_k=1024,
+                              max_new_tokens=1024,
+                              return_dict=True,
+                              min_length=1,
+                              num_return_sequences=4,
+                              output_sequence_lengths=True)
+
+    seq_lengths = outputs['sequence_lengths']
+    assert not (seq_lengths == 0).any(
+    ), f"Found zero length in sequence_lengths tensor: {seq_lengths}"
+
+
 def trtllm_bench_prolog(
         llm_root,
         llm_venv,
