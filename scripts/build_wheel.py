@@ -157,6 +157,40 @@ def setup_conan(scripts_dir, venv_python):
     return venv_conan
 
 
+def generate_fmha_cu(project_dir, venv_python):
+    fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
+    fmha_v2_cu_dir.mkdir(parents=True, exist_ok=True)
+
+    fmha_v2_dir = project_dir / "cpp/kernels/fmha_v2"
+    os.chdir(fmha_v2_dir)
+
+    env = os.environ.copy()
+    env.update({
+        "TORCH_CUDA_ARCH_LIST": "9.0",
+        "ENABLE_SM89_QMMA": "1",
+        "ENABLE_HMMA_FP32": "1",
+        "GENERATE_CUBIN": "1",
+        "SCHEDULING_MODE": "1",
+        "ENABLE_SM100": "1",
+        "ENABLE_SM120": "1",
+        "GENERATE_CU_TRTLLM": "true"
+    })
+
+    build_run("rm -rf generated")
+    build_run("rm -rf temp")
+    build_run("rm -rf obj")
+    build_run("python3 setup.py", env=env)
+
+    # Copy generated header file when cu path is active and cubins are deleted.
+    # cubin_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin"
+    # build_run(f"mv generated/fmha_cubin.h {cubin_dir}")
+
+    for cu_file in (fmha_v2_dir / "generated").glob("*sm*.cu"):
+        build_run(f"mv {cu_file} {fmha_v2_cu_dir}")
+
+    os.chdir(project_dir)
+
+
 def apply_torch_nvtx3_workaround(venv_python: Path):
     """Workaround for nvtx3 path detection in PyTorch's CMake files."""
     try:
@@ -219,7 +253,8 @@ def main(*,
          benchmarks: bool = False,
          micro_benchmarks: bool = False,
          nvtx: bool = False,
-         skip_stubs: bool = False):
+         skip_stubs: bool = False,
+         generate_fmha: bool = False):
 
     if clean:
         clean_wheel = True
@@ -345,6 +380,13 @@ def main(*,
         targets.append("executorWorker")
 
     source_dir = get_source_dir()
+
+    fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
+    if clean or generate_fmha:
+        build_run(f"rm -rf {fmha_v2_cu_dir}")
+        generate_fmha_cu(project_dir, venv_python)
+    elif not fmha_v2_cu_dir.exists():
+        generate_fmha_cu(project_dir, venv_python)
 
     with working_directory(build_dir):
         if clean or first_build or configure_cmake:
@@ -676,6 +718,9 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--skip-stubs",
                         action="store_true",
                         help="Skip building python stubs")
+    parser.add_argument("--generate_fmha",
+                        action="store_true",
+                        help="Generate the FMHA cu files.")
 
 
 if __name__ == "__main__":
