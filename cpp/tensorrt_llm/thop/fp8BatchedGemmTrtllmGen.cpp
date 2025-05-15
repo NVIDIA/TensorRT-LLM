@@ -33,9 +33,9 @@ namespace tg = trtllm::gen;
 
 template <tg::Dtype outDtype>
 void runBatchedGemm(at::Tensor& out, at::Tensor& outSfC, at::Tensor const& mat1, at::Tensor const& mat2,
-    std::optional<at::Tensor> dDqSfsA, std::optional<at::Tensor> dDqSfsB, std::optional<at::Tensor> scaleC, int64_t m,
-    int64_t n, int64_t k, int32_t tileSize, int32_t epilogueTileM, std::vector<int32_t> const& batchedTokens,
-    bool useDeepSeekFp8, bool lowLatencyKernel)
+    std::optional<at::Tensor> const& dDqSfsA, std::optional<at::Tensor> const& dDqSfsB,
+    std::optional<at::Tensor> const& scaleC, int64_t m, int64_t n, int64_t k, int32_t tileSize, int32_t epilogueTileM,
+    std::vector<int32_t> const& batchedTokens, bool useDeepSeekFp8, bool lowLatencyKernel)
 {
     auto eltType = tg::Dtype::E4m3;
 
@@ -78,9 +78,12 @@ void runBatchedGemm(at::Tensor& out, at::Tensor& outSfC, at::Tensor const& mat1,
 
 std::tuple<at::Tensor, at::Tensor> fp8_batched_gemm_sm100(at::Tensor const& mat1, at::Tensor const& mat2,
     int32_t tileSize, bool useDeepSeekFp8, bool lowLatencyKernel, int64_t epilogueTileM,
-    std::optional<at::Tensor> dDqSfsA, std::optional<at::Tensor> dDqSfsB, std::optional<at::Tensor> scaleC,
-    std::optional<c10::ScalarType> outDtype)
+    std::optional<at::Tensor> const& dDqSfsA, std::optional<at::Tensor> const& dDqSfsB,
+    std::optional<at::Tensor> const& scaleC, std::optional<c10::ScalarType> outDtype)
 {
+    TORCH_CHECK(mat1.dim() == 3, "Matrix A must be of size [B, M, K]");
+    TORCH_CHECK(mat2.dim() == 3, "Matrix B must be of size [B, N, K]");
+
     auto const dimsA = mat1.sizes();
     auto const dimsB = mat2.sizes();
     int64_t const b = dimsB[0];
@@ -99,9 +102,6 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_gemm_sm100(at::Tensor const& mat1
     TORCH_CHECK(mat1.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix A dtype must be FP8.");
     TORCH_CHECK(mat2.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix B dtype must be FP8.");
 
-    TORCH_CHECK(mat1.dim() == 3, "Matrix A must be of size [B*M/ts*K]");
-    TORCH_CHECK(mat2.dim() == 3, "Matrix B must be of size [B*N/ts*K]");
-
     TORCH_CHECK(mat1.sizes()[2] == mat2.sizes()[2], "A and B shapes cannot be multiplied (", mat1.sizes()[0], "x",
         mat1.sizes()[1], "x", mat1.sizes()[2], " and ", mat2.sizes()[0], "x", mat2.sizes()[1], "x", mat2.sizes()[2],
         ")");
@@ -117,8 +117,8 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_gemm_sm100(at::Tensor const& mat1
     {
         TORCH_CHECK(n % dsFp8QuantBlockSize == 0, "N must be a multiple of ", dsFp8QuantBlockSize, ", (N=", n, ")");
         TORCH_CHECK(k % dsFp8QuantBlockSize == 0, "K must be a multiple of ", dsFp8QuantBlockSize, ", (K=", k, ")");
-        TORCH_CHECK(dDqSfsA.has_value(), "dDqSfsA must be provided for deep seek fp8.");
-        TORCH_CHECK(dDqSfsB.has_value(), "dDqSfsB must be provided for deep seek fp8.");
+        TORCH_CHECK(dDqSfsA.has_value(), "dDqSfsA must be provided for DeepSeek FP8.");
+        TORCH_CHECK(dDqSfsB.has_value(), "dDqSfsB must be provided for DeepSeek FP8.");
         TORCH_CHECK(dDqSfsA.value().scalar_type() == at::ScalarType::Float, "Scale dtype must be FP32.");
         TORCH_CHECK(dDqSfsB.value().scalar_type() == at::ScalarType::Float, "Scale dtype must be FP32.");
         TORCH_CHECK(dDqSfsA.value().dim() == 2, "batching M: dDqSfsA must be a 2D matrix");
@@ -138,7 +138,7 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_gemm_sm100(at::Tensor const& mat1
     }
     else
     {
-        TORCH_CHECK(scaleC.has_value(), "scaleC must be provided for non-deep seek fp8.");
+        TORCH_CHECK(scaleC.has_value(), "scaleC must be provided for non DeepSeek FP8.");
         TORCH_CHECK(scaleC.value().scalar_type() == at::ScalarType::Float, "Scale dtype must be FP32.");
         TORCH_CHECK(scaleC.value().dim() == 1, "outScalingFactor must be a 1D matrix of size B");
         TORCH_CHECK(scaleC.value().sizes()[0] == b, "outScalingFactor must be a 1D matrix of size B");
@@ -182,8 +182,9 @@ namespace torch_ext
 {
 
 extern std::tuple<at::Tensor, at::Tensor> fp8_batched_gemm_trtllmgen(at::Tensor const& mat1, at::Tensor const& mat2,
-    int64_t tileSize, bool useDeepSeekFp8, bool lowLatency, int64_t epilogueTileM, std::optional<at::Tensor> dDqSfsA,
-    std::optional<at::Tensor> dDqSfsB, std::optional<at::Tensor> scaleC, std::optional<c10::ScalarType> outDtype)
+    int64_t tileSize, bool useDeepSeekFp8, bool lowLatency, int64_t epilogueTileM,
+    std::optional<at::Tensor> const& dDqSfsA, std::optional<at::Tensor> const& dDqSfsB,
+    std::optional<at::Tensor> const& scaleC, std::optional<c10::ScalarType> outDtype)
 {
     auto const smVersion = tensorrt_llm::common::getSMVersion();
     switch (smVersion)
