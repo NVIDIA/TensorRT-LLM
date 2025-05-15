@@ -26,7 +26,7 @@ def temp_extra_llm_api_options_file(request):
         extra_llm_api_options_dict = {
             "guided_decoding_backend": "xgrammar",
             "pytorch_backend_config": {
-                "enable_overlap_scheduler": False,
+                "disable_overlap_scheduler": True,
             }
         }
 
