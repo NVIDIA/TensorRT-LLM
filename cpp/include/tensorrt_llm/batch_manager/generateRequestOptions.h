@@ -59,7 +59,7 @@ public:
     std::tuple<ITensor::SharedPtr, std::vector<runtime::decoder_batch::Request>, std::vector<runtime::SamplingConfig>>
     operator()(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
         executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
-        BufferManager const& bufferManager, nvinfer1::DataType logitsType, DecoderInputBuffers const& inputBuffers,
+        BufferManager const& bufferManager, nvinfer1::DataType logitsType, DecoderInputBuffers& inputBuffers,
         runtime::decoder::DecoderState& decoderState, SizeType32 beamWidth, runtime::CudaStream const& stream,
         OptionalRef<RuntimeBuffers const> buffers = std::nullopt) const;
 

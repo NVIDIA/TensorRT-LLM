@@ -41,8 +41,8 @@ using TensorPtr = GenerateRequestOptions::TensorPtr;
 namespace
 {
 
-void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffers const& inputBuffers,
-    TensorPtr const& sequenceLengths, SizeType32 beamWidth, runtime::BufferManager const& manager,
+void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffers& inputBuffers,
+    ITensor& sequenceLengths, SizeType32 beamWidth, runtime::BufferManager const& manager,
     runtime::CudaStream const& stream)
 {
     auto const batchSize = contextRequests.size();
@@ -71,7 +71,7 @@ void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffe
 
         manager.copy(*batchSlotsView, *batchSlotsDeviceView);
         manager.copy(*fillValuesView, *fillValuesViewDevice);
-        tr::kernels::invokeFillBatch(*sequenceLengths, *batchSlotsDeviceView, beamWidth, *fillValuesViewDevice, stream);
+        tr::kernels::invokeFillBatch(sequenceLengths, *batchSlotsDeviceView, beamWidth, *fillValuesViewDevice, stream);
     }
 }
 
@@ -117,9 +117,8 @@ void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffe
 std::tuple<TensorPtr, std::vector<decoder_batch::Request>, std::vector<SamplingConfig>>
 GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
     te::DecodingConfig const& decodingConfig, RequestVector const& contextRequests, BufferManager const& bufferManager,
-    nvinfer1::DataType logitsType, DecoderInputBuffers const& inputBuffers,
-    runtime::decoder::DecoderState& decoderState, SizeType32 beamWidth, runtime::CudaStream const& stream,
-    OptionalRef<RuntimeBuffers const> buffers) const
+    nvinfer1::DataType logitsType, DecoderInputBuffers& inputBuffers, runtime::decoder::DecoderState& decoderState,
+    SizeType32 beamWidth, runtime::CudaStream const& stream, OptionalRef<RuntimeBuffers const> buffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(GenerateRequestOptions);
@@ -128,8 +127,8 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
     std::copy_if(contextRequests.begin(), contextRequests.end(), std::back_inserter(finishedContextRequests),
         [](auto const& llmReq) { return llmReq->isLastContextChunk(); });
 
-    copySequenceLengths(finishedContextRequests, inputBuffers, decoderState.getJointDecodingOutput().lengths, beamWidth,
-        bufferManager, stream);
+    copySequenceLengths(
+        finishedContextRequests, inputBuffers, *decoderState.getSequenceLengths(), beamWidth, bufferManager, stream);
 
     auto decoderRequests = createDecoderRequests(finishedContextRequests, inputBuffers.inputsIds, decodingConfig,
         bufferManager, logitsType, modelConfig, worldConfig, buffers);

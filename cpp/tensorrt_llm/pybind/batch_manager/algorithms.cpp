@@ -141,9 +141,8 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
             [](GenerateRequestOptions& self, tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
                 executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
                 tr::BufferManager const& bufferManager, nvinfer1::DataType logitsType,
-                DecoderInputBuffers const& inputBuffers, tr::decoder::DecoderState& decoderState,
-                tr::SizeType32 beamWidth, tr::CudaStream const& stream,
-                OptionalRef<RuntimeBuffers const> buffers = std::nullopt)
+                DecoderInputBuffers& inputBuffers, tr::decoder::DecoderState& decoderState, tr::SizeType32 beamWidth,
+                tr::CudaStream const& stream, OptionalRef<RuntimeBuffers const> buffers = std::nullopt)
             {
                 auto [batchSlots, decoderRequests, samplingConfigs] = self(modelConfig, worldConfig, decodingConfig,
                     contextRequests, bufferManager, logitsType, inputBuffers, decoderState, beamWidth, stream, buffers);
