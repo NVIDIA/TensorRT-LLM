@@ -233,7 +233,7 @@ def flattened_mha_with_cache(
         )
 
     return y.view(
-        *bs_view, num_heads, v_head_dim
+        b, s, num_heads, v_head_dim
     )  # [bsnd] in the original view (might have some dims flattened)
 
 

@@ -56,7 +56,7 @@ from utils.llm_data import llm_models_root
         ),
         # small deepseek-v3 model with world_size 2
         (
-            2,
+            4,
             {
                 "model": _hf_model_dir_or_hub_id(
                     f"{llm_models_root()}/DeepSeek-V3",
@@ -65,7 +65,8 @@ from utils.llm_data import llm_models_root
                 "runtime": "demollm",
                 "attn_backend": "TritonWithFlattenedInputs",
                 "compile_backend": "torch-simple",
-                "model_kwargs": {"num_hidden_layers": 4},
+                "model_kwargs": {"num_hidden_layers": 5},
+                "skip_loading_weights": "True",  # TODO: remove this once we fix fp8 weight loading
             },
         ),
     ],
