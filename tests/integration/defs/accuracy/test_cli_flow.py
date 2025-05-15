@@ -200,6 +200,28 @@ class TestNemotronMini4BInstruct(CliFlowAccuracyTestHarness):
         self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
 
 
+# TODO: Remove the CLI tests once NIMs use PyTorch backend
+class TestNemotronSuper(CliFlowAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Llama-3_3-Nemotron-Super-49B-v1"
+    MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1"
+    EXAMPLE_FOLDER = "models/core/nemotron_nas"
+
+    @pytest.mark.skip_less_device(2)
+    def test_auto_dtype_tp2(self):
+        self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=2, dtype='auto')
+
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_device_not_contain(["H100", "B200"])
+    def test_fp8_prequantized_tp2(self, mocker):
+        mocker.patch.object(
+            self.__class__, "MODEL_PATH",
+            f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8"
+        )
+        self.run(tasks=[MMLU(self.MODEL_NAME)],
+                 tp_size=2,
+                 quant_algo=QuantAlgo.FP8)
+
+
 class TestPhi2(CliFlowAccuracyTestHarness):
     MODEL_NAME = "microsoft/phi-2"
     MODEL_PATH = f"{llm_models_root()}/phi-2"
