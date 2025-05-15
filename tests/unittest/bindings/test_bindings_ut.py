@@ -338,12 +338,12 @@ def test_llm_request():
     assert llm_request.pad_id == 99
     assert llm_request.end_id == 100
     assert llm_request.seq_slot == None
-    assert torch.equal(llm_request.prompt_embedding_table(),
+    assert torch.equal(llm_request.prompt_embedding_table,
                        kwargs["prompt_embedding_table"])
     assert llm_request.prompt_vocab_size == 2
-    assert torch.equal(llm_request.embedding_bias(), kwargs["embedding_bias"])
-    assert torch.equal(llm_request.stop_words_list(), kwargs["stop_words_list"])
-    assert torch.equal(llm_request.bad_words_list(), kwargs["bad_words_list"])
+    assert torch.equal(llm_request.embedding_bias, kwargs["embedding_bias"])
+    assert torch.equal(llm_request.stop_words_list, kwargs["stop_words_list"])
+    assert torch.equal(llm_request.bad_words_list, kwargs["bad_words_list"])
 
     assert llm_request.get_num_tokens(0) == 3
     assert llm_request.max_beam_num_tokens == 3
