@@ -51,7 +51,8 @@ def get_llm_args(model: str,
         free_gpu_memory_fraction=free_gpu_memory_fraction)
 
     pytorch_backend_config = PyTorchConfig(
-        enable_overlap_scheduler=True) if backend == "pytorch" else None
+        enable_overlap_scheduler=True,
+        enable_trtllm_decoder=True) if backend == "pytorch" else None
     dynamic_batch_config = DynamicBatchConfig(
         enable_batch_size_tuning=True,
         enable_max_num_tokens_tuning=False,
