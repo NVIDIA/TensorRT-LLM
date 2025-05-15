@@ -544,7 +544,7 @@ def main(*,
                 else:
                     env_ld = os.environ.copy()
 
-                    new_library_path = "/usr/local/cuda/compat/lib.real"
+                    new_library_path = "/usr/local/cuda/compat:/usr/local/cuda/compat/lib:/usr/local/cuda/compat/lib.real"
                     if 'LD_LIBRARY_PATH' in env_ld:
                         new_library_path += f":{env_ld['LD_LIBRARY_PATH']}"
                     env_ld["LD_LIBRARY_PATH"] = new_library_path

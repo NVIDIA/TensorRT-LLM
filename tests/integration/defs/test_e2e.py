@@ -29,7 +29,7 @@ from defs.trt_test_alternative import (check_call, check_call_negative_test,
 
 from .common import (PluginOptions, convert_weights, prune_checkpoint,
                      quantize_data, refit_model, venv_check_call)
-from .conftest import (llm_models_root, skip_nvlink_inactive,
+from .conftest import (llm_models_root, skip_no_sm120, skip_nvlink_inactive,
                        skip_post_blackwell, skip_pre_blackwell, skip_pre_hopper,
                        tests_path, unittest_path)
 
@@ -1265,6 +1265,15 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('Llama3.1-8B-FP8',
                  'llama-3.1-model/Llama-3.1-8B-Instruct-FP8',
                  marks=skip_pre_hopper),
+    pytest.param('Llama3.1-70B-NVFP4',
+                 'nvfp4-quantized/Meta-Llama-3.1-70B',
+                 marks=skip_pre_blackwell),
+    pytest.param('Llama3.1-70B-FP8',
+                 'llama-3.1-model/Llama-3.1-70B-Instruct-FP8',
+                 marks=skip_pre_hopper),
+    pytest.param('Mixtral-8x7B-NVFP4',
+                 'nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1',
+                 marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
@@ -1515,6 +1524,29 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
                          running_log=running_log)
         if model_name in mapping:
             _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0], 8)
+
+
+# This test is specifically to be run on 2 GPUs on Blackwell RTX 6000 Pro (SM120) architecture
+# TODO: remove once we have a node with 8 GPUs and reuse test_ptp_quickstart_advanced_8gpus
+@skip_no_sm120
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_device(2)
+@pytest.mark.parametrize("model_name,model_path", [
+    ("Llama3.1-70B-BF16", "llama-3.1-model/Meta-Llama-3.1-70B"),
+    ("Mixtral-8x7B-BF16", "Mixtral-8x7B-Instruct-v0.1"),
+])
+def test_ptp_quickstart_advanced_2gpus_sm120(llm_root, llm_venv, model_name,
+                                             model_path):
+    print(f"Testing {model_name} on 2 GPUs (SM120+).")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--enable_overlap_scheduler",
+        "--enable_chunked_prefill",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--tp_size=2",
+    ])
 
 
 @skip_pre_blackwell

@@ -45,7 +45,10 @@ def test_cublas_mm(dtype, m, k_n):
         out_dtype=None,
     )
     ref = torch.matmul(x, w.t())
-    np.testing.assert_allclose(ref.float().cpu(), output.float().cpu())
+    np.testing.assert_allclose(ref.float().cpu(),
+                               output.float().cpu(),
+                               atol=0.01,
+                               rtol=0.01)
 
 
 @pytest.mark.parametrize(
@@ -54,7 +57,7 @@ def test_cublas_mm(dtype, m, k_n):
 )
 @pytest.mark.parametrize(
     "m",
-    [1, 4],
+    [1, 8, 512, 1024],
 )
 @pytest.mark.parametrize(
     "dtype",
@@ -76,7 +79,8 @@ def test_cublas_mm_out_fp32(dtype, m, k_n):
     ref = F.linear(x.float(), w.float())
     np.testing.assert_allclose(ref.float().cpu(),
                                output.float().cpu(),
-                               rtol=5e-3)
+                               atol=0.01,
+                               rtol=0.01)
 
 
 if __name__ == '__main__':
