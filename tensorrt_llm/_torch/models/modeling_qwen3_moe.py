@@ -9,7 +9,6 @@ from transformers import Qwen3MoeConfig
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from ..model_config import ModelConfig
-from ..models.modeling_utils import MissingLayer
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import FusedMoE, RenormalizeMoeRoutingMethod
@@ -339,6 +338,6 @@ class Qwen3MoeForCausalLM(DecoderModelForCausalLM[Qwen3MoEModel,
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
-            elif not isinstance(self.model.layers[idx + 1], MissingLayer):
+            else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
