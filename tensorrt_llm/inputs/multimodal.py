@@ -160,7 +160,10 @@ def find_mm_token_lengths(mm_data, input_processor):
     return num_mm_tokens['image']  # flatten all mm instances to a single list
 
 
-def find_mm_token_positions(input_ids, vocab_size, num_mm_tokens):
+def find_mm_token_positions(input_ids,
+                            num_mm_tokens,
+                            vocab_size,
+                            mm_token_ids=None):
     """Get multimodal token positions using IDs > vocab_size and known lengths.
 
     This function finds multimodal tokens (with IDs > vocab_size) and uses the
@@ -170,8 +173,9 @@ def find_mm_token_positions(input_ids, vocab_size, num_mm_tokens):
 
     Args:
         input_ids: Token sequence (tensor, list, or numpy array)
-        vocab_size: Size of the model's vocabulary
         num_mm_tokens: List of lengths for each multimodal token chunk
+        vocab_size: Size of the model's vocabulary
+        mm_token_ids (optional): possible token ids for multimodal tokens
 
     Returns:
         List of starting positions for each multimodal token chunk
@@ -184,14 +188,17 @@ def find_mm_token_positions(input_ids, vocab_size, num_mm_tokens):
             input_ids = torch.from_numpy(input_ids)
 
     # Create mask for multimodal tokens
-    mm_mask = input_ids >= vocab_size
+    if mm_token_ids is None:
+        mm_mask = input_ids >= vocab_size
+    else:
+        mm_mask = torch.isin(input_ids, mm_token_ids)
 
     # If no multimodal tokens found, return empty list
     if not torch.any(mm_mask):
         return []
 
     # Get positions of all multimodal tokens
-    mm_positions = torch.nonzero(mm_mask).flatten().tolist()
+    mm_positions = torch.where(mm_mask)[0].tolist()
     assert len(mm_positions) == sum(
         num_mm_tokens
     ), f"Number of multimodal tokens does not match sum of all lengths"
