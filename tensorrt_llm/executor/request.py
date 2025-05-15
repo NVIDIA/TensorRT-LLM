@@ -5,6 +5,8 @@ from typing import List, Optional, Union
 import numpy as np
 import torch
 
+from tensorrt_llm.inputs.multimodal import MultimodalInput
+
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..sampling_params import SamplingParams
@@ -80,6 +82,7 @@ class GenerationRequest:
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
+        multimodal_input: Optional[MultimodalInput] = None,
         multimodal_embedding: Optional[list] = None,
         mrope_config: Optional[dict] = None,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
@@ -103,6 +106,7 @@ class GenerationRequest:
         self.lora_request = lora_request
         self.prompt_adapter_request = prompt_adapter_request
         self.streaming = streaming
+        self.multimodal_input = multimodal_input
         self.multimodal_embedding = multimodal_embedding
         self.mrope_config = mrope_config
         self.kv_cache_retention_config = kv_cache_retention_config
