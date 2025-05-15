@@ -801,7 +801,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     def test_fp8(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                  overlap_scheduler):
         pytorch_config = PyTorchConfig(
-            enable_overlap_scheduler=overlap_scheduler,
+            disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph)
 
         llm = LLM(
@@ -825,7 +825,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     def test_nvfp4(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                    overlap_scheduler):
         pytorch_config = PyTorchConfig(
-            enable_overlap_scheduler=overlap_scheduler,
+            disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph)
 
         llm = LLM(

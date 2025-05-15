@@ -1535,7 +1535,6 @@ def test_ptp_quickstart_advanced_2gpus_sm120(llm_root, llm_venv, model_name,
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
     llm_venv.run_cmd([
         str(example_root / "quickstart_advanced.py"),
-        "--enable_overlap_scheduler",
         "--enable_chunked_prefill",
         "--model_dir",
         f"{llm_models_root()}/{model_path}",

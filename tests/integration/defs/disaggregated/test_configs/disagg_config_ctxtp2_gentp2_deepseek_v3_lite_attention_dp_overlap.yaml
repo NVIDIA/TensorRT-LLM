@@ -20,6 +20,6 @@ generation_servers:
   enable_attention_dp: True
   pytorch_backend_config:
     use_cuda_graph: False
-    disable_overlap_scheduler: True
+    disable_overlap_scheduler: False
   urls:
       - "localhost:8002"
