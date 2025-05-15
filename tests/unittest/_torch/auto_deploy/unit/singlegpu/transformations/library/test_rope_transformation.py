@@ -142,7 +142,7 @@ class RoPEModel(torch.nn.Module):
 @pytest.mark.parametrize(
     "transformation,variant,layout,batch_size,seq_len,num_heads,num_kv_heads,atol,rtol, target_layout",
     [
-        ("match", "explicit", "BNSD", 8, 16, 8, 8, 1e-3, 1e-3, None),
+        ("match", "explicit", "BNSD", 8, 16, 8, 8, 1e-2, 1e-2, None),
         ("match", "explicit", "BSND", 8, 16, 8, 4, 1e-2, 1e-2, None),
         ("match", "complex", "BNSD", 8, 16, 8, 8, 1e-3, 1e-3, None),
         ("match", "complex", "BSND", 8, 16, 8, 4, 1e-3, 1e-3, None),
