@@ -79,6 +79,10 @@ def verify_waive_list(llm_src):
         if not line:
             continue
 
+        # Skip Perf tests due to they are dynamically generated
+        if "perf/test_perf.py" in line:
+            continue
+
         # Check for kVALID_TEST_LIST_MARKERS and split by the first occurrence
         for marker in kVALID_TEST_LIST_MARKERS:
             if marker in line:
@@ -122,11 +126,21 @@ def main():
     install_python_dependencies(llm_src)
     # Verify L0 test lists
     if args.l0:
+        print("Starting L0 test list verification...")
         verify_l0_test_lists(llm_src)
     else:
         print("Skipping L0 test list verification.")
+
     # Verify QA test lists
+    if args.qa:
+        print("Starting QA test list verification...")
+        verify_qa_test_lists(llm_src)
+    else:
+        print("Skipping QA test list verification.")
+
+    # Verify waive test lists
     if args.waive:
+        print("Starting waive list verification...")
         verify_waive_list(llm_src)
     else:
         print("Skipping waive list verification.")
