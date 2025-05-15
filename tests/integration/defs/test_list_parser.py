@@ -131,7 +131,7 @@ def parse_test_list_lines(test_list, lines, test_prefix):
                 if marker == "TIMEOUT":
                     # Extract timeout value from parentheses
                     timeout = strip_parens(reason_raw.strip())
-                    print_info(f"Timeout setting: {timeout}")
+                    print_info(f"Timeout setting for {test_name}: {timeout}")
                     if not timeout or not timeout.isdigit():
                         raise ValueError(
                             f'{test_list}:{lineno}: Invalid syntax for TIMEOUT value: "{reason_raw}". '
@@ -649,10 +649,8 @@ def modify_by_test_list(test_list, items, config):
             marker, reason, timeout = full_test_name_to_marker_dict[name]
             if marker:
                 if marker == "TIMEOUT" and timeout:
-                    print_info('Marker is TIMEOUT')
                     item.add_marker(pytest.mark.timeout(timeout))
                 else:
-                    print_info('Marker is others')
                     mark_func = getattr(pytest.mark, marker.lower())
                     mark = mark_func(reason=reason)
                     item.add_marker(mark)
