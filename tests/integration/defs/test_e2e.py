@@ -1301,15 +1301,14 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
                                          dir="./",
                                          delete=True,
                                          delete_on_close=True) as running_log:
-            kv_cache_fraction = 0.6 if "Qwen3" in model_name else None
-            llm_venv.run_cmd([
+            cmds = [
                 str(example_root / "quickstart_advanced.py"),
                 "--enable_chunked_prefill",
-                f"--kv_cache_fraction={kv_cache_fraction}",
-                "--model_dir",
-                f"{llm_models_root()}/{model_path}",
-            ],
-                             running_log=running_log)
+                f"--model_dir={llm_models_root()}/{model_path}",
+            ]
+            if "Qwen3" in model_name:
+                cmds.append(f"--kv_cache_fraction=0.6")
+            llm_venv.run_cmd(cmds, running_log=running_log)
             if model_name in mapping:
                 _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0])
 

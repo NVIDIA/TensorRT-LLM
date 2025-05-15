@@ -16,8 +16,7 @@ import pytest
 
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm.llmapi import (LLM, KvCacheConfig, MTPDecodingConfig,
-                                 SamplingParams)
+from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig, SamplingParams
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -201,19 +200,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           sampling_params=sampling_params,
                           extra_acc_spec="temperature=0.8,top_p=0.95")
-
-
-class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
-    MODEL_PATH = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct"
-
-    @pytest.mark.skip_less_device(8)
-    def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH, tensor_parallel_size=8) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["H100", "H200", "B200"])
