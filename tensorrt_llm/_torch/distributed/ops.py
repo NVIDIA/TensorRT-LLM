@@ -1,3 +1,4 @@
+import math
 import threading
 from typing import List, Optional, Tuple, Union
 
@@ -33,6 +34,15 @@ def userbuffers_allreduce_finalize(
     output = torch.ops.trtllm.userbuffers_allreduce_finalize(
         input, force_applying_finalize)
     return output
+
+
+def get_output_info(input: torch.Tensor, dim: int) -> List[int]:
+    dim = dim % input.ndim
+    output_shape = [
+        val if idx != dim else -1 for idx, val in enumerate(input.shape)
+    ]
+    numel_base = -math.prod(output_shape)
+    return {'output_shape': output_shape, 'numel_base': numel_base}
 
 
 def allgather(
@@ -83,12 +93,18 @@ def allgather(
         else:
             sizes = None
 
+    # Inputs are reshaped in this way to pass necessary shape information to the allgather op
     if isinstance(input, torch.Tensor):
         torch_op = torch.ops.trtllm.allgather
-        input = input.movedim(dim, 0).contiguous()
+        output_info = get_output_info(input, dim)
+        input = input.contiguous().view(-1, output_info['numel_base'])
     else:
         torch_op = torch.ops.trtllm.allgather_list
-        input = [val.movedim(dim, 0).contiguous() for val in input]
+        output_info = [get_output_info(val, dim) for val in input]
+        input = [
+            val.contiguous().view(-1, val_info['numel_base'])
+            for val, val_info in zip(input, output_info)
+        ]
 
     output = torch_op(
         input,
@@ -96,10 +112,25 @@ def allgather(
         mapping.tp_group,
     )
 
+    def convert_output(x, x_info):
+        if dim == 0:
+            x = x.view(x_info['output_shape'])
+        else:
+            if sizes is None:
+                x_list = x.chunk(mapping.tp_size)
+            else:
+                x_list = x.split(sizes)
+            x = torch.cat([x.reshape(x_info['output_shape']) for x in x_list],
+                          dim=dim)
+        return x
+
     if isinstance(input, torch.Tensor):
-        output = output.movedim(0, dim).contiguous()
+        output = convert_output(output, output_info)
     else:
-        output = [val.movedim(0, dim).contiguous() for val in output]
+        output = [
+            convert_output(val, val_info)
+            for val, val_info in zip(output, output_info)
+        ]
     return output
 
 
@@ -126,12 +157,29 @@ def reducescatter(
         else:
             sizes = None
 
+    def convert_input(x, x_info):
+        # Inputs are reshaped in this way to pass necessary shape information to the reducescatter op
+        if dim == 0:
+            x = x.contiguous().view(-1, x_info['numel_base'])
+        else:
+            if sizes is None:
+                x_list = x.chunk(mapping.tp_size, dim=dim)
+            else:
+                x_list = x.split(sizes, dim=dim)
+            x = torch.cat([x.reshape(-1, x_info['numel_base']) for x in x_list])
+        return x
+
     if isinstance(input, torch.Tensor):
         torch_op = torch.ops.trtllm.reducescatter
-        input = input.movedim(dim, 0).contiguous()
+        output_info = get_output_info(input, dim)
+        input = convert_input(input, output_info)
     else:
         torch_op = torch.ops.trtllm.reducescatter_list
-        input = [val.movedim(dim, 0).contiguous() for val in input]
+        output_info = [get_output_info(val, dim) for val in input]
+        input = [
+            convert_input(val, val_info)
+            for val, val_info in zip(input, output_info)
+        ]
 
     output = torch_op(
         input,
@@ -140,9 +188,12 @@ def reducescatter(
     )
 
     if isinstance(input, torch.Tensor):
-        output = output.movedim(0, dim).contiguous()
+        output = output.view(output_info['output_shape'])
     else:
-        output = [val.movedim(0, dim).contiguous() for val in output]
+        output = [
+            val.view(val_info['output_shape'])
+            for val, val_info in zip(output, output_info)
+        ]
     return output
 
 

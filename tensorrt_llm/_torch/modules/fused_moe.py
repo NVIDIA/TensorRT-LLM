@@ -944,17 +944,22 @@ class FusedMoE(nn.Module):
                 not self.reduce_results
             ), "cutlass_min_latency_mode must be used with a single chunk and reduce_results must be False"
 
+        if use_dp_padding:
+            all_rank_num_tokens_padded = [max(all_rank_num_tokens)
+                                          ] * len(all_rank_num_tokens)
+        else:
+            all_rank_num_tokens_padded = all_rank_num_tokens
         if num_chunks == 1:
             outputs = self.forward_chunk(
                 x,
                 router_logits,
                 cutlass_min_latency_mode,
                 output_dtype,
-                all_rank_num_tokens=all_rank_num_tokens,
+                all_rank_num_tokens=all_rank_num_tokens_padded,
                 use_dp_padding=use_dp_padding)
             outputs = self.reducescatter_or_allreduce(
                 outputs,
-                all_rank_num_tokens=all_rank_num_tokens,
+                all_rank_num_tokens=all_rank_num_tokens_padded,
                 use_dp_padding=use_dp_padding)
         else:
 
@@ -967,7 +972,8 @@ class FusedMoE(nn.Module):
 
             if self.use_dp:
                 all_rank_chunk_size_list = [
-                    split_chunk(val, num_chunks) for val in all_rank_num_tokens
+                    split_chunk(val, num_chunks)
+                    for val in all_rank_num_tokens_padded
                 ]
                 all_rank_num_tokens_list = [[
                     val[idx_chunk] for val in all_rank_chunk_size_list
