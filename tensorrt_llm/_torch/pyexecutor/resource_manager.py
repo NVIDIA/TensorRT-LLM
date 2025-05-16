@@ -554,9 +554,6 @@ class MambaCacheManager(BaseResourceManager):
             device=device,
         )
 
-        print(
-            f"{num_local_layers=}, {max_batch_size=}, {nheads=}, {d_state=}, {head_dim=}"
-        )
         # mamba ssm states
         self.ssm_states = torch.empty(
             size=[
