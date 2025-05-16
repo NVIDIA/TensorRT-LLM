@@ -72,14 +72,15 @@ class Evaluator(ABC):
             outputs.append(output)
             references.append(reference)
             auxiliaries.append(aux)
+        results = []
         for output in tqdm(outputs, desc="Fetching responses"):
-            output.result()
+            results.append(output.result())
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
         logger.info(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
         profiler.reset("trtllm exec")
 
-        score = self.compute_score(outputs, references, *zip(*auxiliaries))
+        score = self.compute_score(results, references, *zip(*auxiliaries))
         return score
 
     @staticmethod
