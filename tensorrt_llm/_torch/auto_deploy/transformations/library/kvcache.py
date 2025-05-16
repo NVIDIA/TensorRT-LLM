@@ -15,7 +15,9 @@ from .._graph import add_graph_input, canonicalize_graph
 
 
 def update_in_out_nodes(egm: GraphModule, cm: CachedSequenceInterface) -> GraphModule:
-    """Check for input and output nodes in the graph and return input nodes including extra args.
+    """Check for input and output nodes in the graph and return input nodes including new args.
+
+    The new args are related to the extra arguments needed for cached+flattened attention.
 
     Args:
         egm: The graph module to analyze
@@ -36,7 +38,8 @@ def update_in_out_nodes(egm: GraphModule, cm: CachedSequenceInterface) -> GraphM
     assert len(output_nodes[0].all_input_nodes) == 1, "Expected to only return final tensor output!"
 
     # Activate and add extra argument nodes
-    for name in cm.info.activate_extra_args():
+    new_args = cm.info.switch_to_cached_attn_inputs()
+    for name in new_args:
         input_nodes.append(add_graph_input(egm, name))
 
     egm = canonicalize_graph(egm)
