@@ -14,8 +14,9 @@ from ..utils.logger import ad_logger
 class ModelFactory(ABC):
     """An interface to return and correctly initialize a model from a desired source.
 
-    NOTE: we make the assumption that the model can be prompted with a set of input_ids of shape
-    (batch_size, seq_len) and will return a tensor of shape (batch_size, seq_len, embedding_size).
+    NOTE: we make the assumption that the model can be prompted with a set of input_ids and
+    position_ids of shape (batch_size, seq_len) and will return a tensor of shape
+    (batch_size, seq_len, embedding_size).
     """
 
     def __init__(self, model: Optional[str] = None, skip_loading_weights: bool = False, **kwargs):
@@ -47,16 +48,16 @@ class ModelFactory(ABC):
                 self, input_ids: torch.Tensor, position_ids: torch.Tensor
             ) -> Sequence[torch.Tensor]: ...
 
-        ``logits`` are assumeg to be the first output of the model, i.e.,
+        ``logits`` are assumed to be the first output of the model, i.e.,
         ``model(input_ids, position_ids)[0]`` should return a ``logits`` tensor.
 
         Moreover, we assume the following tensor shapes:
 
         .. code-block:: python
 
-            input_ids.shape = (batch_size, seq_len)
-            position_ids.shape = (batch_size, seq_len)
-            logits.shape = (batch_size, seq_len, vocab_size)
+            input_ids.shape == (batch_size, seq_len)
+            position_ids.shape == (batch_size, seq_len)
+            logits.shape == (batch_size, seq_len, vocab_size)
         """
 
     def get_quant_config(self) -> Dict:
