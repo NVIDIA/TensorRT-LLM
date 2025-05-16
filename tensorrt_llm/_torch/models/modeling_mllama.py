@@ -159,7 +159,7 @@ class MllamaTextModel(nn.Module):
 
         residual = None
         for _, decoder_layer in enumerate(self.layers):
-            if decoder_layer == None:
+            if decoder_layer is None:
                 assert skip_cross_attention == True, 'Cross-attention is not supported yet'
             elif isinstance(decoder_layer, MllamaDecoderLayer):
                 hidden_states, residual = decoder_layer(

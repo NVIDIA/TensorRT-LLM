@@ -629,7 +629,7 @@ def launchTestListCheck(pipeline)
             sh "tar -zxf ${tarName}"
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def llmSrc = "${llmPath}/TensorRT-LLM/src"
-            sh "python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa"
+            sh "NVIDIA_TRITON_SERVER_VERSION=25.03 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -748,8 +748,12 @@ def renderTestDB(testContext, llmSrc, stageName) {
         // If stageName contains "-CPP-", add "backend=cpp" to makoArgs
         // At this point, only tests with backend=cpp or unspecified backend will be run
         makoArgs += ["backend=cpp"]
+    } else if (stageName.contains("-Triton-")) {
+        // If stageName contains "-Triton-", add "backend=triton" to makoArgs
+        // At this point, only tests with backend=triton or unspecified backend will be run
+        makoArgs += ["backend=triton"]
     } else {
-        // If stageName does not contain "-PyTorch-", "-TensorRT-", or "-CPP-", do not add any backend
+        // If stageName does not contain "-PyTorch-", "-TensorRT-", "-CPP-", or "-Triton-", do not add any backend
         // At this point, all tests will be run
         // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
     }
@@ -904,6 +908,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (!skipInstallWheel) {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
         }
+
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "mkdir -p /opt/tritonserver/backends/tensorrtllm")
+        def isAarch64 = config.contains("aarch64")
+        if (!isAarch64) {
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && cp TensorRT-LLM/triton_backend/inflight_batcher_llm/libtriton_tensorrtllm.so /opt/tritonserver/backends/tensorrtllm/")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && cp TensorRT-LLM/triton_backend/inflight_batcher_llm/trtllmExecutorWorker /opt/tritonserver/backends/tensorrtllm/")
+        }
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
     }
 
@@ -996,7 +1007,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         testList = "${testList}_${splitId}"
         def testCmdLine = [
             "LLM_ROOT=${llmSrc}",
+            "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
             "LLM_MODELS_ROOT=${MODEL_CACHE_DIR}",
+            "MODEL_CACHE_DIR=${MODEL_CACHE_DIR}",
             extraInternalEnv,
             "pytest",
             "-v",
@@ -1363,6 +1376,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A10-TensorRT-6": ["a10", "l0_a10", 6, 6],
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
+        "A30-Triton-Python-[Post-Merge]-1": ["a30", "l0_a30", 1, 1],
         "A30-CPP-1": ["a30", "l0_a30", 1, 2],
         "A30-CPP-2": ["a30", "l0_a30", 2, 2],
         "A30-TensorRT-1": ["a30", "l0_a30", 1, 4],
@@ -1374,6 +1388,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A100X-TensorRT-2": ["a100x", "l0_a100", 2, 4],
         "A100X-TensorRT-3": ["a100x", "l0_a100", 3, 4],
         "A100X-TensorRT-4": ["a100x", "l0_a100", 4, 4],
+        "A100X-Triton-Python-[Post-Merge]-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 1],
         "L40S-TensorRT-1": ["l40s", "l0_l40s", 1, 3],
         "L40S-TensorRT-2": ["l40s", "l0_l40s", 2, 3],
@@ -1391,6 +1406,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 2],
         "B200_PCIe-TensorRT-1": ["b100-ts2", "l0_b200", 1, 2],
         "B200_PCIe-TensorRT-2": ["b100-ts2", "l0_b200", 2, 2],
+        "B200_PCIe-Triton-Python-[Post-Merge]-1": ["b100-ts2", "l0_b200", 1, 1],
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
         "RTX5080-TensorRT-1": ["rtx-5080", "l0_gb203", 1, 2],
         "RTX5080-TensorRT-2": ["rtx-5080", "l0_gb203", 2, 2],

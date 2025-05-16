@@ -29,7 +29,6 @@ def buildImage(action, type)
         echo "gitlabBranch: ${env.gitlabBranch}"
         echo "action: ${env.action}"
         echo "type: ${env.type}"
-
         sh 'pwd'
         sh 'ls -lah'
         sh 'rm -rf ./*'

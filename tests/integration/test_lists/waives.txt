@@ -340,11 +340,6 @@ examples/test_qwen.py::test_llm_hf_qwen_quantization_1gpu[qwen2_vl_7b_instruct-f
 unittest/_torch/auto_deploy/integration/test_lm_eval.py SKIP (https://nvbugs/5144854)
 examples/test_qwen.py::test_llm_qwen1_5_moe_plugin_single_gpu_lora[qwen1.5_moe_a2.7b_chat-Upcycled-Qwen1.5-MoE2.7B-LoRA] SKIP (https://nvbugs/5155141)
 
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp2pp2-mtp_nextn=2-attention_dp=False-cuda_graph=False-overlap_scheduler=False] SKIP (https://nvbugs/5170160)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp2pp2-mtp_nextn=2-attention_dp=True-cuda_graph=False-overlap_scheduler=False] SKIP (https://nvbugs/5170160)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp2pp2-mtp_nextn=2-attention_dp=False-cuda_graph=True-overlap_scheduler=False] SKIP (https://nvbugs/5170160)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp2pp2-mtp_nextn=2-attention_dp=False-cuda_graph=False-overlap_scheduler=True] SKIP (https://nvbugs/5170160)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp2pp2-mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True] SKIP (https://nvbugs/5170160)
 full:L40S/accuracy/test_cli_flow.py::TestGemma2_9BIt::test_auto_dtype SKIP (https://nvbugs/5176851)
 full:L40S/accuracy/test_cli_flow.py::TestGemma2_9BIt::test_weight_only[int8] SKIP (https://nvbugs/5176851)
 full:L40S/accuracy/test_cli_flow.py::TestGemma2_9BIt::test_weight_only[int4] SKIP (https://nvbugs/5176851)
@@ -450,13 +445,6 @@ examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padd
 examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-disable_attention_plugin-disable_context_fmha-tp:2-pp:1-float16-RobertaForSequenceClassification-bert/twitter-roberta-base-emotion] SKIP (https://nvbugs/5234058)
 examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:2-pp:1-float16-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity] SKIP (https://nvbugs/5234058)
 examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:2-pp:1-float16-RobertaForQuestionAnswering-bert/roberta-base-squad2] SKIP (https://nvbugs/5234058)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp2pp2-mtp_nextn=2-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True] SKIP (https://nvbugs/5261055, https://nvbugs/5170160)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp2pp2-mtp_nextn=2-fp8kv=False-attention_dp=True-cuda_graph=True-overlap_scheduler=True] SKIP (https://nvbugs/5261055, https://nvbugs/5170160)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp2pp2-mtp_nextn=2-fp8kv=False-attention_dp=True-cuda_graph=False-overlap_scheduler=False] SKIP (https://nvbugs/5261055, https://nvbugs/5170160)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp2pp2-mtp_nextn=2-fp8kv=False-attention_dp=False-cuda_graph=True-overlap_scheduler=False] SKIP (https://nvbugs/5261055, https://nvbugs/5170160)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp2pp2-mtp_nextn=2-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=True] SKIP (https://nvbugs/5261055, https://nvbugs/5170160)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp2pp2-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=False-overlap_scheduler=False] SKIP (https://nvbugs/5261055, https://nvbugs/5170160)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp2pp2-mtp_nextn=2-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False] SKIP (https://nvbugs/5261055, https://nvbugs/5170160)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8B::test_auto_dtype[False] SKIP (https://nvbugs/5266257)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8B::test_auto_dtype[True] SKIP (https://nvbugs/5266257)
 disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/5247271)
@@ -483,3 +471,25 @@ unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)" SKIP (https://nv
 examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-disable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] SKIP (https://nvbugs/5244570)
 unittest/_torch/speculative/test_eagle3.py SKIP (https://nvbugs/5280806)
 test_e2e.py::test_ptp_quickstart_multimodal[qwen2-vl-7b-instruct-Qwen2-VL-7B-Instruct-image] SKIP (https://nvbugs/5226211)
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-max_utilization-1-1-1-False-tensorrt_llm_bls] SKIP (https://nvbugs/4931591)
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-disableDecoupleMode-V1-disableTrtOverlap-0.7-guaranteed_no_evict-1-1-1-False-ensemble]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-disableDecoupleMode-V1-disableTrtOverlap-0.7-guaranteed_no_evict-1-1-1-False-tensorrt_llm_bls]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-disableDecoupleMode-V1-disableTrtOverlap-0.7-max_utilization-1-1-1-False-ensemble]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-disableDecoupleMode-V1-disableTrtOverlap-0.7-max_utilization-1-1-1-False-tensorrt_llm_bls]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-guaranteed_no_evict-1-1-1-False-ensemble]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-guaranteed_no_evict-1-1-1-False-tensorrt_llm_bls]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-max_utilization-1-1-1-False-ensemble]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-max_utilization-1-1-1-False-tensorrt_llm_bls]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-enableDecoupleMode-V1-disableTrtOverlap-0.7-guaranteed_no_evict-1-1-1-False-ensemble]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-enableDecoupleMode-V1-disableTrtOverlap-0.7-guaranteed_no_evict-1-1-1-False-tensorrt_llm_bls]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-enableDecoupleMode-V1-disableTrtOverlap-0.7-max_utilization-1-1-1-False-ensemble]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-enableDecoupleMode-V1-disableTrtOverlap-0.7-max_utilization-1-1-1-False-tensorrt_llm_bls]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-guaranteed_no_evict-1-1-1-False-ensemble]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-guaranteed_no_evict-1-1-1-False-tensorrt_llm_bls]
+triton_server/test_triton_llm.py::test_vila[4-False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-max_utilization-1-1-1-False-ensemble]
+triton_server/test_triton_rcca.py::test_mistral_beam_search[rcca_4714407-True-10-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-guaranteed_no_evict-1-1-1-False-ensemble] SKIP (https://nvbugs/5240060)
+triton_server/test_triton.py::test_triton_extensive[triton-extensive] SKIP
+triton_server/test_triton.py::test_gpt_speculative_decoding[gpt-speculative-decoding] SKIP
+triton_server/test_triton.py::test_qwen2_vl[qwen2_vl] SKIP
+triton_server/test_triton.py::test_gpt_ib_speculative_decoding_bls[gpt-ib-speculative-decoding-bls] SKIP
+triton_server/test_triton_llm.py::test_mistral_v1_multi_models[False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-max_utilization-4096-1-1-1-False-ensemble] SKIP

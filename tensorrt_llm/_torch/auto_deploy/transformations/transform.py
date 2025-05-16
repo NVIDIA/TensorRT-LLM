@@ -47,11 +47,15 @@ class InferenceOptimizer:
         self.factory = factory
         self.attn_backend = ad_config.attn_backend
         self.mla_backend = ad_config.mla_backend
-        # TODO (lliebenwein): let's split up the compile backend to separately handle cuda graph
-        # and torch compile so we can follow the PyTorchConfig here and enable it separately.
+
         self.ad_config = ad_config
-        if ad_config.use_cuda_graph or ad_config.torch_compile_enabled:
+        # Map Pytorch config to AutoDeploy compile backends.
+        if ad_config.use_cuda_graph and ad_config.torch_compile_enabled:
             compile_backend = "torch-opt"
+        elif ad_config.use_cuda_graph:
+            compile_backend = "torch-cudagraph"
+        elif ad_config.torch_compile_enabled:
+            compile_backend = "torch-compile"
         else:
             compile_backend = "torch-simple"
         self.compile_backend = compile_backend
