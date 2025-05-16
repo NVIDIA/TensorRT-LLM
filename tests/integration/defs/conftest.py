@@ -179,6 +179,13 @@ def llm_root():
 
 
 @pytest.fixture(scope="session")
+def llm_backend_root():
+    llm_root_directory = get_llm_root()
+    llm_backend_repo_root = os.path.join(llm_root_directory, "triton_backend")
+    return llm_backend_repo_root
+
+
+@pytest.fixture(scope="session")
 def llm_datasets_root() -> str:
     return os.path.join(llm_models_root(), "datasets")
 
@@ -794,6 +801,8 @@ def multimodal_model_root(request, llm_venv):
         tllm_model_name = tllm_model_name + ".nemo"
     elif 'Llama-3.2' in tllm_model_name:
         models_root = os.path.join(llm_models_root(), 'llama-3.2-models')
+    elif 'Mistral-Small' in tllm_model_name:
+        models_root = llm_models_root()
 
     multimodal_model_root = os.path.join(models_root, tllm_model_name)
 
@@ -1822,11 +1831,11 @@ skip_pre_hopper = pytest.mark.skipif(
     reason="This test is not supported in pre-Hopper architecture")
 
 skip_pre_blackwell = pytest.mark.skipif(
-    get_sm_version() < 100 or get_sm_version() >= 120,
+    get_sm_version() < 100,
     reason="This test is not supported in pre-Blackwell architecture")
 
 skip_post_blackwell = pytest.mark.skipif(
-    get_sm_version() >= 100 and get_sm_version() < 120,
+    get_sm_version() >= 100,
     reason="This test is not supported in post-Blackwell architecture")
 
 skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
@@ -1834,6 +1843,9 @@ skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
 skip_no_hopper = pytest.mark.skipif(
     get_sm_version() != 90,
     reason="This test is only  supported in Hopper architecture")
+
+skip_no_sm120 = pytest.mark.skipif(get_sm_version() != 120,
+                                   reason="This test is for Blackwell SM120")
 
 
 def skip_fp8_pre_ada(use_fp8):
@@ -2220,3 +2232,12 @@ def disaggregated_test_root(llm_root, llm_venv):
                                       "tests/integration/defs/disaggregated")
 
     return disaggregated_root
+
+
+@pytest.fixture(scope="function")
+def tritonserver_test_root(llm_root):
+    "Get tritonserver test root"
+    tritonserver_root = os.path.join(llm_root,
+                                     "tests/integration/defs/triton_server")
+
+    return tritonserver_root

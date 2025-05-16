@@ -27,7 +27,7 @@ namespace torch_ext
 class NcclCommunicatorOp : public th::jit::CustomClassHolder
 {
 public:
-    NcclCommunicatorOp(int64_t tpSize, int64_t ppSize, int64_t rank);
+    NcclCommunicatorOp(int64_t worldSize, int64_t rank);
 
     void send(th::Tensor tensor, int64_t toRank) const;
     void recv(th::Tensor& tensor, int64_t fromRank) const;

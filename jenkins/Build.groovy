@@ -16,7 +16,7 @@ AARCH64_TRIPLE = "aarch64-linux-gnu"
 
 LLM_DOCKER_IMAGE = env.dockerImage
 
-AGENT_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-x86_64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202505121727-4049"
+AGENT_IMAGE = env.dockerImage
 
 POD_TIMEOUT_SECONDS = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
 
@@ -192,7 +192,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                     claimName: sw-tensorrt-pvc
     """
     if (arch == "arm64") {
-        // WAR: PVC mount is not setup on GH200 machines, use a small local cache as a WAR
+        // PVC mount isn't supported on aarch64 platform. Use NFS as a WAR.
         pvcVolume = """
                 - name: sw-tensorrt-pvc
                   nfs:
@@ -419,15 +419,25 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     }
     if (is_linux_x86_64) {
         sh "cd ${LLM_ROOT} && python3 scripts/build_cpp_examples.py"
+
+        // Build tritonserver artifacts
+        def llmPath = sh (script: "realpath ${LLM_ROOT}",returnStdout: true).trim()
+        sh "cd ${LLM_ROOT}/triton_backend/inflight_batcher_llm && mkdir build && cd build && cmake .. -DTRTLLM_DIR=${llmPath} -DUSE_CXX11_ABI=ON && make -j${BUILD_JOBS} install"
     }
 
     // Step 3: packaging wheels into tarfile
     sh "cp ${LLM_ROOT}/build/tensorrt_llm-*.whl TensorRT-LLM/"
 
-    // Step 4: packaging benchmark and required cpp dependencies into tarfile
+    // Step 4: packaging tritonserver artifacts into tarfile
+    if (is_linux_x86_64) {
+        sh "mkdir -p TensorRT-LLM/triton_backend/inflight_batcher_llm/"
+        sh "cp ${LLM_ROOT}/triton_backend/inflight_batcher_llm/build/libtriton_tensorrtllm.so TensorRT-LLM/triton_backend/inflight_batcher_llm/"
+        sh "cp ${LLM_ROOT}/triton_backend/inflight_batcher_llm/build/trtllmExecutorWorker TensorRT-LLM/triton_backend/inflight_batcher_llm/"
+    }
+
+    // Step 5: packaging benchmark and required cpp dependencies into tarfile
     sh "mkdir -p TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/benchmarks/bertBenchmark TensorRT-LLM/benchmarks/cpp"
-    sh "cp ${LLM_ROOT}/cpp/build/benchmarks/gptSessionBenchmark TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/benchmarks/gptManagerBenchmark TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/libtensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
@@ -612,7 +622,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(pipeline, globalVars[ACTION_INFO])
     }
 
-    def wheelDockerImage = env.wheelDockerImage
+    def wheelDockerImage = env.wheelDockerImagePy310
     if (!wheelDockerImage && cpu_arch == AARCH64_TRIPLE) {
         wheelDockerImage = env.dockerImage
     }

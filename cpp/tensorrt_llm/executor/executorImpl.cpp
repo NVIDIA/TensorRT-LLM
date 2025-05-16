@@ -476,7 +476,10 @@ std::shared_ptr<Model> Executor::Impl::createModel(runtime::RawEngine const& raw
     {
         switch (executorConfig.getBatchingType())
         {
-        case BatchingType::kSTATIC: return batch_manager::TrtGptModelType::V1;
+        case BatchingType::kSTATIC:
+            TLLM_THROW(
+                "Static batching type is deprecated. Please use in-flight batching with "
+                "CapacitySchedulerPolicy::kSTATIC_BATCH instead.");
         case BatchingType::kINFLIGHT:
             return modelConfig.isRnnBased() ? batch_manager::TrtGptModelType::InflightBatching
                                             : batch_manager::TrtGptModelType::InflightFusedBatching;
