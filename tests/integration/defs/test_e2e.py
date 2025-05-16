@@ -41,7 +41,6 @@ if TEST_MEM_USAGE:
     os.environ['TLLM_LOG_LEVEL'] = 'INFO'
 
 _MEM_FRACTION_50 = 0.5
-_MEM_FRACTION_90 = 0.90
 _MEM_FRACTION_95 = 0.95
 
 
@@ -72,7 +71,7 @@ def _get_mem_info_from_log(file, ranks_num):
 def _get_kv_mem_size_candidate(used_Gib, fraction):
     import torch
     _, total = torch.cuda.mem_get_info()
-    return (total / (1 << 30)) * fraction - used_Gib
+    return (total / (1 << 30) - used_Gib) * fraction
 
 
 def _check_mem_usage(file, mem_info, ranks_num=1):
@@ -524,7 +523,7 @@ def test_trtllm_bench_pytorch_backend_sanity(llm_root, llm_venv,
         f"--dataset {dataset_path} --backend 'pytorch'"
 
     mapping = {
-        "Meta-Llama-3.1-8B": 18.9,
+        "Meta-Llama-3.1-8B": 19.4,
         "Llama-3.1-8B-Instruct-FP8": 12.0,
         "Meta-Llama-3.1-8B-NVFP4": 10.2
     }
