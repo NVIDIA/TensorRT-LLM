@@ -194,7 +194,8 @@ class OpenAIServer:
                 tools=tool_dicts,
                 documents=request.documents,
                 chat_template=request.chat_template,
-                chat_template_kwargs=request.chat_template_kwargs or {})
+                chat_template_kwargs=request.chat_template_kwargs or {},
+            )
             prompt = prompt_inputs(prompt)
 
             mm_data = await mm_coroutines
