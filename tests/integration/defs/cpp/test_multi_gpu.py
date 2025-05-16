@@ -1,8 +1,8 @@
-import copy
 import os as _os
 import pathlib as _pl
 import platform
 import time
+from enum import Enum, auto
 from typing import List, Optional
 
 import defs.cpp.cpp_common as _cpp
@@ -19,6 +19,31 @@ def get_model_test_filter_prefix(model: str) -> str:
         raise ValueError(f"Unsupported model: {model}")
 
 
+class KVCacheType(Enum):
+    NONE = auto()
+    MPI = auto()
+    UCX = auto()
+
+
+def get_multi_gpu_env(kv_cache_type=KVCacheType.NONE, llama_multi_gpu=False):
+    env = {**_os.environ}
+
+    match kv_cache_type:
+        case KVCacheType.MPI:
+            env["TRTLLM_USE_MPI_KVCACHE"] = "1"
+        case KVCacheType.UCX:
+            env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+        case KVCacheType.NONE:
+            pass
+        case _:
+            raise ValueError(f"Unsupported KVCacheType: {kv_cache_type}")
+
+    if llama_multi_gpu:
+        env["RUN_LLAMA_MULTI_GPU"] = "true"
+
+    return env
+
+
 def run_simple_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     tests_dir = build_dir / "tests"
     cpp_env = {**_os.environ}
@@ -32,9 +57,9 @@ def run_simple_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     ]
     _cpp.run_command(mpi_utils_test, cwd=tests_dir, env=cpp_env, timeout=300)
 
-    # Cache transceiver tests
-    new_env = copy.copy(cpp_env)
-    new_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
+    # Cache transceiver MPI tests
+    new_env = get_multi_gpu_env(kv_cache_type=KVCacheType.MPI)
+
     cache_trans_test = [
         "mpirun",
         "-n",
@@ -44,9 +69,6 @@ def run_simple_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     ]
     _cpp.run_command(cache_trans_test, cwd=tests_dir, env=new_env, timeout=300)
 
-    new_env = copy.copy(cpp_env)
-    new_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
-    # Cache transceiver tests
     cache_trans_test_8_proc = [
         "mpirun",
         "-n",
@@ -60,8 +82,8 @@ def run_simple_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
                      timeout=600)
 
     # Cache transceiver tests with UCX
-    new_env = copy.copy(cpp_env)
-    new_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    new_env = get_multi_gpu_env(kv_cache_type=KVCacheType.UCX)
+
     cache_trans_test = [
         "mpirun",
         "-n",
@@ -71,8 +93,6 @@ def run_simple_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     ]
     _cpp.run_command(cache_trans_test, cwd=tests_dir, env=new_env, timeout=300)
 
-    new_env = copy.copy(cpp_env)
-    new_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     # Cache transceiver tests
     cache_trans_test_8_proc = [
         "mpirun",
@@ -89,10 +109,8 @@ def run_simple_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
 
 def run_llama_executor_leader_tests(build_dir: _pl.Path, timeout=1500):
     tests_dir = build_dir / "tests"
-    cpp_env = {**_os.environ}
 
-    mgpu_env = copy.copy(cpp_env)
-    mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
+    mgpu_env = get_multi_gpu_env(llama_multi_gpu=True)
 
     #Executor test in leader mode
     xml_output_file = build_dir / "results-multi-gpu-llama-exec-leader-mode.xml"
@@ -110,10 +128,8 @@ def run_llama_executor_leader_tests(build_dir: _pl.Path, timeout=1500):
 
 def run_llama_executor_orchestrator_tests(build_dir: _pl.Path, timeout=1500):
     tests_dir = build_dir / "tests"
-    cpp_env = {**_os.environ}
 
-    mgpu_env = copy.copy(cpp_env)
-    mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
+    mgpu_env = get_multi_gpu_env(llama_multi_gpu=True)
 
     #Executor test in orchestrator mode
     xml_output_file = build_dir / "results-multi-gpu-llama-exec-orch-mode.xml"
@@ -127,10 +143,8 @@ def run_llama_executor_orchestrator_tests(build_dir: _pl.Path, timeout=1500):
 
 def run_llama_executor_logits_proc_tests(build_dir: _pl.Path, timeout=1500):
     tests_dir = build_dir / "tests"
-    cpp_env = {**_os.environ}
 
-    mgpu_env = copy.copy(cpp_env)
-    mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
+    mgpu_env = get_multi_gpu_env(llama_multi_gpu=True)
 
     #Logits processor test in leader mode
     xml_output_file = build_dir / "results-multi-gpu-logits-proc.xml"
@@ -156,10 +170,8 @@ def run_llama_executor_logits_proc_tests(build_dir: _pl.Path, timeout=1500):
 
 def run_llama_executor_guided_decoding_tests(build_dir: _pl.Path, timeout=1500):
     tests_dir = build_dir / "tests"
-    cpp_env = {**_os.environ}
 
-    mgpu_env = copy.copy(cpp_env)
-    mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
+    mgpu_env = get_multi_gpu_env(llama_multi_gpu=True)
 
     #Guided decoding test in leader mode
     xml_output_file = build_dir / "results-multi-gpu-guided-decoding.xml"
@@ -224,20 +236,14 @@ def run_trt_gpt_model_real_decoder_multi_gpu_tests(build_dir: _pl.Path,
 def run_disagg_symmetric_executor_tests(build_dir: _pl.Path,
                                         model: str,
                                         nprocs=2,
-                                        use_ucx_kvcache=False,
+                                        kvcache_type=KVCacheType.MPI,
                                         timeout=1500):
     tests_dir = build_dir / "tests"
-    cpp_env = {**_os.environ}
 
     prefix = get_model_test_filter_prefix(model)
 
-    mgpu_env = copy.copy(cpp_env)
-    if use_ucx_kvcache:
-        mgpu_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    else:
-        mgpu_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
-
-    mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
+    mgpu_env = get_multi_gpu_env(kv_cache_type=kvcache_type,
+                                 llama_multi_gpu=True)
 
     xml_output_file = build_dir / f"results-multi-gpu-disagg-executor-{nprocs}-process.xml"
     trt_model_test = _cpp.produce_mpirun_command(
@@ -258,21 +264,15 @@ def run_disagg_symmetric_executor_tests(build_dir: _pl.Path,
 def run_disagg_asymmetric_executor_tests(build_dir: _pl.Path,
                                          model: str,
                                          nprocs=4,
-                                         use_ucx_kvcache=False,
+                                         kvcache_type=KVCacheType.MPI,
                                          timeout=1500):
 
     tests_dir = build_dir / "tests"
 
     prefix = get_model_test_filter_prefix(model)
 
-    cpp_env = {**_os.environ}
-    mgpu_env = copy.copy(cpp_env)
-    mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
-
-    if use_ucx_kvcache:
-        mgpu_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    else:
-        mgpu_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
+    mgpu_env = get_multi_gpu_env(kv_cache_type=kvcache_type,
+                                 llama_multi_gpu=True)
 
     xml_output_file = build_dir / f"results-multi-gpu-disagg-asymmetric-executor-{nprocs}-process.xml"
 
@@ -293,21 +293,15 @@ def run_disagg_asymmetric_executor_tests(build_dir: _pl.Path,
 
 def run_disagg_orchestrator_params_tests(build_dir: _pl.Path,
                                          model: str,
-                                         use_ucx_kvcache=False,
+                                         kvcache_type=KVCacheType.MPI,
                                          timeout=1500):
 
     tests_dir = build_dir / "tests"
 
     prefix = get_model_test_filter_prefix(model)
 
-    cpp_env = {**_os.environ}
-    mgpu_env = copy.copy(cpp_env)
-    mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
-
-    if use_ucx_kvcache:
-        mgpu_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    else:
-        mgpu_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
+    mgpu_env = get_multi_gpu_env(kv_cache_type=kvcache_type,
+                                 llama_multi_gpu=True)
 
     xml_output_file = build_dir / "results-multi-gpu-disagg-asymmetric-orchestrator-executor-7-process.xml"
     trt_model_test = _cpp.produce_mpirun_command(
@@ -326,21 +320,15 @@ def run_disagg_orchestrator_params_tests(build_dir: _pl.Path,
 
 def run_disagg_spawn_orchestrator_tests(build_dir: _pl.Path,
                                         model: str,
-                                        use_ucx_kvcache=False,
+                                        kvcache_type=False,
                                         timeout=1500):
 
     tests_dir = build_dir / "tests"
 
     prefix = get_model_test_filter_prefix(model)
 
-    cpp_env = {**_os.environ}
-    mgpu_env = copy.copy(cpp_env)
-    mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
-
-    if use_ucx_kvcache:
-        mgpu_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    else:
-        mgpu_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
+    mgpu_env = get_multi_gpu_env(kv_cache_type=kvcache_type,
+                                 llama_multi_gpu=True)
 
     xml_output_file = build_dir / "results-multi-gpu-disagg-spawn-asymmetric-orchestrator-executor-1-process.xml"
 
@@ -539,14 +527,13 @@ def test_trt_gpt_real_decoder(build_google_tests, multi_gpu_model, lora_setup,
                          indirect=True)
 class TestDisagg:
 
-    @pytest.mark.parametrize("use_ucx_kvcache", [False, True],
+    @pytest.mark.parametrize("kvcache_type", [KVCacheType.MPI, KVCacheType.UCX],
                              ids=["mpi_kvcache", "ucx_kvcache"])
     @pytest.mark.parametrize("nprocs", [2, 4, 8],
                              ids=["2proc", "4proc", "8proc"])
     @pytest.mark.parametrize("model", ["gpt", "llama"])
     def test_symmetric_executor(self, build_google_tests, model, nprocs,
-                                use_ucx_kvcache, prepare_models_disagg,
-                                build_dir):
+                                kvcache_type, prepare_models_disagg, build_dir):
 
         if model == "gpt" and nprocs > 2:
             pytest.skip(
@@ -558,50 +545,47 @@ class TestDisagg:
             run_disagg_symmetric_executor_tests(build_dir=build_dir,
                                                 model=model,
                                                 nprocs=nprocs,
-                                                use_ucx_kvcache=use_ucx_kvcache)
+                                                kvcache_type=kvcache_type)
 
-    @pytest.mark.parametrize("use_ucx_kvcache", [False, True],
+    @pytest.mark.parametrize("kvcache_type", [KVCacheType.MPI, KVCacheType.UCX],
                              ids=["mpi_kvcache", "ucx_kvcache"])
     @pytest.mark.parametrize("nprocs", [4, 6, 8],
                              ids=["4proc", "6proc", "8proc"])
     @pytest.mark.parametrize("model", ["llama"])
     def test_asymmetric_executor(self, build_google_tests, model, nprocs,
-                                 use_ucx_kvcache, prepare_models_disagg,
+                                 kvcache_type, prepare_models_disagg,
                                  build_dir):
 
         if platform.system() != "Windows":
             prepare_models_disagg(model_name=model)
 
-            run_disagg_asymmetric_executor_tests(
-                build_dir=build_dir,
-                model=model,
-                nprocs=nprocs,
-                use_ucx_kvcache=use_ucx_kvcache)
+            run_disagg_asymmetric_executor_tests(build_dir=build_dir,
+                                                 model=model,
+                                                 nprocs=nprocs,
+                                                 kvcache_type=kvcache_type)
 
-    @pytest.mark.parametrize("use_ucx_kvcache", [False, True],
+    @pytest.mark.parametrize("kvcache_type", [KVCacheType.MPI, KVCacheType.UCX],
                              ids=["mpi_kvcache", "ucx_kvcache"])
     @pytest.mark.parametrize("model", ["llama"])
-    def test_orchestrator_params(self, build_google_tests, model,
-                                 use_ucx_kvcache, prepare_models_disagg,
-                                 build_dir):
+    def test_orchestrator_params(self, build_google_tests, model, kvcache_type,
+                                 prepare_models_disagg, build_dir):
 
         if platform.system() != "Windows":
             prepare_models_disagg(model)
 
-            run_disagg_orchestrator_params_tests(
-                build_dir=build_dir,
-                model=model,
-                use_ucx_kvcache=use_ucx_kvcache)
+            run_disagg_orchestrator_params_tests(build_dir=build_dir,
+                                                 model=model,
+                                                 kvcache_type=kvcache_type)
 
-    @pytest.mark.parametrize("use_ucx_kvcache", [True], ids=["ucx_kvcache"])
+    @pytest.mark.parametrize("kvcache_type", [KVCacheType.UCX],
+                             ids=["ucx_kvcache"])
     @pytest.mark.parametrize("model", ["llama"])
-    def test_spawn_orchestrator(self, build_google_tests, model,
-                                use_ucx_kvcache, prepare_models_disagg,
-                                build_dir):
+    def test_spawn_orchestrator(self, build_google_tests, model, kvcache_type,
+                                prepare_models_disagg, build_dir):
 
         if platform.system() != "Windows":
             prepare_models_disagg(model)
 
             run_disagg_spawn_orchestrator_tests(build_dir=build_dir,
                                                 model=model,
-                                                use_ucx_kvcache=use_ucx_kvcache)
+                                                kvcache_type=kvcache_type)
