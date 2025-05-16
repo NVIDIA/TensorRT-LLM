@@ -6,8 +6,21 @@ GITHUB_URL="https://github.com"
 UCX_VERSION="v1.18.1"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 
+NIXL_VERSION="0.2.0"
+
+UCX_REPO="https://github.com/openucx/ucx.git"
+NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
+
+UCX_MIRROR="https://gitlab-master.nvidia.com/ftp/GitHubSync/ucx.git"
+NIXL_MIRROR="https://gitlab-master.nvidia.com/ftp/GitHubSync/nixl.git"
+
+if [ -n "${GITHUB_MIRROR}" ]; then
+  UCX_REPO=${UCX_MIRROR}
+  NIXL_REPO=${NIXL_MIRROR}
+fi
+
 if [ ! -d ${UCX_INSTALL_PATH} ]; then
-  git clone --depth 1 -b ${UCX_VERSION} https://github.com/openucx/ucx.git
+  git clone --depth 1 -b ${UCX_VERSION} ${UCX_REPO}
   cd ucx
   ./autogen.sh
   ./contrib/configure-release --prefix=${UCX_INSTALL_PATH}
@@ -16,9 +29,6 @@ if [ ! -d ${UCX_INSTALL_PATH} ]; then
   rm -rf ucx  # Remove UCX source to save space
   echo "export LD_LIBRARY_PATH=${UCX_INSTALL_PATH}/lib:\$LD_LIBRARY_PATH" >> "${ENV}"
 fi
-
-NIXL_VERSION="0.2.0"
-NIXL_REPO="${GITHUB_URL}/ai-dynamo/nixl.git"
 
 ARCH_NAME="x86_64-linux-gnu"
 if [ "$(uname -m)" != "amd64" ] && [ "$(uname -m)" != "x86_64" ]; then
