@@ -7,7 +7,6 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple, Type
 
-import torch
 import torch.nn as nn
 from torch.fx import GraphModule
 from torch.fx._pytree import tree_flatten_spec
@@ -16,12 +15,10 @@ from torch.utils._pytree import PyTree
 from ..utils.logger import ad_logger
 
 
-def _flatten_args(in_spec, *args, **kwargs) -> Tuple[torch.Tensor, List[Any]]:
+def _flatten_args(in_spec, *args, **kwargs) -> List[Any]:
     """Flatten inputs from in_spec where we assume the first input is the main input tensor."""
     all_args: PyTree = (args, kwargs)
-    input_t, *flat_args = tree_flatten_spec(all_args, in_spec)
-    assert input_t.ndim > 1, "Expecting at least a 2D input tensor."
-    return input_t, flat_args
+    return tree_flatten_spec(all_args, in_spec)
 
 
 class BackendRegistry:
@@ -66,8 +63,9 @@ class BackendCompiler(ABC):
         if self.dynamic_shapes is not None and 0 in self.dynamic_shapes[0]:
             self.max_batch_size = self.dynamic_shapes[0][0].max
         else:
-            idxs, *_ = _flatten_args(self.gm._in_spec, *self.args, **self.kwargs)
-            self.max_batch_size = idxs.shape[0]
+            # NOTE: we assume the first input is the main input tensor with batch dimension
+            batched_input, *_ = _flatten_args(self.gm._in_spec, *self.args, **self.kwargs)
+            self.max_batch_size = batched_input.shape[0]
 
     @abstractmethod
     def compile(self) -> nn.Module:
@@ -85,6 +83,11 @@ def compile_and_capture(
     """Compile or capture graph for single-token generation."""
     elapsed_time = -time.time()
     ad_logger.info("Fusion before compiling...")
+
+    # Try to get the requested backend, fall back to torch-simple if not found
+    if not BackendRegistry.has(backend):
+        ad_logger.warning(f"Backend '{backend}' not found. Falling back to 'torch-simple' backend.")
+        backend = "torch-simple"
 
     ad_logger.info(f"Compiling for {backend} backend...")
 

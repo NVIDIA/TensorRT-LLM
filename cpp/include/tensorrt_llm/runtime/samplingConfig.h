@@ -394,6 +394,23 @@ public:
         }
         return beamWidth;
     }
+
+    // Get the maximum beam width of a whole SamplingConfig
+    SizeType32 getMaxBeamWidth() const noexcept
+    {
+        SizeType32 maxBeamWidth = this->beamWidth; // For non-Variable-Beam-Width-Search
+        auto const& beamWidthArray = this->beamWidthArray;
+        if (beamWidthArray.has_value())
+        {
+            for (size_t indexSC = 0; indexSC < beamWidthArray->size(); ++indexSC)
+            {
+                auto const& array = beamWidthArray.value()[indexSC];
+                auto arrayMax = *std::max_element(array.begin(), array.end());
+                maxBeamWidth = std::max(maxBeamWidth, arrayMax);
+            }
+        }
+        return maxBeamWidth;
+    }
 };
 
 } // namespace tensorrt_llm::runtime

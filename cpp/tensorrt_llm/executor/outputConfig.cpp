@@ -33,10 +33,15 @@ OutputConfig::OutputConfig(bool inReturnLogProbs, bool inReturnContextLogits, bo
 {
 }
 
-OutputConfig::AdditionalModelOutput::AdditionalModelOutput(std::string name, bool gatherContext)
+AdditionalModelOutput::AdditionalModelOutput(std::string name, bool gatherContext)
     : name(std::move(name))
     , gatherContext(gatherContext)
 {
+}
+
+bool AdditionalModelOutput::operator==(AdditionalModelOutput const& other) const
+{
+    return name == other.name && gatherContext == other.gatherContext;
 }
 
 } // namespace tensorrt_llm::executor

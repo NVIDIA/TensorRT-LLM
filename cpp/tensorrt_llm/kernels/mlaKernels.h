@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include <assert.h>
 #include <cstdint>
@@ -27,6 +28,8 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
+
+enum class KvCacheDataType;
 
 struct MlaMetaParams
 {
@@ -48,8 +51,9 @@ struct MlaMetaParams
 template <typename T>
 struct MlaParams
 {
-    T const* latent_cache;       // cKV + k_pe
-    T* attention_input_buf;      // [b, s, 3, h, d_h + r]
+    T const* latent_cache;  // cKV + k_pe
+    T* attention_input_buf; // [b, s, 3, h, d_h + r]
+    void* quant_attention_input_buf;
     T* context_buf;
     T* q_pe;                     // [b, h, d_r], strided
 
@@ -68,6 +72,21 @@ struct MlaParams
     int32_t q_pe_stride;
     MlaMetaParams meta;
     int const* block_ids_per_seq;
+    KvCacheDataType cache_type;
+    // Scales for mla quantization
+    float* bmm1_scale;
+    float* bmm2_scale;
+    float const* quant_scale_o;
+    float const* quant_scale_q;
+    float const* quant_scale_kv;
+    float const* dequant_scale_q;
+    float const* dequant_scale_kv;
+    float host_bmm1_scale;
+
+    // for kv cache reuse/chunked context
+    void* context_paged_kv_ptr = nullptr;
+    void* context_kv_cache_block_offsets_ptr = nullptr;
+    int32_t context_paged_kv_max_blocks_per_seq = 0;
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -75,6 +94,26 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
 
 template <typename T, typename KVCacheBuffer>
 void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
+
+template <typename T>
+void invokeMLALoadPagedKV(T* kv_output, KVBlockArray& kv_cache, int const num_contexts,
+    int64_t const* cu_ctx_cached_kv_lens, int const max_input_seq_len, int head_dim, cudaStream_t stream);
+
+template <typename T>
+void invokeMLASetPagedKV(T* output, T* const k_ptr, T* const v_ptr, T* const k_pe_ptr, int const num_requests,
+    int64_t const* cu_seq_lens, int const max_input_seq_len, int num_heads, int kv_dim, int rope_dim,
+    int kv_cache_tokens_per_block, cudaStream_t stream);
+
+template <typename T>
+void invokeMLASetPagedKVV2(T* output, T* const chached_k_ptr, T* const chached_v_ptr, T* const chached_k_pe_ptr,
+    T* const new_k_ptr, T* const new_v_ptr, T* const new_k_pe_ptr, int const num_requests,
+    int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_seq_len, int num_heads,
+    int kv_dim, int rope_dim, int kv_cache_tokens_per_block, cudaStream_t stream);
+
+template <typename T>
+void invokeMLAAppendPagedKV(KVBlockArray& kv_cache, T* const compressed_kv_ptr, T* const k_pe_ptr,
+    int const num_requests, int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens,
+    int const max_input_uncached_seq_len, int head_dim, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

@@ -103,14 +103,15 @@ public:
     {
         SizeType32 mTensorParallelism;
         SizeType32 mPipelineParallelism;
-        bool mEnableAttenionDP;
+        bool mEnableAttentionDP;
         SizeType32 mDPrank;
         SizeType32 mDPsize;
 
         [[nodiscard]] bool operator==(ParallelConfig const& other) const noexcept
         {
             return mTensorParallelism == other.mTensorParallelism && mPipelineParallelism == other.mPipelineParallelism
-                && mEnableAttenionDP == other.mEnableAttenionDP && mDPrank == other.mDPrank && mDPsize == other.mDPsize;
+                && mEnableAttentionDP == other.mEnableAttentionDP && mDPrank == other.mDPrank
+                && mDPsize == other.mDPsize;
         }
     };
 
@@ -161,7 +162,7 @@ public:
         sstring << "mTokensPerBlock:" << mModelConfig.mTokensPerBlock << "\n";
         sstring << "tp:" << mParallelConfig.mTensorParallelism << "\n";
         sstring << "pp:" << mParallelConfig.mPipelineParallelism << "\n";
-        sstring << "enableAttentionDP:" << mParallelConfig.mEnableAttenionDP << "\n";
+        sstring << "enableAttentionDP:" << mParallelConfig.mEnableAttentionDP << "\n";
         sstring << "datatype:" << static_cast<int32_t>(mDataType) << "\n";
         sstring << "attentionType:" << static_cast<int32_t>(mAttentionConfig.mAttentionType) << "\n";
         sstring << "kvFactor:" << mAttentionConfig.mKvFactor << "\n";

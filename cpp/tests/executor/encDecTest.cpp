@@ -12,7 +12,6 @@
 
 #include "executorTest.h"
 
-#include "modelSpec.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
@@ -20,6 +19,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
+#include "tensorrt_llm/testing/modelSpec.h"
 #include "tests/utils/common.h"
 
 #include <gmock/gmock.h>
@@ -125,8 +125,8 @@ TEST_P(EncDecParamsTest, validEncDecCtor)
     std::filesystem::path encEnginePath = ENC_DEC_ENGINE_BASE / enginePathName / "encoder";
     std::filesystem::path decEnginePath = ENC_DEC_ENGINE_BASE / enginePathName / "decoder";
     ExecutorConfig executorConfig{};
-    FloatType freeGpuMemoryFraction = 0.5f;
-    FloatType crossKvCacheFraction = 0.5f;
+    FloatType freeGpuMemoryFraction = 0.4f;
+    FloatType crossKvCacheFraction = 0.4f;
     KvCacheConfig kvCacheConfig{false, std::nullopt, std::nullopt, std::nullopt, freeGpuMemoryFraction};
     kvCacheConfig.setCrossKvCacheFraction(crossKvCacheFraction);
     executorConfig.setKvCacheConfig(kvCacheConfig);
@@ -322,7 +322,7 @@ TEST_P(EncDecParamsTest, Forward)
 
             // check token-by-token match between beam 0 & ground truth
             ASSERT_TRUE(tokens.size() <= gtMaxLength)
-                << "Request ID " << reqId << "'s generated length is longer than ground truth length" << gtMaxLength;
+                << "Request ID " << reqId << "'s generated length is longer than ground truth length " << gtMaxLength;
             for (int i = 0; i < gtMaxLength; i++)
             {
                 if (outConfig.excludeInputFromOutput)
@@ -337,32 +337,12 @@ TEST_P(EncDecParamsTest, Forward)
                 }
                 else
                 {
-                    ASSERT_EQ(gtOutput[i], eosId)
-                        << "Request ID " << reqId << "'s generated length is shorter than ground truth length"
-                        << gtMaxLength;
+                    ASSERT_EQ(gtOutput[i], eosId) << "Request ID " << reqId << "'s generated length " << tokens.size()
+                                                  << " is shorter than ground truth length " << gtMaxLength;
                 }
             }
         }
     }
-}
-
-TEST_P(EncDecParamsTest, ExecutorKVCacheManager)
-{
-    auto const modelName = std::get<0>(GetParam());
-    SizeType32 const beamWidth = std::get<1>(GetParam());
-    SizeType32 const maxNewTokens = std::get<2>(GetParam());
-    SizeType32 const tp = std::get<3>(GetParam());
-    SizeType32 const pp = std::get<4>(GetParam());
-    SizeType32 const cp = std::get<5>(GetParam());
-
-    auto const enginePathName = getEncDecEnginePath(modelName, tp, pp, cp);
-    std::filesystem::path encEnginePath = ENC_DEC_ENGINE_BASE / enginePathName / "encoder";
-    ExecutorConfig executorConfig{};
-
-    executorConfig.setBatchingType(BatchingType::kSTATIC);
-    auto executor = Executor(encEnginePath, ModelType::kENCODER_ONLY, executorConfig);
-
-    EXPECT_EQ(executor.getKVCacheEventManager(), std::nullopt);
 }
 
 INSTANTIATE_TEST_SUITE_P(T5BasicTest, EncDecParamsTest,

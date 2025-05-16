@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/low_latency_gemm.h"
+#include "low_latency_gemm.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <torch/extension.h>

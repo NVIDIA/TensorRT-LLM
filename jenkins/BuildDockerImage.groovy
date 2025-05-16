@@ -1,3 +1,5 @@
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+
 import java.lang.Exception
 import groovy.transform.Field
 
@@ -14,53 +16,6 @@ LLM_BRANCH = env.gitlabBranch? env.gitlabBranch : params.branch
 LLM_BRANCH_TAG = LLM_BRANCH.replaceAll('/', '_')
 
 BUILD_JOBS = "32"
-
-// Utilities
-def checkoutSource(String repo, String branch, String directory) {
-    def extensionsList = [
-        lfs(),
-        [
-            $class: 'CleanCheckout'
-        ],
-        [
-            $class: 'CloneOption',
-            shallow: true,
-            depth: 1,
-            noTags: true,
-            honorRefspec: true,
-        ],
-        [
-            $class: 'RelativeTargetDirectory',
-            relativeTargetDir: directory
-        ],
-        [
-            $class: 'SubmoduleOption',
-            parentCredentials: true,
-            recursiveSubmodules: true,
-            shallow: true,
-            timeout: 60
-        ]
-    ]
-
-    def scmSpec = [
-        $class: "GitSCM",
-        doGenerateSubmoduleConfigurations: false,
-        submoduleCfg: [],
-        branches: [[name: branch]],
-        userRemoteConfigs: [
-            [
-                credentialsId: "svc_tensorrt_gitlab_api_token",
-                name: "origin",
-                refspec: "${branch}:refs/remotes/origin/${branch}",
-                url: repo,
-            ]
-        ],
-        extensions: extensionsList,
-    ]
-    echo "Cloning with SCM spec: ${scmSpec.toString()}"
-    checkout(scm: scmSpec, changelog: true)
-}
-
 
 def createKubernetesPodConfig(type)
 {
@@ -143,11 +98,11 @@ def createKubernetesPodConfig(type)
 
 def buildImage(target, action="build", torchInstallType="skip", args="", custom_tag="", post_tag="")
 {
-    def tag = "x86_64-${target}-torch_${torchInstallType}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}${post_tag}"
+    def tag = "x86_64-${target}-torch_${torchInstallType}${post_tag}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
     // Step 1: cloning tekit source code
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
-    checkoutSource(LLM_REPO, LLM_BRANCH, LLM_ROOT)
+    trtllm_utils.checkoutSource(LLM_REPO, LLM_BRANCH, LLM_ROOT, true, true)
 
     // Step 2: building wheels in container
     container("docker") {
@@ -294,7 +249,7 @@ pipeline {
                     }
                     steps
                     {
-                        buildImage("devel", params.action, "skip")
+                        buildImage("tritondevel", params.action, "skip")
                     }
                 }
                 stage("Build x86_64-pre_cxx11_abi") {
@@ -321,7 +276,7 @@ pipeline {
                     }
                     steps
                     {
-                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.10.12", "", "-py310")
+                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.10.12 STAGE=tritondevel", "", "-py310")
                     }
                 }
                 stage("Build rockylinux8 x86_64-skip-py3.12") {
@@ -330,7 +285,7 @@ pipeline {
                     }
                     steps
                     {
-                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.12.3", "", "-py312")
+                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.12.3 STAGE=tritondevel", "", "-py312")
                     }
                 }
                 stage("Build SBSA-skip") {
@@ -342,25 +297,24 @@ pipeline {
                         triggerSBSARemoteJob(params.action, "skip")
                     }
                 }
-                // Waived due to a pytorch issue: https://github.com/pytorch/pytorch/issues/141083
-                // stage("Build SBSA-pre_cxx11_abi") {
-                //     agent {
-                //         kubernetes createKubernetesPodConfig("agent")
-                //     }
-                //     steps
-                //     {
-                //         triggerSBSARemoteJob(params.action, "src_non_cxx11_abi")
-                //     }
-                // }
-                // stage("Build SBSA-cxx11_abi") {
-                //     agent {
-                //         kubernetes createKubernetesPodConfig("agent")
-                //     }
-                //     steps
-                //     {
-                //         triggerSBSARemoteJob(params.action, "src_cxx11_abi")
-                //     }
-                // }
+                stage("Build SBSA-pre_cxx11_abi") {
+                    agent {
+                        kubernetes createKubernetesPodConfig("agent")
+                    }
+                    steps
+                    {
+                        triggerSBSARemoteJob(params.action, "src_non_cxx11_abi")
+                    }
+                }
+                stage("Build SBSA-cxx11_abi") {
+                    agent {
+                        kubernetes createKubernetesPodConfig("agent")
+                    }
+                    steps
+                    {
+                        triggerSBSARemoteJob(params.action, "src_cxx11_abi")
+                    }
+                }
             }
         }
     } // stages

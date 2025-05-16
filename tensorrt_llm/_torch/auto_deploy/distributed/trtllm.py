@@ -4,18 +4,19 @@ from .common import ReduceOp, get_rank_world_size, is_ompi
 
 # use trtllm distributed ops to improve TP performance if possible
 try:
+    from ....mapping import Mapping
     from ...distributed import AllReduce, allgather
-    from ...modules.linear import AllReduceFusionOp, AllReduceParams, ParallelConfig
+    from ...modules.linear import AllReduceFusionOp, AllReduceParams
 
     def trtllm_allgather(tensor, dim):
         rank, world_size = get_rank_world_size()
-        p_config = ParallelConfig(tensor_parallel_size=world_size, tensor_parallel_rank=rank)
+        p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
         return allgather(tensor, p_config, gather_dim=dim)
 
     def trtllm_allreduce(tensor, op, all_reduce_params=None):
         rank, world_size = get_rank_world_size()
         assert op == ReduceOp.SUM, "TRT-LLM all reduce only supports SUM op."
-        p_config = ParallelConfig(tensor_parallel_size=world_size, tensor_parallel_rank=rank)
+        p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
         torch_op = AllReduce(p_config)
         return torch_op(tensor, all_reduce_params=all_reduce_params)
 

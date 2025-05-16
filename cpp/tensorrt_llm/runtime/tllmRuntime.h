@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -36,8 +37,8 @@ class TllmRuntime
 public:
     using TensorMap = StringPtrMap<ITensor>;
 
-    explicit TllmRuntime(RawEngine const& rawEngine, nvinfer1::ILogger* logger, float gpuWeightsPercent = 1.0f,
-        bool useShapeInference = true);
+    explicit TllmRuntime(RawEngine const& rawEngine, nvinfer1::ILogger* logger, bool useGpuDirectStorage = false,
+        float gpuWeightsPercent = 1.0f, bool useShapeInference = true);
 
     SizeType32 getNbContexts() const
     {
@@ -143,6 +144,24 @@ public:
         return mUserBufferEnabled;
     }
 
+    void setCurrentBeamWidths(std::vector<SizeType32> const& beamWidth) noexcept
+    {
+        mCurrentBeamWidths = beamWidth;
+    }
+
+    [[nodiscard]] SizeType32 const& getCurrentBeamWidth() const noexcept
+    {
+        // At present, all requests of a batch must have the same beam width in one generation step (or they will not
+        // be batched together). So, the beam widths in `mCurrentBeamWidths` are the same.
+        // Corresponding changes must be done if Diverse-Beam-Width-Search (DBWS, requests with diverse beam width in
+        // a batch in one generation step) is supported in the future.
+        TLLM_CHECK_WITH_INFO(mCurrentBeamWidths.size() > 0, "`mCurrentBeamWidths` is empty.");
+        bool const isEqual = std::all_of(mCurrentBeamWidths.begin(), mCurrentBeamWidths.end(),
+            [&](int elem) { return elem == mCurrentBeamWidths.front(); });
+        TLLM_CHECK_WITH_INFO(isEqual, "beam widths in `mCurrentBeamWidths` are not all equal.");
+        return mCurrentBeamWidths.front();
+    }
+
 private:
     void cacheTensorNames();
 
@@ -218,5 +237,7 @@ private:
     std::vector<std::string> mOutputTensorNames;
 
     bool mUserBufferEnabled;
+    // For Variable-Beam-Width-Search
+    std::vector<SizeType32> mCurrentBeamWidths;
 };
 } // namespace tensorrt_llm::runtime

@@ -3,6 +3,7 @@ import json
 import os
 import subprocess  # nosec B404
 import tempfile
+from typing import Optional
 
 import pytest
 from parameterized import parameterized
@@ -18,11 +19,12 @@ from tensorrt_llm.models.llama.model import LLaMAForCausalLM
 from .test_llm import (
     DummyError, DummyExecutorWorker3, _test_llm_capture_request_error,
     _test_llm_generate_async, check_llm_return_context_logits,
-    check_llm_return_generation_logits, default_model_name, get_model_path,
-    llama_7b_multi_lora_test_harness, llama_model_path,
-    llama_v2_7b_prompt_adapter_test_harness, llama_v2_13b_lora_test_harness,
-    llm_check_output, llm_get_stats_async_test_harness,
-    llm_get_stats_test_harness, llm_test_harness, mixtral_model_name, prompts,
+    check_llm_return_generation_logits, llm_return_logprobs_test_harness,
+    default_model_name, get_model_path, llama_7b_multi_lora_test_harness,
+    llama_model_path, llama_v2_7b_prompt_adapter_test_harness,
+    llama_v2_13b_lora_test_harness, llm_check_output,
+    llm_get_stats_async_test_harness, llm_get_stats_test_harness,
+    llm_test_harness, mixtral_model_name, prompts,
     tinyllama_guided_decoding_test_harness,
     tinyllama_logits_processor_test_harness, run_llm_with_postprocess_parallel,
     run_llm_with_postprocess_parallel_and_result_handler, run_llm_abort_request,
@@ -31,6 +33,8 @@ from .test_llm_kv_cache_events import create_llm
 from utils.util import (skip_gpu_memory_less_than, skip_single_gpu,
                         unittest_name_func, force_ampere)
 # isort: on
+
+pytestmark = pytest.mark.threadleak(enabled=False)
 
 # shrink the kv_cache_config to avoid OOM in CI
 global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
@@ -63,7 +67,8 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
         assert llm.args.parallel_config.tp_size == tp_size
 
     tmpdir = tempfile.TemporaryDirectory()
-    llm.save(tmpdir.name)
+    with llm:
+        llm.save(tmpdir.name)
 
     return tmpdir
 
@@ -72,6 +77,7 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
 @pytest.mark.part0
 def test_llm_loading_from_ckpt_for_tp2(
         engine_from_checkpoint: tempfile.TemporaryDirectory):
+    pytest.skip(reason="https://nvbugspro.nvidia.com/bug/5273941")
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     llm_test_harness(engine_from_checkpoint.name,
                      prompts, ["D E F G H I J K"],
@@ -91,7 +97,7 @@ def test_llm_generate_tp2():
 
 
 def test_llm_explicit_shutdown():
-    # with-statement will invoke _shutdown() explicitly
+    # with-statement will invoke `shutdown()` explicitly
     with LLM(model=llama_model_path,
              tensor_parallel_size=2,
              kv_cache_config=global_kv_cache_config,
@@ -109,6 +115,23 @@ def test_llm_return_context_logits_tp2():
 @skip_single_gpu
 def test_llm_return_generation_logits_tp2():
     check_llm_return_generation_logits(tp_size=2)
+
+
+@skip_single_gpu
+@pytest.mark.parametrize(
+    "prompt_logprobs, logprobs, return_context_logits, return_generation_logits",
+    [
+        (2, 2, False, True),
+    ])
+def test_llm_return_logprobs_tp2(prompt_logprobs: Optional[int],
+                                 logprobs: Optional[int],
+                                 return_context_logits: bool,
+                                 return_generation_logits: bool):
+    llm_return_logprobs_test_harness(prompt_logprobs,
+                                     logprobs,
+                                     return_context_logits,
+                                     return_generation_logits,
+                                     tp_size=2)
 
 
 @pytest.mark.parametrize("use_auto_parallel", [True, False],
@@ -156,7 +179,8 @@ def test_llm_generate_mixtral_for_ep2():
         print(output)
 
     tmpdir = tempfile.TemporaryDirectory()
-    llm.save(tmpdir.name)
+    with llm:
+        llm.save(tmpdir.name)
 
     with open(os.path.join(tmpdir.name, "config.json"), "r") as f:
         # read the build_config and check if the parameters are correctly saved
@@ -223,23 +247,18 @@ def test_llm_end2end_tp2(llm_additional_options):
 
 @pytest.mark.gpu4
 @pytest.mark.part0
-def test_tinyllama_logits_processor_tp2pp2():
-    tinyllama_logits_processor_test_harness(tensor_parallel_size=2,
-                                            pipeline_parallel_size=2)
-
-
-@pytest.mark.gpu4
-@pytest.mark.part0
-@pytest.mark.parametrize("backend", ['tensorrt', 'pytorch'])
-def test_tinyllama_guided_decoding_tp2pp2(backend: str):
-    llm_kwargs = {}
-    if backend == 'pytorch':
-        llm_kwargs['backend'] = 'pytorch'
+def test_tinyllama_guided_decoding_tp2pp2():
+    pytest.skip(reason="https://nvbugs/5244006")
     tinyllama_guided_decoding_test_harness(
         tensor_parallel_size=2,
         pipeline_parallel_size=2,
-        kv_cache_config=global_kv_cache_config,
-        **llm_kwargs)
+        kv_cache_config=global_kv_cache_config)
+
+
+@pytest.mark.gpu4
+def test_tinyllama_logits_processor_tp2pp2():
+    tinyllama_logits_processor_test_harness(tensor_parallel_size=2,
+                                            pipeline_parallel_size=2)
 
 
 @pytest.mark.gpu2
@@ -286,7 +305,6 @@ def run_command(command: str):
 
 @skip_single_gpu
 def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
-    # TODO[chunweiy]: reactivate this later
     nworkers = 2
     test_case_file = os.path.join(os.path.dirname(__file__), "run_llm.py")
     os.path.join(os.path.dirname(__file__), "launch.py")
@@ -309,7 +327,6 @@ def test_llm_multi_node_pytorch():
 
 @skip_single_gpu
 def test_llm_multi_node_with_postproc():
-    # TODO[chunweiy]: reactivate this later
     nworkers = 2
     test_case_file = os.path.join(os.path.dirname(__file__),
                                   "run_llm_with_postproc.py")
@@ -325,7 +342,7 @@ def test_executor_results_cleanup():
     llm = LLM(model=llama_model_path,
               kv_cache_config=global_kv_cache_config,
               tensor_parallel_size=2)
-    sampling_params = SamplingParams(max_new_tokens=6)
+    sampling_params = SamplingParams(max_tokens=6)
     for i in range(20):
         llm.generate(prompts, sampling_params=sampling_params)
 
@@ -396,11 +413,10 @@ def _test_executor_handle_background_error_in_dispatch_result_thread():
     # test in streaming mode
     async def task():
         with pytest.raises(DummyError):
-            with llm:
-                async for output in llm.generate_async(
-                        prompts[0], streaming=True,
-                        sampling_params=sampling_params):
-                    print(output)
+            async for output in llm.generate_async(
+                    prompts[0], streaming=True,
+                    sampling_params=sampling_params):
+                print(output)
 
     asyncio.run(task())
 
@@ -430,18 +446,12 @@ DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
 @skip_single_gpu
 @pytest.mark.parametrize("pytorch_backend", [False, True])
 def test_llm_get_stats_tp2(pytorch_backend):
-    if pytorch_backend:
-        pytest.skip("https://nvbugs/5150466: Flaky hang")
-        return
     llm_get_stats_test_harness(tp_size=2, pytorch_backend=pytorch_backend)
 
 
 @skip_single_gpu
 @pytest.mark.parametrize("pytorch_backend", [False, True])
 def test_llm_get_stats_async_tp2(pytorch_backend):
-    if pytorch_backend:
-        pytest.skip("https://nvbugs/5150466: Flaky hang")
-        return
     llm_get_stats_async_test_harness(tp_size=2, pytorch_backend=pytorch_backend)
 
 
@@ -484,7 +494,7 @@ def test_llm_get_kv_cache_events_tp2():
 
 
 @pytest.fixture(scope="module")
-def llm_for_sampling_params_tp2() -> LLM:
+def llm_for_sampling_params_tp2():
     build_config = BuildConfig(max_beam_width=3)
     llm = LLM(
         model=llama_model_path,
@@ -493,7 +503,8 @@ def llm_for_sampling_params_tp2() -> LLM:
         kv_cache_config=global_kv_cache_config,
         tensor_parallel_size=2,
     )
-    return llm
+    yield llm
+    llm.shutdown()
 
 
 @pytest.mark.parametrize("sampling_params",
@@ -502,10 +513,3 @@ def test_llm_abort_request_tp2(llm_for_sampling_params_tp2: LLM,
                                sampling_params: SamplingParams):
     run_llm_abort_request(llm=llm_for_sampling_params_tp2,
                           sampling_params=sampling_params)
-
-
-if __name__ == '__main__':
-
-    #test_llm_capture_request_error()
-
-    test_llm_generate_tp2()

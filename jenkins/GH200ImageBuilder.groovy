@@ -1,3 +1,5 @@
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+
 import java.lang.Exception
 import groovy.transform.Field
 
@@ -11,42 +13,13 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
 }
 LLM_ROOT = "llm"
 
-// Utilities
-def checkoutSource(String repo, String branch, String directory) {
-    def extensionsList = [
-        [$class: 'CleanCheckout'],
-        [$class: 'RelativeTargetDirectory',
-            relativeTargetDir: directory],
-        [$class: 'SubmoduleOption',
-            parentCredentials: true,
-            recursiveSubmodules: true,
-            timeout: 60
-            ]
-    ]
-    def scmSpec = [
-        $class: "GitSCM",
-        doGenerateSubmoduleConfigurations: false,
-        submoduleCfg: [],
-        branches: [[name: branch]],
-        userRemoteConfigs: [
-            [
-                credentialsId: "svc_tensorrt_gitlab_api_token",
-                name: "origin",
-                url: repo,
-            ]
-        ],
-        extensions: extensionsList,
-    ]
-    echo "Cloning with SCM spec: ${scmSpec.toString()}"
-    checkout(scm: scmSpec, changelog: true)
-}
-
-
 def buildImage(action, type)
 {
     def branch = env.gitlabBranch
     def branchTag = branch.replaceAll('/', '_')
-    def tag = "sbsa-devel-torch_${type}-${branchTag}-${BUILD_NUMBER}"
+    def buildNumber = env.hostBuildNumber ? env.hostBuildNumber : BUILD_NUMBER
+    def stage_docker = "tritondevel"
+    def tag = "sbsa-${stage_docker}-torch_${type}-${branchTag}-${buildNumber}"
 
     // Step 1: cloning tekit source code
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
@@ -56,14 +29,13 @@ def buildImage(action, type)
         echo "gitlabBranch: ${env.gitlabBranch}"
         echo "action: ${env.action}"
         echo "type: ${env.type}"
-
         sh 'pwd'
         sh 'ls -lah'
         sh 'rm -rf ./*'
         sh 'ls -lah'
     }
 
-    checkoutSource(LLM_REPO, branch, LLM_ROOT)
+    trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
 
     // Step 2: building wheels in container
     docker.image(DOCKER_IMAGE).inside('-v /var/run/docker.sock:/var/run/docker.sock --privileged') {
@@ -100,8 +72,11 @@ def buildImage(action, type)
             stage ("Perform '${action}' action on image") {
                 retry(3)
                 {
-                    sh "cd ${LLM_ROOT} && make -C docker devel_${action} IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${tag} TORCH_INSTALL_TYPE=${type}" +
-                    " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
+                    sh """cd ${LLM_ROOT} && make -C docker ${stage_docker}_${action} \
+                        IMAGE_NAME=${IMAGE_NAME} \
+                        IMAGE_TAG=${tag} \
+                        TORCH_INSTALL_TYPE=${type} \
+                        GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"""
                 }
             }
         } catch (Exception ex) {

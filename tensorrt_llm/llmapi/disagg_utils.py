@@ -25,10 +25,18 @@ class CtxGenServerConfig():
 
 
 @dataclass
+class RouterConfig():
+    type: str = "round_robin"
+    args: dict = field(default_factory=dict)
+
+
+@dataclass
 class DisaggServerConfig():
     server_configs: List[CtxGenServerConfig]
     hostname: str = "localhost"
     port: int = 8000
+    ctx_router_config: Optional[RouterConfig] = None
+    gen_router_config: Optional[RouterConfig] = None
 
 
 def parse_disagg_config_file(yaml_config_file: str):
@@ -44,8 +52,8 @@ def parse_disagg_config_file(yaml_config_file: str):
 
 def extract_disagg_cfg(hostname: str = 'localhost',
                        port: int = 8000,
-                       context_servers: dict = {},
-                       generation_servers: dict = {},
+                       context_servers: dict = dict(),
+                       generation_servers: dict = dict(),
                        **kwargs: Any) -> DisaggServerConfig:
 
     # If parameters are specified outside the context_severs and generation_servers sections,
@@ -68,7 +76,11 @@ def extract_disagg_cfg(hostname: str = 'localhost',
         type="ctx", **context_servers) + extract_ctx_gen_cfgs(
             type="gen", **generation_servers)
 
-    return DisaggServerConfig(server_configs, hostname, port)
+    ctx_router_config = extract_router_config(context_servers)
+    gen_router_config = extract_router_config(generation_servers)
+
+    return DisaggServerConfig(server_configs, hostname, port, ctx_router_config,
+                              gen_router_config)
 
 
 def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
@@ -114,16 +126,27 @@ def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
     return cfgs
 
 
-def split_world_comm(
-        server_configs: List[CtxGenServerConfig]) -> Tuple[bool, int, Comm]:
+def extract_router_config(server_cfg: dict) -> RouterConfig:
 
-    # Check that MPI_COMM_WORLD size is compatible with the number of workers
-    global_size = global_mpi_size()
-    global_rank = global_mpi_rank()
+    args = server_cfg.get("router", {})
+    router_type = args.pop("type", "round_robin")
+
+    # add fields that are not specific to router
+    extract_keys = ["max_batch_size", "max_num_tokens"]
+    for key in extract_keys:
+        if key in server_cfg:
+            args[key] = server_cfg[key]
+
+    return RouterConfig(type=router_type, args=args)
+
+
+def get_server_configs_dict(
+        server_configs: List[CtxGenServerConfig]) -> Tuple[int, dict]:
+
     num_workers = 0
+    server_dict = {}
 
     # check for duplicate server configs
-    server_dict = {}
     for cfg in server_configs:
         url = (cfg.hostname, cfg.port)
         if url in server_dict:
@@ -140,6 +163,17 @@ def split_world_comm(
             server_dict[url] = cfg
             num_workers += cfg.instance_num_ranks
 
+    return num_workers, server_dict
+
+
+def split_world_comm(
+        server_configs: List[CtxGenServerConfig]) -> Tuple[bool, int, Comm]:
+
+    # Check that MPI_COMM_WORLD size is compatible with the number of workers
+    global_size = global_mpi_size()
+    global_rank = global_mpi_rank()
+
+    [num_workers, server_dict] = get_server_configs_dict(server_configs)
     assert global_size == num_workers, f"global_size ({global_size}) should be equal to the number of distinct workers ({num_workers})"
 
     # Identify the leader ranks and the instance idx for each rank

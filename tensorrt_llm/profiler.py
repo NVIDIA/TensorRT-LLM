@@ -68,9 +68,13 @@ class Timer:
             return None
         return self._total_elapsed_times[tag]
 
-    def reset(self):
-        self._start_times.clear()
-        self._total_elapsed_times.clear()
+    def reset(self, tag=None) -> None:
+        if tag is None:
+            self._start_times.clear()
+            self._total_elapsed_times.clear()
+        else:
+            self._start_times.pop(tag, None)
+            self._total_elapsed_times.pop(tag, None)
 
     def summary(self):
         logger.info('Profile Results')
@@ -93,8 +97,8 @@ def elapsed_time_in_sec(tag):
     return _default_timer.elapsed_time_in_sec(tag)
 
 
-def reset():
-    _default_timer.reset()
+def reset(tag=None):
+    _default_timer.reset(tag=tag)
 
 
 def summary():

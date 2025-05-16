@@ -18,11 +18,13 @@ add_gtest(shiftKCacheKernelTest shiftKCacheKernelTest.cu)
 add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
 add_gtest(stopCriteriaKernelsTest stopCriteriaKernelsTest.cpp)
 add_gtest(weightOnlyKernelTest weightOnly/weightOnlyKernelTest.cpp)
+add_gtest(mlaPreprocessTest mlaPreprocessTest.cu)
 
 add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
 
 if(NOT ENABLE_MULTI_DEVICE EQUAL 0)
   add_gtest(allReduceKernelTest allReduce/allReduceKernelTest.cu)
+  add_gtest(allReduceFusionTest allReduce/allReduceFusionTest.cu)
   # add_gtest(gemmAllReduceTest allReduce/gemmAllReduceTest.cu)
 endif()
 

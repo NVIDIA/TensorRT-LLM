@@ -568,7 +568,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     using PackedVec = PackedVec<DType>;
     cudaTriggerProgrammaticLaunchCompletion();
-    float const sf = 1.f / *scale;
+    float sf = *scale;
     __shared__ float s_variance;
     int hidden_dim = blockDim.x * UNROLL_NLINES * sizeof(int4) / sizeof(DType);
 
@@ -650,7 +650,8 @@ __global__ void __launch_bounds__(MAX_THREADS)
             if (threadIdx.x % 8 == 0)
             {
                 sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_idx,
-                    threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim, scale_out + scale_out_offset);
+                    threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim, scale_out + scale_out_offset,
+                    FP4QuantizationSFLayout::SWIZZLED);
             }
             uint32_t val = cvt_warp_fp16_to_fp4_mc(valout, sf, sf_out);
             MULTIMEM_ST(val, mc_ptr_out + (out_lineoffset + line + g * loop_step0));
@@ -682,7 +683,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     using PackedVec = PackedVec<DType>;
     cudaTriggerProgrammaticLaunchCompletion();
-    float const sf = 1.f / *scale;
+    float sf = *scale;
     __shared__ float s_variance;
     int hidden_dim = blockDim.x * UNROLL_NLINES * sizeof(int4) / sizeof(DType);
 
@@ -761,7 +762,8 @@ __global__ void __launch_bounds__(MAX_THREADS)
                 i++;
             }
             auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_idx,
-                threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim, scale_out + scale_out_offset);
+                threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim, scale_out + scale_out_offset,
+                FP4QuantizationSFLayout::SWIZZLED);
             mc_ptr_out[out_lineoffset + line + g * loop_step0] = cvt_warp_fp16_to_fp4(valout, sf, sf_out);
         }
     }
@@ -1912,6 +1914,7 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_impl(int const handler, size_t
     switch (dataType)
     {
     case nvinfer1::DataType::kHALF:
+    {
         if (kDISABLE_FP32_ACCUMULATION)
         {
             return allreduce2_userbuff_inplace_rmsnorm_quant_fp4<half, true>(handler, offset, out_handler, out_offset,
@@ -1925,6 +1928,7 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_impl(int const handler, size_t
                 residual_out, comm, stream);
         }
         break;
+    }
 #ifdef ENABLE_BF16
     case nvinfer1::DataType::kBF16:
     {

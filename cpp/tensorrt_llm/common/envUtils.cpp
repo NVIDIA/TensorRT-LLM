@@ -293,10 +293,10 @@ bool getEnvParallelCacheSend()
     return parallelCacheSend;
 }
 
-bool getEnvRequestKVCacheSerial()
+bool getEnvRequestKVCacheConcurrent()
 {
-    static bool const requestKVCacheSerial = getBoolEnv("TRTLLM_REQUEST_KV_CACHE_SERIAL");
-    return requestKVCacheSerial;
+    static bool const requestKVCacheConcurrent = getBoolEnv("TRTLLM_REQUEST_KV_CACHE_CONCURRENT");
+    return requestKVCacheConcurrent;
 }
 
 bool getEnvDisableKVCacheTransferOverlap()
@@ -305,10 +305,10 @@ bool getEnvDisableKVCacheTransferOverlap()
     return disableKVCacheTransferOverlap;
 }
 
-bool getEnvDisableReceiveKVCacheParallel()
+bool getEnvEnableReceiveKVCacheParallel()
 {
-    static bool const disableReceiveParallel = getBoolEnv("TRTLLM_DISABLE_KVCACHE_RECEIVE_PARALLEL");
-    return disableReceiveParallel;
+    static bool const enableReceiveParallel = getBoolEnv("TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL");
+    return enableReceiveParallel;
 }
 
 bool getEnvTryZCopyForKVCacheTransfer()
@@ -365,8 +365,14 @@ bool getEnvKVCacheTransferUseAsyncBuffer()
 size_t getEnvKVCacheSendMaxConcurrenceNum()
 {
 
-    static size_t const maxConcurrenceNum = getUInt64Env("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM").value_or(4);
+    static size_t const maxConcurrenceNum = getUInt64Env("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM").value_or(2);
     return maxConcurrenceNum;
+}
+
+size_t getEnvKVCacheRecvBufferCount()
+{
+    static size_t const recvBufferCount = getUInt64Env("TRTLLM_KVCACHE_RECV_BUFFER_COUNT").value_or(2);
+    return recvBufferCount;
 }
 
 size_t getEnvMemSizeForKVCacheTransferBuffer()
@@ -381,6 +387,10 @@ size_t getEnvMemSizeForKVCacheTransferBuffer()
             if (memSizeForKVCacheTransferBufferEnv)
             {
                 memSizeForKVCacheTransferBuffer = parseMemorySize(memSizeForKVCacheTransferBufferEnv);
+            }
+            else
+            {
+                memSizeForKVCacheTransferBuffer = parseMemorySize("512MB");
             }
         });
 

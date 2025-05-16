@@ -91,21 +91,21 @@ devel_deps, _ = parse_requirements(
 if on_windows:
     package_data = [
         'libs/th_common.dll', 'libs/tensorrt_llm.dll',
-        'libs/nvinfer_plugin_tensorrt_llm.dll',
-        'libs/tensorrt_llm_nvrtc_wrapper.dll', 'bindings.*.pyd', "include/**/*"
+        'libs/nvinfer_plugin_tensorrt_llm.dll', 'bindings.*.pyd', "include/**/*"
     ]
 else:
     package_data = [
         'bin/executorWorker', 'libs/libtensorrt_llm.so', 'libs/libth_common.so',
         'libs/libnvinfer_plugin_tensorrt_llm.so',
-        'libs/libtensorrt_llm_nvrtc_wrapper.so',
         'libs/libtensorrt_llm_ucx_wrapper.so', 'libs/libdecoder_attention_0.so',
         'libs/libdecoder_attention_1.so', 'bindings.*.so', "include/**/*"
     ]
 
 package_data += [
-    'bindings/*.pyi', 'tools/plugin_gen/templates/*',
-    'bench/build/benchmark_config.yml'
+    'bindings/*.pyi',
+    'tools/plugin_gen/templates/*',
+    'bench/build/benchmark_config.yml',
+    'evaluate/lm_eval_tasks/**/*',
 ]
 
 

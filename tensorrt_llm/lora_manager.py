@@ -1,10 +1,11 @@
+import io
 import json
 import re
 import tarfile
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -34,6 +35,10 @@ def get_all_nemo_lora_weights(lora_weights):
             else:
                 continue
             m = layer_pattern.match(key)
+            if m is None:
+                raise KeyError(
+                    f"Failed to extract layer index from key {key} using pattern {layer_pattern.pattern}"
+                )
             layer_idx = int(m.group(1))
             layer_weights[layer_idx][inout] = weights
         else:
@@ -72,7 +77,7 @@ def iterate_hf_lora(iter_fn, lora_weights, hf_modules, component=None):
             hf_module = m.group(3) + "." + module_name
         if hf_module not in hf_modules:
             hf_module = module_name
-            assert hf_module in hf_modules, f"hf_module {hf_module} is not in supported llist {hf_modules}"
+            assert hf_module in hf_modules, f"hf_module {hf_module} is not in supported list {hf_modules}"
 
         is_lora_a_or_b = m.group(8) is not None
         if is_lora_a_or_b:
@@ -153,6 +158,14 @@ class LoraConfig(DictConversion):
         return LoraManager.get_missing_qkv_modules(self.lora_target_modules)
 
 
+@dataclass
+class LoraModelConfig:
+    lora_target_modules: list[str]
+    trtllm_modules_to_hf_modules: dict[str, str]
+    hidden_size: int
+    dtype: str
+
+
 class HfLoraLoader:
 
     def __init__(self, lora_dirs: List[str]):
@@ -181,7 +194,10 @@ class HfLoraLoader:
         with open(f"{lora_dir}/adapter_config.json") as f:
             adapter_config = json.load(f)
 
-        lora_weight = load_state_dict(get_model_path(lora_dir, "adapter_model"))
+        model_path = get_model_path(lora_dir, "adapter_model")
+        if model_path is None:
+            raise ValueError(f"adapter_model file does not exist in {lora_dir}")
+        lora_weight = load_state_dict(model_path)
         self.lora_weight = lora_weight
         if adapter_config["modules_to_save"] is not None:
             if "lm_head" in adapter_config["modules_to_save"]:
@@ -250,10 +266,38 @@ def get_default_trtllm_modules_to_hf_modules():
     }
 
 
+def load_torch_hf_lora(lora_config: LoraConfig):
+    """
+    This is a shortned version of load_hf_lora that is used for torch models.
+    Main problem is model.config in legacy code is custom (defined in the legacy code) whereas
+    pivot model config is the transformer's one.
+    """
+    # TODO smor- need to comibe with load_hf_lora
+    lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules(
+    )
+
+    assert len(lora_config.lora_dir) == 1, "Expecting only a single lora dir"
+    lora_loader = HfLoraLoader(lora_config.lora_dir)
+
+    if len(lora_config.lora_target_modules) == 0:
+        lora_config.lora_target_modules = lora_loader.get_target_modules(
+            lora_config.trtllm_modules_to_hf_modules)
+
+    if len(lora_config.lora_target_modules) == 0:
+        raise ValueError(
+            "lora_target_modules is empty. "
+            "Please specify lora_target_modules or provide lora_dir to infer lora_target_modules."
+        )
+
+    missing_qkv_modules = LoraManager.get_missing_qkv_modules(
+        lora_config.lora_target_modules)
+    lora_config.lora_target_modules.extend(missing_qkv_modules)
+
+
 def load_hf_lora(
     model,
     lora_config: LoraConfig,
-    trtllm_modules_to_hf_modules: Dict[str, str] = None,
+    trtllm_modules_to_hf_modules: Optional[Dict[str, str]] = None,
 ):
     trtllm_modules_to_hf_modules = trtllm_modules_to_hf_modules or get_default_trtllm_modules_to_hf_modules(
     )
@@ -339,7 +383,7 @@ def load_hf_lora(
 def use_lora(
     model,
     lora_config: LoraConfig,
-    trtllm_modules_to_hf_modules: Dict[str, str] = None,
+    trtllm_modules_to_hf_modules: Optional[Dict[str, str]] = None,
 ):
     if lora_config.lora_ckpt_source == "nemo":
         load_nemo_lora(model, lora_config)
@@ -353,17 +397,27 @@ def use_lora(
 def unpack_nemo_weights(nemo_archive_path):
     with tarfile.open(nemo_archive_path) as tar:
         try:
-            model_weights = tar.extractfile("model_weights.ckpt")
-            model_config = tar.extractfile("model_config.yaml")
+            model_weights_file = tar.extractfile("model_weights.ckpt")
+            model_config_file = tar.extractfile("model_config.yaml")
         except KeyError:
             try:
-                model_weights = tar.extractfile("./model_weights.ckpt")
-                model_config = tar.extractfile("./model_config.yaml")
+                model_weights_file = tar.extractfile("./model_weights.ckpt")
+                model_config_file = tar.extractfile("./model_config.yaml")
             except KeyError:
                 err_str = "Both model_weights paths not found in the tar archive."
                 raise Exception(err_str)
-        return yaml.safe_load(model_config), torch.load(
-            model_weights, map_location=torch.device("cpu"))
+
+        if model_weights_file is None or model_config_file is None:
+            raise Exception("Could not extract model weights or config files")
+
+        model_config_content = model_config_file.read()
+        model_config_dict = yaml.safe_load(model_config_content)
+
+        model_weights_bytes = model_weights_file.read()
+        model_weights_dict = torch.load(io.BytesIO(model_weights_bytes),
+                                        map_location=torch.device("cpu"))
+
+        return model_config_dict, model_weights_dict
 
 
 class LoraManager(object):
@@ -453,7 +507,7 @@ class LoraManager(object):
 
     def load_from_ckpt(self,
                        model_dirs_or_files: List[str],
-                       model_config: 'ModelConfig',
+                       model_config: Union['ModelConfig', LoraModelConfig],
                        runtime_mapping: Optional[Mapping] = None,
                        uids: Optional[List[str]] = None,
                        ckpt_source: str = 'hf'):
@@ -472,7 +526,7 @@ class LoraManager(object):
 
     def load_from_nemo(self,
                        model_files: List[str],
-                       model_config: 'ModelConfig',
+                       model_config: Union['ModelConfig', LoraModelConfig],
                        runtime_mapping: Optional[Mapping] = None,
                        uids: Optional[List[str]] = None):
         if runtime_mapping is None:
@@ -498,9 +552,11 @@ class LoraManager(object):
 
         def load_from_model_file(uid, model_file):
             if uid not in self._cpp_lora_weights:
-                self._cpp_lora_weights[uid] = []
+                self._cpp_lora_weights[uid] = [
+                ]  # Will be converted to tensor later
             if uid not in self._cpp_lora_config:
-                self._cpp_lora_config[uid] = []
+                self._cpp_lora_config[uid] = [
+                ]  # Will be converted to tensor later
 
             _, nemo_weights = unpack_nemo_weights(model_file)
             all_lora_weights = get_all_nemo_lora_weights(nemo_weights)
@@ -573,7 +629,7 @@ class LoraManager(object):
 
     def load_from_hf(self,
                      model_dirs: List[str],
-                     model_config: 'ModelConfig',
+                     model_config: Union['ModelConfig', LoraModelConfig],
                      runtime_mapping: Optional[Mapping] = None,
                      uids: Optional[List[str]] = None,
                      component: Optional[str] = None):
@@ -669,12 +725,17 @@ class LoraManager(object):
 
         def load_from_model_dir(uid, model_dir, hf_config):
             if uid not in self._cpp_lora_weights:
-                self._cpp_lora_weights[uid] = []
+                self._cpp_lora_weights[uid] = [
+                ]  # Will be converted to tensor later
             if uid not in self._cpp_lora_config:
-                self._cpp_lora_config[uid] = []
+                self._cpp_lora_config[uid] = [
+                ]  # Will be converted to tensor later
 
             lora_model = load_state_dict(
                 get_model_path(model_dir, "adapter_model"))
+            if lora_model is None:
+                raise ValueError(
+                    f"Failed to load adapter_model from {model_dir}")
             lora_model = preprocess_lora_weights(lora_model)
             all_weights = get_all_hf_lora_weights(lora_model, hf_modules,
                                                   component)
@@ -751,7 +812,7 @@ class LoraManager(object):
                         t_out = torch.split(t_out,
                                             t_out.shape[dim] // tp_size,
                                             dim=dim)[tp_rank].contiguous()
-                        if dim == 0 and is_dora:
+                        if dim == 0 and is_dora and t_mag is not None:
                             t_mag = torch.split(t_mag,
                                                 t_mag.shape[0] // tp_size,
                                                 dim=0)[tp_rank].contiguous()
@@ -761,7 +822,7 @@ class LoraManager(object):
 
                     t_in = t_in.cuda().contiguous()
                     t_out = t_out.cuda().contiguous()
-                    if is_dora:
+                    if is_dora and t_mag is not None:
                         t_mag = t_mag.cuda().contiguous()
 
                     if rs_lora:
@@ -772,7 +833,7 @@ class LoraManager(object):
                     t_out = t_out * scale
                     t_in = t_in.to(str_dtype_to_torch(model_config.dtype))
                     t_out = t_out.to(str_dtype_to_torch(model_config.dtype))
-                    if is_dora:
+                    if is_dora and t_mag is not None:
                         t_mag = t_mag.to(str_dtype_to_torch(model_config.dtype))
 
                     self._lora_uid_to_low_ranks[uid][layer_idx][
@@ -781,20 +842,26 @@ class LoraManager(object):
                         lora_module] = [
                             t_in.data_ptr(),
                             t_out.data_ptr(),
-                            t_mag.data_ptr() if is_dora else 0
+                            t_mag.data_ptr() if
+                            (is_dora and t_mag is not None) else 0
                         ]
 
                     # prevent torch free this buffer
                     self._lora_weights.append(t_in)
                     self._lora_weights.append(t_out)
-                    if is_dora:
+                    if is_dora and t_mag is not None:
                         self._lora_weights.append(t_mag)
 
+                    t_in_cpu = t_in.flatten().cpu()
+                    t_out_cpu = t_out.flatten().cpu()
+                    weights_to_concat = [t_in_cpu, t_out_cpu]
+
+                    if is_dora and t_mag is not None:
+                        t_mag_cpu = t_mag.flatten().cpu()
+                        weights_to_concat.append(t_mag_cpu)
+
                     self._cpp_lora_weights[uid].append(
-                        torch.concatenate(
-                            [t_in.flatten().cpu(),
-                             t_out.flatten().cpu()] +
-                            ([t_mag.flatten().cpu()] if is_dora else [])))
+                        torch.cat(weights_to_concat))
                     self._cpp_lora_config[uid].append(
                         torch.tensor([
                             self.LORA_MODULE_IDS[lora_module], layer_idx,

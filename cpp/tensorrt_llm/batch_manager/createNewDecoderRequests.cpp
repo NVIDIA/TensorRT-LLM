@@ -54,10 +54,11 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     CudaStream const& runtimeStream, SizeType32 maxSequenceLength) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     TLLM_CHECK(batchSlot >= 0);
 
     auto const& decoderStream = decoder.getDecoderStream();
-    BufferManager manager{decoderStream};
+    BufferManager const manager{decoderStream};
 
     auto& decoderState = decoder.getDecoderState();
 
@@ -89,10 +90,10 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     dJointInput.beamWidths.at(batchSlot) = beamWidth;
     decoderState.setNumDecodingEngineTokens(batchSlot, numDecodingEngineTokens);
 
-    TensorPtr endIdTensorPtr{ITensor::slice(constPointerCast(dJointInput.endIds), batchSlot, 1)};
+    TensorPtr const endIdTensorPtr{ITensor::slice(constPointerCast(dJointInput.endIds), batchSlot, 1)};
     runtime::kernels::invokeFill(*endIdTensorPtr, endId, *decoderStream);
 
-    TensorPtr embeddingBiasSlice = ITensor::slice(constPointerCast(dJointInput.embeddingBias), batchSlot, 1);
+    TensorPtr const embeddingBiasSlice = ITensor::slice(constPointerCast(dJointInput.embeddingBias), batchSlot, 1);
     if (request.embeddingBias)
     {
         TLLM_CHECK(request.embeddingBias->getShape().nbDims == 2);
@@ -117,10 +118,10 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
             BufferRange<int32_t*>(*constPointerCast(jointWordsPtrs))[batchSlot]
                 = runtime::bufferCast<TokenIdType>(*requestWordsList);
             runtime::bufferCast<SizeType32>(*constPointerCast(jointWordsLens))[batchSlot] = wordsLen;
-            // FIXME(nkorobov): this is monotonically growing size
+            // FIXME: this is monotonically growing size
             jointMaxWordsLen = std::max(static_cast<SizeType32>(wordsLen), jointMaxWordsLen);
 
-            // NOTE(nkorobov): jointWordsList is not used in gptDecoder, but required to keep <name>WordsList's
+            // NOTE: jointWordsList is not used in gptDecoder, but required to keep <name>WordsList's
             // memory allocated
             jointWordsLists[batchSlot] = requestWordsList;
         }
@@ -136,10 +137,11 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     setupWords(dJointInput.badWordsLists, request.badWordsList, dJointInput.badWordsPtrs, dJointInput.badWordsLens,
         dJointInput.maxBadWordsLen, batchSlot);
 
-    TensorPtr sequenceLimitLength{ITensor::slice(constPointerCast(dJointInput.sequenceLimitLength), batchSlot, 1)};
+    TensorPtr const sequenceLimitLength{
+        ITensor::slice(constPointerCast(dJointInput.sequenceLimitLength), batchSlot, 1)};
     runtime::kernels::invokeFill(*sequenceLimitLength, inputLength + maxNewTokens, *decoderStream);
 
-    TensorPtr inputLengths{ITensor::slice(constPointerCast(dJointInput.lengths), batchSlot, 1)};
+    TensorPtr const inputLengths{ITensor::slice(constPointerCast(dJointInput.lengths), batchSlot, 1)};
     runtime::kernels::invokeFill(*inputLengths, inputLength, *decoderStream);
 
     // output
@@ -151,18 +153,18 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
 
     for (SizeType32 ti = 0; ti < decoderState.getMaxDecodingEngineTokens(); ++ti)
     {
-        TensorPtr newTokensStepView = ITensor::slice(dJointOutput.newTokensSteps, ti, 1);
+        TensorPtr const newTokensStepView = ITensor::slice(dJointOutput.newTokensSteps, ti, 1);
         newTokensStepView->squeeze(0);
         auto newTokensVec = ITensor::slice(newTokensStepView, batchSlot, 1);
         manager.setZero(*newTokensVec);
     }
 
-    // FIXME(nkorobov): we call setZero mMaxDecodingEngineTokens times for only 1 element
+    // FIXME: we call setZero mMaxDecodingEngineTokens times for only 1 element
     for (SizeType32 ti = 0; ti < decoderState.getMaxDecodingEngineTokens(); ++ti)
     {
-        TensorPtr finishedStepsView = ITensor::slice(decoderState.getFinishedSteps(), ti, 1);
+        TensorPtr const finishedStepsView = ITensor::slice(decoderState.getFinishedSteps(), ti, 1);
         finishedStepsView->squeeze(0);
-        TensorPtr finishedSteps = ITensor::slice(finishedStepsView, batchSlot, 1);
+        TensorPtr const finishedSteps = ITensor::slice(finishedStepsView, batchSlot, 1);
         if (ti < numDecodingEngineTokens)
         {
             manager.setZero(*finishedSteps);
@@ -189,7 +191,7 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
 
     if (beamWidth > 1)
     {
-        TensorPtr cumLogProbs = ITensor::slice(dJointOutput.cumLogProbs, batchSlot, 1);
+        TensorPtr const cumLogProbs = ITensor::slice(dJointOutput.cumLogProbs, batchSlot, 1);
         runtime::kernels::invokeFill(
             *IBuffer::slice(cumLogProbs, 1, beamWidth - 1), DecodingOutput::kNegativeInfinity, *decoderStream);
 
@@ -211,7 +213,7 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     }
 
     // fill outputIds with endIds
-    TensorPtr outputIds = ITensor::slice(dJointOutput.ids, batchSlot, 1);
+    TensorPtr const outputIds = ITensor::slice(dJointOutput.ids, batchSlot, 1);
     auto outputIdsTileView = ITensor::view(outputIds, ITensor::makeShape({beamWidth, maxSequenceLength}));
     runtime::kernels::invokeFill(*outputIdsTileView, endId, *decoderStream);
 
@@ -219,10 +221,6 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     auto const requestIdsShape = requestIds->getShape();
     auto outputIdsView = ITensor::view(outputIds, requestIdsShape);
     manager.copy(*requestIds, *outputIdsView);
-    if (beamWidth > 1)
-    {
-        runtime::kernels::tileTensorInplace(*outputIdsTileView, beamWidth, *decoderStream);
-    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -244,7 +242,7 @@ void CreateNewDecoderRequests::newRequestSpeculativeDecoding(SizeType32 batchIdx
 
         TensorPtr nextDraftTokens
             = ITensor::slice(dJointOutput.speculativeDecodingOutputs->nextDraftTokens, batchIdx, 1);
-        // FIXME(nkorobov): can we skip this?
+        // FIXME: can we skip this?
         manager.setZero(*nextDraftTokens);
         if (speculativeDecodingMode.variableDraftLength())
         {
@@ -427,8 +425,6 @@ void CreateNewDecoderRequests::newRequestEagle(SizeType32 batchIdx, runtime::dec
         modelConfig.getSpeculativeDecodingModulePtr());
     std::optional<executor::EagleChoices> eagleChoicesOpt;
 
-    TensorPtr draftPathsSlice = ITensor::slice(jointDecodingOutput.eagleBuffers->draftPaths, batchIdx, 1);
-
     if (request.eagleConfig)
     {
         eagleChoicesOpt = request.eagleConfig->getEagleChoices();
@@ -436,16 +432,18 @@ void CreateNewDecoderRequests::newRequestEagle(SizeType32 batchIdx, runtime::dec
 
     if (!request.eagleConfig || !request.eagleConfig->useDynamicTree())
     {
+        TensorPtr draftPathsHostSlice = ITensor::slice(jointDecodingOutput.eagleBuffers->draftPathsHost, batchIdx, 1);
+        TensorPtr draftPathsSlice = ITensor::slice(jointDecodingOutput.eagleBuffers->draftPaths, batchIdx, 1);
+
         // eagleConfig is nullptr or Eagle-1
         std::vector<SizeType32> topKs;
-        TensorPtr draftPathsHost = manager.pinnedPool(draftPathsSlice->getShape(), nvinfer1::DataType::kINT32);
         auto const depth = utils::initTensorsFromChoices(modelConfig.getSpeculativeDecodingModule(),
             eagleChoicesOpt.value_or(eagleModule->getDefaultEagleChoices()), topKs, nullptr, nullptr, nullptr,
-            draftPathsHost, nullptr, {eagleModule->getMaxNonLeafNodesPerLayer()});
+            draftPathsHostSlice, nullptr, {eagleModule->getMaxNonLeafNodesPerLayer()});
         TLLM_CHECK_WITH_INFO(depth == modelConfig.getSpeculativeDecodingModule().getMaxDraftPathLen(),
             "EAGLE-1 requires Eagle-tree depth being equal to the the number of build-time EAGLE layers.");
 
-        manager.copy(*draftPathsHost, *draftPathsSlice);
+        manager.copy(*draftPathsHostSlice, *draftPathsSlice);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

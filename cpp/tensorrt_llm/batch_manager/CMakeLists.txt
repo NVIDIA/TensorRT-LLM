@@ -50,12 +50,13 @@ set(SRCS
     transformerBuffers.cpp
     trtEncoderModel.cpp
     trtGptModelInflightBatching.cpp
-    trtGptModelV1.cpp
+    updateDecoderBuffers.cpp
     utils/debugUtils.cpp
     utils/inflightBatchingUtils.cpp
     utils/logitsThread.cpp
     utils/staticThreadPool.cpp
-    evictionPolicy.cpp)
+    evictionPolicy.cpp
+    cacheTransBuffer.cpp)
 
 file(GLOB_RECURSE XGRAMMAR_SRCS "${3RDPARTY_DIR}/xgrammar/cpp/*.cc")
 list(FILTER XGRAMMAR_SRCS EXCLUDE REGEX

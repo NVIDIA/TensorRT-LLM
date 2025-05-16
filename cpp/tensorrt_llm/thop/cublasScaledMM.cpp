@@ -21,6 +21,7 @@
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
+#include "userbuffersTensor.h"
 #include <array>
 #include <cublasLt.h>
 #include <torch/extension.h>
@@ -51,9 +52,6 @@ using AlgoListType = std::unordered_map<std::tuple<int32_t, int32_t, int32_t>, s
 
 // bf16*bf16->fp32->bf16
 AlgoListType bf16_algo_list = {
-    // Deepseek v3/R1 fused_a
-    // [-algo66 -m_tile10 -m_stages35 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom5 -m_mma0 -m_cga2 -m_scheduling1]
-    {{8, 7168, 2112}, {10, 35, 1, 0, 0, 5, 2}},
     // Deepseek v3/R1 router gemm
     // [-algo66 -m_tile10 -m_stages35 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom3 -m_mma0 -m_cga2 -m_scheduling1]
     {{8, 7168, 256}, {10, 35, 1, 0, 0, 3, 2}},
@@ -283,21 +281,17 @@ Tensor& cublas_scaled_mm_out(Tensor const& mat_a, Tensor const& mat_b, Tensor co
 }
 
 Tensor cublas_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
-    std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, int64_t userbuffers_id)
+    std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, bool to_userbuffers = false)
 {
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
 
     std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
-    std::vector<int64_t> output_strides = {mat_b.sizes()[1], 1};
 
     Tensor out;
-    if (userbuffers_id >= 0)
+    if (to_userbuffers)
     {
-        TLLM_CHECK_WITH_INFO(tensorrt_llm::runtime::ub::ub_is_initialized(), "UserBuffer has not been initialized!");
-        auto ub_buffer0 = tensorrt_llm::runtime::ub::ub_get(userbuffers_id);
-        out = torch::from_blob(
-            ub_buffer0.addr, output_size, output_strides, torch::dtype(out_dtype_).device(torch::kCUDA));
+        out = torch_ext::create_userbuffers_tensor(output_size, out_dtype_).first;
     }
     else
     {
@@ -345,7 +339,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "cublas_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor? bias,"
-        " ScalarType? out_dtype, int userbuffers_id) -> (Tensor out)");
+        " ScalarType? out_dtype, bool to_userbuffers=False) -> (Tensor out)");
     m.def(
         "cublas_scaled_mm_out(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor? bias,"
         " int userbuffers_id, Tensor! out) -> (Tensor out)");

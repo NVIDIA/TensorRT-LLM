@@ -28,6 +28,10 @@ class TransformersTokenizer(TokenizerBase):
     def pad_token_id(self) -> int:
         return self.tokenizer.pad_token_id
 
+    @property
+    def name_or_path(self) -> str:
+        return self.tokenizer.name_or_path
+
     def encode(self, text: str, *args, **kwargs) -> List[int]:
         return self.tokenizer.encode(text, *args, **kwargs)
 

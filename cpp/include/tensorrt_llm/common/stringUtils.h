@@ -21,6 +21,7 @@
 #endif // ENABLE_BF16
 #include <cuda_fp16.h>
 
+#include <cstdarg>
 #include <memory>  // std::make_unique
 #include <sstream> // std::stringstream
 #include <string>
@@ -101,11 +102,39 @@ inline std::string fmtstr(std::string&& s)
     return s;
 }
 
+typedef char* (*fmtstr_allocator)(void* target, size_t count);
+void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list args);
+
 #if defined(_MSC_VER)
-std::string fmtstr(char const* format, ...);
+inline std::string fmtstr(char const* format, ...);
 #else
-std::string fmtstr(char const* format, ...) __attribute__((format(printf, 1, 2)));
+inline std::string fmtstr(char const* format, ...) __attribute__((format(printf, 1, 2)));
 #endif
+
+inline std::string fmtstr(char const* format, ...)
+{
+    std::string result;
+
+    va_list args;
+    va_start(args, format);
+    fmtstr_(
+        format,
+        [](void* target, size_t count) -> char*
+        {
+            if (count <= 0)
+            {
+                return nullptr;
+            }
+
+            const auto str = static_cast<std::string*>(target);
+            str->resize(count);
+            return str->data();
+        },
+        &result, args);
+    va_end(args);
+
+    return result;
+}
 
 // __PRETTY_FUNCTION__ is used for neat debugging printing but is not supported on Windows
 // The alternative is __FUNCSIG__, which is similar but not identical

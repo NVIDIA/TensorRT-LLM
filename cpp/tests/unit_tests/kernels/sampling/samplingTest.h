@@ -65,6 +65,15 @@ void initRandom(T* ptr, size_t size, float minval, float maxval)
     }
 }
 
+template <typename T>
+void initConstant(T* ptr, size_t size, T val)
+{
+    for (size_t i = 0; i < size; ++i)
+    {
+        ptr[i] = val;
+    }
+}
+
 inline void initRandomInt(int* ptr, size_t size, int minval, int maxval)
 {
     assert(minval < maxval);

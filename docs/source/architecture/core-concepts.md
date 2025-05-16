@@ -103,7 +103,7 @@ class Linear(Module):
         self.weight = Parameter(shape=(self.out_features, self.in_features), dtype=dtype)
         self.bias   = Parameter(shape=(self.out_features, ), dtype=dtype)
 
-# The parameters are bound to the weights before compiling the model. See examples/gpt/weight.py:
+# The parameters are bound to the weights before compiling the model. See examples/models/core/gpt/weight.py:
 tensorrt_llm_gpt.layers[i].mlp.fc.weight.value = fromfile(...)
 tensorrt_llm_gpt.layers[i].mlp.fc.bias.value   = fromfile(...)
 ```
@@ -277,7 +277,7 @@ max_output_len=128
 max_batch_size=4
 workers=$(( tp_size * pp_size ))
 
-python ${folder_trt_llm}/examples/llama/convert_checkpoint.py \
+python ${folder_trt_llm}/examples/models/core/llama/convert_checkpoint.py \
     --output_dir ${ckpt_dir} \
     --model_dir ${model_dir} \
     --dtype ${dtype} \
@@ -329,7 +329,7 @@ max_output_len=128
 max_batch_size=4
 workers=8
 
-python ${folder_trt_llm}/examples/llama/convert_checkpoint.py \
+python ${folder_trt_llm}/examples/models/core/llama/convert_checkpoint.py \
     --output_dir ${ckpt_dir} \
     --model_dir ${model_dir} \
     --dtype ${dtype} \

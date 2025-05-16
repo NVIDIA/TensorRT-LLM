@@ -6,7 +6,9 @@ examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[no_streami
 examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[no_streaming-llama_v2-use_cpp_session-use_tokens-draft_len_4-float16-bs2]
 examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[streaming-gpt2-use_cpp_session-use_logits-draft_len_4-float16-bs2]
 examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[streaming-gpt2-use_cpp_session-use_tokens-draft_len_8-float16-bs1]
-examples/test_eagle.py::test_llm_eagle_1gpu[llama3.1-eagle-8b-hf_v0.5-float16-bs8]
+examples/test_eagle.py::test_llm_eagle_1gpu_modelopt_ckpt[llama3.1-eagle-8b-hf_v0.5-float16-bs8]
+examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle1]
+examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle2]
 examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-float16-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8]
 examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-byt5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-enable_fp8]
 examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-flan-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:2-pp:2-nb:1-disable_fp8]
@@ -31,12 +33,7 @@ examples/test_medusa.py::test_llm_medusa_1gpu[use_cpp_session-medusa-vicuna-7b-v
 examples/test_medusa.py::test_llm_medusa_1gpu[use_cpp_session-medusa-vicuna-7b-v1.3-4-heads-bfloat16-bs8]
 examples/test_medusa.py::test_llm_medusa_1gpu[use_py_session-medusa-vicuna-7b-v1.3-4-heads-bfloat16-bs1]
 examples/test_medusa.py::test_llm_medusa_1gpu[use_py_session-medusa-vicuna-7b-v1.3-4-heads-bfloat16-bs8]
-examples/test_mistral.py::test_llm_mistral_quantization_8gpus_summary[mistral-7b-v0.1-fp8-nb:4]
-examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization]
 examples/test_mixtral.py::test_llm_mixtral_moe_plugin_fp8_lora_4gpus[Mixtral-8x7B-v0.1-chinese-mixtral-lora]
-examples/test_mixtral.py::test_llm_mixtral_v1_8gpus_summary[Mixtral-8x7B-v0.1-plugin-renormalize-tensor_parallel]
-examples/test_mixtral.py::test_llm_mixtral_wo_2gpus_summary[Mixtral-8x7B-v0.1-int4-nb:1]
-examples/test_mixtral.py::test_llm_mixtral_wo_2gpus_summary[Mixtral-8x7B-v0.1-int8-nb:4]
 examples/test_multimodal.py::test_llm_multimodal_general[Phi-3-vision-128k-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
 examples/test_multimodal.py::test_llm_multimodal_general[Phi-3.5-vision-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
 examples/test_multimodal.py::test_llm_multimodal_general[Qwen2-VL-7B-Instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:4]
@@ -89,16 +86,14 @@ examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-re
 examples/test_redrafter.py::test_llm_redrafter_1gpu[use_cpp_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb8-bs8]
 examples/test_redrafter.py::test_llm_redrafter_1gpu[use_py_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb5-bs8]
 examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_cpp_runtime]
-test_e2e.py::test_llama_e2e[use_cpp_session-remove_input_padding]
-test_e2e.py::test_llama_e2e[use_py_session-remove_input_padding]
-test_e2e.py::test_llama_e2e[use_py_session]
-test_e2e.py::test_llmapi_load_engine_from_build_command[falcon-falcon-7b-instruct] # 5min
-test_e2e.py::test_llmapi_load_engine_from_build_command[gptj-gpt-j-6b] # 5min
-test_e2e.py::test_llmapi_load_engine_from_build_command[llama-codellama/CodeLlama-7b-Instruct-hf] # 5min
-test_e2e.py::test_llmapi_load_engine_from_build_command[llama-llama-models/llama-7b-hf] # 5min
-test_e2e.py::test_mistral_e2e[use_cpp_session-remove_input_padding]
-test_e2e.py::test_mistral_e2e[use_py_session-remove_input_padding]
-test_e2e.py::test_mistral_e2e[use_py_session]
+test_e2e.py::test_llama_e2e[use_cpp_session-remove_input_padding-]
+test_e2e.py::test_llama_e2e[use_py_session-remove_input_padding-]
+test_e2e.py::test_llama_e2e[use_py_session--]
+llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command[llama-codellama/CodeLlama-7b-Instruct-hf] # 5min
+llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command[llama-llama-models/llama-7b-hf] # 5min
+test_e2e.py::test_mistral_e2e[use_cpp_session-remove_input_padding--]
+test_e2e.py::test_mistral_e2e[use_py_session-remove_input_padding--]
+test_e2e.py::test_mistral_e2e[use_py_session---]
 test_e2e.py::test_openai_multi_chat_example
 test_e2e.py::test_openai_consistent_chat
 
@@ -118,27 +113,39 @@ accuracy/test_cli_flow.py::TestLlama3_1_8B::test_fp8_rowwise_tp4[disable_gemm_al
 accuracy/test_cli_flow.py::TestLlama3_1_8B::test_autoq
 accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_medusa_fp8_prequantized
 accuracy/test_cli_flow.py::TestLlama3_2_1B::test_auto_dtype
+accuracy/test_cli_flow.py::TestMistral7B::test_fp8_tp4pp2
+accuracy/test_cli_flow.py::TestMistral7B::test_beam_search
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2
+accuracy/test_cli_flow.py::TestMixtral8x7B::test_weight_only_int4_tp2
+accuracy/test_cli_flow.py::TestMixtral8x7B::test_weight_only_int8_tp2
+accuracy/test_cli_flow.py::TestMixtral8x7B::test_plugin_tp8[renormalize-tensor_parallel]
 accuracy/test_cli_flow.py::TestGemma2_9BIt::test_fp8
 accuracy/test_cli_flow.py::TestQwen2_0_5BInstruct::test_auto_dtype
 accuracy/test_cli_flow.py::TestQwen2_0_5BInstruct::test_fp8
-accuracy/test_cli_flow.py::TestQwen2_7BInstruct::test_weight_only
+accuracy/test_llm_api.py::TestQwen2_7BInstruct::test_weight_only
 accuracy/test_cli_flow.py::TestQwen2_7BInstruct::test_int4_awq_prequantized
-accuracy/test_cli_flow.py::TestQwen2_5_1_5BInstruct::test_weight_only
-accuracy/test_cli_flow.py::TestQwen2_5_1_5BInstruct::test_fp8
+accuracy/test_llm_api.py::TestQwen2_5_1_5BInstruct::test_weight_only
+accuracy/test_llm_api.py::TestQwen2_5_1_5BInstruct::test_fp8
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4
+accuracy/test_llm_api_pytorch.py::TestMistral7B::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestLlama4MaverickInstruct::test_auto_dtype[tp8-cuda_graph=False]
+accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_auto_dtype[tp8-cuda_graph=False]
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_fp8_tp2
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_nvfp4_tp2
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_auto_dtype
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4
+accuracy/test_llm_api_pytorch.py::TestNemotronNas::test_auto_dtype_tp8
+accuracy/test_llm_api_pytorch.py::TestNemotronSuper::test_auto_dtype_tp2
+accuracy/test_llm_api_pytorch.py::TestNemotronNano::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False]
 
 # Pivot to Pytorch test cases.
 test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
 test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP8-llama-3.1-model/Llama-3.1-8B-Instruct-FP8]
 test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-NVFP4-nvfp4-quantized/Meta-Llama-3.1-8B]
 test_e2e.py::test_ptp_quickstart_advanced[Nemotron4_4B-BF16-nemotron/Minitron-4B-Base]
+test_e2e.py::test_ptp_quickstart_advanced[Nemotron-H-8B-Nemotron-H-8B-Base-8K]
 test_e2e.py::test_ptp_quickstart_advanced_8gpus[Mixtral-8x7B-BF16-Mixtral-8x7B-v0.1]
 test_e2e.py::test_ptp_quickstart_advanced_8gpus[Mixtral-8x7B-NVFP4-nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1]
 test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-image]
@@ -154,3 +161,5 @@ disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp[DeepSeek-V3-Lite-fp8]
+disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0]

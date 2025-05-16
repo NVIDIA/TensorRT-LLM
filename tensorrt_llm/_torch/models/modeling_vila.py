@@ -30,9 +30,8 @@ from einops import rearrange
 from huggingface_hub import repo_exists, snapshot_download
 from huggingface_hub.utils import HFValidationError
 from PIL import Image
-from transformers import AutoConfig, AutoImageProcessor, AutoModel
-from transformers import AutoModelForCausalLM as HFAutoModelForCausalLM
-from transformers import (AutoTokenizer, LlavaConfig, PretrainedConfig,
+from transformers import (AutoConfig, AutoImageProcessor, AutoModel,
+                          AutoTokenizer, LlavaConfig, PretrainedConfig,
                           PreTrainedModel)
 
 from ..._utils import nvtx_range
@@ -41,6 +40,7 @@ from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
+from ..modules.embedding import Embedding, LMHead
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import (VisionTower, VisionTowerDynamicS2,
                                           VisionTowerS2)
@@ -127,10 +127,10 @@ def process_image(image: Union[Image.Image, torch.Tensor],
                   dtype=None):
 
     image_aspect_ratio = model_config.image_aspect_ratio
-    if hasattr(image_processor, "crop_size"):
-        crop_size = image_processor.crop_size  # CLIP vision tower
-    elif hasattr(image_processor, "size"):
+    if hasattr(image_processor, "size"):
         crop_size = image_processor.size  # SIGLIP vision tower
+    elif hasattr(image_processor, "crop_size"):
+        crop_size = image_processor.crop_size  # CLIP vision tower
 
     if image_aspect_ratio == "dynamic" and enable_dynamic_res:
         # VILA 2.0
@@ -560,6 +560,58 @@ def init_mm_projector(model_type_or_path: str,
         return mm_projector
 
 
+def _resize_embeds(old_embeddings: Embedding, new_num_tokens: int):
+    # build new embeddings
+    new_embeddings = Embedding(
+        num_embeddings=new_num_tokens,
+        embedding_dim=old_embeddings.embedding_dim,
+        dtype=old_embeddings.weight.dtype,
+        mapping=old_embeddings.mapping,
+        tensor_parallel_mode=old_embeddings.tp_mode,
+        gather_output=old_embeddings.gather_output,
+    ).to("cuda")
+
+    # copy weights
+    num_tokens_to_copy = min(old_embeddings.num_embeddings, new_num_tokens)
+    new_embeddings.weight.data[:
+                               num_tokens_to_copy, :] = old_embeddings.weight.data[:
+                                                                                   num_tokens_to_copy, :]
+    old_embeddings.weight.data = new_embeddings.weight.data
+    old_embeddings.num_embeddings = new_embeddings.weight.data.shape[0]
+    if hasattr(old_embeddings,
+               "padding_idx") and old_embeddings.padding_idx is not None:
+        if (new_num_tokens - 1) < old_embeddings.padding_idx:
+            old_embeddings.padding_idx = None
+    return old_embeddings
+
+
+def _resize_lm_head(old_lm_head: LMHead, new_num_tokens: int):
+    # build new lm head
+    new_lm_head = LMHead(
+        num_embeddings=new_num_tokens,
+        embedding_dim=old_lm_head.embedding_dim,
+        dtype=old_lm_head.weight.dtype,
+        mapping=old_lm_head.mapping,
+        tensor_parallel_mode=old_lm_head.tp_mode,
+        gather_output=old_lm_head.gather_output,
+    ).to("cuda")
+
+    # copy weights
+    num_tokens_to_copy = min(old_lm_head.num_embeddings, new_num_tokens)
+    new_lm_head.weight.data[:
+                            num_tokens_to_copy, :] = old_lm_head.weight.data[:
+                                                                             num_tokens_to_copy, :]
+    old_lm_head.weight.data = new_lm_head.weight.data
+
+    return old_lm_head
+
+
+def _resize_token_embeddings(llm, new_num_tokens: int):
+    _resize_embeds(llm.model.embed_tokens, new_num_tokens)
+    if hasattr(llm, "lm_head"):
+        _resize_lm_head(llm.lm_head, new_num_tokens)
+
+
 def init_llm(
     llm_path: str,
     model_config: ModelConfig[PretrainedConfig],
@@ -568,30 +620,9 @@ def init_llm(
     *args,
     **kwargs,
 ) -> PreTrainedModel:
-    # Pre-run to resize vocab embedding (see: https://github.com/NVlabs/VILA/blob/86e009759a14eee045c669421128d703227da362/llava/model/builder.py#L137)
     llm_cfg = AutoConfig.from_pretrained(llm_path)
     tokenizer = init_tokenizer(llm_path)
-    if llm_cfg.vocab_size != len(tokenizer):
-        warnings.warn(
-            "LLM's vocab size does not match tokenizer's vocab size! It is likely this multimodal model has extended the vocabulary with extra special tokens, and have used resize_token_embeddings() (https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings) in the PyTorch implementation. Here, the only way is to refresh the word embedding weight and re-save the checkpoint and update vocab size. This is a one-off operation for a given model. Tokenzier is not re-saved, just the LLM checkpoint."
-        )
-        warnings.warn(
-            "Please be patient when the checkpoint is being updated...")
-        model_hf = HFAutoModelForCausalLM.from_pretrained(llm_path,
-                                                          torch_dtype="auto")
-        model_hf.resize_token_embeddings(len(tokenizer))
-        warnings.warn(f"Saving to {llm_path} by overwriting...")
-        try:
-            model_hf.save_pretrained(llm_path)
-        except (OSError, PermissionError):
-            import tempfile
-            llm_path = os.path.join(tempfile.gettempdir(), "vila")
-            warnings.warn(
-                f"Current checkpoint directory is read-only. Saving to {llm_path} instead."
-            )
-            model_hf.save_pretrained(llm_path)
 
-    # Real run
     llm_cfg = AutoConfig.from_pretrained(llm_path)
     llm_cfg._attn_implementation = attn_implementation
     llm_cfg.model_max_length = model_max_length
@@ -607,6 +638,10 @@ def init_llm(
     llm_model_config = copy.deepcopy(model_config)
     llm_model_config.pretrained_config = llm_cfg
     llm = AutoModelForCausalLM.from_config(llm_model_config)
+    if llm_cfg.vocab_size != len(tokenizer):
+        warnings.warn(
+            "LLM have a different vocab size than tokenizer. Consider update the LLM checkpoint with the tokenizer's vocab size with _resize_token_embeddings()."
+        )
 
     model_config.pretrained_config.hidden_size = llm.config.hidden_size
     return tokenizer, llm, llm_path, llm_cfg.vocab_size
@@ -1054,8 +1089,8 @@ class VilaInputProcessor(InputProcessor):
         (3) passed input_ids and mm_embed via LlmRequest's prompt_token_ids and prompt_embedding_table fields respectively. LlmRequests can be inflight batched, and the mm_embed is passed to LLM model as `multi_modal_data` which is List[torch.Tensor] for batched requests.
         """
 
-        text_prompt = inputs["prompt"]
-        mm_data = inputs["multi_modal_data"]
+        text_prompt, mm_data = inputs.get("prompt"), inputs.get(
+            "multi_modal_data", {})
         mm_processor_kwargs = inputs.get("mm_processor_kwargs", {})
 
         text_prompt = _apply_chat_template(text_prompt, self.conv_mode,
@@ -1069,7 +1104,7 @@ class VilaInputProcessor(InputProcessor):
         mm_features = self._process(mm_tensor, block_sizes)
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
         return fused_input_ids.to(torch.int32).tolist(), {
-            "prompt_tuning_config": [mm_features, None, None]
+            "mm_embedding": mm_features
         }
 
 
@@ -1128,9 +1163,13 @@ class VilaModel(PreTrainedModel):
             mm_embed
         ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
 
-        input_ids, inputs_embeds = fuse_input_embeds(self, input_ids, mm_embed)
-        logits = self.llm.forward(attn_metadata, input_ids, position_ids,
-                                  inputs_embeds, return_context_logits)
+        input_ids, inputs_embeds = fuse_input_embeds(
+            self.llm.model.embed_tokens, input_ids, mm_embed)
+        logits = self.llm.forward(attn_metadata=attn_metadata,
+                                  input_ids=input_ids,
+                                  position_ids=position_ids,
+                                  inputs_embeds=inputs_embeds,
+                                  return_context_logits=return_context_logits)
         return logits
 
     def get_llm(self):
@@ -1146,6 +1185,10 @@ class VilaModel(PreTrainedModel):
 
     def load_weights(self, weights):
         self.llm.load_weights(weights)
+        # resize token embeddings if vocab size mismatch after loading weights
+        if self.vocab_size != len(self.tokenizer):
+            _resize_token_embeddings(self.llm, len(self.tokenizer))
+            self.vocab_size = len(self.tokenizer)
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()

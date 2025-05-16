@@ -12,20 +12,32 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from abc import ABC, abstractmethod, abstractstaticmethod
-from typing import Iterable, List, Optional, Union
+import random
+from abc import ABC, abstractmethod
+from typing import Any, Iterable, List, Optional
 
+import numpy as np
+import torch
 from tqdm import tqdm
 
 import tensorrt_llm.profiler as profiler
 
-from .._torch import LLM as PyTorchLLM
-from ..llmapi import LLM, RequestOutput
+from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
 
 
 class Evaluator(ABC):
+
+    def __init__(self,
+                 random_seed: int = 0,
+                 apply_chat_template: bool = False,
+                 system_prompt: Optional[str] = None):
+        random.seed(random_seed)
+        np.random.seed(random_seed)
+        torch.manual_seed(random_seed)
+        self.apply_chat_template = apply_chat_template
+        self.system_prompt = system_prompt
 
     @abstractmethod
     def generate_samples(self) -> Iterable[tuple]:
@@ -36,13 +48,26 @@ class Evaluator(ABC):
                       *auxiliaries) -> float:
         raise NotImplementedError()
 
+    def do_apply_chat_template(self, llm: Any, prompt: str) -> str:
+        messages = [{"role": "user", "content": prompt}]
+        if self.system_prompt is not None:
+            messages = [{
+                "role": "system",
+                "content": self.system_prompt
+            }] + messages
+        return llm.tokenizer.apply_chat_template(messages,
+                                                 tokenize=False,
+                                                 add_generation_prompt=True)
+
     def evaluate(self,
-                 llm: Union[LLM, PyTorchLLM],
+                 llm: Any,
                  sampling_params: Optional[SamplingParams] = None) -> float:
         profiler.start("trtllm exec")
         outputs, references, auxiliaries = [], [], []
         for prompt, reference, *aux in tqdm(self.generate_samples(),
                                             desc="Submitting requests"):
+            if self.apply_chat_template:
+                prompt = self.do_apply_chat_template(llm, prompt)
             output = llm.generate_async(prompt, sampling_params)
             outputs.append(output)
             references.append(reference)
@@ -52,10 +77,11 @@ class Evaluator(ABC):
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
         logger.info(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
+        profiler.reset("trtllm exec")
 
         score = self.compute_score(outputs, references, *zip(*auxiliaries))
         return score
 
-    @abstractstaticmethod
+    @staticmethod
     def command(ctx, *args, **kwargs) -> None:
         raise NotImplementedError()

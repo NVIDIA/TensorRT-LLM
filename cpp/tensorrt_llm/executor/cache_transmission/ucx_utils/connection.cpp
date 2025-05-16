@@ -33,31 +33,52 @@ UcxConnection::UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx
     , mFromRequester(fromRequester)
 {
 
-    if (mFromRequester)
+    try
     {
-        std::shared_ptr<ucxx::Request> request
-            = mEndpoint->streamSend(reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), false);
-        while (!request->isCompleted())
-            ;
-        request->checkError();
+        if (mFromRequester)
+        {
 
-        request
-            = mEndpoint->streamRecv(reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer), false);
-        while (!request->isCompleted())
-            ;
-        request->checkError();
+            // since the tag don't contain the information of the connection id or mConnectionIdInPeer, we need to
+            // lock the mutex ,to ensure only one tagRecv is called in the same time.
+            std::shared_ptr<ucxx::Request> recvRequest
+                = mEndpoint->tagRecv(reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer),
+                    ucxx::Tag(ResponserTag), ucxx::TagMaskFull);
+            while (!recvRequest->isCompleted())
+                ;
+
+            recvRequest->checkError();
+
+            auto sendTag = ucxx::Tag(mConnectionIdInPeer << 32 | (RequesterTag & 0xFFFFFFFF));
+            std::shared_ptr<ucxx::Request> sendRequest
+                = mEndpoint->tagSend(reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), sendTag);
+            while (!sendRequest->isCompleted())
+                ;
+            sendRequest->checkError();
+        }
+        else
+        {
+
+            // Since Responder may recv from multiple Requesters, we need to send the mConnectionId to the Reqester
+            // first and use ConnectionId as the tag to recv the mConnectionIdInPeer from the Requester
+            std::shared_ptr<ucxx::Request> sendRequest = mEndpoint->tagSend(
+                reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), ucxx::Tag(ResponserTag));
+            while (!sendRequest->isCompleted())
+                ;
+            sendRequest->checkError();
+
+            auto recvTag = ucxx::Tag(mConnectionId << 32 | (RequesterTag & 0xFFFFFFFF));
+            std::shared_ptr<ucxx::Request> recvRequest = mEndpoint->tagRecv(
+                reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer), recvTag, ucxx::TagMaskFull);
+            while (!recvRequest->isCompleted())
+                ;
+            recvRequest->checkError();
+        }
     }
-    else
+    catch (std::exception const& e)
     {
-        std::shared_ptr<ucxx::Request> request
-            = mEndpoint->streamRecv(reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer), false);
-        while (!request->isCompleted())
-            ;
-        request->checkError();
-        request = mEndpoint->streamSend(reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), false);
-        while (!request->isCompleted())
-            ;
-        request->checkError();
+        std::string error = "Error in UcxConnection constructor for rank "
+            + std::to_string(mpi::MpiComm::world().getRank()) + ": " + e.what();
+        TLLM_THROW(error);
     }
 
     mSendTagPrefix = mConnectionIdInPeer;

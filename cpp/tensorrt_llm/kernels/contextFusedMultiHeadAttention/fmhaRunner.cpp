@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/mathUtils.h"
 #include <cassert>
+#include <cstdio>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <iostream>
@@ -142,7 +143,7 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
         // Paged kv cache layout.
         mKernelParams.kv_stride_in_bytes = get_size_in_bytes(
             runnerParams.pagedKvCache.mTokensPerBlock * mFixedParams.headSize, mFixedParams.dataType);
-        // Yuxin: only for deepseek
+        // only for deepseek
         mKernelParams.v_stride_in_bytes = mKernelParams.kv_stride_in_bytes;
     }
     else if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_CONTIGUOUS_KV)
@@ -339,7 +340,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         mLaunchParams.kernel_s = 0;
         mLaunchParams.force_unroll = true;
         // enable tiled kernels on Ampere/Ada
-        if (isSm89 && mFixedParams.dataType == DATA_TYPE_E4M3)
+        if ((isSm89 || isSm120) && mFixedParams.dataType == DATA_TYPE_E4M3)
         {
             // so far Ada QMMA only supports non-tiled kernels.
             mLaunchParams.granular_tiling = false;
@@ -351,7 +352,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
             // can suffer from tile quantization loss therefore use flash attention non-tiled instead
             mLaunchParams.granular_tiling = false;
         }
-        else if (isSm8x && mFixedParams.headSize < 256)
+        else if ((isSm8x || isSm120) && mFixedParams.headSize < 256)
         {
             // flash attention tiled kernel is faster on Ada and Ampere derivatives when head_size>=256
             mLaunchParams.granular_tiling = false;
@@ -384,6 +385,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         mLaunchParams.useBase2ExpTrick = !mLaunchParams.enableAttnLogitSoftcapping;
     }
 
+    // TODO: Refactor these dirty hacks.
     // For Deepseek-v2(MLA), all of SM80, SM89 and SM90 kernels use tiled flash attention
     // in both context (192/128 dimensions) and generation (576/512 dimensions)
     if (mFixedParams.headSize == mFixedParams.headSizeV + 64)
@@ -391,14 +393,25 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         mLaunchParams.flash_attention = true;
         mLaunchParams.force_unroll = true;
         mLaunchParams.kernel_s = 0;
-        mLaunchParams.granular_tiling = true;
-        // Even on SM90, we use ampere-style kernel, will be optimized later
-        mLaunchParams.warp_specialization = false;
-        mLaunchParams.useKernelWithoutAlibi = false;
-        // Deepseek-V2 kernel is not hooper style right now.
-        mLaunchParams.useBase2ExpTrick = false;
-        mLaunchParams.use_tma = false;
-        mLaunchParams.dynamic_scheduler = false;
+
+        // Now we have SM90 FP8 generation and BF16 context MLA kernels
+        bool isHopperFP8GenerationMLA
+            = isSm90 && mFixedParams.dataType == DATA_TYPE_E4M3 && mFixedParams.headSizeV == 512;
+        bool isHopperBF16ContextMLA
+            = isSm90 && mFixedParams.dataType == DATA_TYPE_BF16 && mFixedParams.headSizeV == 128;
+
+        // These treatments are only for other MLA cases
+        if (!isHopperFP8GenerationMLA && !isHopperBF16ContextMLA)
+        {
+            mLaunchParams.granular_tiling = true;
+            // Even on SM90, we use ampere-style kernel, will be optimized later
+            mLaunchParams.warp_specialization = false;
+            mLaunchParams.useKernelWithoutAlibi = false;
+            // Deepseek-V2 kernel is not hooper style right now.
+            mLaunchParams.useBase2ExpTrick = false;
+            mLaunchParams.use_tma = false;
+            mLaunchParams.dynamic_scheduler = false;
+        }
     }
 
     mLaunchParams.sage_block_size_q = mFixedParams.sageBlockSizeQ;
@@ -466,7 +479,7 @@ void FusedMHARunnerV2::setPackedQkvTmaDescriptors(MHARunnerParams runnerParams)
     uint64_t tensor_stride_qkv[3];
     tensor_stride_qkv[0] = get_size_in_bytes(tensor_size_qkv[0], mFixedParams.dataType); // d
     tensor_stride_qkv[1] = tensor_size_qkv[1] * tensor_stride_qkv[0];                    // d*h
-    tensor_stride_qkv[2] = tensor_size_qkv[2] * tensor_stride_qkv[1];                    // d*h*3
+    tensor_stride_qkv[2] = mKernelParams.qkv_stride_in_bytes;
 
     uint64_t tensor_stride_o[3];
     tensor_stride_o[0] = get_size_in_bytes(tensor_size_o[0], mFixedParams.dataTypeOut); // d
@@ -514,6 +527,24 @@ void FusedMHARunnerV2::setPackedQkvTmaDescriptors(MHARunnerParams runnerParams)
     qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
         swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qkv, tensor_stride_qkv,
         traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_kv);
+
+    // Separate TMA descriptor for V when d != dv in packed qkv input layout, e.g. MLA + 192/128 dims
+    if (mKernelParams.d != mKernelParams.dv)
+    {
+        // view V as [total_seq_len, 1, h, dv]
+        tensor_size_qkv[0] = mKernelParams.dv;
+        tensor_size_qkv[1] = mKernelParams.h;
+        tensor_size_qkv[2] = 1;
+
+        tensor_stride_qkv[0] = get_size_in_bytes(tensor_size_qkv[0], mFixedParams.dataType);
+        tensor_stride_qkv[1] = 0; // not used
+
+        size_t v_offset = 2 * mKernelParams.h * mKernelParams.d * get_size_in_bytes(mFixedParams.dataType);
+        qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr + v_offset, desc_format,
+            cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED,
+            tensor_size_qkv, tensor_stride_qkv, traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32,
+            &mKernelParams.tma_desc_v);
+    }
 
     // O: 16
     // Note: sliding window causal kernel currently has reg spill when TMA store is enabled
@@ -596,6 +627,7 @@ void FusedMHARunnerV2::setSeparateQKvTmaDescriptors(MHARunnerParams runnerParams
 
     // O ptr.
     auto const* o_ptr = static_cast<char const*>(mKernelParams.o_ptr);
+    // Note (added by Yuxin): TMA descriptor for o here might be problematic if d and dv are different.
 
     // O: 16. Reuse
     box_size_qo[3] = 16;
@@ -758,7 +790,13 @@ int FusedMHARunnerV2::getSFromMaxSeqLen(int const max_seq_len) const
 // If any kernel in the map meets the requirements, then return true.
 bool FusedMHARunnerV2::isFmhaSupported()
 {
-    return xmmaKernel->checkIfKernelExist(mFixedParams);
+    bool is_supported = xmmaKernel->checkIfKernelExist(mFixedParams);
+    if (!is_supported)
+    {
+        std::string msg = "FMHA Kernel doesn't exist for mFixedParams:\n" + mFixedParams.convertToStrOutput();
+        TLLM_LOG_WARNING("%s\n", msg.c_str());
+    }
+    return is_supported;
 }
 
 } // namespace kernels

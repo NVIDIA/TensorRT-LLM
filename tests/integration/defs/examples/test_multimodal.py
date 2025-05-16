@@ -17,14 +17,15 @@ import os
 
 import pytest
 from defs.common import convert_weights, venv_check_call, venv_mpi_check_call
-from defs.conftest import get_device_memory, skip_pre_ada
+from defs.conftest import get_device_memory, skip_post_blackwell, skip_pre_ada
 from defs.trt_test_alternative import check_call
 
 
 @pytest.fixture(scope="module")
 def multimodal_example_root(llm_root):
     "Get multimodal example root"
-    example_root = os.path.join(llm_root, "examples", "multimodal")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "multimodal")
 
     return example_root
 
@@ -109,11 +110,12 @@ def _test_llm_multimodal_general(llm_venv,
     vila_model = "VILA" in model_name
     cogvlm_model = "cogvlm" in model_name
     nemotron_model = "video-neva" in model_name
-    phi_model = "phi" in model_name.lower()
+    phi3_model = "phi-3" in model_name.lower()
+    phi4_model = "phi-4" in model_name.lower()
     mllama_model = 'Llama-3.2' in model_name
     qwen2_vl_model = 'Qwen2-VL' in model_name
     internlm_model = 'internlm-xcomposer2' in model_name
-
+    mistral_model = 'Mistral-Small' in model_name
     if enc_dec_model:
         builder_root = enc_dec_example_root
         if nougat_model:
@@ -132,13 +134,17 @@ def _test_llm_multimodal_general(llm_venv,
         builder_root, model_type = internlm_example_root, "internlm"
     elif llava_model or vila_model:
         builder_root, model_type = llama_example_root, "llama"
+    elif mistral_model:
+        builder_root, model_type = llama_example_root, "llama"
     elif cogvlm_model:
         builder_root, model_type = cogvlm_example_root, "cogvlm"
     elif nemotron_model:
         builder_root, model_type = nemotron_example_root, "nemotron"
-    elif phi_model:
+    elif phi3_model:
         model_name = model_name.split('/')[-1]  # Remove HF directory name
         builder_root, model_type = phi_example_root, "phi-3-vision"
+    elif phi4_model:
+        builder_root, model_type = phi_example_root, "phi-4-multimodal"
     elif opt_model:
         builder_root, model_type = opt_example_root, "blip2"
     elif mllama_model:
@@ -179,7 +185,7 @@ def _test_llm_multimodal_general(llm_venv,
                    env=llm_venv._new_env)
     if qformat == 'fp8':
         convert_cmd = [
-            f"{multimodal_example_root}/../quantization/quantize.py",
+            f"{multimodal_example_root}/../../../quantization/quantize.py",
             f"--model_dir={model_ckpt_path}",
             f"--calib_dataset={llm_datasets_root}/{dataset_path_mapping[calibration_dataset]}",
             f"--dtype={data_type}",
@@ -210,7 +216,7 @@ def _test_llm_multimodal_general(llm_venv,
     print("Build LLM engines...")
     model_name = model_name.split('/')[-1]  # Remove HF directory name
     llm_engine_dir = f"{engine_dir}/{model_name}/{world_size}-gpu"
-    if "opt" in model_name or llava_model or vila_model or gpt_model or nemotron_model or phi_model or qwen2_vl_model:
+    if "opt" in model_name or llava_model or vila_model or gpt_model or nemotron_model or phi3_model or phi4_model or qwen2_vl_model or mistral_model:
         max_input_len_text = 1024
         max_output_len = 200
         if llava_next_model:
@@ -221,7 +227,11 @@ def _test_llm_multimodal_general(llm_venv,
             multimodal_len = 576
         elif vila_model:
             multimodal_len = 196
-        elif phi_model:
+        elif phi3_model:
+            multimodal_len = 5120
+        elif phi4_model:
+            multimodal_len = 5120
+        elif mistral_model:
             multimodal_len = 5120
         elif "fuyu" in model_name:
             multimodal_len = 2640
@@ -374,11 +384,13 @@ def _test_llm_multimodal_general(llm_venv,
     elif 'fuyu' in model_name: vision_model_type = 'fuyu'
     elif 'neva-22b' in model_name: vision_model_type = 'neva'
     elif 'video-neva' in model_name: vision_model_type = 'video-neva'
-    elif phi_model: vision_model_type = "phi-3-vision"
+    elif phi3_model: vision_model_type = "phi-3-vision"
+    elif phi4_model: vision_model_type = "phi-4-multimodal"
     elif 'blip2' in model_name: vision_model_type = 'blip2'
     elif 'Llama-3.2' in model_name: vision_model_type = 'mllama'
     elif "Qwen2-VL" in model_name: vision_model_type = 'qwen2_vl'
     elif 'internlm' in model_name: vision_model_type = 'internlm-xcomposer2'
+    elif 'Mistral-Small' in model_name: vision_model_type = 'pixtral'
 
     vit_batch_size = batch_size
     if vision_model_type == "llava_next":
@@ -387,9 +399,11 @@ def _test_llm_multimodal_general(llm_venv,
         vit_batch_size = vit_batch_size * 32
 
     llm_engine_subdir = f"{data_type}" if enc_dec_model else ""
+    # Phi4MM has both vision and audio. Engine build dumps to vision and audio dirs automatically by builder.
+    component_dir = "vision" if vision_model_type != "phi-4-multimodal" else ""
     build_cmd = [
         f"{multimodal_example_root}/build_multimodal_engine.py",
-        f"--output_dir={os.path.join(llm_engine_dir, llm_engine_subdir, 'vision')}",
+        f"--output_dir={os.path.join(llm_engine_dir, llm_engine_subdir, component_dir)}",
         f"--model_type={vision_model_type}",
         f"--model_path={model_ckpt_path}",
         f"--max_batch_size={vit_batch_size}",
@@ -402,7 +416,7 @@ def _test_llm_multimodal_general(llm_venv,
         convert_cmd = [
             f"{script_root}/convert_checkpoint.py",
             f"--model_dir={model_ckpt_path}",
-            f"--output_dir={os.path.join(cmodel_dir, model_name, data_type, 'vision')}",
+            f"--output_dir={os.path.join(cmodel_dir, model_name, data_type, component_dir)}",
             f"--dtype={data_type}",
             f"--vision_tp_size={tp_size}",
         ]
@@ -410,8 +424,8 @@ def _test_llm_multimodal_general(llm_venv,
 
         build_cmd = [
             "trtllm-build",
-            f"--checkpoint_dir={os.path.join(cmodel_dir, model_name, data_type, 'vision')}",
-            f"--output_dir={os.path.join(llm_engine_dir, llm_engine_subdir, 'vision')}",
+            f"--checkpoint_dir={os.path.join(cmodel_dir, model_name, data_type, component_dir)}",
+            f"--output_dir={os.path.join(llm_engine_dir, llm_engine_subdir, component_dir)}",
             f"--max_batch_size={vit_batch_size}",
             f"--remove_input_padding disable",
             f"--bert_attention_plugin disable",
@@ -441,6 +455,9 @@ def _test_llm_multimodal_general(llm_venv,
         f"--batch_size={batch_size}", "--check_accuracy",
         "--enable_context_fmha_fp32_acc"
     ]
+    if vision_model_type == 'phi-4-multimodal':
+        audio_path = f"{model_ckpt_path}/examples/what_is_shown_in_this_image.wav"
+        run_cmd.extend(["--audio_path", f"{audio_path}"])
     if vision_model_type in ['llava', 'vila'] and batch_size > 1:
         # batch inference test
         if vision_model_type == 'vila':
@@ -460,7 +477,7 @@ def _test_llm_multimodal_general(llm_venv,
         run_cmd.extend(["--video_path", video_path])
     if llava_onevision_video_model:
         run_cmd.extend(["--video_path", 'llava-onevision-accuracy'])
-    if phi_model:
+    if phi3_model or phi4_model:
         run_cmd.extend(["--kv_cache_free_gpu_memory_fraction", "0.4"])
     if cpp_e2e:
         run_cmd.extend(["--session", "cpp"])
@@ -544,7 +561,7 @@ def _test_llm_multimodal_general(llm_venv,
         # For Phi-3 - correctness lower than HF
         # For qwen_vl - runtime issue with eval.py -- need to unify prompt generation logics
         # For internvl - not added to the test
-        if llava_model or llava_next_model or phi_model or qwen2_vl_model:
+        if llava_model or llava_next_model or phi3_model or qwen2_vl_model:
             return
 
         eval_task = "lmms-lab/ai2d" if mllama_model else "lmms-lab/VQAv2"
@@ -569,7 +586,7 @@ def _test_llm_multimodal_general(llm_venv,
                 f"--dataset_dir={llm_datasets_root}/lmms-lab__VQAv2_valid_2000samples/"
             ])
 
-        if phi_model:
+        if phi3_model:
             eval_cmd.extend(["--kv_cache_free_gpu_memory_fraction", "0.4"])
         elif enc_dec_model:
             eval_cmd.extend(["--cross_kv_cache_fraction", "0.5"])
@@ -594,7 +611,9 @@ def _test_llm_multimodal_general(llm_venv,
     'blip2-flan-t5-xl',
     'llava-1.5-7b-hf',
     'llava-v1.6-mistral-7b-hf',
-    'llava-v1.6-mistral-7b-hf-vision-trtllm',
+    pytest.param('llava-v1.6-mistral-7b-hf-vision-trtllm',
+                 marks=pytest.mark.skipif(get_device_memory() < 50000,
+                                          reason="Skip due to low memory")),
     'llava-onevision-qwen2-7b-ov-hf',
     'llava-onevision-qwen2-7b-ov-hf-video',
     'nougat-base',
@@ -605,11 +624,13 @@ def _test_llm_multimodal_general(llm_venv,
     'neva-22b',
     'kosmos-2',
     'video-neva',
-    'Phi-3-vision-128k-instruct',
+    pytest.param('Phi-3-vision-128k-instruct', marks=skip_post_blackwell),
     'Phi-3.5-vision-instruct',
+    'Phi-4-multimodal-instruct',
     'Llama-3.2-11B-Vision',
     'Qwen2-VL-7B-Instruct',
     'internlm-xcomposer2-vl-7b',
+    'Mistral-Small-3.1-24B-Instruct-2503',
 ],
                          indirect=True)
 def test_llm_multimodal_general(llm_venv, llm_root, llm_datasets_root,
@@ -658,6 +679,7 @@ def test_llm_multimodal_general(llm_venv, llm_root, llm_datasets_root,
     'video-neva',
     'Phi-3-vision-128k-instruct',
     'Phi-3.5-vision-instruct',
+    'Phi-4-multimodal-instruct',
     'Llama-3.2-11B-Vision-Instruct',
     'Llama-3.2-11B-Vision',
     'Qwen2-VL-7B-Instruct',

@@ -1,13 +1,14 @@
 """Common utils for torch fx graph transformation."""
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch._ops import OpOverload, OpOverloadPacket
 from torch.fx import Graph, GraphModule, Node
 
 from ..custom_ops.quant import QUANT_OPS
+from .logger import ad_logger
 
 try:
     # import modelopt to get quantize_op
@@ -22,6 +23,8 @@ try:
 except ImportError:
     modelopt_quantize_op = None
     modelopt_dynamic_block_quantize_op = None
+
+OperatorLike = Union[OpOverloadPacket, OpOverload, Callable]
 
 
 @dataclass
@@ -121,6 +124,25 @@ def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]
     Args:
         mm_node: Matmul node in the graph.
     """
+    # List of nodes allowed in between a get_attr node and the matmul node
+    allowed_ops = {torch.ops.aten.to.dtype}
+
+    def find_get_attr_node(node: Node) -> Node:
+        """Recursively traverse inputs of allowed nodes to find a node with 'get_attr' op."""
+        # If node is a get_attr node return node
+        if node.op == "get_attr":
+            return node
+
+        # If node is not in the list of allowable ops then return None
+        if node.target not in allowed_ops:
+            return None
+
+        for input_node in node.all_input_nodes:
+            result = find_get_attr_node(input_node)
+            if result:
+                return result
+        return None
+
     assert is_linear_op(mm_node, include_quantization=True), (
         f"Expecting linear node, Found: {mm_node}"
     )
@@ -130,7 +152,11 @@ def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]
     _, weight_params, _ = get_quantization_params_from_linear_node(mm_node)
     weight_node = weight_params.input_node if weight_params else weight_node
 
-    assert weight_node.op == "get_attr"
+    # Find the get_attr node for the weight node so that it can be slice.
+    weight_node = find_get_attr_node(weight_node)
+
+    assert weight_node, "Cannot identify weight parameter of linear node."
+
     # Map arg to named parameter
     weight_name = weight_node.target
 
@@ -152,21 +178,30 @@ def get_op_overload_packet(node: Union[OpOverloadPacket, OpOverload]) -> OpOverl
         raise ValueError(f"Expected OpOverloadPacket or OpOverload, got {type(node)}")
 
 
-def is_op(node: Node, ops: Union[OpOverloadPacket, Iterable[OpOverloadPacket]]) -> bool:
+def is_op(node: Node, ops: Union[OperatorLike, Iterable[OperatorLike]]) -> bool:
     """Check if the node is a call to one of the ops."""
+    if not isinstance(node, Node):
+        return False
+
     if node.op != "call_function":
         return False
 
-    # check if it's a single op that's provided
-    if isinstance(ops, OpOverloadPacket):
+    # check if it's a single op that's provided by checking if it's iterable
+    if isinstance(ops, OpOverloadPacket) or not isinstance(ops, Iterable):
         ops = [ops]
 
-    # check if it's the op itself instead of an overload
-    if any(node.target == op for op in ops):
-        return True
+    # now iterate through the operator list and see if there is a match
+    is_match = True
+    for op in ops:
+        if node.target == op:
+            break
+        if isinstance(op, OpOverloadPacket):
+            if any(node.target == getattr(op, overload) for overload in op):
+                break
+    else:
+        is_match = False
 
-    # check the overloads
-    return any(node.target == getattr(op, overload) for op in ops for overload in op)
+    return is_match
 
 
 def is_linear_op(node: Node, include_quantization: bool = False) -> bool:
@@ -258,9 +293,30 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
 
     # sanity check: we expect at most two users for any residual node
     res_nodes_more_users = [n for n in boundary_nodes[2:] if len(n.users) > 2]
-    assert not res_nodes_more_users, f"Unexpected # of users for residuals: {res_nodes_more_users}"
+    if res_nodes_more_users:
+        ad_logger.warning(f"Unexpected # of users for residuals: {res_nodes_more_users}")
 
     # add output node to boundary nodes
     boundary_nodes.append(output_node)
 
     return boundary_nodes
+
+
+def bfs(
+    node: Node, target: Callable, attr_next: str = "users", boundary: Optional[Node] = None
+) -> Node:
+    queue = [node]
+    visited = set()
+    while queue:
+        cur_node = queue.pop(0)
+        if boundary is not None and cur_node == boundary:
+            continue  # Skip the boundary node.
+        if target(cur_node):
+            return cur_node
+        for next_node in getattr(cur_node, attr_next):
+            if boundary is not None and next_node == boundary:
+                continue  # Do not expand past the boundary.
+            if next_node not in visited:
+                visited.add(next_node)
+                queue.append(next_node)
+    raise RuntimeError(f"Could not find node with target condition {target}.")

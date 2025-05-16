@@ -22,7 +22,6 @@
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/generationConfig.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -535,6 +534,7 @@ texec::Request makeExecutorContextRequest(Sample const& sample, SizeType32 const
             std::nullopt,    // embeddingBias
             std::nullopt,    // speculativeDecoding
             std::nullopt,    // pTuning
+            std::nullopt,    // multimodalEmbedding
             std::nullopt,    // mRopeConfig
             loraConfig,      // loraConfig
             lookaheadConfig, // lookaheadConfig

@@ -29,8 +29,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "tensorCaster.h"
-
 #include <optional>
 
 namespace py = pybind11;
@@ -85,6 +83,8 @@ void initBindings(pybind11::module_& m)
         .def("isLookahead", &tle::DecodingMode::isLookahead)
         .def("isExplicitDraftTokens", &tle::DecodingMode::isExplicitDraftTokens)
         .def("isEagle", &tle::DecodingMode::isEagle)
+        .def("useVariableBeamWidthSearch", &tle::DecodingMode::useVariableBeamWidthSearch)
+        .def_property_readonly("name", &tle::DecodingMode::getName)
         .def(py::pickle(decodingModeGetstate, decodingModeSetstate));
 
     py::enum_<tle::CapacitySchedulerPolicy>(m, "CapacitySchedulerPolicy")

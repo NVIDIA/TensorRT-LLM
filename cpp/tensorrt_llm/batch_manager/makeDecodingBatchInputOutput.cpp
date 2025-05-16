@@ -19,8 +19,11 @@
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
+#include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/iGptDecoderBatched.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
@@ -31,31 +34,97 @@ namespace tensorrt_llm::batch_manager
 using SizeType32 = MakeDecodingBatchInputOutput::SizeType32;
 using TensorPtr = MakeDecodingBatchInputOutput::TensorPtr;
 
-namespace
-{
-std::vector<bool> computeActiveVec(
-    RequestVector const& contextRequests, RequestVector const& generationRequests, SizeType32 maxNumSequences)
+std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDecoderBatchInputs(
+    std::vector<SizeType32> const& activeSlots, runtime::decoder::DecoderState const& decoderState,
+    std::vector<TensorPtr> const& logits, SizeType32 maxNumSequences, std::vector<TensorPtr> const& batchSlots,
+    TensorPtr const& cacheIndirectionInput)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    std::vector<bool> active(maxNumSequences, false);
+
+    auto const& numDecodingEngineTokens = decoderState.getNumDecodingEngineTokens();
+    auto const& maxDecodingEngineTokens = decoderState.getMaxDecodingEngineTokens();
+    auto const& maxDecodingDecoderTokens = decoderState.getMaxDecodingDecoderTokens();
+    auto const maxDecoderSteps = common::ceilDiv(maxDecodingEngineTokens, maxDecodingDecoderTokens);
+
+    for (SizeType32 step = 0; step < maxDecoderSteps; ++step)
+    {
+        batchSlots.at(step)->resize(maxNumSequences);
+    }
+
+    std::vector<SizeType32> batchIdx(maxDecoderSteps);
+    auto maxActiveDecoderSteps = 1;
+    for (auto const slot : activeSlots)
+    {
+        auto const numDecoderSteps = common::ceilDiv(numDecodingEngineTokens.at(slot), maxDecodingDecoderTokens);
+        maxActiveDecoderSteps = std::max(maxActiveDecoderSteps, numDecoderSteps);
+        for (SizeType32 step = 0; step < numDecoderSteps; ++step)
+        {
+            auto batchSlotsRange = tr::BufferRange<SizeType32>(*batchSlots.at(step));
+            batchSlotsRange[batchIdx[step]] = slot;
+            batchIdx[step]++;
+        }
+    }
+
+    for (SizeType32 step = 0; step < maxDecoderSteps; ++step)
+    {
+        batchSlots.at(step)->resize(batchIdx[step]);
+    }
+
+    auto constexpr singleRequest = 1;
+    std::vector<std::vector<tr::ITensor::SharedConstPtr>> logitsVec(maxActiveDecoderSteps);
+    for (SizeType32 step = 0; step < maxActiveDecoderSteps; ++step)
+    {
+        auto batchSlotsRange = tr::BufferRange<SizeType32>(*batchSlots.at(step));
+
+        for (auto slot : batchSlotsRange)
+        {
+            auto const& targetLogits = logits.at(slot);
+            TensorPtr logitsSlice = tr::ITensor::slice(targetLogits, step, singleRequest);
+            logitsVec.at(step).push_back(logitsSlice);
+        }
+    }
+
+    auto decodingInput = std::make_unique<tr::decoder_batch::Input>(logitsVec, maxActiveDecoderSteps);
+    decodingInput->batchSlots = batchSlots;
+    decodingInput->cacheIndirection = cacheIndirectionInput;
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    return decodingInput;
+}
+
+namespace
+{
+
+std::pair<std::vector<SizeType32>, std::vector<SizeType32>> getActiveSlots(
+    RequestVector const& contextRequests, RequestVector const& generationRequests)
+{
+    std::vector<std::pair<SizeType32, SizeType32>> slots;
     for (auto const& requests : {contextRequests, generationRequests})
     {
         for (auto const& llmReq : requests)
         {
-            auto const seqSlot = llmReq->mSeqSlot.value();
             if (llmReq->isGenerationInProgressState() || llmReq->isLastContextChunk())
             {
-                active[seqSlot] = true;
+                slots.push_back({llmReq->mSeqSlot.value(), llmReq->getDecodingIter()});
             }
         }
     }
 
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return active;
+    std::sort(slots.begin(), slots.end(),
+        [](std::pair<SizeType32, SizeType32> const& a, std::pair<SizeType32, SizeType32> const& b)
+        { return a.first < b.first; });
+
+    std::vector<SizeType32> activeSlots, generationSteps;
+    for (auto const& slot : slots)
+    {
+        activeSlots.push_back(slot.first);
+        generationSteps.push_back(slot.second);
+    }
+
+    return {activeSlots, generationSteps};
 }
 
 void copySequenceLengths(RequestVector const& contextRequests, RequestVector const& generationRequests,
-    DecoderInputBuffers const& inputBuffers, TensorPtr const& sequenceLengths, SizeType32 beamWidth,
+    DecoderInputBuffers const& inputBuffers, TensorPtr const& sequenceLengths, SizeType32 beamWidth, bool isTrtOverlap,
     runtime::BufferManager const& manager, runtime::CudaStream const& stream)
 {
     auto const batchSize = contextRequests.size() + generationRequests.size();
@@ -67,17 +136,24 @@ void copySequenceLengths(RequestVector const& contextRequests, RequestVector con
 
     // fill buffers on host
     SizeType32 batchIdx{0};
-    for (auto const& requests : {contextRequests, generationRequests})
+    for (auto const& llmReq : contextRequests)
     {
-        for (auto const& llmReq : requests)
-        {
-            auto const currentSequenceLen = llmReq->mPromptLen + llmReq->getMaxNumGeneratedTokens();
-            // Get position of the current sequence in the decoder
-            auto const seqSlot = llmReq->mSeqSlot.value();
-            batchSlotsRange[batchIdx] = seqSlot;
-            fillValuesRange[batchIdx] = currentSequenceLen;
-            ++batchIdx;
-        }
+        auto const currentSequenceLen = llmReq->mPromptLen + llmReq->getMaxNumGeneratedTokens();
+        // Get position of the current sequence in the decoder
+        auto const seqSlot = llmReq->mSeqSlot.value();
+        batchSlotsRange[batchIdx] = seqSlot;
+        fillValuesRange[batchIdx] = currentSequenceLen;
+        ++batchIdx;
+    }
+    for (auto const& llmReq : generationRequests)
+    {
+        auto const currentSequenceLen
+            = llmReq->mPromptLen + llmReq->getMaxNumGeneratedTokens() + static_cast<SizeType32>(isTrtOverlap);
+        // Get position of the current sequence in the decoder
+        auto const seqSlot = llmReq->mSeqSlot.value();
+        batchSlotsRange[batchIdx] = seqSlot;
+        fillValuesRange[batchIdx] = currentSequenceLen;
+        ++batchIdx;
     }
 
     // copy sequence lengths
@@ -94,17 +170,18 @@ void copySequenceLengths(RequestVector const& contextRequests, RequestVector con
 
 std::tuple<std::unique_ptr<tr::decoder_batch::Input>, std::unique_ptr<tr::decoder_batch::Output>>
 MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
-    DecoderBuffers& decoderBuffers, DecoderInputBuffers const& inputBuffers, runtime::ModelConfig const& modelConfig,
-    SizeType32 maxNumSequences, SizeType32 beamWidth, runtime::BufferManager const& manager,
-    runtime::CudaStream const& stream, OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const
+    DecoderBuffers& decoderBuffers, DecoderInputBuffers const& inputBuffers,
+    runtime::decoder::DecoderState& decoderState, runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences,
+    SizeType32 beamWidth, bool isTrtOverlap, runtime::BufferManager const& manager, runtime::CudaStream const& stream,
+    OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto const active = computeActiveVec(contextRequests, generationRequests, maxNumSequences);
-    auto decodingInput = std::make_unique<tr::decoder_batch::Input>(decoderBuffers.logits, active);
-    decodingInput->batchSlots = inputBuffers.forwardBatchSlots;
+    auto [activeSlots, generationSteps] = getActiveSlots(contextRequests, generationRequests);
 
-    decodingInput->cacheIndirection = decoderBuffers.cacheIndirectionInput;
+    auto decodingInput = createDecoderBatchInputs(activeSlots, decoderState, decoderBuffers.logits, maxNumSequences,
+        inputBuffers.forwardBatchSlots, decoderBuffers.cacheIndirectionInput);
+    decodingInput->generationSteps = generationSteps;
 
     if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
     {
@@ -128,12 +205,11 @@ MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests, R
         decodingInput->eagleLastInputs = fusedRuntimeBuffers->eagleBuffers->engineInputs;
     }
 
-    copySequenceLengths(
-        contextRequests, generationRequests, inputBuffers, decoderBuffers.sequenceLengths, beamWidth, manager, stream);
+    copySequenceLengths(contextRequests, generationRequests, inputBuffers,
+        decoderState.getJointDecodingOutput().lengths, beamWidth, isTrtOverlap, manager, stream);
 
     auto decodingOutput = std::make_unique<tr::decoder_batch::Output>();
     decodingOutput->cacheIndirection = decoderBuffers.cacheIndirectionOutput;
-    decodingOutput->sequenceLengths = decoderBuffers.sequenceLengths;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return {std::move(decodingInput), std::move(decodingOutput)};

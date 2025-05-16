@@ -1,11 +1,15 @@
 import copy
 from abc import ABC
 from enum import Enum
-from typing import List, Tuple
+from typing import Any, List, Mapping
 
+import torch
+from torch.nn import functional as F
+
+from tensorrt_llm.logger import logger
 from tensorrt_llm.scaffolding.math_utils import get_digit_majority_vote_result
-from tensorrt_llm.scaffolding.task import (GenerationTask, RewardTask,
-                                           ScaffoldingOutput, Task)
+from tensorrt_llm.scaffolding.task import (GenerationTask, ScaffoldingOutput,
+                                           Task)
 
 
 class ScaffoldingOutput:
@@ -17,6 +21,9 @@ class ScaffoldingOutput:
 
 
 class Controller(ABC):
+
+    def __init__(self):
+        self.task_collections = {}
 
     def clone(self):
         return copy.deepcopy(self)
@@ -32,50 +39,131 @@ class Controller(ABC):
         raise NotImplementedError
 
 
+class ParallelProcess:
+
+    def __init__(self, controllers: List[Controller],
+                 tasks_list: List[List[Task]], kwargs_list: List[Mapping[str,
+                                                                         Any]]):
+        self.sub_gens = []
+        for controller, tasks, kwargs in zip(controllers, tasks_list,
+                                             kwargs_list):
+            gen = controller.process(tasks, **kwargs)
+            self.sub_gens.append(gen)
+
+
 # Controller runs multiple generation tasks.
 class NativeGenerationController(Controller):
 
     class WorkerTag(Enum):
         GENERATION = "generation"
 
-    def __init__(self, custom_sampling_params: dict = None):
+    def __init__(self, sampling_params: dict = None):
         super().__init__()
-        self.custom_sampling_params = copy.deepcopy(custom_sampling_params)
+        if sampling_params is None:
+            sampling_params = {}
+        for key, value in list(sampling_params.items()):
+            if key not in GenerationTask.__annotations__:
+                logger.warning(
+                    f"{key} is not a supported field for GenerationTask")
+                sampling_params.pop(key)
+        self.sampling_params = sampling_params
 
     def process(self, tasks: List[Task], **kwargs):
         for task in tasks:
-            if not isinstance(task, GenerationTask):
-                raise ValueError(
-                    "NativeGenerationController requires exactly one GenerationTask"
-                )
-
-        for task in tasks:
             task.worker_tag = self.WorkerTag.GENERATION
-            if kwargs.get("custom_sampling_params"):
-                task.custom_sampling_params = kwargs.get(
-                    "custom_sampling_params")
-            elif self.custom_sampling_params:
-                task.custom_sampling_params = self.custom_sampling_params
+            for key, value in self.sampling_params.items():
+                if getattr(task, key) is None:
+                    setattr(task, key, value)
 
         yield tasks
 
 
-# Controller runs multiple reward tasks.
 class NativeRewardController(Controller):
 
     class WorkerTag(Enum):
         REWARD = "reward"
 
     def process(self, tasks: List[Task], **kwargs):
-        for task in tasks:
-            if not isinstance(task, RewardTask):
-                raise ValueError(
-                    "NativeRewardController requires exactly one RewardTask")
-
+        task = GenerationTask()
         for task in tasks:
             task.worker_tag = self.WorkerTag.REWARD
 
         yield tasks
+
+
+class QwenRewardController(NativeRewardController):
+    """
+    Controller that integrate multi Generation output into one prompt and get
+    reward values from reward model.
+    """
+
+    def __init__(self, tokenizer, separate_token="<extra_0>"):  # nosec B107
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.separate_token = separate_token
+
+    def _make_step_rewards(self, logits, token_masks):
+        probabilities = F.softmax(logits, dim=-1)
+        probabilities = probabilities * token_masks.unsqueeze(
+            -1)  # bs, seq_len, num_labels=2
+
+        all_scores_res = []
+        for i in range(probabilities.size(0)):
+            sample = probabilities[i]  # seq_len, num_labels
+            positive_probs = sample[sample != 0].view(
+                -1, 2)[:, 1]  # num_separate_tokens, num_labels
+            non_zero_elements_list = positive_probs.cpu().tolist()
+            all_scores_res.append(non_zero_elements_list)
+        return all_scores_res
+
+    def process(self, tasks: List[Task], **kwargs):
+        # Combine messages using chat template
+        content = "".join(
+            (task.output_str + self.separate_token) for task in tasks)
+        messages = [
+            {
+                "role":
+                "system",
+                "content":
+                "Please reason step by step, and put your final answer within \\boxed{}."
+            },
+            {
+                "role": "user",
+                "content": tasks[0].input_str
+            },
+            {
+                "role": "assistant",
+                "content": content
+            },
+        ]
+        combined_prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False)
+
+        # TODO: support input_ids as model input, avoid doing it again in worker
+        merged_task = GenerationTask.create_from_prompt(combined_prompt)
+        merged_task.worker_tag = self.WorkerTag.REWARD
+
+        # TODO: pack this logic
+        merged_task.max_tokens = 1
+        merged_task.return_context_logits = True
+
+        yield [merged_task]
+
+        assert merged_task.context_logits is not None
+        # TODO: consider running on cpu to not interrupt worker or move
+        # tokenizer to a worker
+        input_ids = self.tokenizer.encode(
+            combined_prompt,
+            return_tensors="pt",
+        ).to(merged_task.context_logits.device)
+
+        # TODO: align add_special_tokens with SamplingParams
+        token_masks = (input_ids == self.tokenizer.encode(
+            self.separate_token, add_special_tokens=True)[0])
+        all_scores_res = self._make_step_rewards(merged_task.context_logits,
+                                                 token_masks)
+
+        return all_scores_res
 
 
 # Controller runs a single generation task with majority vote.
@@ -95,20 +183,27 @@ class MajorityVoteController(Controller):
         return MajorityVoteController(generation_controller,
                                       self.default_sample_num)
 
-    def process(self, tasks: List[Task], **kwargs):
-        assert len(tasks) == 1 and isinstance(tasks[0], GenerationTask), \
-            "MajorityVoteController requires exactly one GenerationTask"
+    def process(self,
+                tasks: List[Task],
+                sample_num: int = 1,
+                generation_kwargs: dict = {},
+                majority_vote_kwargs: dict = {}):
+        sample_num = max(sample_num, self.default_sample_num)
+        generation_controllers = [
+            self.generation_controller.clone() for _ in range(sample_num)
+        ]
+        tasks_list = [copy.deepcopy(tasks) for _ in range(sample_num)]
+        generation_kwargs_list = [
+            copy.deepcopy(generation_kwargs) for _ in range(sample_num)
+        ]
 
-        sample_num = kwargs.get("sample_num", self.default_sample_num)
-        generation_tasks = [copy.deepcopy(tasks[0]) for _ in range(sample_num)]
-        yield from self.generation_controller.process(
-            generation_tasks, **kwargs.get("generation_kwargs", {}))
+        yield ParallelProcess(generation_controllers, tasks_list,
+                              generation_kwargs_list)
 
-        candidates = [task.output_str for task in generation_tasks]
-        result = self.majority_vote(candidates,
-                                    **kwargs.get("majority_vote_kwargs", {}))
+        candidates = [tasks[0].output_str for tasks in tasks_list]
+        result = self.majority_vote(candidates, **majority_vote_kwargs)
 
-        assert (isinstance(result, str))
+        assert isinstance(result, str), "majority_vote failed"
         # The task returned by majority vote does not have output_tokens and logits.
         tasks[0].output_str = result
 
@@ -122,7 +217,7 @@ class BestOfNController(Controller):
     def __init__(self,
                  generation_controller: Controller,
                  reward_controller: Controller,
-                 default_sample_num: int = 1):
+                 default_sample_num: int = 4):
         super().__init__()
         self.generation_controller = generation_controller
         self.reward_controller = reward_controller
@@ -134,31 +229,35 @@ class BestOfNController(Controller):
         return BestOfNController(generation_controller, reward_controller,
                                  self.default_sample_num)
 
-    def process(self, tasks: List[Task], **kwargs):
-        assert len(tasks) == 1 and isinstance(tasks[0], GenerationTask), \
-            "BestOfNController requires exactly one GenerationTask"
+    def process(self,
+                tasks: List[Task],
+                sample_num: int = 4,
+                generation_kwargs: dict = {},
+                reward_kwargs: dict = {},
+                select_best_kwargs: dict = {}):
+        assert len(tasks) == 1, "BestOfNController only supports one task"
+        task = tasks[0]
 
-        sample_num = kwargs.get("sample_num", self.default_sample_num)
-        generation_tasks = [tasks[0].deepcopy() for _ in range(sample_num)]
-        yield from self.generation_controller.process(
-            generation_tasks, **kwargs.get("generation_kwargs"))
-
-        reward_tasks = [
-            RewardTask.create_from_generation_task(generation_task)
-            for generation_task in generation_tasks
+        sample_num = max(sample_num, self.default_sample_num)
+        generation_controllers = [
+            self.generation_controller for _ in range(sample_num)
         ]
-        yield from self.reward_controller.process(reward_tasks,
-                                                  **kwargs.get("reward_kwargs"))
+        generation_kwargs_list = [generation_kwargs for _ in range(sample_num)]
+        generation_tasks_list = [copy.deepcopy(task) for _ in range(sample_num)]
 
-        # may used for upper layer controllers
-        self.best_generation_task, self.best_reward_task = (self.select_best(
-            generation_tasks, reward_tasks, **kwargs.get("select_best_kwargs")))
-        tasks[0] = self.best_generation_task
+        # yield from self.generation_controller.process(generation_tasks_list,
+        #                                               **generation_kwargs)
+        yield ParallelProcess(generation_controllers,
+                              [[t] for t in generation_tasks_list],
+                              generation_kwargs_list)
 
-    def select_best(self, generation_tasks: List[GenerationTask],
-                    reward_tasks: List[RewardTask],
-                    **kwargs) -> Tuple[GenerationTask, RewardTask]:
-        max_reward_value_index = reward_tasks.index(
-            max(reward_tasks, key=lambda x: x.reward_value))
-        return generation_tasks[max_reward_value_index], reward_tasks[
-            max_reward_value_index]
+        reward_values = yield from self.reward_controller.process(
+            generation_tasks_list, **reward_kwargs)
+
+        best_task = self.select_best(generation_tasks_list, reward_values,
+                                     **select_best_kwargs)
+        task.output_str = best_task.output_str
+
+    def select_best(self, tasks: List[Task], reward_values, **kwargs) -> Task:
+        max_index = torch.argmax(torch.tensor(reward_values)).item()
+        return tasks[max_index]

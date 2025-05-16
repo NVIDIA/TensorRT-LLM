@@ -1,20 +1,90 @@
 methods:
   __init__:
-    parameters: {}
+    parameters:
+     # Parallelism
+      cp_config:
+        annotation: Optional[dict]
+        default: null
+      auto_parallel:
+        annotation: bool
+        default: false
+      auto_parallel_world_size:
+        annotation: Optional[int]
+        default: null
+      embedding_parallel_mode:
+        annotation: str
+        default: SHARDING_ALONG_VOCAB
+      moe_cluster_parallel_size:
+        annotation: Optional[int]
+        default: null
+      # Engine building
+      build_config:
+        annotation: Optional[tensorrt_llm.builder.BuildConfig]
+        default: null
+      enable_build_cache:
+        annotation: Union[tensorrt_llm.llmapi.build_cache.BuildCacheConfig, bool]
+        default: false
+      fast_build:
+        annotation: bool
+        default: false
+      # Bindings and mirrored configs
+      batching_type:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.BatchingType]
+        default: null
+      peft_cache_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.PeftCacheConfig]
+        default: null
+      scheduler_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.SchedulerConfig]
+        default: null
+      extended_runtime_perf_knob_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.ExtendedRuntimePerfKnobConfig]
+        default: null
+      decoding_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.DecodingConfig]
+        default: null
+      cache_transceiver_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig]
+        default: null
+      # Misc
+      backend:
+        annotation: Optional[str]
+        default: null
+      enable_attention_dp:
+        annotation: bool
+        default: false
+      normalize_log_probs:
+        annotation: bool
+        default: false
+      gather_generation_logits:
+        annotation: bool
+        default: false
+      gpus_per_node:
+        annotation: Optional[int]
+        default: null
+      iter_stats_max_iterations:
+        annotation: Optional[int]
+        default: null
+      request_stats_max_iterations:
+        annotation: Optional[int]
+        default: null
+      workspace:
+        annotation: Optional[str]
+        default: null
+      lora_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.LoraConfig]
+        default: null
+      kwargs:
+        annotation: Any
+        default: inspect._empty
     return_annotation: None
   generate:
     parameters:
-      # TODO [TRTLLM-3925]
       disaggregated_params:
-        annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
+        annotation: Union[tensorrt_llm.disaggregated_params.DisaggregatedParams, Sequence[tensorrt_llm.disaggregated_params.DisaggregatedParams], NoneType]
         default: null
       kv_cache_retention_config:
-        annotation: Optional[tensorrt_llm.bindings.executor.KvCacheRetentionConfig]
-        default: null
-      queries:
-        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt,
-          Sequence[Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]],
-          NoneType]
+        annotation: Union[tensorrt_llm.bindings.executor.KvCacheRetentionConfig, Sequence[tensorrt_llm.bindings.executor.KvCacheRetentionConfig], NoneType]
         default: null
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
@@ -24,10 +94,6 @@ methods:
         default: null
       kv_cache_retention_config:
         annotation: Optional[tensorrt_llm.bindings.executor.KvCacheRetentionConfig]
-        default: null
-      queries:
-        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt,
-          NoneType]
         default: null
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
   get_kv_cache_events:

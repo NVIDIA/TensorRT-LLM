@@ -29,10 +29,9 @@ from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
 from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
-from .llm_args import (CalibConfig, ConfigArbitrateError, EagleDecodingConfig,
-                       KvCacheConfig, LlmArgs, LookaheadDecodingConfig,
-                       MedusaDecodingConfig, MTPDecodingConfig,
-                       _ConfigArbitrator, _ModelFormatKind, _ModelWrapper,
+from .llm_args import (CalibConfig, EagleDecodingConfig, KvCacheConfig, LlmArgs,
+                       LookaheadDecodingConfig, MedusaDecodingConfig,
+                       MTPDecodingConfig, _ModelFormatKind, _ModelWrapper,
                        _ParallelConfig, get_model_format,
                        update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
@@ -41,7 +40,7 @@ from .tokenizer import TransformersTokenizer, load_hf_tokenizer
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (download_hf_model, download_hf_pretrained_config,
                     enable_llm_debug, get_directory_size_in_gb, print_colored,
-                    print_traceback_on_error)
+                    print_colored_debug, print_traceback_on_error)
 
 
 @dataclass
@@ -489,6 +488,7 @@ class ModelLoader:
         self._model_info = _ModelInfo.from_pretrained_config(
             self.pretrained_config)
 
+    @print_traceback_on_error
     def _load_model_from_ckpt(self):
         ''' Load a TRT-LLM model from checkpoint. '''
         self.pretrained_config = PretrainedConfig.from_json_file(
@@ -516,10 +516,14 @@ class ModelLoader:
         assert isinstance(self.llm_args.model, Module)
         self._model_info = _ModelInfo.from_module(self.model)
 
+    @print_traceback_on_error
     def _build_engine(self):
         assert isinstance(
             self.build_config,
             BuildConfig), f"build_config is not set yet: {self.build_config}"
+
+        print_colored_debug(f"rank{mpi_rank()} begin to build engine...\n",
+                            "green")
 
         # avoid the original build_config is modified, avoid the side effect
         copied_build_config = copy.deepcopy(self.build_config)
@@ -536,6 +540,7 @@ class ModelLoader:
 
         # delete the model explicitly to free all the build-time resources
         self.model = None
+        print_colored_debug(f"rank{mpi_rank()} build engine done\n", "green")
 
     def _save_engine_for_runtime(self):
         '''
@@ -620,39 +625,15 @@ class CachedModelLoader:
 
         self.model_loader = ModelLoader(self.llm_args)
 
-        if self.build_cache_enabled:
-            print_colored("Build cache is enabled.\n", 'yellow')
-            if self.model_loader.model_obj.is_hub_model:
-                # This will download the config.json from HF model hub, this helps to create a PretrainedConfig for
-                # cache key.
-                self._hf_model_dir = download_hf_pretrained_config(
-                    self.model_loader.model_obj.model_name,
-                    revision=self.llm_args.revision)
-
-            elif self.model_loader.model_obj.is_local_model:
-                self._hf_model_dir = self.model_loader.model_obj.model_dir if self.llm_args.model_format is _ModelFormatKind.HF else None
-
-            self.engine_cache_stage = self._get_engine_cache_stage()
-            if self.engine_cache_stage.is_cached():
-                self.llm_build_stats.cache_hitted = True
-                print_colored(
-                    f"Reusing cached engine in {self.engine_cache_stage.get_engine_path()}\n\n",
-                    'grey')
-                self.model_loader.model_obj.model_dir = self.engine_cache_stage.get_engine_path(
-                )
-                self.llm_build_stats.engine_dir = self.model_loader.model_obj.model_dir
-                return self.llm_build_stats.engine_dir, self._hf_model_dir
-
         if self.llm_args.backend is not None:
             if self.llm_args.backend not in ["pytorch", "autodeploy"]:
                 raise ValueError(
                     f'backend {self.llm_args.backend} is not supported.')
 
             if self.model_loader.model_obj.is_hub_model:
-                hf_folder = download_hf_model(
+                self._hf_model_dir = download_hf_model(
                     self.model_loader.model_obj.model_name,
                     self.llm_args.revision)
-                self._hf_model_dir = hf_folder
             else:
                 self._hf_model_dir = self.model_loader.model_obj.model_dir
 
@@ -665,6 +646,30 @@ class CachedModelLoader:
             self.model_loader._update_from_hf_quant_config()
 
             return None, self._hf_model_dir
+
+        if self.model_loader.model_obj.is_hub_model:
+            # This will download the config.json from HF model hub, this helps to create a PretrainedConfig for
+            # cache key.
+            self._hf_model_dir = download_hf_pretrained_config(
+                self.model_loader.model_obj.model_name,
+                revision=self.llm_args.revision)
+
+        elif self.model_loader.model_obj.is_local_model:
+            self._hf_model_dir = self.model_loader.model_obj.model_dir if self.llm_args.model_format is _ModelFormatKind.HF else None
+
+        if self.build_cache_enabled:
+            print_colored("Build cache is enabled.\n", 'yellow')
+
+            self.engine_cache_stage = self._get_engine_cache_stage()
+            if self.engine_cache_stage.is_cached():
+                self.llm_build_stats.cache_hitted = True
+                print_colored(
+                    f"Reusing cached engine in {self.engine_cache_stage.get_engine_path()}\n\n",
+                    'grey')
+                self.model_loader.model_obj.model_dir = self.engine_cache_stage.get_engine_path(
+                )
+                self.llm_build_stats.engine_dir = self.model_loader.model_obj.model_dir
+                return self.llm_build_stats.engine_dir, self._hf_model_dir
 
         return self._build_model(), self._hf_model_dir
 
@@ -863,8 +868,6 @@ __all__ = [
     'CalibConfig',
     'KvCacheConfig',
     'CachedModelLoader',
-    'ConfigArbitrateError',
-    '_ConfigArbitrator',
     'EagleDecodingConfig',
     'update_llm_args_with_extra_dict',
     'update_llm_args_with_extra_options',

@@ -175,15 +175,19 @@ class QuantMode(IntFlag):
     def has_weight_quant(self):
         return self._any(self.INT4_WEIGHTS | self.INT8_WEIGHTS)
 
-    def has_any_quant(self):
-        return self._any(self.INT4_WEIGHTS
-                         | self.INT8_WEIGHTS
-                         | self.ACTIVATIONS
-                         | self.INT8_KV_CACHE | self.FP8_KV_CACHE
-                         | self.NVFP4_KV_CACHE
-                         | self.FP8_QDQ | self.FP8_ROWWISE | self.W4A8_QSERVE
-                         | self.FP8_1x128_128x128
-                         | self.NVFP4)
+    def has_any_quant(self, exclude_kv_cache: bool = False):
+        has_quant = self._any(self.INT4_WEIGHTS
+                              | self.INT8_WEIGHTS
+                              | self.ACTIVATIONS
+                              | self.FP8_QDQ | self.FP8_ROWWISE
+                              | self.W4A8_QSERVE
+                              | self.FP8_1x128_128x128
+                              | self.NVFP4)
+        if exclude_kv_cache:
+            return has_quant
+
+        return has_quant | self._any(self.INT8_KV_CACHE | self.FP8_KV_CACHE
+                                     | self.NVFP4_KV_CACHE)
 
     def set_int8_kv_cache(self):
         return self | self.INT8_KV_CACHE

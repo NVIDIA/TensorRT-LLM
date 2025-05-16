@@ -427,7 +427,7 @@ class TestFunctional(unittest.TestCase):
 
         # skip tests based on the gpu_arch_lists
         if gpu_arch != 'all':
-            assert gpu_arch in [80, 86, 89, 90, 100]
+            assert gpu_arch in [80, 86, 89, 90, 100, 120]
             if getSMVersion() != gpu_arch:
                 pytest.skip(
                     "Skip the test as the target gpu arch doesn't match this gpu arch."

@@ -145,6 +145,7 @@ TransformerBuffers::TransformerBuffers(SizeType32 maxBatchSize, SizeType32 maxBe
 void TransformerBuffers::reshape(SizeType32 numSequences, SizeType32 numInputTokens)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     pastKeyValueLengths->reshape(ITensor::makeShape({numSequences}));
 
     if (kvCacheBlockOffsetsHost)
@@ -210,6 +211,7 @@ void TransformerBuffers::reshape(SizeType32 numSequences, SizeType32 numInputTok
             TLLM_LOG_DEBUG("crossAttentionPackedMaskDevice not allocated yet");
         }
     }
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -354,8 +356,8 @@ void TransformerBuffers::resetCacheIndirection(RequestVector const& contextReque
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(resetCacheIndirection);
-    auto const& stream = manager.getStream();
 
+    auto const& stream = manager.getStream();
     auto const numContextRequests = contextRequests.size();
 
     std::fill_n(bufferCast<SizeType32>(*fillValuesAlt), numContextRequests, 0);
@@ -370,6 +372,7 @@ void TransformerBuffers::resetCacheIndirection(RequestVector const& contextReque
         static_cast<std::uint64_t>(maxBeamWidth) * maxAttentionWindow, *fillValuesAltDevice, stream);
     runtime::kernels::invokeFillBatch(*decoderCacheIndirectionOutput, *seqSlotsDeviceView,
         static_cast<std::uint64_t>(maxBeamWidth) * maxAttentionWindow, *fillValuesAltDevice, stream);
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -392,7 +395,7 @@ void TransformerBuffers::copyKvBlockOffsets(RequestVector const& contextRequests
         {
             auto const requestId = llmReq->mRequestId;
             auto const isContextRequest = llmReq->isContextInitState();
-            auto const beamWidth = isContextRequest ? contextBeamWidth : llmReq->mSamplingConfig.beamWidth;
+            auto const beamWidth = isContextRequest ? contextBeamWidth : llmReq->getBeamWidthByIter();
             auto const maxBeamBlockCount
                 = kvCacheManager->copyBlockOffsets(*kvCacheBlockOffsetsHost, numSequences, requestId);
             maxBlockCount = std::max(maxBlockCount, maxBeamBlockCount);
@@ -445,7 +448,16 @@ void TransformerBuffers::copyCacheIndirection(
     auto batchedCopySizes = BufferRange<SizeType64>(*cacheIndirBatchedCopySizes);
 
     auto cacheIndirShape = decoderCacheIndirectionOutput->getShape();
+
+    // At present, all requests of a batch must have the same beam width in one generation step (or they will not
+    // be batched together). So, the beam width of the first request is taken here to reshape the buffer.
+    // Corresponding changes must be done if Diverse-Beam-Width-Search (DBWS, requests with diverse beam width in
+    // a batch in one generation step) is supported in the future.
+    auto reqBeamWidth = genRequests[0]->getBeamWidthByIter();
+
+    // Get size of copying from shape of `CacheIndirectionOutput`
     cacheIndirShape.d[0] = 1;
+    cacheIndirShape.d[1] = reqBeamWidth; // Use beam width of current step rather than max beam width as dst offset
     auto const copySize = static_cast<SizeType64>(ITensor::volume(cacheIndirShape));
 
     std::transform(genRequests.begin(), genRequests.end(), batchedCopySrcOffsets.begin(),
@@ -459,6 +471,7 @@ void TransformerBuffers::copyCacheIndirection(
     auto const batchedCopySizesSlice = ITensor::slice(cacheIndirBatchedCopySizes, 0, numGenerationRequests);
     runtime::kernels::invokeCopyBatch(*decoderCacheIndirectionOutput, *cacheIndirection, *batchedCopySrcOffsetsSlice,
         *batchedCopyDstOffsetsSlice, *batchedCopySizesSlice, copySize, stream);
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 

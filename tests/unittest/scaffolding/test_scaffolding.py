@@ -1,17 +1,23 @@
-# isort: off
-# isort: on
+# autoflake: skip_file
 
-from scaffolding.test_worker import create_trtllm_worker
+from scaffolding.test_worker import (create_trtllm_worker,
+                                     deepseek_distill_7b_path, default_prompt)
 
-from tensorrt_llm.scaffolding.controller import (MajorityVoteController,
-                                                 NativeGenerationController)
-from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
+from tensorrt_llm.scaffolding import (MajorityVoteController,
+                                      NativeGenerationController,
+                                      ScaffoldingLlm)
 
 
 def create_scaffolding_llm_with_native_generation_controller(
         deepseek_distill_7b_path):
     trtllm_worker = create_trtllm_worker(deepseek_distill_7b_path)
-    prototype_generation_controller = NativeGenerationController()
+    prototype_generation_controller = NativeGenerationController(
+        sampling_params={
+            "max_tokens": 8,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "top_k": 50
+        })
     return ScaffoldingLlm(
         prototype_generation_controller,
         {NativeGenerationController.WorkerTag.GENERATION: trtllm_worker},

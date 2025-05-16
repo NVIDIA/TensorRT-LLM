@@ -35,7 +35,6 @@ namespace tensorrt_llm::batch_manager
 {
 enum class TrtGptModelType
 {
-    V1,
     InflightBatching,
     InflightFusedBatching
 };
@@ -69,6 +68,22 @@ public:
         TLLM_CHECK_WITH_INFO(mMaxBatchSize <= modelConfig.getMaxBatchSize(),
             "Runtime configured max batch size (%d) must not exceed engine max batch size (%d)", mMaxBatchSize,
             modelConfig.getMaxBatchSize());
+        if (optionalParams.enableTrtOverlap)
+        {
+            if (mMaxBeamWidth > 1)
+            {
+                mEnableTrtOverlap = false;
+                TLLM_LOG_WARNING(
+                    "TRT overlap is not supported with beam search (maxBeamWidth is set to %d) and will be disabled.",
+                    mMaxBeamWidth);
+            }
+            if (!modelConfig.getSpeculativeDecodingMode().isNone())
+            {
+                mEnableTrtOverlap = false;
+                TLLM_LOG_WARNING("TRT overlap is not supported with speculative decoding and will be disabled.");
+            }
+        }
+
         mMaxAttentionWindow = 0;
         if (optionalParams.kvCacheConfig.maxAttentionWindowVec.has_value())
         {

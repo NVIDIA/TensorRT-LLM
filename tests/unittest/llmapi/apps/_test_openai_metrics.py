@@ -11,6 +11,8 @@ from tensorrt_llm.serve.openai_server import OpenAIServer
 
 from ..test_llm import llama_model_path
 
+pytestmark = pytest.mark.threadleak(enabled=False)
+
 
 @pytest.fixture(scope="module")
 def client():
@@ -22,9 +24,7 @@ def client():
                      kv_cache_config=KvCacheConfig(),
                      backend="pytorch",
                      pytorch_backend_config=PyTorchConfig(
-                         enable_overlap_scheduler=True,
-                         enable_iter_perf_stats=True,
-                     ))
+                         enable_iter_perf_stats=True, ))
     hf_tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
 
     app_instance = OpenAIServer(llm,
@@ -32,9 +32,6 @@ def client():
                                 hf_tokenizer=hf_tokenizer)
     client = TestClient(app_instance.app)
     yield client
-
-    del llm
-    del app_instance.llm
 
 
 def test_health(client):

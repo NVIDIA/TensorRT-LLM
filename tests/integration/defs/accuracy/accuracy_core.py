@@ -15,6 +15,7 @@
 import json
 import math
 import os
+import tempfile
 from typing import Dict, List, Optional, Union
 
 import pytest
@@ -23,35 +24,45 @@ import yaml
 
 import tensorrt_llm.evaluate
 from tensorrt_llm._torch import LLM as PyTorchLLM
+from tensorrt_llm._torch.speculative import SpecConfig
 from tensorrt_llm.builder import BuildConfig
 from tensorrt_llm.llmapi import LLM, SamplingParams
+from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..common import venv_check_call, venv_mpi_check_call
 from ..conftest import llm_models_root
-from ..trt_test_alternative import check_call, exists, makedirs
+from ..trt_test_alternative import check_call, exists
+
+
+def compute_theta(num_samples: int,
+                  sigma: float,
+                  alpha: float = 0.05,
+                  beta: float = 0.2):
+    scale = (2 * sigma**2 / num_samples)**0.5
+
+    # Single-tail testing
+    z_alpha = scipy.stats.norm.ppf(alpha)
+    z_beta = scipy.stats.norm.ppf(beta)
+    theta = -(z_alpha + z_beta) * scale
+    return theta
 
 
 def compute_threshold(num_samples: int,
                       ref_accuracy: float,
                       sigma: float,
                       alpha: float = 0.05,
-                      beta: float = 0.2,
                       higher_is_better: bool = True):
     scale = (2 * sigma**2 / num_samples)**0.5
 
     # Single-tail testing
     z_alpha = scipy.stats.norm.ppf(alpha)
     if higher_is_better:
-        threshold = ref_accuracy + z_alpha * scale
+        return ref_accuracy + z_alpha * scale
     else:
-        threshold = ref_accuracy - z_alpha * scale
-
-    z_beta = scipy.stats.norm.ppf(beta)
-    theta = -(z_alpha + z_beta) * scale
-    return threshold, theta
+        return ref_accuracy - z_alpha * scale
 
 
 class AccuracyTask:
@@ -73,9 +84,13 @@ class AccuracyTask:
     MAX_OUTPUT_LEN = None
     MAX_BATCH_SIZE = None
 
+    # Evaluator
+    EVALUATOR_CLS = None
+    EVALUATOR_KWARGS = None
+
     def __init__(self, model_name: str):
         with open(f"{self.REFERENCE_DIR}/{self.DATASET}.yaml") as f:
-            self.reference = yaml.safe_load(f)[model_name]
+            self.reference: List[dict] = yaml.safe_load(f).get(model_name, [])
 
     def get_num_samples_and_threshold(self, **acc_specs):
         """Get num_samples and threshold via accuracy specifications.
@@ -109,12 +124,12 @@ class AccuracyTask:
         sigma = entry.get("sigma", self.SIGMA)
         num_samples = entry.get("num_samples", self.NUM_SAMPLES)
         higher_is_better = entry.get("higher_is_better", self.HIGHER_IS_BETTER)
-        threshold, theta = compute_threshold(num_samples,
-                                             accuracy,
-                                             sigma=sigma,
-                                             alpha=alpha,
-                                             beta=beta,
-                                             higher_is_better=higher_is_better)
+        theta = compute_theta(num_samples, sigma=sigma, alpha=alpha, beta=beta)
+        threshold = compute_threshold(num_samples,
+                                      accuracy,
+                                      sigma=sigma,
+                                      alpha=alpha,
+                                      higher_is_better=higher_is_better)
         print("===========================================================\n"
               "= ACCURACY HYPOTHESIS TESTING\n"
               "===========================================================\n"
@@ -128,32 +143,54 @@ class AccuracyTask:
               "===========================================================\n")
         return num_samples, threshold
 
-    def create_evaluator(self, **kwargs):
-        raise NotImplementedError()
-
     def evaluate(self,
                  llm: Union[LLM, PyTorchLLM],
-                 extra_acc_spec: Optional[str] = None):
-        spec_dec_algo = None
-        if llm.args.speculative_config is not None:
-            spec_dec_algo = llm.args.speculative_config.decoding_type
+                 extra_acc_spec: Optional[str] = None,
+                 extra_evaluator_kwargs: Optional[dict] = None):
+        assert self.EVALUATOR_CLS is not None
 
-        num_samples, threshold = self.get_num_samples_and_threshold(
-            dtype=llm.args.dtype,
-            quant_algo=llm.args.quant_config.quant_algo,
-            kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
-            spec_dec_algo=spec_dec_algo,
-            extra_acc_spec=extra_acc_spec)
+        if llm.args.speculative_config is None:
+            spec_dec_algo = None
+        elif isinstance(llm.args.speculative_config, DecodingBaseConfig):
+            spec_dec_algo = llm.args.speculative_config.decoding_type
+        elif isinstance(llm.args.speculative_config, SpecConfig):
+            spec_dec_algo = llm.args.speculative_config.spec_dec_name
+        else:
+            raise ValueError(
+                f"Not recognized speculative_config: {llm.args.speculative_config}."
+            )
+        is_integration_test = os.getenv('INTEGRATION_TEST', '0') == '1'
+
+        if is_integration_test:
+            num_samples = 1
+            logger.info(
+                "Running in INTEGRATION_TEST mode: using only 1 sample and skipping accuracy verification"
+            )
+            threshold = 0
+        else:
+            num_samples, threshold = self.get_num_samples_and_threshold(
+                dtype=llm.args.dtype,
+                quant_algo=llm.args.quant_config.quant_algo,
+                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                spec_dec_algo=spec_dec_algo,
+                extra_acc_spec=extra_acc_spec)
 
         sampling_params = SamplingParams(
             max_tokens=self.MAX_OUTPUT_LEN,
             truncate_prompt_tokens=self.MAX_INPUT_LEN)
-        evaluator = self.create_evaluator(num_samples=num_samples)
+
+        evaluator_kwargs = {}
+        if self.EVALUATOR_KWARGS is not None:
+            evaluator_kwargs.update(self.EVALUATOR_KWARGS)
+        if extra_evaluator_kwargs is not None:
+            evaluator_kwargs.update(extra_evaluator_kwargs)
+        evaluator = self.EVALUATOR_CLS(num_samples=num_samples,
+                                       **evaluator_kwargs)
         accuracy = evaluator.evaluate(llm, sampling_params)
         if self.HIGHER_IS_BETTER:
-            assert accuracy >= threshold, f"Expected accuracy >= {threshold}, but got {accuracy}"
+            assert accuracy >= threshold, f"Expected accuracy >= {threshold}, but got {accuracy}."
         else:
-            assert accuracy <= threshold, f"Expected accuracy <= {threshold}, but got {accuracy}"
+            assert accuracy <= threshold, f"Expected accuracy <= {threshold}, but got {accuracy}."
 
 
 class CnnDailymail(AccuracyTask):
@@ -170,11 +207,10 @@ class CnnDailymail(AccuracyTask):
     MAX_INPUT_LEN = 924
     MAX_OUTPUT_LEN = 100
 
-    def create_evaluator(self, **kwargs):
-        return tensorrt_llm.evaluate.CnnDailymail(dataset_path=self.DATASET_DIR,
-                                                  random_seed=0,
-                                                  rouge_path=self.ROUGE_DIR,
-                                                  **kwargs)
+    EVALUATOR_CLS = tensorrt_llm.evaluate.CnnDailymail
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR,
+                            random_seed=0,
+                            rouge_path=ROUGE_DIR)
 
 
 class Humaneval(AccuracyTask):
@@ -228,7 +264,7 @@ class MMLU(AccuracyTask):
     DATASET = "mmlu"
     DATASET_DIR = f"{llm_models_root()}/datasets/mmlu"
 
-    ALPHA = 0.01
+    ALPHA = 0.05
     BETA = 0.2
     SIGMA = 50
     NUM_SAMPLES = 4096
@@ -237,10 +273,40 @@ class MMLU(AccuracyTask):
     MAX_INPUT_LEN = 4094
     MAX_OUTPUT_LEN = 2
 
-    def create_evaluator(self, **kwargs):
-        return tensorrt_llm.evaluate.MMLU(dataset_path=self.DATASET_DIR,
-                                          random_seed=0,
-                                          **kwargs)
+    EVALUATOR_CLS = tensorrt_llm.evaluate.MMLU
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
+
+
+class GSM8K(AccuracyTask):
+    DATASET = "gsm8k"
+    DATASET_DIR = f"{llm_models_root()}/datasets/openai/gsm8k"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50
+    NUM_SAMPLES = 1319  # Full sample
+
+    MAX_INPUT_LEN = 4096
+    MAX_OUTPUT_LEN = 256
+
+    EVALUATOR_CLS = tensorrt_llm.evaluate.GSM8K
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
+
+
+class GPQADiamond(AccuracyTask):
+    DATASET = "gpqa_diamond"
+    DATASET_DIR = f"{llm_models_root()}/datasets/gpqa"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50
+    NUM_SAMPLES = 198  # Full sample
+
+    MAX_INPUT_LEN = 4096
+    MAX_OUTPUT_LEN = 32768
+
+    EVALUATOR_CLS = tensorrt_llm.evaluate.GPQADiamond
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
 
 
 class PassKeyRetrieval64k(AccuracyTask):
@@ -280,32 +346,23 @@ class CliFlowAccuracyTestHarness:
     MODEL_FORMAT = "HF"
     EXAMPLE_FOLDER = None
 
-    @pytest.fixture(autouse=True)
+    @pytest.fixture(autouse=True, scope="class")
     @classmethod
     def setup_class(cls, request):
         cls.llm_venv = request.getfixturevalue("llm_venv")
         cls.llm_root = request.getfixturevalue("llm_root")
 
-    @property
-    def example_dir(self):
-        return f"{self.llm_root}/examples/{self.EXAMPLE_FOLDER}"
-
-    @property
-    def ckpt_dir(self):
-        ckpt_dir = f"{self.llm_venv.get_working_directory()}/cmodels/{self.MODEL_NAME}"
-        if not exists(ckpt_dir):
-            makedirs(ckpt_dir)
-        return ckpt_dir
-
-    @property
-    def engine_dir(self):
-        engine_dir = f"{self.llm_venv.get_working_directory()}/engines/{self.MODEL_NAME}"
-        if not exists(engine_dir):
-            makedirs(engine_dir)
-        return engine_dir
+    @pytest.fixture(autouse=True, scope="function")
+    def setup_method(self):
+        with tempfile.TemporaryDirectory(
+                prefix=self.MODEL_NAME.replace("/", "-"),
+                dir=self.llm_venv.get_working_directory()) as workspace:
+            self.ckpt_dir = f"{workspace}/cmodels"
+            self.engine_dir = f"{workspace}/engines"
+            yield
 
     def install_requirements(self):
-        requirements = f"{self.example_dir}/requirements.txt"
+        requirements = f"{self.llm_root}/examples/{self.EXAMPLE_FOLDER}/requirements.txt"
         if exists(requirements):
             self.llm_venv.run_cmd(["-m", "pip", "install", "-r", requirements])
 
@@ -360,12 +417,12 @@ class CliFlowAccuracyTestHarness:
 
         quant_config = QuantConfig(self.quant_algo, self.kv_cache_quant_algo)
         if not is_prequantized and quant_config._requires_modelopt_quantization:
-            script = "../quantization/quantize.py"
+            script = f"{self.llm_root}/examples/quantization/quantize.py"
         else:
-            script = "convert_checkpoint.py"
+            script = f"{self.llm_root}/examples/{self.EXAMPLE_FOLDER}/convert_checkpoint.py"
 
         convert_cmd = [
-            f"{self.example_dir}/{script}",
+            script,
             f"--output_dir={self.ckpt_dir}",
             f"--dtype={self.dtype}",
         ]
@@ -398,7 +455,7 @@ class CliFlowAccuracyTestHarness:
             if self.quant_algo == QuantAlgo.NVFP4:
                 convert_cmd.append("--use_nvfp4")
             elif self.quant_algo == QuantAlgo.FP8:
-                if self.EXAMPLE_FOLDER != "gpt":  # --use_fp8 flag is not needed for gpt.
+                if self.EXAMPLE_FOLDER != "models/core/gpt":  # --use_fp8 flag is not needed for gpt.
                     convert_cmd.append("--use_fp8")
             elif self.quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
                 convert_cmd.append("--use_fp8_rowwise")
@@ -428,7 +485,7 @@ class CliFlowAccuracyTestHarness:
             if self.kv_cache_quant_algo == QuantAlgo.INT8:
                 convert_cmd.append("--int8_kv_cache")
             elif self.kv_cache_quant_algo == QuantAlgo.FP8:
-                if self.EXAMPLE_FOLDER != "gpt":  # --fp8_kv_cache flag is not needed for gpt.
+                if self.EXAMPLE_FOLDER != "models/core/gpt":  # --fp8_kv_cache flag is not needed for gpt.
                     convert_cmd.append("--fp8_kv_cache")
 
         if quant_config._requires_calibration:
@@ -525,31 +582,30 @@ class CliFlowAccuracyTestHarness:
 
     def mmlu(self, task: AccuracyTask):
         print("Running mmlu...")
-        mmlu_cmd = [
-            f"{self.llm_root}/examples/mmlu_llmapi.py",
-            f"--engine_dir={self.engine_dir}",
-            f"--hf_model_dir={self.MODEL_PATH}",
-            f"--data_dir={task.DATASET_DIR}", "--backend=tensorrt",
-            "--random_seed=0", "--check_accuracy"
-        ]
-
         num_samples, threshold = task.get_num_samples_and_threshold(
             dtype=self.dtype,
             quant_algo=self.quant_algo,
             kv_cache_quant_algo=self.kv_cache_quant_algo,
             spec_dec_algo=self.spec_dec_algo,
             extra_acc_spec=self.extra_acc_spec)
-        mmlu_cmd.extend([
-            f"--num_samples={num_samples}", f"--accuracy_threshold={threshold}"
-        ])
 
-        if task.MAX_INPUT_LEN + task.MAX_OUTPUT_LEN > BuildConfig.max_num_tokens:
-            mmlu_cmd.append("--enable_chunked_prefill")
+        mmlu_cmd = [
+            "trtllm-eval",
+            f"--model={self.engine_dir}",
+            f"--tokenizer={self.MODEL_PATH}",
+            "--backend=tensorrt",
+        ]
 
         if self.extra_mmlu_args:
             mmlu_cmd.extend(self.extra_mmlu_args)
 
-        venv_check_call(self.llm_venv, mmlu_cmd, env=self.env)
+        mmlu_cmd.extend([
+            "mmlu", f"--dataset_path={task.DATASET_DIR}",
+            f"--num_samples={num_samples}", "--random_seed=0",
+            "--check_accuracy", f"--accuracy_threshold={threshold}"
+        ])
+
+        check_call(" ".join(mmlu_cmd), shell=True, env=self.llm_venv._new_env)
 
     def eval_long_context(self, task: AccuracyTask):
         print("Running construct_synthetic_dataset...")
@@ -645,6 +701,10 @@ class LlmapiAccuracyTestHarness:
     MODEL_NAME = None
     MODEL_PATH = None
 
+    @pytest.fixture(autouse=True, scope="class")
     @classmethod
     def setup_class(cls):
+        original_level = logger.level
         logger.set_level("info")
+        yield
+        logger.set_level(original_level)

@@ -704,8 +704,9 @@ class CustomAllReduceHelper:
         )
 
     @staticmethod
-    def max_workspace_size_auto(tp_size: int) -> int:
-        if force_all_reduce_deterministic():
+    def max_workspace_size_auto(tp_size: int,
+                                support_deterministic=True) -> int:
+        if force_all_reduce_deterministic() and support_deterministic:
             workspace_size = os.getenv("FORCE_ALLREDUCE_KERNEL_WORKSPACE_SIZE",
                                        "1000000000")
             return int(workspace_size)
@@ -746,7 +747,7 @@ class CustomAllReduceHelper:
                 lamport_buffers_0.local_ptr,
                 lamport_buffers_1.local_ptr,
                 lamport_buffers_2.local_ptr,
-                size * mapping.tp_size,
+                lamport_buffers_size,
             )
         buffers = [
             ipc_buffers_ping, ipc_buffers_pong, ipc_barriers_in,
@@ -775,9 +776,7 @@ class CustomAllReduceHelper:
         lamport_buffers_size = size * mapping.tp_size
         lamport_buffers = IpcMemory(mapping, 3 * lamport_buffers_size,
                                     is_p2p_supported)
-        rank = mapping.rank
-        tp_rank = mapping.tp_rank
-        if rank == tp_rank and is_p2p_supported:
+        if is_p2p_supported:
             lamport_initialize(
                 lamport_buffers.local_ptr,
                 3 * lamport_buffers_size,

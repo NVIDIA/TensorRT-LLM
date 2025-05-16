@@ -33,6 +33,10 @@ TensorRT-LLM consists of pre– and post-processing steps and multi-GPU multi-no
 TensorRT-LLM supports GPUs based on the NVIDIA Hopper, NVIDIA Ada Lovelace, and NVIDIA Ampere architectures.
 Certain limitations might apply. Refer to the {ref}`support-matrix` for more information.
 
+### Native Windows Support
+
+Windows platform support is deprecated as of v0.18.0. All Windows-related code and functionality will be completely removed in future releases.
+
 ## What Can You Do With TensorRT-LLM?
 
 Let TensorRT-LLM accelerate inference performance on the latest LLMs on NVIDIA GPUs. Use TensorRT-LLM as an optimization backbone for LLM inference in NVIDIA NeMo, an end-to-end framework to build, customize, and deploy generative AI applications into production. NeMo provides complete containers, including TensorRT-LLM and NVIDIA Triton, for generative AI deployments.

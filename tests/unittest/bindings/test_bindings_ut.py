@@ -337,7 +337,7 @@ def test_llm_request():
     assert llm_request.streaming
     assert llm_request.pad_id == 99
     assert llm_request.end_id == 100
-    assert llm_request.seq_slot == None
+    assert llm_request.seq_slot is None
     assert torch.equal(llm_request.prompt_embedding_table(),
                        kwargs["prompt_embedding_table"])
     assert llm_request.prompt_vocab_size == 2
@@ -434,7 +434,7 @@ def test_trt_gpt_model_optional_params():
     assert opt_params.max_beam_width == 4
 
     assert opt_params.scheduler_config.capacity_scheduler_policy == _tb.executor.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
-    assert opt_params.scheduler_config.context_chunking_policy == None
+    assert opt_params.scheduler_config.context_chunking_policy is None
     opt_params.scheduler_config = _tb.executor.SchedulerConfig(
         _tb.executor.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         _tb.executor.ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
@@ -472,20 +472,26 @@ def test_KvCacheConfig_pickle():
 
 
 def test_TrtGptModelOptionalParams_pickle():
-    cache = _tb.KvCacheConfig(free_gpu_memory_fraction=0.4)
-    params1 = _tb.TrtGptModelOptionalParams(
-        kv_cache_config=cache,
-        enable_trt_overlap=True,
-    )
-    params1.enable_chunked_context = True
+    kv_cache_config = _tb.KvCacheConfig(10, [10], 0, 0.5, False)
+    enable_trt_overlap = True
+    device_ids = [0, 1]
+    normalize_log_probs = False
+    enable_chunked_context = True
+    peft_cache_manager_config = _tb.PeftCacheManagerConfig()
+
+    params1 = _tb.TrtGptModelOptionalParams(kv_cache_config, enable_trt_overlap,
+                                            device_ids, normalize_log_probs,
+                                            enable_chunked_context,
+                                            peft_cache_manager_config)
+
     params2 = pickle.loads(pickle.dumps(params1))
 
-    assert params2 == params1
-
-    params1 = _tb.TrtGptModelOptionalParams()
-    params2 = pickle.loads(pickle.dumps(params1))
-
-    assert params2 == params1
+    assert params2.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
+    assert params2.enable_trt_overlap
+    assert params2.device_ids == device_ids
+    assert params2.normalize_log_probs == normalize_log_probs
+    assert params2.enable_chunked_context == enable_chunked_context
+    assert params2.gpu_weights_percent == 1
 
 
 def test_Mpicomm():
@@ -549,8 +555,10 @@ def test_KvCache_events_binding():
         'max_beam_width':
         1,
         'max_attention_window_vec': [10],
-        'temporary_attention_window':
-        0,
+        'temp_attention_window_inputs':
+        None,
+        'dtype':
+        _tb.DataType.FLOAT,
         'sink_token_length':
         0,
         'stream':
@@ -579,3 +587,21 @@ def test_KvCache_events_binding():
 
     del stream
     torch.cuda.empty_cache()
+
+
+def test_ReqIdsSet_pickle():
+    ids = _tb.internal.batch_manager.ReqIdsSet()
+    ids1 = pickle.loads(pickle.dumps(ids))
+    assert ids1 == ids
+
+    ids.insert(0)
+    ids.insert(1)
+    ids.insert(2)
+    ids1 = pickle.loads(pickle.dumps(ids))
+    assert ids1 == ids
+
+    ids1.erase(0)
+    ids2 = _tb.internal.batch_manager.ReqIdsSet()
+    ids2.insert(1)
+    ids2.insert(2)
+    assert ids1 == ids2

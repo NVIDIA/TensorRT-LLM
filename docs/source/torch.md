@@ -41,6 +41,7 @@ scripts/huggingface_example.sh --model <huggingface_model_card> --quant fp8 --ex
 
 - [Architecture Overview](./torch/arch_overview.md)
 - [Adding a New Model](./torch/adding_new_model.md)
+- [Examples](../../examples/pytorch/README.md)
 
 ## Key Components
 
@@ -50,4 +51,4 @@ scripts/huggingface_example.sh --model <huggingface_model_card> --quant fp8 --ex
 
 ## Known Issues
 
-- The PyTorch workflow on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the [PyTorch NGC Container (https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) for optimal support on SBSA platforms.
+- The PyTorch workflow on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) for optimal support on SBSA platforms.

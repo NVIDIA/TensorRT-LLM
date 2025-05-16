@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import Annotated, Required, TypedDict
 
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import SamplingParams
+from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
 
 
 class OpenAIBaseModel(BaseModel):
@@ -44,9 +44,17 @@ class ModelList(OpenAIBaseModel):
     data: List[ModelCard] = Field(default_factory=list)
 
 
+class StructuralTag(OpenAIBaseModel):
+    begin: str
+    schema_: Optional[dict[str, Any]] = Field(alias="schema")
+    end: str
+
+
 class ResponseFormat(OpenAIBaseModel):
-    # type must be "json_object" or "text"
-    type: Literal["text", "json_object"]
+    # type must be "json_object" or "text" or "structural_tag"
+    type: Literal["text", "json_object", "structural_tag"]
+    structures: Optional[List[StructuralTag]] = None
+    triggers: Optional[List[str]] = None
 
 
 class DisaggregatedParams(OpenAIBaseModel):
@@ -88,22 +96,6 @@ class CompletionResponseChoice(OpenAIBaseModel):
     )
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
 
-    @staticmethod
-    def to_disaggregated_params(
-            tllm_disagg_params: LlmDisaggregatedParams) -> DisaggregatedParams:
-        if tllm_disagg_params is None:
-            return None
-        else:
-            encoded_opaque_state = base64.b64encode(
-                tllm_disagg_params.opaque_state).decode(
-                    "utf-8") if tllm_disagg_params is not None else None
-            return DisaggregatedParams(
-                request_type=tllm_disagg_params.request_type,
-                first_gen_tokens=tllm_disagg_params.first_gen_tokens,
-                ctx_request_id=tllm_disagg_params.ctx_request_id,
-                encoded_opaque_state=encoded_opaque_state,
-                draft_tokens=tllm_disagg_params.draft_tokens)
-
 
 class CompletionResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"cmpl-{str(uuid.uuid4().hex)}")
@@ -135,6 +127,23 @@ class CompletionStreamResponse(OpenAIBaseModel):
     model: str
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = Field(default=None)
+
+
+def _response_format_to_guided_decoding_params(
+    response_format: Optional[ResponseFormat]
+) -> Optional[GuidedDecodingParams]:
+    if response_format is None:
+        return None
+    elif response_format.type == "text":
+        return None
+    elif response_format.type == "json_object":
+        return GuidedDecodingParams(json_object=True)
+    elif response_format.type == "structural_tag":
+        return GuidedDecodingParams(
+            structural_tag=response_format.model_dump_json(by_alias=True,
+                                                           exclude_none=True))
+    else:
+        raise ValueError(f"Unsupported response format: {response_format.type}")
 
 
 class CompletionRequest(OpenAIBaseModel):
@@ -186,10 +195,10 @@ class CompletionRequest(OpenAIBaseModel):
     )
     response_format: Optional[ResponseFormat] = Field(
         default=None,
-        description=(
-            "Similar to chat completion, this parameter specifies the format of "
-            "output. Only {'type': 'json_object'} or {'type': 'text' } is "
-            "supported."),
+        description=
+        ("Similar to chat completion, this parameter specifies the format of "
+         "output. {'type': 'json_object'}, {'type': 'text' }, {'type': 'structural_tag'} are "
+         "supported."),
     )
 
     disaggregated_params: Optional[DisaggregatedParams] = Field(
@@ -203,7 +212,6 @@ class CompletionRequest(OpenAIBaseModel):
         sampling_params = SamplingParams(
             best_of=self.best_of,
             frequency_penalty=self.frequency_penalty,
-            return_log_probs=self.logprobs,
             max_tokens=self.max_tokens,
             n=self.n,
             presence_penalty=self.presence_penalty,
@@ -228,26 +236,16 @@ class CompletionRequest(OpenAIBaseModel):
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             return_context_logits=self.return_context_logits,
+            guided_decoding=_response_format_to_guided_decoding_params(
+                self.response_format),
 
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
+
+            # TODO: migrate to use logprobs and prompt_logprobs
+            _return_log_probs=self.logprobs,
         )
         return sampling_params
-
-    def to_llm_disaggregated_params(self) -> LlmDisaggregatedParams:
-        if self.disaggregated_params is None:
-            return None
-        else:
-            opaque_state = base64.b64decode(
-                self.disaggregated_params.encoded_opaque_state
-            ) if self.disaggregated_params.encoded_opaque_state is not None else None
-
-            return LlmDisaggregatedParams(
-                request_type=self.disaggregated_params.request_type,
-                first_gen_tokens=self.disaggregated_params.first_gen_tokens,
-                ctx_request_id=self.disaggregated_params.ctx_request_id,
-                opaque_state=opaque_state,
-                draft_tokens=self.disaggregated_params.draft_tokens)
 
     def model_post_init(self, __context: Any) -> None:
         if self.best_of is None:
@@ -263,9 +261,8 @@ class CompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
-        if ("top_logprobs" in data and data.get("top_logprobs")) or \
-            ("logprobs" in data and data.get("logprobs")):
-            raise ValueError("returning log probs is not supported")
+        if data.get("logprobs"):
+            raise ValueError("logprobs is not supported")
         return data
 
     @model_validator(mode="before")
@@ -287,25 +284,9 @@ class CompletionRequest(OpenAIBaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def check_response_format(cls, data):
-        if data.get("response_format"):
-            raise ValueError("response_format is not supported")
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
     def check_suffix(cls, data):
         if data.get("suffix"):
             raise ValueError("suffix is not supported")
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def check_special_tokens(cls, data):
-        if data.get("skip_special_tokens") or data.get("add_special_tokens") or \
-            data.get("spaces_between_special_tokens"):
-            raise ValueError(
-                "special_tokens related settings are not supported")
         return data
 
 
@@ -324,6 +305,7 @@ class ToolCall(OpenAIBaseModel):
 class ChatMessage(OpenAIBaseModel):
     role: str
     content: str
+    reasoning_content: Optional[str] = None
     tool_calls: List[ToolCall] = Field(default_factory=list)
 
 
@@ -379,6 +361,8 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = None
 
+    disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
+
 
 class ChatCompletionResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"chatcmpl-{str(uuid.uuid4().hex)}")
@@ -392,6 +376,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
 class DeltaMessage(OpenAIBaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
     tool_calls: List[ToolCall] = Field(default_factory=list)
 
 
@@ -439,7 +424,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     model: str
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
-    logprobs: Optional[bool] = False
+    logprobs: Optional[int] = None
     top_logprobs: Optional[int] = 0
     max_completion_tokens: int = Field(default=16,
                                        validation_alias='max_tokens')
@@ -450,7 +435,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
-    temperature: Optional[float] = 0.7
+    temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none"],
@@ -520,13 +505,17 @@ class ChatCompletionRequest(OpenAIBaseModel):
                      "Will be accessible by the chat template."),
     )
 
+    disaggregated_params: Optional[DisaggregatedParams] = Field(
+        default=None,
+        description=("Parameters for disaggregated serving"),
+    )
+
     # doc: end-chat-completion-extra-params
 
     def to_sampling_params(self) -> SamplingParams:
 
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
-            return_log_probs=self.logprobs,
             max_tokens=self.max_completion_tokens,
             n=self.n,
             presence_penalty=self.presence_penalty,
@@ -551,9 +540,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
             skip_special_tokens=self.skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
+            guided_decoding=_response_format_to_guided_decoding_params(
+                self.response_format),
 
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
+
+            # TODO: migrate to use logprobs and prompt_logprobs
+            _return_log_probs=self.logprobs,
         )
         return sampling_params
 
@@ -612,23 +606,45 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def check_response_format(cls, data):
-        if data.get("response_format"):
-            raise ValueError("response_format is not supported")
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
     def check_suffix(cls, data):
         if data.get("suffix"):
             raise ValueError("suffix is not supported")
         return data
 
-    @model_validator(mode="before")
-    @classmethod
-    def check_special_tokens(cls, data):
-        if data.get("skip_special_tokens") or data.get("add_special_tokens") or \
-            data.get("spaces_between_special_tokens"):
-            raise ValueError(
-                "special_tokens related settings are not supported")
-        return data
+
+def encode_opaque_state(opaque_state: Optional[bytes]) -> Optional[str]:
+    if opaque_state is None:
+        return None
+    return base64.b64encode(opaque_state).decode("utf-8")
+
+
+def decode_opaque_state(encoded_opaque_state: Optional[str]) -> Optional[bytes]:
+    if encoded_opaque_state is None:
+        return None
+    return base64.b64decode(encoded_opaque_state)
+
+
+def to_disaggregated_params(
+        tllm_disagg_params: LlmDisaggregatedParams) -> DisaggregatedParams:
+    if tllm_disagg_params is None:
+        return None
+    return DisaggregatedParams(
+        request_type=tllm_disagg_params.request_type,
+        first_gen_tokens=tllm_disagg_params.first_gen_tokens,
+        ctx_request_id=tllm_disagg_params.ctx_request_id,
+        encoded_opaque_state=encode_opaque_state(
+            tllm_disagg_params.opaque_state),
+        draft_tokens=tllm_disagg_params.draft_tokens)
+
+
+def to_llm_disaggregated_params(
+        disaggregated_params: DisaggregatedParams) -> LlmDisaggregatedParams:
+    if disaggregated_params is None:
+        return None
+    return LlmDisaggregatedParams(
+        request_type=disaggregated_params.request_type,
+        first_gen_tokens=disaggregated_params.first_gen_tokens,
+        ctx_request_id=disaggregated_params.ctx_request_id,
+        opaque_state=decode_opaque_state(
+            disaggregated_params.encoded_opaque_state),
+        draft_tokens=disaggregated_params.draft_tokens)

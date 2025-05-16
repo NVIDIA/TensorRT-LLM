@@ -516,6 +516,10 @@ def test_attention_backend(s: Scenario):
         },
     )
 
+    del flashinfer_kv_cache
+    del ref_kv_cache
+    torch.cuda.empty_cache()
+
 
 def generate_causal_mask(seq_lens, qo_lens, batch_size, dtype):
     causal_masks = []
@@ -543,11 +547,11 @@ def generate_causal_mask(seq_lens, qo_lens, batch_size, dtype):
 
 
 @pytest.mark.parametrize("s", [
-    PagedScenario(num_layers=32, num_generations=5),
-    PagedScenario(num_layers=32, num_generations=5, kv_len=64, causal=False),
+    PagedScenario(num_layers=4, num_generations=5),
+    PagedScenario(num_layers=4, num_generations=5, kv_len=64, causal=False),
     PagedScenario(
-        num_layers=32, num_generations=5, kvcache_dtype=torch.float8_e4m3fn),
-    PagedScenario(num_layers=32,
+        num_layers=4, num_generations=5, kvcache_dtype=torch.float8_e4m3fn),
+    PagedScenario(num_layers=4,
                   num_generations=5,
                   kv_len=64,
                   causal=False,
@@ -697,7 +701,7 @@ def test_attention_backend_ifb(s: PagedScenario):
                               atol=fp8_atol if is_fp8 else atol,
                               rtol=rtol)
 
-
-if __name__ == "__main__":
-    test_attention_backend(Scenario(num_layers=1))
-    # test_attention_backend(Scenario(num_layers=1, qo_len=32, kv_len=32, causal=False))
+    del flashinfer_kv_cache
+    del ref_kv_cache
+    del vanilla_kv_cache
+    torch.cuda.empty_cache()

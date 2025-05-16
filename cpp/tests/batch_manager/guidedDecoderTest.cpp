@@ -33,7 +33,7 @@ namespace
 auto const TEST_RESOURCE_PATH = std::filesystem::path{TOP_LEVEL_DIR} / "cpp/tests/resources";
 auto const DATA_PATH = TEST_RESOURCE_PATH / "data";
 auto const GPT_XGRAMMAR_TOKENIZER_INFO_PATH = DATA_PATH / "gpt2" / "xgrammar_tokenizer_info.json";
-auto const LLAMA_XGRAMMAR_TOKENIZER_INFO_PATH = DATA_PATH / "llama-7b-hf" / "xgrammar_tokenizer_info.json";
+auto const LLAMA_XGRAMMAR_TOKENIZER_INFO_PATH = DATA_PATH / "Llama-3.2-1B" / "xgrammar_tokenizer_info.json";
 } // namespace
 
 class GuidedDecoderTest : public ::testing::Test
@@ -194,9 +194,9 @@ TEST_F(GuidedDecoderTest, LlamaTokenizer)
     VecTokens outputIds{6377, 893, 333, 1115, 376, 27247, 6779, 7898, 545, 613, 376, 8926, 17830, 1115, 376, 29956,
         7228, 29906, 29899, 10399, 7734, 613, 376, 4980, 2103, 1115, 376, 29896, 29941, 29900, 29900, 341, 29890, 567,
         9092};
-    std::vector<int32_t> expectedNumRejected{31989, 272, 272, 272, 31846, 265, 265, 265, 265, 265, 31915, 272, 272, 272,
-        31846, 265, 265, 265, 265, 265, 265, 265, 31915, 272, 272, 272, 31846, 265, 265, 265, 265, 265, 265, 265, 265,
-        31999};
-    initData(LLAMA_XGRAMMAR_TOKENIZER_INFO_PATH, 32000, outputIds, expectedNumRejected);
+    std::vector<int32_t> expectedNumRejected{128235, 128235, 128235, 128235, 128235, 128235, 128235, 128235, 128235,
+        128235, 128235, 128235, 128235, 128235, 128235, 128235, 128235, 128235, 128235, 128235, 128235, 128235, 128235,
+        128235, 128235, 128235, 128235, 128235, 128235, 128235, 128235, 128235, 128235, 128235, 128235, 128235};
+    initData(LLAMA_XGRAMMAR_TOKENIZER_INFO_PATH, 128256, outputIds, expectedNumRejected);
     runTest();
 }

@@ -10,6 +10,7 @@ import yaml
 # isort: off
 import torch
 import tensorrt as trt
+from pathlib import Path
 from tensorrt_llm._utils import torch_dtype_to_str, to_json_file
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.logger import logger
@@ -38,8 +39,9 @@ def add_multimodal_arguments(parser):
                             'blip2', 'llava', 'llava_next', 'llava_onevision',
                             'llava_onevision_lmms', 'vila', 'nougat', 'cogvlm',
                             'fuyu', 'pix2struct', 'neva', 'kosmos-2',
-                            'video-neva', 'phi-3-vision', 'mllama', 'internvl',
-                            'qwen2_vl', 'internlm-xcomposer2', 'qwen2_audio'
+                            'video-neva', 'phi-3-vision', 'phi-4-multimodal',
+                            'mllama', 'internvl', 'qwen2_vl',
+                            'internlm-xcomposer2', 'qwen2_audio', 'pixtral'
                         ],
                         help="Model type")
     parser.add_argument(
@@ -130,6 +132,8 @@ class MultimodalEngineBuilder:
             build_kosmos_engine(args)
         elif args.model_type == 'phi-3-vision':
             build_phi_engine(args)
+        elif args.model_type == 'phi-4-multimodal':
+            build_phi4mm_engine(args)
         elif args.model_type == 'mllama':
             build_mllama_engine(args)
         elif args.model_type == 'internvl':
@@ -138,6 +142,8 @@ class MultimodalEngineBuilder:
             build_qwen2_vl_engine(args)
         elif args.model_type == 'qwen2_audio':
             build_qwen2_audio_engine(args)
+        elif args.model_type == "pixtral":
+            build_pixtral_engine(args)
         else:
             raise RuntimeError(f"Invalid model type {args.model_type}")
 
@@ -1014,6 +1020,152 @@ def build_phi_engine(args):
                      args.max_batch_size * (num_crops + 1))
 
 
+def build_phi4mm_engine(args):
+    logger.warning(
+        "Skipping TRT engine build for Phi-4-multimodal encoder.  MultimodalModelRunner will use PyTorch vision & audio encoder. Flash/SDPA attention in CLIP encoder is not compatible with torch.onnx.export and eager attention is unstable in PyTorch."
+    )
+
+    # Dump config.json needed by model runner
+    config_args = {
+        "builder_config": {
+            "precision": torch_dtype_to_str(torch.float16),
+            "model_type": "phi-4-multimodal",
+        }
+    }
+    os.makedirs(os.path.join(args.output_dir, "vision"), exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir, "audio"), exist_ok=True)
+    to_json_file(config_args,
+                 os.path.join(args.output_dir, "vision", "config.json"))
+    to_json_file(config_args,
+                 os.path.join(args.output_dir, "audio", "config.json"))
+    return
+
+    # Following code works ok with eager mode attention. Leaving it here so that it could
+    # be used once issues in torch / onnx mentioned above resolved.
+    processor = AutoProcessor.from_pretrained(args.model_path,
+                                              trust_remote_code=True)
+    raw_image = Image.new('RGB', [10, 10])  # dummy image
+
+    import numpy as np
+    audio_feature_size = 500
+    audio_compression_rate = 8
+    audio_sampling_rate = 16000
+    audio_len = int((audio_feature_size * audio_compression_rate + 2) *
+                    audio_sampling_rate / 100)
+    raw_audio = (np.zeros(audio_len), audio_sampling_rate)  # dummy audio
+
+    inputs = processor(text="<|image_1|><|audio_1|>\ndummy",
+                       images=[raw_image],
+                       audios=[raw_audio],
+                       return_tensors="pt")
+
+    img_embeds = inputs['input_image_embeds'].to(args.device, torch.float16)
+    img_attention_mask = inputs['image_attention_mask'].to(
+        args.device, torch.bool)
+    img_embeds = img_embeds.flatten(0, 1)  # (2, 3, 448, 448)
+    img_attention_mask = img_attention_mask.flatten(0, 1)  # (2, 32, 32)
+
+    aud_embeds = inputs['input_audio_embeds'].to(args.device,
+                                                 torch.float16)  # (1, 4000, 80)
+    aud_len, aud_dim = aud_embeds.shape[1:]
+    aud_embeds = torch.cat(
+        [aud_embeds,
+         aud_embeds.new_zeros(1, 4000 - aud_len, aud_dim)], dim=1)
+    aud_attention_mask = torch.ones(1, aud_embeds.shape[1]).to(
+        args.device, torch.bool)
+    aud_attention_mask[0, aud_len:] = 0
+
+    class Phi4VisionWrapper(torch.nn.Module):
+
+        def __init__(self, vision_model):
+            super().__init__()
+            self.vision_model = vision_model
+
+        @torch.no_grad
+        def forward(self, img_embeds, attention_mask):
+            features = self.vision_model.get_img_features(
+                img_embeds, attention_mask)
+            return self.vision_model.img_projection(features)
+
+    class Phi4AudioWrapper(torch.nn.Module):
+
+        def __init__(self, audio_model):
+            super().__init__()
+            self.audio_model = audio_model
+
+        @torch.no_grad
+        def forward(self, aud_embeds, attention_mask):
+            features, _ = self.audio_model.encoder(aud_embeds, attention_mask)
+            speech_out = self.audio_model.audio_projection['speech'](features)
+            vision_out = self.audio_model.audio_projection['vision'](features)
+            return torch.cat((speech_out, vision_out), dim=-1)
+
+    model = AutoModelForCausalLM.from_pretrained(args.model_path,
+                                                 torch_dtype='auto',
+                                                 trust_remote_code=True)
+
+    vision_model = model.model.embed_tokens_extend.image_embed
+    vision_model = vision_model.to(args.device, torch.float16)
+    vision_model.eval()
+    vision_wrapper = Phi4VisionWrapper(vision_model)
+
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    part_name = 'vision'
+    onnx_dir = f"{args.output_dir}/{part_name}/onnx"
+
+    export_onnx(vision_wrapper,
+                input=(img_embeds, img_attention_mask),
+                onnx_dir=onnx_dir,
+                input_names=['input', 'attention_mask'],
+                dynamic_axes={
+                    'input': {
+                        0: "batch"
+                    },
+                    'attention_mask': {
+                        0: "batch"
+                    }
+                })
+    build_trt_engine(
+        args.model_type,
+        input_sizes=[[list(img_embeds.shape[1:]) for _ in range(3)],
+                     [list(img_attention_mask.shape[1:]) for _ in range(3)]],
+        onnx_dir=onnx_dir,
+        engine_dir=f"{args.output_dir}/{part_name}",
+        max_batch_size=args.max_batch_size,
+        engine_name=f"visual_encoder.engine",
+        dtype=torch.float16)
+
+    audio_model = model.model.embed_tokens_extend.audio_embed
+    audio_model = audio_model.to(args.device, torch.float16)
+    audio_model.eval()
+    audio_wrapper = Phi4AudioWrapper(audio_model)
+
+    part_name = 'audio'
+    onnx_dir = f"{args.output_dir}/{part_name}/onnx"
+
+    export_onnx(audio_wrapper,
+                input=(aud_embeds, aud_attention_mask),
+                onnx_dir=onnx_dir,
+                input_names=['input', 'attention_mask'],
+                dynamic_axes={
+                    'input': {
+                        0: "batch"
+                    },
+                    'attention_mask': {
+                        0: 'batch'
+                    }
+                })
+    build_trt_engine(
+        args.model_type,
+        input_sizes=[[list(aud_embeds.shape[1:]) for _ in range(3)],
+                     [list(aud_attention_mask.shape[1:]) for _ in range(3)]],
+        onnx_dir=onnx_dir,
+        engine_dir=f"{args.output_dir}/{part_name}",
+        max_batch_size=args.max_batch_size,
+        engine_name=f"audio_encoder.engine",
+        dtype=torch.float16)
+
+
 def build_mllama_engine(args):
 
     class MLLaMAVisionWrapper(torch.nn.Module):
@@ -1174,7 +1326,7 @@ def build_qwen2_vl_engine(args):
     from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
     from transformers.models.qwen2_vl.modeling_qwen2_vl import (
         Qwen2VisionTransformerPretrainedModel, Qwen2VLVisionBlock,
-        VisionAttention, VisionRotaryEmbedding, apply_rotary_pos_emb_vision)
+        VisionAttention, VisionRotaryEmbedding)
 
     model = Qwen2VLForConditionalGeneration.from_pretrained(
         args.model_path,
@@ -1247,6 +1399,25 @@ def build_qwen2_vl_engine(args):
                                                       self.num_heads,
                                                       -1).permute(1, 0, 2,
                                                                   3).unbind(0)
+
+            # Copied from transformers.models.llama.modeling_qwen2_vl in v4.48
+            def rotate_half(x):
+                x1 = x[..., :x.shape[-1] // 2]
+                x2 = x[..., x.shape[-1] // 2:]
+                return torch.cat((-x2, x1), dim=-1)
+
+            def apply_rotary_pos_emb_vision(
+                    tensor: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+                orig_dtype = tensor.dtype
+                tensor = tensor.float()
+                cos = freqs.cos()
+                sin = freqs.sin()
+                cos = cos.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+                sin = sin.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+                output = (tensor * cos) + (rotate_half(tensor) * sin)
+                output = output.to(orig_dtype)
+                return output
+
             q = apply_rotary_pos_emb_vision(q.unsqueeze(0),
                                             rotary_pos_emb).squeeze(0)
             k = apply_rotary_pos_emb_vision(k.unsqueeze(0),
@@ -1408,3 +1579,158 @@ def build_qwen2_audio_engine(args):
                          'num_mul_bins': args.num_mul_bins,
                          'max_mel_seq_len': args.max_mel_seq_len
                      })
+
+
+def build_pixtral_engine(args):
+    processor = AutoProcessor.from_pretrained(args.model_path)
+    hf_config = AutoConfig.from_pretrained(args.model_path)
+    vision_config = hf_config.vision_config
+    raw_image = Image.new(
+        'RGB',
+        [vision_config.image_size, vision_config.image_size])  # dummy image
+
+    inputs = processor(text="dummy", images=[raw_image], return_tensors="pt")
+    pixel_values = inputs["pixel_values"].to(args.device, torch.bfloat16)
+    attention_mask = torch.zeros(
+        1, vision_config.image_size // vision_config.patch_size,
+        vision_config.image_size // vision_config.patch_size).to(
+            args.device, torch.bfloat16)
+
+    # isort: off
+    from transformers.models.pixtral.modeling_pixtral import \
+        apply_rotary_pos_emb
+    from transformers import Mistral3ForConditionalGeneration
+    from transformers.models.pixtral.modeling_pixtral import (PixtralAttention,
+                                                              PixtralVisionModel
+                                                              )
+    from transformers.models.mistral3.modeling_mistral3 import (
+        Mistral3MultiModalProjector, Mistral3PatchMerger)
+    # isort: on
+    @torch.no_grad
+    def attn_forward(self,
+                     hidden_states,
+                     attention_mask,
+                     position_embeddings,
+                     output_attentions=False):
+        batch, patches, _ = hidden_states.size()
+
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+
+        q = q.view(batch, patches, self.num_heads,
+                   self.head_dim).transpose(1, 2)
+        k = k.view(batch, patches, self.num_heads,
+                   self.head_dim).transpose(1, 2)
+        v = v.view(batch, patches, self.num_heads,
+                   self.head_dim).transpose(1, 2)
+        cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=0)
+
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=attention_mask).transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(batch, patches, -1)
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None
+
+    @torch.no_grad
+    def vision_tower_forward(self, pixel_values, attention_mask):
+        patch_embeds = self.patch_conv(pixel_values)  # (bs, c, h, w)
+
+        patch_embeds = patch_embeds.flatten(2).transpose(1, 2)  # (bs, h*w, c)
+        attention_mask = attention_mask.flatten(1)  # (bs, h*w)
+
+        patch_embeds = self.ln_pre(patch_embeds)
+        position_ids = self.position_ids.flatten()  # (h*w, )
+        position_embeddings = self.patch_positional_embedding(
+            patch_embeds, position_ids)
+
+        out = self.transformer(patch_embeds,
+                               attention_mask=attention_mask,
+                               position_embeddings=position_embeddings,
+                               output_hidden_states=False,
+                               output_attentions=False,
+                               return_dict=False)[0]
+        return out
+
+    @torch.no_grad
+    def patch_merger_forward(self, image_features, attention_mask):
+        h, w = attention_mask.shape[-2:]
+        bs, n, d = image_features.shape
+        image_grid = image_features.view(bs, h, w, d).permute(0, 3, 1, 2)
+        image_features = torch.nn.functional.unfold(image_grid, 2,
+                                                    stride=2).transpose(1, 2)
+        image_features = self.merging_layer(image_features)
+        return image_features
+
+    @torch.no_grad
+    def mm_projector_forward(self, image_features, attention_mask):
+        image_features = self.norm(image_features)
+        image_features = self.patch_merger(image_features, attention_mask)
+        hidden_states = self.linear_2(self.act(self.linear_1(image_features)))
+        return hidden_states
+
+    class PixtralVisionWrapper(torch.nn.Module):
+
+        def __init__(self, vision_tower, mm_projector):
+            super().__init__()
+            self.vision_tower = vision_tower
+            self.mm_projector = mm_projector
+
+        @torch.no_grad
+        def forward(self, pixel_values, attention_mask):
+            features = self.vision_tower(pixel_values, attention_mask)
+            out = self.mm_projector(features, attention_mask)
+            return out
+
+    model = Mistral3ForConditionalGeneration.from_pretrained(args.model_path,
+                                                             torch_dtype="auto")
+    vision_tower = model.vision_tower
+    mm_projector = model.multi_modal_projector
+
+    height = width = vision_config.image_size // vision_config.patch_size
+    mesh = torch.meshgrid(torch.arange(height),
+                          torch.arange(width),
+                          indexing="ij")
+    h_grid, v_grid = torch.stack(mesh, dim=-1).chunk(2, -1)
+    ids = h_grid[..., 0] * width + v_grid[..., 0]
+    vision_tower.register_buffer("position_ids", ids)
+
+    PixtralAttention.forward = attn_forward
+    PixtralVisionModel.forward = vision_tower_forward
+
+    Mistral3PatchMerger.forward = patch_merger_forward
+    Mistral3MultiModalProjector.forward = mm_projector_forward
+
+    vision_tower = vision_tower.to(args.device, torch.bfloat16)
+    mm_projector = mm_projector.to(args.device, torch.bfloat16)
+    vision_tower.eval()
+    mm_projector.eval()
+    wrapper = PixtralVisionWrapper(vision_tower, mm_projector)
+
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    part_name = 'vision'
+    onnx_dir = f"{args.output_dir}/{part_name}/onnx"
+
+    export_onnx(wrapper,
+                input=(pixel_values, attention_mask),
+                onnx_dir=onnx_dir,
+                input_names=['input', 'attention_mask'],
+                dynamic_axes={
+                    'input': {
+                        0: "batch"
+                    },
+                    'attention_mask': {
+                        0: "batch"
+                    }
+                })
+    build_trt_engine(
+        args.model_type,
+        input_sizes=[[list(pixel_values.shape[1:]) for _ in range(3)],
+                     [list(attention_mask.shape[1:]) for _ in range(3)]],
+        onnx_dir=onnx_dir,
+        engine_dir=args.output_dir,
+        max_batch_size=args.max_batch_size,
+        engine_name=f"model.engine",
+        dtype=torch.bfloat16)

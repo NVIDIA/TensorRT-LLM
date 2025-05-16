@@ -4,10 +4,6 @@ This document shows how to build and run a model using Prompt-Lookup speculative
 
 ## Overview
 
-The Prompt-Lookup speculative decoding directly copies from the input prompt and previous generated output as draft tokens while generating the later output. It works like Draft-Target-Model but involves only one Target LLM model without further fine-tuning.
-
-The Prompt-Lookup profit from the scenarios which have high n-gram overlap between input prompt and output, such as summarization, document QA, multi-turn chat, code editing, etc.
-
 The Prompt-Lookup has 3 additional hyperparameters that you need to specify to control the process of generation:
 - `prompt_lookup_num_tokens`: the number of tokens we extract from input prompt or previous generated output as draft tokens in one iteration, which the range is from 4 to 10 in common usage. Empirically, the larger the value is, the higher acceptance ratio but higher overhead is expected at the same time, so the right balance based on the models and application scenarios needs to be found.
 - `max_matching_ngram_size`: the number of tokens we get from the tail of the generated output as a pattern, which is used to match in input prompt or previous generated output. Empirically, the larger the value is, the more precise context can be matched from the existed sequence, indicating higher acceptance ratio, but the higher probability of miss-match and higher overhead appear, which fall back to normal generation (one token per iteration).
@@ -29,7 +25,7 @@ The Prompt-Lookup has 3 additional hyperparameters that you need to specify to c
 + `--max_draft_len` must be specified larger or equal to `prompt_lookup_num_tokens`.
 
 ```bash
-cd examples/llama
+cd examples/models/core/llama
 
 python3 convert_checkpoint.py \
     --model_dir=<Path To Llama-v2-13B repo> \
@@ -57,9 +53,9 @@ trtllm-build \
 + `--num_beams` can not be specified as larger than 1 since beam search is not supported in this approach yet.
 
 ```bash
-cd examples/llama
+cd examples/models/core/llama
 
-python3 ../run.py \
+python3 ../../../run.py \
     --tokenizer_dir <Path To Llama-v2-7B repo> \
     --engine_dir ./target-engine \
     --prompt_lookup_config="[10,2,[0]]" \
@@ -71,9 +67,9 @@ python3 ../run.py \
 ## Run summarization tasks
 
 ```bash
-cd examples/llama
+cd examples/models/core/llama
 
-python ../summarize.py \
+python ../../../summarize.py \
     --test_hf \
     --test_trt_llm \
     --check_accuracy \

@@ -123,6 +123,8 @@ Array<TValue, 1>& addConstantScalarResource(EngineBuildState& buildState, TValue
 }
 
 nvinfer1::ITensor& addInputIds(EngineBuildState& buildState, runtime::SizeType32 maxNumTokens);
+nvinfer1::ITensor* addLastTokenIds(
+    EngineBuildState& buildState, runtime::SizeType32 maxBatchSize, runtime::SizeType32 maxBeamWidth);
 nvinfer1::ITensor& addKvCacheOffsets(EngineBuildState& buildState, runtime::SizeType32 numPools,
     runtime::SizeType32 tokensPerBlock, runtime::SizeType32 maxBatchSize, runtime::SizeType32 maxNumTokens,
     runtime::SizeType32 maxBeamWidth);
@@ -204,17 +206,20 @@ nvinfer1::ITensor& oneHotEncode(
 struct TrivialDecoderParameters
 {
     TrivialDecoderParameters(runtime::SizeType32 vocabSize, runtime::SizeType32 maxBatchSize,
-        runtime::SizeType32 maxNumTokens, runtime::SizeType32 tokensPerBlock, runtime::SizeType32 maxBeamWidth)
+        runtime::SizeType32 maxNumTokens, runtime::SizeType32 tokensPerBlock, runtime::SizeType32 maxBeamWidth,
+        bool gatherContextLogits)
         : vocabSize(vocabSize)
         , maxBatchSize(maxBatchSize)
         , maxNumTokens(maxNumTokens)
         , tokensPerBlock(tokensPerBlock)
-        , maxBeamWidth(maxBeamWidth){};
+        , maxBeamWidth(maxBeamWidth)
+        , gatherContextLogits(gatherContextLogits){};
     runtime::SizeType32 vocabSize;
     runtime::SizeType32 maxBatchSize;
     runtime::SizeType32 maxNumTokens;
     runtime::SizeType32 tokensPerBlock;
     runtime::SizeType32 maxBeamWidth;
+    bool gatherContextLogits;
 };
 
 details::EngineBuildState initializeEngineBuild(std::shared_ptr<runtime::TllmLogger> const& logger);
@@ -270,6 +275,12 @@ details::EngineBuildState createConstantTrivialDecoderBase(
     auto* profile = buildState.profile;
     auto* network = buildState.networkDefinition.get();
     auto& inputIds = details::addInputIds(buildState, parameters.trivialDecoderParameters.maxNumTokens);
+    nvinfer1::ITensor* lastTokenIds = nullptr;
+    if (!parameters.trivialDecoderParameters.gatherContextLogits)
+    {
+        lastTokenIds = details::addLastTokenIds(buildState, parameters.trivialDecoderParameters.maxBatchSize,
+            parameters.trivialDecoderParameters.maxBeamWidth);
+    }
     auto& kvCacheOffsets = details::addKvCacheOffsets(buildState, 1, parameters.trivialDecoderParameters.tokensPerBlock,
         parameters.trivialDecoderParameters.maxBatchSize, parameters.trivialDecoderParameters.maxNumTokens,
         parameters.trivialDecoderParameters.maxBeamWidth);
@@ -284,8 +295,23 @@ details::EngineBuildState createConstantTrivialDecoderBase(
     auto* intermediateLayer1 = network->addMatrixMultiply(
         ones, nvinfer1::MatrixOperation::kNONE, oneHotLayerOutput, nvinfer1::MatrixOperation::kNONE);
     auto* intermediateLayer1Output = intermediateLayer1->getOutput(0);
-    auto* constLogitsLayer = network->addMatrixMultiply(*intermediateLayer1Output,
-        nvinfer1::MatrixOperation::kTRANSPOSE, constantLogitsPerToken, nvinfer1::MatrixOperation::kTRANSPOSE);
+
+    nvinfer1::ITensor* gatherLayerOutput = nullptr;
+    if (!parameters.trivialDecoderParameters.gatherContextLogits)
+    {
+        auto& one = details::addSingleConstantTensor<int32_t>(buildState, 1, runtime::ITensor::makeShape({1}));
+        auto* lastTokenIdsMinus1Layer
+            = network->addElementWise(*lastTokenIds, one, nvinfer1::ElementWiseOperation::kSUB);
+        auto* gatherLayer = network->addGather(*intermediateLayer1Output, *lastTokenIdsMinus1Layer->getOutput(0), 1);
+        gatherLayerOutput = gatherLayer->getOutput(0);
+    }
+    else
+    {
+        gatherLayerOutput = intermediateLayer1Output;
+    }
+
+    auto* constLogitsLayer = network->addMatrixMultiply(*gatherLayerOutput, nvinfer1::MatrixOperation::kTRANSPOSE,
+        constantLogitsPerToken, nvinfer1::MatrixOperation::kTRANSPOSE);
     auto* outputLogits = constLogitsLayer->getOutput(0);
     network->markOutput(*outputLogits);
     outputLogits->setName(batch_manager::RuntimeBuffers::kLogitsTensorName);

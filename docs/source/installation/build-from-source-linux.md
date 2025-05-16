@@ -2,7 +2,8 @@
 
 # Building from Source Code on Linux
 
-This document provides instructions for building TensorRT-LLM from source code on Linux. Building from source code is necessary if you want the best performance or debugging capabilities, or if the [GNU C++11 ABI](https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html) is required.
+This document provides instructions for building TensorRT-LLM from source code on Linux. Building from source is recommended for achieving optimal performance, enabling debugging capabilities, or when you need a different [GNU CXX11 ABI](https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html) configuration than what is available in the pre-built TensorRT-LLM wheel on PyPI. Note that the current pre-built TensorRT-LLM wheel on PyPI is linked against PyTorch 2.7.0, which uses the new CXX11 ABI.
+
 
 ## Prerequisites
 
@@ -149,7 +150,7 @@ Refer to the {ref}`support-matrix-hardware` section for a list of architectures.
 
 #### Building the Python Bindings for the C++ Runtime
 
-The C++ Runtime, in particular, `GptSession` can be exposed to Python via bindings. This feature can be turned on through the default build options.
+The C++ Runtime can be exposed to Python via bindings. This feature can be turned on through the default build options.
 
 ```bash
 python3 ./scripts/build_wheel.py
@@ -169,8 +170,7 @@ The `build_wheel.py` script will also compile the library containing the C++ run
 python3 ./scripts/build_wheel.py --cuda_architectures "80-real;86-real" --cpp_only --clean
 ```
 
-This is particularly useful to avoid linking problems which may be introduced by particular versions of `torch` related to the [dual ABI support of GCC](https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html). The option `--clean` will remove the build directory before building. The default build directory is `cpp/build`, which may be overridden using the option
-`--build_dir`. Run `build_wheel.py --help` for an overview of all supported options.
+This is particularly useful for avoiding linking issues that may arise with older versions of `torch` (prior to 2.7.0) due to the [Dual ABI support in GCC](https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html). The `--clean` option removes the build directory before starting a new build. By default, TensorRT-LLM uses `cpp/build` as the build directory, but you can specify a different location with the `--build_dir` option. For a complete list of available build options, run `python3 ./scripts/build_wheel.py --help`.
 
 The shared library can be found in the following location:
 
@@ -216,7 +216,5 @@ TRTLLM_PRECOMPILED_LOCATION=https://pypi.nvidia.com/tensorrt-llm/tensorrt_llm-0.
 ```
 
 #### Known Limitations
-
-Currently, our released TensorRT-LLM wheel packages are linked against public PyTorch hosted on PyPI, which disables C++11 ABI support. However, the Docker image built previously is based on an NGC container where PyTorch has C++11 ABI enabled; see [NGC PyTorch container page](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch). Therefore, we recommend performing a full build inside this container.
 
 When using `TRTLLM_PRECOMPILED_LOCATION`, ensure that your wheel is compiled based on the same version of C++ code as your current directory; any discrepancies may lead to compatibility issues.

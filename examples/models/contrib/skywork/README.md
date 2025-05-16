@@ -39,7 +39,7 @@ git clone https://huggingface.co/Skywork/Skywork-13B-base
 ### 2. Convert HF Model to TRT Checkpoint
 
 ```bash
-cd examples/llama
+cd examples/models/core/llama
 
 # fp16 model
 python3 convert_checkpoint.py --model_dir ./Skywork-13B-base \

@@ -15,14 +15,32 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/executor/executor.h"
-
-#include <algorithm>
 
 #include <algorithm>
 
 namespace tensorrt_llm::executor
 {
+
+KvCacheRetentionConfig::TokenRangeRetentionConfig::TokenRangeRetentionConfig(SizeType32 tokenStart,
+    std::optional<SizeType32> tokenEnd, RetentionPriority priority, std::optional<std::chrono::milliseconds> durationMs)
+    : tokenStart{tokenStart}
+    , tokenEnd{tokenEnd}
+    , priority{priority}
+    , durationMs{durationMs}
+{
+    TLLM_CHECK_WITH_INFO(priority >= KvCacheRetentionConfig::kMinRetentionPriority
+            && priority <= KvCacheRetentionConfig::kMaxRetentionPriority,
+        "Invalid priority value. Must be between %d and %d", KvCacheRetentionConfig::kMinRetentionPriority,
+        KvCacheRetentionConfig::kMaxRetentionPriority);
+};
+
+bool KvCacheRetentionConfig::TokenRangeRetentionConfig::operator==(TokenRangeRetentionConfig const& other) const
+{
+    return tokenStart == other.tokenStart && tokenEnd == other.tokenEnd && priority == other.priority
+        && durationMs == other.durationMs;
+}
 
 KvCacheRetentionConfig::KvCacheRetentionConfig(
     std::vector<KvCacheRetentionConfig::TokenRangeRetentionConfig> const& tokenRangeRetentionPriorities,

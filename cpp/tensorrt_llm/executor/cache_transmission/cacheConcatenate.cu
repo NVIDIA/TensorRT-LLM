@@ -76,12 +76,12 @@ TargetRanksInfo TargetRanksInfoForDP(
     int mDomainTPSize = 1;
     int peerTpRankEnd = 0;
     int peerDpRank
-        = peerCacheState.getParallelConfig().mEnableAttenionDP ? peerCacheState.getParallelConfig().mDPrank : 0;
-    int selfTPSizeOneDPGroup = selfCacheState.getParallelConfig().mEnableAttenionDP
+        = peerCacheState.getParallelConfig().mEnableAttentionDP ? peerCacheState.getParallelConfig().mDPrank : 0;
+    int selfTPSizeOneDPGroup = selfCacheState.getParallelConfig().mEnableAttentionDP
         ? selfCacheState.getParallelConfig().mTensorParallelism / selfCacheState.getParallelConfig().mDPsize
         : selfTPNum;
 
-    int peerTPSizeOneDPGroup = peerCacheState.getParallelConfig().mEnableAttenionDP
+    int peerTPSizeOneDPGroup = peerCacheState.getParallelConfig().mEnableAttentionDP
         ? peerCacheState.getParallelConfig().mTensorParallelism / peerCacheState.getParallelConfig().mDPsize
         : peerTPNum;
 
@@ -119,7 +119,8 @@ TargetRanksInfo targetIRanks(
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank)
 {
     if (selfCacheState.getAttentionConfig().mAttentionType == CacheState::AttentionType::kMLA
-        || selfCacheState.getParallelConfig().mEnableAttenionDP || peerCacheState.getParallelConfig().mEnableAttenionDP)
+        || selfCacheState.getParallelConfig().mEnableAttentionDP
+        || peerCacheState.getParallelConfig().mEnableAttentionDP)
     {
         return TargetRanksInfoForDP(peerCacheState, selfCacheState, selfRank);
     }

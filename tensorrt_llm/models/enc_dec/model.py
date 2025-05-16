@@ -1617,7 +1617,7 @@ class DecoderModel(PretrainedModel):
                 shape=[-1, -1, -1],
                 dim_range=OrderedDict([
                     ('batch_size_beam_width', [bb_range]),
-                    ('query_len', [1]),
+                    ('query_len', [inlen_range]),
                     ('encoder_input_len_2', [encoder_input_len_range]),
                 ]),
             )
@@ -1629,7 +1629,7 @@ class DecoderModel(PretrainedModel):
                 dim_range=OrderedDict([
                     ('decoder_num_tokens_2',
                      [decoder_num_tokens_range
-                      ]),  # TODO (bhsueh) should use same name as input_ids
+                      ]),  # TODO should use same name as input_ids
                     ('encoder_input_len_2', [encoder_input_len_range]),
                 ]),
             )

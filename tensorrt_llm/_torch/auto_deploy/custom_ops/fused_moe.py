@@ -35,7 +35,9 @@ def torch_moe(
         torch.Tensor: Output tensor with the same shape as the input x.
     """
 
-    hidden_dim = x.shape[-1]
+    x_shape = x.shape
+    hidden_dim = x_shape[-1]
+    x = x.view(-1, hidden_dim)
     num_experts = len(w1_weight)
 
     final_hidden_states = torch.zeros_like(x)
@@ -59,9 +61,11 @@ def torch_moe(
         expert_out = F.linear(prod, w2_weight[expert_idx])
 
         current_hidden_states = expert_out * routing_weights[top_x, idx, None]
-        final_hidden_states.index_add_(0, top_x, current_hidden_states)
+        final_hidden_states.index_add_(
+            0, top_x, current_hidden_states.to(final_hidden_states.dtype)
+        )
 
-    return final_hidden_states.view_as(x)
+    return final_hidden_states.view(x_shape)
 
 
 @torch_moe.register_fake
@@ -102,6 +106,8 @@ def torch_fused_moe(
     Returns:
         torch.Tensor: Output tensor with the same shape as the input x.
     """
+    x_shape = x.shape
+    x = x.view(-1, x_shape[-1])
     num_experts = w2_stacked_weight.shape[0]
     intermediate_size = w3_w1_stacked_weight.shape[1] // 2
     results = torch.zeros_like(x)
@@ -127,7 +133,7 @@ def torch_fused_moe(
         scaling = routing_weights[batch_idx, nth_expert].unsqueeze(-1)
         results[batch_idx] += scaling * expert_out
 
-    return results.view_as(x)
+    return results.view(x_shape)
 
 
 @torch_fused_moe.register_fake
@@ -149,8 +155,12 @@ def trtllm_fused_moe(
     w3_w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
 ) -> torch.Tensor:
+    x_shape = x.shape
+    x = x.view(-1, x_shape[-1])
+
     routing_weights = routing_weights.to(torch.float32)
     selected_experts = selected_experts.to(torch.int32)
+    quant_scales = []
 
     return torch.ops.trtllm.fused_moe(
         x,
@@ -159,11 +169,12 @@ def trtllm_fused_moe(
         w3_w1_stacked_weight,
         w2_stacked_weight,
         x.dtype,
+        quant_scales,
         tp_size=1,
         tp_rank=0,
         ep_size=1,
         ep_rank=0,
-    )
+    )[0].view(x_shape)
 
 
 @trtllm_fused_moe.register_fake

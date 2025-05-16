@@ -46,10 +46,11 @@ static constexpr int kLamportHiddenSizeThreshold = 256;
 enum class AllReduceStrategyType : int8_t
 {
     NCCL = 0,
-    ONESHOT = 1,
-    TWOSHOT = 2,
-    UB = 3,
-    AUTO = 4,
+    MIN_LATENCY = 1,
+    UB = 2,
+    AUTO = 3,
+    ONESHOT = 4,
+    TWOSHOT = 5,
 };
 
 enum class AllReduceStrategyConfig : int8_t
@@ -66,9 +67,35 @@ enum class AllReduceFusionOp : int8_t
     RESIDUAL_RMS_PREPOST_NORM = 3,
     RESIDUAL_RMS_NORM_QUANT_FP8 = 4,
     RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5,
-    MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 6,
-    RESIDUAL_RMS_NORM_AND_QUANT_NVFP4 = 7,
+    RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6,
+    RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7,
+    MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 8,
 };
+
+inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
+{
+    switch (op)
+    {
+    case AllReduceFusionOp::NONE: os << "NONE"; break;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM: os << "RESIDUAL_RMS_NORM"; break;
+    case AllReduceFusionOp::LAST_PROCESS_FOR_UB: os << "LAST_PROCESS_FOR_UB"; break;
+    case AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM: os << "RESIDUAL_RMS_PREPOST_NORM"; break;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: os << "RESIDUAL_RMS_NORM_QUANT_FP8"; break;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4: os << "RESIDUAL_RMS_NORM_QUANT_NVFP4"; break;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8: os << "RESIDUAL_RMS_NORM_OUT_QUANT_FP8"; break;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4: os << "RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4"; break;
+    case AllReduceFusionOp::MOE_ALLREDUCE_RESIDUAL_RMS_NORM: os << "MOE_ALLREDUCE_RESIDUAL_RMS_NORM"; break;
+    default: os << "UNKNOWN"; break;
+    }
+    return os;
+}
+
+inline std::string toString(AllReduceFusionOp op)
+{
+    std::ostringstream oss;
+    oss << op;
+    return oss.str();
+}
 
 struct AllReduceFusionParams
 {
