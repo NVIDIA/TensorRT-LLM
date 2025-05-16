@@ -15,9 +15,27 @@ LLM_ROOT = "llm"
 LLM_BRANCH = env.gitlabBranch? env.gitlabBranch : params.branch
 LLM_BRANCH_TAG = LLM_BRANCH.replaceAll('/', '_')
 
-BUILD_JOBS = "32"
+LLM_COMMIT_OR_BRANCH = env.gitlabCommit ?: (params.commit ? params.commit : LLM_BRANCH)
 
-def createKubernetesPodConfig(type)
+BUILD_JOBS = "32"
+BUILD_JOBS_RELEASE_X86_64 = "16"
+BUILD_JOBS_RELEASE_SBSA = "8"
+
+CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
+
+@Field
+def GITHUB_PR_API_URL = "github_pr_api_url"
+@Field
+def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
+@Field
+def ACTION_INFO = "action_info"
+def globalVars = [
+    (GITHUB_PR_API_URL): null,
+    (CACHED_CHANGED_FILE_LIST): null,
+    (ACTION_INFO): null,
+]
+
+def createKubernetesPodConfig(type, arch = "amd64")
 {
     def targetCould = "kubernetes-cpu"
     def containerConfig = ""
@@ -63,7 +81,20 @@ def createKubernetesPodConfig(type)
                         - SYS_ADMIN"""
         break
     }
-
+    def pvcVolume = """
+                - name: sw-tensorrt-pvc
+                  persistentVolumeClaim:
+                    claimName: sw-tensorrt-pvc
+    """
+    if (arch == "arm64") {
+        // PVC mount isn't supported on aarch64 platform. Use NFS as a WAR.
+        pvcVolume = """
+                - name: sw-tensorrt-pvc
+                  nfs:
+                    server: 10.117.145.13
+                    path: /vol/scratch1/scratch.svc_tensorrt_blossom
+        """
+    }
     def podConfig = [
         cloud: targetCould,
         namespace: "sw-tensorrt",
@@ -75,6 +106,7 @@ def createKubernetesPodConfig(type)
                 nodeSelector:
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux
+                  kubernetes.io/arch: ${arch}
                 containers:
                   ${containerConfig}
                   - name: jnlp
@@ -89,6 +121,12 @@ def createKubernetesPodConfig(type)
                         cpu: '2'
                         memory: 10Gi
                         ephemeral-storage: 25Gi
+                volumeMounts:
+                    - name: sw-tensorrt-pvc
+                      mountPath: "/mnt/sw-tensorrt-pvc"
+                      readOnly: false
+                volumes:
+                ${pvcVolume}
         """.stripIndent(),
     ]
 
@@ -96,13 +134,21 @@ def createKubernetesPodConfig(type)
 }
 
 
-def buildImage(target, action="build", torchInstallType="skip", args="", custom_tag="", post_tag="")
+def buildImage(config)
 {
-    def tag = "x86_64-${target}-torch_${torchInstallType}${post_tag}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
+    def target = config.target
+    def action = config.action
+    def torchInstallType = config.torchInstallType
+    def args = config.args
+    def customTag = config.customTag
+    def postTag = config.postTag
+    def arch = config.arch == 'arm64' ? 'aarch64' : 'x86_64'
+
+    def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
     // Step 1: cloning tekit source code
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
-    trtllm_utils.checkoutSource(LLM_REPO, LLM_BRANCH, LLM_ROOT, true, true)
+    trtllm_utils.checkoutSource(LLM_REPO, LLM_COMMIT_OR_BRANCH, LLM_ROOT, true, true)
 
     // Step 2: building wheels in container
     container("docker") {
@@ -128,27 +174,43 @@ def buildImage(target, action="build", torchInstallType="skip", args="", custom_
             }
         }
         try {
+            // Fix the build OOM issue of release builds
+            def build_jobs = BUILD_JOBS
+            if (target == "trtllm") {
+                build_jobs = BUILD_JOBS_RELEASE_X86_64
+            } else if (target == "trtllm_sbsa") {
+                build_jobs = BUILD_JOBS_RELEASE_SBSA
+            }
             containerGenFailure = null
             stage ("make ${target}_${action}") {
                 retry(3)
                 {
+                  // Fix the triton image pull timeout issue
+                  def TRITON_IMAGE = sh(script: "cd ${LLM_ROOT} && grep 'ARG TRITON_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+                  def TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep 'ARG TRITON_BASE_TAG=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+                  retry(3) {
+                    sh "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}"
+                  }
+
                   sh """
                   cd ${LLM_ROOT} && make -C docker ${target}_${action} \
                   TORCH_INSTALL_TYPE=${torchInstallType} \
                   IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${tag} \
-                  BUILD_WHEEL_OPTS='-j ${BUILD_JOBS}' ${args} \
+                  BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} \
+                  SHARED_CCACHE_DIR=${CCACHE_DIR} \
                   GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote
                   """
                 }
             }
 
-            if (custom_tag) {
-                stage ("custom tag: ${custom_tag}") {
+            if (customTag) {
+                stage ("custom tag: ${customTag}") {
                   sh """
                   cd ${LLM_ROOT} && make -C docker ${target}_${action} \
                   TORCH_INSTALL_TYPE=${torchInstallType} \
-                  IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${custom_tag} \
-                  BUILD_WHEEL_OPTS='-j ${BUILD_JOBS}' ${args} \
+                  IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${customTag} \
+                  BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} \
+                  SHARED_CCACHE_DIR=${CCACHE_DIR} \
                   GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote
                   """
                }
@@ -170,35 +232,116 @@ def buildImage(target, action="build", torchInstallType="skip", args="", custom_
 }
 
 
-def triggerSBSARemoteJob(action, type)
-{
-    script
-    {
-        def parameters = """
-            token=L1_Nightly_Token
-            hostJobName=${JOB_NAME}
-            hostBuildNumber=${BUILD_NUMBER}
-            gitlabBranch=${LLM_BRANCH}
-            action=${action}
-            type=${type}
-        """.stripIndent()
-
-        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE')
-        {
-            def handle = triggerRemoteJob(
-                job: "https://prod.blsm.nvidia.com/sw-tensorrt-static-1/job/LLM/job/helpers/job/gh200-BuildImage/",
-                auth: CredentialsAuth(credentials: "STATIC_1_TOKEN"),
-                parameters: parameters,
-                pollInterval: 60,
-                abortTriggeredJob: true,
-            )
-            def status = handle.getBuildResult().toString()
-
-            if (status != "SUCCESS") {
-                error "Downstream job did not succeed"
+def launchBuildJobs(pipeline) {
+    def defaultBuildConfig = [
+        target: "tritondevel",
+        action: params.action,
+        customTag: "",
+        postTag: "",
+        args: "",
+        torchInstallType: "skip",
+        arch: "amd64"
+    ]
+    def buildConfigs = [
+        "Build trtllm release(x86_64)": [
+            target: "trtllm_x86_64",
+            action: "push",
+            customTag: LLM_BRANCH_TAG + "-amd64",
+        ],
+        "Build trtllm release(aarch64)": [
+            target: "trtllm_aarch64",
+            action: "push",
+            customTag: LLM_BRANCH_TAG + "-arm64",
+            arch: "arm64"
+        ],
+        "Build CI image(x86_64)": [],
+        "Build CI image(aarch64)": [
+            arch: "arm64",
+        ],
+        "Build CI image(rockylinux8-py310)": [
+            target: "rockylinux8",
+            args: "PYTHON_VERSION=3.10.12 STAGE=tritondevel",
+            postTag: "-py310",
+        ],
+        "Build CI image(rockylinux8-py312)": [
+            target: "rockylinux8",
+            args: "PYTHON_VERSION=3.12.3 STAGE=tritondevel",
+            postTag: "-py312",
+        ],
+        "Build NGC devel(x86_64)": [
+            target: "devel",
+        ],
+        "Build NGC devel(aarch64)": [
+            target: "devel",
+            arch: "arm64",
+        ],
+        "Build NGC release(x86_64)": [
+            target: "ngc_release",
+            action: "push",
+            customTag: "ngc-" + LLM_BRANCH_TAG + "-amd64",
+        ],
+        "Build NGC release(aarch64)": [
+            target: "ngc_release",
+            action: "push",
+            customTag: "ngc-" + LLM_BRANCH_TAG + "-arm64",
+            arch: "arm64",
+        ],
+    ]
+    def dependencies = [
+        "Build NGC devel and release(x86_64)": [
+            "Build NGC devel(x86_64)",
+            "Build NGC release(x86_64)",
+        ],
+        "Build NGC devel and release(aarch64)": [
+            "Build NGC devel(aarch64)",
+            "Build NGC release(aarch64)",
+        ],
+    ]
+    // Override all fields in build config with default values
+    buildConfigs.each { key, config ->
+        defaultConfig.each { defaultKey, defaultValue ->
+            if (!config.containsKey(defaultKey)) {
+                config[defaultKey] = defaultValue
             }
         }
     }
+    echo "Build configs:"
+    println buildConfigs
+
+    def buildJobs = buildConfigs.collectEntries { key, config ->
+        [key, {
+            stage(key) {
+                agent {
+                    kubernetes createKubernetesPodConfig("build", config.arch)
+                }
+                steps
+                {
+                    buildImage(config)
+                }
+            }
+        }]
+    }
+    // 处理stage依赖关系
+    def parallelStages = [:]
+    
+    // 添加独立stage（不在依赖列表中的）
+    buildConfigs.keySet().findAll { stageName ->
+        !dependencies.values().flatten().contains(stageName)
+    }.each { stageName ->
+        parallelStages[stageName] = buildJobs[stageName]
+    }
+    
+    // 添加合并stage
+    dependencies.each { depName, depList ->
+        parallelStages[depName] = {
+            stage(depName) {
+                depList.each { stageName -> buildJobs[stageName]() }
+            }
+        }
+    }
+    
+    pipeline.parallel parallelStages
+
 }
 
 
@@ -228,92 +371,26 @@ pipeline {
         timeout(time: 24, unit: 'HOURS')
     }
     environment {
+        CCACHE_DIR="${CCACHE_DIR}"
         PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
     }
     stages {
-        stage("Build")
-        {
-            parallel {
-                stage("Build trtllm release") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("trtllm", "push", "skip", "", LLM_BRANCH_TAG)
-                    }
+        stage("Setup environment") {
+            steps {
+                script {
+                    echo "branch is: ${LLM_BRANCH}"
+                    echo "env.gitlabCommit is: ${env.gitlabCommit}"
+                    echo "LLM_REPO is: ${LLM_REPO}"
+                    echo "env.globalVars is: ${env.globalVars}"
+                    globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
+                    globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
                 }
-                stage("Build x86_64-skip") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("tritondevel", params.action, "skip")
-                    }
-                }
-                stage("Build x86_64-pre_cxx11_abi") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("devel", params.action, "src_non_cxx11_abi")
-                    }
-                }
-                stage("Build x86_64-cxx11_abi") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("devel", params.action, "src_cxx11_abi")
-                    }
-                }
-                stage("Build rockylinux8 x86_64-skip-py3.10") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.10.12 STAGE=tritondevel", "", "-py310")
-                    }
-                }
-                stage("Build rockylinux8 x86_64-skip-py3.12") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.12.3 STAGE=tritondevel", "", "-py312")
-                    }
-                }
-                stage("Build SBSA-skip") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("agent")
-                    }
-                    steps
-                    {
-                        triggerSBSARemoteJob(params.action, "skip")
-                    }
-                }
-                stage("Build SBSA-pre_cxx11_abi") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("agent")
-                    }
-                    steps
-                    {
-                        triggerSBSARemoteJob(params.action, "src_non_cxx11_abi")
-                    }
-                }
-                stage("Build SBSA-cxx11_abi") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("agent")
-                    }
-                    steps
-                    {
-                        triggerSBSARemoteJob(params.action, "src_cxx11_abi")
-                    }
+            }
+        }
+        stage("Build") {
+            steps{
+                script{
+                    launchBuildJobs(this)
                 }
             }
         }

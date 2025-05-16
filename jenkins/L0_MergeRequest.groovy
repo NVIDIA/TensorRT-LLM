@@ -964,6 +964,30 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             }
         },
     ]
+    def dockerBuildJob = [
+        "BuildDockerImages": {
+            script {
+                stage("BuildDockerImages") {
+                    def parameters = getCommonParameters()
+                    String globalVarsJson = writeJSON returnText: true, json: globalVars
+                    parameters += [
+                        'branch': env.gitlabBranch ? env.gitlabBranch : "main",
+                        'globalVars': globalVarsJson,
+                    ]
+
+                    echo "trigger BuildDockerImages job, params: ${parameters}"
+
+                    def status = triggerJob("/LLM/helpers/BuildDockerImages", parameters)
+                    if (status != "SUCCESS") {
+                        error "Downstream job did not succeed"
+                    }
+                }
+            }
+        }
+    ]
+    if (testFilter[(IS_POST_MERGE)]) {
+        stages += dockerBuildJob
+    }
 
     parallelJobs = stages.collectEntries{key, value -> [key, {
         script {
