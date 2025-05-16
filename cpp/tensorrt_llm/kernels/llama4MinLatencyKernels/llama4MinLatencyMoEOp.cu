@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/kernels/llama4MinLatencyMoEOp.h"
+#include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4MinLatencyMoEOp.h"
+#include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Utils.cuh"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -33,73 +33,18 @@
 #define ENABLE_PREFETCH 1
 #define ENABLE_PREEXIT 1
 
-using namespace tensorrt_llm::common;
-
-namespace
+namespace tensorrt_llm::kernels::llama4_min_latency::llama4_moe
 {
-// Function to launch kernel using FDL.
-void launch_kernel_fdl(
-    dim3 grid_dim, dim3 block_dim, cudaStream_t stream, void* kernel_func, void* args[], int num_args)
-{
-    cudaLaunchConfig_t config;
-    config.gridDim = grid_dim;
-    config.blockDim = block_dim;
-    config.dynamicSmemBytes = 0;
-    config.stream = stream;
-
-    cudaLaunchAttribute attrs[1];
-    config.attrs = attrs;
-    config.numAttrs = 0;
-    attrs[config.numAttrs].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[config.numAttrs++].val.programmaticStreamSerializationAllowed = 1;
-
-    cudaLaunchKernelExC(&config, (void const*) kernel_func, args);
-}
-} // namespace
-
-namespace tensorrt_llm
-{
-namespace kernels
-{
-
-struct __align__(8) aligned_fp8x8
-{
-    __align__(8) __nv_fp8x4_e4m3 data[2];
-};
 
 #define TOPK_VEC_SIZE 4
 static_assert(NUM_EXPERTS == TOPK_VEC_SIZE * WARP_SIZE, "NUM_EXPERTS must be equal to TOPK_VEC_SIZE * WARP_SIZE");
-
-struct __align__(8) aligned_bfloat16x4
-{
-    __align__(8) __nv_bfloat16 data[4];
-};
-
-__device__ __forceinline__ float silu(float x)
-{
-    return x / (1.0f + __expf(-x));
-}
-
-__device__ __forceinline__ float sigmoid(float x)
-{
-    return 1.0f / (1.0f + __expf(-x));
-}
-
-__device__ __forceinline__ float2 ffma2(float2 x, float2 y, float2 acc)
-{
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000))
-    return __ffma2_rn(x, y, acc);
-#else
-    return make_float2(x.x * y.x + acc.x, x.y * y.y + acc.y);
-#endif
-}
 
 // This is the hand-optimized kernel by Po-Han.
 // The computation is:
 //   C = silu(AxB_gated * in_scale * sigmoid(logit)) * (AxB_linear * in_scale * sigmoid(logit)) * out_scale_inv
 // The out_scale_inv cannot be fused with in_scale because silu() is non-linear.
 // Also, Llama-4 applies score scaling, which is sigmoid(logit), on tensor A.
-__global__ void moe_mlp_fc13_swiglu_fp8_5120(int num_tokens,
+__global__ void llama4_moe_fc13_swiglu_fp8_kernel(int num_tokens,
     __nv_fp8_e4m3 const* __restrict__ A,      // Input tensor [num_tokens][HIDDEN_SIZE]
     __nv_fp8_e4m3 const* __restrict__ B,      // Input tensor [num_experts][INTER_SIZE*2][HIDDEN_SIZE]
     __nv_bfloat16 const* __restrict__ logits, // Input tensor logits [num_tokens][num_experts]
@@ -156,7 +101,8 @@ __global__ void moe_mlp_fc13_swiglu_fp8_5120(int num_tokens,
 
     // Perform top1 across threads using Warp reduction.
     // We pack logit and expert index into an int so that we can use integer max op for reduction.
-    int best_result = ((int) (__bfloat16_as_short(best_logit) ^ (best_logit < __nv_bfloat16(0.f) ? 0x7fff : 0)) << 16) | best_exp;
+    int best_result
+        = ((int) (__bfloat16_as_short(best_logit) ^ (best_logit < __nv_bfloat16(0.f) ? 0x7fff : 0)) << 16) | best_exp;
 
 #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
@@ -245,15 +191,15 @@ __global__ void moe_mlp_fc13_swiglu_fp8_5120(int num_tokens,
 #endif
 }
 
-// Launch moe_mlp_fc13_swiglu_fp8_5120 kernel
-void launch_moe_mlp_fc13_swiglu_fp8_5120(int num_tokens, int num_experts,
-    __nv_fp8_e4m3 const* __restrict__ A,      // Input tensor A [num_tokens][HIDDEN_SIZE]
-    __nv_fp8_e4m3 const* __restrict__ B,      // Input tensor B [num_experts][INTER_SIZE*2][HIDDEN_SIZE]
-    __nv_bfloat16 const* __restrict__ logits, // Input tensor logits [num_tokens][num_experts]
-    __nv_fp8_e4m3* __restrict__ C,            // Output tensor [num_tokens][INTER_SIZE]
-    int* __restrict__ exp_idx,                // Output tensor [num_tokens]
-    float const* __restrict__ in_scales,      // Input scales [num_experts]
-    float const* __restrict__ out_scale_inv,  // Output scale [1]
+// Launch llama4_moe_fc13_swiglu_fp8_kernel
+void launch_llama4_moe_fc13_swiglu_fp8_kernel(int num_tokens, int num_experts,
+    void const* __restrict__ A,              // Input tensor A [num_tokens][HIDDEN_SIZE]
+    void const* __restrict__ B,              // Input tensor B [num_experts][INTER_SIZE*2][HIDDEN_SIZE]
+    void const* __restrict__ logits,         // Input tensor logits [num_tokens][num_experts]
+    void* __restrict__ C,                    // Output tensor [num_tokens][INTER_SIZE]
+    int* __restrict__ exp_idx,               // Output tensor [num_tokens]
+    float const* __restrict__ in_scales,     // Input scales [num_experts]
+    float const* __restrict__ out_scale_inv, // Output scale [1]
     cudaStream_t stream)
 {
     int const grid_size = num_tokens * INTER_SIZE;
@@ -262,18 +208,14 @@ void launch_moe_mlp_fc13_swiglu_fp8_5120(int num_tokens, int num_experts,
         printf("The implementation currently assumes num_experts = %d\n", NUM_EXPERTS);
         exit(1);
     }
-#if !ENABLE_FDL
-    moe_mlp_fc13_swiglu_fp8_5120<<<grid_size, BLOCK_SIZE, 0, stream>>>(
-        num_tokens, A, B, logits, C, exp_idx, in_scales, out_scale_inv);
-#else
+
     void* args[] = {(void*) &num_tokens, (void*) &A, (void*) &B, (void*) &logits, (void*) &C, (void*) &exp_idx,
         (void*) &in_scales, (void*) &out_scale_inv};
-    launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, (void*) moe_mlp_fc13_swiglu_fp8_5120, args, 8);
-#endif
+    launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, (void*) llama4_moe_fc13_swiglu_fp8_kernel, args, 8);
 }
 
 // This is the hand-optimized kernel by Po-Han.
-__global__ void moe_fc_fp8_bf16_1024(int num_tokens,
+__global__ void llama4_moe_fc2_fp8_kernel(int num_tokens,
     __nv_fp8_e4m3 const* __restrict__ A,      // Input tensor A [num_tokens][INTER_SIZE]
     __nv_fp8_e4m3 const* __restrict__ B,      // Input tensor B [num_experts][HIDDEN_SIZE][INTER_SIZE]
     int const* __restrict__ exp_idx,          // Input tensor exp_idx [num_tokens].
@@ -366,11 +308,11 @@ __global__ void moe_fc_fp8_bf16_1024(int num_tokens,
 #endif
 }
 
-void launch_moe_fc_fp8_bf16_1024(int num_tokens, int num_experts,
-    __nv_fp8_e4m3 const* __restrict__ A,       // Input tensor A [num_tokens][INTER_SIZE]
-    __nv_fp8_e4m3 const* __restrict__ B,       // Input tensor B [num_experts][HIDDEN_SIZE][INTER_SIZE]
+void launch_llama4_moe_fc2_fp8_kernel(int num_tokens, int num_experts,
+    void const* __restrict__ A,                // Input tensor A [num_tokens][INTER_SIZE]
+    void const* __restrict__ B,                // Input tensor B [num_experts][HIDDEN_SIZE][INTER_SIZE]
     int const* __restrict__ exp_idx,           // Input tensor exp_idx [num_tokens].
-    __nv_bfloat16* __restrict__ C,             // Output tensor [num_tokens][HIDDEN_SIZE]
+    void* __restrict__ C,                      // Output tensor [num_tokens][HIDDEN_SIZE]
     float const* __restrict__ scaling_factors, // Scaling factors [num_experts]
     cudaStream_t stream)
 {
@@ -380,13 +322,10 @@ void launch_moe_fc_fp8_bf16_1024(int num_tokens, int num_experts,
         exit(1);
     }
     int const grid_size = num_tokens * HIDDEN_SIZE / TILE_ROW;
-#if !ENABLE_FDL
-    moe_fc_fp8_bf16_1024<<<grid_size, BLOCK_SIZE, 0, stream>>>(num_tokens, A, B, exp_idx, C, scaling_factors);
-#else
+
     void* args[]
         = {(void*) &num_tokens, (void*) &A, (void*) &B, (void*) &exp_idx, (void*) &C, (void*) &scaling_factors};
-    launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, (void*) moe_fc_fp8_bf16_1024, args, 6);
-#endif
+    launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, (void*) llama4_moe_fc2_fp8_kernel, args, 6);
 }
 
 void run_moe_llama4_tp8ep1_min_latency(int num_tokens, int num_experts,
@@ -402,15 +341,10 @@ void run_moe_llama4_tp8ep1_min_latency(int num_tokens, int num_experts,
     void* __restrict__ output_void,                   // FC2 output tensor BF16 [num_tokens][HIDDEN_SIZE]
     cudaStream_t stream)
 {
-    launch_moe_mlp_fc13_swiglu_fp8_5120(num_tokens, num_experts,
-        static_cast<__nv_fp8_e4m3 const*>(input_activations_void),
-        static_cast<__nv_fp8_e4m3 const*>(fc1_expert_weights_void),
-        static_cast<__nv_bfloat16 const*>(router_logits_void), static_cast<__nv_fp8_e4m3*>(fc2_input_activations_void),
-        exp_idx, dequant_fc1, quant_fc2, stream);
-    launch_moe_fc_fp8_bf16_1024(num_tokens, num_experts, static_cast<__nv_fp8_e4m3*>(fc2_input_activations_void),
-        static_cast<__nv_fp8_e4m3 const*>(fc2_expert_weights_void), exp_idx, static_cast<__nv_bfloat16*>(output_void),
-        dequant_fc2, stream);
+    launch_llama4_moe_fc13_swiglu_fp8_kernel(num_tokens, num_experts, input_activations_void, fc1_expert_weights_void,
+        router_logits_void, fc2_input_activations_void, exp_idx, dequant_fc1, quant_fc2, stream);
+    launch_llama4_moe_fc2_fp8_kernel(num_tokens, num_experts, fc2_input_activations_void, fc2_expert_weights_void,
+        exp_idx, output_void, dequant_fc2, stream);
 }
 
-} // namespace kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels::llama4_min_latency::llama4_moe

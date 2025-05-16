@@ -56,9 +56,7 @@ add_library(
   fp8Quantize.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
-  llama4GemmSwiGLU.cpp
-  llama4RouterGemm.cpp
-  llama4QKVGemm.cpp
+  llama4MinLatency.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
   moeOp.cpp

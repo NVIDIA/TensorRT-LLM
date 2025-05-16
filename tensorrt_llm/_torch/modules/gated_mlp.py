@@ -37,8 +37,7 @@ class GatedMLP(nn.Module):
                  config: Optional[ModelConfig] = None,
                  overridden_tp_size: Optional[int] = None,
                  is_expert: bool = False,
-                 layer_idx: Optional[int] = None,
-                 is_llama4: bool = False):
+                 layer_idx: Optional[int] = None):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
@@ -63,8 +62,6 @@ class GatedMLP(nn.Module):
             tp_size=tp_size,
             pp_size=pp_size,
         )
-
-        self.is_llama4 = is_llama4
         self.gate_up_proj = Linear(
             self.hidden_size,
             self.intermediate_size * 2,
@@ -77,8 +74,6 @@ class GatedMLP(nn.Module):
             quant_config=config.get_quant_config(),
             is_expert=is_expert,
             skip_create_weights=config.skip_create_weights,
-            # In Llama4, we are using the custom kernel that performs FC+SwiGLU
-            use_llama4_fc_swiglu_kernel=is_llama4,
         )
 
         self.down_proj = Linear(
@@ -91,12 +86,6 @@ class GatedMLP(nn.Module):
             quant_config=config.get_quant_config(),
             is_expert=is_expert,
             skip_create_weights=config.skip_create_weights,
-            # In llama4, the custom kernel (triggered by use_llama4_fc_swiglu_kernel)
-            # is outputing fp8. The current setting is assuming bf16 out, so we need
-            # to provide the inv_input_scale of this layer to it to offset the un-needed
-            # quantization.
-            previous_gate_up_proj=self.gate_up_proj,
-            use_llama4_trtllm_gen=is_llama4,
         )
 
         # These two modules are mutually exclusive - either splitted_gate_up_lora or fused_gate_up_lora will be used,
@@ -116,31 +105,24 @@ class GatedMLP(nn.Module):
         all_rank_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         min_latency_mode: Optional[bool] = False,
-        llama4_tp8ep1_min_latency_mode: Optional[bool] = False,
         lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         if self.activation == F.silu:
-            if self.gate_up_proj.use_llama4_fc_swiglu_kernel and self.down_proj.has_fp8_qdq and x.shape[0] <= 16:
-                # In Llama4, we have two custom kernels for FC+SwiGLU. The first one is a
-                # gemv kernel that is efficient for small input sizes (token_length <= 4).
-                # The second one is the trtllm-gen kernel that is efficient for (4 < token_length <= 16).
-                h2 = self.gate_up_proj(x)
-            else:
-                h1 = self.gate_up_proj(x)
-                if lora_params is not None:
-                    assert self.layer_idx is not None, "layer_idx is required for lora"
-                    h1_lora = self.splitted_gate_up_lora(
-                        x, lora_params, self.layer_idx)
-                    if h1_lora is not None:
-                        h1 = h1 + h1_lora
+            h1 = self.gate_up_proj(x)
+            if lora_params is not None:
+                assert self.layer_idx is not None, "layer_idx is required for lora"
+                h1_lora = self.splitted_gate_up_lora(
+                    x, lora_params, self.layer_idx)
+                if h1_lora is not None:
+                    h1 = h1 + h1_lora
 
-                    h1_lora = self.fused_gate_up_lora(x, lora_params,
-                                                      self.layer_idx)
+                h1_lora = self.fused_gate_up_lora(x, lora_params,
+                                                    self.layer_idx)
 
-                    if h1_lora is not None:
-                        h1 = h1 + h1_lora
+                if h1_lora is not None:
+                    h1 = h1 + h1_lora
 
-                h2 = swiglu(h1)
+            h2 = swiglu(h1)
             output = self.down_proj(h2,
                                     all_reduce_params=final_all_reduce_params)
             if lora_params is not None:

@@ -1,25 +1,39 @@
+/*
+ * Copyright (c) 2025-2025, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #pragma once
 
-#include "tensorrt_llm/kernels/llama4Utils.cuh"
+#include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Utils.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdexcept>
 
-namespace tensorrt_llm::kernels::llama4_qkv_gemm
+namespace tensorrt_llm::kernels::llama4_min_latency::llama4_fp8_bf16_gemm
 {
-
-using tensorrt_llm::kernels::aligned_fp8x8;
 
 // Grid size is num_tokens / TILE_TOKEN * hidden_out / TILE_OUT / WARP_PER_BLOCK.
 // Each warp processes TILE_TOKEN tokens and TILE_OUT rows.
 // Within each warp, it loops through hidden_in in steps of WARP_SIZE * VEC_SIZE.
 template <int HIDDEN_IN, int TILE_TOKEN, int TILE_OUT, bool ALIGNED>
-__launch_bounds__(BLOCK_SIZE) __global__
-    void llama4_gemv_per_warp_kernel(__nv_fp8_e4m3 const* __restrict__ A, // Input tensor [num_tokens][hidden_in]
-        __nv_fp8_e4m3 const* __restrict__ B,                              // Input tensor [hidden_out][hidden_in]
-        __nv_bfloat16* __restrict__ C,                                    // Output tensor [num_tokens][hidden_out]
-        float* __restrict__ scaling_factor, int num_tokens, int hidden_in, int hidden_out)
+__launch_bounds__(BLOCK_SIZE) __global__ void llama4_fp8_bf16_gemm_per_warp_kernel(
+    __nv_fp8_e4m3 const* __restrict__ A, // Input tensor [num_tokens][hidden_in]
+    __nv_fp8_e4m3 const* __restrict__ B, // Input tensor [hidden_out][hidden_in]
+    __nv_bfloat16* __restrict__ C,       // Output tensor [num_tokens][hidden_out]
+    float* __restrict__ scaling_factor, int num_tokens, int hidden_in, int hidden_out)
 {
     // Shared memory for tensor A values.
     __shared__ aligned_fp8x8 shared_a[TILE_TOKEN][BLOCK_SIZE];
@@ -254,23 +268,23 @@ __launch_bounds__(BLOCK_SIZE) __global__
     {                                                                                                                  \
         if (TILE_TOKEN == 1)                                                                                           \
         {                                                                                                              \
-            return reinterpret_cast<void*>(llama4_gemv_per_warp_kernel<HIDDEN_IN, 1, TILE_OUT, ALIGNED>);              \
+            return reinterpret_cast<void*>(llama4_fp8_bf16_gemm_per_warp_kernel<HIDDEN_IN, 1, TILE_OUT, ALIGNED>);     \
         }                                                                                                              \
         if (TILE_TOKEN == 2)                                                                                           \
         {                                                                                                              \
-            return reinterpret_cast<void*>(llama4_gemv_per_warp_kernel<HIDDEN_IN, 2, TILE_OUT, ALIGNED>);              \
+            return reinterpret_cast<void*>(llama4_fp8_bf16_gemm_per_warp_kernel<HIDDEN_IN, 2, TILE_OUT, ALIGNED>);     \
         }                                                                                                              \
         if (TILE_TOKEN == 3)                                                                                           \
         {                                                                                                              \
-            return reinterpret_cast<void*>(llama4_gemv_per_warp_kernel<HIDDEN_IN, 3, TILE_OUT, ALIGNED>);              \
+            return reinterpret_cast<void*>(llama4_fp8_bf16_gemm_per_warp_kernel<HIDDEN_IN, 3, TILE_OUT, ALIGNED>);     \
         }                                                                                                              \
         if (TILE_TOKEN == 4)                                                                                           \
         {                                                                                                              \
-            return reinterpret_cast<void*>(llama4_gemv_per_warp_kernel<HIDDEN_IN, 4, TILE_OUT, ALIGNED>);              \
+            return reinterpret_cast<void*>(llama4_fp8_bf16_gemm_per_warp_kernel<HIDDEN_IN, 4, TILE_OUT, ALIGNED>);     \
         }                                                                                                              \
         if (TILE_TOKEN == 8)                                                                                           \
         {                                                                                                              \
-            return reinterpret_cast<void*>(llama4_gemv_per_warp_kernel<HIDDEN_IN, 8, TILE_OUT, ALIGNED>);              \
+            return reinterpret_cast<void*>(llama4_fp8_bf16_gemm_per_warp_kernel<HIDDEN_IN, 8, TILE_OUT, ALIGNED>);     \
         }                                                                                                              \
         throw std::invalid_argument("Invalid tile token");                                                             \
     } while (0)
@@ -307,4 +321,4 @@ __launch_bounds__(BLOCK_SIZE) __global__
         DISPATCH_PER_WARP_FC_FP8_BF16_TILE_OUT(HIDDEN_IN, tile_token, tile_out, ALIGNED);                              \
     }
 
-} // namespace tensorrt_llm::kernels::llama4_qkv_gemm
+} // namespace tensorrt_llm::kernels::llama4_min_latency::llama4_fp8_bf16_gemm
