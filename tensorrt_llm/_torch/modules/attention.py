@@ -209,6 +209,7 @@ class Attention(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         attention_window_size: Optional[int] = None,
+        attention_chunk_size: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -263,7 +264,8 @@ class Attention(nn.Module):
             out_scale=out_scale,
             attention_mask=attention_mask,
             mrope_config=mrope_config,
-            attention_window_size=attention_window_size)
+            attention_window_size=attention_window_size,
+            attention_chunk_size=attention_chunk_size)
         hidden_states = attn_output
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params,
