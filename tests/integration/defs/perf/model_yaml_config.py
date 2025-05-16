@@ -14,7 +14,7 @@
 # limitations under the License.
 # -*- coding: utf-8 -*-
 """
-Model yaml config for trtllm-bench perf tests
+Model pytorch yaml config for trtllm-bench perf tests
 """
 
 
@@ -32,7 +32,6 @@ def get_model_yaml_config(model_label: str) -> dict:
             'print_iter_log': True,
             'use_cuda_graph': True,
             'cuda_graph_padding_enabled': True,
-            'cuda_graph_max_batch_size': 4096,
         }
     }
     model_configs = {
