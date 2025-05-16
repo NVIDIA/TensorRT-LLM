@@ -914,12 +914,11 @@ class TestNemotronSuper(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-            # TODO: Add GSM8K and GPQADiamond once the CLI tests are removed
-            # task = GSM8K(self.MODEL_NAME)
-            # task.evaluate(llm)
-            # task = GPQADiamond(self.MODEL_NAME)
-            # task.evaluate(llm,
-            #               extra_evaluator_kwargs=dict(apply_chat_template=True))
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
 class TestNemotronNano(LlmapiAccuracyTestHarness):
