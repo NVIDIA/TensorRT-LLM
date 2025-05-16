@@ -915,7 +915,7 @@ class GenerationSession(object):
 
         if self.mapping.has_pp():
             self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
-                self.mapping.tp_size, self.mapping.pp_size, self.mapping.rank)
+                self.mapping.world_size, self.mapping.rank)
 
         if self.mapping.is_last_pp_rank():
             self.decoder_logits_dtype = self._tensor_dtype('logits')

@@ -1147,7 +1147,7 @@ def gemm_swiglu(input: Tensor,
 
     p_dtype = default_net().plugin_config.gemm_swiglu_plugin
     if p_dtype == "fp8":
-        assert bias == None, "fp8 gemm_swiglu does not support bias yet"
+        assert bias is None, "fp8 gemm_swiglu does not support bias yet"
 
     pf_type = trt.PluginField(
         "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
@@ -2790,7 +2790,7 @@ def embedding(input: Tensor,
     # Distribute embedding lookup table across multiple GPU
     if tp_size > 1 and tp_group is not None:
         if sharding_dim == 0:  # TP on vocab_size dimension
-            if tp_rank == None:
+            if tp_rank is None:
                 raise ValueError(
                     "Rank cannot be none for tensor parallelism on vocab dim")
 
@@ -4351,7 +4351,7 @@ def gemm_allreduce(a: Tensor,
         assert a.dtype == trt.fp8
         assert b.dtype == trt.fp8
 
-    if output_dtype == None:
+    if output_dtype is None:
         output_dtype = str_dtype_to_trt(
             default_net().plugin_config.gemm_allreduce_plugin)
     assert output_dtype in [trt.float16, trt.bfloat16]
