@@ -22,9 +22,12 @@ from .rotary_embedding import RotaryEmbedding
 
 
 class QkNormType(IntEnum):
-    none = 0
-    pre_rope = 1
-    post_rope = 2
+    """
+    The type of QK normalization.
+    """
+    none = 0  # No normalization applied to Q and K
+    pre_rope = 1  # Apply normalization before Rope
+    post_rope = 2  # Apply normalization after Rope
 
 
 class Attention(nn.Module):
@@ -45,6 +48,23 @@ class Attention(nn.Module):
         qk_norm_type: QkNormType = QkNormType.none,
         q_scaling: float = 1.0,
     ):
+        """
+        Initialize the Attention module.
+
+        Args:
+            hidden_size (int): The size of the hidden dimension.
+            num_attention_heads (int): The number of attention heads.
+            num_key_value_heads (int): The number of key value heads.
+            max_position_embeddings (int): The maximum position embeddings.
+            bias (bool): Whether to use bias in the linear layers.
+            pos_embd_params (PositionalEmbeddingParams): The positional embedding parameters.
+            layer_idx (int): The layer index.
+            dtype (torch.dtype): The data type.
+            dense_bias (bool): Whether to use bias in the output projection layer.
+            config (ModelConfig): The model configuration.
+            qk_norm_type (QkNormType): The type of QK normalization.
+            q_scaling (float): The scaling factor for the qk_scale. The definition is $O = softmax(QK^T * qk_scale) * V, qk_scale = 1 / (sqrt(head_dim) * q_scaling)$. The default value is 1.0.
+        """
         super().__init__()
         self.layer_idx = layer_idx
 
@@ -191,6 +211,22 @@ class Attention(nn.Module):
         attention_window_size: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
+        """
+        Forward pass for the Attention module.
+
+        Args:
+            position_ids (Optional[torch.LongTensor]): The position IDs.
+            hidden_states (torch.Tensor): The hidden states.
+            attn_metadata (AttentionMetadata): The attention metadata.
+            attention_mask (PredefinedAttentionMask): The attention mask type.
+            mrope_config (Optional[dict]): The MROPE configuration.
+            all_reduce_params (Optional[AllReduceParams]): The all reduce parameters.
+            lora_params (Optional[dict]): The LoRA parameters.
+            attention_window_size (Optional[int]): The attention window size.
+
+        Returns:
+            torch.Tensor: The output tensor.
+        """
         qkv = self.qkv_proj(hidden_states)
 
         if bool(lora_params):
@@ -264,6 +300,28 @@ class MLA(nn.Module):
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
     ):
+        """
+        Initialize the MLA module.
+
+        Args:
+            hidden_size (int): The size of the hidden dimension.
+            num_attention_heads (int): The number of attention heads.
+            num_key_value_heads (int): The number of key value heads.
+            qk_nope_head_dim (int): The dimension of the query and key without Rope.
+            qk_rope_head_dim (int): The dimension of the Rope of query and key.
+            v_head_dim (int): The dimension of the value.
+            q_lora_rank (int): The dimension of the compressed query.
+            kv_lora_rank (int): The dimension of the compressed key and value.
+            predicted_tokens_per_seq (int): The number of predicted tokens per sequence.
+            max_position_embeddings (int): The maximum position embeddings.
+            bias (bool): Whether to use bias in the linear layers.
+            aux_stream (Optional[torch.cuda.Stream]): The auxiliary CUDA stream for running operations in two parallel streams.
+            pos_embd_params (PositionalEmbeddingParams): The positional embedding parameters.
+            layer_idx (int): The layer index.
+            dtype (torch.dtype): The data type.
+            dense_bias (bool): Whether to use bias in the output projection layer.
+            config (ModelConfig): The model configuration.
+        """
         super().__init__()
         self.layer_idx = layer_idx
         self.dtype = dtype
@@ -533,6 +591,18 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
     ) -> torch.Tensor:
+        """
+        Forward pass for the MLA module.
+
+        Args:
+            position_ids (Optional[torch.LongTensor]): The position IDs.
+            hidden_states (torch.Tensor): The hidden states.
+            attn_metadata (AttentionMetadata): The attention metadata.
+            all_reduce_params (Optional[AllReduceParams]): The all reduce parameters.
+
+        Returns:
+            torch.Tensor: The output tensor.
+        """
         if self.is_lite:
             compressed_kv, k_pe = self.fused_a(hidden_states).split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], -1)
