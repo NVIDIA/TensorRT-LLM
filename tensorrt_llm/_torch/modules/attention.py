@@ -315,7 +315,7 @@ class MLA(nn.Module):
             predicted_tokens_per_seq (int): The number of predicted tokens per sequence.
             max_position_embeddings (int): The maximum position embeddings.
             bias (bool): Whether to use bias in the linear layers.
-            aux_stream (Optional[torch.cuda.Stream]): The auxiliary CUDA stream.
+            aux_stream (Optional[torch.cuda.Stream]): The auxiliary CUDA stream for running operations in two parallel streams.
             pos_embd_params (PositionalEmbeddingParams): The positional embedding parameters.
             layer_idx (int): The layer index.
             dtype (torch.dtype): The data type.
