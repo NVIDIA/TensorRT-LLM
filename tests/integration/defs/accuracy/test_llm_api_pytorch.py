@@ -238,6 +238,32 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(8)
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
+                                                         (8, 1, 8)],
+                             ids=["tp8", "tp8ep4", "tp8ep8"])
+    def test_fp8_prequantized(self, cuda_graph, tp_size, pp_size, ep_size):
+        pytorch_config = PyTorchConfig(use_cuda_graph=cuda_graph)
+
+        quant_config = QuantConfig()
+        quant_config.quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
+        quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+        pytorch_config.kv_cache_dtype = "fp8"
+
+        model_path = f"{llm_models_root()}/llama4-models/Llama-4-Maverick-17B-128E-Instruct-FP8"
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 pytorch_backend_config=pytorch_config,
+                 quant_config=quant_config) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
