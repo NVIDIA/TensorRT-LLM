@@ -1148,6 +1148,17 @@ class TestQwen2_0_5BInstruct(CliFlowAccuracyTestHarness):
                  quant_algo=QuantAlgo.FP8)
 
 
+class TestQwen2_1_5B(CliFlowAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen2-1.5B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen2-1.5B"
+    EXAMPLE_FOLDER = "models/core/qwen"
+
+    @pytest.mark.skip_less_device(4)
+    def test_auto_dtype_cp4(self):
+        "RCCA: https://nvbugs/5170106"
+        self.run(dtype='auto', cp_size=4)
+
+
 class TestQwen2_7BInstruct(CliFlowAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen2-7B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Qwen2-7B-Instruct"
