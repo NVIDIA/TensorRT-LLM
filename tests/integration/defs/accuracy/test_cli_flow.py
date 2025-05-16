@@ -1137,12 +1137,6 @@ class TestQwen2_0_5BInstruct(CliFlowAccuracyTestHarness):
     def test_auto_dtype(self):
         self.run(dtype='auto')
 
-    @pytest.mark.skip(reason="https://nvbugs/5280195")
-    @pytest.mark.skip_less_device(4)
-    def test_auto_dtype_cp4(self):
-        "RCCA: https://nvbugs/5170106"
-        self.run(dtype='auto', cp_size=4)
-
     @skip_post_blackwell
     def test_weight_only(self):
         self.run(quant_algo=QuantAlgo.W8A16)
@@ -1152,6 +1146,17 @@ class TestQwen2_0_5BInstruct(CliFlowAccuracyTestHarness):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
                         MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.FP8)
+
+
+class TestQwen2_1_5B(CliFlowAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen2-1.5B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen2-1.5B"
+    EXAMPLE_FOLDER = "models/core/qwen"
+
+    @pytest.mark.skip_less_device(4)
+    def test_auto_dtype_cp4(self):
+        "RCCA: https://nvbugs/5170106"
+        self.run(dtype='auto', cp_size=4)
 
 
 class TestQwen2_7BInstruct(CliFlowAccuracyTestHarness):
