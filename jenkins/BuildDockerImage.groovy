@@ -101,7 +101,7 @@ def createKubernetesPodConfig(type, arch = "amd64")
 
 def buildImage(target, action="build", torchInstallType="skip", args="", custom_tag="", post_tag="", is_sbsa=false)
 {
-    def arch = is_sbsa ? "aarch64" : "x86_64"
+    def arch = is_sbsa ? "sbsa" : "x86_64"
     def tag = "${arch}-${target}-torch_${torchInstallType}${post_tag}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
     // Step 1: cloning tekit source code
@@ -226,7 +226,7 @@ pipeline {
                     }
                     steps
                     {
-                        buildImage("trtllm_x86_64", "push", "skip", "", LLM_BRANCH_TAG + "-x86_64")
+                        buildImage("trtllm", "push", "skip", "", LLM_BRANCH_TAG)
                     }
                 }
                 stage("Build trtllm release-sbsa") {
@@ -235,7 +235,7 @@ pipeline {
                     }
                     steps
                     {
-                        buildImage("trtllm_sbsa", "push", "skip", "", LLM_BRANCH_TAG + "-sbsa", "", true)
+                        buildImage("trtllm", "push", "skip", "", LLM_BRANCH_TAG + "-sbsa", "", true)
                     }
                 }
                 stage("Build x86_64-skip") {
@@ -245,24 +245,6 @@ pipeline {
                     steps
                     {
                         buildImage("tritondevel", params.action, "skip")
-                    }
-                }
-                stage("Build x86_64-pre_cxx11_abi") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("devel", params.action, "src_non_cxx11_abi")
-                    }
-                }
-                stage("Build x86_64-cxx11_abi") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("devel", params.action, "src_cxx11_abi")
                     }
                 }
                 stage("Build rockylinux8 x86_64-skip-py3.10") {
@@ -289,25 +271,7 @@ pipeline {
                     }
                     steps
                     {
-                        buildImage("devel", params.action, "skip", "", "", "", true)
-                    }
-                }
-                stage("Build SBSA-pre_cxx11_abi") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("agent")
-                    }
-                    steps
-                    {
-                        triggerSBSARemoteJob(params.action, "src_non_cxx11_abi")
-                    }
-                }
-                stage("Build SBSA-cxx11_abi") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("agent")
-                    }
-                    steps
-                    {
-                        triggerSBSARemoteJob(params.action, "src_cxx11_abi")
+                        buildImage("tritondevel", params.action, "skip", "", "", "", true)
                     }
                 }
             }

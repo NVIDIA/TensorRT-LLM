@@ -117,12 +117,6 @@ FROM ${DEVEL_IMAGE} AS release
 # Create a cache directory for pip
 RUN mkdir -p /root/.cache/pip
 
-ARG PLATFORM="x86_64"
-RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "$PLATFORM" = "arm64" ]; then \
-        pip install torch==2.6.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126; \
-    fi
-
 WORKDIR /app/tensorrt_llm
 COPY --from=wheel /src/tensorrt_llm/build/tensorrt_llm*.whl .
 RUN --mount=type=cache,target=/root/.cache/pip \
