@@ -76,6 +76,7 @@ class SimpleConfig:
     visualize: bool = False
 
     ### BENCHMARKING CONFIG ########################################################################
+    free_mem_ratio: float = 0.8  # specifies the fraction of available memory to occupy for cache
     benchmark: bool = False  # If true, set ISO to 2048 random int and OSL to 128
     benchmark_num: int = 10  # By default run 10 times and get average
     benchmark_isl: int = 2048  # input seq length for benchmarking

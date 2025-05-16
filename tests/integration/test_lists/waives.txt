@@ -487,3 +487,4 @@ triton_server/test_triton.py::test_gpt_speculative_decoding[gpt-speculative-deco
 triton_server/test_triton.py::test_qwen2_vl[qwen2_vl] SKIP
 triton_server/test_triton.py::test_gpt_ib_speculative_decoding_bls[gpt-ib-speculative-decoding-bls] SKIP
 triton_server/test_triton_llm.py::test_mistral_v1_multi_models[False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-max_utilization-4096-1-1-1-False-ensemble] SKIP
+accuracy/test_cli_flow.py::TestTinyLlama1_1BChat::test_pp4 SKIP (https://nvbugs/5287097)

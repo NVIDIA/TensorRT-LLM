@@ -292,10 +292,7 @@ def _match_eager_attention_pattern(final_matmul_node: Node) -> Optional[Dict[str
     Match the eager attention pattern starting from the final matmul node.
 
     The pattern is:
-    transpose -> matmul -> mul -> (optional) add -> softmax -> to -> dropout -> matmul
-
-    Or alternatively:
-    transpose -> matmul -> div -> (optional) add -> softmax -> to -> dropout -> matmul
+    transpose -> matmul -> mul/div -> (optional) add -> (optional) to -> softmax -> (optional) to -> dropout -> matmul
 
     Returns a dictionary with information about the match or None if no match.
     """
@@ -312,48 +309,57 @@ def _match_eager_attention_pattern(final_matmul_node: Node) -> Optional[Dict[str
     if not is_op(dropout_node, torch.ops.aten.dropout):
         return None
 
-    # The second arg of final matmul is the value tensor
+    # The second arg of final matmul is the value tensor (possibly repeated/transformed)
     value = final_matmul_node.args[1]
 
-    # The dropout should have a to_dtype node as input
+    # The dropout should have a to_dtype node (or directly softmax) as input
     if len(dropout_node.args) < 1:
         return None
-    to_dtype_node = dropout_node.args[0]
-    if not is_op(to_dtype_node, torch.ops.aten.to):
-        return None
 
-    # The to_dtype node should have a softmax node as input
-    if len(to_dtype_node.args) < 1:
-        return None
-    softmax_node = to_dtype_node.args[0]
+    # Allow optional to_dtype node after softmax
+    to_dtype_after_softmax = dropout_node.args[0]
+    if is_op(to_dtype_after_softmax, torch.ops.aten.to):
+        if len(to_dtype_after_softmax.args) < 1:
+            return None
+        softmax_node = to_dtype_after_softmax.args[0]
+    else:
+        softmax_node = to_dtype_after_softmax
+
+    # Now we should have a softmax node
     if not is_op(softmax_node, torch.ops.aten.softmax):
         return None
 
-    # The softmax should have the right parameters (dim=-1, dtype=float32)
-    if (
-        len(softmax_node.args) < 3
-        or softmax_node.args[1] != -1
-        or softmax_node.args[2] != torch.float32
+    # The softmax should have dim=-1 (may be specified in different ways)
+    if len(softmax_node.args) < 2 or (
+        isinstance(softmax_node.args[1], int) and softmax_node.args[1] != -1
     ):
-        return None
+        # Check kwargs if not in args
+        if softmax_node.kwargs.get("dim", -1) != -1:
+            return None
 
-    # The softmax node should have an add or mul or div as input (could be either mask or no mask)
+    # The softmax node's input can be:
+    # - direct from add/mul/div
+    # - or through a to_dtype node (like to_35 in the example)
     if len(softmax_node.args) < 1:
         return None
 
+    # Handle optional to_dtype node before softmax
     prev_node = softmax_node.args[0]
+    if is_op(prev_node, torch.ops.aten.to):
+        if len(prev_node.args) < 1:
+            return None
+        prev_node = prev_node.args[0]
 
-    # Check if the pattern has an attention mask (add node)
+    # Check for attention mask pattern (add node)
     if is_op(prev_node, torch.ops.aten.add):
         add_node = prev_node
+        attn_mask = add_node.args[1]  # Second arg is the mask
 
         # The add should have a mul or div node as its first argument
-        if len(add_node.args) < 2:
+        if len(add_node.args) < 1:
             return None
 
         scaling_node = add_node.args[0]
-        attn_mask = add_node.args[1]
-
         if not (is_op(scaling_node, torch.ops.aten.mul) or is_op(scaling_node, torch.ops.aten.div)):
             return None
     elif is_op(prev_node, torch.ops.aten.mul) or is_op(prev_node, torch.ops.aten.div):
@@ -372,42 +378,34 @@ def _match_eager_attention_pattern(final_matmul_node: Node) -> Optional[Dict[str
 
     # Extract the scaling factor, adjusting for division vs multiplication
     scale = scaling_node.args[1]
-    if not isinstance(scale, (float, int)):
+    # Allow for constant or tensor scale
+    if not isinstance(scale, (float, int, Node)):
         return None
 
-    # For division, we need to invert the scaling factor
-    if is_division:
+    # For division, we need to invert the scaling factor if it's a constant
+    if is_division and isinstance(scale, (float, int)):
         scale = 1.0 / scale
 
     first_matmul_node = scaling_node.args[0]
     if not is_op(first_matmul_node, torch.ops.aten.matmul):
         return None
 
-    # The first matmul should have the query and transposed key as inputs
+    # The first matmul should have the query and key transpose as inputs
     if len(first_matmul_node.args) < 2:
         return None
 
     query = first_matmul_node.args[0]
-    transpose_node = first_matmul_node.args[1]
+    transpose_key = first_matmul_node.args[1]
 
-    if not is_op(transpose_node, torch.ops.aten.transpose):
+    # Check for transpose, could be any dimensions
+    if not is_op(transpose_key, torch.ops.aten.transpose):
         return None
 
-    # The transpose should have the key and correct dimensions as input
-    if len(transpose_node.args) < 3 or transpose_node.args[1] != 2 or transpose_node.args[2] != 3:
+    # The transpose should have the key as input
+    if len(transpose_key.args) < 1:
         return None
 
-    key = transpose_node.args[0]
-
-    # Check that query, key, value have correct dimensions (batch, num_heads, seq_len, head_dim)
-    for tensor in [query, key, value]:
-        tensor_val = tensor.meta.get("val", None)
-        if tensor_val is None:
-            continue  # Skip if no metadata available
-
-        # Check that input is 4D
-        if len(tensor_val.shape) != 4:
-            return None
+    key = transpose_key.args[0]
 
     # Create the match info dictionary
     match_info = {
@@ -415,7 +413,7 @@ def _match_eager_attention_pattern(final_matmul_node: Node) -> Optional[Dict[str
         "key": key,
         "value": value,
         "scale": scale,
-        "dropout_p": dropout_node.args[1],
+        "dropout_p": dropout_node.args[1] if len(dropout_node.args) > 1 else 0.0,
         "final_matmul": final_matmul_node,
     }
 

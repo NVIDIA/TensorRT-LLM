@@ -49,6 +49,7 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
         mla_backend=config.mla_backend,
         skip_loading_weights=config.skip_loading_weights,
         cuda_graph_max_batch_size=config.max_batch_size,
+        free_mem_ratio=config.free_mem_ratio,
     )
     ad_logger.info(f"AutoDeploy Config: {ad_config}")
 

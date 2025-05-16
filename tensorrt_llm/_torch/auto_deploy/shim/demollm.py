@@ -391,6 +391,13 @@ class DemoLLM(LLM):
             device="cuda",
         )
 
+    def __del__(self):
+        """Ensure proper cleanup of distributed resources."""
+        if hasattr(self, "_executor") and self._executor is not None:
+            self._executor.shutdown()
+        # Call cleanup to ensure process group is properly destroyed
+        dist_ad.cleanup()
+
     @staticmethod
     def _handle_response(request_output: RequestOutput, response: List[CompletionOutput]):
         request_output._done = True
