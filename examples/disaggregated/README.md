@@ -50,7 +50,7 @@ Clients can then send requests to the disaggregated server at `localhost:8000`, 
 One can also launch all context and generation servers using MPI. This can be done by issuing the following command:
 ```
 export TRTLLM_USE_MPI_KVCACHE=1
-mpirun -n <total_num_ranks> trtllm-serve disaggregated_mpi_worker -c disagg_config.yaml
+mpirun --allow-run-as-root -n <total_num_ranks> trtllm-serve disaggregated_mpi_worker -c disagg_config.yaml
 ```
 where `<total_num_ranks>` is the sum of `TP*PP` for all context and generation servers. For the example above, `total_num_ranks` is 3
 since `TP` and `PP` is 1 for all context and generation servers.
@@ -67,7 +67,7 @@ pytorch_backend_config:
   use_cuda_graph: False
   disable_overlap_scheduler: True
 context_servers:
-  num_instances: 1
+  num_instances: 2
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
   kv_cache_config:
