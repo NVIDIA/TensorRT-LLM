@@ -1,5 +1,5 @@
 # Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs
-by NVIDIA TensorRT-LLM team 
+by NVIDIA TensorRT-LLM team
 ## Table of Contents
 
 - [Background](#background)
@@ -82,14 +82,14 @@ We have also explored and introduced mixed parallel strategy on 8xB200 GPUs. Spe
 | RouterGEMM           | DP8                                                     |
 
 ### Everything in One Diagram
-Now let's put everything into one diagram, which represents a MoE layer from a decoding iteration. 
+Now let's put everything into one diagram, which represents a MoE layer from a decoding iteration.
 
 <img src="../media/tech_blog1_model_details.png?raw=true" alt="tech_blog1_model_details" width="1600" height="auto">
 
 
 The modules in the diagram are:
 
-- Input Module: A BF16 tensor with shape [m, 7168], where m is the number of tokens (for instance, m = 4 when using three MTP layers), and 7168 is the model's hidden size. 
+- Input Module: A BF16 tensor with shape [m, 7168], where m is the number of tokens (for instance, m = 4 when using three MTP layers), and 7168 is the model's hidden size.
 
 - Module1: Fuse_A_GEMM Concatenates the weights for [WDQ, WDKV, and WKR](https://arxiv.org/pdf/2412.19437) to reduce kernel launch overhead.
 
@@ -162,7 +162,7 @@ For the reasoning model (such as DeepSeek R1), the generation may consist of two
 - topN: The topN tokens are sampled from logits.
 - Probability threshold. Based on topN candidates, only those tokens with a probability greater than the Top1's probability - delta can remain in the candidate set.
 
-During the non-thinking phase, we still use strict acceptance. 
+During the non-thinking phase, we still use strict acceptance.
 
 | Version            | Acceptance Rate | TPS/User Speedup |
 |:------------------:|:--------------:|:----------------:|
@@ -183,7 +183,7 @@ This is a relaxed way of verification and comparison, which can improve the acce
 | SciCode                   | 338       | 36.0%      | 39.0%      |
 | LiveCodeBench             | 315       | 62.0%      | 66.0%      |
 
-For more information, please visit [multi-token-prediction-mtp](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/deepseek_v3#multi-token-prediction-mtp)  
+For more information, please visit [multi-token-prediction-mtp](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/deepseek_v3#multi-token-prediction-mtp)
 
 
 
@@ -207,7 +207,7 @@ For sparse experts, two parallelization strategies are commonly used: Expert Par
 A combined EP/TP approach can mitigate both challenges. In practice, our experiments show that a configuration of TP4EP2 offers the best performance.
 
 ##### Smart Router
-Alternatively, by storing all expert weights on a cluster of four GPUs and replicating them to another four-GPU cluster, a smart router can dynamically dispatch tokens across each cluster. This design keeps balanced workload distribution even without significantly impacting local memory and computation efficiency. 
+Alternatively, by storing all expert weights on a cluster of four GPUs and replicating them to another four-GPU cluster, a smart router can dynamically dispatch tokens across each cluster. This design keeps balanced workload distribution even without significantly impacting local memory and computation efficiency.
 
 
 ### Kernel Level optimizations
@@ -253,7 +253,7 @@ input_ids = tokenizer.encode(tokenizer.apply_chat_template(msg, tokenize=False, 
 ```
 It's also needed to set `use_relaxed_acceptance_for_thinking: true`, `relaxed_topk: 10` and `relaxed_delta: 0.6` in speculative_config.
 
- 
+
 ## Future Works
 - More Fusions
 - More Overlap
@@ -264,4 +264,3 @@ It's also needed to set `use_relaxed_acceptance_for_thinking: true`, `relaxed_to
 Pushing the performance boundaries of DeepSeek R1 for latency-sensitive applications has been a remarkable engineering journey. The optimizations detailed in this post represent an exceptional cross-functional collaboration across the entire AI technology stack - spanning kernel-level optimizations, runtime enhancements, model quantization techniques, algorithmic improvements, and systematic performance analysis and tuning. While we can't individually acknowledge every contributor, we're proud to recognize the dedicated team of engineers whose collective expertise has helped advance the state-of-the-art in TensorRT-LLM performance engineering.
 
 Through this collaborative endeavor, we've developed valuable insights into maximizing GPU utilization for large language model inference. We hope that the techniques and best practices shared in this blog will empower the developer community to better leverage NVIDIA GPU capabilities in their mission-critical LLM inference applications.
-
