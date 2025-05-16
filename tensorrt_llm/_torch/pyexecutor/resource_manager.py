@@ -328,7 +328,8 @@ class KVCacheManager(BaseResourceManager):
         requests = []
         for i, req_id in enumerate(request_ids):
             sampling_params = SamplingParams()
-            token_num = token_nums[i] if token_nums is not None else 1
+            token_num = token_nums[
+                i] if token_nums is not None else 1 + max_num_draft_tokens
             encoder_input_tokens = [
                 1
             ] * token_num if self.impl.cross_kv else None
@@ -348,9 +349,8 @@ class KVCacheManager(BaseResourceManager):
                 req.prompt_len = token_num - 1
                 req.py_prompt_len = req.prompt_len
                 req.py_draft_tokens = [1] * max_num_draft_tokens
-                for _ in range(max_num_draft_tokens):
-                    req.add_new_token(1, 0)
-                    if prepare_resource:
+                if prepare_resource:
+                    for _ in range(max_num_draft_tokens):
                         self.impl.add_token(req_id)
             requests.append(req)
         return requests
