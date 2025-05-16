@@ -142,7 +142,7 @@ def buildImage(config)
     def args = config.args
     def customTag = config.customTag
     def postTag = config.postTag
-    def arch = if (config.arch == 'arm64') 'aarch64' else 'x86_64'
+    def arch = config.arch == 'arm64' ? 'aarch64' : 'x86_64'
 
     def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
