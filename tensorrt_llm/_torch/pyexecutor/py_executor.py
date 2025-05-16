@@ -1076,14 +1076,10 @@ class PyExecutor:
     @nvtx_range("_forward_step_inter_pp")
     def _forward_step_inter_pp(self, scheduled_batch) -> SampleState:
         batch_outputs = self._forward_step(scheduled_batch)
+        sample_state = self._sample_async(scheduled_batch, batch_outputs)
         self._update_request_states(scheduled_batch)
-        tokens_shape = batch_outputs["hidden_states"].shape[:-1]
-        new_tokens_host = torch.empty(tokens_shape,
-                                      dtype=torch.int64,
-                                      device='cpu',
-                                      pin_memory=True)
-        return SampleState(scheduled_requests=scheduled_batch,
-                           host=SampleStateTensors(new_tokens=new_tokens_host))
+        sample_state.sampler_event.synchronize()
+        return sample_state
 
     def _update_new_active_requests_queue_latency(self, new_requests):
         if self.enable_iter_perf_stats and self.dist.rank == 0:

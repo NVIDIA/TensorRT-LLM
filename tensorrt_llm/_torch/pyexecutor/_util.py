@@ -15,7 +15,7 @@ from tensorrt_llm.lora_manager import (LoraConfig,
                                        load_torch_hf_lora)
 from tensorrt_llm.mapping import Mapping
 
-from ..speculative import get_num_spec_layers, get_spec_decoder
+from ..speculative import get_spec_decoder
 from .config_utils import is_mla, is_nemotron_hybrid
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .model_engine import KV_CACHE_MANAGER_KEY, PyTorchModelEngine
@@ -60,7 +60,8 @@ def get_cache_size_per_token(model_config, mapping):
             config.hidden_size // config.num_attention_heads,
         ) * num_key_value_heads // tp_size
 
-    num_hidden_layers = len(mapping.pp_layers(config.num_hidden_layers))
+    # provide at least 1 layer to prevent division by zero cache size
+    num_hidden_layers = max(len(mapping.pp_layers(config.num_hidden_layers)), 1)
     mem_per_token *= num_hidden_layers * head_dim
     # K and V
     mem_per_token *= kv_factor
@@ -237,12 +238,9 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
             kv_cache_dtype = str_dtype_to_binding(
                 torch_dtype_to_str(model_engine.dtype))
 
-        num_hidden_layers = len(mapping.pp_layers(config.num_hidden_layers))
+        num_hidden_layers = config.num_hidden_layers
 
         if is_mla(config):
-            if spec_config is not None:
-                num_hidden_layers += get_num_spec_layers(spec_config)
-
             kv_cache_manager = KVCacheManager(
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.
@@ -255,14 +253,12 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
                 max_batch_size=executor_config.max_batch_size,
                 mapping=mapping,
                 dtype=kv_cache_dtype,
-                num_extra_kv_tokens=0
-                if spec_config is None else spec_config.num_extra_kv_tokens,
+                spec_config=spec_config,
             )
         elif is_nemotron_hybrid(config):
             config = model_engine.model.model_config.pretrained_config
             num_layers = config.hybrid_override_pattern.count("*")
-            mamba_num_layers = num_mamba_layers = config.hybrid_override_pattern.count(
-                "M")
+            mamba_num_layers = config.hybrid_override_pattern.count("M")
             kv_cache_manager = MambaHybridCacheManager(
                 # mamba cache parameters
                 config.hidden_size,
@@ -284,11 +280,9 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
                 max_batch_size=executor_config.max_batch_size,
                 mapping=mapping,
                 dtype=kv_cache_dtype,
-                num_extra_kv_tokens=0,
+                spec_config=spec_config,
             )
         else:
-            if spec_config is not None:
-                num_hidden_layers += get_num_spec_layers(spec_config)
             kv_cache_manager = KVCacheManager(
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -300,8 +294,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
                 max_batch_size=executor_config.max_batch_size,
                 mapping=mapping,
                 dtype=kv_cache_dtype,
-                num_extra_kv_tokens=0
-                if spec_config is None else spec_config.num_extra_kv_tokens,
+                spec_config=spec_config,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == KV_CACHE_MANAGER_KEY:
