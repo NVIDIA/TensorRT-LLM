@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 import openai
@@ -20,7 +21,7 @@ from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 
 from ..conftest import llm_models_root
-from .accuracy_core import MMLU, LlmapiAccuracyTestHarness
+from .accuracy_core import GSM8K, MMLU, LlmapiAccuracyTestHarness
 
 
 class Result(GenerationResultBase):
@@ -47,7 +48,9 @@ class OpenAIServerClient:
                  gen_server_config: Dict[str, Any],
                  model_name: str,
                  tensor_parallel_size: int = 1):
+        self.thread_pool = ThreadPoolExecutor(max_workers=16)
         self.temp_dir = tempfile.mkdtemp()
+        self.futures = []
         self.disaggregated_serving_config_path = os.path.join(
             self.temp_dir, "disaggregated_serving_config.yaml")
         with open(self.disaggregated_serving_config_path, "w") as f:
@@ -120,10 +123,7 @@ class OpenAIServerClient:
         self.client = openai.OpenAI(api_key="1234567890",
                                     base_url=f"http://localhost:8000/v1")
 
-    def generate_async(self,
-                       prompt: str,
-                       sampling_params: Optional[SamplingParams] = None):
-        # TODO: Make this async
+    def send_request(self, prompt: str, sampling_params: SamplingParams):
         response = self.client.completions.create(
             model=self.model_name,
             prompt=prompt,
@@ -144,6 +144,14 @@ class OpenAIServerClient:
         setattr(requested_output, "result", result.result)
         return requested_output
 
+    def generate_async(self,
+                       prompt: str,
+                       sampling_params: Optional[SamplingParams] = None):
+        future = self.thread_pool.submit(self.send_request, prompt,
+                                         sampling_params)
+        self.futures.append(future)
+        return future
+
     def __enter__(self):
         return self
 
@@ -157,10 +165,14 @@ class OpenAIServerClient:
         self._gen_server.wait()
         self._disaggregated_server.wait()
 
+        for future in self.futures:
+            future.result()
+        self.thread_pool.shutdown(wait=True)
 
-class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "meta-llama/Llama-3.1-8B"
-    MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Meta-Llama-3.1-8B"
+
+class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.skip_device_not_contain(["H100", "H200"])
@@ -193,24 +205,24 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                                 gen_server_config, self.MODEL_PATH) as client:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(client)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(client)
 
 
 class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct"
 
-    @pytest.mark.skip_less_device_memory(32000)
-    @pytest.mark.skip_device_not_contain(["H100"])
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
         ctx_server_config = {
             "pytorch_backend_config": {
-                "enable_overlap_scheduler": False
+                "disable_overlap_scheduler": True
             }
         }
         gen_server_config = {
             "pytorch_backend_config": {
-                "enable_overlap_scheduler": overlap_scheduler
+                "disable_overlap_scheduler": overlap_scheduler
             }
         }
         disaggregated_server_config = {
@@ -232,4 +244,6 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
                                 self.MODEL_PATH,
                                 tensor_parallel_size=4) as client:
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(client)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(client)
