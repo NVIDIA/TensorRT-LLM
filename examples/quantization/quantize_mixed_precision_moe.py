@@ -1,3 +1,4 @@
+# autoflake: skip_file
 import argparse
 import json
 import os
@@ -7,6 +8,8 @@ import shutil
 import torch
 from safetensors.torch import safe_open, save_file
 from tqdm import tqdm
+
+import tensorrt_llm
 
 
 def parse_args():
@@ -241,7 +244,7 @@ def main(args):
             input_scales = safe_open(args.act_scales, "pt")
             for k in input_scales.keys():
                 new_safetensors.update({k: input_scales.get_tensor(k)})
-                new_json['weight_map'][k] = "input_scales.safetensors"
+                new_json['weight_map'][k] = args.act_scales.split("/")[-1]
 
         file_name = get_file_name(start_layer)
         print(f'saving to {file_name}...')
@@ -298,6 +301,10 @@ def main(args):
         with open(os.path.join(output_dir, "hf_quant_config.json"),
                   'w') as file:
             json.dump(hf_quant_config, file, indent=4)
+    else:
+        file_name = get_file_name(start_layer)
+        print(f'saving to {file_name}...')
+        save_file(new_safetensors, os.path.join(output_dir, file_name))
 
 
 if __name__ == "__main__":

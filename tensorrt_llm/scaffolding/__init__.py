@@ -1,3 +1,4 @@
+from .benchmark import ScaffoldingBenchRequest, async_scaffolding_benchmark
 from .controller import (BestOfNController, Controller, MajorityVoteController,
                          NativeGenerationController, NativeRewardController,
                          ParallelProcess, ScaffoldingOutput)
@@ -32,4 +33,6 @@ __all__ = [
     "TaskCollection",
     "with_task_collection",
     "GenerationTokenCounter",
+    "async_scaffolding_benchmark",
+    "ScaffoldingBenchRequest",
 ]
