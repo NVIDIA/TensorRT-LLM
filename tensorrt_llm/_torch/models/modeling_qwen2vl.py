@@ -229,7 +229,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         self.cos_ori = self.rotary_cos_sin[:, :, 0]
         self.sin_ori = self.rotary_cos_sin[:, :, 1]
 
-    def get_num_image_tokens(
+    def get_num_tokens_per_image(
         self,
         *,
         image_width: int,

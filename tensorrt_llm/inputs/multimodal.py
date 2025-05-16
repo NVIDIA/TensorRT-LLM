@@ -95,6 +95,7 @@ def apply_mm_hashes(mm_data, hash_lib=default_hasher):
         # TODO: possible hash collision w/ this simplified version (vllm/PR/17378)
         hasher = hash_lib()
         if isinstance(image, torch.Tensor):
+            # TODO: Device tensor hashing is an open issue. Limited hashing to CPU for now.
             image = image.cpu()
         hasher.update(serialize_item(image))
         return hasher.hexdigest()
@@ -140,8 +141,8 @@ def find_mm_token_lengths(mm_data, input_processor):
         if modality != "image":
             #TODO: support other modalities
             return []
-        if not hasattr(input_processor, "get_num_image_tokens"):
-            #TODO: backward compatibility for models that don't yet have get_num_image_tokens implemented
+        if not hasattr(input_processor, "get_num_tokens_per_image"):
+            #TODO: backward compatibility for models that don't yet have get_num_tokens_per_image implemented
             #TODO: only support qwen2_vl for now
             return []
 
@@ -149,7 +150,7 @@ def find_mm_token_lengths(mm_data, input_processor):
         for item in items:
             if isinstance(item, torch.Tensor):
                 item = ToPILImage()(item)
-            num_tokens = input_processor.get_num_image_tokens(
+            num_tokens = input_processor.get_num_tokens_per_image(
                 image_width=item.width,
                 image_height=item.height,
             )
