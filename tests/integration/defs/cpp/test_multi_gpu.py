@@ -290,6 +290,7 @@ def run_disagg_symmetric_executor_tests(build_dir: _pl.Path,
 
 def run_disagg_asymmetric_executor_tests(build_dir: _pl.Path,
                                          model: str,
+                                         nprocs=4,
                                          use_ucx_kvcache=False,
                                          timeout=1500):
 
@@ -306,43 +307,17 @@ def run_disagg_asymmetric_executor_tests(build_dir: _pl.Path,
     else:
         mgpu_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
 
-    xml_output_file = build_dir / "results-multi-gpu-disagg-asymmetric-executor-4-process.xml"
-    trt_model_test = _cpp.produce_mpirun_command(
-        global_commands=["mpirun", "--allow-run-as-root"],
-        nranks=4,
-        local_commands=[
-            "executor/disaggExecutorTest",
-            f"--gtest_filter=*{prefix}*DisaggAsymmetricExecutorTest*"
-        ],
-        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-    _cpp.run_command(trt_model_test,
-                     cwd=tests_dir,
-                     env=mgpu_env,
-                     timeout=timeout)
+    xml_output_file = build_dir / f"results-multi-gpu-disagg-asymmetric-executor-{nprocs}-process.xml"
 
-    xml_output_file = build_dir / "results-multi-gpu-disagg-asymmetric-executor-6-process.xml"
     trt_model_test = _cpp.produce_mpirun_command(
         global_commands=["mpirun", "--allow-run-as-root"],
-        nranks=6,
+        nranks=nprocs,
         local_commands=[
             "executor/disaggExecutorTest",
             f"--gtest_filter=*{prefix}*DisaggAsymmetricExecutorTest*"
         ],
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-    _cpp.run_command(trt_model_test,
-                     cwd=tests_dir,
-                     env=mgpu_env,
-                     timeout=timeout)
 
-    xml_output_file = build_dir / "results-multi-gpu-disagg-asymmetric-executor-8-process.xml"
-    trt_model_test = _cpp.produce_mpirun_command(
-        global_commands=["mpirun", "--allow-run-as-root"],
-        nranks=8,
-        local_commands=[
-            "executor/disaggExecutorTest",
-            f"--gtest_filter=*{prefix}*DisaggAsymmetricExecutorTest*"
-        ],
-        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
     _cpp.run_command(trt_model_test,
                      cwd=tests_dir,
                      env=mgpu_env,
@@ -613,8 +588,10 @@ class TestDisagg:
 
     @pytest.mark.parametrize("use_ucx_kvcache", [False, True],
                              ids=["mpi_kvcache", "ucx_kvcache"])
+    @pytest.mark.parametrize("nprocs", [4, 6, 8],
+                             ids=["4proc", "6proc", "8proc"])
     @pytest.mark.parametrize("model", ["llama"])
-    def test_asymmetric_executor(self, build_google_tests, model,
+    def test_asymmetric_executor(self, build_google_tests, model, nprocs,
                                  use_ucx_kvcache, prepare_models_disagg,
                                  build_dir):
 
@@ -624,6 +601,7 @@ class TestDisagg:
             run_disagg_asymmetric_executor_tests(
                 build_dir=build_dir,
                 model=model,
+                nprocs=nprocs,
                 use_ucx_kvcache=use_ucx_kvcache)
 
     @pytest.mark.parametrize("use_ucx_kvcache", [False, True],
