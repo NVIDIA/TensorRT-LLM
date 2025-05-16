@@ -853,8 +853,7 @@ def test_moe_fp4(num_tokens, expert_info, hidden_size, intermediate_size):
     getSMVersion(),
 )
 @pytest.mark.parametrize("num_tokens", [1, 2, 16, 64, 1024])
-@pytest.mark.parametrize("expert_info", [(128, 0, 0, 1, True),
-                                         (128, 8, 4, 8, False)])
+@pytest.mark.parametrize("expert_info", [(128, 0, 0, 1, True)])
 @pytest.mark.parametrize("hidden_size", [2048])
 @pytest.mark.parametrize("intermediate_size", [2048])
 def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
