@@ -586,6 +586,68 @@ class TestLlama3_8BInstructGradient1048k(CliFlowAccuracyTestHarness):
                  extra_build_args=["--gather_context_logits"])
 
 
+class TestLlama4MaverickInstruct(CliFlowAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-4-Maverick-17B-128E-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Maverick-17B-128E-Instruct"
+    EXAMPLE_FOLDER = "models/core/llama"
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(8)
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
+                                                         (8, 1, 8)],
+                             ids=["tp8", "tp8ep4", "tp8ep8"])
+    def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
+        extra_summarize_args = []
+        if cuda_graph:
+            extra_summarize_args.append("--cuda_graph_mode")
+
+        self.run(tasks=[MMLU(self.MODEL_NAME)],
+                 tp_size=tp_size,
+                 pp_size=pp_size,
+                 extra_convert_args=[
+                     f"--moe_tp_size={tp_size // ep_size}",
+                     f"--moe_ep_size={ep_size}", f"--moe_renorm_mode={0}"
+                 ],
+                 extra_build_args=[
+                     "--gemm_plugin=auto", "--moe_plugin=auto",
+                     f"--max_seq_len={8192}"
+                 ],
+                 extra_summarize_args=extra_summarize_args)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(8)
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
+                                                         (8, 1, 8)],
+                             ids=["tp8", "tp8ep4", "tp8ep8"])
+    def test_fp8_prequantized(self, cuda_graph, tp_size, pp_size, ep_size,
+                              mocker):
+        mocker.patch.object(
+            self.__class__, "MODEL_PATH",
+            f"{llm_models_root()}/llama4-models/Llama-4-Maverick-17B-128E-Instruct-FP8"
+        )
+
+        extra_summarize_args = []
+        if cuda_graph:
+            extra_summarize_args.append("--cuda_graph_mode")
+
+        self.run(tasks=[MMLU(self.MODEL_NAME)],
+                 quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+                 kv_cache_quant_algo=QuantAlgo.FP8,
+                 tp_size=tp_size,
+                 pp_size=pp_size,
+                 extra_convert_args=[
+                     f"--moe_tp_size={tp_size // ep_size}",
+                     f"--moe_ep_size={ep_size}", f"--moe_renorm_mode={0}"
+                 ],
+                 extra_build_args=[
+                     "--gemm_plugin=auto", "--moe_plugin=auto",
+                     f"--max_seq_len={8192}"
+                 ],
+                 extra_summarize_args=extra_summarize_args)
+
+
 class TestLlama3_1_8B(CliFlowAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Meta-Llama-3.1-8B"
