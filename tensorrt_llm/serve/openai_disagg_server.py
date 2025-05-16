@@ -17,7 +17,8 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
-from tensorrt_llm.llmapi.disagg_utils import DisaggCondition, RouterConfig
+from tensorrt_llm.llmapi.disagg_utils import (ConditionalDisaggConfig,
+                                              RouterConfig)
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
                                                 CompletionRequest,
@@ -41,13 +42,13 @@ class OpenAIDisaggServer:
                  server_start_timeout_secs: int = 180,
                  ctx_router_config: Optional[RouterConfig] = None,
                  gen_router_config: Optional[RouterConfig] = None,
-                 condition: Optional[DisaggCondition] = None):
+                 conditional_disagg_config: Optional[ConditionalDisaggConfig] = None):
 
         self.ctx_servers = ctx_servers
         self.gen_servers = gen_servers
         self.ctx_router = create_router(ctx_router_config, ctx_servers)
         self.gen_router = create_router(gen_router_config, gen_servers)
-        self.condition = condition
+        self.conditional_disagg_config = conditional_disagg_config
 
         if (len(self.gen_servers) == 0):
             raise ValueError("At least one generation server must be provided")
@@ -55,7 +56,7 @@ class OpenAIDisaggServer:
         if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") != "1" and len(ctx_servers) == 0:
             raise ValueError("At least one context server must be provided")
 
-        if condition is not None and not isinstance(self.gen_router, KvCacheAwareRouter):
+        if self.conditional_disagg_config is not None and not isinstance(self.gen_router, KvCacheAwareRouter):
             raise ValueError("Generation router must be a KvCacheAwareRouter to enable conditional disaggregation")
 
         # Session will be initialized in lifespan
@@ -167,12 +168,13 @@ class OpenAIDisaggServer:
         ctx_req = None
         ctx_finished = False
         try:
-            if self.condition is not None:
+            condition = self.conditional_disagg_config
+            if condition is not None:
                 assert isinstance(self.gen_router, KvCacheAwareRouter)
                 gen_server, info = await self.gen_router.get_next_server(req)
                 match_length = sum(info["matches"])
                 total_length = sum(len(token_list) for token_list in info["token_lists"])
-                if match_length == 0 or total_length - match_length > self.condition.max_local_prefill_length:
+                if match_length == 0 or total_length - match_length > condition.max_local_prefill_length:
                     ctx_req = copy.deepcopy(req)
                     ctx_server, _ = await self.ctx_router.get_next_server(ctx_req)
             elif os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":

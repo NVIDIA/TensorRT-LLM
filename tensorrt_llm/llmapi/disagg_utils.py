@@ -31,7 +31,7 @@ class RouterConfig():
 
 
 @dataclass
-class DisaggCondition():
+class ConditionalDisaggConfig():
     max_local_prefill_length: int = 0
 
 
@@ -42,7 +42,7 @@ class DisaggServerConfig():
     port: int = 8000
     ctx_router_config: Optional[RouterConfig] = None
     gen_router_config: Optional[RouterConfig] = None
-    condition: Optional[DisaggCondition] = None
+    conditional_disagg_config: Optional[ConditionalDisaggConfig] = None
 
 
 def parse_disagg_config_file(yaml_config_file: str):
@@ -60,7 +60,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        port: int = 8000,
                        context_servers: dict = dict(),
                        generation_servers: dict = dict(),
-                       condition: Optional[dict] = None,
+                       conditional_disagg_config: Optional[dict] = None,
                        **kwargs: Any) -> DisaggServerConfig:
 
     # If parameters are specified outside the context_severs and generation_servers sections,
@@ -85,10 +85,12 @@ def extract_disagg_cfg(hostname: str = 'localhost',
 
     ctx_router_config = extract_router_config(context_servers)
     gen_router_config = extract_router_config(generation_servers)
-    condition = DisaggCondition(**condition) if condition else None
+    conditional_disagg_config = ConditionalDisaggConfig(
+        **conditional_disagg_config) if conditional_disagg_config else None
 
     config = DisaggServerConfig(server_configs, hostname, port,
-                                ctx_router_config, gen_router_config, condition)
+                                ctx_router_config, gen_router_config,
+                                conditional_disagg_config)
 
     return config
 
