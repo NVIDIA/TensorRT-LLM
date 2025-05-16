@@ -135,9 +135,11 @@ def buildImage(target, action="build", torchInstallType="skip", args="", custom_
             // Fix the build OOM issue of release builds
             def build_jobs = BUILD_JOBS
             if (target == "trtllm") {
-                build_jobs = BUILD_JOBS_RELEASE_X86_64
-            } else if (target == "trtllm_sbsa") {
-                build_jobs = BUILD_JOBS_RELEASE_SBSA
+                if (arch == "x86_64") {
+                    build_jobs = BUILD_JOBS_RELEASE_X86_64
+                } else {
+                    build_jobs = BUILD_JOBS_RELEASE_SBSA
+                }
             }
             containerGenFailure = null
             stage ("make ${target}_${action}") {
