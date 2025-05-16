@@ -50,7 +50,7 @@ from collections import defaultdict
 from typing import Any, DefaultDict, Dict, List, Optional, Sequence
 
 import torch
-from torch._inductor.pattern_matcher import PatternMatcherPass
+from torch._inductor.pattern_matcher import Match, PatternMatcherPass
 from torch.fx import GraphModule, Node
 
 from ...utils.logger import ad_logger
@@ -71,7 +71,7 @@ def _rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def _rope_pattern(q, k, cos, sin, unsqueeze_dim=1):
+def _explicit_rope_pattern(q, k, cos, sin, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (_rotate_half(q) * sin)
@@ -79,11 +79,47 @@ def _rope_pattern(q, k, cos, sin, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-def _rope_repl(q, k, cos, sin, unsqueeze_dim):
+def _explicit_rope_repl(q, k, cos, sin, unsqueeze_dim):
     return torch.ops.rope.torch_apply_rope_with_explicit_cos_sin(q, k, cos, sin, unsqueeze_dim)
 
 
-def match_explicit_rope_with_pm(gm: GraphModule) -> GraphModule:
+def _interleaved_rope_pattern(q, k, cos, sin, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    b, h, s, d = q.shape
+    q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+    b, h, s, d = k.shape
+    k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+    q_embed = (q * cos) + (_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def _interleaved_rope_repl(q, k, cos, sin, unsqueeze_dim):
+    return torch.ops.rope.torch_apply_rope_with_qk_interleaving(q, k, cos, sin, unsqueeze_dim)
+
+
+# exporting with {"unsqueeze_dim": 2},
+# would confuse the pattern matcher since '2' is arg of other ops
+def _complex_rope_pattern(xq, xk, freqs_cis, unsqueeze_dim=1):
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    freqs = freqs_cis.unsqueeze(unsqueeze_dim)
+    xq_out = torch.view_as_real(xq_ * freqs).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+def _complex_rope_repl(q, k, freqs_cis, unsqueeze_dim):
+    return torch.ops.rope.torch_apply_rope_with_complex_freqs(q, k, freqs_cis, unsqueeze_dim)
+
+
+def _explicit_not_interleaved(match: Match) -> bool:
+    q, k = match.kwargs.get("q"), match.kwargs.get("k")
+    return not any(isinstance(n, Node) and _match_input_interleave_pattern(n) for n in (q, k))
+
+
+def match_rope_pattern(gm: GraphModule) -> GraphModule:
     graph = gm.graph
     patterns = PatternMatcherPass()
 
@@ -94,18 +130,44 @@ def match_explicit_rope_with_pm(gm: GraphModule) -> GraphModule:
     hidden_size = 512
     head_dim = hidden_size // num_heads
 
-    dummy = [
+    dummy_explicit = [
         torch.randn(batch_size, num_heads, seq_len, head_dim, device="cuda", dtype=torch.float16),
         torch.randn(batch_size, num_heads, seq_len, head_dim, device="cuda", dtype=torch.float16),
         torch.randn(batch_size, seq_len, head_dim, device="cuda", dtype=torch.float16),
         torch.randn(batch_size, seq_len, head_dim, device="cuda", dtype=torch.float16),
     ]
+    dummy_complex = [
+        torch.randn(batch_size, num_heads, seq_len, head_dim, device="cuda", dtype=torch.float16),
+        torch.randn(batch_size, num_heads, seq_len, head_dim, device="cuda", dtype=torch.float16),
+        torch.randn(batch_size, seq_len, head_dim // 2, device="cuda", dtype=torch.float16),
+    ]
     register_pattern(
-        search_fn=_rope_pattern,
-        replace_fn=_rope_repl,
+        search_fn=_explicit_rope_pattern,
+        replace_fn=_explicit_rope_repl,
         patterns=patterns,
-        dummy_args=dummy,
+        dummy_args=dummy_explicit,
         op_ignore_types={torch.ops.aten.slice.Tensor: (int,)},
+        scalar_workaround={"unsqueeze_dim": 1},
+        extra_check=_explicit_not_interleaved,
+    )
+    register_pattern(
+        search_fn=_interleaved_rope_pattern,
+        replace_fn=_interleaved_rope_repl,
+        patterns=patterns,
+        dummy_args=dummy_explicit,
+        op_ignore_types={
+            torch.ops.aten.slice.Tensor: (int,),
+            torch.ops.aten.reshape.default: (int,),
+            torch.ops.aten.view.default: (int,),
+        },
+        scalar_workaround={"unsqueeze_dim": 1},
+    )
+    register_pattern(
+        search_fn=_complex_rope_pattern,
+        replace_fn=_complex_rope_repl,
+        patterns=patterns,
+        dummy_args=dummy_complex,
+        op_ignore_types={torch.ops.aten.reshape.default: (int,)},
         scalar_workaround={"unsqueeze_dim": 1},
     )
 

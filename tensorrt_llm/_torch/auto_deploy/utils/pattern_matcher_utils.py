@@ -19,6 +19,7 @@ from torch._inductor.pattern_matcher import (
     ExclusiveKeywordArg,
     Ignored,
     KeywordArg,
+    Match,
     MultiOutputPattern,
     PatternExpr,
     PatternMatcherPass,
@@ -51,6 +52,14 @@ def trace_to_gm(fn: Callable, args: Sequence[torch.Tensor]) -> GraphModule:
     return torch_export_to_gm(module, tuple(args))
 
 
+def _not_implemented(*args: Any, **kwargs: Any) -> NoReturn:
+    raise NotImplementedError
+
+
+def _return_true(match: Match) -> bool:
+    return True
+
+
 def register_pattern(
     search_fn: Callable,
     replace_fn: Callable,
@@ -61,6 +70,7 @@ def register_pattern(
     exclusive_arg_names: Sequence[str] = (),
     scalar_workaround: Optional[Any] = None,
     op_ignore_types: Optional[Mapping[Callable[..., Any], Sequence[type[Any]]]] = None,
+    extra_check: Callable[[Match], bool] = _return_true,
 ) -> None:
     """
     Tracing a Python-level pattern into a GraphModule and registering its replacement.
@@ -106,6 +116,7 @@ def register_pattern(
         trace_fn=trace_fn,
         pass_dicts=patterns,
         search_fn_pattern=pattern,
+        extra_check=extra_check,
     )
 
 
@@ -216,7 +227,3 @@ def fx_to_pattern_with_op_ignore(
     if not isinstance(pattern, PatternExpr):
         return MultiOutputPattern(pytree.tree_leaves(pattern))
     return pattern
-
-
-def _not_implemented(*args: Any, **kwargs: Any) -> NoReturn:
-    raise NotImplementedError

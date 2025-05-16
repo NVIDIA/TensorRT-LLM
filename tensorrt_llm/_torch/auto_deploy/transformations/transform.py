@@ -23,13 +23,12 @@ from .library import (
     insert_cached_attention,
     match_attention_layout,
     match_causal_attn_mask,
-    match_complex_rope,
     match_eager_attention,
-    match_explicit_rope,
     match_grouped_attention,
     match_moe_pattern,
     match_repeat_kv,
     match_rope_layout,
+    match_rope_pattern,
     optimize_rope,
     quantize,
     resize_kv_cache,
@@ -121,8 +120,11 @@ class InferenceOptimizer:
         egm = match_attention_layout(egm, self.attention_op)
 
         # Match rope
-        egm = match_explicit_rope(egm)
-        egm = match_complex_rope(egm)
+        # TODO: remove `match_explicit_rope` and `match_explicit_rope` once Llama4 RoPE and DeepSeek RoPE are verified
+        # egm = match_explicit_rope(egm)
+        # egm = match_complex_rope(egm)
+        egm = match_rope_pattern(egm)
+
         # Match RoPE layout expected by our backend
         egm = match_rope_layout(egm, self.attention_op.get_attention_layout())
 
