@@ -63,10 +63,10 @@ struct Softmax_base
         CAUSAL_MASK = Kernel_traits::CAUSAL_MASK
     };
 
-    // Whether we will ignore the long distance tokens in the beginning.
+    // Whether do we attend to the specific sliding window or chunk ?
     enum
     {
-        SLIDING_WINDOW_ATTENTION = Kernel_traits::SLIDING_WINDOW_ATTENTION
+        SLIDING_OR_CHUNKED_ATTENTION = Kernel_traits::SLIDING_OR_CHUNKED_ATTENTION
     };
 
     // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
@@ -96,7 +96,7 @@ struct Softmax_base
     // Whether we need to check if local_max could be -inf or not.
     enum
     {
-        CHECK_IF_NEG_INF_EXISTS = SLIDING_WINDOW_ATTENTION || USE_CUSTOM_MASK
+        CHECK_IF_NEG_INF_EXISTS = SLIDING_OR_CHUNKED_ATTENTION || USE_CUSTOM_MASK
     };
 
     // Ctor.
@@ -105,6 +105,8 @@ struct Softmax_base
         : tidx_(tidx)
         , scale_bmm1_(params.scale_bmm1_d ? *params.scale_bmm1_d : params.scale_bmm1)
         , softcapping_scale_bmm1_(params.softcapping_scale_bmm1)
+        , sliding_window_size_(params.sliding_window_size)
+        , log2_chunked_attention_size_(params.log2_chunked_attention_size)
         , packed_mask_ptr_{reinterpret_cast<uint32_t*>(params.packed_mask_ptr)}
         , params_packed_mask_stride_in_bytes_{params.packed_mask_stride_in_bytes}
     {
@@ -117,6 +119,22 @@ struct Softmax_base
         if (CAUSAL_MASK)
         {
             quad_row_ = warp * 16 + lane / 4;
+        }
+    }
+
+    // Compute the sliding window or chunk start.
+    inline __device__ int compute_sliding_window_or_chunk_start(int row)
+    {
+        // If the chunked atteniton is used.
+        if (log2_chunked_attention_size_ > 0)
+        {
+            // The attention chunk start.
+            return (row >> log2_chunked_attention_size_) << log2_chunked_attention_size_;
+        }
+        else
+        {
+            // The sliding window start is the max of 0 and row - sliding_window_size.
+            return max(0, row - sliding_window_size_);
         }
     }
 
@@ -230,7 +248,7 @@ struct Softmax_base
     // Convert from bmm1 output fragments to floats.
     template <bool APPLY_MASK, typename AlibiParams>
     inline __device__ void apply_alibi_and_mask(Compute_tile_p& ctile_p, AlibiParams const& alibi_params,
-        float const alibi_head_scale, int actual_seqlen, int sliding_window_size, int row_offset, int col_offset)
+        float const alibi_head_scale, int actual_seqlen, int row_offset, int col_offset)
     {
 #pragma unroll
         for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++)
@@ -259,12 +277,12 @@ struct Softmax_base
                         v0 = (col <= row);
                         v1 = (col + 1 <= row);
 
-                        // Only pay attention to the last max-past-seqlen long tokens.
-                        if constexpr (SLIDING_WINDOW_ATTENTION)
+                        // Attend to the specific sliding window or chunk.
+                        if constexpr (SLIDING_OR_CHUNKED_ATTENTION)
                         {
-                            int start_seqlen = max(0, row - sliding_window_size);
-                            v0 &= (col >= start_seqlen);
-                            v1 &= (col + 1 >= start_seqlen);
+                            int sliding_window_or_chunk_start = compute_sliding_window_or_chunk_start(row);
+                            v0 &= (col >= sliding_window_or_chunk_start);
+                            v1 &= (col + 1 >= sliding_window_or_chunk_start);
                         }
                         // Dense(padding) mask.
                     }
@@ -469,6 +487,11 @@ struct Softmax_base
     // The row index for the mma thread layout.
     int quad_row_;
 
+    // The sliding window size.
+    int const sliding_window_size_;
+    // The log2 attention chunk size.
+    int const log2_chunked_attention_size_;
+
     // The packed mask ptr.
     uint32_t const* packed_mask_ptr_;
     // The packed mask k-dim stride in bytes;
@@ -556,10 +579,10 @@ struct Softmax_fp32_base : public Softmax_base<Traits, Kernel_traits>
         USE_CUSTOM_MASK = Base::USE_CUSTOM_MASK
     };
 
-    // Whether we will ignore the long distance tokens in the beginning.
+    // Whether we attend to the specific sliding window or chunk ?
     enum
     {
-        SLIDING_WINDOW_ATTENTION = Base::SLIDING_WINDOW_ATTENTION
+        SLIDING_OR_CHUNKED_ATTENTION = Base::SLIDING_OR_CHUNKED_ATTENTION
     };
 
     // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
@@ -801,10 +824,10 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
         CAUSAL_MASK = Base::CAUSAL_MASK
     };
 
-    // Whether we will ignore the long distance tokens in the beginning.
+    // Whether we attend to the specific sliding window or chunk ?
     enum
     {
-        SLIDING_WINDOW_ATTENTION = Base::SLIDING_WINDOW_ATTENTION
+        SLIDING_OR_CHUNKED_ATTENTION = Base::SLIDING_OR_CHUNKED_ATTENTION
     };
 
     // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).

@@ -209,7 +209,7 @@ __global__ void packFlashAttentionMask(PackedMaskParams<MaskInputDataType> param
                     validMasks[2] &= (col <= (row + 8));
                     validMasks[3] &= ((col + 1) <= (row + 8));
                 }
-                else if constexpr (MaskType == ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL)
+                else if constexpr (MaskType == ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL)
                 {
                     validMasks[0] &= (col <= row) && (col > (row - params.slidingWindowSize));
                     validMasks[1] &= ((col + 1) <= row && (col + 1) > (row - params.slidingWindowSize));
@@ -260,9 +260,9 @@ void invokeBuildPackedMask(PackedMaskParams<MaskInputDataType> const& params, cu
         packFlashAttentionMask<MaskInputDataType, ContextAttentionMaskType::CUSTOM_MASK>
             <<<grid, 256, 0, stream>>>(params);
     }
-    else if (params.attentionMaskType == ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL)
+    else if (params.attentionMaskType == ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL)
     {
-        packFlashAttentionMask<MaskInputDataType, ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL>
+        packFlashAttentionMask<MaskInputDataType, ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL>
             <<<grid, 256, 0, stream>>>(params);
     }
     else
