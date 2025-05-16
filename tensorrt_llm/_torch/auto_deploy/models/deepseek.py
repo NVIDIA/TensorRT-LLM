@@ -1,75 +1,9 @@
 import types
-import warnings
-from typing import Dict, Optional
+from typing import Dict
 
 import torch
 import torch.utils.checkpoint
 from transformers import AutoModelForCausalLM
-from transformers.cache_utils import Cache
-
-
-def deepseek_v3_attention(
-    self,
-    hidden_states: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_value: Optional[Cache] = None,
-    output_attentions: bool = False,
-    use_cache: bool = False,
-    **kwargs,
-):
-    """DeepSeekV3Attention forward function rewritten to wrap MultiheadLatentAttention as a custom op."""
-    if "padding_mask" in kwargs:
-        warnings.warn(
-            "Passing `padding_mask` is deprecated and will be removed in v4.37. "
-            "Please make sure use `attention_mask` instead.`"
-        )
-    bsz, q_len, _ = hidden_states.size()
-
-    # If else paths are determined by config.json
-    if self.q_lora_rank is None:
-        q = self.q_proj(hidden_states)
-    else:
-        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-    q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
-    q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
-    compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-    compressed_kv, k_pe = torch.split(
-        compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-    )
-    k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
-    kv = (
-        self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
-        .view(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-        .transpose(1, 2)
-    )
-    _, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-    kv_seq_len = value_states.shape[-2]
-    if past_key_value is not None:
-        raise ValueError("past_key_value is not supported")
-    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-
-    # Use custom op to capture mla. This does not handle KV cache
-    # as passing transformers Cache into a custom op is throwing an error.
-    # Would not be an issue, cause we intend to replace mla op with our implementation further along the pipeline
-    attn_output = torch.ops.deepseek.fused_mla(
-        q_nope,
-        q_pe,
-        kv,
-        k_pe,
-        cos,
-        sin,
-        position_ids,
-        attention_mask,
-        self.softmax_scale,
-    )
-
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
-    attn_output = self.o_proj(attn_output)
-
-    return attn_output, None, past_key_value
 
 
 # This patched module matches exactly with HF generate
@@ -146,13 +80,28 @@ def deepseek_v3_moe(self, hidden_states):
     return final_hidden_states.to(hidden_states.dtype)
 
 
+def deepseek_v3_rope(self, x, seq_len=None):
+    """
+    DeepSeekV3 Rotary Embedding forward function rewritten to enable torch export.
+
+    We return the full cached cos and sin values, instead of slicing them based on seq_len as this
+    would cause an issue during the generate phase (when seq_len=1 from input_ids). We also move the cos
+    and sin buffers to the appropriate device to enable export.
+    """
+
+    return (
+        self.cos_cached.to(dtype=x.dtype).to(device=x.device),
+        self.sin_cached.to(dtype=x.dtype).to(device=x.device),
+    )
+
+
 _from_config_original = AutoModelForCausalLM.from_config
 
 CUSTOM_MODULE_PATCHES: Dict[str, callable] = {
     "DeepseekV3MoE": deepseek_v3_moe,
     "DeepseekV2MoE": deepseek_v3_moe,
-    "DeepseekV3Attention": deepseek_v3_attention,
-    "DeepseekV2Attention": deepseek_v3_attention,
+    "DeepseekV3RotaryEmbedding": deepseek_v3_rope,
+    "DeepseekV3YarnRotaryEmbedding": deepseek_v3_rope,
 }
 
 

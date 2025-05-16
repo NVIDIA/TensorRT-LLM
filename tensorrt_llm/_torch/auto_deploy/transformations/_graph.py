@@ -106,6 +106,7 @@ def move_to_device(gm: fx.GraphModule, device: DeviceLikeType) -> fx.GraphModule
             kwargs = node.kwargs.copy()
             kwargs["device"] = device
             node.kwargs = kwargs
+
         # move all the tensor metadata
         node.meta["val"] = pytree.tree_map(
             lambda v: v.to(device) if isinstance(v, torch.Tensor) else v,
