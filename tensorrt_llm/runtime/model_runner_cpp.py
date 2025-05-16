@@ -500,7 +500,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
     @property
     def num_layers(self) -> int:
         return self.model_config.num_layers(
-            self.world_config.pipeline_parallelism)
+            self.world_config.pipeline_parallelism,
+            self.world_config.pipeline_parallel_rank,
+        )
 
     @property
     def max_sequence_length(self) -> int:
