@@ -21,11 +21,11 @@ by NVIDIA TensorRT-LLM team
       - [Mixed ETP](#mixed-etp)
       - [Smart Router](#smart-router)
   - [Kernel Level optimizations](#kernel-level-optimizations)
-    - [Attention](#attention)
+    - [Attention Kernel](#attention-kernel)
     - [Grouped GEMM](#grouped-gemm)
       - [CUTLASS Backend](#cutlass-backend-default-backend)
       - [TRTLLM Backend](#trtllm-backend)
-      - [Communication](#communication)
+    - [Communication Kernel](#communication-kernel)
     - [Dense GEMM optimization](#dense-gemm-optimization)
       - [Fuse_A_GEMM](#fuse_a_gemm)
       - [RouterGEMM](#routergemm)
@@ -36,6 +36,7 @@ by NVIDIA TensorRT-LLM team
 
 ## Background
 Recent advancements in Large Language Reasoning Models have demonstrated remarkable success, while creating new deployment challenges. A critical challenge emerges from extended Output Sequence Lengths (OSL) due to complex "thinking and reasoning" processes. Longer OSL demands stricter Token-to-Token Latency (TTL) requirements, often forcing concurrency limitations. The most extreme case, single concurrency (min-latency scenario) , becomes particularly challenging for real-time applications.
+
 This article explores how TensorRT-LLM achieves record-breaking performance for [DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1) in min-latency scenarios on NVIDIA's 8×B200 GPU configuration progressing from 67 tokens per second (TPS) to 253 before GTC 2025(**3.7x** speed-up), and to our current number is 368 TPS (**5.5x** speed-up).
 
 
@@ -43,6 +44,7 @@ This article explores how TensorRT-LLM achieves record-breaking performance for 
 
 ### Workload Profile
 Input Sequence Length (ISL): 1k tokens
+
 Output Sequence Length (OSL): 2k tokens
 
 ### Model Architecture
@@ -209,7 +211,7 @@ Alternatively, by storing all expert weights on a cluster of four GPUs and repli
 
 
 ### Kernel Level optimizations
-#### Attention
+#### Attention Kernel
 We have developed a customized MLA attention kernel to better utilize GPU resources for latency scenarios.
 #### Grouped GEMM
 ##### CUTLASS Backend (default backend)
@@ -218,7 +220,7 @@ Our default MoE backend is based on CUTLASS, which is flexible/robust but may no
 ##### TRTLLM Backend
 The other MoE backend is TRTLLM, which provides better performance, and we are working to make it more flexible and robust, and in the future it will be switched as the default backend for Grouped GEMM computation for latency scenarios.
 
-##### Communication
+#### Communication Kernel
 For small message sizes, regular NCCL latency-bound AllReduce kernels are inefficient, so we've developed a customized oneshot AllReduce kernel. It leverages the powerful NVSwitch HW capability by acting like an initial broadcast followed by local reduction, delivering better performance in min-latency scenarios.
 
 #### Dense GEMM optimization
