@@ -20,32 +20,72 @@ namespace tr = tensorrt_llm::runtime;
 
 using namespace tensorrt_llm::testing;
 
-using DisaggParamsType = std::tuple< //
-    int,                             // processNum
-    std::vector<std::string>,        // modelNames
-    std::vector<std::vector<int>>,   // participantIdsEachInstance
-    std::vector<std::vector<int>>,   // participantDeviceIdsEachInstance
-    std::vector<int>,                // instanceRoles
-    int                              // controllerRank
-    >;
-
-using CondDisaggParamsType = std::tuple<std::string>; // modelName
-
 namespace
 {
-
 auto constexpr LLAMA_INPUT_FILE = "input_tokens_llama.npy";
 auto constexpr LLAMA_VOCAB_SIZE_PADDED = 128256;
 auto constexpr LLAMA_END_ID = 128001;
 auto constexpr LLAMA_PAD_ID = 128001;
 
-} // namespace
+using CondDisaggParamsType = std::tuple<std::string>; // modelName
 
-enum InstanceRole : int
+enum class InstanceRole : int
 {
-    CONTEXT = 1,
-    GENERATION = 0,
-    MIXED = 2
+    kCONTEXT = 1,
+    kGENERATION = 0,
+    kMIXED = 2
+};
+
+using DisaggParamsType = std::tuple< //
+    int,                             // processNum
+    std::vector<std::string>,        // modelNames
+    std::vector<std::vector<int>>,   // participantIdsEachInstance
+    std::vector<std::vector<int>>,   // participantDeviceIdsEachInstance
+    std::vector<InstanceRole>,       // instanceRoles
+    int                              // controllerRank
+    >;
+
+std::string convertToString(std::vector<std::vector<int>> const& vec)
+{
+    std::ostringstream oss;
+    oss << "XX";
+
+    for (size_t i = 0; i < vec.size(); ++i)
+    {
+        for (size_t j = 0; j < vec[i].size(); ++j)
+        {
+            oss << vec[i][j];
+            if (j < vec[i].size() - 1)
+            {
+                oss << "_";
+            }
+        }
+        if (i < vec.size() - 1)
+        {
+            oss << "X_X";
+        }
+    }
+
+    oss << "XX";
+    return oss.str();
+};
+
+std::string convertToString(std::vector<InstanceRole> const& vec)
+{
+    std::ostringstream oss;
+    oss << "XX";
+
+    for (size_t j = 0; j < vec.size(); ++j)
+    {
+        oss << static_cast<int>(vec[j]);
+        if (j < vec.size() - 1)
+        {
+            oss << "_";
+        }
+    }
+
+    oss << "XX";
+    return oss.str();
 };
 
 std::string generateTestNameDisaggParams(testing::TestParamInfo<DisaggParamsType> const& info)
@@ -57,30 +97,6 @@ std::string generateTestNameDisaggParams(testing::TestParamInfo<DisaggParamsType
     auto const instanceRoles = std::get<4>(info.param); // std::vector<int> ; //1 is context , 0 is generation
     auto const controllerRank = std::get<5>(info.param);
 
-    auto convertToString = [](std::vector<std::vector<int>> const& vec)
-    {
-        std::ostringstream oss;
-        oss << "XX";
-
-        for (size_t i = 0; i < vec.size(); ++i)
-        {
-            for (size_t j = 0; j < vec[i].size(); ++j)
-            {
-                oss << vec[i][j];
-                if (j < vec[i].size() - 1)
-                {
-                    oss << "_";
-                }
-            }
-            if (i < vec.size() - 1)
-            {
-                oss << "X_X";
-            }
-        }
-
-        oss << "XX";
-        return oss.str();
-    };
     std::string name = "DisaggExecutorTest_";
 
     name.append("ProcessNum_" + std::to_string(processNum));
@@ -95,7 +111,7 @@ std::string generateTestNameDisaggParams(testing::TestParamInfo<DisaggParamsType
 
     name.append("_ranks_").append(convertToString(participantIdsEachInstance));
     name.append("_devices_").append(convertToString(participantDeviceIdsEachInstance));
-    name.append("_roles_").append(convertToString({instanceRoles}));
+    name.append("_roles_").append(convertToString(instanceRoles));
     name.append("_controllerRank_" + std::to_string(controllerRank));
 
     return name;
@@ -119,8 +135,6 @@ class ConditionalDisaggParamsTest : public GptExecutorTest, public ::testing::Wi
 {
 };
 
-namespace
-{
 void verifyGenerateDistStats(std::deque<RequestStatsPerIteration> const& iterationStats)
 {
     for (auto const& iteration : iterationStats)
@@ -506,8 +520,9 @@ TEST_P(DisaggParamsTest, DisaggTokenComparison)
             {
                 participatntIds = ranksThisInstance;
                 deviceIds = devicesThisInstance;
-                isContext = instanceRoles[i] == InstanceRole::CONTEXT || instanceRoles[i] == InstanceRole::MIXED;
-                isGeneration = instanceRoles[i] == InstanceRole::GENERATION || instanceRoles[i] == InstanceRole::MIXED;
+                isContext = instanceRoles[i] == InstanceRole::kCONTEXT || instanceRoles[i] == InstanceRole::kMIXED;
+                isGeneration
+                    = instanceRoles[i] == InstanceRole::kGENERATION || instanceRoles[i] == InstanceRole::kMIXED;
                 // modelName = isContext ? contextModel : genModel;
                 modelName = modelNames[i];
             }
@@ -741,7 +756,7 @@ TEST_P(DisaggOrchestratorParamsTest, DisaggTokenComparison)
     };
     for (SizeType32 i = 0; i < instanceNum; i++)
     {
-        if (instanceRoles[i] == 1)
+        if (instanceRoles[i] == InstanceRole::kCONTEXT)
         {
             contextModels.push_back(getModelPath(modelNames[i]));
         }
@@ -1093,19 +1108,8 @@ INSTANTIATE_TEST_SUITE_P(GptDisaggSymmetricExecutorTest, DisaggParamsTest,
         testing::Values(std::vector<std::string>{"gpt", "gpt"}),  // modelNames
         testing::Values(std::vector<std::vector<int>>{{0}, {1}}), // participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{0}, {1}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 0}),                  // instanceRoles
-        testing::Values(0)                                        // controllerRank
-        ),
-    generateTestNameDisaggParams);
-
-INSTANTIATE_TEST_SUITE_P(GptDisaggSymmetricExecutorTest2, DisaggParamsTest,
-    testing::Combine(                                             //
-        testing::Values(2),                                       // processNum
-        testing::Values(std::vector<std::string>{"gpt", "gpt"}),  // modelNames
-        testing::Values(std::vector<std::vector<int>>{{0}, {1}}), // participantIdsEachInstance
-        testing::Values(std::vector<std::vector<int>>{{0}, {1}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 0}),                  // instanceRoles
-        testing::Values(1)                                        // controllerRank
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kGENERATION}), // instanceRoles
+        testing::Values(0, 1)                                                                          // controllerRank
         ),
     generateTestNameDisaggParams);
 
@@ -1115,8 +1119,8 @@ INSTANTIATE_TEST_SUITE_P(GptDisaggSymmetricExecutorMixedTest, DisaggParamsTest,
         testing::Values(std::vector<std::string>{"gpt", "gpt"}),  // modelNames
         testing::Values(std::vector<std::vector<int>>{{0}, {1}}), // participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{0}, {1}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{2, 2}),                  // instanceRoles
-        testing::Values(1)                                        // controllerRank
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kMIXED, InstanceRole::kMIXED}), // instanceRoles
+        testing::Values(1)                                                                      // controllerRank
         ),
     generateTestNameDisaggParams);
 
@@ -1126,8 +1130,8 @@ INSTANTIATE_TEST_SUITE_P(GptSingleDeviceDisaggSymmetricExecutorTest, DisaggParam
         testing::Values(std::vector<std::string>{"gpt", "gpt"}),  // modelNames
         testing::Values(std::vector<std::vector<int>>{{0}, {1}}), // participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{0}, {0}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 0}),                  // instanceRoles
-        testing::Values(0)                                        // controllerRank
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kGENERATION}), // instanceRoles
+        testing::Values(0)                                                                             // controllerRank
         ),
     generateTestNameDisaggParams);
 
@@ -1137,8 +1141,8 @@ INSTANTIATE_TEST_SUITE_P(GptSingleDeviceDisaggSymmetricExecutorMixedTest, Disagg
         testing::Values(std::vector<std::string>{"gpt", "gpt"}),  // modelNames
         testing::Values(std::vector<std::vector<int>>{{0}, {1}}), // participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{0}, {0}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{2, 2}),                  // instanceRoles
-        testing::Values(1)                                        // controllerRank
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kMIXED, InstanceRole::kMIXED}), // instanceRoles
+        testing::Values(1)                                                                      // controllerRank
         ),
     generateTestNameDisaggParams);
 
@@ -1154,8 +1158,8 @@ INSTANTIATE_TEST_SUITE_P(LlamaTP2DisaggSymmetricExecutorTest, DisaggParamsTest,
         testing::Values(std::vector<std::string>{"llama_tp2_pp1_cp1", "llama_tp2_pp1_cp1"}), // modelNames
         testing::Values(std::vector<std::vector<int>>{{0, 1}, {2, 3}}), // participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{0, 1}, {2, 3}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 0}),                        // instanceRoles
-        testing::Values(0)                                              // controllerRank
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kGENERATION}), // instanceRoles
+        testing::Values(0)                                                                             // controllerRank
         ),
     generateTestNameDisaggParams);
 
@@ -1165,30 +1169,30 @@ INSTANTIATE_TEST_SUITE_P(LlamaPP2DisaggSymmetricExecutorTest, DisaggParamsTest,
         testing::Values(std::vector<std::string>{"llama_tp1_pp2_cp1", "llama_tp1_pp2_cp1"}), // modelNames
         testing::Values(std::vector<std::vector<int>>{{0, 1}, {2, 3}}), // participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{1, 0}, {3, 2}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 0}),                        // instanceRoles
-        testing::Values(0)                                              // controllerRank
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kGENERATION}), // instanceRoles
+        testing::Values(0)                                                                             // controllerRank
         ),
     generateTestNameDisaggParams);
 
 INSTANTIATE_TEST_SUITE_P(LlamaTP2DisaggSymmetricExecutorMixedTest, DisaggParamsTest,
-    testing::Combine(                                                   //
-        testing::Values(2),                                             // processNum
-        testing::Values(std::vector<std::string>{"llama_tp2_pp1_cp1"}), // modelNames
-        testing::Values(std::vector<std::vector<int>>{{0, 1}}),         // participantIdsEachInstance
-        testing::Values(std::vector<std::vector<int>>{{0, 1}}),         // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{2}),                           // instanceRoles
-        testing::Values(0)                                              // controllerRank
+    testing::Combine(                                                     //
+        testing::Values(2),                                               // processNum
+        testing::Values(std::vector<std::string>{"llama_tp2_pp1_cp1"}),   // modelNames
+        testing::Values(std::vector<std::vector<int>>{{0, 1}}),           // participantIdsEachInstance
+        testing::Values(std::vector<std::vector<int>>{{0, 1}}),           // participantDeviceIdsEachInstance
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kMIXED}), // instanceRoles
+        testing::Values(0)                                                // controllerRank
         ),
     generateTestNameDisaggParams);
 
 INSTANTIATE_TEST_SUITE_P(LlamaPP2DisaggSymmetricExecutorMixedTest, DisaggParamsTest,
-    testing::Combine(                                                   //
-        testing::Values(2),                                             // processNum
-        testing::Values(std::vector<std::string>{"llama_tp1_pp2_cp1"}), // modelNames
-        testing::Values(std::vector<std::vector<int>>{{0, 1}}),         // participantIdsEachInstance
-        testing::Values(std::vector<std::vector<int>>{{0, 1}}),         // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{2}),                           // instanceRoles
-        testing::Values(0)                                              // controllerRank
+    testing::Combine(                                                     //
+        testing::Values(2),                                               // processNum
+        testing::Values(std::vector<std::string>{"llama_tp1_pp2_cp1"}),   // modelNames
+        testing::Values(std::vector<std::vector<int>>{{0, 1}}),           // participantIdsEachInstance
+        testing::Values(std::vector<std::vector<int>>{{0, 1}}),           // participantDeviceIdsEachInstance
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kMIXED}), // instanceRoles
+        testing::Values(0)                                                // controllerRank
         ),
     generateTestNameDisaggParams);
 
@@ -1198,8 +1202,8 @@ INSTANTIATE_TEST_SUITE_P(LlamaTP2PP2DisaggSymmetricExecutorTest, DisaggParamsTes
         testing::Values(std::vector<std::string>{"llama_tp2_pp2_cp1", "llama_tp2_pp2_cp1"}), // modelNames
         testing::Values(std::vector<std::vector<int>>{{0, 1, 2, 3}, {4, 5, 6, 7}}), // participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{2, 3, 0, 1}, {2, 3, 0, 1}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 0}),                                    // instanceRoles
-        testing::Values(0)                                                          // controllerRank
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kGENERATION}), // instanceRoles
+        testing::Values(0)                                                                             // controllerRank
         ),
     generateTestNameDisaggParams);
 
@@ -1209,8 +1213,8 @@ INSTANTIATE_TEST_SUITE_P(LlamaConPP2GenTP2DisaggAsymmetricExecutorTest, DisaggPa
         testing::Values(std::vector<std::string>{"llama_tp1_pp2_cp1", "llama_tp2_pp1_cp1"}), // modelNames
         testing::Values(std::vector<std::vector<int>>{{0, 1}, {2, 3}}), // (1,0) (2,3) // participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{1, 0}, {2, 3}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 0}),                        // instanceRoles
-        testing::Values(0)                                              // controllerRank
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kGENERATION}), // instanceRoles
+        testing::Values(0)                                                                             // controllerRank
         ),
     generateTestNameDisaggParams);
 
@@ -1220,8 +1224,8 @@ INSTANTIATE_TEST_SUITE_P(LlamaConTP2GenPP2DisaggAsymmetricExecutorTest, DisaggPa
         testing::Values(std::vector<std::string>{"llama_tp2_pp1_cp1", "llama_tp1_pp2_cp1"}), // modelNames
         testing::Values(std::vector<std::vector<int>>{{0, 1}, {2, 3}}), // (0,1), (3,2)// participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{0, 1}, {3, 2}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 0}),                        // instanceRoles
-        testing::Values(0)                                              // controllerRank
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kGENERATION}), // instanceRoles
+        testing::Values(0)                                                                             // controllerRank
         ),
     generateTestNameDisaggParams);
 
@@ -1232,8 +1236,8 @@ INSTANTIATE_TEST_SUITE_P(LlamaConTP2PP2GenPP2DisaggAsymmetricExecutorTest, Disag
         testing::Values(
             std::vector<std::vector<int>>{{0, 1, 2, 3}, {4, 5}}), // (2,3,0,1) , (5,4)// participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{2, 3, 0, 1}, {1, 0}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 0}),                              // instanceRoles
-        testing::Values(0)                                                    // controllerRank
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kGENERATION}), // instanceRoles
+        testing::Values(0)                                                                             // controllerRank
         ),
     generateTestNameDisaggParams);
 
@@ -1244,8 +1248,8 @@ INSTANTIATE_TEST_SUITE_P(LlamaConTP2PP2GenTP2DisaggAsymmetricExecutorTest, Disag
         testing::Values(
             std::vector<std::vector<int>>{{0, 1, 2, 3}, {4, 5}}), // (2,3,0,1), (4,5)// participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{2, 3, 0, 1}, {0, 1}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 0}),                              // instanceRoles
-        testing::Values(0)                                                    // controllerRank
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kGENERATION}), // instanceRoles
+        testing::Values(0)                                                                             // controllerRank
         ),
     generateTestNameDisaggParams);
 INSTANTIATE_TEST_SUITE_P(LlamaConTP2PP1GenTP2PP2DisaggAsymmetricExecutorTest, DisaggParamsTest,
@@ -1255,8 +1259,8 @@ INSTANTIATE_TEST_SUITE_P(LlamaConTP2PP1GenTP2PP2DisaggAsymmetricExecutorTest, Di
         testing::Values(
             std::vector<std::vector<int>>{{0, 1}, {2, 3, 4, 5}}), // (0,1) , (4,5,2,3)%4// participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{0, 1}, {0, 1, 2, 3}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 0}),                              // instanceRoles
-        testing::Values(0)                                                    // controllerRank
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kGENERATION}), // instanceRoles
+        testing::Values(0)                                                                             // controllerRank
         ),
     generateTestNameDisaggParams);
 
@@ -1267,8 +1271,8 @@ INSTANTIATE_TEST_SUITE_P(LlamaConTP2GenPP4DisaggAsymmetricExecutorTest, DisaggPa
         testing::Values(
             std::vector<std::vector<int>>{{4, 5}, {0, 1, 2, 3}}), // (4,5) ,(3,2,1,0)// participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{0, 1}, {3, 2, 1, 0}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 0}),                              // instanceRoles
-        testing::Values(0)                                                    // controllerRank
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kGENERATION}), // instanceRoles
+        testing::Values(0)                                                                             // controllerRank
         ),
     generateTestNameDisaggParams);
 
@@ -1280,8 +1284,9 @@ INSTANTIATE_TEST_SUITE_P(LlamaCon4TP1Gen1TP4DisaggAsymmetricExecutorTest, Disagg
         testing::Values(std::vector<std::vector<int>>{{0}, {1}, {2}, {3}, {4, 5, 6, 7}}), // participantIdsEachInstance
         testing::Values(
             std::vector<std::vector<int>>{{0}, {1}, {2}, {3}, {0, 1, 2, 3}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 1, 1, 1, 0}),                     // instanceRoles
-        testing::Values(4)                                                    // controllerRank
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kCONTEXT,
+            InstanceRole::kCONTEXT, InstanceRole::kCONTEXT, InstanceRole::kGENERATION}), // instanceRoles
+        testing::Values(4)                                                               // controllerRank
         ),
     generateTestNameDisaggParams);
 
@@ -1292,7 +1297,8 @@ INSTANTIATE_TEST_SUITE_P(LlamaCon2TP1Gen2TP2AndPP2DisaggAsymmetricExecutorTest, 
             "llama_tp1_pp1_cp1", "llama_tp1_pp1_cp1", "llama_tp2_pp1_cp1", "llama_tp1_pp2_cp1"}), // modelNames
         testing::Values(std::vector<std::vector<int>>{{0}, {1}, {2, 3}, {4, 5}}), // participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{0}, {1}, {2, 3}, {1, 0}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 1, 0, 0}),                            // instanceRoles
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kCONTEXT,
+            InstanceRole::kGENERATION, InstanceRole::kGENERATION}),               // instanceRoles
         testing::Values(0)                                                        // controllerRank
         ),
     generateTestNameDisaggParams);
@@ -1304,7 +1310,8 @@ INSTANTIATE_TEST_SUITE_P(LlamaCon2TP1Gen2PP2DisaggAsymmetricExecutorTest, Disagg
             "llama_tp1_pp1_cp1", "llama_tp1_pp1_cp1", "llama_tp1_pp2_cp1", "llama_tp1_pp2_cp1"}), // modelNames
         testing::Values(std::vector<std::vector<int>>{{0}, {1}, {2, 3}, {4, 5}}), // participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{0}, {1}, {3, 2}, {1, 0}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 1, 0, 0}),                            // instanceRoles
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kCONTEXT,
+            InstanceRole::kGENERATION, InstanceRole::kGENERATION}),               // instanceRoles
         testing::Values(0)                                                        // controllerRank
         ),
     generateTestNameDisaggParams);
@@ -1317,8 +1324,9 @@ INSTANTIATE_TEST_SUITE_P(LlamaCon4TP1Gen1TP2PP2DisaggAsymmetricExecutorTest, Dis
         testing::Values(std::vector<std::vector<int>>{{0}, {1}, {2}, {3}, {4, 5, 6, 7}}), // participantIdsEachInstance
         testing::Values(
             std::vector<std::vector<int>>{{0}, {1}, {2}, {3}, {2, 3, 0, 1}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 1, 1, 1, 0}),                     // instanceRoles
-        testing::Values(4)                                                    // controllerRank
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kCONTEXT,
+            InstanceRole::kCONTEXT, InstanceRole::kCONTEXT, InstanceRole::kGENERATION}), // instanceRoles
+        testing::Values(4)                                                               // controllerRank
         ),
     generateTestNameDisaggParams);
 
@@ -1329,7 +1337,8 @@ INSTANTIATE_TEST_SUITE_P(LlamaCon2TP1Gen2TP2DisaaggOrchestrator, DisaggOrchestra
             std::vector<std::string>{"llama_tp1_pp1", "llama_tp1_pp1", "llama_tp2_pp1", "llama_tp2_pp1"}), // modelNames
         testing::Values(std::vector<std::vector<int>>{{1}, {2}, {3, 4}, {5, 6}}), // participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{0}, {1}, {2, 3}, {0, 1}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 1, 0, 0}),                            // instanceRoles
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kCONTEXT,
+            InstanceRole::kGENERATION, InstanceRole::kGENERATION}),               // instanceRoles
         testing::Values(0)                                                        // controllerRank
         ),
     generateTestNameDisaggParams);
@@ -1342,7 +1351,8 @@ INSTANTIATE_TEST_SUITE_P(LlamaCon2TP2Gen2TP1DisaaggOrchestrator, DisaggOrchestra
             std::vector<std::string>{"llama_tp2_pp1", "llama_tp2_pp1", "llama_tp1_pp1", "llama_tp1_pp1"}), // modelNames
         testing::Values(std::vector<std::vector<int>>{{1, 2}, {3, 4}, {5}, {6}}), // participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{0, 1}, {2, 3}, {0}, {1}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 1, 0, 0}),                            // instanceRoles
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kCONTEXT,
+            InstanceRole::kGENERATION, InstanceRole::kGENERATION}),               // instanceRoles
         testing::Values(0)                                                        // controllerRank
         ),
     generateTestNameDisaggParams);
@@ -1354,7 +1364,8 @@ INSTANTIATE_TEST_SUITE_P(LlamaCon2TP1Gen2PP2DisaaggOrchestrator, DisaggOrchestra
             std::vector<std::string>{"llama_tp1_pp1", "llama_tp1_pp1", "llama_tp1_pp2", "llama_tp1_pp2"}), // modelNames
         testing::Values(std::vector<std::vector<int>>{{1}, {2}, {3, 4}, {5, 6}}), // participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{0}, {1}, {3, 2}, {1, 0}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 1, 0, 0}),                            // instanceRoles
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kCONTEXT,
+            InstanceRole::kGENERATION, InstanceRole::kGENERATION}),               // instanceRoles
         testing::Values(0)                                                        // controllerRank
         ),
     generateTestNameDisaggParams);
@@ -1365,8 +1376,9 @@ INSTANTIATE_TEST_SUITE_P(LlamaCon2TP1Gen1TP2PP2DisaaggOrchestrator, DisaggOrches
         testing::Values(std::vector<std::string>{"llama_tp1_pp1", "llama_tp1_pp1", "llama_tp2_pp2"}), // modelNames
         testing::Values(std::vector<std::vector<int>>{{1}, {2}, {3, 4, 5, 6}}), // participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{0}, {1}, {0, 1, 2, 3}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 1, 0}),                             // instanceRoles
-        testing::Values(0)                                                      // controllerRank
+        testing::Values(std::vector<InstanceRole>{
+            InstanceRole::kCONTEXT, InstanceRole::kCONTEXT, InstanceRole::kGENERATION}), // instanceRoles
+        testing::Values(0)                                                               // controllerRank
         ),
     generateTestNameDisaggParams);
 
@@ -1377,7 +1389,8 @@ INSTANTIATE_TEST_SUITE_P(LlamaCon2TP2Gen2TP1DisaaggSpawnOrchestrator, DisaggOrch
             std::vector<std::string>{"llama_tp2_pp1", "llama_tp2_pp1", "llama_tp1_pp1", "llama_tp1_pp1"}), // modelNames
         testing::Values(std::vector<std::vector<int>>{{1, 2}, {3, 4}, {5}, {6}}), // participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{0, 1}, {2, 3}, {0}, {1}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 1, 0, 0}),                            // instanceRoles
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kCONTEXT,
+            InstanceRole::kGENERATION, InstanceRole::kGENERATION}),               // instanceRoles
         testing::Values(0)                                                        // controllerRank
         ),
     generateTestNameDisaggParams);
@@ -1389,7 +1402,8 @@ INSTANTIATE_TEST_SUITE_P(LlamaCon2TP1Gen2PP2DisaaggSpawnOrchestrator, DisaggOrch
             std::vector<std::string>{"llama_tp1_pp1", "llama_tp1_pp1", "llama_tp1_pp2", "llama_tp1_pp2"}), // modelNames
         testing::Values(std::vector<std::vector<int>>{{1}, {2}, {3, 4}, {5, 6}}), // participantIdsEachInstance
         testing::Values(std::vector<std::vector<int>>{{0}, {1}, {3, 2}, {1, 0}}), // participantDeviceIdsEachInstance
-        testing::Values(std::vector<int>{1, 1, 0, 0}),                            // instanceRoles
+        testing::Values(std::vector<InstanceRole>{InstanceRole::kCONTEXT, InstanceRole::kCONTEXT,
+            InstanceRole::kGENERATION, InstanceRole::kGENERATION}),               // instanceRoles
         testing::Values(0)                                                        // controllerRank
         ),
     generateTestNameDisaggParams);
