@@ -71,3 +71,20 @@ l0_b200:
   - unittest/trt/attention/test_gpt_attention.py -k "trtllm_gen"
   - unittest/llmapi/test_llm_quant.py # 3.5 mins on B200
   - unittest/trt/functional/test_fp4_gemm.py # 3 mins on B200
+
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*b100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: triton
+  tests:
+  - triton_server/test_triton.py::test_llava[llava]
+  - triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]
+  - triton_server/test_triton.py::test_gpt_2b_ib_lora[gpt-2b-ib-lora]

@@ -120,3 +120,6 @@ class AutoDeployConfig(PyTorchConfig):
         # gets replaced by the user provided one. We don't want that though.
         f_default = self.__dataclass_fields__["model_kwargs"].default_factory()
         setattr(self, "model_kwargs", {**f_default, **getattr(self, "model_kwargs")})
+
+        # TODO (https://github.com/NVIDIA/TensorRT-LLM/issues/4364) support overlap scheduler
+        self.disable_overlap_scheduler = True
