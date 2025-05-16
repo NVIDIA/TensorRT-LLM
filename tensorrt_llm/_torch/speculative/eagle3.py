@@ -10,7 +10,6 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, allreduce_argmax
-from ..pyexecutor.decoder import DecoderState, TorchDecoder
 from ..pyexecutor.sampler import SampleState, SampleStateTensors, TorchSampler
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 from .mtp import MTPDecoder
@@ -215,7 +214,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                 break
 
 
-class Eagle3Decoder(TorchDecoder):
+class Eagle3Decoder(TorchSampler):
 
     def _batch_sample(self, scheduled_requests, model_outputs) -> SampleState:
         logits = model_outputs["logits"]
@@ -228,11 +227,11 @@ class Eagle3Decoder(TorchDecoder):
         new_tensors_host = {"new_tokens_host": new_tokens_host}
         decoder_event = torch.cuda.Event()
         decoder_event.record()
-        return DecoderState(scheduled_requests=scheduled_requests,
-                            logits=logits,
-                            new_tensors_device=new_tensors_device,
-                            new_tensors_host=new_tensors_host,
-                            decoder_event=decoder_event)
+        return SampleState(scheduled_requests=scheduled_requests,
+                           logits=logits,
+                           new_tensors_device=new_tensors_device,
+                           new_tensors_host=new_tensors_host,
+                           decoder_event=decoder_event)
 
 
 class Eagle3OneModelDecoder(MTPDecoder):
