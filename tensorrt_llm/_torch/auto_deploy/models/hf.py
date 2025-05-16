@@ -4,7 +4,7 @@ import json
 import os
 import types
 from contextlib import contextmanager, nullcontext
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 import torch
 import torch.nn as nn
@@ -31,8 +31,10 @@ def load_state_dict_with_assign():
     original_load_state_dict = torch.nn.Module.load_state_dict
 
     # Define and apply the patched version
-    def load_state_dict_with_assign(*args, **kwargs):
-        return original_load_state_dict(*args, **kwargs, assign=True)
+    def load_state_dict_with_assign(
+        self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False
+    ):
+        return original_load_state_dict(self, state_dict, strict=strict, assign=True)
 
     # Apply the patch
     torch.nn.Module.load_state_dict = load_state_dict_with_assign
@@ -53,7 +55,6 @@ def hf_load_state_dict_with_device(device: DeviceLikeType):
 
     # Define and apply the patched version
     def load_state_dict_with_device(checkpoint_file, device_map=None):
-        assert device_map is None, "device_map not expected while using patch."
         return original_load_state_dict(checkpoint_file, device_map={"": device})
 
     # Apply the patch
