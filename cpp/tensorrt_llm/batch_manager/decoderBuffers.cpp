@@ -35,12 +35,10 @@ DecoderInputBuffers::DecoderInputBuffers(
     auto const maxBatchSizeShape = ITensor::makeShape({maxBatchSize});
     auto const nvSizeType = TRTDataType<SizeType32>::value;
 
-    setupBatchSlots = BufferManager::pinnedPool(maxBatchSizeShape, nvSizeType);
-
     inputsIds = BufferManager::pinnedPool(ITensor::makeShape({0}), TRTDataType<TokenIdType>::value);
 
-    forwardBatchSlotsRequestOrder = tensorrt_llm::runtime::BufferManager::pinnedPool(maxBatchSizeShape, nvSizeType);
-    forwardBatchSlotsRequestOrderDevice = manager.gpu(maxBatchSizeShape, nvSizeType);
+    setupBatchSlots = BufferManager::pinnedPool(maxBatchSizeShape, nvSizeType);
+    setupBatchSlotsDevice = manager.gpu(maxBatchSizeShape, nvSizeType);
 
     fillValues = tensorrt_llm::runtime::BufferManager::pinnedPool(maxBatchSizeShape, nvSizeType);
     fillValuesDevice = manager.gpu(maxBatchSizeShape, nvSizeType);
