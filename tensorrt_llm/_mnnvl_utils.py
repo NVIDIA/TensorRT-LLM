@@ -318,24 +318,14 @@ class MnnvlMoe:
                                     gathered_expert_ids: torch.Tensor,
                                     gathered_scales: torch.Tensor,
                                     max_token_count_per_rank: int,
-                                    expert_count: int,
-                                    top_k: int,
-                                    ep_rank: int,
-                                    ep_size: int,
-                                    use_real_size=False):
+                                    expert_count: int, top_k: int, ep_rank: int,
+                                    ep_size: int):
         local_gather_indices, send_rank_count_cumsum, send_rank_local_indices, \
         recv_rank_count_cumsum, recv_rank_local_indices, backward_recv_rank_local_indices = \
             torch.ops.trtllm.moe_comm_prepare_indices(gathered_target_rank_ids, real_rank_token_count_cumsum,
                                                       max_token_count_per_rank, expert_count, top_k, ep_rank, ep_size)
 
         local_token_allocation_count = max_token_count_per_rank * ep_size
-        if use_real_size:
-            local_token_allocation_count = recv_rank_count_cumsum[-1].cpu(
-            ).item()
-            # at least one token for padding
-            local_token_allocation_count = max(local_token_allocation_count, 1)
-            local_gather_indices = local_gather_indices[:
-                                                        local_token_allocation_count]
 
         local_expert_ids = torch.empty(local_token_allocation_count,
                                        top_k,
