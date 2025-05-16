@@ -466,30 +466,6 @@ def llava_model_root():
 
 
 @pytest.fixture(scope="session")
-def vila_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    vila_model_root = os.path.join(models_root, "vila", "VILA1.5-3b")
-
-    assert os.path.exists(
-        vila_model_root
-    ), f"{vila_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return vila_model_root
-
-
-@pytest.fixture(scope="session")
-def vila_repo_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    vila_repo_root = os.path.join(models_root, "vila", "VILA")
-
-    assert os.path.exists(
-        vila_repo_root
-    ), f"{vila_repo_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return vila_repo_root
-
-
-@pytest.fixture(scope="session")
 def mllama_model_root():
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
