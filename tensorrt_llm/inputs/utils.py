@@ -272,10 +272,13 @@ def format_qwen2_vl_input(model_dir, inputs):
     return inputs
 
 
-def default_image_loader(prompts, images, image_data_format="pt"):
+def default_image_loader(prompts: List[str],
+                         images: Union[List[List[str]], List[str]],
+                         image_data_format: str = "pt"):
     if len(images) > len(prompts) and len(prompts) == 1:
         # 1 prompt + N media
         images = [images]
+    assert len(images) == len(prompts)
     inputs = [{
         "prompt": prompt,
         "multi_modal_data": {
@@ -289,10 +292,14 @@ def default_image_loader(prompts, images, image_data_format="pt"):
     return inputs
 
 
-def default_video_loader(prompts, videos, image_data_format="pt", num_frames=8):
+def default_video_loader(prompts: List[str],
+                         videos: Union[List[List[str]], List[str]],
+                         image_data_format: str = "pt",
+                         num_frames: int = 8):
     if len(videos) > len(prompts) and len(prompts) == 1:
         # 1 prompt + N media
         videos = [videos]
+    assert len(videos) == len(prompts)
     inputs = [{
         "prompt": prompt,
         "multi_modal_data": {
