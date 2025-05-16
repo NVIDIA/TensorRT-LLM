@@ -149,26 +149,28 @@ def noaux_tc_ref(logits, bias, n_group, topk_group, top_k,
                  routed_scaling_factor):
     scores = F.sigmoid(logits)
     scores_with_bias = scores + bias
-    scores_shape = list(scores_with_bias.shape)
-    group_scores = torch.sum(torch.topk(
-        scores_with_bias.view(scores_shape[:-1] +
-                              [n_group, scores_shape[-1] // n_group]),
-        k=2,
-        dim=-1,
-        largest=True,
-        sorted=True)[0],
-                             dim=-1)
-    _, group_idx = torch.topk(group_scores,
-                              k=topk_group,
-                              dim=-1,
-                              largest=True,
-                              sorted=True)
-    group_mask = torch.zeros_like(group_scores)
-    group_mask.scatter_(-1, group_idx, 1)
-    score_mask = group_mask.unsqueeze(
-        -1).expand(scores_shape[:-1] +
-                   [n_group, scores_shape[-1] // n_group]).reshape(scores_shape)
-    scores_with_bias = scores_with_bias * score_mask
+    if n_group > 1:
+        scores_shape = list(scores_with_bias.shape)
+        group_scores = torch.sum(torch.topk(
+            scores_with_bias.view(scores_shape[:-1] +
+                                  [n_group, scores_shape[-1] // n_group]),
+            k=2,
+            dim=-1,
+            largest=True,
+            sorted=True)[0],
+                                 dim=-1)
+        _, group_idx = torch.topk(group_scores,
+                                  k=topk_group,
+                                  dim=-1,
+                                  largest=True,
+                                  sorted=True)
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(-1, group_idx, 1)
+        score_mask = group_mask.unsqueeze(-1).expand(
+            scores_shape[:-1] +
+            [n_group, scores_shape[-1] // n_group]).reshape(scores_shape)
+        scores_with_bias = scores_with_bias * score_mask
+
     _, topk_idx = torch.topk(scores_with_bias,
                              k=top_k,
                              dim=-1,
@@ -198,7 +200,6 @@ def routing_reference_no_aux(expert_logits,
         scores = noaux_tc_ref(routing_logits, routing_bias, n_groups,
                               top_k_groups, top_k, routed_scaling)
     permute_info = routing_reference(scores, top_k, padding)
-    # print("permute_info: ", permute_info)
     return permute_info, scores
 
 
@@ -528,26 +529,26 @@ def quant_dequant_per_tensor_fp8(a):
     getSMVersion(),
 )
 @pytest.mark.parametrize("num_tokens", [16, 64, 1024])
-@pytest.mark.parametrize("num_experts", [32, 256])
+@pytest.mark.parametrize("expert_info", [(32, 8, 4, 8), (32, 1, 1, 5),
+                                         (72, 1, 1, 6), (256, 8, 4, 8)])
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512])
-def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size):
+def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
     torch.random.manual_seed(0)
 
     #
     # Data Generation
     #
-    top_k = 8
+    num_experts, n_groups, top_k_groups, top_k = expert_info
     padding = 8
-    n_groups = 8
-    top_k_groups = 4
     routed_scaling = 2.5
 
     assert top_k <= num_experts
-    assert top_k == 8
-    assert top_k_groups == 4
+    assert top_k <= 8
+    assert top_k_groups <= 4
     assert num_experts > n_groups
     assert num_experts % n_groups == 0
+    assert num_experts % 4 == 0
     assert top_k < (top_k_groups * num_experts / n_groups)
     assert hidden_size % 128 == 0
     assert intermediate_size % 128 == 0
@@ -625,27 +626,27 @@ def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size):
     getSMVersion(),
 )
 @pytest.mark.parametrize("num_tokens", [1, 2, 16, 64, 1024])
-@pytest.mark.parametrize("num_experts", [32, 256])
+@pytest.mark.parametrize("expert_info", [(32, 8, 4, 8), (32, 1, 1, 5),
+                                         (72, 1, 1, 6), (256, 8, 4, 8)])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [1024])
-def test_moe_fp4(num_tokens, num_experts, hidden_size, intermediate_size):
+def test_moe_fp4(num_tokens, expert_info, hidden_size, intermediate_size):
     torch.random.manual_seed(0)
 
     #
     # Data Generation
     #
-    top_k = 8
+    num_experts, n_groups, top_k_groups, top_k = expert_info
     # FIXME: set to TileN size
     padding = 8
-    n_groups = 8
-    top_k_groups = 4
     routed_scaling = 2.5
 
     assert top_k <= num_experts
-    assert top_k == 8
-    assert top_k_groups == 4
+    assert top_k <= 8
+    assert top_k_groups <= 4
     assert num_experts > n_groups
     assert num_experts % n_groups == 0
+    assert num_experts % 4 == 0
     assert top_k < (top_k_groups * num_experts / n_groups)
     assert hidden_size % 128 == 0
     assert intermediate_size % 128 == 0
@@ -850,30 +851,28 @@ def test_moe_fp4(num_tokens, num_experts, hidden_size, intermediate_size):
     getSMVersion(),
 )
 @pytest.mark.parametrize("num_tokens", [1, 2, 16, 64, 1024])
-@pytest.mark.parametrize("num_experts", [128])
+@pytest.mark.parametrize("expert_info", [(128, 0, 0, 1, True)])
 @pytest.mark.parametrize("hidden_size", [2048])
 @pytest.mark.parametrize("intermediate_size", [2048])
-@pytest.mark.parametrize("use_routing_scales_on_input", [True])
-def test_moe_fp8_per_tensor_scale(num_tokens, num_experts, hidden_size,
-                                  intermediate_size,
-                                  use_routing_scales_on_input):
+def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
+                                  intermediate_size):
     torch.random.manual_seed(0)
 
     #
     # Data Generation
     #
-    top_k = 8 if not use_routing_scales_on_input else 1
+    num_experts, n_groups, top_k_groups, top_k, use_routing_scales_on_input = expert_info
+    # FIXME: set to TileN size
     padding = 8
-    n_groups = 8
-    top_k_groups = 4
     routed_scaling = 2.5
 
     assert top_k <= num_experts
-    assert top_k == 8 or top_k == 1
-    assert top_k_groups == 4
+    assert top_k <= 8
+    assert top_k_groups <= 4
     assert num_experts > n_groups
-    assert num_experts % n_groups == 0
-    assert top_k < (top_k_groups * num_experts / n_groups)
+    assert n_groups == 0 or num_experts % n_groups == 0
+    assert num_experts % 4 == 0
+    assert n_groups == 0 or top_k < (top_k_groups * num_experts / n_groups)
     assert hidden_size % 128 == 0
     assert intermediate_size % 128 == 0
 
