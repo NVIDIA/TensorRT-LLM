@@ -164,7 +164,7 @@ def create_input_processor_with_hash(
         else:
             # disable hashing when output num_mm_tokens is empty, when
             # (1) other modalities are found other than image
-            # (2) models that don't have get_num_image_tokens implemented
+            # (2) models that don't have get_num_tokens_per_image implemented
             return input_processor(inputs, sampling_params)
 
     return input_processor_wrapper
