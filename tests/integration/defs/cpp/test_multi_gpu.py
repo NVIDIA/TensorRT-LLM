@@ -223,6 +223,7 @@ def run_trt_gpt_model_real_decoder_multi_gpu_tests(build_dir: _pl.Path,
 
 def run_disagg_symmetric_executor_tests(build_dir: _pl.Path,
                                         model: str,
+                                        nprocs=2,
                                         use_ucx_kvcache=False,
                                         timeout=1500):
     tests_dir = build_dir / "tests"
@@ -230,62 +231,28 @@ def run_disagg_symmetric_executor_tests(build_dir: _pl.Path,
 
     prefix = get_model_test_filter_prefix(model)
 
-    new_env = copy.copy(cpp_env)
-    if use_ucx_kvcache:
-        new_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    else:
-        new_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
-
-    xml_output_file = build_dir / "results-multi-gpu-disagg-executor-2-process.xml"
-    trt_model_test = _cpp.produce_mpirun_command(
-        global_commands=["mpirun", "--allow-run-as-root"],
-        nranks=2,
-        local_commands=[
-            "executor/disaggExecutorTest",
-            f"--gtest_filter=*{prefix}*DisaggSymmetricExecutorTest*"
-        ],
-        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-    _cpp.run_command(trt_model_test,
-                     cwd=tests_dir,
-                     env=new_env,
-                     timeout=timeout)
-
     mgpu_env = copy.copy(cpp_env)
-    mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
-
     if use_ucx_kvcache:
         mgpu_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     else:
         mgpu_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
 
-    xml_output_file = build_dir / "results-multi-gpu-disagg-executor-4-process.xml"
+    mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
+
+    xml_output_file = build_dir / f"results-multi-gpu-disagg-executor-{nprocs}-process.xml"
     trt_model_test = _cpp.produce_mpirun_command(
         global_commands=["mpirun", "--allow-run-as-root"],
-        nranks=4,
+        nranks=nprocs,
         local_commands=[
             "executor/disaggExecutorTest",
             f"--gtest_filter=*{prefix}*DisaggSymmetricExecutorTest*"
         ],
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+
     _cpp.run_command(trt_model_test,
                      cwd=tests_dir,
                      env=mgpu_env,
                      timeout=timeout)
-
-    if model == "llama":
-        xml_output_file = build_dir / "results-multi-gpu-disagg-executor-8-process.xml"
-        trt_model_test = _cpp.produce_mpirun_command(
-            global_commands=["mpirun", "--allow-run-as-root"],
-            nranks=8,
-            local_commands=[
-                "executor/disaggExecutorTest",
-                "--gtest_filter=*LlamaTP2PP2DisaggSymmetricExecutorTest*"
-            ],
-            leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-        _cpp.run_command(trt_model_test,
-                         cwd=tests_dir,
-                         env=mgpu_env,
-                         timeout=timeout)
 
 
 def run_disagg_asymmetric_executor_tests(build_dir: _pl.Path,
@@ -574,16 +541,23 @@ class TestDisagg:
 
     @pytest.mark.parametrize("use_ucx_kvcache", [False, True],
                              ids=["mpi_kvcache", "ucx_kvcache"])
+    @pytest.mark.parametrize("nprocs", [2, 4, 8],
+                             ids=["2proc", "4proc", "8proc"])
     @pytest.mark.parametrize("model", ["gpt", "llama"])
-    def test_symmetric_executor(self, build_google_tests, model,
+    def test_symmetric_executor(self, build_google_tests, model, nprocs,
                                 use_ucx_kvcache, prepare_models_disagg,
                                 build_dir):
+
+        if model == "gpt" and nprocs > 2:
+            pytest.skip(
+                "test_symmetric_executor only supports 2 processes for gpt")
 
         if platform.system() != "Windows":
             prepare_models_disagg(model)
 
             run_disagg_symmetric_executor_tests(build_dir=build_dir,
                                                 model=model,
+                                                nprocs=nprocs,
                                                 use_ucx_kvcache=use_ucx_kvcache)
 
     @pytest.mark.parametrize("use_ucx_kvcache", [False, True],
