@@ -216,7 +216,10 @@ async def test_kv_cache_aware_router(servers):
         CompletionRequest(model="TinyLlama", prompt=[[1002] * 300]),
     ]
 
-    router = KvCacheAwareRouter(servers, use_tokens=False, max_batch_size=32)
+    router = KvCacheAwareRouter(servers,
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
     results = [await router.get_next_server(req) for req in requests]
     servers, infos = zip(*results)
     assert servers == ("server1", "server2", "server3")
@@ -236,6 +239,10 @@ async def test_kv_cache_aware_router(servers):
     results = [await router.get_next_server(req) for req in reversed(requests)]
     servers, infos = zip(*results)
     assert servers == ("server3", "server2", "server1")
+    # matched partial block will be counted as a whole block
+    assert infos[0]["matches"] == [0, 0, 320]
+    assert infos[1]["matches"] == [32, 224, 0]
+    assert infos[2]["matches"] == [128, 32, 0]
     for request in requests:
         await router.finish_request(request)
 
@@ -253,6 +260,7 @@ async def test_kv_cache_aware_router(servers):
     for server in servers:
         counts[server] += 1
     assert counts["server1"] > counts["server2"] > counts["server3"] > 0
+    assert infos[0]["matches"] == [96, 32, 0]
     for req in dup_requests:
         await router.finish_request(req)
 
