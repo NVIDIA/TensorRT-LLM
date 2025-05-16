@@ -43,6 +43,10 @@ from .utils import (download_hf_model, download_hf_pretrained_config,
                     print_colored_debug, print_traceback_on_error)
 
 
+def dummy_task():
+    print(f"global rank {global_mpi_rank()} is doing dummy task")
+
+
 @dataclass
 class _ModelInfo:
     dtype: Optional[str] = None
@@ -745,6 +749,11 @@ class CachedModelLoader:
 
                 if self.llm_args.parallel_config.is_multi_gpu:
                     assert self.mpi_session
+
+                    #mpi_session cannot be pickled so remove from self.llm_args
+                    if self.llm_args.mpi_session:
+                        del self.llm_args.mpi_session
+
                     # The engine_dir:Path will be stored to MPINodeState.state
                     build_infos = self.mpi_session.submit_sync(
                         CachedModelLoader._node_build_task,

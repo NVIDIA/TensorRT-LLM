@@ -394,4 +394,9 @@ size_t getEnvMemSizeForKVCacheTransferBuffer()
     return memSizeForKVCacheTransferBuffer;
 }
 
+bool getEnvDisaggBenchmarkGenOnly()
+{
+    return getBoolEnv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY");
+}
+
 } // namespace tensorrt_llm::common

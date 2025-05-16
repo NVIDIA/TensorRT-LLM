@@ -103,6 +103,10 @@ class OpenAIDisaggServer:
                                         gen_server: str,
                                         gen_req: Union[CompletionRequest, ChatCompletionRequest]):
         try:
+
+            if len(ctx_response.choices) != 1:
+                raise ValueError("Context server did not return a single choice. This is not expected")
+
             # First yield the context response if it's not None
             if ctx_response is not None:
                 # Remove the disaggregated params from the context response
@@ -111,16 +115,20 @@ class OpenAIDisaggServer:
                 data = json.dumps(data)
                 yield f"data: {data}\n\n".encode('utf-8')
 
-            # Then yield the generation responses
-            if isinstance(gen_req, CompletionRequest):
-                gen_response = await self.send_completion_request(gen_server, gen_req)
-            elif isinstance(gen_req, ChatCompletionRequest):
-                gen_response = await self.send_chat_request(gen_server, gen_req)
-            else:
-                raise TypeError("Invalid request type: {type(gen_req).__name__}")
+            # Only send request to gen server if request is not finished
+            if ctx_response.choices[0].finish_reason == "not_finished":
+                # Then yield the generation responses
+                if isinstance(gen_req, CompletionRequest):
+                    gen_response = await self.send_completion_request(gen_server, gen_req)
+                elif isinstance(gen_req, ChatCompletionRequest):
+                    gen_response = await self.send_chat_request(gen_server, gen_req)
+                else:
+                    raise TypeError("Invalid request type: {type(gen_req).__name__}")
 
-            async for chunk in gen_response.body_iterator:
-                yield chunk
+                async for chunk in gen_response.body_iterator:
+                    yield chunk
+            else:
+                yield f"data: [DONE]\n\n".encode('utf-8')
 
         finally:
             await self.gen_router.finish_request(gen_req)
@@ -168,10 +176,6 @@ class OpenAIDisaggServer:
             return None
 
         try:
-            if request_type == "chat":
-                ctx_req.max_completion_tokens = 1
-            elif request_type == "completion":
-                ctx_req.max_tokens = 1
             ctx_req.disaggregated_params = DisaggregatedParams(request_type="context_only")
             ctx_req.stream = False
             ctx_req.stream_options = None
@@ -210,12 +214,20 @@ class OpenAIDisaggServer:
 
         if not gen_req.stream:
             try:
-                if isinstance(gen_req, CompletionRequest):
-                    gen_response = await self.send_completion_request(gen_server, gen_req)
-                elif isinstance(gen_req, ChatCompletionRequest):
-                    gen_response = await self.send_chat_request(gen_server, gen_req)
+                if len(ctx_response.choices) != 1:
+                    raise ValueError("Context server did not return a single choice. This is not expected")
 
-                return gen_response
+                if ctx_response.choices[0].finish_reason == "not_finished":
+                    if isinstance(gen_req, CompletionRequest):
+                        gen_response = await self.send_completion_request(gen_server, gen_req)
+                    elif isinstance(gen_req, ChatCompletionRequest):
+                        gen_response = await self.send_chat_request(gen_server, gen_req)
+
+                    return gen_response
+                else:
+                    #If request finished after first token, return right away and skip gen
+                    del ctx_response.choices[0].disaggregated_params
+                    return ctx_response
             finally:
                 await self.gen_router.finish_request(gen_req)
         else:

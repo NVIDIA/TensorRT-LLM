@@ -864,12 +864,11 @@ class PyExecutor:
                                                        batch_outputs)
 
                     self._update_request_states(scheduled_batch)
+                    self._update_requests(decoder_state)
 
                     ctx_transmission_reqs = self._send_disagg_ctx_cache(
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
-
-                    self._update_requests(decoder_state)
 
                     if self.kv_cache_transceiver:
                         # For context only req in transmission, we reset the state since decoder might have changed it
