@@ -60,7 +60,6 @@ We have explored a mixed precision recipe, which provides a better tradeoff betw
 |  58x MoE FFN Layers                   |   nvfp4   |
 |  3x MTP Layers                        |   bf16    |
 |  RouterGEMM***                        |   bf16    |
-|||
 
 *TensorRT-LLM already supports [FP8 Attention](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/deepseek_v3#fp8-kv-cache-and-mla) while for this latency scenario low-precision attention computation doesn't help with performance so we choose to use bf16 precision for the Attention Modules.
 
@@ -79,7 +78,6 @@ We have also explored and introduced mixed parallel strategy on 8xB200 GPUs. Spe
 | MoE Shared Experts    | TP8                                                     |
 | Fuse_A GEMM          | Data Parallelism 8 (DP8)                                 |
 | RouterGEMM           | DP8                                                     |
-|||
 
 ### Everything in One Diagram
 Now let's put everything into one diagram, which represents a MoE layer from a decoding iteration. 
@@ -138,7 +136,6 @@ The modules in the diagram are:
 | Introduce moe_backend=TRTLLM, EP2TP4 for better balance   |   299    | WIP: [PR #4280](https://github.com/NVIDIA/TensorRT-LLM/pull/4280)                                                                                          |
 | Optimize Fuse_A_GEMM and Router_GEMM                      |   340    | WIP: [PR #4115](https://github.com/NVIDIA/TensorRT-LLM/pull/4115)                                                                                          |
 | Relax Acceptance                                          |   **368**    | [deepseek_v3#multi-token-prediction-mtp](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/deepseek_v3#multi-token-prediction-mtp)     |
-||||
 
 ### System Level optimizations
 #### CUDA Graph & Programmatic Dependent Launch
@@ -155,7 +152,6 @@ There are two optimizations based on MTP
 | MTP 3       |       2.82      |   253    |       2.28       |
 | MTP 4       |       2.99      |   245    |       2.21       |
 | MTP 5       |       3.01      |   239    |       2.15       |
-||||
 
 Based on our exploration, 3x MTP layers configuration demonstrates optimal performance.
 
@@ -172,7 +168,6 @@ During the non-thinking phase, we still use strict acceptance.
 | MTP3_top10, d0.5   |      3.06      |       1.08       |
 | MTP3_top10, d0.6   |      3.10      |       1.09       |
 | MTP3_top15, d0.5   |      3.07      |       1.08       |
-||||
 
 This is a relaxed way of verification and comparison, which can improve the acceptance rate and bring positive speedup with limited influence on accuracy.
 
@@ -185,7 +180,6 @@ This is a relaxed way of verification and comparison, which can improve the acce
 | AIME 2024                 | 30        | 68.0%      | 74.0%      |
 | SciCode                   | 338       | 36.0%      | 39.0%      |
 | LiveCodeBench             | 315       | 62.0%      | 66.0%      |
-||||
 
 For more information, please visit [multi-token-prediction-mtp](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/deepseek_v3#multi-token-prediction-mtp)  
 
