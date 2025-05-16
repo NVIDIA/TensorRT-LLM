@@ -201,6 +201,10 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                           sampling_params=sampling_params,
                           extra_acc_spec="temperature=0.8,top_p=0.95")
 
+
+class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
+
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["H100", "H200", "B200"])
     def test_fp8_tp4(self):
