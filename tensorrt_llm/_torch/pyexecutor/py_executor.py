@@ -1075,15 +1075,10 @@ class PyExecutor:
     @nvtx_range("_forward_step_inter_pp")
     def _forward_step_inter_pp(self, scheduled_batch) -> DecoderState:
         batch_outputs = self._forward_step(scheduled_batch)
+        decoder_state = self._decode_async(scheduled_batch, batch_outputs)
         self._update_request_states(scheduled_batch)
-        tokens_shape = batch_outputs["hidden_states"].shape[:-1]
-        new_tokens_host = torch.empty(tokens_shape,
-                                      dtype=torch.int64,
-                                      device='cpu',
-                                      pin_memory=True)
-        return DecoderState(
-            scheduled_requests=scheduled_batch,
-            new_tensors_host={"new_tokens_host": new_tokens_host})
+        decoder_state.decoder_event.synchronize()
+        return decoder_state
 
     def _update_new_active_requests_queue_latency(self, new_requests):
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -1291,7 +1286,6 @@ class PyExecutor:
             if _is_executor_request(req_item):
                 req_id, exe_req = req_item
                 req = executor_request_to_llm_request(req_id, exe_req)
-                req.is_dummy = False
                 self.active_requests.append(req)
             elif _is_cancel_request(req_item):
                 self.canceled_req_ids.insert(req_item)
@@ -1307,18 +1301,18 @@ class PyExecutor:
             if self.has_context_request else self.max_draft_tokens,
         )
         for llm_request in llm_request_list:
-            llm_request.is_dummy = True
+            llm_request.is_attention_dp_dummy = True
         self.active_requests += llm_request_list
 
     def _finish_dummy_request(self, scheduled_requests: ScheduledRequests):
         for req in scheduled_requests.context_requests:
-            if req.is_dummy:
+            if req.is_attention_dp_dummy:
                 req.state = LlmRequestState.GENERATION_COMPLETE
         for req in scheduled_requests.generation_requests:
-            if req.is_dummy:
+            if req.is_attention_dp_dummy:
                 req.state = LlmRequestState.GENERATION_COMPLETE
         for req in self.active_requests[:]:
-            if req.is_dummy:
+            if req.is_attention_dp_dummy:
                 self.inflight_req_ids.erase(req.request_id)
                 self._terminate_request(req)
                 self.active_requests.remove(req)
@@ -1447,7 +1441,6 @@ class PyExecutor:
                 req.ctx_blocks = ctx_blocks
                 req.ctx_position_blocks = position_blocks
                 req.query_id = query_token_ids
-                req.is_dummy = False
                 self.active_requests.append(req)
             elif _is_cancel_request(req_item):
                 self.canceled_req_ids.insert(req_item)
@@ -1627,7 +1620,7 @@ class PyExecutor:
             request.move_to_next_context_chunk()
             if request.get_context_remaining_length() == 0:
                 request.state = LlmRequestState.GENERATION_IN_PROGRESS
-            if request.is_dummy:
+            if request.is_attention_dp_dummy:
                 request.state = LlmRequestState.GENERATION_COMPLETE
 
     def _update_request_states_star_attention(
@@ -1762,7 +1755,6 @@ class PyExecutor:
                     draft_batch.context_requests.append(new_request)
 
                 new_request.py_stop_words_list = request.py_stop_words_list
-                new_request.is_dummy = False
 
             return draft_batch, req_id_to_num_rejected_tokens
 
@@ -1967,7 +1959,7 @@ class PyExecutor:
         for request in self.active_requests:
             req_id = request.py_request_id
             # no responses for dummy request, and finish it
-            if request.is_dummy:
+            if request.is_attention_dp_dummy:
                 requests_to_terminate.append(request)
                 continue
 

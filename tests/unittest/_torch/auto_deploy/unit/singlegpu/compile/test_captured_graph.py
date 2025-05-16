@@ -6,7 +6,7 @@ from _model_test_utils import (
     generate_dynamic_shapes,
 )
 
-from tensorrt_llm._torch.auto_deploy.compile.backends.torch_opt import CompiledGraph
+from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import CapturedGraph
 from tensorrt_llm._torch.auto_deploy.compile.compiler import _flatten_args
 from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export_to_gm
 
@@ -42,7 +42,7 @@ class ModelWithMultipleInputs(torch.nn.Module):
     ],
 )
 def test_round_up_to_closest(lst, value, expected):
-    assert CompiledGraph.round_up_to_closest(lst, value) == expected
+    assert CapturedGraph.round_up_to_closest(lst, value) == expected
 
 
 @pytest.mark.parametrize("num_inputs", [1, 2, 3])
@@ -53,7 +53,10 @@ def test_round_up_to_closest(lst, value, expected):
         ("vit", VisionTransformerLikeModel, (32, 4096, 16), 1e-3),
     ],
 )
-def test_cudagraph_capture_replay(model_type, model_cls, input_shape, atol, num_inputs):
+@pytest.mark.parametrize("use_torch_compile", [False, True])
+def test_cudagraph_capture_replay(
+    model_type, model_cls, input_shape, atol, num_inputs, use_torch_compile
+):
     batch_size, *seq_shape = input_shape
 
     if model_type == "llm":
@@ -88,8 +91,19 @@ def test_cudagraph_capture_replay(model_type, model_cls, input_shape, atol, num_
     print(dynamic_shapes)
 
     graph_module = torch_export_to_gm(model, args=args, dynamic_shapes=dynamic_shapes)
-    compiled_model = CompiledGraph(
-        graph_module, max_batch_size=batch_size, num_batched_inputs=num_inputs
+    in_spec = graph_module._in_spec
+    out_spec = graph_module._out_spec
+
+    # Apply torch.compile if needed
+    if use_torch_compile:
+        graph_module = torch.compile(graph_module, dynamic=True)
+
+    compiled_model = CapturedGraph(
+        graph_module,
+        in_spec,
+        out_spec,
+        max_batch_size=batch_size,
+        num_batched_inputs=num_inputs,
     )
 
     with torch.inference_mode():
@@ -136,7 +150,7 @@ def test_cudagraph_capture_replay(model_type, model_cls, input_shape, atol, num_
         )
 
         # Compare with original model output
-        original_output = compiled_model.gm_compiled(*replay_args)
+        original_output = compiled_model.model(*replay_args)
         assert torch.allclose(original_output, replay_output, atol=atol), (
             "CUDAGraph replay output mismatch"
         )

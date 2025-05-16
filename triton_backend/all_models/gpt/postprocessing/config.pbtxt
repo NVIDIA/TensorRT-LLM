@@ -1,0 +1,32 @@
+name: "postprocessing"
+backend: "python"
+max_batch_size: 1024
+dynamic_batching {}
+input [
+  {
+    name: "TOKENS_BATCH"
+    data_type: TYPE_INT32
+    dims: [ -1, -1 ]
+  }
+]
+output [
+  {
+    name: "OUTPUT"
+    data_type: TYPE_STRING
+    dims: [ -1, -1 ]
+  }
+]
+
+parameters {
+  key: "tokenizer_dir"
+  value: {
+    string_value: "${tokenizer_dir}"
+  }
+}
+
+instance_group [
+    {
+        count: 1
+        kind: KIND_CPU
+    }
+]
