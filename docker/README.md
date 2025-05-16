@@ -52,6 +52,28 @@ make -C docker release_build CUDA_ARCHS="80-real;90-real"
 
 For more build options, see the variables defined in [`Makefile`](Makefile).
 
+### NGC Integration
+
+When building from source, one can conveniently download a docker image for development from
+the [NVIDIA NGC Catalog](https://catalog.ngc.nvidia.com/) and start it like so:
+
+```bash
+make -C docker ngc-devel_run LOCAL_USER=1 DOCKER_PULL=1
+```
+
+As before, specifying `LOCAL_USER=1` will run the container with the local user's identity. Specifying `DOCKER_PULL=1`
+is optional, but it will pull the latest image from the NGC Catalog. This will map the source code into the container
+in the directory `/code/tensorrt_llm`.
+
+We also provide an image with pre-installed binaries for release. This can be used like so:
+
+```bash
+make -C docker ngc-release_run LOCAL_USER=1 DOCKER_PULL=1
+```
+
+If you want to deploy a specific version of TensorRT-LLM, you can specify the version with
+`TRT_LLM_VERSION=<version_tag>`. The application examples and benchmarks are installed in `/app/tensorrt_llm`.
+
 ### Jenkins Integration
 
 [`Makefile`](Makefile) has special targets for building, pushing and running the Docker build image used on Jenkins.
@@ -91,14 +113,3 @@ make -C docker trtllm_run LOCAL_USER=1 DOCKER_PULL=1
 
 The argument `DOCKER_PULL=1` instructs `make` to pull the latest version of the image before deploying it in the container.
 By default, images are tagged by their `git` branch name and may be frequently updated.
-
-### Binary Compatible Environment
-
-Currently, `BatchManager` is released as a closed source binary library. In order to make it deployable in a wider
-scope, the compilation environment needs to be constructed in the following way.
-
-The compilation environment for x86_64 architecture
-
-```bash
-make -C docker centos7_push
-```
