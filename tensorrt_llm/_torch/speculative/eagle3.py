@@ -21,14 +21,13 @@ class Eagle3Config(SpecConfig):
     spec_dec_name: str = "EAGLE3"
     num_layers: int = 0
     hidden_size: int = 0
+    eagle3_one_model: bool = True
 
     def __post_init__(self):
         if self.draft_model_path is None:
             raise ValueError("Path to EAGLE3 weights must be specified.")
 
-        # TODO: remove this once we have a better way to handle the one model case
-        eagle3_one_model = os.environ.get("TRTLLM_EAGLE3_ONE_MODEL", "1") == "1"
-        if eagle3_one_model:
+        if self.eagle3_one_model:
             self.spec_dec_mode = SpeculativeDecodingMode.EAGLE3_ONE_MODEL
             self.num_extra_kv_tokens = self.max_draft_tokens - 1
         else:
