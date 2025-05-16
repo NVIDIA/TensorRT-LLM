@@ -1523,8 +1523,7 @@ class PyExecutor:
                 request_ids=list(range(num_dummy_request)),
                 is_gen=not self.has_context_request,
                 prepare_resource=not self.has_context_request,
-                max_num_draft_tokens=0
-                if self.has_context_request else self.max_draft_tokens,
+                max_num_draft_tokens=self.max_draft_tokens,
             )
             for llm_request in llm_request_list:
                 llm_request.is_attention_dp_dummy = True
