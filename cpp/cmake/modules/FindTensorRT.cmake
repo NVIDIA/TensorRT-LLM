@@ -31,14 +31,27 @@ function(_tensorrt_get_version)
     return()
   endif()
 
-  file(STRINGS "${_hdr_file}" VERSION_STRINGS REGEX "#define NV_TENSORRT_.*")
+  file(STRINGS "${_hdr_file}" IS_10_11_NEW_MACRO REGEX "TRT_MAJOR_ENTERPRISE")
+  if(IS_10_11_NEW_MACRO)
+    file(STRINGS "${_hdr_file}" VERSION_STRINGS
+         REGEX "#define TRT_.+_ENTERPRISE.*")
+    foreach(TYPE MAJOR MINOR PATCH BUILD)
+      string(REGEX MATCH "TRT_${TYPE}_ENTERPRISE [0-9]+" TRT_TYPE_STRING
+                   ${VERSION_STRINGS})
+      string(REGEX MATCH "[0-9]+" TensorRT_VERSION_${TYPE} ${TRT_TYPE_STRING})
+    endforeach(TYPE)
+  else()
+    file(STRINGS "${_hdr_file}" VERSION_STRINGS REGEX "#define NV_TENSORRT_.*")
+    foreach(TYPE MAJOR MINOR PATCH BUILD)
+      string(REGEX MATCH "NV_TENSORRT_${TYPE} [0-9]+" TRT_TYPE_STRING
+                   ${VERSION_STRINGS})
+      string(REGEX MATCH "[0-9]+" TensorRT_VERSION_${TYPE} ${TRT_TYPE_STRING})
+    endforeach(TYPE)
+  endif()
 
-  foreach(TYPE MAJOR MINOR PATCH BUILD)
-    string(REGEX MATCH "NV_TENSORRT_${TYPE} [0-9]+" TRT_TYPE_STRING
-                 ${VERSION_STRINGS})
-    string(REGEX MATCH "[0-9]+" TensorRT_VERSION_${TYPE} ${TRT_TYPE_STRING})
-  endforeach(TYPE)
-
+  set(TensorRT_VERSION_MAJOR
+      ${TensorRT_VERSION_MAJOR}
+      PARENT_SCOPE)
   set(TensorRT_VERSION_STRING
       "${TensorRT_VERSION_MAJOR}.${TensorRT_VERSION_MINOR}.${TensorRT_VERSION_PATCH}.${TensorRT_VERSION_BUILD}"
       PARENT_SCOPE)
