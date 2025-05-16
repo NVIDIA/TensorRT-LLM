@@ -146,10 +146,13 @@ class OPTModel(DecoderModel):
             config.word_embed_proj_dim,
             dtype=config.torch_dtype,
             mapping=model_config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN)
-        self.embed_positions = nn.Embedding(config.max_position_embeddings + 2,
-                                            config.hidden_size,
-                                            dtype=config.torch_dtype)
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+        )
+        self.embed_positions = Embedding(
+            config.max_position_embeddings + 2,
+            config.hidden_size,
+            dtype=config.torch_dtype,
+        )
 
         if config.word_embed_proj_dim != config.hidden_size:
             self.project_out = nn.Linear(config.hidden_size,
