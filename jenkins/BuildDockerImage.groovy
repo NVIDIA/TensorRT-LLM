@@ -229,15 +229,6 @@ pipeline {
                         buildImage("trtllm", "push", "skip", "", LLM_BRANCH_TAG)
                     }
                 }
-                stage("Build trtllm release-sbsa") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build", "arm64")
-                    }
-                    steps
-                    {
-                        buildImage("trtllm", "push", "skip", "", LLM_BRANCH_TAG + "-sbsa", "", true)
-                    }
-                }
                 stage("Build x86_64-skip") {
                     agent {
                         kubernetes createKubernetesPodConfig("build")
@@ -245,6 +236,15 @@ pipeline {
                     steps
                     {
                         buildImage("tritondevel", params.action, "skip")
+                    }
+                }
+                stage("Build trtllm release-sbsa") {
+                    agent {
+                        kubernetes createKubernetesPodConfig("build", "arm64")
+                    }
+                    steps
+                    {
+                        buildImage("trtllm", "push", "skip", "", LLM_BRANCH_TAG + "-sbsa", "", true)
                     }
                 }
                 stage("Build rockylinux8 x86_64-skip-py3.10") {
