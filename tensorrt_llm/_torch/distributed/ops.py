@@ -8,7 +8,8 @@ from torch import nn
 
 from tensorrt_llm._utils import mpi_barrier
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
-from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
+from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
+                                     AllReduceStrategy)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
@@ -45,6 +46,54 @@ def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
         CustomAllReduceHelper.initialize_lowprecision_buffers(
             workspace, mapping.tp_size)
     return
+
+
+def get_allreduce_mnnvl_workspace(
+        mapping: Mapping,
+        dtype: torch.dtype) -> Tuple[McastGPUBuffer, torch.Tensor, int]:
+    if not hasattr(_thread_local,
+                   f'allreduce_mnnvl_workspaces_{mapping.pp_rank}'):
+        setattr(_thread_local, f'allreduce_mnnvl_workspaces_{mapping.pp_rank}',
+                {})
+
+    force_mn = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
+
+    allreduce_mnnvl_workspaces = getattr(
+        _thread_local, f'allreduce_mnnvl_workspaces_{mapping.pp_rank}')
+    if mapping not in allreduce_mnnvl_workspaces:
+        # how to set the buffer size?
+        # buffer_tokens * hidden_dim * 3 * 2 * dtype.itemsize
+        stride = 3 * 2 * dtype.itemsize * mapping.tp_size
+        buffer_size_in_bytes = math.ceil(100_000_000 / stride) * stride
+        max_num_elements = buffer_size_in_bytes // stride
+
+        mcast_buffer = McastGPUBuffer(
+            buffer_size_in_bytes,
+            mapping.tp_size,
+            mapping.tp_rank,
+            torch.device("cuda", mapping.local_rank),
+            mapping.is_multi_node() or force_mn,
+        )
+
+        buffer = mcast_buffer.get_uc_buffer(mapping.tp_rank,
+                                            (3, 2, max_num_elements), dtype, 0)
+        # Only initialize the buffer when we need to resize it
+        buffer.fill_(-0.0)
+        # CPU barrier since we assume this should not be called in cuda graph
+        torch.cuda.synchronize()
+        mpi_barrier()
+
+        # This is a buffer to maintain the state of this allreduce Op
+        # Should have the same lifetime with self._buffer
+        # [Buffer_ptr, Clear_ptr, Buffer_size, atomic access counter]
+        buffer_flags = torch.tensor([0, 2, max_num_elements, 0],
+                                    dtype=torch.uint32,
+                                    device=torch.device("cuda",
+                                                        mapping.local_rank))
+
+        allreduce_mnnvl_workspaces[mapping] = (mcast_buffer, buffer,
+                                               buffer_flags, max_num_elements)
+    return allreduce_mnnvl_workspaces[mapping]
 
 
 def userbuffers_allreduce_finalize(
@@ -220,7 +269,8 @@ class AllReduce(nn.Module):
 
     def __init__(self,
                  mapping: Mapping,
-                 strategy: AllReduceStrategy = AllReduceStrategy.AUTO):
+                 strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
+                 dtype: Optional[torch.dtype] = None):
         super().__init__()
         """
         AllReduce is a module that performs an all-reduce operation on a tensor.
@@ -266,6 +316,10 @@ class AllReduce(nn.Module):
         self.mapping = mapping
         self.workspace = None
         self.strategy = strategy
+        self.enable_mnnvl = False
+        self.buffer_mnnvl = None
+        self.buffer_flags_mnnvl = None
+        self.max_num_elements_mnnvl = 0
 
         self.force_low_precision_env = os.environ.get(
             "FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY")
@@ -275,6 +329,14 @@ class AllReduce(nn.Module):
                 if self.strategy == AllReduceStrategy.LOWPRECISION or self.force_low_precision_env is not None:
                     allocate_low_presicion_allreduce_workspace(self.mapping)
                 self.workspace = get_allreduce_workspace(self.mapping)
+
+            self.enable_mnnvl = (os.environ.get("TRTLLM_MNNVL_AR_ENABLED",
+                                                "0") == "1"
+                                 and dtype in [torch.bfloat16, torch.float32]
+                                 and (not mapping.has_cp()))
+            if self.enable_mnnvl:
+                self.mcast_buffer_mnnvl, self.buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = get_allreduce_mnnvl_workspace(
+                    self.mapping, dtype)
 
     def forward(
         self,
@@ -313,6 +375,35 @@ class AllReduce(nn.Module):
         # Assume using no fusion allreduce here
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
+
+        fusion_op = all_reduce_params.fusion_op
+
+        if (self.enable_mnnvl
+                and fusion_op in [AllReduceFusionOp.RESIDUAL_RMS_NORM, None]
+                and input.numel() <= self.max_num_elements_mnnvl):
+            shape = input.shape
+            input = input.view(-1, input.shape[-1])
+            output = torch.empty_like(input)
+
+            torch.ops.trtllm.lowlat_twoshot_allreduce(
+                output,
+                input,
+                self.buffer_mnnvl,
+                self.buffer_flags_mnnvl,
+                True,
+            )
+            if fusion_op is None:
+                return output.view(shape)
+            elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+                residual_in = all_reduce_params.residual
+                residual_out = torch.empty_like(input)
+
+                torch.ops.trtllm.lowlat_twoshot_rmsnorm(
+                    residual_out, output, self.buffer_mnnvl,
+                    all_reduce_params.norm_weight, all_reduce_params.eps,
+                    residual_in, self.buffer_flags_mnnvl)
+
+                return output.view(shape), residual_out.view(shape)
 
         output = torch.ops.trtllm.allreduce(
             input=input,
