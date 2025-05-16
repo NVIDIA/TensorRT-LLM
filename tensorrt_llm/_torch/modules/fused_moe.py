@@ -590,18 +590,12 @@ class FusedMoE(nn.Module):
                                    self.intermediate_size_per_partition // 2)
 
                 fc31_act_scale = nn.Parameter(torch.empty(
-                    self.expert_size_per_partition,
-                    1,
-                    dtype=self.dtype,
-                    device=device),
+                    self.expert_size_per_partition, 1, dtype=self.dtype),
                                               requires_grad=False)
                 self.register_parameter("fc31_act_scale", fc31_act_scale)
 
                 fc2_act_scale = nn.Parameter(torch.empty(
-                    self.expert_size_per_partition,
-                    1,
-                    dtype=self.dtype,
-                    device=device),
+                    self.expert_size_per_partition, 1, dtype=self.dtype),
                                              requires_grad=False)
                 self.register_parameter("fc2_act_scale", fc2_act_scale)
 
@@ -611,8 +605,7 @@ class FusedMoE(nn.Module):
                                 self.hidden_size // (128 * self.interleave[0]),
                                 self.intermediate_size_per_partition * 2 *
                                 self.interleave[0],
-                                dtype=self.dtype,
-                                device=device),
+                                dtype=self.dtype),
                     requires_grad=False)
                 self.register_parameter("fc31_weight_scale", fc31_weight_scale)
 
@@ -622,24 +615,17 @@ class FusedMoE(nn.Module):
                                 self.intermediate_size_per_partition //
                                 (128 * self.interleave[1]),
                                 self.hidden_size * self.interleave[1],
-                                dtype=self.dtype,
-                                device=device),
+                                dtype=self.dtype),
                     requires_grad=False)
                 self.register_parameter("fc2_weight_scale", fc2_weight_scale)
 
                 fc31_alpha = nn.Parameter(torch.empty(
-                    self.expert_size_per_partition,
-                    1,
-                    dtype=torch.float32,
-                    device=device),
+                    self.expert_size_per_partition, 1, dtype=torch.float32),
                                           requires_grad=False)
                 self.register_parameter("fc31_alpha", fc31_alpha)
 
                 fc2_alpha = nn.Parameter(torch.empty(
-                    self.expert_size_per_partition,
-                    1,
-                    dtype=torch.float32,
-                    device=device),
+                    self.expert_size_per_partition, 1, dtype=torch.float32),
                                          requires_grad=False)
                 self.register_parameter("fc2_alpha", fc2_alpha)
             elif qc.quant_mode.has_nvfp4():

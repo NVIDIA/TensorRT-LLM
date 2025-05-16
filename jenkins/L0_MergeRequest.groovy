@@ -560,6 +560,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/compilation/patterns/ar_residual_norm.py",
         "tensorrt_llm/_torch/compilation/patterns/ub_allreduce.py",
         "tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py",
+        "tensorrt_llm/_torch/pyexecutor/model_engine.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
         "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/models/modeling_llama.py",

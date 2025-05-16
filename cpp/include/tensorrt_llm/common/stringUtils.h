@@ -187,4 +187,22 @@ inline bool strStartsWith(std::string const& str, std::string const& prefix)
 /// @brief Split a string into a set of strings using a delimiter
 std::unordered_set<std::string> str2set(std::string const& input, char delimiter);
 
+/// @brief Convert string to lower-case (inplace)
+inline void toLower(std::string& s)
+{
+    for (char& c : s)
+    {
+        c = std::tolower(static_cast<unsigned char>(c));
+    }
+}
+
+/// @brief Convert string to upper-case (inplace)
+inline void toUpper(std::string& s)
+{
+    for (char& c : s)
+    {
+        c = std::toupper(static_cast<unsigned char>(c));
+    }
+}
+
 } // namespace tensorrt_llm::common

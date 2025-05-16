@@ -41,7 +41,7 @@ scripts/huggingface_example.sh --model <huggingface_model_card> --quant fp8 --ex
 
 - [Architecture Overview](./torch/arch_overview.md)
 - [Adding a New Model](./torch/adding_new_model.md)
-- [Examples](../../examples/pytorch/README.md)
+- [Examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/pytorch/README.md)
 
 ## Key Components
 

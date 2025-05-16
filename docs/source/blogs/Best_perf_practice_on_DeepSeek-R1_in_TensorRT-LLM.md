@@ -325,7 +325,7 @@ trtllm-bench -m deepseek-ai/DeepSeek-R1 \
     --dataset $YOUR_DATA_PATH \
     --backend pytorch \
     --max_batch_size 128 \
-    --max_num_tokens 1127 \
+    --max_num_tokens 1151 \
     --num_requests 5120 \
     --concurrency 1024 \
     --kv_cache_free_gpu_mem_fraction 0.8 \
@@ -339,13 +339,13 @@ The perf might be different from different datasets and machines
 ===========================================================
 = PERFORMANCE OVERVIEW
 ===========================================================
-Request Throughput (req/sec):                     5.1532
-Total Output Throughput (tokens/sec):             10553.8445
-Per User Output Throughput (tokens/sec/user):     10.4199
-Per GPU Output Throughput (tokens/sec/gpu):       1319.2306
-Total Token Throughput (tokens/sec):              15707.0888
-Total Latency (ms):                               993548.8470
-Average request latency (ms):                     197768.0434
+Request Throughput (req/sec):                     5.6100
+Total Output Throughput (tokens/sec):             11489.2671
+Per User Output Throughput (tokens/sec/user):     11.3476
+Per GPU Output Throughput (tokens/sec/gpu):       1436.1584
+Total Token Throughput (tokens/sec):              17233.9007
+Total Latency (ms):                               912656.9938
+Average request latency (ms):                     181540.5739
 ```
 
 ## Exploring more ISL/OSL combinations
