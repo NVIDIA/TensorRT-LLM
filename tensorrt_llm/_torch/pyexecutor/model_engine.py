@@ -17,6 +17,8 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
+from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
+from tensorrt_llm._torch.speculative.mtp import SampleStateTensorsMTP
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
 from tensorrt_llm.bindings.executor import GuidedDecodingConfig
@@ -64,7 +66,7 @@ class ModelEngine(ABC):
     @abstractmethod
     def forward(self, scheduled_requests: ScheduledRequests,
                 resource_manager: ResourceManager,
-                new_tensors_device: Optional[Dict[str, torch.Tensor]],
+                new_tensors_device: Optional[SampleStateTensors],
                 extra_model_inputs: Optional[Dict[str, Any]]):
         raise NotImplementedError
 
@@ -430,11 +432,10 @@ class PyTorchModelEngine(ModelEngine):
             self.previous_kv_lens_offsets_cuda = torch.zeros((batch_size, ),
                                                              dtype=torch.int,
                                                              device='cuda')
-            self.without_logits = self.spec_config.spec_dec_mode.without_logits(
-            )
+            self.is_mtp = self.spec_config.spec_dec_mode.is_mtp()
             self.max_draft_len = spec_config.max_draft_tokens
         else:
-            self.without_logits = False
+            self.is_mtp = False
             self.max_draft_len = 0
         self.iter_counter = 0
 
@@ -1010,7 +1011,7 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager: KVCacheManager,
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
-            new_tensors_device: Optional[Dict[str, torch.Tensor]] = None):
+            new_tensors_device: Optional[SampleStateTensors] = None):
         """
         Prepare inputs for Pytorch Model.
         """
@@ -1063,12 +1064,11 @@ class PyTorchModelEngine(ModelEngine):
         new_tokens_device, new_tokens_lens_device, next_draft_tokens_device = None, None, None
         if new_tensors_device is not None:
             # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
-            new_tokens_device = new_tensors_device["new_tokens_device"]
-            if self.without_logits:
-                new_tokens_lens_device = new_tensors_device[
-                    "new_tokens_lens_device"]  # [batch]
-                next_draft_tokens_device = new_tensors_device[
-                    "next_draft_tokens_device"]  # [batch, draft_len]
+            new_tokens_device = new_tensors_device.new_tokens
+            if self.is_mtp:
+                assert isinstance(new_tensors_device, SampleStateTensorsMTP)
+                new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
+                next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
 
         # Requests with draft tokens are treated like extend requests.
         extend_requests = []
@@ -1811,7 +1811,7 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager: KVCacheManager,
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
-            new_tensors_device: Optional[Dict[str, torch.Tensor]] = None):
+            new_tensors_device: Optional[SampleStateTensors] = None):
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
             cp_type = self.mapping.cp_config['cp_type']
             if 'star_attention' == cp_type:
@@ -1829,7 +1829,7 @@ class PyTorchModelEngine(ModelEngine):
     def forward(self,
                 scheduled_requests: ScheduledRequests,
                 resource_manager: ResourceManager,
-                new_tensors_device: Optional[Dict[str, torch.Tensor]] = None,
+                new_tensors_device: Optional[SampleStateTensors] = None,
                 extra_model_inputs: Optional[Dict[str, Any]] = None):
 
         kv_cache_manager = resource_manager.get_resource_manager(
@@ -1918,7 +1918,7 @@ class PyTorchModelEngine(ModelEngine):
     def _forward_step(self, inputs: Dict[str, Any],
                       gather_ids: Optional[torch.Tensor]) -> Dict[str, Any]:
         inputs = self._preprocess_inputs(inputs)
-        if self.without_logits:
+        if self.is_mtp:
             outputs = self.model_forward(**inputs)
             return outputs
 

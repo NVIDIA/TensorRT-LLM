@@ -1,4 +1,3 @@
-import itertools
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -24,8 +23,16 @@ from .llm_request import LlmRequest, LlmRequestState
 from .scheduler import ScheduledRequests
 
 
-@dataclass
-class DecoderState:
+@dataclass(frozen=True, kw_only=True)
+class SampleStateTensors:
+    new_tokens: torch.Tensor
+
+    def values(self):
+        return vars(self).values()
+
+
+@dataclass(frozen=True, kw_only=True)
+class SampleState:
     scheduled_requests: ScheduledRequests
 
     logits: torch.Tensor = None
@@ -34,46 +41,46 @@ class DecoderState:
     # log_probs[request_idx][token_idx]
     log_probs: list[list[float] | None] | None = None
 
-    new_tensors_device: dict[str, torch.Tensor] = None
-    new_tensors_host: dict[str, torch.Tensor] = None
+    device: SampleStateTensors = None
+    host: SampleStateTensors = None
 
-    decoder_event: torch.cuda.Event = None
+    sampler_event: torch.cuda.Event = None
 
 
-class Decoder(ABC):
+class Sampler(ABC):
 
-    def setup_decoder_step(self, scheduled_requests: ScheduledRequests):
+    def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
         pass
 
     @abstractmethod
-    def decode_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs) -> DecoderState:
+    def sample_async(self, scheduled_requests: ScheduledRequests,
+                     model_outputs) -> SampleState:
         raise NotImplementedError
 
     @abstractmethod
-    def update_requests(self, decoder_state: DecoderState) -> None:
+    def update_requests(self, state: SampleState) -> None:
         raise NotImplementedError
 
 
-class EarlyStopDecoder(Decoder):
+class EarlyStopSampler(Sampler):
     """
     Use for skipping decoding step for non generation model,
     such as encoder-only model (e.g., BERT) or reward models that only need context phase.
     """
 
-    def decode_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs) -> DecoderState:
-        return DecoderState(scheduled_requests=scheduled_requests,
-                            logits=model_outputs['logits'])
+    def sample_async(self, scheduled_requests: ScheduledRequests,
+                     model_outputs) -> SampleState:
+        return SampleState(scheduled_requests=scheduled_requests,
+                           logits=model_outputs['logits'])
 
-    def update_requests(self, decoder_state: DecoderState) -> None:
-        scheduled_requests = decoder_state.scheduled_requests
+    def update_requests(self, state: SampleState) -> None:
+        scheduled_requests = state.scheduled_requests
         assert (not scheduled_requests.generation_requests)
         for idx, request in enumerate(scheduled_requests.context_requests):
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
-            logits = decoder_state.logits[idx]
+            logits = state.logits[idx]
             if logits.ndim == 1:
                 # For BERT: Add vocab_size axis to be compatible with LogitsStorage.
                 logits = logits.unsqueeze(-1)
@@ -170,11 +177,11 @@ def decode_single_request(request: LlmRequest, logits):
     return next_tokens, log_probs
 
 
-class TorchDecoder(Decoder):
+class TorchSampler(Sampler):
 
-    def __init__(self, max_seq_len: int, mixed_decoder: bool = False):
+    def __init__(self, max_seq_len: int, mixed_sampler: bool = False):
         self.max_seq_len = max_seq_len
-        self.mixed_decoder = mixed_decoder
+        self.mixed_sampler = mixed_sampler
 
     def _meet_max_token_stop_criteria(self, request: LlmRequest,
                                       num_tokens: int):
@@ -221,12 +228,11 @@ class TorchDecoder(Decoder):
 
         return False
 
-    def update_requests(self, decoder_state: DecoderState) -> None:
-        if decoder_state.decoder_event:
-            decoder_state.decoder_event.synchronize()
-        new_tokens_list = decoder_state.new_tensors_host[
-            "new_tokens_host"].tolist()
-        scheduled_requests = decoder_state.scheduled_requests
+    def update_requests(self, state: SampleState) -> None:
+        if state.sampler_event:
+            state.sampler_event.synchronize()
+        new_tokens_list = state.host.new_tokens.tolist()
+        scheduled_requests = state.scheduled_requests
 
         request_idx = 0
         token_idx = 0
@@ -238,22 +244,22 @@ class TorchDecoder(Decoder):
             token_idx += num_tokens
 
         def handle_logits(request: LlmRequest, tokens: list[int], count=1):
-            if decoder_state.logits is None:
+            if state.logits is None:
                 return
             if not request.py_return_generation_logits and not request.py_return_log_probs:
                 return
 
             current_slice = slice(token_idx, token_idx + count)
-            current_logits = decoder_state.logits[current_slice]
+            current_logits = state.logits[current_slice]
 
             request.py_result.append_generation_logits(current_logits)
 
             if not request.py_return_log_probs:
                 return
 
-            log_probs = decoder_state.log_probs and decoder_state.log_probs[
-                request_idx]
-            if not log_probs:
+            if state.log_probs:
+                log_probs = state.log_probs[request_idx]
+            else:
                 _, log_probs = greedy_search_sampling_batch(current_logits)
 
             token_log_probs = [{
@@ -325,16 +331,10 @@ class TorchDecoder(Decoder):
                 request.py_decoding_iter += 1
             advance_idx()
 
-    def _mixed_decode(self, scheduled_requests: ScheduledRequests,
-                      model_outputs) -> DecoderState:
+    def _mixed_sample(self, scheduled_requests: ScheduledRequests,
+                      model_outputs) -> SampleState:
         logits = model_outputs["logits"]
-
-        state = DecoderState(
-            scheduled_requests=scheduled_requests,
-            logits=logits,
-            log_probs=[],
-        )
-
+        log_probs = []
         new_tokens_device_array = []
 
         idx = 0
@@ -342,11 +342,10 @@ class TorchDecoder(Decoder):
         for request in scheduled_requests.context_requests:
             assert not request.py_return_context_logits, "Return context logits not supported"
             token_logits = logits[idx:idx + 1, :]
-            new_token, log_probs = decode_single_request(request, token_logits)
+            new_token, probs = decode_single_request(request, token_logits)
             new_tokens_device_array.append(new_token)
-            log_probs = [log_probs.tolist()
-                         ] if request.py_return_log_probs else None
-            state.log_probs.append(log_probs)  # Currently always beam_width=1
+            probs = [probs.tolist()] if request.py_return_log_probs else None
+            log_probs.append(probs)  # Currently always beam_width=1
             idx += 1
 
         for request in scheduled_requests.generation_requests:
@@ -354,45 +353,48 @@ class TorchDecoder(Decoder):
                 continue
             assert request.py_draft_tokens is None, "Speculative decoding not supported in SeparateDecoder."
             token_logits = logits[idx:idx + 1, :]
-            new_token, log_probs = decode_single_request(request, token_logits)
+            new_token, probs = decode_single_request(request, token_logits)
             new_tokens_device_array.append(new_token)
-            log_probs = [log_probs.tolist()
-                         ] if request.py_return_log_probs else None
-            state.log_probs.append(log_probs)  # Currently always beam_width=1
+            probs = [probs.tolist()] if request.py_return_log_probs else None
+            log_probs.append(probs)  # Currently always beam_width=1
             idx += 1
 
         new_tokens_device = torch.cat(new_tokens_device_array)
         new_tokens_host = new_tokens_device.to('cpu', non_blocking=True)
-        state.new_tensors_device = {"new_tokens_device": new_tokens_device}
-        state.new_tensors_host = {"new_tokens_host": new_tokens_host}
-        state.decoder_event = torch.cuda.Event()
-        state.decoder_event.record()
+        sampler_event = torch.cuda.Event()
+        sampler_event.record()
 
-        return state
+        return SampleState(
+            scheduled_requests=scheduled_requests,
+            logits=logits,
+            device=SampleStateTensors(new_tokens=new_tokens_device),
+            host=SampleStateTensors(new_tokens=new_tokens_host),
+            sampler_event=sampler_event,
+            log_probs=log_probs)
 
-    def _batch_decode(self, scheduled_requests: ScheduledRequests,
-                      model_outputs) -> DecoderState:
+    def _batch_sample(self, scheduled_requests: ScheduledRequests,
+                      model_outputs) -> SampleState:
         logits = model_outputs["logits"]
         new_tokens_device = torch.argmax(logits, dim=-1)
         new_tokens_host = new_tokens_device.to('cpu', non_blocking=True)
-        decoder_event = torch.cuda.Event()
-        decoder_event.record()
-        return DecoderState(
+        sampler_event = torch.cuda.Event()
+        sampler_event.record()
+        return SampleState(
             scheduled_requests=scheduled_requests,
             logits=logits,
-            new_tensors_device={"new_tokens_device": new_tokens_device},
-            new_tensors_host={"new_tokens_host": new_tokens_host},
-            decoder_event=decoder_event)
+            device=SampleStateTensors(new_tokens=new_tokens_device),
+            host=SampleStateTensors(new_tokens=new_tokens_host),
+            sampler_event=sampler_event)
 
-    def decode_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs) -> DecoderState:
-        if self.mixed_decoder:
-            return self._mixed_decode(scheduled_requests, model_outputs)
+    def sample_async(self, scheduled_requests: ScheduledRequests,
+                     model_outputs) -> SampleState:
+        if self.mixed_sampler:
+            return self._mixed_sample(scheduled_requests, model_outputs)
         else:
-            return self._batch_decode(scheduled_requests, model_outputs)
+            return self._batch_sample(scheduled_requests, model_outputs)
 
 
-class TorchStarAttentionDecoder(TorchDecoder):
+class TorchStarAttentionSampler(TorchSampler):
 
     def update_one_request(self, request: LlmRequest,
                            new_tokens_list: list[int], logits: torch.Tensor):
@@ -415,18 +417,17 @@ class TorchStarAttentionDecoder(TorchDecoder):
         if request.state != LlmRequestState.GENERATION_COMPLETE:
             request.py_decoding_iter += 1
 
-    def update_requests(self, decoder_state: DecoderState):
-        if decoder_state.decoder_event:
-            decoder_state.decoder_event.synchronize()
-        new_tokens_list = decoder_state.new_tensors_host[
-            "new_tokens_host"].tolist()
-        logits = decoder_state.logits
+    def update_requests(self, state: SampleState):
+        if state.sampler_event:
+            state.sampler_event.synchronize()
+        new_tokens_list = state.host.new_tokens.tolist()
+        logits = state.logits
 
-        for request in decoder_state.scheduled_requests.context_requests:
+        for request in state.scheduled_requests.context_requests:
             if request.state == LlmRequestState.GENERATION_IN_PROGRESS:
                 self.update_one_request(request, new_tokens_list, logits)
 
-        for request in decoder_state.scheduled_requests.generation_requests:
+        for request in state.scheduled_requests.generation_requests:
             self.update_one_request(request, new_tokens_list, logits)
 
 
@@ -440,7 +441,21 @@ class Algorithms:
         return f"Algs({', '.join(algs)})"
 
 
-class TRTLLMDecoder(Decoder):
+@dataclass(frozen=True, kw_only=True)
+class SampleStateTensorsHostTRTLLM(SampleStateTensors):
+    finished_sum: torch.Tensor
+    finish_reasons: torch.Tensor
+    sequence_lengths: torch.Tensor
+
+
+@dataclass(frozen=True, kw_only=True)
+class SampleStateTRTLLM(SampleState):
+    host: SampleStateTensorsHostTRTLLM
+    device: SampleStateTensors
+
+
+class TRTLLMSampler(Sampler):
+    MAX_DECODING_TOKENS = 1  # It must be 1 when not in speculative decoding
 
     def __init__(
         self,
@@ -467,7 +482,6 @@ class TRTLLMDecoder(Decoder):
         self.max_attention_window = max_attn_window if max_attn_window is not None else executor_config.max_seq_len
         self.max_num_sequences = mapping.pp_size * self.executor_config.max_batch_size
         self.max_seq_idle_microseconds = 180 * 1000 * 1000
-        self.max_decoding_tokens = 1  # It must be 1 when not in speculative decoding
         self.is_trt_overlap = not disable_overlap_scheduler
 
         self.world_config = WorldConfig.mpi(mapping.gpus_per_node,
@@ -494,12 +508,12 @@ class TRTLLMDecoder(Decoder):
             "decoder_buffers":
             DecoderBuffers(self.max_num_sequences,
                            self.executor_config.max_beam_width,
-                           self.max_attention_window, self.max_decoding_tokens,
+                           self.max_attention_window, self.MAX_DECODING_TOKENS,
                            buffer_manager, self.model_config,
                            self.world_config),
             "decoder_input_buffers":
             DecoderInputBuffers(self.executor_config.max_batch_size,
-                                self.max_decoding_tokens, buffer_manager),
+                                self.MAX_DECODING_TOKENS, buffer_manager),
             "new_tokens_device_tensor":
             torch.empty((
                 self.executor_config.max_batch_size,
@@ -528,7 +542,7 @@ class TRTLLMDecoder(Decoder):
             max_attention_window=self.max_attention_window,
             sink_token_length=0,
             max_sequence_length=self.executor_config.max_seq_len,
-            max_tokens_per_step=self.max_decoding_tokens,
+            max_tokens_per_step=self.MAX_DECODING_TOKENS,
             dtype=self.logits_datatype,
             model_config=self.model_config,
             world_config=self.world_config)
@@ -542,7 +556,7 @@ class TRTLLMDecoder(Decoder):
         self.algs.make_decoding_batch_input_output = MakeDecodingBatchInputOutput(
         )
 
-    def setup_decoder_step(self, requests):
+    def setup_sampler_step(self, requests):
         batch_slots, decoder_requests, sampling_configs = self.algs.generate_request_options(
             self.model_config, self.world_config, self.decoding_config,
             requests, self.store["buffer_manager"], self.logits_datatype,
@@ -563,23 +577,25 @@ class TRTLLMDecoder(Decoder):
                 self.algs.decoder.decoder_state.joint_decoding_output,
                 decoder_requests)
 
-    def decode_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs):
-        self.batch_size = scheduled_requests.batch_size
-        for req in itertools.chain(scheduled_requests.context_requests,
-                                   scheduled_requests.generation_requests):
-            self.beam_width = req.sampling_config.beam_width
-            break
+    @staticmethod
+    def beam_width(scheduled_requests: ScheduledRequests) -> int:
+        for req in scheduled_requests.all_requests:
+            return req.sampling_config.beam_width
+        raise ValueError("No beam width found")
 
-        logits = model_outputs["logits"].reshape(
-            (self.batch_size, self.beam_width, -1))
+    def sample_async(self, scheduled_requests: ScheduledRequests,
+                     model_outputs) -> SampleStateTRTLLM:
+        batch_size = scheduled_requests.batch_size
+        beam_width = self.beam_width(scheduled_requests)
 
-        self.setup_decoder_step(scheduled_requests.context_requests)
+        logits = model_outputs["logits"].reshape((batch_size, beam_width, -1))
+
+        self.setup_sampler_step(scheduled_requests.context_requests)
 
         # Note: In runtimeBuffers.cpp, num_context_logits is set to:
         #       numContextLogits.at(batchIdx) = modelConfig.computeContextLogits() ? contextChunkSize : 1;
         # Revisit this when we support chunked context.
-        num_context_logits = [1] * self.batch_size
+        num_context_logits = [1] * batch_size
         logits_index = self.algs.handle_context_logits(
             scheduled_requests.context_requests, num_context_logits, logits,
             self.store["decoder_buffers"], self.model_config,
@@ -604,11 +620,9 @@ class TRTLLMDecoder(Decoder):
         # TODO: When we support speculative decoding:
         # new_tokens_device_tensor should be, for speculative decoding cases: [batch, 1 + draft_len], others: [batch]
         new_tokens_device_tensor = self.store[
-            "new_tokens_device_tensor"][:self.batch_size, :self.beam_width]
+            "new_tokens_device_tensor"][:batch_size, :beam_width]
         seq_slots = [
-            request.seq_slot for request in itertools.chain(
-                scheduled_requests.context_requests,
-                scheduled_requests.generation_requests)
+            request.seq_slot for request in scheduled_requests.all_requests
         ]
         new_tokens_device_tensor.copy_(
             self.algs.decoder.decoder_state.all_new_tokens[0][seq_slots],
@@ -624,39 +638,39 @@ class TRTLLMDecoder(Decoder):
         sequence_lengths = self.algs.decoder.decoder_state.sequence_lengths.to(
             'cpu', non_blocking=True)
 
-        new_tensors_device = {"new_tokens_device": new_tokens_device_tensor}
+        device = SampleStateTensors(new_tokens=new_tokens_device_tensor)
 
-        new_tensors_host = {
-            "new_tokens_host": new_output_tokens,
-            "finished_sum_host": finished_sum,
-            "finish_reasons_host": finish_reasons,
-            "sequence_lengths_host": sequence_lengths
-        }
+        host = SampleStateTensorsHostTRTLLM(new_tokens=new_output_tokens,
+                                            finished_sum=finished_sum,
+                                            finish_reasons=finish_reasons,
+                                            sequence_lengths=sequence_lengths)
 
-        decoder_event = torch.cuda.Event()
-        decoder_event.record()
+        sampler_event = torch.cuda.Event()
+        sampler_event.record()
 
-        return DecoderState(scheduled_requests=scheduled_requests,
-                            logits=logits,
-                            new_tensors_device=new_tensors_device,
-                            new_tensors_host=new_tensors_host,
-                            decoder_event=decoder_event)
+        return SampleStateTRTLLM(scheduled_requests=scheduled_requests,
+                                 logits=logits,
+                                 device=device,
+                                 host=host,
+                                 sampler_event=sampler_event)
 
-    def update_requests(self, decoder_state: DecoderState):
-        scheduled_requests = decoder_state.scheduled_requests
-        new_tensors_host = decoder_state.new_tensors_host
-        decoder_event = decoder_state.decoder_event
+    def update_requests(self, state: SampleStateTRTLLM):
+        assert isinstance(state, SampleStateTRTLLM)
 
-        if decoder_event:
-            decoder_event.synchronize()
+        scheduled_requests = state.scheduled_requests
+        assert scheduled_requests.batch_size > 0
+        beam_width = self.beam_width(scheduled_requests)
+        sampler_event = state.sampler_event
 
-        new_tokens_host = new_tensors_host["new_tokens_host"]
-        finished_sum_host = new_tensors_host["finished_sum_host"]
-        finish_reasons_host = new_tensors_host["finish_reasons_host"]
-        sequence_lengths_host_data = new_tensors_host["sequence_lengths_host"]
+        if sampler_event:
+            sampler_event.synchronize()
 
-        for request in itertools.chain(scheduled_requests.context_requests,
-                                       scheduled_requests.generation_requests):
+        new_tokens_host = state.host.new_tokens
+        finished_sum_host = state.host.finished_sum
+        finish_reasons_host = state.host.finish_reasons
+        sequence_lengths_host_data = state.host.sequence_lengths
+
+        for request in scheduled_requests.all_requests:
             if request.is_context_init_state:
                 continue
 
@@ -664,23 +678,20 @@ class TRTLLMDecoder(Decoder):
             num_generated_tokens = request.num_draft_tokens + 1
             current_num_of_tokens = request.max_beam_num_tokens
 
-            num_new_tokens = [0] * self.beam_width
-            num_dropped_tokens = [0] * self.beam_width
+            num_new_tokens = [0] * beam_width
 
-            for beam in range(self.beam_width):
-                seq_len = sequence_lengths_host_data[seq_slot * self.beam_width
-                                                     + beam].item()
+            for beam in range(beam_width):
+                seq_len = sequence_lengths_host_data[seq_slot * beam_width +
+                                                     beam].item()
                 num_new_tokens[beam] = min(
                     num_generated_tokens,
                     seq_len - request.get_num_tokens(beam))
-                num_dropped_tokens[
-                    beam] = num_generated_tokens - num_new_tokens[beam]
 
                 for step in range(num_new_tokens[beam]):
                     new_token = new_tokens_host[step][seq_slot][beam]
                     request.add_new_token(new_token, beam)
 
-                finish_reason = finish_reasons_host[seq_slot * self.beam_width +
+                finish_reason = finish_reasons_host[seq_slot * beam_width +
                                                     beam].item()
                 request.set_finished_reason(FinishReason(finish_reason), beam)
 
@@ -693,5 +704,5 @@ class TRTLLMDecoder(Decoder):
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 request.py_decoding_iter += 1
 
-            if finished_sum_host[seq_slot] == self.beam_width:
+            if finished_sum_host[seq_slot] == beam_width:
                 request.state = LlmRequestState.GENERATION_COMPLETE

@@ -139,7 +139,7 @@ class TRTLLMWorker(Worker):
         disable_overlap_scheduler: bool = False,
     ):
         pytorch_backend_config = PyTorchConfig(
-            mixed_decoder=True,
+            mixed_sampler=True,
             disable_overlap_scheduler=disable_overlap_scheduler,
         )
         kv_cache_config = KvCacheConfig(
