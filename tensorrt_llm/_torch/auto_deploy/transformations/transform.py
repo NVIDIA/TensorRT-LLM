@@ -14,6 +14,7 @@ from ..utils.logger import ad_logger
 from ._graph import canonicalize_graph, move_to_device
 from .export import torch_export_to_gm
 from .library import (
+    add_nvtx_annotations,
     check_in_out_nodes,
     column_row_shard,
     eliminate_redundant_transposes,
@@ -212,7 +213,7 @@ class InferenceOptimizer:
         ############################################################################################
         # COMPILE MODEL
         ############################################################################################
-
+        egm = add_nvtx_annotations(egm, "layers.0.post_attention_layernorm")
         cm.info._set_generate_only_batch()
         compiler_kwargs = {
             "cuda_graph_batch_sizes": self.ad_config.cuda_graph_batch_sizes,
