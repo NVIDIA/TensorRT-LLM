@@ -23,9 +23,14 @@ class ScaffoldingResult:
         self._done = False
         self.aqueue = asyncio.Queue()
         self.output = None
+        self.task_collections = None
 
     def set_output(self, output: ScaffoldingOutput):
         self.aqueue.put_nowait(output)
+
+    def set_task_collections(self, task_collections: Mapping[str,
+                                                             "TaskCollection"]):
+        self.task_collections = task_collections
 
     async def aresult_step(self):
         # TODO: error handling or raise exception?
@@ -76,6 +81,8 @@ class ScaffoldingLlm:
         self.max_parallel_requests = 64
         self.pending_queue = deque()
 
+        self.output_task_collection = False
+
     def __enter__(self):
         return self
 
@@ -121,6 +128,9 @@ class ScaffoldingLlm:
             def controller_generator_wrapper(request: ScaffoldingRequest):
                 scaffolding_output = yield from request.controller.generate(
                     request.prompt, **request.kwargs)
+                if self.output_task_collection:
+                    request.result.set_task_collections(
+                        request.controller.task_collections)
                 request.result.set_output(scaffolding_output)
 
             try:
@@ -211,6 +221,9 @@ class ScaffoldingLlm:
             scaffolding_result.result()
 
         return scaffolding_results[0] if unbatched else scaffolding_results
+
+    def enable_output_task_collection(self):
+        self.output_task_collection = True
 
     def shutdown(self, shutdown_workers=False):
 
