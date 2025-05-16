@@ -2,8 +2,11 @@
 
 # Installing on Linux
 
-1. Install TensorRT-LLM (tested on Ubuntu 24.04).
+TRT-LLM team has verified the installation of TensorRT-LLM wheel both on Ubuntu 24.04 and CUDA container.
 
+**Option 1. Install TensorRT-LLM on Ubuntu 24.04.**
+
+1. Install the dependencies and TensorRT-LLM package.
     ```bash
     (Optional) pip3 install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
@@ -20,6 +23,32 @@
         :language: python
         :linenos:
     ```
+
+**Option 2. Install TensorRT-LLM on CUDA container.**
+
+Besides installing TensorRT-LLM on Ubuntu 24.04, you can also install TensorRT-LLM on [CUDA container](https://hub.docker.com/r/nvidia/cuda).
+
+Here is the step-by-step guide to install TensorRT-LLM on CUDA container.
+
+1. Launch the CUDA container.
+```bash
+docker run --rm --ipc=host --runtime=nvidia --gpus all --entrypoint /bin/bash -it  nvidia/cuda:12.8.1-devel-ubuntu24.04
+```
+
+2. Install the dependencies.
+```bash
+apt-get update && apt-get -y install python3.10 python3-pip openmpi-bin libopenmpi-dev git git-lfs python3-venv
+```
+
+3. Create a virtual environment and install TensorRT-LLM.
+```python
+python3 -m venv myenv && source myenv/bin/activate && pip3 install tensorrt_llm -U --pre --extra-index-url https://pypi.nvidia.com
+```
+
+4. Sanity check the installation.
+```python
+python3 -c "import tensorrt_llm"
+```
 
 **Known limitations**
 
