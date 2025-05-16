@@ -440,7 +440,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_fp8_block_scales_cuda_graph_padding(self):
         # OOM on H100 with default free_gpu_memory_fraction=0.9
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
-        pytorch_config = PyTorchConfig(enable_overlap_scheduler=True,
+        pytorch_config = PyTorchConfig(disable_overlap_scheduler=False,
                                        use_cuda_graph=True,
                                        cuda_graph_max_batch_size=512,
                                        cuda_graph_padding_enabled=True)
