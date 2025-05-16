@@ -136,6 +136,11 @@ public:
         return reinterpret_cast<int64_t>(this);
     }
 
+    int getLayerId() const
+    {
+        return mLayerId;
+    }
+
     tensorrt_llm::kernels::MoeLoadBalanceMetaInfo getMetaInfo() const
     {
         return mMetaInfo;

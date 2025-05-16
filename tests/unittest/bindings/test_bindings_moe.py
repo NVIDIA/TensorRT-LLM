@@ -77,11 +77,21 @@ class TestMoePythonBindings(unittest.TestCase):
             layer_updates_per_iter=self.layer_updates_per_iter)
 
         # Add a layer and verify return value type
-        layer = balancer.add_layer(expert_count=self.expert_count,
-                                   top_k=self.top_k,
-                                   slot_count_per_rank=self.slot_count_per_rank)
+        layer0 = balancer.add_layer(
+            expert_count=self.expert_count,
+            top_k=self.top_k,
+            slot_count_per_rank=self.slot_count_per_rank)
 
-        self.assertIsInstance(layer, _tbr.SingleLayerMoeLoadBalancer)
+        self.assertIsInstance(layer0, _tbr.SingleLayerMoeLoadBalancer)
+        self.assertEqual(layer0.get_layer_id(), 0)
+
+        # Add another layer and verify return value type
+        layer1 = balancer.add_layer(
+            expert_count=self.expert_count,
+            top_k=self.top_k,
+            slot_count_per_rank=self.slot_count_per_rank)
+        self.assertIsInstance(layer1, _tbr.SingleLayerMoeLoadBalancer)
+        self.assertEqual(layer1.get_layer_id(), 1)
 
     def _create_weight_buffers(self, weight_height, weight_width, num_experts,
                                num_slots):
