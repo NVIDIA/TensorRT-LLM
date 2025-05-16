@@ -25,13 +25,10 @@ __host__ __device__ void applyRoPE(
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 __global__ void qwen3RopeCacheUpdateKernel(
-    const __nv_bfloat16* q,  // Input matrix Q
-    const __nv_bfloat16* k,  // Input matrix K
-    __nv_bfloat16* outputQ,  // Output normalized Q
-    __nv_fp8_e4m3** outputK, // Output normalized K in e4m3 format
+    __nv_bfloat16* q,  // Input/output matrix Q (modified in place)
+    __nv_bfloat16* k,  // Input/output matrix K (modified in place)
     int numRowsQ,
     int numRowsK,
-    int numTokensPerPage,    // Number of tokens (rows) per page
     float base = 10000.0f    // Base for RoPE computation
 ) {
     // The number of columns in this matrix.
@@ -53,7 +50,7 @@ __global__ void qwen3RopeCacheUpdateKernel(
     const bool isQ = rowIdx < numRowsQ;
 
     // The matrix to process.
-    const __nv_bfloat16* matrix = isQ ? q : k;
+    __nv_bfloat16* matrix = isQ ? q : k;
     // Remap the rowIdx to the correct row in the matrix.
     const int matrixRowIdx = rowIdx - (isQ ? 0 : numRowsQ);
     
@@ -121,30 +118,16 @@ __global__ void qwen3RopeCacheUpdateKernel(
     
     // Store the rotated elements back to memory
     if (colIdx < numCols) {
-        if (isQ) {
-            // For Q matrix, write directly to outputQ as bfloat16
-            __nv_bfloat162 vals0 = __float22bfloat162_rn(make_float2(elements[0], elements[1]));
-            __nv_bfloat162 vals1 = __float22bfloat162_rn(make_float2(elements[2], elements[3]));
+        // Write directly back to the original matrix as bfloat16
+        __nv_bfloat162 vals0 = __float22bfloat162_rn(make_float2(elements[0], elements[1]));
+        __nv_bfloat162 vals1 = __float22bfloat162_rn(make_float2(elements[2], elements[3]));
 
-            uint2 data;
-            data.x = *reinterpret_cast<uint32_t*>(&vals0);
-            data.y = *reinterpret_cast<uint32_t*>(&vals1);
-            
-            uint2* outputPtr = reinterpret_cast<uint2*>(&outputQ[matrixRowIdx * numCols + colIdx]);
-            outputPtr[0] = data;
-        } else {
-            // For K matrix, convert to e4m3 and write to the appropriate page
-            int pageIdx = matrixRowIdx / numTokensPerPage;
-            int pageRow = matrixRowIdx % numTokensPerPage;
-
-            // Get the pointer to the page.
-            __nv_fp8_e4m3* pageK = outputK[pageIdx];
-
-            // Convert and store 4 elements at once using STG.32
-            float4 vals = make_float4(elements[0], elements[1], elements[2], elements[3]);
-            __nv_fp8x4_e4m3 fp8x4(vals);
-            *reinterpret_cast<uint32_t*>(&pageK[pageRow * numCols + colIdx]) = *reinterpret_cast<uint32_t*>(&fp8x4);
-        }
+        uint2 data;
+        data.x = *reinterpret_cast<uint32_t*>(&vals0);
+        data.y = *reinterpret_cast<uint32_t*>(&vals1);
+        
+        uint2* outputPtr = reinterpret_cast<uint2*>(&matrix[matrixRowIdx * numCols + colIdx]);
+        outputPtr[0] = data;
     }
 }
 
@@ -363,8 +346,9 @@ int main() {
     dim3 blockDim(256);  // 8 warps * 32 threads
     dim3 gridDim((numRowsQ + numRowsK + 7) / 8);  // Ceiling division to handle all rows
     qwen3RopeCacheUpdateKernel<<<gridDim, blockDim>>>(
-        dQ, dK, dOutputQ, dPagesK,
-        numRowsQ, numRowsK, numTokensPerPage
+        dQ, dK,
+        numRowsQ, numRowsK,
+        numTokensPerPage
     );
 
     // Check for kernel launch errors
@@ -378,7 +362,7 @@ int main() {
     cudaDeviceSynchronize();
 
     // Copy results back to host
-    cudaMemcpy(hOutputQ.data(), dOutputQ, numRowsQ * numCols * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+    cudaMemcpy(hOutputQ.data(), dQ, numRowsQ * numCols * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
     
     // Copy K results from pages
     for (int page = 0; page < numPagesK; ++page) {
