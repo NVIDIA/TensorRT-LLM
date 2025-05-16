@@ -75,7 +75,7 @@ from utils.llm_data import llm_models_root
                     "num_attention_heads": 8,
                     "num_key_value_heads": 4,
                 },
-                "skip_loading_weights": "True",  # TODO: remove this once we fix fp8 weight loading
+                "skip_loading_weights": "True",
             },
         ),
     ],

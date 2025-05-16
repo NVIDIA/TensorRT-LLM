@@ -17,7 +17,6 @@ from torch.fx.passes.tools_common import legalize_graph
 from torch.utils._pytree import _LEAF_SPEC
 
 from ..utils.logger import ad_logger
-from ..utils.node_utils import is_op
 
 
 def get_buffers_and_params(model: nn.Module) -> Dict[str, torch.Tensor]:
@@ -107,11 +106,6 @@ def move_to_device(gm: fx.GraphModule, device: DeviceLikeType) -> fx.GraphModule
             kwargs = node.kwargs.copy()
             kwargs["device"] = device
             node.kwargs = kwargs
-
-        if is_op(node, torch.ops.aten.to.device):
-            args = list(node.args)
-            args[1] = device
-            node.args = tuple(args)
 
         # move all the tensor metadata
         node.meta["val"] = pytree.tree_map(

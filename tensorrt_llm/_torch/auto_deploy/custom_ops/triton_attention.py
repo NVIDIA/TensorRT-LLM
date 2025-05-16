@@ -195,12 +195,12 @@ def flattened_mha_with_cache(
     # 1. b > 0, s==1: this indicates a generate-only batch of tokens.
     # 2. b==1, s > 0: this indicates a mixed context+generate phase. The actual number of sequences
     #    and number of tokens per sequence are encoded in seq_len and seq_start.
-    num_kv_heads, head_dim = k_cache.shape[-2:]
+    num_kv_heads, qk_head_dim = k_cache.shape[-2:]
     v_head_dim = v_cache.shape[-1]
     b, s = q.shape[:2]
 
     # check for num_heads
-    num_heads = q.shape[2] // head_dim if q.ndim == 3 else q.shape[2]
+    num_heads = q.shape[2] // qk_head_dim if q.ndim == 3 else q.shape[2]
 
     # Define output shape
     output_shape = (b, s, num_heads * v_head_dim) if q.ndim == 3 else (b, s, num_heads, v_head_dim)
@@ -211,8 +211,8 @@ def flattened_mha_with_cache(
     else:
         bs_view = (b * s,)
 
-    q = q.contiguous().view(*bs_view, num_heads, head_dim)
-    k = k.contiguous().view(*bs_view, num_kv_heads, head_dim)
+    q = q.contiguous().view(*bs_view, num_heads, qk_head_dim)
+    k = k.contiguous().view(*bs_view, num_kv_heads, qk_head_dim)
     v = v.contiguous().view(*bs_view, num_kv_heads, v_head_dim)
 
     # run attention
@@ -251,7 +251,7 @@ def flattened_mha_fake(
     v_cache: torch.Tensor,
     scale: Optional[float],
 ):
-    return q.new_empty(*q.shape[:3], v.shape[-1]).contiguous()
+    return q.new_empty(*q.shape[:-1], v.shape[-1]).contiguous()
 
 
 @torch.library.custom_op("attention::prepare_fused_mha_metadata", mutates_args=())
