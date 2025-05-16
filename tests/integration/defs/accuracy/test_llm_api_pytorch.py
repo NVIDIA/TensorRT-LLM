@@ -857,6 +857,17 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_fp8_prequantized(self):
+        model_path = f"{llm_models_root()}/nemotron/nemotron-h-8b-128k-step-400-fp8-dynamic"
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+        with LLM(model_path,
+                 kv_cache_config=kv_cache_config,
+                 max_batch_size=128) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen2-7B-Instruct"
