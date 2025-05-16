@@ -270,7 +270,7 @@ llm = LLM(
 
 </details>
 
-For more examples on TRT-LLM LLM API, visit [`this page`](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/).
+For more examples on TRT-LLM LLM API, visit [`this page`](https://nvidia.github.io/TensorRT-LLM/examples/llm_api_examples.html).
 
 ______________________________________________________________________
 

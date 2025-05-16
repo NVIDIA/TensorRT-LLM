@@ -701,8 +701,8 @@ def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
             streaming=streaming)
 
         benchmark_cmd = \
-            f"trtllm-bench --model {model_path} throughput " \
-            f"--dataset {dataset_path} --iteration_log {iteration_log}"
+            f"trtllm-bench --model {model_name} --model_path {model_path} " \
+            f"throughput --dataset {dataset_path} --iteration_log {iteration_log}"
 
         if streaming:
             benchmark_cmd += " --streaming"
