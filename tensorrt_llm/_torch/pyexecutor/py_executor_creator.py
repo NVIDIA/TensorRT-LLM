@@ -19,12 +19,13 @@ from .config import PyTorchConfig
 from .config_utils import is_mla
 from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
                            PyTorchModelEngine)
+from .py_executor import PyExecutor
 
 
 def create_py_executor(executor_config: ExecutorConfig,
                        checkpoint_dir: str = None,
                        engine_dir: str = None,
-                       lora_config: LoraConfig = None):
+                       lora_config: LoraConfig = None) -> PyExecutor:
     if executor_config.pytorch_backend_config is None:
         executor_config.pytorch_backend_config = PyTorchConfig()
 
@@ -197,23 +198,27 @@ def create_py_executor(executor_config: ExecutorConfig,
             origin_seq_len, ctx_chunk_config, draft_model_engine)
         # This may be None if no max number tokens set and enable cp.
         if kv_cache_max_tokens is not None:
+            del py_executor  # free before constructing new
+            del kv_cache_manager  # free before constructing new
+
             executor_config.kv_cache_config.max_tokens = kv_cache_max_tokens
 
             kv_cache_manager = create_kv_cache_manager(model_engine, mapping,
                                                        executor_config)
             resources[KV_CACHE_MANAGER_KEY] = kv_cache_manager
 
-            if model_engine.attn_metadata is not None and kv_cache_manager is not None:
+            if model_engine.attn_metadata is not None:
                 if pytorch_backend_config.use_cuda_graph:
                     model_engine._release_cuda_graphs()
                 del model_engine.attn_metadata
                 model_engine.attn_metadata = None
 
             if draft_model_engine is not None:
+                del draft_kv_cache_manager  # free before constructing new
                 draft_kv_cache_manager = create_kv_cache_manager(
                     draft_model_engine, mapping, executor_config)
                 resources[DRAFT_KV_CACHE_MANAGER_KEY] = draft_kv_cache_manager
-                if draft_model_engine.attn_metadata is not None and draft_kv_cache_manager is not None:
+                if draft_model_engine.attn_metadata is not None:
                     if pytorch_backend_config.use_cuda_graph:
                         draft_model_engine._release_cuda_graphs()
                     del draft_model_engine.attn_metadata

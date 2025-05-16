@@ -1,6 +1,7 @@
 import math
 import random
 from collections.abc import Iterable
+from typing import Optional
 
 import torch
 
@@ -75,7 +76,8 @@ def get_fraction_from_executor_config(executor_config):
 
 
 def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
-                   draft_model_config, mapping: Mapping, alloc_kv_tokens: int):
+                   draft_model_config, mapping: Mapping,
+                   alloc_kv_tokens: int) -> int:
     model_kv_size_per_token = get_cache_size_per_token(model_config, mapping)
     draft_kv_size_per_token = get_cache_size_per_token(
         draft_model_config, mapping) if draft_model_config is not None else 0
@@ -135,12 +137,11 @@ def get_token_num_for_estimation(executor_config, model_config):
         return None
 
 
-def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
-                                 model_engine: PyTorchModelEngine,
-                                 executor_config: ExecutorConfig,
-                                 mapping: Mapping, origin_seq_len: int,
-                                 ctx_chunk_config,
-                                 draft_model_engine: PyTorchModelEngine):
+def estimate_max_kv_cache_tokens(
+        py_executor: PyExecutor, model_engine: PyTorchModelEngine,
+        executor_config: ExecutorConfig, mapping: Mapping, origin_seq_len: int,
+        ctx_chunk_config,
+        draft_model_engine: PyTorchModelEngine) -> Optional[int]:
     # TODO: support CP by generating dummy requests for it.
     if 'cp_type' in mapping.cp_config:
         return executor_config.max_num_tokens
@@ -198,7 +199,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
         model_engine.model.model_config, draft_model_config, mapping,
         kv_stats.max_num_blocks * kv_stats.tokens_per_block)
 
-    if kv_cache_max_tokens_in is not None and kv_cache_max_tokens is not None:
+    if kv_cache_max_tokens_in is not None:
         kv_cache_max_tokens = min(kv_cache_max_tokens, kv_cache_max_tokens_in)
 
     logger.info(f"Estimated max tokens in KV cache : {kv_cache_max_tokens}")
@@ -209,8 +210,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
         "kv_cache_manager").shutdown()
 
     py_executor.is_warmup = False
-    if py_executor.dist.mapping.rank == 0:
-        py_executor.shutdown()
+    py_executor.shutdown()
 
     return kv_cache_max_tokens
 
@@ -299,6 +299,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
         if model_engine.kv_cache_manager_key == KV_CACHE_MANAGER_KEY:
             executor_config.max_seq_len = kv_cache_manager.max_seq_len
 
+    assert kv_cache_manager is not None
     return kv_cache_manager
 
 
@@ -312,7 +313,7 @@ def create_py_executor_instance(dist,
                                 draft_model_engine,
                                 start_worker,
                                 decoder,
-                                lora_config: LoraConfig = None):
+                                lora_config: LoraConfig = None) -> PyExecutor:
     kv_cache_manager = resources.get(KV_CACHE_MANAGER_KEY, None)
 
     spec_config = model_engine.spec_config
