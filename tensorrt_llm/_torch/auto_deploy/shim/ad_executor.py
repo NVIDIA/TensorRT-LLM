@@ -12,10 +12,10 @@ from ....bindings.internal.batch_manager import CacheType
 from ....mapping import Mapping
 from ...distributed import MPIDist
 from ...pyexecutor.config import PyTorchConfig
-from ...pyexecutor.decoder import TorchDecoder
 from ...pyexecutor.model_engine import ModelEngine
 from ...pyexecutor.py_executor import PyExecutor
 from ...pyexecutor.resource_manager import KVCacheManager, ResourceManager
+from ...pyexecutor.sampler import TorchSampler
 from ...pyexecutor.scheduler import (
     BindCapacityScheduler,
     BindMicroBatchScheduler,
@@ -291,8 +291,8 @@ def create_autodeploy_executor(
     )
     scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
 
-    # search decoder with speculative decoding
-    decoder = TorchDecoder(max_seq_len=max_seq_len)
+    # search sampler with speculative decoding
+    sampler = TorchSampler(max_seq_len=max_seq_len)
 
     # creating the executor object
     py_config: PyTorchConfig = executor_config.pytorch_backend_config
@@ -300,7 +300,7 @@ def create_autodeploy_executor(
         resource_manager,
         scheduler,
         model_engine=engine,
-        decoder=decoder,
+        sampler=sampler,
         dist=mpi_dist,
         disable_overlap_scheduler=py_config.disable_overlap_scheduler,
         max_input_len=executor_config.max_input_len,

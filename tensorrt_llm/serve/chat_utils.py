@@ -274,7 +274,6 @@ def apply_chat_template(
     documents: Optional[list[dict[str, str]]] = None,
     chat_template: Optional[str] = None,
     chat_template_kwargs: Optional[dict[str, Any]] = None,
-    **kwargs: Any,
 ) -> str:
     """Apply chat template to the conversation."""
     hf_chat_template = resolve_hf_chat_template(tokenizer, processor,

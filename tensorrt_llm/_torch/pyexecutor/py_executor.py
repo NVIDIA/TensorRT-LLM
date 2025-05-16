@@ -30,11 +30,11 @@ from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
 from tensorrt_llm.logger import logger
 
 from ..distributed import Distributed
-from .decoder import Decoder, DecoderState
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
                           LlmRequestState, executor_request_to_llm_request)
 from .model_engine import ModelEngine
+from .sampler import Sampler, SampleState, SampleStateTensors
 from .scheduler import ScheduledRequests
 
 # Environment variable to specify iteration ranges for profiling start/stop.
@@ -142,7 +142,7 @@ def _gc_nvtx_watcher():
 
 @dataclasses.dataclass
 class BatchState:
-    decoder_state: DecoderState
+    sample_state: SampleState
 
     iter_start_time: float = 0
     iter_stats: IterationStats = None
@@ -160,7 +160,7 @@ class PyExecutor:
                  resource_manager,
                  scheduler,
                  model_engine: ModelEngine,
-                 decoder: Decoder,
+                 sampler: Sampler,
                  dist: Distributed,
                  disable_overlap_scheduler: bool = False,
                  max_input_len: int = 2048,
@@ -185,7 +185,7 @@ class PyExecutor:
         self.scheduler = scheduler
         self.model_engine = model_engine
         self.enable_attention_dp = model_engine.enable_attention_dp
-        self.decoder = decoder
+        self.sampler = sampler
         self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
 
@@ -633,14 +633,14 @@ class PyExecutor:
 
         req_stats = self._populate_req_stats(
             finished_requests, active_requests,
-            batch_state.decoder_state.scheduled_requests) if (
+            batch_state.sample_state.scheduled_requests) if (
                 self.enable_iter_req_stats
                 and self.enable_iter_perf_stats) else None
 
         self._append_iter_stats(
             self._update_iter_stats(
                 batch_state.iter_stats, iter_latency_ms, len(finished_requests),
-                batch_state.decoder_state.scheduled_requests), req_stats)
+                batch_state.sample_state.scheduled_requests), req_stats)
 
     def _executor_loop_cleanup(self):
         with self.response_cv:
@@ -703,12 +703,12 @@ class PyExecutor:
 
                     # Stage 1: Async forward (all ranks) and decoding pass (last rank only)
                     if not self.dist.is_last_pp_rank:
-                        decoder_state = self._forward_step_inter_pp(
+                        sample_state = self._forward_step_inter_pp(
                             scheduled_batch)
                     else:
                         with torch.cuda.nvtx.range("_forward_step_last_pp"):
                             batch_outputs = self._forward_step(scheduled_batch)
-                            decoder_state = self._decode_async(
+                            sample_state = self._sample_async(
                                 scheduled_batch, batch_outputs)
                             self._update_request_states(scheduled_batch)
 
@@ -716,7 +716,7 @@ class PyExecutor:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                             'num_ctx_tokens']
                     batch_state = BatchStatePP(
-                        decoder_state=decoder_state,
+                        sample_state=sample_state,
                         iter_start_time=iter_start_time,
                         iter_stats=iter_stats,
                         microbatch_id=microbatch_id,
@@ -724,7 +724,7 @@ class PyExecutor:
 
                     if num_dummy_request > 0:
                         self._finish_dummy_request(
-                            decoder_state.scheduled_requests)
+                            sample_state.scheduled_requests)
                     self.micro_batches[microbatch_id] = batch_state
 
                 # Stage 2: Communicate new tokens for previous batch between ranks
@@ -740,13 +740,13 @@ class PyExecutor:
                         torch.cuda.nvtx.range_push(
                             "_handle_new_tokens_inter_pp")
                         # Receive tokens from previous pp rank (w.r.t model forward direction)
-                        self.dist.recv_tensor_list(previous_batch.decoder_state.
-                                                   new_tensors_host.values(),
-                                                   src=self.dist.prev_pp_rank,
-                                                   tag=prev_microbatch_id)
+                        self.dist.recv_tensor_list(
+                            previous_batch.sample_state.host.values(),
+                            src=self.dist.prev_pp_rank,
+                            tag=prev_microbatch_id)
                     else:
                         torch.cuda.nvtx.range_push("_handle_new_tokens_last_pp")
-                        previous_batch.decoder_state.decoder_event.synchronize()
+                        previous_batch.sample_state.sampler_event.synchronize()
 
                     # Send tokens to next pp rank (w.r.t model forward direction)
                     # Second last rank does not need to since last rank has original decoded tokens
@@ -755,8 +755,7 @@ class PyExecutor:
                             self.send_handles[prev_microbatch_id].Wait()
                         self.send_handles[
                             prev_microbatch_id] = self.dist.isend_tensor_list(
-                                previous_batch.decoder_state.new_tensors_host.
-                                values(),
+                                previous_batch.sample_state.host.values(),
                                 dest=self.dist.next_pp_rank,
                                 tag=prev_microbatch_id)
                     torch.cuda.nvtx.range_pop()
@@ -769,10 +768,10 @@ class PyExecutor:
                 finished_requests = []
                 if previous_batch is not None:
                     with torch.cuda.nvtx.range("_handle_previous_batch_pp"):
-                        self._update_requests(previous_batch.decoder_state)
+                        self._update_requests(previous_batch.sample_state)
                         self._handle_cancelled_requests()
                         finished_requests = self._handle_responses()
-                        previous_scheduled_batch = previous_batch.decoder_state.scheduled_requests
+                        previous_scheduled_batch = previous_batch.sample_state.scheduled_requests
                         self.resource_manager.update_resources(
                             previous_scheduled_batch)
                         self._remove_inflight_ids(previous_scheduled_batch)
@@ -860,8 +859,8 @@ class PyExecutor:
 
                     batch_outputs = self._forward_step(scheduled_batch)
 
-                    decoder_state = self._decode_async(scheduled_batch,
-                                                       batch_outputs)
+                    sample_state = self._sample_async(scheduled_batch,
+                                                      batch_outputs)
 
                     self._update_request_states(scheduled_batch)
 
@@ -869,7 +868,7 @@ class PyExecutor:
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
 
-                    self._update_requests(decoder_state)
+                    self._update_requests(sample_state)
 
                     if self.kv_cache_transceiver:
                         # For context only req in transmission, we reset the state since decoder might have changed it
@@ -892,7 +891,7 @@ class PyExecutor:
                         'num_ctx_tokens']
                     self._process_iter_stats(
                         finished_requests, self.active_requests,
-                        BatchState(decoder_state=DecoderState(
+                        BatchState(sample_state=SampleState(
                             scheduled_requests=scheduled_batch),
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
@@ -1005,13 +1004,13 @@ class PyExecutor:
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
 
-                    previous_new_tensors_device = self.previous_batch and self.previous_batch.decoder_state.new_tensors_device
+                    previous_tensors_device = self.previous_batch and self.previous_batch.sample_state.device
 
-                    batch_outputs = self._forward_step(
-                        scheduled_batch, previous_new_tensors_device)
+                    batch_outputs = self._forward_step(scheduled_batch,
+                                                       previous_tensors_device)
 
-                    decoder_state = self._decode_async(scheduled_batch,
-                                                       batch_outputs)
+                    sample_state = self._sample_async(scheduled_batch,
+                                                      batch_outputs)
 
                     self._update_request_states(scheduled_batch)
 
@@ -1024,7 +1023,9 @@ class PyExecutor:
 
                     has_previous_batch = self.previous_batch is not None
                     if has_previous_batch:
-                        self._process_previous_batch()
+                        previous_batch_size = self.previous_batch.sample_state.scheduled_requests.batch_size
+                        if previous_batch_size > 0:  # first previous batch size is 0
+                            self._process_previous_batch()
                         self.previous_batch: Optional[BatchState] = None
 
                     # Separate chunked requests so we can handle them in _update_requests w/o relying on the request state.
@@ -1043,7 +1044,7 @@ class PyExecutor:
                             'num_ctx_tokens']
 
                     self.previous_batch = BatchState(
-                        decoder_state=decoder_state,
+                        sample_state=sample_state,
                         iter_start_time=iter_start_time,
                         iter_stats=iter_stats,
                         ctx_transmission_reqs=ctx_transmission_reqs)
@@ -1055,7 +1056,7 @@ class PyExecutor:
         self._executor_loop_cleanup()
 
     def _process_previous_batch(self):
-        self._update_requests(self.previous_batch.decoder_state)
+        self._update_requests(self.previous_batch.sample_state)
 
         if self.kv_cache_transceiver and self.previous_batch.ctx_transmission_reqs:
             for req in self.previous_batch.ctx_transmission_reqs:
@@ -1063,7 +1064,7 @@ class PyExecutor:
 
         self._handle_cancelled_requests()
         finished_requests = self._handle_responses()
-        scheduled_requests = self.previous_batch.decoder_state.scheduled_requests
+        scheduled_requests = self.previous_batch.sample_state.scheduled_requests
         self.resource_manager.update_resources(scheduled_requests)
         if self.enable_kv_cache_events:
             self._add_kv_cache_events()
@@ -1073,12 +1074,12 @@ class PyExecutor:
                                      self.previous_batch)
 
     @nvtx_range("_forward_step_inter_pp")
-    def _forward_step_inter_pp(self, scheduled_batch) -> DecoderState:
+    def _forward_step_inter_pp(self, scheduled_batch) -> SampleState:
         batch_outputs = self._forward_step(scheduled_batch)
-        decoder_state = self._decode_async(scheduled_batch, batch_outputs)
+        sample_state = self._sample_async(scheduled_batch, batch_outputs)
         self._update_request_states(scheduled_batch)
-        decoder_state.decoder_event.synchronize()
-        return decoder_state
+        sample_state.sampler_event.synchronize()
+        return sample_state
 
     def _update_new_active_requests_queue_latency(self, new_requests):
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -1531,7 +1532,7 @@ class PyExecutor:
             if req.is_disagg_generation_transmission_complete:
                 cache_trans_complete_requests.append(req)
         if len(cache_trans_complete_requests) > 0:
-            self._setup_decoder_step(cache_trans_complete_requests)
+            self._setup_sampler_step(cache_trans_complete_requests)
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
@@ -1592,8 +1593,7 @@ class PyExecutor:
 
     def _forward_step(self,
                       scheduled_requests,
-                      new_tensors_device: Optional[Dict[str,
-                                                        torch.Tensor]] = None):
+                      new_tensors_device: Optional[SampleStateTensors] = None):
 
         @nvtx_range(
             f"[Executor] _forward_step: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
@@ -1645,35 +1645,36 @@ class PyExecutor:
         else:
             self._update_request_states_tp(scheduled_requests)
 
-    @nvtx_range("_decode_async")
-    def _decode_async(self, scheduled_batch, batch_outputs) -> DecoderState:
+    @nvtx_range("_sample_async")
+    def _sample_async(self, scheduled_batch,
+                      batch_outputs) -> SampleState | None:
         try:
             if batch_outputs is not None:
-                return self.decoder.decode_async(scheduled_batch, batch_outputs)
+                return self.sampler.sample_async(scheduled_batch, batch_outputs)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
-            logger.error(f"Encountered an error in decode: {error_msg}")
+            logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
-    @nvtx_range("_setup_decoder_step")
-    def _setup_decoder_step(self, requests):
+    @nvtx_range("_setup_sampler_step")
+    def _setup_sampler_step(self, requests):
         try:
-            return self.decoder.setup_decoder_step(requests)
+            return self.sampler.setup_sampler_step(requests)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
-            logger.error(f"Encountered an error in decode: {error_msg}")
+            logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
     @nvtx_range("_update_requests")
-    def _update_requests(self, decoder_state: DecoderState):
+    def _update_requests(self, sample_state: SampleState):
         try:
-            self.decoder.update_requests(decoder_state)
+            self.sampler.update_requests(sample_state)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
-            logger.error(f"Encountered an error in decode: {error_msg}")
+            logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
     @nvtx_range("_prepare_draft_batch")
@@ -1802,11 +1803,11 @@ class PyExecutor:
             if spec_metadata.spec_dec_mode.is_eagle3():
                 outputs['d2t'] = self.draft_model_engine.model.model.d2t.data
 
-            decoder_state = self._decode_async(draft_batch, outputs)
+            sample_state = self._sample_async(draft_batch, outputs)
 
             self._update_request_states(draft_batch)
 
-            self._update_requests(decoder_state)
+            self._update_requests(sample_state)
 
             def _process_decoded_tokens():
                 new_requests = []
@@ -1854,9 +1855,9 @@ class PyExecutor:
                 if spec_metadata.spec_dec_mode.is_eagle3():
                     outputs[
                         'd2t'] = self.draft_model_engine.model.model.d2t.data
-                decoder_state = self._decode_async(draft_batch, outputs)
+                sample_state = self._sample_async(draft_batch, outputs)
                 self._update_request_states(draft_batch)
-                self._update_requests(decoder_state)
+                self._update_requests(sample_state)
 
                 new_requests = _process_decoded_tokens()
                 if not new_requests:
@@ -1898,7 +1899,7 @@ class PyExecutor:
 
         cancelled_responses = {}
         left_requests = []
-        # Tracks canceled requests for proper handling in overlap mode during `decoder.update_requests`.
+        # Tracks canceled requests for proper handling in overlap mode during `sampler.update_requests`.
         self.canceled_requests = []
         for request in self.active_requests:
             req_id = request.py_request_id
