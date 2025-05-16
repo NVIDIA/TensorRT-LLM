@@ -50,7 +50,6 @@ from collections import defaultdict
 from typing import Any, DefaultDict, Dict, List, Optional, Sequence
 
 import torch
-from torch._inductor.pattern_matcher import Match, PatternMatcherPass
 from torch.fx import GraphModule, Node
 
 from ...utils.logger import ad_logger
@@ -61,7 +60,7 @@ from ...utils.node_utils import (
     identify_regions_between_residuals,
     is_op,
 )
-from ...utils.pattern_matcher_utils import register_pattern
+from ...utils.pattern_matcher import Match, PatternMatcherPass, register_pattern
 from .._graph import canonicalize_graph
 
 
@@ -80,7 +79,9 @@ def _explicit_rope_pattern(q, k, cos, sin, unsqueeze_dim=1):
 
 
 def _explicit_rope_repl(q, k, cos, sin, unsqueeze_dim):
-    return torch.ops.rope.torch_apply_rope_with_explicit_cos_sin(q, k, cos, sin, unsqueeze_dim)
+    return torch.ops.rope.torch_apply_rope_with_explicit_cos_sin.default(
+        q, k, cos, sin, unsqueeze_dim
+    )
 
 
 def _interleaved_rope_pattern(q, k, cos, sin, unsqueeze_dim=1):
@@ -96,7 +97,9 @@ def _interleaved_rope_pattern(q, k, cos, sin, unsqueeze_dim=1):
 
 
 def _interleaved_rope_repl(q, k, cos, sin, unsqueeze_dim):
-    return torch.ops.rope.torch_apply_rope_with_qk_interleaving(q, k, cos, sin, unsqueeze_dim)
+    return torch.ops.rope.torch_apply_rope_with_qk_interleaving.default(
+        q, k, cos, sin, unsqueeze_dim
+    )
 
 
 # exporting with {"unsqueeze_dim": 2},
@@ -111,7 +114,9 @@ def _complex_rope_pattern(xq, xk, freqs_cis, unsqueeze_dim=1):
 
 
 def _complex_rope_repl(q, k, freqs_cis, unsqueeze_dim):
-    return torch.ops.rope.torch_apply_rope_with_complex_freqs(q, k, freqs_cis, unsqueeze_dim)
+    return torch.ops.rope.torch_apply_rope_with_complex_freqs.default(
+        q, k, freqs_cis, unsqueeze_dim
+    )
 
 
 def _explicit_not_interleaved(match: Match) -> bool:
@@ -131,15 +136,15 @@ def match_rope_pattern(gm: GraphModule) -> GraphModule:
     head_dim = hidden_size // num_heads
 
     dummy_explicit = [
-        torch.randn(batch_size, num_heads, seq_len, head_dim, device="cuda", dtype=torch.float16),
-        torch.randn(batch_size, num_heads, seq_len, head_dim, device="cuda", dtype=torch.float16),
-        torch.randn(batch_size, seq_len, head_dim, device="cuda", dtype=torch.float16),
-        torch.randn(batch_size, seq_len, head_dim, device="cuda", dtype=torch.float16),
+        torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16),
+        torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16),
+        torch.randn(batch_size, seq_len, head_dim, device="meta", dtype=torch.float16),
+        torch.randn(batch_size, seq_len, head_dim, device="meta", dtype=torch.float16),
     ]
     dummy_complex = [
-        torch.randn(batch_size, num_heads, seq_len, head_dim, device="cuda", dtype=torch.float16),
-        torch.randn(batch_size, num_heads, seq_len, head_dim, device="cuda", dtype=torch.float16),
-        torch.randn(batch_size, seq_len, head_dim // 2, device="cuda", dtype=torch.float16),
+        torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16),
+        torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16),
+        torch.randn(batch_size, seq_len, head_dim // 2, device="meta", dtype=torch.float16),
     ]
     register_pattern(
         search_fn=_explicit_rope_pattern,
@@ -167,13 +172,15 @@ def match_rope_pattern(gm: GraphModule) -> GraphModule:
         replace_fn=_complex_rope_repl,
         patterns=patterns,
         dummy_args=dummy_complex,
-        op_ignore_types={torch.ops.aten.reshape.default: (int,)},
+        op_ignore_types={
+            torch.ops.aten.reshape.default: (int,),
+        },
         scalar_workaround={"unsqueeze_dim": 1},
     )
 
-    patterns.apply(graph)
+    num_matches = patterns.apply(graph)
     gm = canonicalize_graph(gm)
-    return gm
+    return gm, num_matches
 
 
 def match_explicit_rope(gm: GraphModule) -> GraphModule:

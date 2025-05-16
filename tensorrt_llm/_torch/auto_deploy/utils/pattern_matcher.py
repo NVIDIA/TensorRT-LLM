@@ -9,7 +9,7 @@ import itertools
 import operator
 import re
 from collections.abc import Mapping, Sequence
-from typing import Any, Callable, Iterable, List, NoReturn, Optional, Union
+from typing import Any, Callable, Iterable, NoReturn, Optional, Union
 
 import torch
 import torch.fx
@@ -64,46 +64,65 @@ def register_pattern(
     search_fn: Callable,
     replace_fn: Callable,
     patterns: PatternMatcherPass,
-    dummy_args: List[torch.Tensor],
+    dummy_args: Iterable[Any],
     trace_fn: Callable[[Callable, Sequence[torch.Tensor]], GraphModule] = trace_to_gm,
-    example_inputs: Iterable[Any] = [None],
-    exclusive_arg_names: Sequence[str] = (),
-    scalar_workaround: Optional[Any] = None,
+    # optional args input to our variants of `fx_to_pattern`
+    ignore_types: Sequence[type[Any]] = (),
     op_ignore_types: Optional[Mapping[Callable[..., Any], Sequence[type[Any]]]] = None,
+    scalar_workaround: Optional[Any] = None,
+    exclusive_arg_names: Sequence[str] = (),
+    # optional args input to torch._inductor's register_replacement
     extra_check: Callable[[Match], bool] = _return_true,
+    skip_duplicates: bool = False,
 ) -> None:
     """
     Tracing a Python-level pattern into a GraphModule and registering its replacement.
-
-    The inductor matcher treats tensor-shaped arguments and numeric (literal) arguments differently:
-
-    Note:
-    1. Numeric (integer/float) args will be lifted as hard-coded literals in the FX graph,
-        utilize `scalar_workaround` to detect those literals and replace with args in the pattern
-    2. register_replacement can auto-generate `search_fn_pattern` if you omit it,
-        but that approach will fail when symbolic shapes are involved. Here
-        we explicitly trace & convert via `fx_to_pattern`.
 
     Args:
         search_fn:          Function defining the “before” pattern (traced for matching).
         replace_fn:         Function or op defining the “after” replacement.
         patterns:           PatternMatcherPass instance (passed to register_replacement).
-        example_inputs:     Example inputs for register_replacement's initial trace.
         dummy_args:         Inputs matching search_fn's signature used to generate
                             the FX pattern (must reflect any real dims materialized
                             as aten-op literals).
         trace_fn:           Callable to export Python functions/modules into FX (e.g.
                             torch_export_to_gm).
-        exclusive_arg_names:
-                            Parameter names to ignore when matching.
+        ignore_types:       Literal value types to ignore when converting an FX graph to a pattern.
+        op_ignore_types:    Per-operator mapping of argument types to ignore during pattern matching.
         scalar_workaround:  Optional dict or value to workaround FX scalar lifting bugs.
-        op_ignore_types:    Ignore certain types of arg for certain op type
+
+        exclusive_arg_names:Names of pattern inputs that must match exactly (not treated as ignored).
+        extra_check:        Additional run on each `Match` to decide if it should be replaced.
+        skip_duplicates:    If True, don't re-register a pattern that's already been seen.
+
+    Note:
+    1. Tensor arguments—both the inputs you pass into the pattern and any tensor args inside its ops
+    are matched purely by their place in the graph; their shape, device, and dtype are not validated.
+    2. Your `dummy_args` may use any shape, device, or dtype so long as they successfully trace
+        the pattern and do not alter the resulting FX graph.
+    3. However, `dummy_args` *can* accidentally bake in layout or type information.
+    To guard against this:
+       a. If a shape value ends up as a literal in calls like `aten.view`, `aten.slice`,
+       or `aten.reshape`, add those ops to `op_ignore_types` so their int args are ignored.
+       b. If your pattern does explicit `to(device=…)` or `to(dtype=…)` calls,
+       consider skipping those args in `op_ignore_types` too
+       c. If your pattern includes `aten.to.device` or `aten.to.dtype`,
+       FX may automatically drop that node when the dummy's device/dtype already matches the target
+       altering your graph topology. Consider registering a separate pattern to handle this case.
+    4. Numeric (integer/float) args input to the pattern will be lifted as hard-coded literals
+        in the FX graph, utilize `scalar_workaround` to detect those literals and
+        replace with args in the pattern
+    5. register_replacement can auto-generate `search_fn_pattern` if you input `example_inputs`,
+        but that approach will fail when symbolic shapes are involved. Here
+        we explicitly trace & convert via `fx_to_pattern`.
+
     """
     argnames = list(inspect.signature(search_fn).parameters.keys())
     specific_gm = trace_fn(search_fn, dummy_args)
     pattern = fx_to_pattern_with_op_ignore(
         specific_gm,
         argnames=argnames,
+        ignore_types=ignore_types,
         op_ignore_types=op_ignore_types,
         exclusive_arg_names=exclusive_arg_names,
         scalar_workaround=scalar_workaround,
@@ -112,11 +131,12 @@ def register_pattern(
     register_replacement(
         search_fn=search_fn,
         replace_fn=replace_fn,
-        example_inputs=example_inputs,
+        example_inputs=[None],
         trace_fn=trace_fn,
         pass_dicts=patterns,
         search_fn_pattern=pattern,
         extra_check=extra_check,
+        skip_duplicates=skip_duplicates,
     )
 
 

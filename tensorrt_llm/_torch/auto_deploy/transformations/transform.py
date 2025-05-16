@@ -123,7 +123,7 @@ class InferenceOptimizer:
         # TODO: remove `match_explicit_rope` and `match_explicit_rope` once Llama4 RoPE and DeepSeek RoPE are verified
         # egm = match_explicit_rope(egm)
         # egm = match_complex_rope(egm)
-        egm = match_rope_pattern(egm)
+        egm, _ = match_rope_pattern(egm)
 
         # Match RoPE layout expected by our backend
         egm = match_rope_layout(egm, self.attention_op.get_attention_layout())

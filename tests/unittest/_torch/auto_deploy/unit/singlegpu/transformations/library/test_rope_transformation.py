@@ -256,7 +256,7 @@ def test_rope_variants(
         def checker(gm):
             return any(is_op(n, torch.ops.rope.flashinfer) for n in gm.graph.nodes)
 
-    if target_layout:
+    if transformation == "match_layout":
         _ = run_test(
             model,
             x,
@@ -268,7 +268,22 @@ def test_rope_variants(
             True,  # test_load_hook
             True,  # strict_loading
             dyn,  # dynamic_shapes
+            None,  # check_num_matches
             target_layout,
+        )
+    elif transformation == "match":
+        _ = run_test(
+            model,
+            x,
+            fn,
+            checker,
+            lambda n: n,
+            atol,  # atol
+            rtol,  # rtol
+            True,  # test_load_hook
+            True,  # strict_loading
+            dyn,  # dynamic_shapes
+            1,  # check_num_matches
         )
     else:
         _ = run_test(
@@ -282,6 +297,7 @@ def test_rope_variants(
             True,  # test_load_hook
             True,  # strict_loading
             dyn,  # dynamic_shapes
+            None,  # check_num_matches
         )
 
 
@@ -399,7 +415,7 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode, target
 
             return matched if layout != target_layout else not matched
 
-    if target_layout:
+    if mode == "match_layout":
         _ = run_test(
             model,
             x,
@@ -411,6 +427,7 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode, target
             True,  # test_load_hook
             True,  # strict_loading
             dynamic_shapes,  # dynamic_shapes
+            None,  # check_num_matches
             target_layout,
         )
     else:
@@ -425,4 +442,5 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode, target
             True,  # test_load_hook
             True,  # strict_loading
             dynamic_shapes,  # dynamic_shapes
+            1,  # check_num_matches
         )
