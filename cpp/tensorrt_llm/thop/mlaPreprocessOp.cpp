@@ -33,20 +33,22 @@ namespace
 {
 
 template <typename T>
-void loadPagedKVCacheForMLAHelper(torch::Tensor& output, KVBlockArray& kv_cache, int const num_contexts,
-    torch::Tensor const& cu_ctx_cached_kv_lens, int const max_input_seq_len, int head_dim)
+void loadPagedKVCacheForMLAHelper(torch::Tensor& compressed_kv, torch::Tensor& k_pe, KVBlockArray& kv_cache,
+    int const num_contexts, torch::Tensor const& cu_ctx_cached_kv_lens, int const max_input_seq_len,
+    int const lora_size, int const rope_size)
 {
-    auto stream = at::cuda::getCurrentCUDAStream(output.get_device());
+    auto stream = at::cuda::getCurrentCUDAStream(compressed_kv.get_device());
 
-    T* output_ptr = static_cast<T*>(output.data_ptr());
-    tensorrt_llm::kernels::invokeMLALoadPagedKV<T>(output_ptr, kv_cache, num_contexts,
-        cu_ctx_cached_kv_lens.data_ptr<int64_t>(), max_input_seq_len, head_dim, stream);
+    T* compressed_kv_ptr = static_cast<T*>(compressed_kv.data_ptr());
+    T* k_pe_ptr = static_cast<T*>(k_pe.data_ptr());
+    tensorrt_llm::kernels::invokeMLALoadPagedKV<T>(compressed_kv_ptr, k_pe_ptr, kv_cache, num_contexts,
+        cu_ctx_cached_kv_lens.data_ptr<int64_t>(), max_input_seq_len, lora_size, rope_size, stream);
 }
 
 template <typename T>
 void setPagedKVCacheForMLAHelper(torch::Tensor& output, torch::Tensor const& k, torch::Tensor const& v,
     torch::Tensor const& k_pe, int const num_requests, torch::Tensor const& cu_seq_lens, int const max_input_seq_len,
-    int num_heads, int kv_dim, int rope_dim, int kv_cache_tokens_per_block)
+    int num_heads, int kv_dim, int rope_dim, int kv_cache_tokens_per_block, int64_t kv_token_stride)
 {
     auto stream = at::cuda::getCurrentCUDAStream(output.get_device());
     T* output_ptr = static_cast<T*>(output.data_ptr());
@@ -56,7 +58,7 @@ void setPagedKVCacheForMLAHelper(torch::Tensor& output, torch::Tensor const& k, 
     auto* cu_seq_lens_ptr = cu_seq_lens.data_ptr<int64_t>();
 
     tensorrt_llm::kernels::invokeMLASetPagedKV<T>(output_ptr, k_ptr, v_ptr, k_pe_ptr, num_requests, cu_seq_lens_ptr,
-        max_input_seq_len, num_heads, kv_dim, rope_dim, kv_cache_tokens_per_block, stream);
+        max_input_seq_len, num_heads, kv_dim, rope_dim, kv_cache_tokens_per_block, kv_token_stride, stream);
 }
 
 template <typename T>
@@ -153,12 +155,12 @@ KVBlockArray createKVBlockArray(int num_contexts, int max_blocks_per_sequence, i
 
 } // namespace
 
-torch::Tensor loadPagedKVCacheForMLA(torch::ScalarType out_dtype, int64_t const num_contexts,
+std::vector<torch::Tensor> loadPagedKVCacheForMLA(torch::ScalarType out_dtype, int64_t const num_contexts,
     int64_t const max_ctx_cached_kv_len, torch::Tensor& cu_ctx_cached_kv_lens,
     torch::Tensor const& kv_cache_block_offsets, torch::Tensor const& host_kv_cache_block_offsets,
     torch::Tensor const& host_kv_cache_pool_pointers, torch::Tensor const& host_kv_cache_pool_mapping,
     torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
-    int64_t const layer_idx, int64_t const head_size, int64_t const tokens_per_block,
+    int64_t const layer_idx, int64_t const lora_size, int64_t const rope_size, int64_t const tokens_per_block,
     int64_t const attention_window_size, int64_t const sink_token_length, int64_t const beam_width,
     int64_t const quant_mode)
 {
@@ -172,6 +174,7 @@ torch::Tensor loadPagedKVCacheForMLA(torch::ScalarType out_dtype, int64_t const 
 
     auto kv_cache_quant_mode = tc::QuantMode(static_cast<uint32_t>(quant_mode));
     int max_blocks_per_sequence = kv_cache_block_offsets.size(-1);
+    int head_size = lora_size + rope_size;
     KVBlockArray kv_cache_buffer
         = createKVBlockArray(num_contexts, max_blocks_per_sequence, tokens_per_block, head_size,
             1, // num_kv_heads is always 1 for MLA
@@ -192,26 +195,31 @@ torch::Tensor loadPagedKVCacheForMLA(torch::ScalarType out_dtype, int64_t const 
 
     auto const num_ctx_cached_tokens = cu_ctx_cached_kv_lens.index({num_contexts}).item<int64_t>();
     TORCH_CHECK(num_ctx_cached_tokens > 0);
-    auto output = torch::empty(
-        {num_ctx_cached_tokens, 1 * head_size}, torch::dtype(out_dtype).device(torch::kCUDA).requires_grad(false));
+    std::vector<torch::Tensor> outputs;
+    // compressed_kv {num_ctx_cached_tokens, lora_size}
+    outputs.push_back(torch::empty(
+        {num_ctx_cached_tokens, lora_size}, torch::dtype(out_dtype).device(torch::kCUDA).requires_grad(false)));
+    // k_pe {num_ctx_cached_tokens, rope_size}
+    outputs.push_back(torch::empty(
+        {num_ctx_cached_tokens, rope_size}, torch::dtype(out_dtype).device(torch::kCUDA).requires_grad(false)));
 
     if (out_dtype == torch::kFloat16)
     {
-        loadPagedKVCacheForMLAHelper<half>(
-            output, kv_cache_buffer, num_contexts, cu_ctx_cached_kv_lens, max_ctx_cached_kv_len, head_size);
+        loadPagedKVCacheForMLAHelper<half>(outputs[0], outputs[1], kv_cache_buffer, num_contexts, cu_ctx_cached_kv_lens,
+            max_ctx_cached_kv_len, lora_size, rope_size);
     }
     else if (out_dtype == torch::kFloat32)
     {
-        loadPagedKVCacheForMLAHelper<float>(
-            output, kv_cache_buffer, num_contexts, cu_ctx_cached_kv_lens, max_ctx_cached_kv_len, head_size);
+        loadPagedKVCacheForMLAHelper<float>(outputs[0], outputs[1], kv_cache_buffer, num_contexts,
+            cu_ctx_cached_kv_lens, max_ctx_cached_kv_len, lora_size, rope_size);
     }
     else if (out_dtype == torch::kBFloat16)
     {
-        loadPagedKVCacheForMLAHelper<__nv_bfloat16>(
-            output, kv_cache_buffer, num_contexts, cu_ctx_cached_kv_lens, max_ctx_cached_kv_len, head_size);
+        loadPagedKVCacheForMLAHelper<__nv_bfloat16>(outputs[0], outputs[1], kv_cache_buffer, num_contexts,
+            cu_ctx_cached_kv_lens, max_ctx_cached_kv_len, lora_size, rope_size);
     }
 
-    return output;
+    return outputs;
 }
 
 torch::Tensor setPagedKVCacheForMLA(torch::Tensor& output, torch::Tensor const& k, torch::Tensor const& v,
@@ -220,31 +228,52 @@ torch::Tensor setPagedKVCacheForMLA(torch::Tensor& output, torch::Tensor const& 
     int64_t const kv_cache_tokens_per_block)
 {
     TORCH_CHECK(output.numel() > 0);
-    TORCH_CHECK(output.scalar_type() == torch::kFloat16 || output.scalar_type() == torch::kFloat32
-        || output.scalar_type() == torch::kBFloat16);
+    auto output_scalar_type = output.scalar_type();
+    TORCH_CHECK(output_scalar_type == torch::kFloat16 || output_scalar_type == torch::kFloat32
+        || output_scalar_type == torch::kBFloat16);
     CHECK_TH_CUDA(output);
     CHECK_CONTIGUOUS(output);
-    CHECK_INPUT(k, output.scalar_type());
-    CHECK_INPUT(v, output.scalar_type());
-    CHECK_INPUT(k_pe, output.scalar_type());
+
+    // k and v can be non-contiguous
+    CHECK_TH_CUDA(k);
+    CHECK_TYPE(k, output_scalar_type);
+    CHECK_TH_CUDA(v);
+    CHECK_TYPE(v, output_scalar_type);
+    TORCH_CHECK(k.dim() == 3);
+    TORCH_CHECK(v.dim() == 3);
+    TORCH_CHECK(k.size(0) == v.size(0));
+    TORCH_CHECK(k.size(1) == v.size(1));
+    TORCH_CHECK(k.size(2) == v.size(2));
+    TORCH_CHECK(k.stride(1) == k.size(2));
+    TORCH_CHECK(v.stride(1) == v.size(2));
+    TORCH_CHECK(k.stride(2) == 1);
+    TORCH_CHECK(v.stride(2) == 1);
+    // k and v should have the same token stride
+    int64_t k_token_stride = k.stride(0);
+    int64_t v_token_stride = v.stride(0);
+    TORCH_CHECK(k_token_stride == v_token_stride);
+
+    // k_pe should be contiguous
+    CHECK_INPUT(k_pe, output_scalar_type);
+
     CHECK_INPUT(cu_seq_lens, torch::kInt64);
     TORCH_CHECK(cu_seq_lens.dim() == 1);
     TORCH_CHECK(cu_seq_lens.size(0) >= num_requests + 1);
 
-    if (output.scalar_type() == torch::kFloat16)
+    if (output_scalar_type == torch::kFloat16)
     {
         setPagedKVCacheForMLAHelper<half>(output, k, v, k_pe, num_requests, cu_seq_lens, max_input_seq_len, num_heads,
-            kv_dim, rope_dim, kv_cache_tokens_per_block);
+            kv_dim, rope_dim, kv_cache_tokens_per_block, k_token_stride);
     }
-    else if (output.scalar_type() == torch::kFloat32)
+    else if (output_scalar_type == torch::kFloat32)
     {
         setPagedKVCacheForMLAHelper<float>(output, k, v, k_pe, num_requests, cu_seq_lens, max_input_seq_len, num_heads,
-            kv_dim, rope_dim, kv_cache_tokens_per_block);
+            kv_dim, rope_dim, kv_cache_tokens_per_block, k_token_stride);
     }
-    else if (output.scalar_type() == torch::kBFloat16)
+    else if (output_scalar_type == torch::kBFloat16)
     {
         setPagedKVCacheForMLAHelper<__nv_bfloat16>(output, k, v, k_pe, num_requests, cu_seq_lens, max_input_seq_len,
-            num_heads, kv_dim, rope_dim, kv_cache_tokens_per_block);
+            num_heads, kv_dim, rope_dim, kv_cache_tokens_per_block, k_token_stride);
     }
 
     int64_t max_block_num = (max_input_seq_len + kv_cache_tokens_per_block - 1) / kv_cache_tokens_per_block;
@@ -392,13 +421,14 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor? kv_scale_orig_quant"
         ", Tensor? kv_scale_quant_orig"
         ", int layer_idx"
-        ", int head_size"
+        ", int lora_size"
+        ", int rope_size"
         ", int tokens_per_block"
         ", int attention_window_size"
         ", int sink_token_length"
         ", int beam_width"
         ", int quant_mode"
-        ") -> Tensor");
+        ") -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
