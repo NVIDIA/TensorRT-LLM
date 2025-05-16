@@ -16,6 +16,9 @@
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
 #include "tests/utils/common.h"
 
+#include <cstddef>
+#include <unordered_set>
+
 namespace tr = tensorrt_llm::runtime;
 
 using namespace tensorrt_llm::testing;
@@ -486,6 +489,21 @@ TEST_P(DisaggParamsTest, DisaggTokenComparison)
     SizeType32 instanceNum = participantIdsEachInstance.size();
     ASSERT_EQ(instanceNum, instanceRoles.size());
     ASSERT_EQ(instanceNum, modelNames.size());
+
+    std::unordered_set<int> deviceIdsSet;
+    for (auto const& ids : participantDeviceIdsEachInstance)
+    {
+        for (auto const& id : ids)
+        {
+            deviceIdsSet.insert(id);
+        }
+    }
+    if (mDeviceCount < deviceIdsSet.size())
+    {
+        GTEST_SKIP() << " need " << deviceIdsSet.size() << " devices but got " << mDeviceCount
+                     << " devices, skip test.";
+    }
+
     ASSERT_GE(controllerRank, 0);
     ASSERT_LT(controllerRank, commSize);
     int ranksNum = 0;
@@ -627,19 +645,9 @@ TEST_P(DisaggParamsTest, DisaggTokenComparison)
     if (modelName == "llama_tp4_pp1_cp1" || modelName == "llama_tp1_pp4_cp1" || modelName == "llama_tp2_pp2_cp1"
         || modelName == "llama_tp1_pp2_cp1" || modelName == "llama_tp2_pp1_cp1")
     {
-        // For llama model, only run for multiple GPUs
-        // This is detected by setting an env variable when running the test
-        char const* val = getenv("RUN_LLAMA_MULTI_GPU");
-        if (val == NULL)
+        if (outConfig.returnLogProbs || outConfig.returnContextLogits || outConfig.returnGenerationLogits)
         {
-            GTEST_SKIP() << "Skipping Llama test";
-        }
-        else
-        {
-            if (outConfig.returnLogProbs || outConfig.returnContextLogits || outConfig.returnGenerationLogits)
-            {
-                GTEST_SKIP() << "Skipping logits and log probs tests for mpi runs";
-            }
+            GTEST_SKIP() << "Skipping logits and log probs tests for mpi runs";
         }
     }
 
@@ -701,13 +709,12 @@ TEST_P(DisaggOrchestratorParamsTest, DisaggTokenComparison)
     {
         GTEST_SKIP() << " need " << processNum << " processes but got " << commSize << " mpi processes, skip test.";
     }
+
     bool spawnProcess = false;
     if (commSize == 1)
     {
         spawnProcess = true;
-        int deviceCount = -1;
-        TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
-        if (deviceCount < 4)
+        if (mDeviceCount < 4)
         {
             GTEST_SKIP() << "DisaggExecutorTest requires at least 4 GPUs";
         }
@@ -718,6 +725,21 @@ TEST_P(DisaggOrchestratorParamsTest, DisaggTokenComparison)
     SizeType32 instanceNum = participantIdsEachInstance.size();
     ASSERT_EQ(instanceNum, instanceRoles.size());
     ASSERT_EQ(instanceNum, modelNames.size());
+
+    std::unordered_set<int> deviceIdsSet;
+    for (auto const& ids : participantDeviceIdsEachInstance)
+    {
+        for (auto const& id : ids)
+        {
+            deviceIdsSet.insert(id);
+        }
+    }
+    if (mDeviceCount < deviceIdsSet.size())
+    {
+        GTEST_SKIP() << " need " << deviceIdsSet.size() << " devices but got " << mDeviceCount
+                     << " devices, skip test.";
+    }
+
     ASSERT_GE(controllerRank, 0);
     ASSERT_LT(controllerRank, commSize);
     std::string modelName = modelNames[0];
@@ -835,19 +857,9 @@ TEST_P(DisaggOrchestratorParamsTest, DisaggTokenComparison)
     if (modelName == "llama_tp4_pp1" || modelName == "llama_tp1_pp4" || modelName == "llama_tp2_pp2"
         || modelName == "llama_tp1_pp2" || modelName == "llama_tp2_pp1")
     {
-        // For llama model, only run for multiple GPUs
-        // This is detected by setting an env variable when running the test
-        char const* val = getenv("RUN_LLAMA_MULTI_GPU");
-        if (val == NULL)
+        if (outConfig.returnLogProbs || outConfig.returnContextLogits || outConfig.returnGenerationLogits)
         {
-            GTEST_SKIP() << "Skipping Llama test";
-        }
-        else
-        {
-            if (outConfig.returnLogProbs || outConfig.returnContextLogits || outConfig.returnGenerationLogits)
-            {
-                GTEST_SKIP() << "Skipping logits and log probs tests for mpi runs";
-            }
+            GTEST_SKIP() << "Skipping logits and log probs tests for mpi runs";
         }
     }
 
@@ -912,6 +924,7 @@ TEST_P(ConditionalDisaggParamsTest, DisaggTokenComparison)
         setenv("UCX_TLS", "^cuda_ipc", 1); // disable cuda_ipc for testing for mpi
     }
     auto constexpr processNum = 2;
+    auto constexpr deviceNum = 2;
     auto const& modelName = std::get<0>(GetParam());
     auto constexpr controllerRank = 0;
 
@@ -922,6 +935,10 @@ TEST_P(ConditionalDisaggParamsTest, DisaggTokenComparison)
     if (commSize != processNum)
     {
         GTEST_SKIP() << " need " << processNum << " processes but got " << commSize << " mpi processes, skip test.";
+    }
+    if (mDeviceCount < deviceNum)
+    {
+        GTEST_SKIP() << " need " << deviceNum << " devices but got " << mDeviceCount << " devices, skip test.";
     }
 
     bool isContext = commRank == 0;
