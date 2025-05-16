@@ -84,7 +84,7 @@ class InferenceOptimizer:
         # EXPORT MODEL TO GRAPH MODULE
         ############################################################################################
 
-        cm.info._set_example_sequence()
+        cm.info.set_example_sequence()
         egm = torch_export_to_gm(model, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
         del model
         ad_logger.debug("original graph: " + str(egm))
@@ -179,7 +179,7 @@ class InferenceOptimizer:
                 pass
 
         ############################################################################################
-        # HANDLE CACHES
+        # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
         ############################################################################################
 
         egm = update_in_out_nodes(egm, cm)
@@ -199,7 +199,7 @@ class InferenceOptimizer:
         # COMPILE MODEL
         ############################################################################################
 
-        cm.info._set_generate_only_batch()
+        cm.info.set_generate_only_batch()
         compiler_kwargs = {
             "cuda_graph_batch_sizes": self.ad_config.cuda_graph_batch_sizes,
             "num_batched_inputs": 2,  # TODO (lucaslie): improve once we have a config system...
