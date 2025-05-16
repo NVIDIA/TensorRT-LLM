@@ -2,8 +2,7 @@ import contextlib
 import math
 import time
 from dataclasses import dataclass
-from typing import (ClassVar, Dict, Generic, List, Optional, Tuple, Type,
-                    TypeVar, Union)
+from typing import Dict, Generic, List, Optional, Tuple, Type, TypeVar, Union
 
 import torch
 from torch import nn
@@ -18,15 +17,14 @@ from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantConfig
 from ..attention_backend import AttentionMetadata
+from ..distributed.communicator import pp_recv, pp_send
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
-from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding, LMHead
 from ..modules.fused_moe import FusedMoE
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
-from ..pipeline_interface import PipelineInterface
 from ..speculative import SpecMetadata
 
 
@@ -119,109 +117,100 @@ def duplicate_kv_weight(weight: torch.Tensor, head_dim: int,
     return weight.reshape(num_kv_heads * reps * head_dim, -1).clone().detach()
 
 
-def unpack_hidden_states(hidden_states):
-    if isinstance(hidden_states, (tuple, list)):
-        return hidden_states
-    else:
-        return hidden_states, None
-
-
-def create_pipeline_interface_factory(keys: List[str], hidden_size: int,
-                                      dtype: torch.dtype):
-
-    def create_pipeline_interface(num_input_ids: torch.int):
-        tensors = {
-            key:
-            # ones to avoid NaNs for DS, that cause hang in cuda graphs
-            torch.ones((num_input_ids, hidden_size),
-                       dtype=dtype,
-                       device=torch.cuda.current_device())
-            for key in keys
-        }
-        return PipelineInterface(**tensors)
-
-    return create_pipeline_interface
-
-
-class MissingLayer(torch.nn.Identity):
-    """Signature of missing layers in pipeline parallel setup."""
-
-    def __init__(self):
-        super().__init__()
-
-
-class MissingDecoderLayer(MissingLayer, DecoderLayer):
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor] = ...,
-        **kwargs,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if residual is ...:
-            return hidden_states
+def iter_modules(
+    module: nn.Module,
+    ignore_modules: Optional[List[nn.Module]] = None,
+):
+    """Iterate over all modules of a module."""
+    ignore_modules = ignore_modules or []
+    ignore_names = []
+    for name, mod in module.named_modules():
+        if mod in ignore_modules:
+            ignore_names.append(name)
+        elif any(name.startswith(ignore_name) for ignore_name in ignore_names):
+            continue
         else:
-            return hidden_states, residual
-
-    def is_missing(self) -> bool:
-        return True
+            yield mod
 
 
-def build_pipeline_layers(layer_list,
-                          num_hidden_layers,
-                          layer_fn,
-                          missing_layer_fn=MissingDecoderLayer):
-    layer_offset = layer_list[0]
-    layers = [
-        layer_fn(layer_idx - layer_offset)  # local layer idx to attn_backend
-        if layer_idx in layer_list else missing_layer_fn()
-        for layer_idx in range(num_hidden_layers)
-    ]
-    return nn.ModuleList(layers)
+def remove_weights(
+    module: nn.Module,
+    ignore_modules: Optional[List[nn.Module]] = None,
+):
+    """Remove weights and buffers of a module."""
+    for mod in iter_modules(module, ignore_modules):
+        mod._parameters.clear()
+        mod._buffers.clear()
 
 
-def missing_layer_parameter(name: str, model: torch.nn.Module) -> bool:
-    """ Check if a layer parameter is missing if when pp is enabled.
-        A layer parameter is missing if either:
-            1. The model itself is a MissingLayer, or
-            2. It has a submodule that is a MissingLayer.
-    """
-    if isinstance(model, MissingLayer):
-        return True
-
-    return any(
-        name.startswith(missing_layer_name)
-        for missing_layer_name in _get_missing_layer_names(model))
+def skip_forward(
+    module: nn.Module,
+    ignore_modules: Optional[List[nn.Module]] = None,
+):
+    """Skip forward of a module."""
+    if hasattr(module, 'skip_forward'):
+        module.forward = module.skip_forward
+        remove_weights(module, ignore_modules)
 
 
-# Static cache to store missing layer names for each model instance
-_model_to_missing_layer_names: Dict[int, List[str]] = {}
+def forward_after_recv(forward_fn):
+
+    def forward_after_recv_fn(
+        position_ids,
+        hidden_states,
+        attn_metadata,
+        residual=...,
+        **kwargs,
+    ):
+        pp_recv(hidden_states)
+        if residual is not ...:
+            if residual is None:
+                residual = torch.empty_like(hidden_states)
+            pp_recv(residual)
+        return forward_fn(
+            position_ids,
+            hidden_states,
+            attn_metadata,
+            residual=residual,
+            **kwargs,
+        )
+
+    return forward_after_recv_fn
 
 
-def _get_missing_layer_names(model: torch.nn.Module) -> List[str]:
-    """ Get the missing layer names of a given model when pp is enabled.
-    """
-    model_id = id(model)
-    if model_id in _model_to_missing_layer_names:
-        return _model_to_missing_layer_names[model_id]
+def forward_before_send(forward_fn):
 
-    missing_layer_names = []
-    for name, module in model.named_modules():
-        if isinstance(module, MissingLayer):
-            # Add trailing dot to ensure exact prefix matching
-            missing_layer_names.append(name + '.')
+    def forward_before_send_fn(
+        position_ids,
+        hidden_states,
+        attn_metadata,
+        residual=...,
+        **kwargs,
+    ):
+        output = forward_fn(
+            position_ids,
+            hidden_states,
+            attn_metadata,
+            residual=residual,
+            **kwargs,
+        )
+        if residual is not ...:
+            hidden_states, residual = output
+            pp_send(hidden_states)
+            pp_send(residual)
+        else:
+            hidden_states = output
+            pp_send(hidden_states)
+        return output
 
-    # Cache the result
-    _model_to_missing_layer_names[model_id] = missing_layer_names
-    return missing_layer_names
+    return forward_before_send_fn
 
 
 class PPInitCaller(type):
 
     def __call__(cls, *args, **kwargs):
         obj = type.__call__(cls, *args, **kwargs)
-        if getattr(obj, '_supports_pp', False):
-            obj.__pp_init__()
+        obj.__pp_init__()
         return obj
 
 
@@ -230,12 +219,13 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
     embed_tokens: Embedding
     layers: nn.ModuleList
     norm: RMSNorm
-    _supports_pp: ClassVar[bool] = False  # Whether the model supports PP
 
     def __init__(self, model_config: ModelConfig):
         super().__init__()
         self.dtype = model_config.pretrained_config.torch_dtype
         self.model_config = model_config
+        self.prologue = []
+        self.epilogue = []
 
     def forward(
         self,
@@ -269,45 +259,54 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         return hidden_states
 
     def __pp_init__(self):
-        self.pp_rank = self.model_config.mapping.pp_rank
-        self.pp_size = self.model_config.mapping.pp_size
-        if self.pp_size == 1:
+        mapping = self.model_config.mapping
+        if not mapping.has_pp():
             return
 
-        config = self.model_config.pretrained_config
-        # override embed_tokens and norm w.r.t pp rank
-        if self.pp_rank != 0:
-            self.embed_tokens = MissingLayer()
-        if self.pp_rank != self.pp_size - 1:
-            self.norm = MissingLayer()
+        if not hasattr(self, "layers"):
+            logger.warning(
+                f"Disable pipeline parallelism since {self.__class__.__name__} does not have `layers`."
+            )
+            return
 
-        # rebuild layers with pipeline parallel support
-        num_hidden_layers = len(self.layers)
-        self.pp_layer_list = self.model_config.mapping.pp_layers(
-            num_hidden_layers)
-        decoder_layer_cls = self.layers[0].__class__
-        if hasattr(self, 'aux_stream_dict'):  # DeepseekV3
-            layer_fn = lambda layer_idx: decoder_layer_cls(
-                self.model_config, layer_idx, self.aux_stream_dict)
-        else:
-            layer_fn = lambda layer_idx: decoder_layer_cls(
-                self.model_config, layer_idx)
-        self.layers = build_pipeline_layers(self.pp_layer_list,
-                                            num_hidden_layers, layer_fn)
-        self._local_layers = [
-            layer for layer in self.layers[:config.num_hidden_layers]
-            if not layer.is_missing()
-        ]
+        if hasattr(self, "embed_tokens"):
+            self.prologue.append(self.embed_tokens)
+        if hasattr(self, "norm"):
+            self.epilogue.append(self.norm)
 
-        # add create_pipeline_interface method
-        pp_interface_keys = ["hidden_states", "residual"]
-        self.create_pipeline_interface = create_pipeline_interface_factory(
-            pp_interface_keys, config.hidden_size, config.torch_dtype)
+        if not mapping.is_first_pp_rank():
+            for module in self.prologue:
+                skip_forward(module)
+        if not mapping.is_last_pp_rank():
+            for module in self.epilogue:
+                skip_forward(module)
 
-    def local_layers(self) -> List[DecoderLayer]:
-        return (
-            self._local_layers if hasattr(self, "_local_layers") else
-            self.layers[:self.model_config.pretrained_config.num_hidden_layers])
+        num_hidden_layers = self.model_config.pretrained_config.num_hidden_layers
+        assert num_hidden_layers >= mapping.pp_size, f"{num_hidden_layers} layers are not enough for PP{mapping.pp_size}"
+        pp_layer_list = mapping.pp_layers(num_hidden_layers)
+        has_pp_layer = len(pp_layer_list) > 0
+        for layer_idx in range(num_hidden_layers):
+            layer = self.layers[layer_idx]
+            is_last_layer = (layer_idx == num_hidden_layers - 1)
+            if layer_idx not in pp_layer_list:
+                # keep next layer's input_layernorm's weights for fusion
+                is_next_pp_layer = (has_pp_layer
+                                    and layer_idx - 1 == pp_layer_list[-1])
+                keep_input_layernorm = (is_next_pp_layer
+                                        and hasattr(layer, "input_layernorm"))
+                skip_forward(
+                    layer,
+                    ignore_modules=[layer.input_layernorm]
+                    if keep_input_layernorm else None,
+                )
+            is_first_pp_layer = (not has_pp_layer and is_last_layer) or (
+                has_pp_layer and layer_idx == pp_layer_list[0])
+            if is_first_pp_layer and not mapping.is_first_pp_rank():
+                layer.forward = forward_after_recv(layer.forward)
+            is_last_pp_layer = (not has_pp_layer and is_last_layer) or (
+                has_pp_layer and layer_idx == pp_layer_list[-1])
+            if is_last_pp_layer and not mapping.is_last_pp_rank():
+                layer.forward = forward_before_send(layer.forward)
 
 
 class PostInitCaller(type):
@@ -315,6 +314,13 @@ class PostInitCaller(type):
     def __call__(cls, *args, **kwargs):
         obj = type.__call__(cls, *args, **kwargs)
         obj.__post_init__()
+        # We create weights in __init__ and __post_init__
+        # and remove unneeded weights in __pp_init__.
+        # We use MetaInitMode to skip memory allocation when creating weights,
+        # which avoids OOM when GPU memory is not enough for all weights.
+        # The memory allocation is delayed until __pp_init__ is finished,
+        # so only needed weights are allocated and loaded.
+        obj.__pp_init__()
         return obj
 
 
@@ -332,74 +338,78 @@ class DecoderModelForCausalLM(nn.Module,
         self.model = model
         self.pp_rank = config.mapping.pp_rank
         self.pp_size = config.mapping.pp_size
-        # Check PP support during initialization
-        self._supports_pp = getattr(self.model, '_supports_pp', False)
-        if self.pp_size > 1 and not self._supports_pp:
-            raise ValueError(
-                f"Model {type(self.model).__name__} has not enabled "
-                "pipeline parallel support yet.")
 
-        if self.pp_size > 1 and self.pp_rank != self.pp_size - 1:
-            self.lm_head = MissingLayer()
-            self.logits_processor = MissingLayer()
+        if config.mapping.enable_attention_dp:
+            self.lm_head = LMHead(
+                vocab_size,
+                hidden_size,
+                dtype=config.pretrained_config.torch_dtype,
+                mapping=Mapping(
+                    world_size=1,
+                    tp_size=1,
+                    rank=0,
+                ),
+                tensor_parallel_mode=None,
+                gather_output=False,
+            )
         else:
-            if config.mapping.enable_attention_dp:
-                self.lm_head = LMHead(
-                    vocab_size,
-                    hidden_size,
-                    dtype=config.pretrained_config.torch_dtype,
-                    mapping=Mapping(
-                        world_size=1,
-                        tp_size=1,
-                        rank=0,
-                    ),
-                    tensor_parallel_mode=None,
-                    gather_output=False,
-                )
-            else:
-                # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
-                # will considering per layer QuantConfig in the future.
+            # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
+            # will considering per layer QuantConfig in the future.
 
-                if hasattr(config, 'lora_config'
-                           ) and config.lora_config is not None and len(
-                               config.lora_config.lora_dir) == 1:
-                    from tensorrt_llm.lora_manager import HfLoraLoader
-                    lora_loader = HfLoraLoader(config.lora_config.lora_dir)
-                    weight = lora_loader.lm_head
-                    vocab_size = lora_loader.vocab_size
+            if (hasattr(config, 'lora_config')
+                    and config.lora_config is not None
+                    and len(config.lora_config.lora_dir) == 1):
+                from tensorrt_llm.lora_manager import HfLoraLoader
+                lora_loader = HfLoraLoader(config.lora_config.lora_dir)
+                weight = lora_loader.lm_head
+                vocab_size = lora_loader.vocab_size
 
-                self.lm_head = LMHead(
-                    vocab_size,
-                    hidden_size,
-                    dtype=config.pretrained_config.torch_dtype,
-                    mapping=config.mapping,
-                    tensor_parallel_mode=TensorParallelMode.COLUMN,
-                    gather_output=True,
-                )
+            self.lm_head = LMHead(
+                vocab_size,
+                hidden_size,
+                dtype=config.pretrained_config.torch_dtype,
+                mapping=config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=True,
+            )
 
-                if hasattr(config, 'lora_config'
-                           ) and config.lora_config is not None and len(
-                               config.lora_config.lora_dir) == 1:
-                    with torch.no_grad():
-                        if config.mapping.tp_size > 1:
-                            weight = split_matrix_tp(
-                                weight,
-                                config.mapping.tp_size,
-                                config.mapping.tp_rank,
-                                dim=0)  # split by vocabulary dimension
-                        x = weight.to(self.lm_head.dtype).cuda()
-                        self.lm_head.weight.data.copy_(x)
+            if (hasattr(config, 'lora_config')
+                    and config.lora_config is not None
+                    and len(config.lora_config.lora_dir) == 1):
+                with torch.no_grad():
+                    if config.mapping.tp_size > 1:
+                        weight = split_matrix_tp(
+                            weight,
+                            config.mapping.tp_size,
+                            config.mapping.tp_rank,
+                            dim=0)  # split by vocabulary dimension
+                    x = weight.to(self.lm_head.dtype).cuda()
+                    self.lm_head.weight.data.copy_(x)
 
-            # use embedding weights in lm_head if tie word embedding is enabled
-            if config.pretrained_config.tie_word_embeddings and not isinstance(
-                    self.model.embed_tokens, MissingLayer):
-                assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
-                    "lm_head and vocab embedding should use the same TP size")
-                assert self.lm_head.tp_mode == self.model.embed_tokens.tp_mode, (
-                    "lm_head and vocab embedding should use the same TP mode")
-                self.lm_head.weight = self.model.embed_tokens.weight
+        # use embedding weights in lm_head if tie word embedding is enabled
+        if config.pretrained_config.tie_word_embeddings:
+            assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
+                "lm_head and vocab embedding should use the same TP size")
+            assert self.lm_head.tp_mode == self.model.embed_tokens.tp_mode, (
+                "lm_head and vocab embedding should use the same TP mode")
+            self.lm_head.weight = self.model.embed_tokens.weight
 
-            self.logits_processor = LogitsProcessor()
+        self.logits_processor = LogitsProcessor()
+
+        self.prologue = []
+        self.epilogue = [self.lm_head]
+
+    def __pp_init__(self):
+        mapping = self.model_config.mapping
+        if not mapping.has_pp():
+            return
+
+        if not mapping.is_first_pp_rank():
+            for module in self.prologue:
+                skip_forward(module)
+        if not mapping.is_last_pp_rank():
+            for module in self.epilogue:
+                skip_forward(module)
 
     def __post_init__(self):
         # 1. mixed precision
@@ -474,10 +484,6 @@ class DecoderModelForCausalLM(nn.Module,
     def config(self):
         return self.model_config.pretrained_config
 
-    def create_pipeline_interface(self, num_input_ids: torch.int):
-        # create each interface buffer at runtime
-        return self.model.create_pipeline_interface(num_input_ids)
-
     @property
     def vocab_size_padded(self) -> int:
         return self.lm_head.vocab_size_padded
@@ -488,35 +494,20 @@ class DecoderModelForCausalLM(nn.Module,
         input_ids: torch.LongTensor = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        pipeline_interface: Optional[PipelineInterface] = None,
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
         lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if self._supports_pp and self.pp_size > 1:
-            output = self.model(
-                input_ids=input_ids,
-                attn_metadata=attn_metadata,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                pipeline_interface=pipeline_interface,
-                spec_metadata=spec_metadata,
-            )
 
-            # No need to compute logits for non-last PP ranks
-            if self.pp_rank < self.pp_size - 1:
-                return output
-        else:
-
-            output = self.model(
-                input_ids=input_ids,
-                attn_metadata=attn_metadata,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                spec_metadata=spec_metadata,
-                lora_params=lora_params,
-            )
+        output = self.model(
+            input_ids=input_ids,
+            attn_metadata=attn_metadata,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            spec_metadata=spec_metadata,
+            lora_params=lora_params,
+        )
 
         return self.logits_processor.forward(
             output,
@@ -579,11 +570,6 @@ def get_model_architecture(
         raise RuntimeError(
             f"Unknown model architecture: {model_config.architectures[0]}")
     return cls, model_config.architectures[0]
-
-
-def support_pp(cls: Type) -> Type:
-    cls._supports_pp = True
-    return cls
 
 
 def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
@@ -677,10 +663,6 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                            model.model_config.lora_config.lora_dir) == 1 and (
                                name == "model.embed_tokens"
                                or name == "lm_head"):
-                continue
-
-            # Skip if parameter belongs to a missing layer
-            if missing_layer_parameter(name, model):
                 continue
 
             names = name.split('.')

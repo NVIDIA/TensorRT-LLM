@@ -975,7 +975,7 @@ class Attention(Module):
                 if hasattr(self, 'kv'):
                     # We optimize the graph by adding kv in the cross attention layer, preventing computing the
                     # query of encoder_output.
-                    assert qkv_lora_params == None, "Not support LoRA when we only compute key/value in cross atteniton"
+                    assert qkv_lora_params is None, "Not support LoRA when we only compute key/value in cross atteniton"
                     # see optimization_model's optimize_cross_qkv
                     cross_kv = self.kv(encoder_output, qkv_lora_params)
                     base_shape = shape(

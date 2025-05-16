@@ -197,7 +197,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     if (mModelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
     {
         mSeamlessLADMaxDraftLen = modelConfig.getMaxDecodingDraftTokens();
-        // TODO: enable it when speculativeDecodingMode == None and run with '--lookahead_config'
+        // TODO: enable it when speculativeDecodingMode is None and run with '--lookahead_config'
         mUseSeamlessLookahead = false;
     }
 

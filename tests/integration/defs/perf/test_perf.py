@@ -83,6 +83,7 @@ MODEL_PATH_DICT = {
     "gpt_350m_moe": "gpt2-medium",
     "phi_3_mini_4k_instruct": "Phi-3/Phi-3-mini-4k-instruct",
     "phi_3_mini_128k_instruct": "Phi-3/Phi-3-mini-128k-instruct",
+    "phi_4_mini_instruct": "Phi-4-mini-instruct",
 }
 # Model PATH of HuggingFace
 HF_MODEL_PATH = {
@@ -102,6 +103,7 @@ HF_MODEL_PATH = {
     "mixtral_8x7b_v0.1_instruct_hf": "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "mistral_7b_v0.1_hf": "mistralai/Mistral-7B-v0.1",
     "flan_t5_base_hf": "google/flan-t5-small",
+    "phi_4_mini_instruct_hf": "microsoft/Phi-4-mini-instruct",
 }
 LORA_MODEL_PATH = {
     "llama_v2_13b": "llama-models-v2/chinese-llama-2-lora-13b",

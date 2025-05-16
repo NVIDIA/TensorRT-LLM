@@ -659,7 +659,7 @@ def trace_func(func):
                         ignore_it = tracer.ignore.names(filename, modulename)
                         if not ignore_it:
                             print(
-                                f"[rank{rank}] --- path: {filename}, funcname: {code.co_name}"
+                                f"[rank{rank}] --- path: {filename} , funcname: {code.co_name}"
                             )
                             return localtrace
                 else:

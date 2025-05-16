@@ -143,7 +143,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Meta-Llama-3.1-8B"
 
     @pytest.mark.skip_less_device_memory(32000)
-    @pytest.mark.skip_device_not_contain(["H100"])
+    @pytest.mark.skip_device_not_contain(["H100", "H200"])
     @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
     def test_auto_dtype(self, disable_overlap_scheduler):
         ctx_server_config = {

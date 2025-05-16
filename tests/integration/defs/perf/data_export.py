@@ -482,7 +482,7 @@ def _write_session_properties_helper(write_dict, session_data_list, src_key,
 def _get_subset_keys(key_list, include_keys=[]):
     """Returns a subset of keys from a key list"""
 
-    if include_keys == None:
+    if include_keys is None:
         return key_list
 
     res = []

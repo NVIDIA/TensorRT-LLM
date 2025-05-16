@@ -4,7 +4,7 @@ Modify directly if you want to change settings.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 
 @dataclass
@@ -21,7 +21,7 @@ class SimpleConfig:
     # If no `model` argument is provided, the checkpoint directory is used to infer the model
     # architecture.
     model: Optional[str] = None
-    model_factory: str = "hf"  # choose from 'hf' or 'llama4' (only 'hf' supported for "trtllm"!)
+    model_factory: Literal["hf"] = "hf"
     skip_loading_weights: bool = False  # only load the architecture, not the weights
     customize_tokenizer: bool = False  # True: tokenizer from the model factory, False: from LLM api
 
@@ -34,12 +34,7 @@ class SimpleConfig:
     # 3. Values in the model_kwargs
     # Note that that if the kwarg does not exist in the model config class, it will be ignored.
     # An example model config class can be found [here](https://github.com/huggingface/transformers/blob/c409cd81777fb27aadc043ed3d8339dbc020fb3b/src/transformers/models/llama/configuration_llama.py#L26).
-    model_kwargs: Dict = field(
-        default_factory=lambda: {
-            "max_position_embeddings": 4096,  # to save on memory
-            "use_cache": False,
-        }
-    )
+    model_kwargs: Dict = field(default_factory=dict)
 
     ### TOKENIZER EXTRA KWARGS #####################################################################
     # Extra kwargs for the tokenizer class to customize the tokenizer. Same as model_kwargs.
@@ -50,10 +45,12 @@ class SimpleConfig:
 
     ### CONFIGURE BACKEND, RUNTIME, AND WORLD SIZE ##################################
     world_size: int = 1  # choose from number of GPUs for TP (0--> no TP, no spawned processes)
-    runtime: str = "demollm"  # chose from "demollm" or "trtllm" (production-grade runtime)
-    compile_backend: str = "torch-opt"  # choose from "torch-simple", "torch-opt"
-    attn_backend: str = "TritonWithFlattenedInputs"  # "TritonWithFlattenedInputs" or "FlashInfer"
-    mla_backend: str = "MultiHeadLatentAttention"  # only option for now
+    runtime: Literal["demollm", "trtllm"] = "trtllm"
+    compile_backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = (
+        "torch-compile"
+    )
+    attn_backend: Literal["TritonWithFlattenedInputs", "FlashInfer"] = "FlashInfer"
+    mla_backend: Literal["MultiHeadLatentAttention"] = "MultiHeadLatentAttention"
     max_seq_len: int = 512  # max sequence length for inference/cache
     max_batch_size: int = 8  # max dimension for statically allocated kv cache
     page_size: int = 64  # page size for attention
@@ -122,7 +119,7 @@ class SimpleConfig:
         # use min instead of max to avoid OOM for large batch size
         self.model_kwargs["max_position_embeddings"] = min(
             self.max_seq_len,
-            self.model_kwargs["max_position_embeddings"],
+            self.model_kwargs.get("max_position_embeddings", self.max_seq_len),
         )
 
         if isinstance(self.prompt, str):

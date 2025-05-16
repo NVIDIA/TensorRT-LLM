@@ -146,8 +146,7 @@ class AccuracyTask:
     def evaluate(self,
                  llm: Union[LLM, PyTorchLLM],
                  extra_acc_spec: Optional[str] = None,
-                 extra_evaluator_kwargs: Optional[dict] = None,
-                 sampling_params: Optional[SamplingParams] = None):
+                 extra_evaluator_kwargs: Optional[dict] = None):
         assert self.EVALUATOR_CLS is not None
 
         if llm.args.speculative_config is None:
@@ -176,15 +175,9 @@ class AccuracyTask:
                 spec_dec_algo=spec_dec_algo,
                 extra_acc_spec=extra_acc_spec)
 
-        if sampling_params is None:
-            sampling_params = SamplingParams(
-                max_tokens=self.MAX_OUTPUT_LEN,
-                truncate_prompt_tokens=self.MAX_INPUT_LEN)
-        else:
-            if sampling_params.max_tokens is None:
-                sampling_params.max_tokens = self.MAX_OUTPUT_LEN
-            if sampling_params.truncate_prompt_tokens is None:
-                sampling_params.truncate_prompt_tokens = self.MAX_INPUT_LEN
+        sampling_params = SamplingParams(
+            max_tokens=self.MAX_OUTPUT_LEN,
+            truncate_prompt_tokens=self.MAX_INPUT_LEN)
 
         evaluator_kwargs = {}
         if self.EVALUATOR_KWARGS is not None:
