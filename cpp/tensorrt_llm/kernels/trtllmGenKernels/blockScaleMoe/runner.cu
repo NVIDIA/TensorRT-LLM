@@ -59,7 +59,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     int32_t* numNonExitingCtas, tg::Dtype dtypeElt, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
     cudaStream_t stream)
 {
-    if (n_group > 0 && topk_group > 0 && topk_group <= 4 && top_k <= 8)
+    if (nGroup > 0 && topkGroup > 0 && topkGroup <= 4 && topK <= 8)
     {
         // FIXME: hardcoded for now
         int32_t tileN = 8;
@@ -102,7 +102,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mUseRoutingSoftmax = false;
         moe::dev::routing::run(routingData, stream);
     }
-    else if (n_group <= 0 && topk_group <= 0 && top_k == 1)
+    else if (nGroup <= 0 && topkGroup <= 0 && topK == 1)
     {
         // FIXME: hardcoded for now
         int32_t tileN = 8;
@@ -134,8 +134,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mNumTokens = numTokens;
         // routingData.mHiddenDim = args.mHiddenDim;
         routingData.mNumExperts = numExperts;
-        // routingData.mNumExpertGroups = n_group;
-        // routingData.mNumLimitedGroups = topk_group;
+        // routingData.mNumExpertGroups = nGroup;
+        // routingData.mNumLimitedGroups =topkGroup;
         routingData.mTopK = topK;
         routingData.mPaddingLog2 = computeLog2(tileN);
         routingData.mLocalExpertsStartIdx = localExpertOffset;
@@ -148,10 +148,10 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     else
     {
         // check for DeepSeek-style routing with groups
-        TLLM_CHECK_ERROR(
-            n_group > 0 && topk_group > 0, "For group-based routing, must have topk_group <= 4 && top_k <= 8.");
+        TLLM_CHECK_WITH_INFO(
+            nGroup > 0 && topkGroup > 0, "For group-based routing, must havetopkGroup <= 4 && topK <= 8.");
         // here we are using Llama4-style routing without groups
-        TLLM_CHECK_ERROR(false, "For non-group-based routing, must have top_k == 1.");
+        TLLM_CHECK_WITH_INFO(false, "For non-group-based routing, must have topK == 1.");
     }
 }
 } // namespace Routing
