@@ -57,6 +57,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     def test_chunked_prefill(self, attn_backend):
+        pytest.skip("https://nvbugspro.nvidia.com/bug/5285881")
         pytorch_config = PyTorchConfig(attn_backend=attn_backend, )
         llm = LLM(self.MODEL_PATH,
                   enable_chunked_prefill=True,
