@@ -347,8 +347,11 @@ class KVCacheManager(BaseResourceManager):
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.prompt_len = token_num - 1
                 req.py_prompt_len = req.prompt_len
-                if max_num_draft_tokens > 0:
-                    req.py_draft_tokens = [0] * max_num_draft_tokens
+                req.py_draft_tokens = [1] * max_num_draft_tokens
+                for _ in range(max_num_draft_tokens):
+                    req.add_new_token(1, 0)
+                    if prepare_resource:
+                        self.impl.add_token(req_id)
             requests.append(req)
         return requests
 
