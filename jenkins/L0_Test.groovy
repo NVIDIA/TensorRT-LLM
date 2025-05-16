@@ -242,6 +242,8 @@ def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
 @Field
 def DEBUG_MODE = "debug"
 @Field
+def DETAILED_LOG = "detailed_log"
+@Field
 def testFilter = [
     (REUSE_STAGE_LIST): null,
     (ENABLE_SKIP_TEST): false,
@@ -257,6 +259,7 @@ def testFilter = [
     (ONLY_PYTORCH_FILE_CHANGED): false,
     (DEBUG_MODE): false,
     (AUTO_TRIGGER_TAG_LIST): [],
+    (DETAILED_LOG): false,
 ]
 
 @Field
@@ -1013,6 +1016,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             extraInternalEnv,
             "pytest",
             "-v",
+            testFilter[(DETAILED_LOG)] ? "-s" : "",
             "--apply-test-list-correction",
             "--splitting-algorithm least_duration",
             "--timeout=${pytestTestTimeout}",
