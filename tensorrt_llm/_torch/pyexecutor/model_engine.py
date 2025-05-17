@@ -291,6 +291,7 @@ class PyTorchModelEngine(ModelEngine):
         self.batch_size = batch_size
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
+        self.stream = torch.cuda.Stream()
 
         self.mapping = mapping
         if mapping.has_pp():
@@ -1909,10 +1910,11 @@ class PyTorchModelEngine(ModelEngine):
             return outputs
 
     def model_forward(self, **kwargs):
-        if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
-            return trace_func(self.model.forward)(**kwargs)
-        else:
-            return self.model.forward(**kwargs)
+        with torch.cuda.stream(self.stream):
+            if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
+                return trace_func(self.model.forward)(**kwargs)
+            else:
+                return self.model.forward(**kwargs)
 
     @nvtx_range("_forward_step")
     def _forward_step(self, inputs: Dict[str, Any],
