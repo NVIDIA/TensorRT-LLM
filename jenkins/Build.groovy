@@ -50,7 +50,7 @@ def BUILD_CONFIGS = [
   // Vanilla TARNAME is used for packaging in runLLMPackage
   // cmake-vars cannot be empty, so passing (default) multi-device configuration.
   (CONFIG_LINUX_X86_64_VANILLA) : [
-    (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --micro_benchmarks",
+    (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --micro_benchmarks",
     (TARNAME) : "TensorRT-LLM.tar.gz",
     (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;120-real",
   ],
