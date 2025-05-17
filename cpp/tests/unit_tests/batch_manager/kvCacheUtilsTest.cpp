@@ -91,7 +91,7 @@ TEST_F(BlockIteratorTest, CacheManagerTest)
 
     BlockManager blockManager(std::vector<BlockManager::SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock,
         blocksInPrimaryPool, blocksInSecondaryPool, maxNumSequences, stream, maxSequenceLength, beamWidth,
-        maxAttentionWindowVec, std::nullopt, dataType, 0, onboardBlocks);
+        maxAttentionWindowVec, std::nullopt, dataType, 0, 0, onboardBlocks);
     blockManager.allocatePools(false);
 
     EXPECT_EQ(blockManager.getTokensPerBlock(), tokensPerBlock);
