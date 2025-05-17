@@ -799,6 +799,10 @@ class PyExecutor:
         torch.cuda.set_device(self.device_id)
         got_finish_signal = False
         num_dummy_request = 0
+        is_ngram = hasattr(
+            self.model_engine, "spec_config"
+        ) and self.model_engine.spec_config is not None and self.model_engine.spec_config.spec_dec_mode.is_ngram(
+        )
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
@@ -825,9 +829,7 @@ class PyExecutor:
                 if num_dummy_request > 0:
                     self._merge_dummy_request(num_dummy_request)
 
-                spec_config = self.model_engine.spec_config
-                if self.draft_model_engine is not None or \
-                    (spec_config is not None and spec_config.spec_dec_mode.is_ngram()):
+                if self.draft_model_engine is not None or is_ngram:
                     self._prepare_draft_requests()
 
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
@@ -860,7 +862,7 @@ class PyExecutor:
                 finished_requests = []
 
                 if scheduled_batch.batch_size > 0:
-                    has_ngram_iter_stats = spec_config is not None and spec_config.spec_dec_mode.is_ngram(
+                    has_ngram_iter_stats = is_ngram and self.model_engine.spec_config.spec_dec_mode.is_ngram(
                     ) and iter_stats is not None
                     if has_ngram_iter_stats:
                         before = time.time()
