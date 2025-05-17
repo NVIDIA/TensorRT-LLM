@@ -394,11 +394,34 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 )
 
         assert request.id is not None
+
+        def _deduce_max_tokens(request: GenerationRequest,
+                               executor_config: tllm.ExecutorConfig) -> int:
+            if request.sampling_params.max_tokens:
+                return request.sampling_params.max_tokens
+            # deduce max_tokens when it's not set by user
+            query_token_len = len(
+                request.query_token_ids) if request.query_token_ids else 0
+            cp_size = 1 if (not hasattr(executor_config, "mapping")
+                            or executor_config.mapping.cp_size
+                            is None) else executor_config.mapping.cp_size
+            if not hasattr(executor_config, "max_seq_len"):
+                raise RuntimeError(
+                    "max_tokens for sampling is not set and cannot be deduced")
+            splited_prompt_len = int(len(prompt_token_ids) / cp_size)
+            default_max_tokens = executor_config.max_seq_len - splited_prompt_len - query_token_len
+            if default_max_tokens < 0:
+                raise ValueError(
+                    f"Deduced max_tokens {default_max_tokens} is less than 0, because"
+                    f"prompt length {splited_prompt_len} plus query length {query_token_len} "
+                    f"is larger than max_seq_len {executor_config.max_seq_len}")
+            return default_max_tokens
+
         try:
             executor_request = tllm.Request(
                 client_id=request.id,
                 input_token_ids=prompt_token_ids,
-                max_tokens=request.sampling_params.max_tokens,
+                max_tokens=_deduce_max_tokens(request, self._executor_config),
                 streaming=request.streaming,
                 sampling_config=request.sampling_params._get_sampling_config(),
                 end_id=-1 if request.sampling_params.ignore_eos else
