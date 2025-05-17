@@ -2,8 +2,9 @@ import copy
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, List
-from tensorrt_llm.scaffolding import (Task, ChatTask, Controller)
+from tensorrt_llm.scaffolding import (Task,  Controller)
 from .mcp_task import (MCPCallTask, MCPListTask)
+from .chat_task import (ChatTask)
 
 class MCPController(Controller):
 

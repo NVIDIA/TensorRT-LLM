@@ -1,7 +1,7 @@
 import asyncio
 
 from tensorrt_llm.scaffolding import (ScaffoldingLlm, OpenaiWorker)
-from tensorrt_llm.scaffolding.contrib import (MCPController,MCPWorker)
+from tensorrt_llm.scaffolding.contrib import (MCPController,MCPWorker,ChatTask, chat_handler)
 
 from typing import Any
 
@@ -13,12 +13,13 @@ async def main():
         "What's the weather like today in LA?"
     ]
     API_KEY = os.environ.get("API_KEY")
+    print(f"API_KEY {API_KEY}")
     client = AsyncOpenAI(
         api_key=API_KEY,
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
     )
     qwen_worker = OpenaiWorker(client, "qwen-plus")
-
+    qwen_worker.register_task_handler(ChatTask, chat_handler)
     mcp_worker = await MCPWorker.init_with_url("http://0.0.0.0:8080/sse")
 
     prototype_controller = MCPController()
