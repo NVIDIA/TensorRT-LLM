@@ -538,7 +538,7 @@ def test_trtllm_bench_pytorch_backend_sanity(llm_root, llm_venv,
                                      dir="./",
                                      delete=True,
                                      delete_on_close=True) as running_log:
-        check_call(benchmark_cmd, shell=True, running_log=running_log)
+        check_call(benchmark_cmd, shell=True, stdout=running_log)
         if model_id in mapping and not use_extra_config:
             # extra config defines max kv cache tokens number to be 40000 which makes the checking
             # the checking process not unified.
@@ -570,7 +570,7 @@ def test_trtllm_bench_mgmn(llm_root, llm_venv):
                                      dir="./",
                                      delete=True,
                                      delete_on_close=True) as running_log:
-        check_call(benchmark_cmd, shell=True, running_log=running_log)
+        check_call(benchmark_cmd, shell=True, stdout=running_log)
         _check_mem_usage(running_log, [30, 0, 0, 0])
 
 
@@ -722,7 +722,7 @@ def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
                     dir="./",
                     delete=True,
                     delete_on_close=True) as running_log:
-                check_call(benchmark_cmd, shell=True, running_log=running_log)
+                check_call(benchmark_cmd, shell=True, stdout=running_log)
                 _check_mem_usage(running_log, [19.4, 0, 0, 0])
         else:
             check_call(benchmark_cmd, shell=True)
@@ -1248,7 +1248,7 @@ def test_ptp_quickstart(llm_root, llm_venv):
                                      delete=True,
                                      delete_on_close=True) as running_log:
         venv_check_call(llm_venv, [str(example_root / "quickstart.py")],
-                        running_log=running_log)
+                        stdout=running_log)
         _check_mem_usage(running_log, [4.60, 0, 0, 0])
 
 
@@ -1303,7 +1303,7 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
                 "--model_dir",
                 f"{llm_models_root()}/{model_path}",
             ],
-                             running_log=running_log)
+                             stdout=running_log)
             if model_name in mapping:
                 _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0])
 
@@ -1331,7 +1331,7 @@ def test_ptq_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
                 "--model_dir",
                 f"{llm_models_root()}/{model_path}",
             ],
-            running_log=running_log)
+            stdout=running_log)
         _check_mem_usage(running_log, [54.50, 0, 0, 0])
 
 
@@ -1389,7 +1389,7 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
             "--disable_kv_cache_reuse",
             "--disable_overlap_scheduler",
         ],
-                         running_log=running_log)
+                         stdout=running_log)
         _check_mem_usage(running_log, [25.2, 0, 0, 0])
 
 
@@ -1423,7 +1423,7 @@ def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
             "--max_seq_len=3000",
             "--disable_kv_cache_reuse",
         ],
-                         running_log=running_log)
+                         stdout=running_log)
         _check_mem_usage(running_log, [106.3, 0, 0, 0], 8)
 
 
@@ -1462,7 +1462,7 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
             "--relaxed_topk=10",
             "--relaxed_delta=0.5",
         ],
-                         running_log=running_log)
+                         stdout=running_log)
         _check_mem_usage(running_log, [85.6, 0, 0, 0], 8)
     # TODO: relaxed acceptance is incompatible with attention dp
     # "--enable_attention_dp"
@@ -1512,7 +1512,7 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
             f"{llm_models_root()}/{model_path}",
             "--tp_size=8",
         ],
-                         running_log=running_log)
+                         stdout=running_log)
         if model_name in mapping:
             _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0], 8)
 
@@ -1553,7 +1553,7 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
             "--model_dir",
             f"{llm_models_root()}/{model_path}",
         ],
-                         running_log=running_log)
+                         stdout=running_log)
         _check_mem_usage(running_log, [12.0, 0, 0, 0])
 
 
@@ -1744,7 +1744,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             "--media",
             *functionality_inputs[modality]["media"],
         ],
-                         running_log=running_log)
+                         stdout=running_log)
 
         if model_name in mapping:
             peak, fraction = mapping[model_name]
