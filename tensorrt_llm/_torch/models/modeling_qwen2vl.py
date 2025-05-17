@@ -318,12 +318,14 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         mm_processor_kwargs['do_rescale'] = False
         processed_inputs = self._preprocess(text_prompt, mm_data,
                                             mm_processor_kwargs).to(self.device)
-
-        mm_features = self._process(
-            processed_inputs.get('pixel_values', None),
-            processed_inputs.get('pixel_values_videos', None),
-            processed_inputs.get('image_grid_thw', None),
-            processed_inputs.get('video_grid_thw', None))
+        if mm_data:
+            mm_features = self._process(
+                processed_inputs.get('pixel_values', None),
+                processed_inputs.get('pixel_values_videos', None),
+                processed_inputs.get('image_grid_thw', None),
+                processed_inputs.get('video_grid_thw', None))
+        else:
+            mm_features = None
 
         input_ids = processed_inputs['input_ids']
 

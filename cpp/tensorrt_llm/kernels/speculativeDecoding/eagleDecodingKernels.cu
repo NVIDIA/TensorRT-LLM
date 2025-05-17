@@ -882,7 +882,7 @@ namespace
 
 // Extract the number of successors for each node from path
 __global__ void extractNumSuccessorsFromPath(SizeType32 const* paths, SizeType32* numSuccessorsForEachNode,
-    SizeType32 layerId, SizeType32 batchSize, SizeType32 maxDecodingTokens, SizeType32 maxPathLen)
+    SizeType32 layerId, SizeType32 maxDecodingTokens, SizeType32 maxPathLen)
 {
     // paths: shape [batchSize, maxDecodingTokens, maxPathLen]
     // numSuccessorsForEachNode: shape [batchSize, maxDecodingTokens]
@@ -1016,7 +1016,7 @@ void invokeExtractTopKsFromPath(runtime::SizeType32 const* paths, runtime::SizeT
     // Each thread block corresponds to a request.
     // The shared memory in a block is the adjacency matrix for this request's path
     extractNumSuccessorsFromPath<<<batchSize, BLOCK_SIZE, dynamicSmemSize, stream>>>(
-        paths, numSuccessorsForEachNode, layerId, batchSize, maxDecodingTokens, maxPathLen);
+        paths, numSuccessorsForEachNode, layerId, maxDecodingTokens, maxPathLen);
 
     sync_check_cuda_error(stream);
 
@@ -1030,7 +1030,7 @@ void invokeExtractTopKsFromPath(runtime::SizeType32 const* paths, runtime::SizeT
 
 namespace
 {
-__global__ void copyOutputTokensIds(TokenIdType** tmpOutputIdsPtrs, SizeType32 const* topKs,
+__global__ void copyOutputTokensIds(TokenIdType const* const* tmpOutputIdsPtrs, SizeType32 const* topKs,
     SizeType32 const* topKOffset, TokenIdType const* pluginInputDraftIdsPtrs, SizeType32 const* pluginInputDraftLens,
     SizeType32 const* numValidLogits, TokenIdType* pluginOutputDraftIdsPtrs, SizeType32* pluginOutputDraftLens,
     SizeType32 layerId, SizeType32 batchSize, SizeType32 maxDecodingDraftTokens, SizeType32 const* inputPaths,
@@ -1094,7 +1094,7 @@ __global__ void copyOutputTokensIds(TokenIdType** tmpOutputIdsPtrs, SizeType32 c
 } // namespace
 
 // Copy output draft token ids from temporary buffer to plugin output buffer, also update the draft token length
-void invokeCopyOutputTokensIds(runtime::TokenIdType** tmpOutputIdsPtrs, runtime::SizeType32 const* topKs,
+void invokeCopyOutputTokensIds(runtime::TokenIdType const* const* tmpOutputIdsPtrs, runtime::SizeType32 const* topKs,
     runtime::SizeType32 const* topKOffset, runtime::TokenIdType const* pluginInputDraftIdsPtrs,
     runtime::SizeType32 const* pluginInputDraftLens, runtime::SizeType32 const* numValidLogits,
     runtime::TokenIdType* pluginOutputDraftIdsPtrs, runtime::SizeType32* pluginOutputDraftLens,
@@ -1419,8 +1419,8 @@ void invokeAugmentBatchSlots(SizeType32* augmentedSeqSlots, SizeType32* augmente
 
 namespace
 {
-__global__ void setTopKsFromDyanmicTreeMaxTopK(SizeType32 layerIdx, SizeType32 numInputLogits, SizeType32 batchSize,
-    SizeType32* topKs, SizeType32* topKOffset, SizeType32 const dynamicTreeMaxTopK, SizeType32 const* numValidLogits)
+__global__ void setTopKsFromDyanmicTreeMaxTopK(SizeType32 layerIdx, SizeType32 batchSize, SizeType32* topKs,
+    SizeType32* topKOffset, SizeType32 const dynamicTreeMaxTopK, SizeType32 const* numValidLogits)
 {
     // topKs: shape [numInputLogits]
     // topKOffset: shape [batchSize]
@@ -1463,7 +1463,7 @@ void invokeSetTopKsFromDyanmicTreeMaxTopK(SizeType32 layerIdx, SizeType32 batchS
 {
     SizeType32 constexpr BLOCK_SIZE = 128;
     setTopKsFromDyanmicTreeMaxTopK<<<divUp(numInputLogits, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(
-        layerIdx, numInputLogits, batchSize, topKs, topKOffset, dynamicTreeMaxTopK, numValidLogits);
+        layerIdx, batchSize, topKs, topKOffset, dynamicTreeMaxTopK, numValidLogits);
 
     sync_check_cuda_error(stream);
 }
@@ -1472,7 +1472,7 @@ namespace
 {
 __global__ void copyScoresAndDraftTokenIds(SizeType32 layerIdx, SizeType32 mNumEagleLayers,
     SizeType32 maxDecodingDraftTokens, SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
-    SizeType32* topKOffset, TokenIdType const* pluginInputCurrentExpandIndices, float const* pluginInputAllLayersScores,
+    TokenIdType const* pluginInputCurrentExpandIndices, float const* pluginInputAllLayersScores,
     TokenIdType const* pluginInputAllLayersDraftTokenIds,
     TokenIdType const* pluginInputAllLayersDraftTokenIdsPredecessor, float* pluginOutputAllLayersScores,
     TokenIdType* pluginOutputAllLayersDraftTokenIds, TokenIdType* pluginOutputAllLayersDraftTokenIdsPredecessor,
@@ -1557,7 +1557,7 @@ __global__ void copyScoresAndDraftTokenIds(SizeType32 layerIdx, SizeType32 mNumE
 
 void invokeCopyScoresAndDraftTokenIds(SizeType32 layerIdx, SizeType32 mNumEagleLayers,
     SizeType32 maxDecodingDraftTokens, SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
-    SizeType32* topKOffset, TokenIdType const* pluginInputCurrentExpandIndices, float const* pluginInputAllLayersScores,
+    TokenIdType const* pluginInputCurrentExpandIndices, float const* pluginInputAllLayersScores,
     TokenIdType const* pluginInputAllLayersDraftTokenIds,
     TokenIdType const* pluginInputAllLayersDraftTokenIdsPredecessor, float* pluginOutputAllLayersScores,
     TokenIdType* pluginOutputAllLayersDraftTokenIds, TokenIdType* pluginOutputAllLayersDraftTokenIdsPredecessor,
@@ -1565,7 +1565,7 @@ void invokeCopyScoresAndDraftTokenIds(SizeType32 layerIdx, SizeType32 mNumEagleL
 {
     SizeType32 constexpr BLOCK_SIZE = 128;
     copyScoresAndDraftTokenIds<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(layerIdx, mNumEagleLayers,
-        maxDecodingDraftTokens, batchSize, dynamicTreeMaxTopK, topKOffset, pluginInputCurrentExpandIndices,
+        maxDecodingDraftTokens, batchSize, dynamicTreeMaxTopK, pluginInputCurrentExpandIndices,
         pluginInputAllLayersScores, pluginInputAllLayersDraftTokenIds, pluginInputAllLayersDraftTokenIdsPredecessor,
         pluginOutputAllLayersScores, pluginOutputAllLayersDraftTokenIds, pluginOutputAllLayersDraftTokenIdsPredecessor,
         firstTopKOutputLogProbs, firstTopKOutputIds);
@@ -1899,7 +1899,7 @@ namespace
 {
 
 __global__ void updateDraftTokensAndLensAndCurScores(SizeType32 layerIdx, SizeType32 batchSize,
-    SizeType32 dynamicTreeMaxTopK, SizeType32 maxDecodingDraftTokens, TokenIdType** curDraftIds,
+    SizeType32 dynamicTreeMaxTopK, SizeType32 maxDecodingDraftTokens, TokenIdType const* const* curDraftIds,
     TokenIdType const* pluginInputDraftIds, SizeType32 const* pluginInputDraftLens, TokenIdType* pluginOutputDraftIds,
     SizeType32* pluginOutputDraftLens, float const* curLayerScores, float* pluginOutputCurrentScores)
 {
@@ -1957,7 +1957,7 @@ __global__ void updateDraftTokensAndLensAndCurScores(SizeType32 layerIdx, SizeTy
 } // namespace
 
 void invokeUpdateDraftTokensAndLensAndCurScores(SizeType32 layerIdx, SizeType32 batchSize,
-    SizeType32 dynamicTreeMaxTopK, SizeType32 maxDecodingDraftTokens, TokenIdType** curDraftIds,
+    SizeType32 dynamicTreeMaxTopK, SizeType32 maxDecodingDraftTokens, TokenIdType const* const* curDraftIds,
     TokenIdType const* pluginInputDraftIds, SizeType32 const* pluginInputDraftLens, TokenIdType* pluginOutputDraftIds,
     SizeType32* pluginOutputDraftLens, float const* curLayerScores, float* pluginOutputCurrentScores,
     cudaStream_t stream)
@@ -1973,8 +1973,8 @@ void invokeUpdateDraftTokensAndLensAndCurScores(SizeType32 layerIdx, SizeType32 
 namespace
 {
 __global__ void extractScoresAndRealDraftTokensIds(SizeType32 batchSize, SizeType32 dynamicTreeMaxTopK,
-    SizeType32 maxDecodingDraftTokens, float** secondTopKInputScoresPtrs, TokenIdType** secondTopKOutputIdsPtrs,
-    TokenIdType* firstTopKOutputIds, float* secondTopKOutputLogProbs)
+    SizeType32 maxDecodingDraftTokens, float const* const* secondTopKInputScoresPtrs,
+    TokenIdType* const* secondTopKOutputIdsPtrs, TokenIdType* firstTopKOutputIds, float* secondTopKOutputLogProbs)
 {
     // secondTopKInputScoresPtrs: shape [batchSize][dynamicTreeMaxTopK * maxDecodingDraftTokens]
     // secondTopKOutputIdsPtrs: shape [batchSize][maxDecodingDraftTokens]
@@ -2007,8 +2007,9 @@ __global__ void extractScoresAndRealDraftTokensIds(SizeType32 batchSize, SizeTyp
 } // namespace
 
 void invokeExtractScoresAndRealDraftTokensIds(SizeType32 batchSize, SizeType32 dynamicTreeMaxTopK,
-    SizeType32 maxDecodingDraftTokens, float** secondTopKInputScoresPtrs, TokenIdType** secondTopKOutputIdsPtrs,
-    TokenIdType* firstTopKOutputIds, float* secondTopKOutputLogProbs, cudaStream_t stream)
+    SizeType32 maxDecodingDraftTokens, float const* const* secondTopKInputScoresPtrs,
+    TokenIdType* const* secondTopKOutputIdsPtrs, TokenIdType* firstTopKOutputIds, float* secondTopKOutputLogProbs,
+    cudaStream_t stream)
 {
     SizeType32 constexpr BLOCK_SIZE = 128;
     extractScoresAndRealDraftTokensIds<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(batchSize,
@@ -2021,10 +2022,10 @@ void invokeExtractScoresAndRealDraftTokensIds(SizeType32 batchSize, SizeType32 d
 namespace
 {
 
-__global__ void assembleThridTopKSamplingInputs(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
-    SizeType32 maxDecodingDraftTokens, SizeType32 mNumEagleLayers, SizeType32 const maxNodesOnFinalTree,
-    SizeType32* thirdTopKs, float* pluginOutputAllLayersScores, float** thirdTopKInputScoresPtrs,
-    TokenIdType* thirdTopKOutputIds, TokenIdType** thirdTopKOutputIdsPtrs)
+__global__ void assembleThridTopKSamplingInputs(SizeType32 batchSize, SizeType32 maxDecodingDraftTokens,
+    SizeType32 mNumEagleLayers, SizeType32 const maxNodesOnFinalTree, SizeType32* thirdTopKs,
+    float* pluginOutputAllLayersScores, float** thirdTopKInputScoresPtrs, TokenIdType* thirdTopKOutputIds,
+    TokenIdType** thirdTopKOutputIdsPtrs)
 {
     // pluginOutputAllLayersScores: [batchSize, mNumEagleLayers, maxDecodingDraftTokens x maxDecodingDraftTokens]
     // thirdTopKInputScoresPtrs: [batchSize]
@@ -2043,15 +2044,15 @@ __global__ void assembleThridTopKSamplingInputs(SizeType32 batchSize, SizeType32
 
 } // namespace
 
-void invokeAssembleThridTopKSamplingInputs(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
-    SizeType32 maxDecodingDraftTokens, SizeType32 mNumEagleLayers, SizeType32 const maxNodesOnFinalTree,
-    SizeType32* thirdTopKs, float* pluginOutputAllLayersScores, float** thirdTopKInputScoresPtrs,
-    TokenIdType* thirdTopKOutputIds, TokenIdType** thirdTopKOutputIdsPtrs, cudaStream_t stream)
+void invokeAssembleThridTopKSamplingInputs(SizeType32 batchSize, SizeType32 maxDecodingDraftTokens,
+    SizeType32 mNumEagleLayers, SizeType32 const maxNodesOnFinalTree, SizeType32* thirdTopKs,
+    float* pluginOutputAllLayersScores, float** thirdTopKInputScoresPtrs, TokenIdType* thirdTopKOutputIds,
+    TokenIdType** thirdTopKOutputIdsPtrs, cudaStream_t stream)
 {
     SizeType32 constexpr BLOCK_SIZE = 128;
     assembleThridTopKSamplingInputs<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(batchSize,
-        dynamicTreeMaxTopK, maxDecodingDraftTokens, mNumEagleLayers, maxNodesOnFinalTree, thirdTopKs,
-        pluginOutputAllLayersScores, thirdTopKInputScoresPtrs, thirdTopKOutputIds, thirdTopKOutputIdsPtrs);
+        maxDecodingDraftTokens, mNumEagleLayers, maxNodesOnFinalTree, thirdTopKs, pluginOutputAllLayersScores,
+        thirdTopKInputScoresPtrs, thirdTopKOutputIds, thirdTopKOutputIdsPtrs);
 
     sync_check_cuda_error(stream);
 }
@@ -2074,7 +2075,7 @@ __device__ SizeType32 findIndexInPaths(
 
 __global__ void reconstructFinalPath(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
     SizeType32 maxDecodingDraftTokens, SizeType32 maxDecodingTokens, SizeType32 maxPathLen, SizeType32 mNumEagleLayers,
-    SizeType32 const maxNodesOnFinalTree, TokenIdType** thirdTopKOutputIdsPtrs,
+    SizeType32 const maxNodesOnFinalTree, TokenIdType* const* thirdTopKOutputIdsPtrs,
     TokenIdType* pluginOutputAllLayersDraftTokenIdsPredecessor, SizeType32* finalOutputPaths)
 {
     // thirdTopKOutputIdsPtrs: shape [batchSize], each element points to a [maxDecodingDraftTokens] buffer
@@ -2270,7 +2271,7 @@ __global__ void reconstructFinalPath(SizeType32 batchSize, SizeType32 const dyna
 
 void invokeReconstructFinalPath(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
     SizeType32 maxDecodingDraftTokens, SizeType32 maxDecodingTokens, SizeType32 maxPathLen, SizeType32 mNumEagleLayers,
-    SizeType32 const maxNodesOnFinalTree, TokenIdType** thirdTopKOutputIdsPtrs,
+    SizeType32 const maxNodesOnFinalTree, TokenIdType* const* thirdTopKOutputIdsPtrs,
     TokenIdType* pluginOutputAllLayersDraftTokenIdsPredecessor, SizeType32* newPaths, cudaStream_t stream)
 {
     SizeType32 constexpr BLOCK_SIZE = 32;
@@ -2293,10 +2294,10 @@ void invokeReconstructFinalPath(SizeType32 batchSize, SizeType32 const dynamicTr
 
 namespace
 {
-__global__ void copyFinalDraftTokens(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
-    SizeType32 maxDecodingDraftTokens, SizeType32 mNumEagleLayers, SizeType32 const maxNodesOnFinalTree,
-    TokenIdType** thirdTopKOutputIdsPtrs, TokenIdType* pluginOutputAllLayersDraftTokenIds,
-    TokenIdType* pluginOutputDraftTokenIds, SizeType32* pluginOutputDraftLens)
+__global__ void copyFinalDraftTokens(SizeType32 batchSize, SizeType32 maxDecodingDraftTokens,
+    SizeType32 mNumEagleLayers, SizeType32 const maxNodesOnFinalTree, TokenIdType const* const* thirdTopKOutputIdsPtrs,
+    TokenIdType* pluginOutputAllLayersDraftTokenIds, TokenIdType* pluginOutputDraftTokenIds,
+    SizeType32* pluginOutputDraftLens)
 {
     // thirdTopKOutputIdsPtrs: shape [batchSize], each points to [maxDecodingDraftTokens]
     // pluginOutputAllLayersDraftTokenIds: shape [batchSize, mNumEagleLayers, maxDecodingDraftTokens x
@@ -2326,15 +2327,15 @@ __global__ void copyFinalDraftTokens(SizeType32 batchSize, SizeType32 const dyna
 
 } // namespace
 
-void invokeCopyFinalDraftTokens(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
-    SizeType32 maxDecodingDraftTokens, SizeType32 mNumEagleLayers, SizeType32 const maxNodesOnFinalTree,
-    TokenIdType** thirdTopKOutputIdsPtrs, TokenIdType* pluginOutputAllLayersDraftTokenIds,
-    TokenIdType* pluginOutputDraftTokenIds, SizeType32* pluginOutputDraftLens, cudaStream_t stream)
+void invokeCopyFinalDraftTokens(SizeType32 batchSize, SizeType32 maxDecodingDraftTokens, SizeType32 mNumEagleLayers,
+    SizeType32 const maxNodesOnFinalTree, TokenIdType const* const* thirdTopKOutputIdsPtrs,
+    TokenIdType* pluginOutputAllLayersDraftTokenIds, TokenIdType* pluginOutputDraftTokenIds,
+    SizeType32* pluginOutputDraftLens, cudaStream_t stream)
 {
     SizeType32 constexpr BLOCK_SIZE = 128;
-    copyFinalDraftTokens<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(batchSize, dynamicTreeMaxTopK,
-        maxDecodingDraftTokens, mNumEagleLayers, maxNodesOnFinalTree, thirdTopKOutputIdsPtrs,
-        pluginOutputAllLayersDraftTokenIds, pluginOutputDraftTokenIds, pluginOutputDraftLens);
+    copyFinalDraftTokens<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(batchSize, maxDecodingDraftTokens,
+        mNumEagleLayers, maxNodesOnFinalTree, thirdTopKOutputIdsPtrs, pluginOutputAllLayersDraftTokenIds,
+        pluginOutputDraftTokenIds, pluginOutputDraftLens);
 
     sync_check_cuda_error(stream);
 }

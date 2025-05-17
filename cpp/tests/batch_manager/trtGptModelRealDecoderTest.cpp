@@ -292,57 +292,36 @@ std::vector<TokenIdType> pickRandomEndIds(TestData const& testData, TrtGptModelT
 
     std::vector<TokenIdType> endIds;
 
-    if (modelType == TrtGptModelType::V1)
+    // For IFB, pick one of the output tokens as endId
+    for (SizeType32 bi = 0; bi < nbGivenInputs; ++bi)
     {
-        // For V1, all entries in batch must have same endId
-        SizeType32 skippedTokenIndex = 0;
+        TokenIdType skippedEndId0 = 0;
+        TokenIdType skippedEndId1 = 0;
+        SizeType32 endIdIndex = 0;
         TokenIdType endId = 0;
+        auto const endIdRow = bi;
+        auto const inputLength = givenInputLengths.at(endIdRow);
         do
         {
-            auto const endIdRow = std::rand() % nbGivenInputs;
             auto const endIdBeam = std::rand() % beamWidth;
+            auto const firstOutputIndex
+                = tc::flat_index3(endIdRow, endIdBeam, inputLength, beamWidth, testData.maxSeqLen);
+            // We do not use the 1st token for EndId because of Speculative Decoding test design
             // We skip 1st token because minLength is 1
-            auto const endIdCol = givenInputLengths.at(endIdRow) + 1 + std::rand() % std::max(maxNewTokens - 1, 1);
-            auto const endIdIndex = tc::flat_index2((endIdRow * beamWidth + endIdBeam), endIdCol, testData.maxSeqLen);
-            skippedTokenIndex = tc::flat_index2(
-                (endIdRow * beamWidth + endIdBeam), givenInputLengths.at(endIdRow), testData.maxSeqLen);
+            auto const endIdCol = 2 + (std::rand() % std::max(maxNewTokens - 2, 1));
+            endIdIndex = firstOutputIndex + endIdCol;
+            skippedEndId0 = expectedOutputData[firstOutputIndex];
+            skippedEndId1 = expectedOutputData[firstOutputIndex + 1];
             endId = expectedOutputData[endIdIndex];
-        } while (endId == expectedOutputData[skippedTokenIndex]);
-        endIds.insert(testData.endIds.end(), nbGivenInputs, endId);
-    }
-    else
-    {
-        // For IFB, pick one of the output tokens as endId
-        for (SizeType32 bi = 0; bi < nbGivenInputs; ++bi)
+        } while (endId == skippedEndId0 || endId == skippedEndId1);
+        // Workaround: The first example has endIdIndex 14, where the generation logits are almost same at
+        // token ids 257 and 373, which causes unstable generation results. Hence, we use the one previous
+        // token as endId.
+        if (bi == 0 && !replaceLogits)
         {
-            TokenIdType skippedEndId0 = 0;
-            TokenIdType skippedEndId1 = 0;
-            SizeType32 endIdIndex = 0;
-            TokenIdType endId = 0;
-            auto const endIdRow = bi;
-            auto const inputLength = givenInputLengths.at(endIdRow);
-            do
-            {
-                auto const endIdBeam = std::rand() % beamWidth;
-                auto const firstOutputIndex
-                    = tc::flat_index3(endIdRow, endIdBeam, inputLength, beamWidth, testData.maxSeqLen);
-                // We do not use the 1st token for EndId because of Speculative Decoding test design
-                // We skip 1st token because minLength is 1
-                auto const endIdCol = 2 + (std::rand() % std::max(maxNewTokens - 2, 1));
-                endIdIndex = firstOutputIndex + endIdCol;
-                skippedEndId0 = expectedOutputData[firstOutputIndex];
-                skippedEndId1 = expectedOutputData[firstOutputIndex + 1];
-                endId = expectedOutputData[endIdIndex];
-            } while (endId == skippedEndId0 || endId == skippedEndId1);
-            // Workaround: The first example has endIdIndex 14, where the generation logits are almost same at
-            // token ids 257 and 373, which causes unstable generation results. Hence, we use the one previous
-            // token as endId.
-            if (bi == 0 && !replaceLogits)
-            {
-                endId = expectedOutputData[endIdIndex - 1];
-            }
-            endIds.push_back(endId);
+            endId = expectedOutputData[endIdIndex - 1];
         }
+        endIds.push_back(endId);
     }
 
     return endIds;
@@ -509,16 +488,6 @@ RequestList runGptModelInference(std::shared_ptr<TrtGptModel>& trtGptModel, std:
             samplingConfig.topP = std::vector{0.0f};
             samplingConfig.draftAcceptanceThreshold = std::vector{0.3f};
             samplingConfig.noRepeatNgramSize = std::vector{1 << 30};
-
-            if (modelType != TrtGptModelType::V1)
-            {
-                // Check that sampling config can work with diverging specialization of sampling params.
-                if (req % 2 == 0)
-                {
-                    // minLength is defaulted as 1.
-                    samplingConfig.minLength = std::nullopt;
-                }
-            }
 
             auto const [givenInputIdx, inputLength]
                 = getRequestGivenInputIdxLength(requestId, nbGivenInputs, givenInputLengths);
@@ -771,7 +740,6 @@ std::string generateTestName(testing::TestParamInfo<ParamType> const& info)
     auto const modelType = std::get<2>(info.param);
     switch (modelType)
     {
-    case TrtGptModelType::V1: name.append("V1Model"); break;
     case TrtGptModelType::InflightBatching: name.append("IbModel"); break;
     case TrtGptModelType::InflightFusedBatching: name.append("FusedIbModel"); break;
     default: name.append("DefaultModel"); break;
@@ -931,8 +899,7 @@ TEST_P(ParamTest, Test)
     auto const enableStreamingMode = std::get<9>(GetParam());
     auto const cudaGraphMode = std::get<10>(GetParam());
 
-    if (modelType != TrtGptModelType::V1
-        && !(modelSpec.mUsePackedInput
+    if (!(modelSpec.mUsePackedInput
             && (modelSpec.mKVCacheType == KVCacheType::kPAGED || modelSpec.mKVCacheType == KVCacheType::kDISABLED)))
     {
         GTEST_SKIP() << "Inflight batching requires packed input and (paged KV cache or disabled KV cache).";
@@ -950,24 +917,10 @@ TEST_P(ParamTest, Test)
             GTEST_SKIP() << "Test does not support endId test with beam search";
         }
 
-        if (modelSpec.mMaxDraftTokens > 0 && (beamWidth > 1 || modelType == TrtGptModelType::V1))
+        if (modelSpec.mMaxDraftTokens > 0 && beamWidth > 1)
         {
-            GTEST_SKIP() << "Target model in speculative decoding does not support beam search and V1";
+            GTEST_SKIP() << "Target model in speculative decoding does not support beam search";
         }
-    }
-
-    if (cudaGraphMode && modelType == TrtGptModelType::V1)
-    {
-        GTEST_SKIP() << "Do not test cuda graph with V1";
-    }
-
-    if (modelDir == LLAMA_MODEL_DIR && modelSpec.mDataType == nvinfer1::DataType::kHALF
-        && modelType == TrtGptModelType::V1 && modelSpec.mPPSize > 1 && modelSpec.mKVCacheType == KVCacheType::kPAGED
-        && beamConfig.maxBeamWidth == 1 && beamWidths[0] == 1
-        && (testType == TrtGptModelIfbTestType::BULK || testType == TrtGptModelIfbTestType::RANDOM))
-    {
-        GTEST_SKIP() << "This combination of test is waived due to a suspected bug in GptSession pipeline parallelism "
-                        "with Llama 3.2 1B";
     }
 
     TrtGptModelOptionalParams modelOptionalParams;
@@ -981,9 +934,7 @@ TEST_P(ParamTest, Test)
     modelOptionalParams.maxBeamWidth = beamConfig.maxBeamWidth;
     modelOptionalParams.gatherGenerationLogits = modelSpec.mCollectGenerationLogits;
     modelOptionalParams.extendedRuntimePerfKnobConfig.setCudaGraphMode(cudaGraphMode);
-    texec::CapacitySchedulerPolicy capacitySchedulerPolicy = (modelType == TrtGptModelType::V1)
-        ? texec::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT
-        : texec::CapacitySchedulerPolicy::kMAX_UTILIZATION;
+    texec::CapacitySchedulerPolicy capacitySchedulerPolicy = texec::CapacitySchedulerPolicy::kMAX_UTILIZATION;
     if (modelSpec.mCapacitySchedulerPolicy)
     {
         capacitySchedulerPolicy = modelSpec.mCapacitySchedulerPolicy.value();
@@ -993,12 +944,6 @@ TEST_P(ParamTest, Test)
     if (modelSpec.mSpecDecodingMode == SpeculativeDecodingMode::LookaheadDecoding())
     {
         modelOptionalParams.decodingConfig.setLookaheadDecodingConfig(texec::LookaheadDecodingConfig(5, 5, 5));
-    }
-
-    if (modelType == TrtGptModelType::V1
-        && (modelOptionalParams.kvCacheConfig.maxTokens.has_value() || modelOptionalParams.enableTrtOverlap))
-    {
-        GTEST_SKIP() << "Not running V1 with Inflight batching optional params";
     }
 
     for (auto beamWidth : beamWidths)
@@ -1071,62 +1016,6 @@ std::shared_ptr<ModelSpec> getGptChunkedContextTestsCompareModelSpec()
 
     return pModelSpec;
 }
-
-INSTANTIATE_TEST_SUITE_P(GptV1Tests, ParamTest,
-    testing::Combine(testing::Values(gptModelParams),
-        testing::Values(
-            //
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
-                .useGptAttentionPlugin()
-                .setKVCacheType(KVCacheType::kCONTINUOUS)
-                .usePackedInput(),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
-                .useGptAttentionPlugin()
-                .setKVCacheType(KVCacheType::kPAGED)
-                .usePackedInput()),
-        testing::Values(TrtGptModelType::V1),
-        testing::Values(
-            TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
-        testing::Values(
-            // TODO: enable more tests when mixed beam width is supported
-            BeamConfig{1, {1}}, BeamConfig{2, {2}} // , BeamConfig{2, {1, 2}}
-            ),
-        testing::Values(std::nullopt),             // maxTokensInPagedKvCache
-        testing::Values(0.4),                      // freeGpuMemoryFraction
-        testing::Values(false),                    // enableTrtOverlap
-        testing::Values(false),                    // enableChunkedContext
-        testing::Values(false),                    // enableStreamingMode
-        testing::Values(false),                    // enableCudaGraphMode
-        testing::Values(std::nullopt),             // hostCacheSize
-        testing::Values(false)                     // useRandomEndId
-        ),
-    generateTestName);
-
-INSTANTIATE_TEST_SUITE_P(GptV1RandomEndIdTests, ParamTest,
-    testing::Combine(testing::Values(gptModelParams),
-        testing::Values(
-            //
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
-                .useGptAttentionPlugin()
-                .setKVCacheType(KVCacheType::kPAGED)
-                .usePackedInput()),
-        testing::Values(TrtGptModelType::V1),
-        testing::Values(
-            TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
-        testing::Values(
-            // TODO: enable more tests when mixed beam width is supported
-            BeamConfig{1, {1}}, BeamConfig{2, {2}} // , BeamConfig{2, {1, 2}}
-            ),
-        testing::Values(std::nullopt),             // maxTokensInPagedKvCache
-        testing::Values(std::nullopt, 0.4),        // freeGpuMemoryFraction
-        testing::Values(false),                    // enableTrtOverlap
-        testing::Values(false),                    // enableChunkedContext
-        testing::Values(false),                    // enableStreamingMode
-        testing::Values(false),                    // enableCudaGraphMode
-        testing::Values(std::nullopt),             // hostCacheSize
-        testing::Values(true)                      // useRandomEndId
-        ),
-    generateTestName);
 
 INSTANTIATE_TEST_SUITE_P(GptTests, ParamTest,
     testing::Combine(testing::Values(gptModelParams),
@@ -1495,7 +1384,7 @@ INSTANTIATE_TEST_SUITE_P(GptjTests, ParamTest,
                 .usePackedInput()
 
                 ),
-        testing::Values(TrtGptModelType::V1, TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
         // WAR: disable wavefront and random tests on because of switched beams
         testing::Values(TrtGptModelIfbTestType::BULK
             /* , TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM */),
@@ -1528,7 +1417,7 @@ INSTANTIATE_TEST_SUITE_P(MambaTests, ParamTest,
                 .usePackedInput()
 
                 ),
-        testing::Values(TrtGptModelType::V1, TrtGptModelType::InflightBatching),
+        testing::Values(TrtGptModelType::InflightBatching),
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}),
@@ -1592,7 +1481,7 @@ INSTANTIATE_TEST_SUITE_P(LlamaTests, ParamTest,
                 .useTensorParallelism(2)
 
                 ),
-        testing::Values(TrtGptModelType::V1, TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(
@@ -1769,7 +1658,7 @@ INSTANTIATE_TEST_SUITE_P(GptjFP8Tests, ParamTest,
                 .usePackedInput()
 
                 ),
-        testing::Values(TrtGptModelType::V1, TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(

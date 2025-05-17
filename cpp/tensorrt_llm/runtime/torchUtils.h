@@ -109,6 +109,7 @@ public:
         case at::ScalarType::Bool: return IBuffer::DataType::kBOOL;
         case at::ScalarType::Float8_e4m3fn: return IBuffer::DataType::kFP8;
         case at::ScalarType::BFloat16: return IBuffer::DataType::kBF16;
+        case at::ScalarType::QUInt4x2: return IBuffer::DataType::kINT4;
         default: TLLM_THROW("unsupported data type");
         }
     }

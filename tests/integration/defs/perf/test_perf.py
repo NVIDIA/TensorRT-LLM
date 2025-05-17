@@ -83,6 +83,7 @@ MODEL_PATH_DICT = {
     "gpt_350m_moe": "gpt2-medium",
     "phi_3_mini_4k_instruct": "Phi-3/Phi-3-mini-4k-instruct",
     "phi_3_mini_128k_instruct": "Phi-3/Phi-3-mini-128k-instruct",
+    "phi_4_mini_instruct": "Phi-4-mini-instruct",
 }
 # Model PATH of HuggingFace
 HF_MODEL_PATH = {
@@ -102,6 +103,7 @@ HF_MODEL_PATH = {
     "mixtral_8x7b_v0.1_instruct_hf": "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "mistral_7b_v0.1_hf": "mistralai/Mistral-7B-v0.1",
     "flan_t5_base_hf": "google/flan-t5-small",
+    "phi_4_mini_instruct_hf": "microsoft/Phi-4-mini-instruct",
 }
 LORA_MODEL_PATH = {
     "llama_v2_13b": "llama-models-v2/chinese-llama-2-lora-13b",
@@ -366,9 +368,9 @@ class PerfTestConfig:
         # First, add the model name.
         entries = [self.model_name]
 
-        if self.runtime == "cpp":  # gptSessionBenchmark or berBenchmark runtime
+        if self.runtime == "cpp":  # bertBenchmark runtime
             entries.append(f"cpp")
-        elif self.runtime == "cppmanager":  # gptMananberBenchmark runtime
+        elif self.runtime == "cppmanager":  # gptManagerBenchmark runtime
             entries.append(f"cppmanager")
             if self.api == "exe":  # executor
                 entries.append(f"exe")
@@ -481,11 +483,9 @@ class PerfTestConfig:
         labels = test_param_labels.split("-")
 
         self.model_name = labels.pop(0)
-        self.runtime = "python" if labels[0] not in [
-            "cpp",
-            "cppmanager",
-            "bench",
-        ] else labels.pop(0)
+        assert labels[0] in ["cpp", "cppmanager", "bench"], \
+            f"Invalid runtime {labels[0]}!"
+        self.runtime = labels.pop(0)
         self.api = labels.pop(0) if labels[0] == "exe" else ""
         self.backend = labels.pop(0) if labels[0] == "pytorch" else ""
         self.streaming = labels.pop(0) if labels[0] == "streaming" else ""
@@ -592,7 +592,7 @@ class PerfTestConfig:
             assert self.model_name in allowed_models, f"model_name {self.model_name} is not in allowed_models!"
 
         # Validate runtime type.
-        VALID_RUNTIMES = ["cpp", "cppmanager", "python", "bench"]
+        VALID_RUNTIMES = ["cpp", "cppmanager", "bench"]
         assert self.runtime in VALID_RUNTIMES, f"Invalid runtime {self.runtime}!"
 
         # Validate plugin mode.
@@ -766,17 +766,18 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def set_runtime_configs(self, llm_root, working_dir,
                             perf_cache_fpath) -> None:
         if self._config.runtime == "cpp":
-            cpp_benchmark_name = "bertBenchmark" if self._config.is_bert_like(
-            ) else "gptSessionBenchmark"
-            benchmark_script = get_cpp_benchmark(cpp_benchmark_name, llm_root)
+            if not self._config.is_bert_like():
+                raise ValueError(
+                    f"Invalid config: '{self._config.runtime}' is only supported for bert-like models!"
+                )
+            benchmark_script = get_cpp_benchmark("bertBenchmark", llm_root)
         elif self._config.runtime == "cppmanager":
             benchmark_script = get_cpp_benchmark("gptManagerBenchmark",
                                                  llm_root)
         elif self._config.runtime == "bench":
             benchmark_script = "trtllm-bench"
         else:
-            benchmark_script = os.path.join(llm_root, "benchmarks", "python",
-                                            "benchmark.py")
+            raise RuntimeError(f"Invalid runtime {self._config.runtime}.")
         allowed_configs = import_allowed_perf_config()
         allowed_models = allowed_configs.get_allowed_models()
         if self._config.runtime == "bench":

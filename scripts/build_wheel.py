@@ -157,41 +157,38 @@ def setup_conan(scripts_dir, venv_python):
     return venv_conan
 
 
-def apply_torch_nvtx3_workaround(venv_python: Path):
-    """Workaround for nvtx3 path detection in PyTorch's CMake files."""
-    try:
-        # Get site-packages directory
-        result = check_output(
-            f'"{venv_python}" -c "import site; print(site.getsitepackages()[0])"',
-            shell=True,
-            text=True)
-        site_packages = Path(result.strip())
-        torch_dir = site_packages / "torch"
+def generate_fmha_cu(project_dir, venv_python):
+    fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
+    fmha_v2_cu_dir.mkdir(parents=True, exist_ok=True)
 
-        if not torch_dir.exists():
-            print(f"Not found torch installation for patching NVTX3 workaround")
-            return
+    fmha_v2_dir = project_dir / "cpp/kernels/fmha_v2"
+    os.chdir(fmha_v2_dir)
 
-        # Define patterns and their corresponding messages
-        replacement_patterns = [
-            ("find_path(nvtx3_dir NAMES nvtx3)",
-             "Applying NVTX3 workaround to {cmake_file}"),
-            ('find_path(nvtx3_dir NAMES nvtx3 PATHS "${PROJECT_SOURCE_DIR}/third_party/NVTX/c/include" NO_DEFAULT_PATH)',
-             "Applying additional NVTX3 workaround to {cmake_file}")
-        ]
+    env = os.environ.copy()
+    env.update({
+        "TORCH_CUDA_ARCH_LIST": "9.0",
+        "ENABLE_SM89_QMMA": "1",
+        "ENABLE_HMMA_FP32": "1",
+        "GENERATE_CUBIN": "1",
+        "SCHEDULING_MODE": "1",
+        "ENABLE_SM100": "1",
+        "ENABLE_SM120": "1",
+        "GENERATE_CU_TRTLLM": "true"
+    })
 
-        replacement = "find_path(nvtx3_dir NAMES nvtx3 PATHS ${CUDA_INCLUDE_DIRS})"
+    build_run("rm -rf generated")
+    build_run("rm -rf temp")
+    build_run("rm -rf obj")
+    build_run("python3 setup.py", env=env)
 
-        for search_pattern, message_template in replacement_patterns:
-            for cmake_file in torch_dir.rglob("*.cmake"):
-                content = cmake_file.read_text()
-                if search_pattern in content:
-                    print(message_template.format(cmake_file=cmake_file))
-                    new_content = content.replace(search_pattern, replacement)
-                    cmake_file.write_text(new_content)
+    # Copy generated header file when cu path is active and cubins are deleted.
+    # cubin_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin"
+    # build_run(f"mv generated/fmha_cubin.h {cubin_dir}")
 
-    except Exception as e:
-        print(f"Failed to apply NVTX3 workaround: {e}")
+    for cu_file in (fmha_v2_dir / "generated").glob("*sm*.cu"):
+        build_run(f"mv {cu_file} {fmha_v2_cu_dir}")
+
+    os.chdir(project_dir)
 
 
 def main(*,
@@ -219,7 +216,8 @@ def main(*,
          benchmarks: bool = False,
          micro_benchmarks: bool = False,
          nvtx: bool = False,
-         skip_stubs: bool = False):
+         skip_stubs: bool = False,
+         generate_fmha: bool = False):
 
     if clean:
         clean_wheel = True
@@ -243,11 +241,6 @@ def main(*,
     # Setup venv and install requirements
     venv_python, venv_conan = setup_venv(project_dir,
                                          project_dir / requirements_filename)
-
-    # Workaround for torch nvtx3 find_path not work issue with CUDA 12.9.
-    # See https://github.com/pytorch/pytorch/pull/147418.
-    apply_torch_nvtx3_workaround(Path(sys.executable))
-    apply_torch_nvtx3_workaround(venv_python)
 
     # Ensure base TRT is installed (check inside the venv)
     reqs = check_output([str(venv_python), "-m", "pip", "freeze"])
@@ -346,6 +339,13 @@ def main(*,
 
     source_dir = get_source_dir()
 
+    fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
+    if clean or generate_fmha:
+        build_run(f"rm -rf {fmha_v2_cu_dir}")
+        generate_fmha_cu(project_dir, venv_python)
+    elif not fmha_v2_cu_dir.exists():
+        generate_fmha_cu(project_dir, venv_python)
+
     with working_directory(build_dir):
         if clean or first_build or configure_cmake:
             build_run(
@@ -363,6 +363,7 @@ def main(*,
                 f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}"'
                 f' -DNVTX_DISABLE="{disable_nvtx}" -DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}'
                 f' -DBUILD_WHEEL_TARGETS="{";".join(targets)}"'
+                f' -DPython_EXECUTABLE={venv_python} -DPython3_EXECUTABLE={venv_python}'
                 f' {cmake_cuda_architectures} {cmake_def_args} {cmake_generator} -S "{source_dir}"'
             )
             print("CMake Configure command: ")
@@ -544,7 +545,7 @@ def main(*,
                 else:
                     env_ld = os.environ.copy()
 
-                    new_library_path = "/usr/local/cuda/compat/lib.real"
+                    new_library_path = "/usr/local/cuda/compat:/usr/local/cuda/compat/lib:/usr/local/cuda/compat/lib.real"
                     if 'LD_LIBRARY_PATH' in env_ld:
                         new_library_path += f":{env_ld['LD_LIBRARY_PATH']}"
                     env_ld["LD_LIBRARY_PATH"] = new_library_path
@@ -676,6 +677,9 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--skip-stubs",
                         action="store_true",
                         help="Skip building python stubs")
+    parser.add_argument("--generate_fmha",
+                        action="store_true",
+                        help="Generate the FMHA cu files.")
 
 
 if __name__ == "__main__":

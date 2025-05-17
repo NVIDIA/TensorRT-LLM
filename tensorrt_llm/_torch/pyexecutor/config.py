@@ -45,19 +45,25 @@ class PyTorchConfig:
     # If true, batches are rounded up to the nearest cuda_graph_batch_size.
     # This is usually a net win for performance.
     cuda_graph_padding_enabled: bool = False
-    enable_overlap_scheduler: bool = False
+    disable_overlap_scheduler: bool = False
     # If set, at most moe_max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time.
     # If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used.
     moe_max_num_tokens: Optional[int] = None
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'
-    # If true, will iterate over sampling_params of each request and use the
-    # corresponding decoding way, like top-k, top-p, etc.
-    mixed_decoder: bool = False
-    # If true, will use the TRTLLM decoder instead of the PyTorch decoder.
-    # The TRTLLM decoder has a wide coverage of decoding strategies.
-    enable_trtllm_decoder: bool = False
+
+    mixed_sampler: bool = False
+    """
+    If true, will iterate over sampling_params of each request and use the
+    corresponding sampling strategy, e.g. top-k, top-p, etc.
+    """
+    enable_trtllm_sampler: bool = False
+    """
+    If true, will use the TRTLLM sampler instead of the PyTorch sampler.
+    The TRTLLM sampler has a wide coverage of sampling strategies.
+    """
+
     kv_cache_dtype: str = "auto"
     use_kv_cache: bool = True
     enable_iter_perf_stats: bool = False

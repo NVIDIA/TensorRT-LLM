@@ -50,8 +50,7 @@ def get_llm_args(model: str,
     kv_cache_config = KvCacheConfig(
         free_gpu_memory_fraction=free_gpu_memory_fraction)
 
-    pytorch_backend_config = PyTorchConfig(
-        enable_overlap_scheduler=True) if backend == "pytorch" else None
+    pytorch_backend_config = PyTorchConfig() if backend == "pytorch" else None
     dynamic_batch_config = DynamicBatchConfig(
         enable_batch_size_tuning=True,
         enable_max_num_tokens_tuning=False,

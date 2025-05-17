@@ -52,9 +52,6 @@ using AlgoListType = std::unordered_map<std::tuple<int32_t, int32_t, int32_t>, s
 
 // bf16*bf16->fp32->bf16
 AlgoListType bf16_algo_list = {
-    // Deepseek v3/R1 fused_a
-    // [-algo66 -m_tile10 -m_stages35 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom5 -m_mma0 -m_cga2 -m_scheduling1]
-    {{8, 7168, 2112}, {10, 35, 1, 0, 0, 5, 2}},
     // Deepseek v3/R1 router gemm
     // [-algo66 -m_tile10 -m_stages35 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom3 -m_mma0 -m_cga2 -m_scheduling1]
     {{8, 7168, 256}, {10, 35, 1, 0, 0, 3, 2}},

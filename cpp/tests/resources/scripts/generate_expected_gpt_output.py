@@ -111,38 +111,10 @@ def generate_outputs(num_beams):
     input_name = 'input_tokens.npy'
     input_name_long = 'input_tokens_long.npy'
 
-    print('Generating GPT2 FP32 outputs')
-    model_spec_obj = ModelSpec(input_name, _tb.DataType.FLOAT)
-    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
-    if num_beams == 1:
-        generate_output(engine=model_spec_obj.get_model_path(),
-                        num_beams=num_beams,
-                        input_name=input_name,
-                        model_spec_obj=model_spec_obj)
-    model_spec_obj.use_gpt_plugin()
-    generate_output(engine=model_spec_obj.get_model_path(),
-                    num_beams=num_beams,
-                    input_name=input_name,
-                    model_spec_obj=model_spec_obj)
-
     print('Generating GPT2 FP16 outputs')
     model_spec_obj = ModelSpec(input_name, _tb.DataType.HALF)
-    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
-    if num_beams == 1:
-        generate_output(engine=model_spec_obj.get_model_path(),
-                        num_beams=num_beams,
-                        input_name=input_name,
-                        model_spec_obj=model_spec_obj)
     model_spec_obj.use_gpt_plugin()
-    generate_output(engine=model_spec_obj.get_model_path(),
-                    num_beams=num_beams,
-                    input_name=input_name,
-                    model_spec_obj=model_spec_obj)
     model_spec_obj.use_packed_input()
-    generate_output(engine=model_spec_obj.get_model_path(),
-                    num_beams=num_beams,
-                    input_name=input_name,
-                    model_spec_obj=model_spec_obj)
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.gather_logits()
     generate_output(engine=model_spec_obj.get_model_path(),

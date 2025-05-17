@@ -68,7 +68,7 @@ class SanityPerfCheck():
                             cleaned_options = []
                             for option in options:
                                 # Truncate workspace dir
-                                if "build.py" in option or "benchmark.py" in option or "SessionBenchmark.cpp" in option:
+                                if "build.py" in option or "SessionBenchmark.cpp" in option:
                                     cleaned_options.append("/".join(
                                         option.split("/")[-5:]))
                                 # Remove engine_dir as it is not useful

@@ -140,10 +140,6 @@ public:
     //! @returns [maxTokensPerStep, batchSize, beamWidth], finished states of type FinishedState, on gpu
     [[nodiscard]] TensorPtr getFinishedSteps() const;
 
-    [[nodiscard]] SizeType32 getActualBatchSize() const;
-
-    void setActualBatchSize(SizeType32 actualBatchSize);
-
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
 
     [[nodiscard]] SizeType32 getMaxSequenceLength() const;
@@ -178,7 +174,6 @@ public:
     [[nodiscard]] DecodingOutput& getJointDecodingOutput() const;
 
 private:
-    SizeType32 mActualBatchSize{};
     SizeType32 mMaxBatchSize{};
     SizeType32 mMaxBeamWidth{};
     SizeType32 mMaxSequenceLength{};

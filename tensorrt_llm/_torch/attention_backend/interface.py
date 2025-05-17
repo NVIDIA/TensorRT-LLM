@@ -49,6 +49,7 @@ class AttentionMetadata:
     mapping: Optional[Mapping] = None
 
     enable_flash_mla: bool = False
+    enable_paged_context_mla: bool = False
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
 
@@ -393,7 +394,7 @@ class RopeParams:
 
         if self.scale_type == RotaryScalingType.yarn:
             rope_inv_freq = None
-            rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+            _, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
                 self.max_positions,
                 self.dim,
                 self.theta,

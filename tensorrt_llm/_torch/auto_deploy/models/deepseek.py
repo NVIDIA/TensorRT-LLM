@@ -129,12 +129,8 @@ def deepseek_v3_moe_exact(self, hidden_states):
 @torch.inference_mode()
 def deepseek_v3_moe(self, hidden_states):
     """DeepSeekV3MoE forward function rewritten in Mixtral style to enable torch export."""
-    identity = hidden_states
-    batch_size, sequence_length, hidden_dim = hidden_states.shape
 
     selected_experts, routing_weights, *_ = self.gate(hidden_states)
-    hidden_states = hidden_states.view(-1, hidden_dim)
-
     final_hidden_states = torch.ops.moe.torch_moe(
         hidden_states,
         selected_experts,
@@ -144,10 +140,8 @@ def deepseek_v3_moe(self, hidden_states):
         w3_weight=[expert.up_proj.weight for expert in self.experts],
     )
 
-    final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-
     if self.config.n_shared_experts is not None:
-        final_hidden_states = final_hidden_states + self.shared_experts(identity)
+        final_hidden_states = final_hidden_states + self.shared_experts(hidden_states)
 
     return final_hidden_states.to(hidden_states.dtype)
 

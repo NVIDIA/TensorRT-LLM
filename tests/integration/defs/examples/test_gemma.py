@@ -80,7 +80,6 @@ VSWA_MODELS = VSWA_ATTENTION.keys()
 GEMMA2_MODELS = {GEMMA_2_9B_IT, GEMMA_2_27B_IT}
 
 
-@pytest.mark.skip(reason="untested")
 @pytest.mark.parametrize("batch_size", [8])
 @pytest.mark.parametrize("data_type", ['bfloat16'])
 @pytest.mark.parametrize("qformat", ['fp8'])
@@ -164,25 +163,28 @@ def hf_gemma_quantization_1gpu(batch_size,
     if "gemma-7b" in gemma_model_root:
         threshold_score = 18
 
-    window = [
-        "--max_attention_window_size",
-        *max_attention_window,
-    ] if max_attention_window is not None else []
+    window = {
+        'max_attention_window_size': max_attention_window
+    } if max_attention_window is not None else {}
+    summary_cmd = generate_summary_cmd(
+        gemma_example_root,
+        engine_dir=engine_dir,
+        max_ite=40,
+        batch_size=batch_size,
+        tensorrt_llm_rouge1_threshold=threshold_score,
+        dataset_dir=llm_datasets_root,
+        rouge_dir=llm_rouge_root,
+        **window)
 
-    summary_cmd = [
-        f"{gemma_example_root}/../../../summarize.py",
-        "--test_trt_llm",
-        f"--hf_model_dir={gemma_model_root}",
-        f"--tokenizer_dir={gemma_model_root}",
-        f"--engine_dir={engine_dir}",
-        "--check_accuracy",
-        f"--tensorrt_llm_rouge1_threshold={threshold_score}",
-        "--max_ite=40",
-        f"--batch_size={batch_size}",
-        f"--dataset_dir={llm_datasets_root}",
-        f"--rouge_dir={llm_rouge_root}",
-        *window,
-    ]
+    ckpt_type = get_ckpt_type(gemma_model_root)
+    vocab_file = get_vocab_file(gemma_model_root)
+    if ckpt_type == "hf":
+        summary_cmd.extend([
+            f"--hf_model_dir={gemma_model_root}",
+            f"--tokenizer_dir={gemma_model_root}"
+        ])
+    else:
+        summary_cmd.append(f"--vocab_file={vocab_file}")
     venv_check_call(llm_venv, summary_cmd)
 
 
@@ -403,9 +405,10 @@ def test_llm_gemma_1gpu_mmlu(batch_size, data_type, gemma_model_root, llm_venv,
 
 @skip_pre_hopper
 @skip_post_blackwell
-@pytest.mark.parametrize("gemma_model_root",
-                         ["gemma-2b", "gemma-7b", *GEMMA2_MODELS],
-                         indirect=True)
+@pytest.mark.parametrize(
+    "gemma_model_root",
+    ["gemma-2b", "gemma-7b", *GEMMA2_MODELS, "gemma-3-1b-it"],
+    indirect=True)
 def test_hf_gemma_fp8_base_bf16_multi_lora(gemma_model_root,
                                            llm_venv,
                                            cmodel_dir,

@@ -251,11 +251,10 @@ void runDisaggTest(tensorrt_llm::testing::disaggexecutor::DisaggExecutorLeader& 
                         flakyTestInfo);
 
                     testData.validateContextLogits(outConfig.returnContextLogits, givenInputLengths.at(batchId),
-                        beamWidth, contextLogits, vocabSizePadded, batchId, batchingType);
+                        beamWidth, contextLogits, vocabSizePadded, batchId);
                     testData.validateGenerationLogits(outConfig.returnGenerationLogits, result.isFinal, streaming,
                         outConfig.excludeInputFromOutput, givenInputLengths.at(batchId), reqMaxNewTokens.at(batchId),
-                        beamWidth, beamTokens, genLogits, vocabSizePadded, batchId, batchingType,
-                        returnAllGeneratedTokens);
+                        beamWidth, beamTokens, genLogits, vocabSizePadded, batchId, returnAllGeneratedTokens);
                 }
                 else
                 {
@@ -410,11 +409,10 @@ void runDisaggTest(DisaggExecutorOrchestrator& executor, tensorrt_llm::runtime::
                         flakyTestInfo);
 
                     testData.validateContextLogits(outConfig.returnContextLogits, givenInputLengths.at(batchId),
-                        beamWidth, contextLogits, vocabSizePadded, batchId, batchingType);
+                        beamWidth, contextLogits, vocabSizePadded, batchId);
                     testData.validateGenerationLogits(outConfig.returnGenerationLogits, result.isFinal, streaming,
                         outConfig.excludeInputFromOutput, givenInputLengths.at(batchId), reqMaxNewTokens.at(batchId),
-                        beamWidth, beamTokens, genLogits, vocabSizePadded, batchId, batchingType,
-                        returnAllGeneratedTokens);
+                        beamWidth, beamTokens, genLogits, vocabSizePadded, batchId, returnAllGeneratedTokens);
                 }
                 else
                 {

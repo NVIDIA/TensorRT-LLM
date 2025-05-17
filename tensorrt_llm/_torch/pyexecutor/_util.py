@@ -1,11 +1,13 @@
 import math
 import random
 from collections.abc import Iterable
+from typing import Optional
 
 import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
+from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
 from tensorrt_llm.logger import logger
@@ -14,33 +16,18 @@ from tensorrt_llm.lora_manager import (LoraConfig,
                                        load_torch_hf_lora)
 from tensorrt_llm.mapping import Mapping
 
-from ..speculative import get_num_spec_layers, get_spec_decoder
-from .decoder import (EarlyStopDecoder, TorchDecoder, TorchStarAttentionDecoder,
-                      TRTLLMDecoder)
+from ..speculative import get_spec_decoder
+from .config_utils import is_mla, is_nemotron_hybrid
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .model_engine import KV_CACHE_MANAGER_KEY, PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
                                PeftCacheManager, ResourceManager)
+from .sampler import (EarlyStopSampler, TorchSampler, TorchStarAttentionSampler,
+                      TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
-
-
-def is_nemotron_hybrid(config):
-    if hasattr(config, "hybrid_override_pattern"):
-        return True
-    return False
-
-
-def is_mla(config):
-    if hasattr(config, "kv_lora_rank"):
-        assert hasattr(
-            config, "qk_rope_head_dim"
-        ), "both of kv_lora_rank and qk_rope_head_dim are required."
-        return True
-    return False
-
 
 GB = 1 << 30
 
@@ -74,7 +61,8 @@ def get_cache_size_per_token(model_config, mapping):
             config.hidden_size // config.num_attention_heads,
         ) * num_key_value_heads // tp_size
 
-    num_hidden_layers = len(mapping.pp_layers(config.num_hidden_layers))
+    # provide at least 1 layer to prevent division by zero cache size
+    num_hidden_layers = max(len(mapping.pp_layers(config.num_hidden_layers)), 1)
     mem_per_token *= num_hidden_layers * head_dim
     # K and V
     mem_per_token *= kv_factor
@@ -89,7 +77,8 @@ def get_fraction_from_executor_config(executor_config):
 
 
 def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
-                   draft_model_config, mapping: Mapping, alloc_kv_tokens: int):
+                   draft_model_config, mapping: Mapping,
+                   alloc_kv_tokens: int) -> int:
     model_kv_size_per_token = get_cache_size_per_token(model_config, mapping)
     draft_kv_size_per_token = get_cache_size_per_token(
         draft_model_config, mapping) if draft_model_config is not None else 0
@@ -99,8 +88,8 @@ def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
                         alloc_kv_tokens * kv_size_per_token) * fraction
     logger.info(
         f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
-        f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB"
-    )
+        f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
+        f"fraction is set {fraction}, kv size is {kv_size_per_token}")
     max_tokens = int((available_kv_mem) // kv_size_per_token)
     max_tokens = max(max_tokens, 0)
     return max_tokens
@@ -149,12 +138,11 @@ def get_token_num_for_estimation(executor_config, model_config):
         return None
 
 
-def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
-                                 model_engine: PyTorchModelEngine,
-                                 executor_config: ExecutorConfig,
-                                 mapping: Mapping, origin_seq_len: int,
-                                 ctx_chunk_config,
-                                 draft_model_engine: PyTorchModelEngine):
+def estimate_max_kv_cache_tokens(
+        py_executor: PyExecutor, model_engine: PyTorchModelEngine,
+        executor_config: ExecutorConfig, mapping: Mapping, origin_seq_len: int,
+        ctx_chunk_config,
+        draft_model_engine: PyTorchModelEngine) -> Optional[int]:
     # TODO: support CP by generating dummy requests for it.
     if 'cp_type' in mapping.cp_config:
         return executor_config.max_num_tokens
@@ -176,10 +164,10 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     py_executor.enable_iter_perf_stats = False
     req_ids = []
     if py_executor.dist.mapping.rank == 0:
-        # NOTE: TRTLLMDecoder requires origin_seq_len - 1 for requests.
+        # NOTE: TRTLLMSampler requires origin_seq_len - 1 for requests.
         #       Spec decoders with overlap require origin_seq_len.
         seq_len = origin_seq_len - 1 if type(
-            py_executor.decoder) == TRTLLMDecoder else origin_seq_len
+            py_executor.sampler) == TRTLLMSampler else origin_seq_len
         req = create_dummy_context_requests(max_num_tokens, seq_len, vocab_size)
         req_ids = py_executor.enqueue_requests(req)
     req_ids = py_executor.dist.broadcast(req_ids, root=0)
@@ -212,7 +200,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
         model_engine.model.model_config, draft_model_config, mapping,
         kv_stats.max_num_blocks * kv_stats.tokens_per_block)
 
-    if kv_cache_max_tokens_in is not None and kv_cache_max_tokens is not None:
+    if kv_cache_max_tokens_in is not None:
         kv_cache_max_tokens = min(kv_cache_max_tokens, kv_cache_max_tokens_in)
 
     logger.info(f"Estimated max tokens in KV cache : {kv_cache_max_tokens}")
@@ -223,8 +211,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
         "kv_cache_manager").shutdown()
 
     py_executor.is_warmup = False
-    if py_executor.dist.mapping.rank == 0:
-        py_executor.shutdown()
+    py_executor.shutdown()
 
     return kv_cache_max_tokens
 
@@ -251,12 +238,9 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
             kv_cache_dtype = str_dtype_to_binding(
                 torch_dtype_to_str(model_engine.dtype))
 
-        num_hidden_layers = len(mapping.pp_layers(config.num_hidden_layers))
+        num_hidden_layers = config.num_hidden_layers
 
         if is_mla(config):
-            if spec_config is not None:
-                num_hidden_layers += get_num_spec_layers(spec_config)
-
             kv_cache_manager = KVCacheManager(
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.
@@ -269,14 +253,12 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
                 max_batch_size=executor_config.max_batch_size,
                 mapping=mapping,
                 dtype=kv_cache_dtype,
-                num_extra_kv_tokens=0
-                if spec_config is None else spec_config.num_extra_kv_tokens,
+                spec_config=spec_config,
             )
         elif is_nemotron_hybrid(config):
             config = model_engine.model.model_config.pretrained_config
             num_layers = config.hybrid_override_pattern.count("*")
-            mamba_num_layers = num_mamba_layers = config.hybrid_override_pattern.count(
-                "M")
+            mamba_num_layers = config.hybrid_override_pattern.count("M")
             kv_cache_manager = MambaHybridCacheManager(
                 # mamba cache parameters
                 config.hidden_size,
@@ -298,11 +280,9 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
                 max_batch_size=executor_config.max_batch_size,
                 mapping=mapping,
                 dtype=kv_cache_dtype,
-                num_extra_kv_tokens=0,
+                spec_config=spec_config,
             )
         else:
-            if spec_config is not None:
-                num_hidden_layers += get_num_spec_layers(spec_config)
             kv_cache_manager = KVCacheManager(
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -314,13 +294,13 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
                 max_batch_size=executor_config.max_batch_size,
                 mapping=mapping,
                 dtype=kv_cache_dtype,
-                num_extra_kv_tokens=0
-                if spec_config is None else spec_config.num_extra_kv_tokens,
+                spec_config=spec_config,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == KV_CACHE_MANAGER_KEY:
             executor_config.max_seq_len = kv_cache_manager.max_seq_len
 
+    assert kv_cache_manager is not None
     return kv_cache_manager
 
 
@@ -333,8 +313,8 @@ def create_py_executor_instance(dist,
                                 model_engine,
                                 draft_model_engine,
                                 start_worker,
-                                decoder,
-                                lora_config: LoraConfig = None):
+                                sampler,
+                                lora_config: LoraConfig = None) -> PyExecutor:
     kv_cache_manager = resources.get(KV_CACHE_MANAGER_KEY, None)
 
     spec_config = model_engine.spec_config
@@ -343,7 +323,7 @@ def create_py_executor_instance(dist,
         if spec_config is not None:
             raise ValueError(
                 "Guided decoding is not supported with speculative decoding.")
-        if pytorch_backend_config.enable_overlap_scheduler:
+        if not pytorch_backend_config.disable_overlap_scheduler:
             raise ValueError(
                 "Guided decoding is not supported with overlap scheduler.")
 
@@ -412,9 +392,10 @@ def create_py_executor_instance(dist,
             lora_config.lora_target_modules,
             lora_config.trtllm_modules_to_hf_modules)
 
-    num_micro_batches = 1
-    if mapping.has_pp:
-        num_micro_batches = mapping.pp_size + pytorch_backend_config.enable_overlap_scheduler
+    if mapping.has_pp():
+        num_micro_batches = mapping.pp_size
+    else:
+        num_micro_batches = 1 if pytorch_backend_config.disable_overlap_scheduler else 2
 
     resources["seq_slot_manager"] = SeqSlotManager(
         executor_config.max_batch_size * num_micro_batches)
@@ -447,10 +428,10 @@ def create_py_executor_instance(dist,
     return PyExecutor(resource_manager,
                       scheduler,
                       model_engine=model_engine,
-                      decoder=decoder,
+                      sampler=sampler,
                       dist=dist,
-                      enable_overlap_scheduler=pytorch_backend_config.
-                      enable_overlap_scheduler,
+                      disable_overlap_scheduler=pytorch_backend_config.
+                      disable_overlap_scheduler,
                       max_batch_size=executor_config.max_batch_size,
                       max_draft_tokens=spec_config.max_draft_tokens
                       if spec_config is not None else 0,
@@ -459,31 +440,33 @@ def create_py_executor_instance(dist,
                       start_worker=start_worker)
 
 
-def instantiate_decoder(model_engine, executor_config, pytorch_backend_config,
-                        mapping):
+def instantiate_sampler(model_engine: PyTorchModelEngine,
+                        executor_config: ExecutorConfig,
+                        pytorch_backend_config: PyTorchConfig,
+                        mapping: Mapping):
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
-        decoder = TorchStarAttentionDecoder(
+        sampler = TorchStarAttentionSampler(
             max_seq_len=model_engine.max_seq_len)
     elif model_engine.spec_config is not None:
-        decoder = get_spec_decoder(max_seq_len=model_engine.max_seq_len,
+        sampler = get_spec_decoder(max_seq_len=model_engine.max_seq_len,
                                    spec_config=model_engine.spec_config)
-    elif pytorch_backend_config.enable_trtllm_decoder:
+    elif pytorch_backend_config.enable_trtllm_sampler:
         decoding_mode = get_decoding_mode(executor_config)
-        decoder = TRTLLMDecoder(executor_config, model_engine.model,
-                                model_engine.dtype, mapping, decoding_mode,
-                                pytorch_backend_config.enable_overlap_scheduler)
+        sampler = TRTLLMSampler(
+            executor_config, model_engine.model, model_engine.dtype, mapping,
+            decoding_mode, pytorch_backend_config.disable_overlap_scheduler)
     elif not model_engine.model.model_config.is_generation:
-        # NOTE: choose decoder based on model type
-        decoder = EarlyStopDecoder()
+        # NOTE: choose sampler based on model type
+        sampler = EarlyStopSampler()
     else:
-        decoder = TorchDecoder(
+        sampler = TorchSampler(
             max_seq_len=model_engine.max_seq_len,
-            mixed_decoder=pytorch_backend_config.mixed_decoder)
-    return decoder
+            mixed_sampler=pytorch_backend_config.mixed_sampler)
+    return sampler
 
 
-def get_decoding_mode(executor_config):
+def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:
     '''This implementation is based off trtGptModelInflightBatching.cpp getDecodingMode().'''
 
     if executor_config.decoding_config and executor_config.decoding_config.decoding_mode and not executor_config.decoding_config.decoding_mode.isAuto(

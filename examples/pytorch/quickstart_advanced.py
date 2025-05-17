@@ -55,7 +55,7 @@ def add_llm_args(parser):
     parser.add_argument('--enable_attention_dp',
                         default=False,
                         action='store_true')
-    parser.add_argument('--enable_trtllm_decoder',
+    parser.add_argument('--enable_trtllm_sampler',
                         default=False,
                         action='store_true')
     parser.add_argument('--tp_size', type=int, default=1)
@@ -72,7 +72,7 @@ def add_llm_args(parser):
     parser.add_argument("--kv_cache_fraction", type=float, default=None)
 
     # Runtime
-    parser.add_argument('--enable_overlap_scheduler',
+    parser.add_argument('--disable_overlap_scheduler',
                         default=False,
                         action='store_true')
     parser.add_argument('--enable_chunked_prefill',
@@ -124,7 +124,7 @@ def parse_arguments():
 
 def setup_llm(args):
     pytorch_config = PyTorchConfig(
-        enable_overlap_scheduler=args.enable_overlap_scheduler,
+        disable_overlap_scheduler=args.disable_overlap_scheduler,
         kv_cache_dtype=args.kv_cache_dtype,
         attn_backend=args.attention_backend,
         use_cuda_graph=args.use_cuda_graph,
@@ -133,7 +133,7 @@ def setup_llm(args):
         torch_compile_enabled=args.use_torch_compile,
         torch_compile_piecewise_cuda_graph=args.use_piecewise_cuda_graph,
         moe_backend=args.moe_backend,
-        enable_trtllm_decoder=args.enable_trtllm_decoder)
+        enable_trtllm_sampler=args.enable_trtllm_sampler)
 
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=not args.disable_kv_cache_reuse,

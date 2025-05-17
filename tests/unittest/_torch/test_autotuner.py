@@ -246,14 +246,12 @@ def test_multiple_runners_different_attributes():
 
         # Verify different cache keys are generated
         shapes = (x.shape, w.shape)
-        cache_key_0 = tuner.get_cache_key(
-            "test_multiple_runners", runner_0,
-            tuner._find_nearest_profile(tuning_config.dynamic_tensors, (),
-                                        shapes))
-        cache_key_1 = tuner.get_cache_key(
-            "test_multiple_runners", runner_1,
-            tuner._find_nearest_profile(tuning_config.dynamic_tensors, (),
-                                        shapes))
+        cache_key_0 = runner_0.get_cache_key(custom_op="test_multiple_runners",
+                                             input_shapes=shapes,
+                                             tuning_config=tuning_config)
+        cache_key_1 = runner_1.get_cache_key(custom_op="test_multiple_runners",
+                                             input_shapes=shapes,
+                                             tuning_config=tuning_config)
 
         assert cache_key_0 != cache_key_1, "Runners with different attributes should have different cache keys"
 
@@ -277,13 +275,13 @@ def test_multiple_dynamic_shapes_cache():
         runner, tactic = tuner.choose_one("test_multiple_dynamic_shapes",
                                           runners, tuning_config, [x, w])
 
-        # Verify cache size - should have 12 entries (3x4 combinations)
-        cache_entries = [
-            k for k in tuner.profiling_cache.keys()
-            if k[0] == "test_multiple_dynamic_shapes"
-        ]
-        assert len(cache_entries) == 12, \
-            f"Expected 12 cache entries for 3x4 shape combinations, got {len(cache_entries)}"
+    # Verify cache size - should have 12 entries (3x4 combinations)
+    cache_entries = [
+        k for k in tuner.profiling_cache.keys()
+        if k[0][0] == "test_multiple_dynamic_shapes"
+    ]
+    assert len(cache_entries) == 12, \
+        f"Expected 12 cache entries for 3x4 shape combinations, got {len(cache_entries)}"
 
 
 def test_autotuner_statistics():
