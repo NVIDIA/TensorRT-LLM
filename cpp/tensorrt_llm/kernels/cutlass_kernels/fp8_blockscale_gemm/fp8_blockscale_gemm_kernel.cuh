@@ -1047,98 +1047,23 @@ __global__ void scale_1x128_kernel(
 #endif
 }
 
-template <int NumThreads>
-__global__ void problem_m_padding_kernel(
-    int64_t const* problem_m_offsets, int64_t* problem_m_padded_offsets, int num_problems)
-{
-    extern __shared__ char shared_memory[];
-    int64_t* smem_problem_m_boundaries = reinterpret_cast<int64_t*>(shared_memory);
-    using BlockScan = cub::BlockScan<int64_t, NumThreads>;
-    using TempStorage = typename BlockScan::TempStorage;
-    TempStorage* smem_temp_storage = reinterpret_cast<TempStorage*>(smem_problem_m_boundaries + num_problems);
-    // problem_m_offsets[0] is omitted because its value is known to be 0
-    for (int i = threadIdx.x; i < num_problems; i += NumThreads)
-    {
-        smem_problem_m_boundaries[i] = problem_m_offsets[i + 1];
-    }
-    __syncthreads();
-    int64_t reduce_offset = 0;
-    int idx_scan = 0;
-    int num_problems_padded = div_up(num_problems, NumThreads) * NumThreads;
-    for (int i = threadIdx.x; i < num_problems_padded; i += NumThreads)
-    {
-        int64_t problem_m_size = 0;
-        if (i < num_problems)
-        {
-            problem_m_size = smem_problem_m_boundaries[i] - (i > 0 ? smem_problem_m_boundaries[i - 1] : 0);
-        }
-        int64_t scan_val = ((problem_m_size + 31) >> 5) << 5;
-        int64_t block_aggregate;
-        // To reduce the use of __syncthreads, TempStorage is not reused
-        BlockScan(smem_temp_storage[idx_scan++]).InclusiveSum(scan_val, scan_val, block_aggregate);
-        if (i < num_problems)
-        {
-            problem_m_padded_offsets[i + 1] = scan_val + reduce_offset;
-        }
-        reduce_offset += block_aggregate;
-    }
-    if (threadIdx.x == 0)
-    {
-        problem_m_padded_offsets[0] = 0;
-    }
-}
-
-template <bool UseBinarySearch, int NumThreads, typename InputType, typename OutputType>
+template <bool UseBinarySearch, typename InputType, typename OutputType>
 __global__ void scale_1x128_kernel(OutputType* output, float* scales, InputType const* input,
-    int64_t const* problem_m_offsets, int64_t* problem_m_padded_offsets, int num_problems, int dim_x,
+    int64_t const* problem_m_offsets, int64_t const* problem_m_padded_offsets, int num_problems, int dim_x,
     int64_t scale_leading_dim, uint32_t scale_dim_x_mul, uint32_t scale_dim_x_shr)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     extern __shared__ char shared_memory[];
     int64_t* smem_problem_m_boundaries = reinterpret_cast<int64_t*>(shared_memory);
     int64_t* smem_problem_m_padded_boundaries = smem_problem_m_boundaries + num_problems;
-    using BlockScan = cub::BlockScan<int64_t, NumThreads>;
-    using TempStorage = typename BlockScan::TempStorage;
-    TempStorage* smem_temp_storage = reinterpret_cast<TempStorage*>(smem_problem_m_padded_boundaries + num_problems);
 
-    // problem_m_offsets[0] is omitted because its value is known to be 0
-    for (int i = threadIdx.x; i < num_problems; i += NumThreads)
+    // problem_m_offsets[0] and problem_m_padded_offsets[0] are omitted because their values are known to be 0
+    for (int i = threadIdx.x; i < num_problems; i += blockDim.x)
     {
         smem_problem_m_boundaries[i] = problem_m_offsets[i + 1];
+        smem_problem_m_padded_boundaries[i] = problem_m_padded_offsets[i + 1];
     }
     __syncthreads();
-    int64_t reduce_offset = 0;
-    int idx_scan = 0;
-    int num_problems_padded = div_up(num_problems, NumThreads) * NumThreads;
-    for (int i = threadIdx.x; i < num_problems_padded; i += NumThreads)
-    {
-        int64_t problem_m_size = 0;
-        if (i < num_problems)
-        {
-            problem_m_size = smem_problem_m_boundaries[i] - (i > 0 ? smem_problem_m_boundaries[i - 1] : 0);
-        }
-        int64_t scan_val = ((problem_m_size + 31) >> 5) << 5;
-        int64_t block_aggregate;
-        // To reduce the use of __syncthreads, TempStorage is not reused
-        BlockScan(smem_temp_storage[idx_scan++]).InclusiveSum(scan_val, scan_val, block_aggregate);
-        if (i < num_problems)
-        {
-            smem_problem_m_padded_boundaries[i] = scan_val + reduce_offset;
-        }
-        reduce_offset += block_aggregate;
-    }
-    __syncthreads();
-    if (blockIdx.x == 0)
-    {
-        for (int i = threadIdx.x; i < num_problems; i += NumThreads)
-        {
-            problem_m_padded_offsets[i + 1] = smem_problem_m_padded_boundaries[i];
-        }
-        if (threadIdx.x == 0)
-        {
-            problem_m_padded_offsets[0] = 0;
-        }
-    }
 
     size_t scales_along_dim_x = div_up(dim_x, 128);
     size_t scales_along_dim_y = smem_problem_m_boundaries[num_problems - 1];
@@ -1158,8 +1083,8 @@ __global__ void scale_1x128_kernel(OutputType* output, float* scales, InputType 
         boundary_right = smem_problem_m_boundaries[0];
     }
 
-    for (size_t warp_idx = (threadIdx.x + blockIdx.x * NumThreads) / 32; warp_idx < total_scales;
-         warp_idx += (NumThreads * gridDim.x) / 32)
+    for (size_t warp_idx = (threadIdx.x + blockIdx.x * blockDim.x) / 32; warp_idx < total_scales;
+         warp_idx += (blockDim.x * gridDim.x) / 32)
     {
         uint32_t scales_idx_y; // = warp_idx / scales_along_dim_x;
         uint32_t scales_idx_x; // = warp_idx % scales_along_dim_x;
@@ -1683,9 +1608,9 @@ void fp8_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, int ld_a
 }
 
 void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d, uint32_t num_problems,
-    int64_t const* problem_m_offsets, int64_t* problem_m_padded_offsets, uint32_t expected_m, uint32_t max_shape_m,
-    uint32_t max_shape_m_padded, uint32_t shape_n, uint32_t shape_k, float* scales_a, float* scales_b,
-    cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
+    int64_t const* problem_m_offsets, int64_t const* problem_m_padded_offsets, uint32_t expected_m,
+    uint32_t max_shape_m, uint32_t max_shape_m_padded, uint32_t shape_n, uint32_t shape_k, float* scales_a,
+    float* scales_b, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
 {
     if (num_device_sms < 0)
     {
@@ -1701,13 +1626,14 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
     auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
     deep_gemm::runGemm(kernel, mat_a, 0, mat_b, 0, mat_d, 0, scales_a, scales_b, max_shape_m, shape_n, shape_k,
         best_block_m, best_block_n, block_k, num_problems, best_num_tma_multicast,
-        deep_gemm::GemmType::GroupedWithOffset, const_cast<int64_t*>(problem_m_offsets), problem_m_padded_offsets,
-        stream, num_device_sms, static_cast<uint32_t>(best_smem_size), max_shape_m_padded);
+        deep_gemm::GemmType::GroupedWithOffset, const_cast<int64_t*>(problem_m_offsets),
+        const_cast<int64_t*>(problem_m_padded_offsets), stream, num_device_sms, static_cast<uint32_t>(best_smem_size),
+        max_shape_m_padded);
 }
 
 void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, float* scales_a,
     __nv_bfloat16 const* mat_b, __nv_fp8_e4m3* fp8_mat_b, float* scales_b, __nv_bfloat16* mat_d,
-    int64_t const* problem_m_offsets, int64_t* problem_m_padded_offsets, int num_problems, int64_t expected_m,
+    int64_t const* problem_m_offsets, int64_t const* problem_m_padded_offsets, int num_problems, int64_t expected_m,
     int64_t max_shape_m, int64_t max_shape_m_padded, int shape_n, int shape_k, cudaStream_t stream,
     bool internal_quantize_a = true, bool internal_quantize_b = true)
 {
@@ -1723,30 +1649,18 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, 
         uint32_t scale_dim_x_mul, scale_dim_x_shr;
         kernel_utils::find_divisor(scale_dim_x_mul, scale_dim_x_shr, scales_dim_x);
 
-        using BlockScan = cub::BlockScan<int64_t, NumThreads>;
-        int smem_size
-            = num_problems * sizeof(int64_t) * 2 + div_up(num_problems, NumThreads) * sizeof(BlockScan::TempStorage);
+        int smem_size = num_problems * sizeof(int64_t) * 2;
         int num_blocks
             = std::min(static_cast<int64_t>(kNumDeviceSMs), div_up(max_shape_m * scales_dim_x, NumThreads / 32));
         // Binary search is expected to have lower complexity when max_shape_m is small
         bool use_binary_search
             = static_cast<double>(max_shape_m) * scales_dim_x / static_cast<double>(NumThreads * num_blocks / 32)
             <= static_cast<double>(num_problems) / std::log2(static_cast<double>(num_problems));
-        auto kernel = use_binary_search ? scale_1x128_kernel<true, NumThreads, __nv_bfloat16, __nv_fp8_e4m3>
-                                        : scale_1x128_kernel<false, NumThreads, __nv_bfloat16, __nv_fp8_e4m3>;
+        auto kernel = use_binary_search ? scale_1x128_kernel<true, __nv_bfloat16, __nv_fp8_e4m3>
+                                        : scale_1x128_kernel<false, __nv_bfloat16, __nv_fp8_e4m3>;
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
         kernel<<<num_blocks, NumThreads, smem_size, stream>>>(fp8_mat_a, scales_a, mat_a, problem_m_offsets,
             problem_m_padded_offsets, num_problems, shape_k, max_shape_m_padded, scale_dim_x_mul, scale_dim_x_shr);
-    }
-    else
-    {
-        constexpr int NumThreads = 256;
-        using BlockScan = cub::BlockScan<int64_t, NumThreads>;
-        int smem_size
-            = num_problems * sizeof(int64_t) + div_up(num_problems, NumThreads) * sizeof(BlockScan::TempStorage);
-        auto kernel = problem_m_padding_kernel<NumThreads>;
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-        kernel<<<1, NumThreads, smem_size, stream>>>(problem_m_offsets, problem_m_padded_offsets, num_problems);
     }
 
     if (internal_quantize_b)

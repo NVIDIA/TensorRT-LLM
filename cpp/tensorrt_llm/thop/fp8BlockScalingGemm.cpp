@@ -167,13 +167,16 @@ extern torch::Tensor fp8_block_scaling_gemm(torch::Tensor const& mat1, torch::Te
 }
 
 torch::Tensor fp8_block_scaling_moe_gemm_hopper(torch::Tensor const& mat1, torch::Tensor const& mat2,
-    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, torch::Tensor const& token_offset)
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, torch::Tensor const& token_offset,
+    torch::Tensor const& token_padded_offsets)
 {
     TORCH_CHECK(mat1.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix dtype must be FP8.");
     TORCH_CHECK(mat2.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix dtype must be FP8.");
     TORCH_CHECK(mat1Scale.scalar_type() == at::ScalarType::Float, "Scale dtype must be FP32.");
     TORCH_CHECK(mat2Scale.scalar_type() == at::ScalarType::Float, "Scale dtype must be FP32.");
     TORCH_CHECK(token_offset.scalar_type() == at::ScalarType::Long, "Token offset dtype must be INT64.");
+    TORCH_CHECK(
+        token_padded_offsets.scalar_type() == at::ScalarType::Long, "Token padded offsets dtype must be INT64.");
 
     TORCH_CHECK(mat1.dim() == 2, "mat1 must be a matrix of shape (m_total, k)");
     TORCH_CHECK(mat2.dim() == 3, "mat2 must be a matrix of shape (num_problems, n, k)");
@@ -200,18 +203,21 @@ torch::Tensor fp8_block_scaling_moe_gemm_hopper(torch::Tensor const& mat1, torch
     void* workspace_ptr = workspace.data_ptr();
     gemm_runner->configureWorkspace(static_cast<char*>(workspace_ptr));
     gemm_runner->moeGemm(out.data_ptr(), mat1.data_ptr(), mat2.data_ptr(),
-        static_cast<int64_t*>(token_offset.data_ptr()), num_problems, n, k, stream, mat1ScalePtr, mat2ScalePtr);
+        static_cast<int64_t*>(token_offset.data_ptr()), static_cast<int64_t*>(token_padded_offsets.data_ptr()),
+        num_problems, n, k, stream, mat1ScalePtr, mat2ScalePtr);
 
     return out;
 }
 
 extern torch::Tensor fp8_block_scaling_moe_gemm(torch::Tensor const& mat1, torch::Tensor const& mat2,
-    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, torch::Tensor const& token_offset)
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, torch::Tensor const& token_offset,
+    torch::Tensor const& token_padded_offsets)
 {
     auto const sm = tensorrt_llm::common::getSMVersion();
     switch (sm)
     {
-    case 90: return fp8_block_scaling_moe_gemm_hopper(mat1, mat2, mat1Scale, mat2Scale, token_offset);
+    case 90:
+        return fp8_block_scaling_moe_gemm_hopper(mat1, mat2, mat1Scale, mat2Scale, token_offset, token_padded_offsets);
     default: TORCH_CHECK(false, "Unsupported SM version for FP8 block scaling MoEGEMM");
     }
 }
@@ -304,7 +310,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "fp8_block_scaling_bmm_out(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor(a!) out) -> "
         "Tensor(a!)");
     m.def(
-        "fp8_block_scaling_moe_gemm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor token_offset) "
+        "fp8_block_scaling_moe_gemm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor token_offset, "
+        "Tensor token_padded_offset) "
         "-> Tensor");
 }
 

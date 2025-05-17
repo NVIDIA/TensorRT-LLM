@@ -166,11 +166,17 @@ def construct_batched(
 @pytest.mark.parametrize("k, n", [(7168, 4096), (2048, 7168)])
 def test_fp8_block_scaling_moe_gemm(ms, k, n):
     offset_cpu = [0] + list(itertools.accumulate(ms))
+    padded_offset_cpu = [0] + list(
+        itertools.accumulate([(val + 31) // 32 * 32 for val in ms]))
     offset = torch.tensor(offset_cpu, device='cuda', dtype=torch.int64)
+    padded_offset = torch.tensor(padded_offset_cpu,
+                                 device='cuda',
+                                 dtype=torch.int64)
     x_fp8, x_scale, y_fp8, y_scale, ref_out = construct_grouped(ms, k, n)
     x_fp8, x_scale = change_to_offset_layout(ms, x_fp8, x_scale)
     out = torch.ops.trtllm.fp8_block_scaling_moe_gemm(x_fp8, y_fp8, x_scale,
-                                                      y_scale, offset)
+                                                      y_scale, offset,
+                                                      padded_offset)
     diff = calc_diff(out, ref_out)
     assert diff < 1e-3
     torch.testing.assert_close(out, ref_out, atol=1e-3, rtol=1e-3)
