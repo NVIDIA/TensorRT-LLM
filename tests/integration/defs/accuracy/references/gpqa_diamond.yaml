@@ -15,3 +15,9 @@ deepseek-ai/DeepSeek-R1:
     accuracy: 70.45
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 44.95
+nvidia/Llama-3.1-Nemotron-Nano-8B-v1:
+  - accuracy: 40.40
+nvidia/Llama-3_1-Nemotron-Ultra-253B-v1:
+  - accuracy: 58.08
+# microsoft/Phi-4-mini-instruct:
+#   - accuracy: 0.0
