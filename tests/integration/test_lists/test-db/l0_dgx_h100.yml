@@ -115,10 +115,29 @@ l0_dgx_h100:
   tests:
   # ------------- CPP tests ---------------
   - cpp/test_multi_gpu.py::test_simple[90]
-  - cpp/test_multi_gpu.py::test_t5[90]
-  - cpp/test_multi_gpu.py::test_llama_executor[90]
-  - cpp/test_multi_gpu.py::test_trt_gpt_real_decoder[90]
-  - cpp/test_multi_gpu.py::test_disagg[90]
+  - cpp/test_multi_gpu.py::test_enc_dec[t5-90]
+  - cpp/test_multi_gpu.py::test_llama_executor[llama-orchestrator-90]
+  - cpp/test_multi_gpu.py::test_llama_executor[llama-leader-90]
+  - cpp/test_multi_gpu.py::test_llama_executor_guided_decoding[llama-90]
+  - cpp/test_multi_gpu.py::test_llama_executor_logits_proc[llama-90]
+  - cpp/test_multi_gpu.py::test_trt_gpt_real_decoder[llama-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[gpt-2proc-mpi_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[gpt-2proc-ucx_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[llama-2proc-mpi_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[llama-4proc-mpi_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[llama-8proc-mpi_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[llama-2proc-ucx_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[llama-4proc-ucx_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[llama-8proc-ucx_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_asymmetric_executor[llama-4proc-mpi_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_asymmetric_executor[llama-6proc-mpi_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_asymmetric_executor[llama-8proc-mpi_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_asymmetric_executor[llama-4proc-ucx_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_asymmetric_executor[llama-6proc-ucx_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_asymmetric_executor[llama-8proc-ucx_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_orchestrator_params[llama-mpi_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_orchestrator_params[llama-ucx_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_spawn_orchestrator[llama-ucx_kvcache-90]
 - condition:
     ranges:
       system_gpu_count:

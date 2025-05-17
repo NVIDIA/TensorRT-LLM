@@ -31,7 +31,7 @@ pytest tests/integration/defs/cpp/test_e2e.py::test_model[llama-90]
 
 pytest tests/integration/defs/cpp/test_e2e.py::test_benchmarks[gpt-90]
 
-pytest tests/integration/defs/cpp/test_multi_gpu.py::test_disagg[90]
+pytest tests/integration/defs/cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[gpt-mpi_kvcache-90]
 ```
 
 ## Manual steps
