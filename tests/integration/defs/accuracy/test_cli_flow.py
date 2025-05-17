@@ -210,6 +210,8 @@ class TestNemotronSuper(CliFlowAccuracyTestHarness):
     def test_auto_dtype_tp2(self):
         self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=2, dtype='auto')
 
+    @pytest.mark.skip(
+        reason="nemotron-nas scripts have to accommodate fp8 flags")
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_device_not_contain(["H100", "B200"])
     def test_fp8_prequantized_tp2(self, mocker):
