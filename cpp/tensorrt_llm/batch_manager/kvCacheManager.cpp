@@ -1292,6 +1292,38 @@ void WindowBlockManager::storeBlocks(
     }
 }
 
+void WindowBlockManager::storeBlock(BlockKey const& blockKey, KVCacheBlock::IdType blockId, BlockPtr const& prevBlock)
+{
+    TLLM_CHECK(prevBlock != nullptr && prevBlock->getPrevBlock() != nullptr);
+    TLLM_LOG_DEBUG("%s::storeBlock - store block %d", mLogPrefix.c_str(), blockId);
+    auto& block = mAllBlocksById[blockId];
+    block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
+    block->setPrevBlock(prevBlock);
+    block->setPrevBlockInSeq(prevBlock);
+    if (prevBlock != nullptr)
+    {
+        prevBlock->addNextBlock(blockKey, block);
+    }
+
+    // Sanity check. The list of stored blocks should be connected.
+    TLLM_CHECK(block->getPrevBlockInSeq() == nullptr || block->getPrevBlockInSeq()->getHash() == prevBlock->getHash());
+    auto oldHash = block->getHash();
+    auto newHash = BlockKeyHasher()(blockKey, prevBlock->getHash());
+    if (oldHash != newHash)
+    {
+        TLLM_LOG_DEBUG("#%d block hash %zx -> %zx", block->getBlockId(), oldHash, newHash);
+        removeBlockFromHashMap(block);
+        block->setHash(newHash);
+        addBlockToHashMap(block);
+    }
+    if (mEventManager)
+    {
+        std::vector<BlockPtr> storedBlocks;
+        storedBlocks.push_back(block);
+        mEventManager->enqueueStoredEvent(storedBlocks);
+    }
+}
+
 void BlockManager::replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx)
 {
     mWindowBlockManagers.at(windowSize).replaceSharedBlock(sequence, blockIdx);
@@ -1420,6 +1452,61 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
         }
         manager.releaseBlocks(sequence);
     }
+}
+
+void BlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
+{
+    // we store newest block for potential reuse only if:
+    // - Block reuse is enabled.
+    // - A request was provided to this function call to identify which tokens these blocks cover
+    // - Beam search is NOT enabled <=> beam width == 1
+    // - The sequence was not marked for use with cyclic kv-cache when it was added (when its context is too long to fit
+    // the max attention window).
+    // - The sequence did not switch to cyclic kv-cache during generation phase.
+    //  A sequence is cyclic if its *minimum window size* is crossed, even if other window sizes were not reached.
+    bool const storeBlocksForReuse = sequence.getBeamWidth() == 1 && llmRequest.has_value() && !sequence.isCyclic();
+    if (!storeBlocksForReuse)
+    {
+        return;
+    }
+    for (auto& [_, manager] : mWindowBlockManagers)
+    {
+        manager.storeNewBlock(sequence, llmRequest);
+    }
+}
+
+void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
+{
+    auto constexpr beamIdx = 0;
+    auto const& uniqueTokens = llmRequest->getUniqueTokens(beamIdx);
+    auto const& cacheBlockIds = sequence.getCacheBlockIds(mWindowSize);
+
+    // TODO: get the caller to mark tokens as filled / not filled, so that the kv-cache manager doesn't
+    // have to guess. Only (length - 1) tokens of the sequence have their kv-state recorded in kv-cache. We assume
+    // the last token's state is not filled yet.
+    auto const usableSize = static_cast<runtime::SizeType32>(uniqueTokens.size()) - 1;
+    if (usableSize % mTokensPerBlock != 0)
+    {
+        return;
+    }
+    auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, true);
+    auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
+    if (blockedUniqueTokens.size() < 2)
+    {
+        storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+        return;
+    }
+
+    auto prevBlock = mAllBlocksById.at(cacheBlockIds[beamIdx][cacheBlockIds[beamIdx].size() - 2]);
+
+    // If the previous block is not in the radix tree, we don't need to store the new block
+    if (prevBlock->getPrevBlock() == nullptr)
+    {
+        storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+        return;
+    }
+
+    storeBlock(blockKeys.back(), cacheBlockIds[beamIdx].back(), prevBlock);
 }
 
 void WindowBlockManager::storeBlocksForReuse(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
@@ -1966,6 +2053,17 @@ void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
     if (mEnableBlockReuse && !sequence.isCyclic())
     {
         mBlockManager.storeContextBlocks(sequence, llmRequest);
+    }
+}
+
+void KVCacheManager::storeNewBlock(LlmRequest const& llmRequest)
+{
+    auto const requestId = llmRequest.mRequestId;
+    auto& sequence = getSequence(requestId);
+    bool const storeBlocksForReuse = sequence.getBeamWidth() == 1 && !sequence.isCyclic();
+    if (mEnableBlockReuse && storeBlocksForReuse && !sequence.isCyclic())
+    {
+        mBlockManager.storeNewBlock(sequence, llmRequest);
     }
 }
 
