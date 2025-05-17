@@ -76,6 +76,20 @@ def run_simple_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
                      env=new_env,
                      timeout=600)
 
+    new_env = copy.copy(cpp_env)
+    # Transfer agent tests
+    transfer_agent_test_2_proc = [
+        "mpirun",
+        "-n",
+        "2",
+        "--allow-run-as-root",
+        "executor/transferAgentTest",
+    ]
+    _cpp.run_command(transfer_agent_test_2_proc,
+                     cwd=tests_dir,
+                     env=new_env,
+                     timeout=600)
+
 
 def run_llama_executor_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     tests_dir = build_dir / "tests"
