@@ -89,6 +89,7 @@ class OPTDecoderLayer(DecoderLayer):
 
     def forward(
         self,
+        position_ids: torch.LongTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         **kwargs,
@@ -211,8 +212,11 @@ class OPTModel(DecoderModel):
 
         # residual = None
         for decoder_layer in self.layers:
-            hidden_states = decoder_layer(hidden_states=hidden_states,
-                                          attn_metadata=attn_metadata)
+            hidden_states = decoder_layer(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+            )
 
         if self.final_layer_norm is not None:
             hidden_states = self.final_layer_norm(hidden_states)
