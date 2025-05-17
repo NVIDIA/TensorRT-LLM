@@ -42,9 +42,8 @@ enum class Attention_mask_type
     PADDING = 0,
     // Mask the padded tokens and all the tokens that come after in a sequence.
     CAUSAL,
-    // Causal mask + mask the beginning tokens based on sliding_window_size
-    // Only pay attention to [max(0, q_i - sliding_window_size), q_i]
-    SLIDING_WINDOW_CAUSAL,
+    // Causal mask + attend to the specific sliding window or chunk.
+    SLIDING_OR_CHUNKED_CAUSAL,
     // The custom mask input.
     CUSTOM_MASK,
 };
@@ -57,7 +56,7 @@ static inline std::string mask_type_to_string(Attention_mask_type mask_type)
     {
     case Attention_mask_type::PADDING: return "padding";
     case Attention_mask_type::CAUSAL: return "causal";
-    case Attention_mask_type::SLIDING_WINDOW_CAUSAL: return "sliding_window_causal";
+    case Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL: return "sliding_or_chunked_causal";
     case Attention_mask_type::CUSTOM_MASK: return "custom_mask";
     default: assert(false); return "";
     }
@@ -238,9 +237,15 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
     // h_q_per_kv is sometimes rematerialized in the kernel by formula h / h_kv to reclaim one register
     int h_q_per_kv = 1;
 
+    // The number of grouped heads in the seqlen dimension.
+    int num_grouped_heads = 1;
+
     // Sliding Window Attention
     // Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
     int sliding_window_size = INT_MAX;
+
+    // The chunked attention size (<= 0 means no chunked attention).
+    int log2_chunked_attention_size = 0;
 
     // The softcapping scale (scale * tanh (x / scale)) applied to bmm1 output.
     float softcapping_scale_bmm1 = 0.0f;
@@ -290,7 +295,7 @@ struct Fused_multihead_attention_launch_params
     bool warp_specialization = false;
     // granular tiling flash attention kernels
     bool use_granular_tiling = false;
-    // causal masking or sliding_window_causal masking or dense(padding) mask.
+    // causal masking or sliding_or_chunked_causal masking or dense(padding) mask.
     fmha::Attention_mask_type attention_mask_type = fmha::Attention_mask_type::PADDING;
     // the attention input layout.
     fmha::Attention_input_layout attention_input_layout = fmha::Attention_input_layout::PACKED_QKV;
