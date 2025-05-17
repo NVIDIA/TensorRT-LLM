@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# AFFILIATES. All rights reserved. SPDX-License-Identifier: NVIDIA TensorRT
+# Source Code License Agreement
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related documentation
+# and any modifications thereto. Any use, reproduction, disclosure or
+# distribution of this material and related documentation without an express
+# license agreement from NVIDIA CORPORATION or its affiliates is strictly
+# prohibited.
+
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
+  message(
+    STATUS
+      "The NIXL backend is temporarily unavailable on the aarch64 platform.")
+  unset(NIXL_ROOT)
+endif()
+
+if(NIXL_ROOT)
+  find_package(NIXL REQUIRED)
+  # Check if all required packages were found
+  if(NOT NIXL_FOUND)
+    message(
+      FATAL_ERROR "NIXL not found. Please install NIXL or set `NIXL_ROOT`.")
+  endif()
+
+  # Define the NIXL wrapper target
+  set(NIXL_WRAPPER_TARGET "tensorrt_llm_nixl_wrapper")
+
+  # Add the NIXL wrapper target
+  add_library(${NIXL_WRAPPER_TARGET} SHARED transferAgent.cpp)
+  target_compile_options(
+    ${NIXL_WRAPPER_TARGET} PRIVATE -U_GLIBCXX_USE_CXX11_ABI
+                                   -D_GLIBCXX_USE_CXX11_ABI=1 -Wno-error)
+
+  # Add include directories
+  target_include_directories(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
+
+  # Link against all NIXL libraries
+  target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
+
+  add_custom_command(
+    TARGET ${NIXL_WRAPPER_TARGET}
+    POST_BUILD
+    COMMAND nm -C $<TARGET_FILE:${NIXL_WRAPPER_TARGET}> | grep -E
+            'tensorrt_llm.*__cxx11|__cxx11.*tensorrt_llm' && exit 1 || exit 0)
+endif()

@@ -55,7 +55,7 @@ def parse_arguments() -> _ap.Namespace:
 
 def get_current_timestamp() -> str:
     """Get the current timestamp in YYYYMMDDhhmm format."""
-    return _dt.datetime.now(_dt.UTC).strftime("%Y%m%d%H%M")
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d%H%M")
 
 
 def run_shell_command(command: str, dry_run: bool) -> None:
@@ -209,7 +209,7 @@ def rename_images(*,
         run_shell_command(f"docker push {dst_image}", dry_run)
         find_and_replace_in_files(base_dir / "jenkins", ".groovy",
                                   dst_image_old, dst_image, dry_run)
-        find_and_replace_in_files(base_dir / ".devcontainer", ".yaml",
+        find_and_replace_in_files(base_dir / ".devcontainer", ".yml",
                                   dst_image_old, dst_image, dry_run)
 
 
