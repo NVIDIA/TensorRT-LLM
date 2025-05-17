@@ -457,17 +457,23 @@ class Deepseekv3MoE(nn.Module):
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
                               all_rank_num_tokens, cutlass_min_latency_mode):
         # max-throughput
+        use_dp_padding = False
         if self.use_dp and self.mapping.tp_size > 1:
-            max_num_token = max(all_rank_num_tokens)
-            hidden_states = torch.nn.functional.pad(
-                hidden_states,
-                (0, 0, 0, max_num_token - hidden_states.shape[0]))
             # FP4 all_gather moves this bf16 allgather in to after topk and fp4 quantization
             # to reduce allreduce BW
             if disable_fp4_allgather() and not self.enable_alltoall:
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
-                                          gather_dim=0)
+                                          dim=0,
+                                          sizes=all_rank_num_tokens)
+            elif not self.experts.is_cutlass() or (not self.experts.has_fp8_qdq
+                                                   and self.experts.has_nvfp4):
+                # Use padding when not using the cutlass path or when x_sf in self.experts is not None
+                use_dp_padding = True
+                max_num_token = max(all_rank_num_tokens)
+                hidden_states = torch.nn.functional.pad(
+                    hidden_states,
+                    (0, 0, 0, max_num_token - hidden_states.shape[0]))
 
         router_logits = self.gate(hidden_states)
 
@@ -475,7 +481,8 @@ class Deepseekv3MoE(nn.Module):
                                      router_logits,
                                      cutlass_min_latency_mode,
                                      output_dtype=hidden_states.dtype,
-                                     all_rank_num_tokens=all_rank_num_tokens)
+                                     all_rank_num_tokens=all_rank_num_tokens,
+                                     use_dp_padding=use_dp_padding)
 
         return routed_output
 
@@ -928,12 +935,11 @@ class DeepseekV3Model(DecoderModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
+        aux_stream_list = [torch.cuda.Stream() for _ in range(2)]
         self.aux_stream_dict = {
-            key: torch.cuda.Stream()
-            for key in [
-                AuxStreamType.Attention, AuxStreamType.MoeShared,
-                AuxStreamType.MoeChunkingOverlap
-            ]
+            AuxStreamType.Attention: aux_stream_list[0],
+            AuxStreamType.MoeShared: aux_stream_list[0],
+            AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
         }
 
         self.embed_tokens = Embedding(

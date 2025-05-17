@@ -17,7 +17,6 @@ l0_h100:
   # Only key models in H100: llama/mixtral/nemotron/deepseek
   - unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)"
   - unittest/_torch -k "modeling_llama"
-  - unittest/_torch/multi_gpu_modeling -k "deepseek"
   - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_nemotron"
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype

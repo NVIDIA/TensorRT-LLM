@@ -257,7 +257,10 @@ class Llama4MoE(nn.Module):
 
     def compute_routed_output(self, hidden_states, all_rank_num_tokens,
                               cutlass_min_latency_mode):
+        use_dp_padding = False
         if self.enable_attention_dp and self.mapping.tp_size > 1:
+            # Use padding here to keep the behavior unchanged
+            use_dp_padding = True
             max_num_token_across_dp_ranks = max(all_rank_num_tokens)
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
@@ -267,7 +270,8 @@ class Llama4MoE(nn.Module):
         routed_output = self.experts(hidden_states,
                                      router_logits,
                                      cutlass_min_latency_mode,
-                                     all_rank_num_tokens=all_rank_num_tokens)
+                                     all_rank_num_tokens=all_rank_num_tokens,
+                                     use_dp_padding=use_dp_padding)
         return routed_output
 
     def forward(
