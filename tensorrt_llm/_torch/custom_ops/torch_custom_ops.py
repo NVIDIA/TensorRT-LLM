@@ -10,6 +10,9 @@ from ..utils import (get_last_power_of_2_num_tokens_buckets,
                      get_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2, next_positive_power_of_2)
 
+_torch_compile_event = [torch.cuda.Event() for _ in range(2)]
+_torch_compile_prev_stream = None
+
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
 @torch.library.custom_op("trtllm::bmm_out", mutates_args=("out", ))
@@ -526,3 +529,31 @@ def _(
     is_gen_only = attention_input_type == AttentionInputType.generation_only
     v_head_size = head_size if not is_mla_enable else kv_lora_rank if is_gen_only else v_head_dim
     return q.new_empty((num_tokens, num_heads * v_head_size), dtype=out_dtype)
+
+
+@torch.library.custom_op("trtllm::set_stream", mutates_args=())
+def set_stream(stream_ptr: int) -> None:
+    if stream_ptr == -1:
+        stream = _torch_compile_prev_stream
+    else:
+        stream = torch.cuda.ExternalStream(stream_ptr)
+    assert stream is not None
+    torch.cuda.set_stream(stream)
+
+
+@torch.library.custom_op("trtllm::record_event", mutates_args=())
+def record_event(event_idx: int) -> None:
+    event = _torch_compile_event[event_idx]
+    event.record()
+
+
+@torch.library.custom_op("trtllm::wait_event", mutates_args=())
+def wait_event(event_idx: int) -> None:
+    event = _torch_compile_event[event_idx]
+    event.wait()
+
+
+@torch.library.custom_op("trtllm::get_current_stream", mutates_args=())
+def get_current_stream() -> None:
+    global _torch_compile_prev_stream
+    _torch_compile_prev_stream = torch.cuda.current_stream()

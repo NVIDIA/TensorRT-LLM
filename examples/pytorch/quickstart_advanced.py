@@ -86,7 +86,11 @@ def add_llm_args(parser):
     parser.add_argument('--use_torch_compile',
                         default=False,
                         action='store_true',
-                        help='Use torch.compile to optimize the model')
+                        help='Enable torch compile')
+    parser.add_argument('--torch_compile_fullgraph',
+                        default=False,
+                        action='store_true',
+                        help='Enable torch compile full graph')
     parser.add_argument('--use_piecewise_cuda_graph',
                         default=False,
                         action='store_true',
@@ -131,6 +135,7 @@ def setup_llm(args):
         load_format=args.load_format,
         print_iter_log=args.print_iter_log,
         torch_compile_enabled=args.use_torch_compile,
+        torch_compile_fullgraph=args.torch_compile_fullgraph,
         torch_compile_piecewise_cuda_graph=args.use_piecewise_cuda_graph,
         moe_backend=args.moe_backend,
         enable_trtllm_sampler=args.enable_trtllm_sampler)

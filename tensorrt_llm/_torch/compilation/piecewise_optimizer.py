@@ -13,6 +13,7 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug
 from tensorrt_llm.logger import logger
 
 from ..utils import get_piecewise_cuda_graph_flag, make_weak_ref
+from .multi_stream import multi_stream_pass
 from .utils import (get_arg, get_enable_piecewise_cuda_graph_capture_flag,
                     is_call_function)
 
@@ -23,6 +24,7 @@ class PiecewiseInterpreter(Interpreter):
         self,
         module: GraphModule,
         enable_inductor: bool,
+        enable_multi_stream: bool,
         compile_time_num_tokens: Union[int | torch.SymInt],
         cuda_graph_batch_sizes: list[int],
         exclude_modules_id: list[int],
@@ -38,7 +40,8 @@ class PiecewiseInterpreter(Interpreter):
         self.cuda_graph_batch_sizes = cuda_graph_batch_sizes
         self.exclude_modules = [f"submod_{i}" for i in exclude_modules_id]
         self.graph_pool_handle = graph_pool_handle
-        self.enable_inductor = enable_inductor
+        self.enable_inductor = enable_inductor if not enable_multi_stream else False
+        self.enable_multi_stream = enable_multi_stream
 
     def run(self, *args):
         fake_args = [
@@ -79,8 +82,9 @@ class PiecewiseInterpreter(Interpreter):
                 runtime_num_tokens_idx,
                 self.cuda_graph_batch_sizes,
                 self.graph_pool_handle,
-                compile_fx(submod, args) if self.enable_inductor else submod,
+                submod,
                 self.enable_inductor,
+                self.enable_multi_stream,
             )
 
         return output
@@ -91,6 +95,7 @@ class Entry:
     shape: int
 
     enable_inductor: bool = False
+    enable_multi_stream: bool = False
     compiled: bool = False
     warmup_count: int = 0
 
@@ -115,6 +120,7 @@ class PiecewiseRunner(object):
         graph_pool_handle,
         default_callable: Callable,
         enable_inductor: bool,
+        enable_multi_stream: bool,
     ):
         if runtime_num_tokens_idx != None:
             assert isinstance(compile_time_num_tokens, torch.SymInt)
@@ -127,6 +133,7 @@ class PiecewiseRunner(object):
         self.call_count = 0
         self.graph_pool_handle = graph_pool_handle
         self.enable_inductor = enable_inductor
+        self.enable_multi_stream = enable_multi_stream
 
         self.entries: dict[int, Entry] = {}
 
@@ -152,8 +159,12 @@ class PiecewiseRunner(object):
 
         entry = self.entries[runtime_num_of_token]
 
-        if entry.enable_inductor and not entry.compiled:
-            entry.callable = compile_fx(entry.callable, args)
+        if not entry.compiled:
+            if self.enable_multi_stream:
+                entry.callable = multi_stream_pass(entry.callable)
+            elif self.enable_inductor:
+                entry.callable = compile_fx(entry.callable, args)
+
             entry.compiled = True
 
         if entry.cuda_graph is None:
@@ -215,6 +226,7 @@ def piecewise_optimizer(
     gm: GraphModule,
     example_inputs: List[torch.Tensor],
     enable_inductor: bool,
+    enable_multi_stream: bool,
     input_num_tokens: Union[int | torch.SymInt],
     cuda_graph_batch_sizes: Sequence[int],
     graph_pool_handle: tuple[int, int],
@@ -301,6 +313,7 @@ def piecewise_optimizer(
     PiecewiseInterpreter(
         gm,
         enable_inductor,
+        enable_multi_stream,
         input_num_tokens,
         cuda_graph_batch_sizes,
         exclude_modules_id,

@@ -75,6 +75,7 @@ class PyTorchConfig:
     torch_compile_enabled: bool = False
     torch_compile_fullgraph: bool = True
     torch_compile_inductor_enabled: bool = False
+    torch_compile_multi_stream: bool = True
     torch_compile_piecewise_cuda_graph: bool = False
     # When torch compile is enabled, userbuffers is enabled by default
     torch_compile_enable_userbuffers: bool = True

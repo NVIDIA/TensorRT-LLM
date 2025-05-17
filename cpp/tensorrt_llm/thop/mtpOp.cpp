@@ -93,8 +93,8 @@ std::tuple<th::Tensor, th::Tensor> mtp_prepare_drafter_inputs_op(th::Tensor& inp
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////
 std::tuple<th::Tensor, th::Tensor> mtp_sampling_and_accepted_draft_tokens_op(th::Tensor& logits,
-    th::Tensor& draftTokens, th::Tensor& targetTokens, th::Tensor& acceptedTokens, th::Tensor& numAcceptedTokens,
-    int64_t numMTPModules, int64_t batchSize, int64_t numContextRequest, int64_t vocabSize)
+    th::Tensor& draftTokens, th::Tensor& targetTokens, int64_t numMTPModules, int64_t batchSize,
+    int64_t numContextRequest, int64_t vocabSize)
 {
     int const numGenerationRequest = batchSize - numContextRequest;
     auto dataType = logits.scalar_type();
@@ -109,6 +109,9 @@ std::tuple<th::Tensor, th::Tensor> mtp_sampling_and_accepted_draft_tokens_op(th:
     TLLM_CHECK(draftTokensSizes[0] == (numGenerationRequest * numMTPModules));
 
     auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
+    auto acceptedTokens = torch::empty(
+        {batchSize, numMTPModules + 1}, at::TensorOptions().dtype(torch::kInt32).device(logits.device()));
+    auto numAcceptedTokens = torch::ones({batchSize}, at::TensorOptions().dtype(torch::kInt32).device(logits.device()));
 
     // Fill params
     tk::MTPSampleAndAcceptDraftTokensParam params;
@@ -288,8 +291,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "mtp_sampling_and_accepted_draft_tokens_op(Tensor logits, Tensor draftTokens, Tensor "
-        "targetTokens, Tensor acceptedTokens, Tensor numAcceptedTokens, int numMTPModules, "
-        "int batchSize, int numContextRequest, int vocabSize) -> (Tensor, Tensor)");
+        "targetTokens, int numMTPModules, int batchSize, int numContextRequest, int vocabSize) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

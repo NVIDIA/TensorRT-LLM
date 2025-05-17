@@ -356,6 +356,8 @@ class PyTorchModelEngine(ModelEngine):
                 self._torch_compile_backend = Backend(
                     pytorch_backend_config.torch_compile_inductor_enabled,
                     enable_userbuffers=use_ub,
+                    enable_multi_stream=pytorch_backend_config.
+                    torch_compile_multi_stream,
                     enable_piecewise_cuda_graph=pytorch_backend_config.
                     torch_compile_piecewise_cuda_graph,
                     cuda_graph_batch_sizes=pytorch_backend_config.

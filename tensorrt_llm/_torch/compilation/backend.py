@@ -2,6 +2,7 @@ import os
 from typing import List, Optional
 
 import torch
+import torch._inductor.config as inductor_config
 from torch._functorch.aot_autograd import aot_module_simplified
 from torch._inductor.compile_fx import compile_fx, select_decomp_table
 from torch._inductor.pattern_matcher import PatternMatcherPass
@@ -11,6 +12,7 @@ from torch.fx import GraphModule
 import tensorrt_llm
 from tensorrt_llm import logger
 
+from .multi_stream import multi_stream_pass
 from .patterns.ar_residual_norm import register_ar_residual_norm
 from .patterns.residual_add_norm import register_add_norm
 from .patterns.ub_allreduce import register_ub_patterns
@@ -28,6 +30,7 @@ class Backend:
         self,
         enable_inductor=True,
         enable_userbuffers=False,
+        enable_multi_stream=True,
         enable_piecewise_cuda_graph: bool = False,
         cuda_graph_batch_sizes: Optional[List[int]] = None,
     ) -> None:
@@ -38,12 +41,16 @@ class Backend:
         self.call_count = 0
         self.custom_passes = Backend.get_custom_pass(enable_userbuffers)
         self.rank = tensorrt_llm.mpi_rank()
-        self.enable_inductor = enable_inductor
+        # If multi-stream is enabled, we disable inductor since they are not compatible
+        self.enable_inductor = enable_inductor if not enable_multi_stream else False
+        self.enable_multi_stream = enable_multi_stream
+        self.aux_stream = None
         self.cuda_graph_batch_sizes = (cuda_graph_batch_sizes
                                        if cuda_graph_batch_sizes is not None
                                        else [])
         self.piecewise_cuda_graph = enable_piecewise_cuda_graph
         self.no_optimization = False
+        inductor_config.enable_auto_functionalized_v2 = False
 
         if Backend._graph_pool_handle is None:
             Backend._graph_pool_handle = torch.cuda.graph_pool_handle()
@@ -99,6 +106,11 @@ class Backend:
                 self.cuda_graph_batch_sizes,
                 self._graph_pool_handle,
             )
+        elif self.enable_multi_stream:
+            # After multi-stream pass, we'd better not to run any pass on the graph since multi-stream relay on the specific op order to work properly
+            gm, aux_stream = multi_stream_pass(gm)
+            self.aux_stream = aux_stream
+            return gm.forward
         elif self.enable_inductor:
             return compile_fx(gm, example_inputs)
         else:
