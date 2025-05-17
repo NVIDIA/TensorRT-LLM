@@ -228,7 +228,7 @@ pipeline {
                     }
                     steps
                     {
-                        buildImage("trtllm", "push", "skip", "", LLM_BRANCH_TAG)
+                        buildImage("trtllm", params.action, "skip", "", LLM_BRANCH_TAG)
                     }
                 }
                 stage("Build x86_64-skip") {
@@ -246,7 +246,7 @@ pipeline {
                     }
                     steps
                     {
-                        buildImage("trtllm", "push", "skip", "", LLM_BRANCH_TAG + "-sbsa", "", true)
+                        buildImage("trtllm", params.action, "skip", "", LLM_BRANCH_TAG + "-sbsa", "", true)
                     }
                 }
                 stage("Build rockylinux8 x86_64-skip-py3.10") {
