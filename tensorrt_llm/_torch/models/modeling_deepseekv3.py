@@ -300,11 +300,16 @@ class DeepseekV3Gate(BaseMoeRoutingMethod):
             is_fused=fuse_routing_kernel)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # router gemm
-        logits = torch.ops.trtllm.cublas_mm(hidden_states,
-                                            self.weight.t(),
-                                            bias=None,
-                                            out_dtype=torch.float32)
+        if hidden_states.size(0) >= 1 and hidden_states.size(0) <= 16:
+            logits = torch.ops.trtllm.router_gemm_op(hidden_states,
+                                                     self.weight.t(),
+                                                     bias=None,
+                                                     out_dtype=torch.float32)
+        else:
+            logits = torch.ops.trtllm.cublas_mm(hidden_states,
+                                                self.weight.t(),
+                                                bias=None,
+                                                out_dtype=torch.float32)
         return logits
 
     def load_weights(self, weights: List[Dict]):
@@ -510,8 +515,8 @@ class Deepseekv3MoE(nn.Module):
                 cutlass_min_latency_mode)
             return routed_output
 
-        shared_output, routed_output = maybe_execute_in_parallel(
-            _compute_shared_output, _compute_routed_output,
+        routed_output, shared_output = maybe_execute_in_parallel(
+            _compute_routed_output, _compute_shared_output,
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared], self.aux_stream)
 
@@ -754,6 +759,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                         residual=residual,
                         norm_weight=self.post_attention_layernorm.weight,
                         eps=self.post_attention_layernorm.variance_epsilon,
+                        trigger_completion_at_end=False,
                     ))
             else:
                 # No fusion
@@ -770,6 +776,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
                         eps=self.next_layer_layernorm.variance_epsilon,
+                        trigger_completion_at_end=False,
                     ))
             else:
                 if self.next_layer_layernorm is not None:
