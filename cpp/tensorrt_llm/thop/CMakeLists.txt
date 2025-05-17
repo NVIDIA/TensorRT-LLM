@@ -62,6 +62,7 @@ add_library(
   mambaConv1dOp.cpp
   moeOp.cpp
   moeCommOp.cpp
+  moeLoadBalanceOp.cpp
   fp8BlockScaleMoe.cpp
   fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp

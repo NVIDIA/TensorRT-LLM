@@ -42,6 +42,7 @@ set(SRCS
     ipcSocket.cpp
     ipcNvlsMemory.cpp
     memoryCounters.cpp
+    moeLoadBalancer.cpp
     ncclCommunicator.cpp
     promptTuningParams.cpp
     runtimeKernels.cu
