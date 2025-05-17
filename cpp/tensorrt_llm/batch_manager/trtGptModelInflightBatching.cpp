@@ -1717,7 +1717,8 @@ void TrtGptModelInflightBatching::executeStep(
         // TODO: support layer-wise cross kv cache in encoder-decoder models
         if (!layerWiseRequests.empty() && !mModelConfig.useCrossAttention())
         {
-            int const numLayers = mModelConfig.getNbAttentionLayers(mWorldConfig.getPipelineParallelism());
+            int const numLayers = mModelConfig.getNbAttentionLayers(
+                mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank());
             progress = std::make_shared<ContextProgress>(numLayers);
         }
         bufferCast<void*>(*mBuffers[bufferId]->transformerBuffers->contextProgressHost)[0] = progress.get();
