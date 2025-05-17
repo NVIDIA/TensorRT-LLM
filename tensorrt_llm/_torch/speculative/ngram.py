@@ -106,14 +106,13 @@ class NGramPoolManager(BaseResourceManager):
             )
 
             # Pad to max_draft_tokens
-            pad_length = self.max_num_draft_tokens - len(draft_tokens)
-            draft_tokens.extend([request.py_end_id] * pad_length)
+            if draft_tokens is not None:
+                pad_length = self.max_num_draft_tokens - len(draft_tokens)
+                draft_tokens.extend([request.py_end_id] * pad_length)
             request.py_draft_tokens = draft_tokens
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
-        """
-        We do not need work after docoding part in NGram drafter
-        """
+        pass
 
     def free_resources(self, request: LlmRequest):
         if self.is_public_pool:
@@ -124,9 +123,7 @@ class NGramPoolManager(BaseResourceManager):
             self.start_index.pop(request_id)
 
     def add_dummy_requests(self, request_ids: List[int]):
-        """
-        We do not need work after docoding part in NGram drafter
-        """
+        pass
 
     def shutdown(self):
         pass
@@ -161,11 +158,10 @@ class NGramPoolManager(BaseResourceManager):
         end_id: int,
         max_sequence_length: int,
     ):
-        draft_tokens = [end_id]
         prefix_len = len(prefix)
-        # Skip search if prefix is length of `max_length - 1`
-        if prefix_len >= max_sequence_length - 1:
-            return draft_tokens
+        max_draft_token_length = max_sequence_length - 1 - prefix_len
+        if max_draft_token_length <= 0:  # Skip search if prefix is long enough
+            return None
 
         if request_id not in self.start_index:  # A new request
             self.start_index[request_id] = 0
@@ -199,12 +195,14 @@ class NGramPoolManager(BaseResourceManager):
                     pool[pattern].add(new_match)
 
         # Find match
+        draft_tokens = [end_id]
         for size in range(min(self.max_matching_ngram_size, prefix_len - 1), 0,
                           -1):
             pattern = tuple(prefix[-size:])
             if pattern not in pool:
                 continue
-            draft_tokens = list(pool[pattern][0 if self.is_use_oldest else -1])
+            draft_tokens = pool[pattern][0 if self.is_use_oldest else -1]
+            draft_tokens = list(draft_tokens)[:max_draft_token_length]
             break
         self.start_index[request_id] = max(
             0, prefix_len -
