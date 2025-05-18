@@ -86,53 +86,55 @@ def _generate(
         for token_ids, this_logits in zip(all_token_ids, all_logits)
     ]
 
-    # sample token greedily
-    sampled_tokens = torch.cat([
-        torch.argmax(this_logits[-1]).unsqueeze(0) for this_logits in all_logits
-    ],
-                               dim=0)
-    for i in range(num_seqs):
-        all_token_ids[i].append(sampled_tokens[i].item())
-        all_logprobs[i].append(
-            get_logprobs(sampled_tokens[i].unsqueeze(0),
-                         all_logits[i][-1:]).item())
-
-    # one token already generated at prefill
-    for i in range(tokens_to_generate - 1):
-        num_cached_tokens_per_seq = [
-            prompt_len + i + 1 for prompt_len in prompt_lens
-        ]
-        position_ids = torch.tensor([num_cached_tokens_per_seq],
-                                    dtype=torch.int64,
-                                    device=device)
-
-        attn_metadata = metadata_cls(
-            seq_lens=torch.tensor([1] * num_seqs, dtype=torch.int),
-            num_contexts=0,
-            kv_cache_params=KVCacheParams(
-                use_cache=True,
-                num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            ),
-            max_num_requests=num_seqs,
-            max_num_tokens=8192,
-            kv_cache_manager=cache,
-            request_ids=request_ids,
-            prompt_lens=prompt_lens,
-        )
-
-        with torch.inference_mode():
-            attn_metadata.prepare()
-            logits = model.forward(input_ids=sampled_tokens,
-                                   position_ids=position_ids,
-                                   attn_metadata=attn_metadata)
-
+    if tokens_to_generate > 0:
         # sample token greedily
-        sampled_tokens = torch.argmax(logits, dim=-1, keepdim=False)
+        sampled_tokens = torch.cat([
+            torch.argmax(this_logits[-1]).unsqueeze(0)
+            for this_logits in all_logits
+        ],
+                                   dim=0)
         for i in range(num_seqs):
             all_token_ids[i].append(sampled_tokens[i].item())
             all_logprobs[i].append(
                 get_logprobs(sampled_tokens[i].unsqueeze(0),
-                             logits[i].unsqueeze(0)).item())
+                             all_logits[i][-1:]).item())
+
+        # one token already generated at prefill
+        for i in range(tokens_to_generate - 1):
+            num_cached_tokens_per_seq = [
+                prompt_len + i + 1 for prompt_len in prompt_lens
+            ]
+            position_ids = torch.tensor([num_cached_tokens_per_seq],
+                                        dtype=torch.int64,
+                                        device=device)
+
+            attn_metadata = metadata_cls(
+                seq_lens=torch.tensor([1] * num_seqs, dtype=torch.int),
+                num_contexts=0,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True,
+                    num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+                ),
+                max_num_requests=num_seqs,
+                max_num_tokens=8192,
+                kv_cache_manager=cache,
+                request_ids=request_ids,
+                prompt_lens=prompt_lens,
+            )
+
+            with torch.inference_mode():
+                attn_metadata.prepare()
+                logits = model.forward(input_ids=sampled_tokens,
+                                       position_ids=position_ids,
+                                       attn_metadata=attn_metadata)
+
+            # sample token greedily
+            sampled_tokens = torch.argmax(logits, dim=-1, keepdim=False)
+            for i in range(num_seqs):
+                all_token_ids[i].append(sampled_tokens[i].item())
+                all_logprobs[i].append(
+                    get_logprobs(sampled_tokens[i].unsqueeze(0),
+                                 logits[i].unsqueeze(0)).item())
 
     for req in requests:
         cache.free_resources(req)
@@ -379,7 +381,7 @@ class TestNemotronH(unittest.TestCase):
                 atol=0.1,
                 rtol=0.0)
 
-            # compare logprobs with and without batching
+            # compare logprobs with and without batching, tolerace by diff in initial implementation
             torch.testing.assert_close(prefill_logprobs_batching,
                                        prefill_logprobs_no_batching,
                                        atol=prefill_batching_atol,
@@ -387,6 +389,26 @@ class TestNemotronH(unittest.TestCase):
             torch.testing.assert_close(decode_logprobs_batching,
                                        decode_logprobs_no_batching,
                                        atol=decode_batching_atol,
+                                       rtol=0.0)
+
+        # now let's test that decodes match prefill logprobs
+        text_prompts_with_completions = [
+            f"{text_prompts[i]}{completions_batching[i]}"
+            for i in range(num_prompts)
+        ]
+        _, _, full_sequence_logprobs = generate(
+            model=nemotron_h,
+            tokenizer=tokenizer,
+            cache=kv_cache_manager,
+            text_prompts=text_prompts_with_completions,
+            tokens_to_generate=0,
+            device=torch.device("cuda"))
+
+        # compare full sequence logprobs with prefill+decode logprobs, tolerance like mcore tolerance
+        for i in range(num_prompts):
+            torch.testing.assert_close(torch.tensor(full_sequence_logprobs[i]),
+                                       torch.tensor(logprobs_batching[i]),
+                                       atol=0.3,
                                        rtol=0.0)
 
         kv_cache_manager.shutdown()
