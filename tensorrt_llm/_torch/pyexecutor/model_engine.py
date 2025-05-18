@@ -44,6 +44,7 @@ from ..pipeline_interface import PipelineInterface
 from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
 from ..utils import set_torch_compiling, with_model_extra_attrs
 from .config import LoadFormat, PyTorchConfig
+from .config_utils import is_mla
 from .cuda_graph_runner import DecodingCUDAGraphRunner
 from .guided_decoder import GuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
@@ -533,11 +534,8 @@ class PyTorchModelEngine(ModelEngine):
                 yield result
             finally:
                 if result is not None:
-                    for req in result.generation_requests:
-                        kv_cache_manager.free_resources(req)
-                        if spec_resource_manager is not None:
-                            spec_resource_manager.free_resources(req)
-                    for req in result.context_requests:
+                    for req in itertools.chain(result.generation_requests,
+                                               result.context_requests):
                         kv_cache_manager.free_resources(req)
                         if spec_resource_manager is not None:
                             spec_resource_manager.free_resources(req)
@@ -690,6 +688,9 @@ class PyTorchModelEngine(ModelEngine):
                             torch.cuda.empty_cache()
 
     def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
+        enable_paged_context_mla = is_mla(
+            self.model.model_config.pretrained_config
+        ) and self.attn_runtime_features.cache_reuse
         if kv_cache_manager is None:
             return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,
@@ -697,7 +698,8 @@ class PyTorchModelEngine(ModelEngine):
                 kv_cache_manager=None,
                 mapping=self.mapping,
                 runtime_features=self.attn_runtime_features,
-                enable_flash_mla=self.model.model_config.enable_flash_mla)
+                enable_flash_mla=self.model.model_config.enable_flash_mla,
+                enable_paged_context_mla=enable_paged_context_mla)
 
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -711,7 +713,8 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager=kv_cache_manager,
             mapping=self.mapping,
             runtime_features=self.attn_runtime_features,
-            enable_flash_mla=self.model.model_config.enable_flash_mla)
+            enable_flash_mla=self.model.model_config.enable_flash_mla,
+            enable_paged_context_mla=enable_paged_context_mla)
         return self.attn_metadata
 
     def _set_up_spec_metadata(
@@ -1714,11 +1717,7 @@ class PyTorchModelEngine(ModelEngine):
         lora_params = {}
         tmp_lora_params = {}
 
-        request_list = []
-        for request in scheduled_requests.context_requests:
-            request_list.append(request)
-        for request in scheduled_requests.generation_requests:
-            request_list.append(request)
+        request_list = scheduled_requests.context_requests + scheduled_requests.generation_requests
 
         # trace all requests to get the union set of the lora params
         for request in request_list:

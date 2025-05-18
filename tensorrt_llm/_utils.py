@@ -25,7 +25,7 @@ import weakref
 from contextlib import contextmanager
 from dataclasses import asdict
 from enum import EnumMeta
-from functools import partial, wraps
+from functools import lru_cache, partial, wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -627,6 +627,7 @@ def release_gc():
         torch.cuda.ipc_collect()
 
 
+@lru_cache(maxsize=1)
 def get_sm_version():
     prop = torch.cuda.get_device_properties(0)
     return prop.major * 10 + prop.minor
