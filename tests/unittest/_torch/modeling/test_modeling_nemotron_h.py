@@ -30,15 +30,11 @@ def get_logprobs(token_ids: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
     return torch.log(token_probs)
 
 
-def generate(
+def _generate(
     model: NemotronHForCausalLM, tokenizer: PreTrainedTokenizerBase,
     cache: MambaHybridCacheManager, text_prompts: list[str],
     tokens_to_generate: int, device: torch.device
 ) -> tuple[list[int], list[list[int]], list[list[float]]]:
-    """
-    Generate `tokens_to_generate` tokens from the given prompts using the given model and cache.
-    Return the prompt_lens along with the prefill+generated tokens and their logprobs, minus the first token in the prompt.
-    """
     num_seqs = len(text_prompts)
     all_token_ids = [
         tokenizer.encode(prompt, add_special_tokens=False)
@@ -144,6 +140,33 @@ def generate(
     return prompt_lens, all_token_ids, all_logprobs
 
 
+def generate(
+    model: NemotronHForCausalLM,
+    tokenizer: PreTrainedTokenizerBase,
+    cache: MambaHybridCacheManager,
+    text_prompts: list[str],
+    tokens_to_generate: int,
+    device: torch.device,
+    one_by_one: bool = False
+) -> tuple[list[int], list[list[int]], list[list[float]]]:
+    """
+    Generate `tokens_to_generate` tokens from the given prompts using the given model and cache.
+    Return the prompt_lens along with the prefill+generated tokens and their logprobs, minus the first token in the prompt.
+    """
+    if one_by_one:
+        num_prompts = len(text_prompts)
+        prompt_lens, tokens, logprobs = [None] * num_prompts, [
+            None
+        ] * num_prompts, [None] * num_prompts
+        for i in range(num_prompts):
+            p, t, l = _generate(model, tokenizer, cache, [text_prompts[i]],
+                                tokens_to_generate, device)
+            prompt_lens[i], tokens[i], logprobs[i] = p[0], t[0], l[0]
+        return prompt_lens, tokens, logprobs
+    return _generate(model, tokenizer, cache, text_prompts, tokens_to_generate,
+                     device)
+
+
 class TestNemotronH(unittest.TestCase):
 
     @skip_gpu_memory_less_than(
@@ -168,6 +191,7 @@ class TestNemotronH(unittest.TestCase):
 
         text_prompts = [
             "The future of AI is",
+            "The president of the United States is",
         ]
         num_prompts = len(text_prompts)
 
@@ -207,36 +231,162 @@ class TestNemotronH(unittest.TestCase):
             num_extra_kv_tokens=0,
         )
 
-        prompt_lens, tokens, logprobs = generate(model=nemotron_h,
-                                                 tokenizer=tokenizer,
-                                                 cache=kv_cache_manager,
-                                                 text_prompts=text_prompts,
-                                                 tokens_to_generate=9,
-                                                 device=torch.device("cuda"))
+        prompt_lens, tokens_no_batching, logprobs_no_batching = generate(
+            model=nemotron_h,
+            tokenizer=tokenizer,
+            cache=kv_cache_manager,
+            text_prompts=text_prompts,
+            tokens_to_generate=9,
+            device=torch.device("cuda"),
+            one_by_one=True)
+        completions_no_batching = [
+            tokenizer.decode(tokens_no_batching[i][prompt_lens[i]:])
+            for i in range(num_prompts)
+        ]
 
-        # reference logprobs from mcore for prompt minus first token
+        _, tokens_batching, logprobs_batching = generate(
+            model=nemotron_h,
+            tokenizer=tokenizer,
+            cache=kv_cache_manager,
+            text_prompts=text_prompts,
+            tokens_to_generate=9,
+            device=torch.device("cuda"))
+        completions_batching = [
+            tokenizer.decode(tokens_batching[i][prompt_lens[i]:])
+            for i in range(num_prompts)
+        ]
+
+        # reference logprobs for first prompt from mcore for prompt minus first token
         # TODO(oargov): generate a reference on-the-fly once we have confidence in the HF impl
-        prefill_logprobs_ref = torch.tensor([
+        prefill_logprobs_ref_mcore = torch.tensor([
             -7.415980815887451, -0.36192911863327026, -2.8658294677734375,
             -2.316344738006592
         ])
 
         # compare logprobs with mcore logprobs, check that the max error is less than 0.3
-        torch.testing.assert_close(torch.tensor(logprobs[0][:prompt_lens[0] -
-                                                            1]),
-                                   prefill_logprobs_ref,
+        torch.testing.assert_close(torch.tensor(
+            logprobs_no_batching[0][:prompt_lens[0] - 1]),
+                                   prefill_logprobs_ref_mcore,
                                    atol=0.3,
                                    rtol=0.0)
 
-        # TODO(oargov): get a reference for the decode logprobs and compare
+        # reference logprobs for first prompt from initial implementation (commit 5ce1102a02bd2938c0c8334138371f081f55fcc1)
+        prefill_logprobs_ref_initial_no_batching = [
+            torch.tensor([
+                -7.4359540939331055,
+                -0.37661877274513245,
+                -2.8925108909606934,
+                -2.268364906311035,
+            ]),
+            torch.tensor([
+                -8.759482383728027,
+                -1.656238079071045,
+                -0.5448741912841797,
+                -1.7702054977416992,
+                -0.05832016468048096,
+                -1.460732102394104,
+            ])
+        ]
+        prefill_logprobs_ref_initial_with_batching = [
+            torch.tensor([
+                -7.401950836181641, -0.38696032762527466, -2.8725428581237793,
+                -2.2654521465301514
+            ]),
+            torch.tensor([
+                -8.73007583618164, -1.6853574514389038, -0.5468529462814331,
+                -1.7846013307571411, -0.053610533475875854, -1.4385275840759277
+            ])
+        ]
+        prefill_batching_atol = min(
+            0.1, 1.5 * max(
+                torch.max(torch.abs(x - y))
+                for x, y in zip(prefill_logprobs_ref_initial_with_batching,
+                                prefill_logprobs_ref_initial_no_batching)))
+
+        decode_logprobs_ref_initial_no_batching = [
+            torch.tensor([
+                -2.2722280025482178, -0.5235245823860168, -0.8821321725845337,
+                -1.9436249732971191, -0.07366813719272614, -0.4224405586719513,
+                -0.3872227966785431, -0.06121065467596054, -1.0475994348526
+            ]),
+            torch.tensor([
+                -1.329713225364685, -1.6879069805145264, -0.040034178644418716,
+                -0.4808207154273987, -0.3581068515777588, -0.2784178853034973,
+                -0.005814795847982168, -0.0563097707927227, -0.05941024422645569
+            ])
+        ]
+        decode_logprobs_ref_initial_with_batching = [
+            torch.tensor([
+                -2.2877156734466553, -0.507795512676239, -0.8313305377960205,
+                -1.940523386001587, -0.07369701564311981, -0.4190545976161957,
+                -0.4250463843345642, -0.061063338071107864, -1.046282410621643
+            ]),
+            torch.tensor([
+                -1.3567769527435303, -1.7291667461395264, -0.04527968540787697,
+                -0.4836069345474243, -0.3971801698207855, -0.2481495887041092,
+                -0.005787517875432968, -0.056093256920576096,
+                -0.058267030864953995
+            ])
+        ]
+        decode_batching_atol = min(
+            0.1, 1.5 * max(
+                torch.max(torch.abs(x - y))
+                for x, y in zip(decode_logprobs_ref_initial_with_batching,
+                                decode_logprobs_ref_initial_no_batching)))
+
         expected_completions = [
             " bright, with endless possibilities for innovation and growth",
+            " the head of state and head of government of",
         ]
-        completions = [
-            tokenizer.decode(tokens[i][prompt_lens[i]:])
-            for i in range(num_prompts)
-        ]
+
         for i in range(num_prompts):
-            self.assertEqual(completions[i], expected_completions[i])
+            prefill_logprobs_no_batching = torch.tensor(
+                logprobs_no_batching[i][:prompt_lens[i] - 1])
+            decode_logprobs_no_batching = torch.tensor(
+                logprobs_no_batching[i][prompt_lens[i] - 1:])
+
+            prefill_logprobs_batching = torch.tensor(
+                logprobs_batching[i][:prompt_lens[i] - 1])
+            decode_logprobs_batching = torch.tensor(
+                logprobs_batching[i][prompt_lens[i] - 1:])
+
+            # compare prompt logprobs with initial implementation
+            torch.testing.assert_close(
+                prefill_logprobs_no_batching,
+                prefill_logprobs_ref_initial_no_batching[i],
+                atol=0.1,
+                rtol=0.0)
+            torch.testing.assert_close(
+                prefill_logprobs_batching,
+                prefill_logprobs_ref_initial_with_batching[i],
+                atol=0.1,
+                rtol=0.0)
+
+            # compare expected completion
+            self.assertEqual(completions_batching[i], expected_completions[i])
+            self.assertEqual(completions_no_batching[i],
+                             expected_completions[i])
+
+            # compare decode logprobs with initial implementation
+            torch.testing.assert_close(
+                decode_logprobs_no_batching,
+                decode_logprobs_ref_initial_no_batching[i],
+                atol=0.1,
+                rtol=0.0)
+            torch.testing.assert_close(
+                decode_logprobs_batching,
+                decode_logprobs_ref_initial_with_batching[i],
+                atol=0.1,
+                rtol=0.0)
+
+            # compare logprobs with and without batching
+            torch.testing.assert_close(prefill_logprobs_batching,
+                                       prefill_logprobs_no_batching,
+                                       atol=prefill_batching_atol,
+                                       rtol=0.0)
+            torch.testing.assert_close(decode_logprobs_batching,
+                                       decode_logprobs_no_batching,
+                                       atol=decode_batching_atol,
+                                       rtol=0.0)
 
         kv_cache_manager.shutdown()
