@@ -191,7 +191,27 @@ class ModelConfig(Generic[TConfig]):
             data_type=torch_dtype_to_binding(
                 self.pretrained_config.torch_dtype))
 
-        mlp_hidden_size = self.pretrained_config.intermediate_size // self.mapping.tp_size
+        mlp_hidden_size = None
+        if self.pretrained_config.intermediate_size is not None:
+            mlp_hidden_size = self.pretrained_config.intermediate_size // self.mapping.tp_size
+        else:
+            # TODO: once tensorrt_llm._torch.AutoConfig is implemented, the following logic
+            # should be moved to tensorrt_llm._torch.AutoConfig of the relevant modeling_xxx file
+            if hasattr(self.pretrained_config, "architectures"
+                       ) and self.pretrained_config.architectures is not None:
+                architectures = self.pretrained_config.architectures
+                if len(architectures
+                       ) == 1 and architectures[0] == "DeciLMForCausalLM":
+                    mlp_hidden_size = self._infer_nemotron_ffn_mult()
+                else:
+                    raise ValueError(
+                        f"Inferring mlp hidden size for model architecture: {architectures} isn't supported yet"
+                    )
+        if mlp_hidden_size is None:
+            raise ValueError(
+                f"Failed to infer mlp hidden size for model: {self.pretrained_config.model_type}"
+            )
+
         if "head_size" in self.pretrained_config:
             head_size = self.pretrained_config.head_size
         else:
@@ -201,3 +221,18 @@ class ModelConfig(Generic[TConfig]):
         model_config_cpp.size_per_head = head_size
 
         return model_config_cpp
+
+    def _infer_nemotron_ffn_mult(self):
+        # TODO smor: this is a hack to support Nemotron-Super-49B-v1 with LoRA, tracked by TRTLLM-5045 ticket
+        # Nemotron-NAS has variable ffn_mult for each layer, we need to find the maximum
+        # so that we don't set a too small mlp_hidden_size. This solution leads to a memory
+        # consumption that is higher than required.
+        biggest_ffn_mult = max(
+            [x.ffn.ffn_mult for x in self.pretrained_config.block_configs])
+
+        from tensorrt_llm._torch.models.modeling_nemotron_nas import \
+            _ffn_mult_to_intermediate_size
+        mlp_hidden_size = _ffn_mult_to_intermediate_size(
+            biggest_ffn_mult, self.pretrained_config.hidden_size)
+
+        return mlp_hidden_size

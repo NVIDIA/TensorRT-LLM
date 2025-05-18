@@ -7,6 +7,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
@@ -304,17 +305,18 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
     return kv_cache_manager
 
 
-def create_py_executor_instance(dist,
-                                resources,
-                                mapping,
-                                pytorch_backend_config,
-                                executor_config,
-                                ctx_chunk_config,
-                                model_engine,
-                                draft_model_engine,
-                                start_worker,
-                                sampler,
-                                lora_config: LoraConfig = None) -> PyExecutor:
+def create_py_executor_instance(
+        dist,
+        resources,
+        mapping,
+        pytorch_backend_config,
+        executor_config,
+        ctx_chunk_config,
+        model_engine,
+        draft_model_engine,
+        start_worker,
+        sampler,
+        lora_config: Optional[LoraConfig] = None) -> PyExecutor:
     kv_cache_manager = resources.get(KV_CACHE_MANAGER_KEY, None)
 
     spec_config = model_engine.spec_config
@@ -351,11 +353,18 @@ def create_py_executor_instance(dist,
 
         model_binding_config = model_engine.model.model_config.get_bindings_model_config(
         )
+
+        num_experts = _try_infer_num_experts(model_engine.model.model_config)
+
         lora_modules = LoraModule.create_lora_modules(
-            lora_config.lora_target_modules, model_binding_config.hidden_size,
-            model_binding_config.mlp_hidden_size,
-            model_binding_config.num_heads, model_binding_config.num_heads,
-            model_binding_config.head_size)
+            lora_module_names=lora_config.lora_target_modules,
+            hidden_size=model_binding_config.hidden_size,
+            mlp_hidden_size=model_binding_config.mlp_hidden_size,
+            num_attention_heads=model_binding_config.num_heads,
+            num_kv_attention_heads=model_binding_config.num_heads,
+            attention_head_size=model_binding_config.head_size,
+            tp_size=mapping.tp_size,
+            num_experts=num_experts)
         model_binding_config.use_lora_plugin = True
         model_binding_config.lora_modules = lora_modules
         model_binding_config.max_lora_rank = lora_config.max_lora_rank
@@ -365,13 +374,11 @@ def create_py_executor_instance(dist,
             len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
 
         # TODO smor- need to figure out how to set these values
-        max_loras = 2
-        max_cpu_loras = 2
         executor_config.peft_cache_config = trtllm.PeftCacheConfig(
             num_device_module_layer=max_lora_rank * num_lora_modules *
-            max_loras,
+            lora_config.max_loras,
             num_host_module_layer=max_lora_rank * num_lora_modules *
-            max_cpu_loras,
+            lora_config.max_cpu_loras,
         )
 
         from tensorrt_llm.bindings import WorldConfig
@@ -571,3 +578,30 @@ def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:
 
     logger.debug(f"DecodingMode: {decoding_mode.name}")
     return decoding_mode
+
+
+def _try_infer_num_experts(model_config: ModelConfig) -> int:
+    """
+    Attempt to infer the number of experts from the model configuration.
+
+    Different MoE models use different attribute names for storing the number of experts,
+    so this function checks for various possible names and returns a default of 1 if none are found.
+    However, this function is not exhaustive and may miss some cases, so it should be revised.
+    """
+    config = getattr(model_config, 'pretrained_config', model_config)
+
+    expert_attr_names = [
+        'num_experts', 'num_local_experts', 'moe_num_experts',
+        'experts_per_router'
+    ]
+    num_experts = None
+    for attr_name in expert_attr_names:
+        if hasattr(config, attr_name):
+            num_experts = getattr(config, attr_name)
+            break
+
+    # Default to 1 for non-MoE models or if no experts attribute is found
+    if num_experts is None:
+        return 1
+
+    return num_experts
