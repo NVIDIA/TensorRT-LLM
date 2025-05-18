@@ -799,7 +799,7 @@ class PyExecutor:
         torch.cuda.set_device(self.device_id)
         got_finish_signal = False
         num_dummy_request = 0
-        is_ngram = self.model_engine.is_spec_decode and self.model_engine.spec_config.spec_dec_mode.is_ngram(
+        is_ngram = hasattr(self.model_engine, "spec_config") and self.model_engine.spec_config.spec_dec_mode.is_ngram(
         )
         with self._profiler() as profile_step:
             iter_start_time = time.time()
