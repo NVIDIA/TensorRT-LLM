@@ -486,7 +486,7 @@ class LLM:
 
         if (not self.args.enable_chunked_prefill) and (
                 prompt_len / self.args.parallel_config.cp_size + query_len +
-                sampling_params.max_tokens > max_seq_len):
+            (sampling_params.max_tokens or 0) > max_seq_len):
             raise ValueError(
                 f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and query length ({query_len}) max_tokens ({sampling_params.max_tokens}) should not exceed "
                 f"max_seq_len ({build_config.max_seq_len})")
@@ -542,6 +542,14 @@ class LLM:
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
             gather_generation_logits=self.args.gather_generation_logits)
+        if self.args.backend is None:
+            # also set executor_config.max_seq_len in TRT workflow, to deduce default max_tokens
+            if max_seq_len is not None:
+                executor_config.max_seq_len = max_seq_len
+            else:
+                engine_config = EngineConfig.from_json_file(self._engine_dir /
+                                                            "config.json")
+                executor_config.max_seq_len = engine_config.build_config.max_seq_len
         if self.args.kv_cache_config is not None:
             executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
                 self.args.kv_cache_config)
