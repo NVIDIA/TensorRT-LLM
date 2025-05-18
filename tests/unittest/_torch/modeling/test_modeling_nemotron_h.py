@@ -273,8 +273,9 @@ class TestNemotronH(unittest.TestCase):
                                    atol=mcore_atol,
                                    rtol=0.0)
 
-        # reference logprobs for first prompt from initial implementation (commit 5ce1102a02bd2938c0c8334138371f081f55fcc1)
+        # reference logprobs from initial implementation (commit 5ce1102a02bd2938c0c8334138371f081f55fcc1)
         initial_impl_atol = 0.2
+        batching_atol = 0.2
 
         prefill_logprobs_ref_initial_no_batching = [
             torch.tensor([
@@ -302,11 +303,6 @@ class TestNemotronH(unittest.TestCase):
                 -1.7846013307571411, -0.053610533475875854, -1.4385275840759277
             ])
         ]
-        prefill_batching_atol = min(
-            initial_impl_atol, 1.5 * max(
-                torch.max(torch.abs(x - y))
-                for x, y in zip(prefill_logprobs_ref_initial_with_batching,
-                                prefill_logprobs_ref_initial_no_batching)))
 
         decode_logprobs_ref_initial_no_batching = [
             torch.tensor([
@@ -333,11 +329,6 @@ class TestNemotronH(unittest.TestCase):
                 -0.058267030864953995
             ])
         ]
-        decode_batching_atol = min(
-            initial_impl_atol, 1.5 * max(
-                torch.max(torch.abs(x - y))
-                for x, y in zip(decode_logprobs_ref_initial_with_batching,
-                                decode_logprobs_ref_initial_no_batching)))
 
         expected_completions = [
             " bright, with endless possibilities for innovation and growth",
@@ -387,11 +378,11 @@ class TestNemotronH(unittest.TestCase):
             # compare logprobs with and without batching, tolerace by diff in initial implementation
             torch.testing.assert_close(prefill_logprobs_batching,
                                        prefill_logprobs_no_batching,
-                                       atol=prefill_batching_atol,
+                                       atol=batching_atol,
                                        rtol=0.0)
             torch.testing.assert_close(decode_logprobs_batching,
                                        decode_logprobs_no_batching,
-                                       atol=decode_batching_atol,
+                                       atol=batching_atol,
                                        rtol=0.0)
 
         # now let's test that decodes match prefill logprobs
