@@ -266,13 +266,16 @@ class TestNemotronH(unittest.TestCase):
         ])
 
         # compare logprobs with mcore logprobs, check that the max error is less than 0.3
+        mcore_atol = 0.3
         torch.testing.assert_close(torch.tensor(
             logprobs_no_batching[0][:prompt_lens[0] - 1]),
                                    prefill_logprobs_ref_mcore,
-                                   atol=0.3,
+                                   atol=mcore_atol,
                                    rtol=0.0)
 
         # reference logprobs for first prompt from initial implementation (commit 5ce1102a02bd2938c0c8334138371f081f55fcc1)
+        initial_impl_atol = 0.2
+
         prefill_logprobs_ref_initial_no_batching = [
             torch.tensor([
                 -7.4359540939331055,
@@ -300,7 +303,7 @@ class TestNemotronH(unittest.TestCase):
             ])
         ]
         prefill_batching_atol = min(
-            0.1, 1.5 * max(
+            initial_impl_atol, 1.5 * max(
                 torch.max(torch.abs(x - y))
                 for x, y in zip(prefill_logprobs_ref_initial_with_batching,
                                 prefill_logprobs_ref_initial_no_batching)))
@@ -331,7 +334,7 @@ class TestNemotronH(unittest.TestCase):
             ])
         ]
         decode_batching_atol = min(
-            0.1, 1.5 * max(
+            initial_impl_atol, 1.5 * max(
                 torch.max(torch.abs(x - y))
                 for x, y in zip(decode_logprobs_ref_initial_with_batching,
                                 decode_logprobs_ref_initial_no_batching)))
@@ -356,12 +359,12 @@ class TestNemotronH(unittest.TestCase):
             torch.testing.assert_close(
                 prefill_logprobs_no_batching,
                 prefill_logprobs_ref_initial_no_batching[i],
-                atol=0.1,
+                atol=initial_impl_atol,
                 rtol=0.0)
             torch.testing.assert_close(
                 prefill_logprobs_batching,
                 prefill_logprobs_ref_initial_with_batching[i],
-                atol=0.1,
+                atol=initial_impl_atol,
                 rtol=0.0)
 
             # compare expected completion
@@ -373,12 +376,12 @@ class TestNemotronH(unittest.TestCase):
             torch.testing.assert_close(
                 decode_logprobs_no_batching,
                 decode_logprobs_ref_initial_no_batching[i],
-                atol=0.1,
+                atol=initial_impl_atol,
                 rtol=0.0)
             torch.testing.assert_close(
                 decode_logprobs_batching,
                 decode_logprobs_ref_initial_with_batching[i],
-                atol=0.1,
+                atol=initial_impl_atol,
                 rtol=0.0)
 
             # compare logprobs with and without batching, tolerace by diff in initial implementation
@@ -408,7 +411,7 @@ class TestNemotronH(unittest.TestCase):
         for i in range(num_prompts):
             torch.testing.assert_close(torch.tensor(full_sequence_logprobs[i]),
                                        torch.tensor(logprobs_batching[i]),
-                                       atol=0.3,
+                                       atol=mcore_atol,
                                        rtol=0.0)
 
         kv_cache_manager.shutdown()
