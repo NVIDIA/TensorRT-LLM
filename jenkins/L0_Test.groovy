@@ -635,7 +635,7 @@ def launchTestListCheck(pipeline)
             sh "tar -zxf ${tarName}"
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def llmSrc = "${llmPath}/TensorRT-LLM/src"
-            sh "NVIDIA_TRITON_SERVER_VERSION=25.03 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa"
+            sh "NVIDIA_TRITON_SERVER_VERSION=25.04 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -1383,7 +1383,6 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A10-TensorRT-6": ["a10", "l0_a10", 6, 6],
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
-        "A30-Triton-Python-[Post-Merge]-1": ["a30", "l0_a30", 1, 1],
         "A30-CPP-1": ["a30", "l0_a30", 1, 2],
         "A30-CPP-2": ["a30", "l0_a30", 2, 2],
         "A30-TensorRT-1": ["a30", "l0_a30", 1, 4],
@@ -1395,7 +1394,6 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A100X-TensorRT-2": ["a100x", "l0_a100", 2, 4],
         "A100X-TensorRT-3": ["a100x", "l0_a100", 3, 4],
         "A100X-TensorRT-4": ["a100x", "l0_a100", 4, 4],
-        "A100X-Triton-Python-[Post-Merge]-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 1],
         "L40S-TensorRT-1": ["l40s", "l0_l40s", 1, 3],
         "L40S-TensorRT-2": ["l40s", "l0_l40s", 2, 3],
@@ -1413,7 +1411,6 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 2],
         "B200_PCIe-TensorRT-1": ["b100-ts2", "l0_b200", 1, 2],
         "B200_PCIe-TensorRT-2": ["b100-ts2", "l0_b200", 2, 2],
-        "B200_PCIe-Triton-Python-[Post-Merge]-1": ["b100-ts2", "l0_b200", 1, 1],
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
         "RTX5080-TensorRT-1": ["rtx-5080", "l0_gb203", 1, 2],
         "RTX5080-TensorRT-2": ["rtx-5080", "l0_gb203", 2, 2],
@@ -1424,14 +1421,19 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A30-TensorRT-[Post-Merge]-1": ["a30", "l0_a30", 1, 2],
         "A30-TensorRT-[Post-Merge]-2": ["a30", "l0_a30", 2, 2],
         "A30-CPP-[Post-Merge]-1": ["a30", "l0_a30", 1, 1],
+        "A30-Triton-Python-[Post-Merge]-1": ["a30", "l0_a30", 1, 2],
+        "A30-Triton-Python-[Post-Merge]-2": ["a30", "l0_a30", 2, 2],
         "A100X-TensorRT-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
         "A100X-TensorRT-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
+        "A100X-Triton-Python-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
+        "A100X-Triton-Python-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
         "L40S-TensorRT-[Post-Merge]-1": ["l40s", "l0_l40s", 1, 2],
         "L40S-TensorRT-[Post-Merge]-2": ["l40s", "l0_l40s", 2, 2],
         "H100_PCIe-PyTorch-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-TensorRT-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 2],
         "H100_PCIe-TensorRT-[Post-Merge]-2": ["h100-cr", "l0_h100", 2, 2],
+        "B200_PCIe-Triton-Python-[Post-Merge]-1": ["b100-ts2", "l0_b200", 1, 1],
         "DGX_H100-4_GPUs-PyTorch-[Post-Merge]": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-TensorRT-[Post-Merge]": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A100_80GB_PCIE-TensorRT-Perf": ["a100-80gb-pcie", "l0_perf", 1, 1],
