@@ -189,7 +189,6 @@ class OpenAIServer:
                 tokenizer=self.tokenizer,
                 processor=self.processor,
                 conversation=conversation,
-                tokenize=False,
                 add_generation_prompt=request.add_generation_prompt,
                 tools=tool_dicts,
                 documents=request.documents,
