@@ -15,7 +15,6 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 from ...quantization.utils.fp4_utils import float4_sf_dtype
 from ..distributed import allgather, reducescatter
 from ..model_config import ModelConfig
-from ..pyexecutor.cuda_graph_runner import is_graph_capturing
 from ..utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
                      reswizzle_sf, swizzle_sf, unswizzle_sf)
 from .linear import TensorParallelMode, load_weight_shard
@@ -1135,10 +1134,8 @@ class FusedMoE(nn.Module):
                                         x: torch.Tensor,
                                         token_selected_experts: torch.Tensor,
                                         token_final_scales: torch.Tensor):
-        using_cuda_graph = is_graph_capturing()
         top_k = self.routing_method.experts_per_token
         expert_count = self.num_experts
-        use_real_size = not using_cuda_graph
         # gather router info
         max_num_token = max(all_rank_num_tokens)
         token_selected_experts = torch.nn.functional.pad(
@@ -1161,7 +1158,7 @@ class FusedMoE(nn.Module):
         alltoall_info, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv_prepare(
             gathered_target_rank_ids, None, gathered_token_selected_experts,
             gathered_token_final_scales, max_num_token, expert_count, top_k,
-            self.ep_rank, self.ep_size, use_real_size)
+            self.ep_rank, self.ep_size)
 
         if not self.use_postquant_alltoall:
             assert not isinstance(
