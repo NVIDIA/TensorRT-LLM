@@ -416,17 +416,19 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
             hf_model_dir = hf_model_or_dir
             hf_config_or_dir = hf_model_or_dir
 
-        config = LLaMAConfig.from_hugging_face(hf_config_or_dir,
-                                               dtype=dtype,
-                                               mapping=mapping,
-                                               quant_config=quant_config,
-                                               **kwargs)
+        config, orig_conf = LLaMAConfig.from_hugging_face(hf_config_or_dir,
+                                                          dtype=dtype,
+                                                          mapping=mapping,
+                                                          quant_config=quant_config,
+                                                          **kwargs)
         if config.remove_duplicated_kv_heads:
             config.num_key_value_heads = config.num_key_value_heads // 2
         if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
             custom_dict = {}
             model_name = hf_model.config.model_type if use_preloading else hf_model_or_dir
-            if "llava" in model_name or  "cosmos" in model_name or "NVLM_D" in model_name:
+            if "llava" in model_name or (
+                len(orig_conf.architectures) == 1 and orig_conf.architectures[0] == "NVLM_D"
+            ):
                 custom_dict = {
                     "transformer": "language_model.model",
                     "lm_head": "language_model.lm_head"
