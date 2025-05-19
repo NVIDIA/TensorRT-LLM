@@ -1,6 +1,7 @@
 import asyncio
 import enum
 import os
+import signal  # Added import
 import subprocess  # nosec B404
 import sys
 from typing import Any, List, Optional
@@ -23,6 +24,46 @@ from tensorrt_llm.llmapi.mpi_session import find_free_port
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
+
+# Global variable to store the Popen object of the child process
+_child_p_global: Optional[subprocess.Popen] = None
+
+
+def _signal_handler_cleanup_child(signum, frame):
+    """Signal handler to clean up the child process."""
+    global _child_p_global
+    if _child_p_global and _child_p_global.poll() is None:
+        # Using print for safety in signal handlers
+        print(
+            f"Parent process (PID {os.getpid()}) received signal {signal.Signals(signum).name}. Terminating child process (PID {_child_p_global.pid})."
+        )
+        _child_p_global.terminate()
+        try:
+            _child_p_global.wait(
+                timeout=10)  # Allow 10 seconds for graceful termination
+        except subprocess.TimeoutExpired:
+            print(
+                f"Child process (PID {_child_p_global.pid}) did not terminate gracefully after signal. Killing."
+            )
+            _child_p_global.kill()
+            try:
+                _child_p_global.wait(timeout=10)  # Allow 10 seconds for kill
+            except subprocess.TimeoutExpired:
+                print(
+                    f"Child process (PID {_child_p_global.pid}) failed to die even after kill command from signal handler."
+                )
+
+        if _child_p_global.poll() is not None:
+            print(
+                f"Child process (PID {_child_p_global.pid}) confirmed terminated due to signal {signal.Signals(signum).name}."
+            )
+        else:
+            print(
+                f"Child process (PID {_child_p_global.pid}) is still running after cleanup attempt for signal {signal.Signals(signum).name}."
+            )
+
+    # Standard exit code for signal termination
+    sys.exit(128 + signum)
 
 
 def get_llm_args(model: str,
@@ -307,8 +348,8 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     """Launching disaggregated MPI worker"""
 
     from tensorrt_llm._utils import mpi_rank
-    if os.environ.get(DistaggLauncherEnvs.
-                      TLLM_DISTAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
+    if os.environ.get(DisaggLauncherEnvs.
+                      TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
         set_cuda_device()
     # Importing mpi4py after setting CUDA device. This is needed to war an issue with mpi4py and CUDA
     from mpi4py.futures import MPICommExecutor
@@ -319,10 +360,10 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     disagg_cfg = parse_disagg_config_file(config_file)
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
-    if os.environ.get(DistaggLauncherEnvs.
-                      TLLM_DISTAGG_RUN_REMOTE_MPI_SESSION_CLIENT) == "1":
+    if os.environ.get(DisaggLauncherEnvs.
+                      TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) == "1":
         instance_idx = os.environ.get(
-            DistaggLauncherEnvs.TLLM_DISTAGG_INSTANCE_IDX)
+            DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
         server_cfg = disagg_cfg.server_configs[int(instance_idx)]
 
         llm_args, llm_args_extra_dict = get_llm_args(**server_cfg.other_args)
@@ -345,7 +386,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     # Leader ranks will start the trtllm-server using it's own server config
     # and start a RemoteMPISessionServer to accept MPI tasks
     if is_leader:
-        os.environ[DistaggLauncherEnvs.TLLM_DISTAGG_INSTANCE_IDX] = str(
+        os.environ[DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX] = str(
             instance_idx)
         server_cfg = disagg_cfg.server_configs[instance_idx]
 
@@ -364,20 +405,20 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
                     f"rank{global_mpi_rank()} should not have executor")
 
 
-class DistaggLauncherEnvs(enum.StrEnum):
-    TLLM_DISTAGG_INSTANCE_IDX = "TLLM_DISTAGG_INSTANCE_IDX"
-    TLLM_DISTAGG_RUN_REMOTE_MPI_SESSION_CLIENT = "TLLM_DISTAGG_RUN_REMOTE_MPI_SESSION_CLIENT"
+class DisaggLauncherEnvs(enum.StrEnum):
+    TLLM_DISAGG_INSTANCE_IDX = "TLLM_DISAGG_INSTANCE_IDX"
+    TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT = "TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT"
 
 
 def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     # Launching the server
-    instance_idx = os.environ.get(DistaggLauncherEnvs.TLLM_DISTAGG_INSTANCE_IDX)
-    assert instance_idx is not None, f"{DistaggLauncherEnvs.TLLM_DISTAGG_INSTANCE_IDX} should be set by the launcher"
+    instance_idx = os.environ.get(DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
+    assert instance_idx is not None, f"{DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX} should be set by the launcher"
     disagg_config = parse_disagg_config_file(disagg_config_file)
     server_cfg = disagg_config.server_configs[int(instance_idx)]
 
     logger.info(
-        f"rank {mpi_rank()} for index {instance_idx} launch the distagg server")
+        f"rank {mpi_rank()} for index {instance_idx} launch the disagg server")
 
     launch_server(host=server_cfg.hostname,
                   port=server_cfg.port,
@@ -386,6 +427,9 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
 
 def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
                                  log_level: str):
+    global _child_p_global  # Declare usage of global variable
+    # Assuming logger and mpi_rank are available from module imports or passed in
+    from tensorrt_llm._utils import mpi_rank
     from tensorrt_llm.llmapi.mgmn_leader_node import \
         launch_server_main as launch_remote_mpi_session_server
     from tensorrt_llm.llmapi.mpi_session import split_mpi_env
@@ -396,10 +440,9 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS] = "1"
     os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR.
                value] = f"tcp://127.0.0.1:{free_port}"
-    os.environ[DistaggLauncherEnvs.TLLM_DISTAGG_RUN_REMOTE_MPI_SESSION_CLIENT.
+    os.environ[DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT.
                value] = "1"
-    os.environ[DistaggLauncherEnvs.TLLM_DISTAGG_INSTANCE_IDX] = str(
-        instance_idx)
+    os.environ[DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX] = str(instance_idx)
 
     logger.debug(
         f"proxy controller address: {os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR]}"
@@ -412,30 +455,90 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
 
     assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS in non_mpi_env
     assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR in non_mpi_env
-    assert DistaggLauncherEnvs.TLLM_DISTAGG_INSTANCE_IDX in non_mpi_env
-    assert DistaggLauncherEnvs.TLLM_DISTAGG_RUN_REMOTE_MPI_SESSION_CLIENT in non_mpi_env
+    assert DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX in non_mpi_env
+    assert DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT in non_mpi_env
 
     # Two steps:
     # 1. Run the LLM-API Proxy in a separate process for streaming performance.
     #      The Proxy will create a RemoteMpiSessionClient as mpi_session in LLM
     #      class.
-    logger.info(f"rank {mpi_rank()} step1: command: {sys.argv}")
     command = [
         "python3", sys.argv[0], "disaggregated_mpi_worker", "-c", config_file,
         "--log_level", log_level
     ]
-    subprocess.Popen(
-        command,
-        env=non_mpi_env,
-        stdout=sys.stdout,  # Redirect to parent's stdout
-        stderr=sys.stderr,  # Redirect to parent's stderr
-        start_new_session=True)
+    logger.info(
+        f"rank {mpi_rank()} step1: preparing to launch command: {command}")
 
-    logger.info(f"rank {mpi_rank()} step2: start the mpi session server")
-    # 2. Run the RemoteMpiSessionServer to accept MPI tasks
-    assert sub_comm is not None
-    assert sub_comm.Get_rank() == 0
-    launch_remote_mpi_session_server(sub_comm)
+    # Store original signal handlers
+    original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+    original_sigint_handler = signal.getsignal(signal.SIGINT)
+
+    # Register new signal handlers
+    signal.signal(signal.SIGTERM, _signal_handler_cleanup_child)
+    signal.signal(signal.SIGINT, _signal_handler_cleanup_child)
+
+    try:
+        _child_p_global = subprocess.Popen(
+            command,
+            env=non_mpi_env,
+            stdout=sys.stdout,  # Redirect to parent's stdout
+            stderr=sys.stderr,  # Redirect to parent's stderr
+            start_new_session=True)
+
+        logger.info(
+            f"Parent process (PID {os.getpid()}) launched child process (PID {_child_p_global.pid})."
+        )
+
+        logger.info(f"rank {mpi_rank()} step2: start the mpi session server")
+        # 2. Run the RemoteMpiSessionServer to accept MPI tasks
+        assert sub_comm is not None
+        assert sub_comm.Get_rank() == 0
+        # This is a blocking call
+        launch_remote_mpi_session_server(sub_comm)
+
+    finally:
+        # Restore original signal handlers
+        signal.signal(signal.SIGTERM, original_sigterm_handler)
+        signal.signal(signal.SIGINT, original_sigint_handler)
+
+        if _child_p_global:  # If Popen was successful and object exists
+            logger.info(
+                f"Parent process (PID {os.getpid()}) in finally block. Cleaning up child process (PID: {_child_p_global.pid})."
+            )
+            # Check if child is still running
+            if _child_p_global.poll() is None:
+                _child_p_global.terminate()
+                try:
+                    _child_p_global.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    logger.warning(
+                        f"Child process {_child_p_global.pid} timed out on terminate (30s), killing."
+                    )
+                    _child_p_global.kill()
+                    try:
+                        _child_p_global.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        logger.error(
+                            f"Child process {_child_p_global.pid} failed to be killed even after 30s."
+                        )
+            assert _child_p_global.poll(
+            ) is not None, f"the subprocess should be terminated"
+
+    # Check if the process was launched and assert it's terminated
+    if _child_p_global and hasattr(_child_p_global,
+                                   'pid') and _child_p_global.pid is not None:
+        final_status = _child_p_global.poll()
+        assert final_status is not None, \
+            f"The subprocess (PID {_child_p_global.pid}) should be terminated, but its status is {final_status}"
+        logger.info(
+            f"Subprocess (PID {_child_p_global.pid}) final status: {final_status}"
+        )
+    elif _child_p_global is None:
+        # This implies Popen might have failed or was not reached.
+        # If Popen failed, an exception would likely have occurred earlier.
+        logger.info(
+            "Child process was not assigned to _child_p_global, skipping final termination assertion."
+        )
 
 
 class DefaultGroup(click.Group):
