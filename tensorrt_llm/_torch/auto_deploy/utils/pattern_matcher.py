@@ -112,6 +112,10 @@ def register_pattern(
     4. Numeric (integer/float) args input to the pattern will be lifted as hard-coded literals
         in the FX graph, utilize `scalar_workaround` to detect those literals and
         replace with args in the pattern
+        - The literal value you choose must exactly match the default kwarg in your search function.
+        - FX will treat every literal with that same value as an occurrence of your kwarg,
+        so ensure no other ops in the pattern use that same number,
+        otherwise pick a different workaround value.
     5. register_replacement can auto-generate `search_fn_pattern` if you input `example_inputs`,
         but that approach will fail when symbolic shapes are involved. Here
         we explicitly trace & convert via `fx_to_pattern`.
