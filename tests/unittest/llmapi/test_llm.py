@@ -24,7 +24,6 @@ from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, EagleDecodingConfig,
                                  KvCacheRetentionConfig,
                                  LookaheadDecodingConfig, MedusaDecodingConfig,
                                  RequestOutput)
-from tensorrt_llm.llmapi._perf_evaluator import perform_faked_oai_postprocess
 from tensorrt_llm.llmapi.llm_args import DynamicBatchConfig, SchedulerConfig
 from tensorrt_llm.llmapi.llm_utils import (BuildConfig, LlmArgs, QuantAlgo,
                                            QuantConfig, _ParallelConfig)
@@ -2104,9 +2103,13 @@ def test_llm_with_postprocess_parallel():
 
 def run_llm_with_postprocess_parallel_and_result_handler(
         streaming, backend, tp_size: int = 1):
-    sampling_params = SamplingParams(max_tokens=6)
+    # avoid import error when running in CI
     from tensorrt_llm.executor.postproc_worker import (PostprocArgs,
                                                        PostprocParams)
+
+    from .run_llm_with_postproc import perform_faked_oai_postprocess
+
+    sampling_params = SamplingParams(max_tokens=6)
     post_proc_args = PostprocArgs(tokenizer=llama_model_path)
     post_proc_params = PostprocParams(
         post_processor=perform_faked_oai_postprocess,

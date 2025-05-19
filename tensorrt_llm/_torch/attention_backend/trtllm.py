@@ -1,3 +1,4 @@
+import weakref
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -7,6 +8,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..utils import get_global_attrs, get_model_extra_attrs
 from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
                         AttentionMetadata, KVCacheParams, MLAParams,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
@@ -63,7 +65,6 @@ class TrtllmAttentionWrapper:
 
     def __init__(
         self,
-        layer_idx: int,
         num_heads: int,
         head_size: int,
         num_kv_heads: Optional[int] = None,
@@ -75,7 +76,6 @@ class TrtllmAttentionWrapper:
         """
         Initialize the attention wrapper.
         Args:
-            layer_idx (int): The index of the attention layer in the model.
             num_heads (int): The number of query heads.
             head_dim (int): The size of each attention head (hidden_size // num_heads).
             num_kv_heads (int): The number of kv heads. Defaults to num_heads if None.
@@ -108,7 +108,6 @@ class TrtllmAttentionWrapper:
         self.rotary_inv_freq, self.rotary_cos_sin = rope_params.create_rope_const_params(
         )
 
-        self.layer_idx = layer_idx
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads or num_heads
         self.head_size = head_size
@@ -132,6 +131,7 @@ class TrtllmAttentionWrapper:
     def plan(
         self,
         *,
+        layer_idx: int = 0,
         tokens_per_block: Optional[int] = None,
         max_num_requests: int = 0,
         max_sequence_length: int = 0,
@@ -168,6 +168,7 @@ class TrtllmAttentionWrapper:
         Call this method without arguments can reset the planned states.
         For required arguments, can use ellipsis (...) as default value to represent invalid states.
         Args:
+            layer_idx (int): The index of the attention layer in the model.
             tokens_per_block (int): Token number per KV cache block.
             max_num_requests (int): Max request number per batch.
             max_sequence_length (int): Max sequence length.
@@ -194,6 +195,7 @@ class TrtllmAttentionWrapper:
             mla_context_paged_kv (torch.Tensor): The paged KV cache for MLA context, for kv cache reuse/chunked context.
             mla_context_kv_cache_block_offsets (torch.Tensor): The block offsets for the paged KV cache for MLA context, for kv cache reuse/chunked context.
         """
+        self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
         self.max_num_requests = max_num_requests
         self.max_context_length = max_context_length
@@ -531,7 +533,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 )
 
     def prepare(self) -> None:
-
+        extra_attrs = get_model_extra_attrs()
+        # If model extra attrs is set, attention_metadata is setup in executor.
+        if extra_attrs is None:
+            get_global_attrs().attention_metadata = weakref.ref(self)
         if self.kv_cache_manager is None:
             # Convert the attention metadata to a TRT-LLM no cache attention metadata.
             assert self.kv_cache_manager is None, "no cache attention should not have KV cache manager"
@@ -691,7 +696,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                          **kwargs)
 
         self.wrapper = TrtllmAttentionWrapper(
-            layer_idx,
             num_heads,
             head_dim,
             num_kv_heads,
@@ -727,7 +731,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.has_fp8_block_wise = self.quant_config.layer_quant_mode.has_fp8_block_scales(
             )
             self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
-            self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
+
+    def get_local_layer_idx(self, metadata: TrtllmAttentionMetadata) -> int:
+        if metadata.kv_cache_manager is None:
+            return self.layer_idx
+        else:
+            return metadata.kv_cache_manager.layer_offsets[self.layer_idx]
 
     def forward(
         self,
@@ -765,6 +774,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 metadata)
 
         self.wrapper.plan(
+            layer_idx=self.get_local_layer_idx(metadata),
             tokens_per_block=metadata.tokens_per_block,
             max_num_requests=metadata.max_num_requests,
             max_sequence_length=metadata.max_seq_len,
@@ -863,7 +873,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_manager.kv_cache_pool_mapping,
             self.kv_scale_orig_quant,
             self.kv_scale_quant_orig,
-            self.layer_idx,
+            self.get_local_layer_idx(metadata),
             metadata.kv_cache_manager.head_dim,
             metadata.kv_cache_manager.tokens_per_block,
             metadata.kv_cache_manager.max_seq_len,
@@ -989,7 +999,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_manager.kv_cache_pool_mapping,
             self.kv_scale_orig_quant,
             self.kv_scale_quant_orig,
-            self.layer_idx,
+            self.get_local_layer_idx(metadata),
             self.mla_params.kv_lora_rank + self.mla_params.qk_rope_head_dim,
             metadata.kv_cache_manager.tokens_per_block,
             metadata.kv_cache_manager.max_seq_len,

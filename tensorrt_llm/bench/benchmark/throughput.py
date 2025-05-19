@@ -7,6 +7,7 @@ from pathlib import Path
 import click
 from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
+from huggingface_hub import snapshot_download
 
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
@@ -279,6 +280,11 @@ def throughput_command(
 
     # Engine configuration parsing
     if backend and backend.lower() in ["pytorch", "autodeploy"]:
+        # If we're dealing with a model name, perform a snapshot download to
+        # make sure we have a local copy of the model.
+        if bench_env.checkpoint_path is None:
+            snapshot_download(model)
+
         exec_settings = get_settings(params, metadata, bench_env.model,
                                      bench_env.checkpoint_path)
         kwargs_max_sql = max_seq_len or metadata.max_sequence_length

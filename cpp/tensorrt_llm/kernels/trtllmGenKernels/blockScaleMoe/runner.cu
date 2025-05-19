@@ -14,12 +14,14 @@
  * limitations under the License.
  */
 
-#include "gemmCommon.h"
-#include "gemmList.h"
+#include "DevKernel.h"
+#include "RoutingKernel.h"
 #include "runner.h"
-#include "trtllmGenSrc/DevKernel.h"
-#include "trtllmGenSrc/RoutingKernel.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/SfLayoutDecl.h"
 #include <iostream>
+#include <tensorrt_llm/common/assert.h>
 
 namespace tensorrt_llm
 {
@@ -27,6 +29,8 @@ namespace kernels
 {
 namespace trtllmGenFp8BlockScaleMoe
 {
+
+namespace tg = trtllm::gen;
 
 namespace Routing
 {
@@ -40,37 +44,25 @@ inline int32_t computeLog2(int32_t val, std::string const& name = "")
     {
         ++out;
     }
-    TLLM_CHECK_ERROR((1 << out) == val, "Expected ", name, " to be a power of 2, got ", val);
+    TLLM_CHECK_WITH_INFO((1 << out) == val, "Expected %s to be a power of 2, got %d", name.c_str(), val);
     return out;
 }
 } // namespace
 
 Runner::Runner() {}
 
-void Runner::run(void* routingLogits, void* routingBias, int32_t num_tokens, int32_t num_experts, int32_t top_k,
-    int32_t n_group, int32_t topk_group, int32_t local_expert_offset, int32_t local_num_experts,
-    float routed_scaling_factor, int32_t* routingExpertIndexes, int32_t* expertCountHistogram,
-    int32_t* permuted_idx_size, int32_t* expanded_idx_to_permuted_idx, int32_t* permuted_idx_to_expanded_idx,
-    int32_t* permuted_idx_to_token_idx, void* expert_weights, int32_t* num_tokens_per_expert,
-    int32_t* cta_idx_xy_to_batch_idx, int32_t* cta_idx_xy_to_mn_limit, int32_t* num_non_exiting_ctas,
-    tg::Dtype dtypeElt, bool use_routing_scales_on_input, bool use_deep_seek_fp8, cudaStream_t stream)
+void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts, int32_t topK,
+    int32_t nGroup, int32_t topkGroup, int32_t localExpertOffset, int32_t localNumExperts, float routedScalingFactor,
+    int32_t* routingExpertIndexes, int32_t* expertCountHistogram, int32_t* permutedIdxSize,
+    int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx,
+    void* expertWeights, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
+    int32_t* numNonExitingCtas, tg::Dtype dtypeElt, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
+    cudaStream_t stream)
 {
-    if (top_k == 8)
+    if (topK == 8)
     {
-        std::vector<int32_t> selectedIndex;
-        for (size_t ii = 0; ii < PermuteGemm1::gemmList.size(); ii++)
-        {
-            auto gemmInfo = PermuteGemm1::gemmList[ii];
-            if (gemmInfo.dtypeElt == dtypeElt && gemmInfo.usePerTokenSfB == use_routing_scales_on_input
-                && gemmInfo.useDeepSeekFp8 == use_deep_seek_fp8)
-            {
-                selectedIndex.push_back(ii);
-            }
-        }
-        TLLM_CHECK_WITH_INFO(selectedIndex.size() != 0, "No kernel found for the given element type");
-        TLLM_CHECK_WITH_INFO(selectedIndex.size() == 1, "Multiple kernels found for the given element type");
-        auto const& kernelInfo = PermuteGemm1::gemmList[*selectedIndex.begin()];
-        int32_t tileN = kernelInfo.tileN;
+        // FIXME: hardcoded for now
+        int32_t tileN = 8;
 
         moe::dev::routing::Data routingData;
         routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
@@ -80,16 +72,16 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t num_tokens, int
         // output:
         routingData.mPtrExpertIdx = routingExpertIndexes;
         routingData.mPtrExpertCounts = expertCountHistogram;
-        routingData.mPtrPermutedIdxSize = permuted_idx_size;
-        routingData.mPtrExpandedIdxToPermutedIdx = expanded_idx_to_permuted_idx;
-        routingData.mPtrPermutedIdxToExpandedIdx = permuted_idx_to_expanded_idx;
-        routingData.mPtrPermutedIdxToTokenIdx = permuted_idx_to_token_idx;
-        routingData.mPtrNumTokensPerExpert = num_tokens_per_expert;
-        routingData.mPtrExpertWeights = expert_weights;
+        routingData.mPtrPermutedIdxSize = permutedIdxSize;
+        routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+        routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
+        routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
+        routingData.mPtrNumTokensPerExpert = numTokensPerExpert;
+        routingData.mPtrExpertWeights = expertWeights;
 
-        routingData.mPtrCtaIdxXyToBatchIdx = cta_idx_xy_to_batch_idx;
-        routingData.mPtrCtaIdxXyToMnLimit = cta_idx_xy_to_mn_limit;
-        routingData.mPtrNumNonExitingCtas = num_non_exiting_ctas;
+        routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
+        routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
+        routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
         routingData.mAllToAllRouteAct = false;
 
         // input:
@@ -97,36 +89,24 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t num_tokens, int
         routingData.mPtrRoutingBias = routingBias;
         routingData.mPtrScores = reinterpret_cast<float*>(routingLogits);
         // routingData.mPtrIn = args.mInputActs;
-        routingData.mNumTokens = num_tokens;
+        routingData.mNumTokens = numTokens;
         // routingData.mHiddenDim = args.mHiddenDim;
-        routingData.mNumExperts = num_experts;
-        routingData.mNumExpertGroups = n_group;
-        routingData.mNumLimitedGroups = topk_group;
-        routingData.mTopK = top_k;
+        routingData.mNumExperts = numExperts;
+        routingData.mNumExpertGroups = nGroup;
+        routingData.mNumLimitedGroups = topkGroup;
+        routingData.mTopK = topK;
         routingData.mPaddingLog2 = computeLog2(tileN);
-        routingData.mLocalExpertsStartIdx = local_expert_offset;
+        routingData.mLocalExpertsStartIdx = localExpertOffset;
         routingData.mLocalExpertsStrideLog2 = 0;
-        routingData.mNumLocalExperts = local_num_experts;
-        routingData.mRouteScale = routed_scaling_factor;
+        routingData.mNumLocalExperts = localNumExperts;
+        routingData.mRouteScale = routedScalingFactor;
         routingData.mUseRoutingSoftmax = false;
         moe::dev::routing::run(routingData, stream);
     }
-    else if (top_k == 1)
+    else if (topK == 1)
     {
-        std::vector<int32_t> selectedIndex;
-        for (size_t ii = 0; ii < PermuteGemm1::gemmList.size(); ii++)
-        {
-            auto gemmInfo = PermuteGemm1::gemmList[ii];
-            if (gemmInfo.dtypeElt == dtypeElt && gemmInfo.usePerTokenSfB == use_routing_scales_on_input
-                && gemmInfo.useDeepSeekFp8 == use_deep_seek_fp8)
-            {
-                selectedIndex.push_back(ii);
-            }
-        }
-        TLLM_CHECK_WITH_INFO(selectedIndex.size() != 0, "No kernel found for the given element type");
-        TLLM_CHECK_WITH_INFO(selectedIndex.size() == 1, "Multiple kernels found for the given element type");
-        auto const& kernelInfo = PermuteGemm1::gemmList[*selectedIndex.begin()];
-        int32_t tileN = kernelInfo.tileN;
+        // FIXME: hardcoded for now
+        int32_t tileN = 8;
 
         moe::dev::routingLlama4::Data routingData;
         // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
@@ -136,16 +116,16 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t num_tokens, int
         // output:
         routingData.mPtrExpertIdx = routingExpertIndexes;
         routingData.mPtrExpertCounts = expertCountHistogram;
-        routingData.mPtrPermutedIdxSize = permuted_idx_size;
-        routingData.mPtrExpandedIdxToPermutedIdx = expanded_idx_to_permuted_idx;
+        routingData.mPtrPermutedIdxSize = permutedIdxSize;
+        routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
         // routingData.mPtrPermutedIdxToExpandedIdx = permuted_idx_to_expanded_idx;
-        routingData.mPtrPermutedIdxToTokenIdx = permuted_idx_to_token_idx;
+        routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
         // routingData.mPtrNumTokensPerExpert = num_tokens_per_expert;
-        routingData.mPtrExpertWeights = expert_weights;
+        routingData.mPtrExpertWeights = expertWeights;
 
-        routingData.mPtrCtaIdxXyToBatchIdx = cta_idx_xy_to_batch_idx;
-        routingData.mPtrCtaIdxXyToMnLimit = cta_idx_xy_to_mn_limit;
-        routingData.mPtrNumNonExitingCtas = num_non_exiting_ctas;
+        routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
+        routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
+        routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
         // routingData.mAllToAllRouteAct = false;
 
         // input:
@@ -153,165 +133,128 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t num_tokens, int
         // routingData.mPtrRoutingBias = routingBias;
         routingData.mPtrScores = routingLogits;
         // routingData.mPtrIn = args.mInputActs;
-        routingData.mNumTokens = num_tokens;
+        routingData.mNumTokens = numTokens;
         // routingData.mHiddenDim = args.mHiddenDim;
-        routingData.mNumExperts = num_experts;
+        routingData.mNumExperts = numExperts;
         // routingData.mNumExpertGroups = n_group;
         // routingData.mNumLimitedGroups = topk_group;
-        routingData.mTopK = top_k;
+        routingData.mTopK = topK;
         routingData.mPaddingLog2 = computeLog2(tileN);
-        routingData.mLocalExpertsStartIdx = local_expert_offset;
+        routingData.mLocalExpertsStartIdx = localExpertOffset;
         routingData.mLocalExpertsStrideLog2 = 0;
-        routingData.mNumLocalExperts = local_num_experts;
+        routingData.mNumLocalExperts = localNumExperts;
         // routingData.mRouteScale = routed_scaling_factor;
         // routingData.mUseRoutingSoftmax = false;
         moe::dev::routingLlama4::run(routingData, stream);
     }
     else
     {
-        TLLM_CHECK_ERROR(false, "top_k can only be 1 or 8.");
+        TLLM_CHECK_WITH_INFO(false, "top_k can only be 1 or 8.");
     }
 }
 } // namespace Routing
 
 namespace PermuteGemm1
 {
-Runner::Runner(trtllm::gen::Dtype dtypeElt)
+
+tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
+    trtllm::gen::Dtype dtypeElt, int32_t tileTokensDim, bool useDeepSeekFp8)
+{
+    tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {.eltType = dtypeElt,
+        .outputType = dtypeElt,
+        .deepSeekFp8 = useDeepSeekFp8,
+        .fusedAct = !useDeepSeekFp8,
+        .routeAct = true,
+        .staticBatch = false,
+        .transposeMmaOutput = true,
+        .tileSize = tileTokensDim,
+        .epilogueTileM = useDeepSeekFp8 ? 64 : 128};
+    return options;
+}
+
+Runner::Runner(trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8)
     : mDtypeElt(dtypeElt)
+    , mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(getOptions(mDtypeElt, mTileTokensDim, useDeepSeekFp8)))
 {
 }
 
-void Runner::run(void* hidden_state, void* hidden_state_scale, void* weight, void* weight_scale, void* expert_weights,
-    float* output_scales_scalar, float* output_scales_gate_scalar, void* output, void* output_scale, int32_t top_k,
-    int32_t hidden_size, int32_t intermediate_size, int32_t num_experts, int32_t num_tokens,
-    int32_t* permuted_idx_to_token_idx, int32_t* ptr_num_non_exiting_ctas, int32_t* ptr_total_num_padded_tokens,
-    int32_t* ptr_cta_idx_xy_to_batch_idx, int32_t* ptr_cta_idx_xy_to_mn_limit, bool use_routing_scales_on_input,
-    bool use_deep_seek_fp8, cudaStream_t stream)
+void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void* weightsScale, void* expertWeights,
+    float* outputScalesScalar, float* outputScalesGateScalar, void* output, void* outputScale, int32_t topK,
+    int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens, int32_t* permutedIdxToTokenIdx,
+    int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
+    int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput, int device, cudaStream_t stream)
 {
-    std::vector<int32_t> selectedIndex;
-    for (size_t ii = 0; ii < gemmList.size(); ii++)
-    {
-        auto gemmInfo = gemmList[ii];
-        if (gemmInfo.dtypeElt == mDtypeElt && gemmInfo.usePerTokenSfB == use_routing_scales_on_input
-            && gemmInfo.useDeepSeekFp8 == use_deep_seek_fp8)
-        {
-            selectedIndex.push_back(ii);
-        }
-    }
-    TLLM_CHECK_WITH_INFO(selectedIndex.size() != 0, "No kernel found for the given element type");
-    TLLM_CHECK_WITH_INFO(selectedIndex.size() == 1, "Multiple kernels found for the given element type");
-    auto const& kernelInfo = gemmList[*selectedIndex.begin()];
+    auto maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    mRunner.run(numTokens, 2 * intermediateSize, hiddenSize, {}, numTokens, numExperts, maxNumCtasInBatchDim,
+        hiddenState, hiddenStateScale, weights, weightsScale, expertWeights, /* perTokensSfB */ nullptr,
+        outputScalesScalar, outputScalesGateScalar, output, outputScale, permutedIdxToTokenIdx, ptrTotalNumPaddedTokens,
+        ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm1Workspace, stream, device);
+}
 
-    gemmCommon::MyOptions options;
-    options.mTopK = top_k;
-    options.mBatchM = false;
-    options.mTransposeMmaOutput = true;
-    options.mNumTokens = num_tokens;
-    options.mNumExperts = num_experts;
-    options.mM = 2 * intermediate_size;
-    options.mN = 256; // A default value in GemmOptions.h that is not supposed to be used. Same as trtllm-gen behavior.
-    options.mK = hidden_size;
-    options.mClusterDimX = 1;
-    options.mClusterDimY = 1;
-    options.mClusterDimZ = 1;
-    options.mAllReduceAlgo = gemmCommon::gemm::AllReduceAlgo::None;
-    options.mSplitK = gemmCommon::gemm::SplitK::None;
-    options.mPtrNumNonExitingCtas = ptr_num_non_exiting_ctas;
-    options.mPtrTotalNumPaddedTokens = ptr_total_num_padded_tokens;
-    options.mPtrCtaIdxXyToBatchIdx = ptr_cta_idx_xy_to_batch_idx;
-    options.mPtrCtaIdxXyToMnLimit = ptr_cta_idx_xy_to_mn_limit;
-    options.mSfLayoutB = tg::SfLayout::Linear;
-    options.mSfLayoutC = tg::SfLayout::Linear;
-    options.mUseCustomLowLatencyImpl = false;
-    options.mAllToAllRouteAct = false;
-    options.mIsStaticBatch = false;
-    options.mBatchedN = std::vector(num_experts, -1);
-    gemmCommon::copyKernelInfoToOptions(kernelInfo, options);
-    gemmCommon::batchedGemm::checkAndUpdateGemmOptions(options, true, false, false);
-
-    gemmCommon::BatchedGemmData batchedGemmData;
-    auto max_num_padded_tokens = Routing::getMaxPermutedPaddedCount(num_tokens, top_k, num_experts, kernelInfo.tileN);
-    gemmCommon::setSingleBatchedGemmData(weight, hidden_state, output, output_scales_scalar, output_scales_gate_scalar,
-        reinterpret_cast<float*>(weight_scale), reinterpret_cast<float*>(hidden_state_scale),
-        reinterpret_cast<float*>(output_scale),
-        // FIXME: we pass the same scaling factors in one case for dsfp8 and in the other case for fp4
-        // We should pass them once only and decide on the case inside of the setSingleBatchedGemmData
-        weight_scale, hidden_state_scale, output_scale, permuted_idx_to_token_idx, nullptr, nullptr, expert_weights,
-        kernelInfo.numSlicesForSplitK, options, batchedGemmData, max_num_padded_tokens);
-
-    gemmCommon::launchGemmFromData(kernelInfo, options, batchedGemmData, stream, /*usePDL*/ false);
+size_t Runner::getWorkspaceSizeInBytes(
+    int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens)
+{
+    auto maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    return mRunner.getWorkspaceSizeInBytes(
+        numTokens, 2 * intermediateSize, hiddenSize, {}, numTokens, numExperts, maxNumCtasInBatchDim);
 }
 } // namespace PermuteGemm1
 
 namespace Gemm2
 {
-Runner::Runner(tg::Dtype dtypeElt, tg::Dtype outputDtype)
+tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
+    trtllm::gen::Dtype dtypeElt, trtllm::gen::Dtype dtypeOut, int32_t tileTokensDim, bool useDeepSeekFp8)
+{
+    tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {.eltType = dtypeElt,
+        .outputType = dtypeOut,
+        .deepSeekFp8 = useDeepSeekFp8,
+        .fusedAct = false,
+        .routeAct = false,
+        .staticBatch = false,
+        .transposeMmaOutput = true,
+        .tileSize = tileTokensDim,
+        .epilogueTileM = useDeepSeekFp8 ? 64 : 128};
+    return options;
+}
+
+Runner::Runner(tg::Dtype dtypeElt, tg::Dtype outputDtype, bool useDeepSeekFp8)
     : mDtypeElt(dtypeElt)
     , mOutputDtype(outputDtype)
+    , mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
+          getOptions(mDtypeElt, mOutputDtype, mTileTokensDim, useDeepSeekFp8)))
 {
 }
 
-void Runner::run(void* permuted_hidden_state, void* permuted_hidden_state_scale, void* weight, void* weight_scale,
-    float* output_scales_scalar, void* output, void* output_scale, int32_t top_k, int32_t hidden_size,
-    int32_t intermediate_size, int32_t num_experts, int32_t num_tokens, int32_t* ptr_num_non_exiting_ctas,
-    int32_t* ptr_total_num_padded_tokens, int32_t* ptr_cta_idx_xy_to_batch_idx, int32_t* ptr_cta_idx_xy_to_mn_limit,
-    bool use_deep_seek_fp8, cudaStream_t stream)
+void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weights, void* weightsScale,
+    float* outputScalesScalar, void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
+    int32_t intermediateSize, int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
+    int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit,
+    void* bmm2Workspace, int device, cudaStream_t stream)
 {
-    std::vector<int32_t> selectedIndex;
-    for (size_t ii = 0; ii < gemmList.size(); ii++)
-    {
-        auto gemmInfo = gemmList[ii];
-        if (gemmInfo.dtypeElt == mDtypeElt && gemmInfo.dtypeC == mOutputDtype
-            && gemmInfo.useDeepSeekFp8 == use_deep_seek_fp8)
-        {
-            selectedIndex.push_back(ii);
-        }
-    }
-    TLLM_CHECK_WITH_INFO(selectedIndex.size() != 0, "No kernel found for the given element and output types");
-    TLLM_CHECK_WITH_INFO(selectedIndex.size() == 1, "Multiple kernels found for the given element and output types");
-    auto const& kernelInfo = gemmList[*selectedIndex.begin()];
+    auto maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    mRunner.run(numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts, maxNumCtasInBatchDim,
+        permutedHiddenState, permutedHiddenStateScale, weights, weightsScale, /* perTokensSfA */ nullptr,
+        /* perTokensSfB */ nullptr, outputScalesScalar, /* outputScalesGateScalar */ nullptr, output, outputScale,
+        /* permutedIdxToTokenIdx */ nullptr, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit,
+        ptrNumNonExitingCtas, bmm2Workspace, stream, device);
+}
 
-    gemmCommon::MyOptions options;
-    options.mTopK = top_k;
-    options.mBatchM = false;
-    options.mTransposeMmaOutput = true;
-    options.mNumExperts = num_experts;
-    options.mNumTokens = num_tokens;
-    options.mM = hidden_size;
-    options.mN = 256; // A default value in GemmOptions.h that is not supposed to be used. Same as trtllm-gen behavior.
-    options.mK = intermediate_size;
-    options.mClusterDimX = 1;
-    options.mClusterDimY = 1;
-    options.mClusterDimZ = 1;
-    options.mAllReduceAlgo = gemmCommon::gemm::AllReduceAlgo::None;
-    options.mSplitK = gemmCommon::gemm::SplitK::None;
-    options.mPtrNumNonExitingCtas = ptr_num_non_exiting_ctas;
-    options.mPtrTotalNumPaddedTokens = ptr_total_num_padded_tokens;
-    options.mPtrCtaIdxXyToBatchIdx = ptr_cta_idx_xy_to_batch_idx;
-    options.mPtrCtaIdxXyToMnLimit = ptr_cta_idx_xy_to_mn_limit;
-    options.mSfLayoutB = tg::SfLayout::Linear;
-    options.mSfLayoutC = tg::SfLayout::Linear;
-    options.mUseCustomLowLatencyImpl = false;
-    options.mAllToAllRouteAct = false;
-    options.mIsStaticBatch = false;
-    options.mBatchedN = std::vector(num_experts, -1);
-    gemmCommon::copyKernelInfoToOptions(kernelInfo, options);
-    gemmCommon::batchedGemm::checkAndUpdateGemmOptions(options, true, false, false);
-
-    gemmCommon::BatchedGemmData batchedGemmData;
-    auto max_num_padded_tokens = Routing::getMaxPermutedPaddedCount(num_tokens, top_k, num_experts, kernelInfo.tileN);
-    gemmCommon::setSingleBatchedGemmData(weight, permuted_hidden_state, output, output_scales_scalar, nullptr,
-        reinterpret_cast<float*>(weight_scale), reinterpret_cast<float*>(permuted_hidden_state_scale),
-        reinterpret_cast<float*>(output_scale), weight_scale, permuted_hidden_state_scale, output_scale, nullptr,
-        nullptr, nullptr, nullptr, kernelInfo.numSlicesForSplitK, options, batchedGemmData, max_num_padded_tokens);
-
-    gemmCommon::launchGemmFromData(kernelInfo, options, batchedGemmData, stream);
+size_t Runner::getWorkspaceSizeInBytes(
+    int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens)
+{
+    auto maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    return mRunner.getWorkspaceSizeInBytes(
+        numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts, maxNumCtasInBatchDim);
 }
 } // namespace Gemm2
 
 namespace MoE
 {
-Runner::Runner() {}
+Runner::Runner(trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8)
+    : mPermuteGemm1(PermuteGemm1::Runner(dtypeElt, useDeepSeekFp8))
+    , mGemm2(Gemm2::Runner(dtypeElt, tg::Dtype::Bfloat16, useDeepSeekFp8))
+{
+}
 
 void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace,
     moe::dev::convertsf::Data& convertSfData, moe::dev::activation::Data& activationData,
@@ -366,7 +309,16 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     finalizeData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
 }
 
-void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, cudaStream_t stream)
+std::tuple<int32_t, int32_t> Runner::getWorkspaceSizeInBytes(MoERunnerArgs const& args)
+{
+    auto workspace_size_fc1 = static_cast<int32_t>(mPermuteGemm1.getWorkspaceSizeInBytes(
+        args.top_k, args.hidden_size, args.intermediate_size, args.local_num_experts, args.num_tokens));
+    auto workspace_size_fc2 = static_cast<int32_t>(mGemm2.getWorkspaceSizeInBytes(
+        args.top_k, args.hidden_size, args.intermediate_size, args.local_num_experts, args.num_tokens));
+    return std::make_tuple(workspace_size_fc1, workspace_size_fc2);
+}
+
+void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device, cudaStream_t stream)
 {
     // Setup all operation data
     moe::dev::activation::Data activationData;
@@ -377,13 +329,12 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, cudaS
 
     void* hidden_states_scale_linear{args.hidden_states_scale};
 
-    PermuteGemm1::Runner permuteGemm1(args.mDtypeElt);
-    permuteGemm1.run(args.hidden_states, hidden_states_scale_linear, args.gemm1_weights, args.gemm1_weights_scale,
+    mPermuteGemm1.run(args.hidden_states, hidden_states_scale_linear, args.gemm1_weights, args.gemm1_weights_scale,
         workspace.expert_weights, args.output1_scales_scalar, args.output1_scales_gate_scalar, workspace.gemm1_output,
         workspace.gemm1_output_scale, args.top_k, args.hidden_size, args.intermediate_size, args.local_num_experts,
         args.num_tokens, workspace.permuted_idx_to_token_idx, workspace.num_non_exiting_ctas,
         workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit,
-        args.mUseRoutingScalesOnInput, args.mUseDeepSeekFp8, stream);
+        workspace.bmm1_workspace, args.mUseRoutingScalesOnInput, device, stream);
 
     // We do not fuse activation with FC1 for DeepSeek FP8 due to the weights shuffling constraint.
     void* gemm2_input = workspace.gemm1_output;
@@ -398,11 +349,10 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, cudaS
     }
 
     // Run gemm2
-    Gemm2::Runner gemm2(args.mDtypeElt, tg::Dtype::Bfloat16);
-    gemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale, args.output2_scales_scalar,
+    mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale, args.output2_scales_scalar,
         workspace.gemm2_output, workspace.gemm2_output_scale, args.top_k, args.hidden_size, args.intermediate_size,
         args.local_num_experts, args.num_tokens, workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
-        workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit, args.mUseDeepSeekFp8, stream);
+        workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream);
 
     // Run finalize
     moe::dev::finalize::run(finalizeData, stream);
