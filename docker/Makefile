@@ -28,12 +28,8 @@ PUSH_TO_STAGING    ?= 1
 DOCKER_BUILD_OPTS  ?= --pull --load
 DOCKER_BUILD_ARGS  ?=
 DOCKER_PROGRESS    ?= auto
-CUDA_ARCHS         ?=
 PLATFORM           ?= $(shell uname -m | grep -q 'aarch64' && echo "arm64" || echo "amd64")
-ifeq ($(PLATFORM), arm64)
-  CUDA_ARCHS = '90-real;100-real;120-real'
-endif
-
+CUDA_ARCHS         ?= $(if $(filter arm64,$(PLATFORM)),'90-real;100-real;120-real',)
 BUILD_WHEEL_OPTS   ?=
 BUILD_WHEEL_ARGS   ?= $(shell grep 'ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))
 TORCH_INSTALL_TYPE ?= skip
@@ -49,7 +45,6 @@ PYTHON_VERSION     ?=
 NGC_STAGING_REPO   ?= nvcr.io/nvstaging/tensorrt-llm
 NGC_REPO           ?= nvcr.io/nvidia/tensorrt-llm
 NGC_USE_STAGING    ?= 0
-PLATFORM           ?= $(shell uname -m | grep -q 'aarch64' && echo "arm64" || echo "amd64")
 
 define add_local_user
 	docker build \
