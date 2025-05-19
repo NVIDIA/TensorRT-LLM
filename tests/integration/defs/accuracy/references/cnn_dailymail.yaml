@@ -310,7 +310,3 @@ Qwen3/Qwen3-8B:
     accuracy: 30
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 34.003
-nvidia/Llama-3.1-Nemotron-Nano-8B-v1:
-  - accuracy: 27.810
-nvidia/Llama-3_1-Nemotron-Ultra-253B-v1:
-  - accuracy: 33.378

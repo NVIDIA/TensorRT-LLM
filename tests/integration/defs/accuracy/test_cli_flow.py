@@ -725,55 +725,38 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/llama"
 
     def test_auto_dtype(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 dtype='auto')
+        self.run(dtype='auto')
 
     @skip_post_blackwell
     def test_smooth_quant(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN)
+        self.run(quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN)
 
     @skip_post_blackwell
     def test_smooth_quant_ootb(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL)
+        self.run(quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL)
 
     @skip_post_blackwell
     def test_smooth_quant_ootb_manage_weights(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL,
+        self.run(quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL,
                  extra_build_args=["--fast_build"])
 
     @skip_post_blackwell
     def test_int4_awq(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.W4A16_AWQ)
+        self.run(quant_algo=QuantAlgo.W4A16_AWQ)
 
     @skip_post_blackwell
     def test_int4_awq_int8_kv_cache(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.W4A16_AWQ,
+        self.run(quant_algo=QuantAlgo.W4A16_AWQ,
                  kv_cache_quant_algo=QuantAlgo.INT8)
 
     @skip_post_blackwell
     def test_int4_awq_manage_weights(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.W4A16_AWQ,
+        self.run(quant_algo=QuantAlgo.W4A16_AWQ,
                  extra_build_args=["--fast_build"])
 
     @skip_pre_ada
     def test_fp8(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8,
-                 kv_cache_quant_algo=QuantAlgo.FP8)
+        self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
 
     @skip_pre_ada
     @pytest.mark.skip_less_device(2)
@@ -800,9 +783,7 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
         else:
             extra_build_args.append("--reduce_fusion=disable")
 
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8,
+        self.run(quant_algo=QuantAlgo.FP8,
                  kv_cache_quant_algo=QuantAlgo.FP8,
                  tp_size=2,
                  extra_build_args=extra_build_args)
@@ -810,18 +791,14 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
     @skip_pre_ada
     @pytest.mark.skip_less_device(2)
     def test_fp8_pp2(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8,
+        self.run(quant_algo=QuantAlgo.FP8,
                  kv_cache_quant_algo=QuantAlgo.FP8,
                  pp_size=2)
 
     @skip_pre_ada
     @skip_post_blackwell
     def test_fp8_rowwise(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
+        self.run(quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
 
     @skip_pre_ada
     @skip_post_blackwell
