@@ -6,6 +6,7 @@ from typing import Dict, Literal, Optional
 import flashinfer
 import torch
 from flashinfer.jit.core import check_cuda_arch
+from typing_extensions import Self
 
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -163,6 +164,19 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                                  device='cuda',
                                                  dtype=torch.int)
 
+    def create_cuda_graph_metadata(self,
+                                   max_batch_size: int,
+                                   sub_cross_metadata: bool = False,
+                                   max_draft_tokens: int = 0) -> Self:
+        metadata = super().create_cuda_graph_metadata(max_batch_size,
+                                                      sub_cross_metadata,
+                                                      max_draft_tokens)
+        metadata.max_num_requests = max_batch_size
+        metadata.max_num_tokens = max_batch_size * (1 + max_draft_tokens)
+        # Post init again to make sure all tensors are allocated
+        metadata.__post_init__()
+        return metadata
+
     @property
     def page_size(self) -> int:
         """
@@ -172,9 +186,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
     def prepare(self) -> None:
         extra_attrs = get_model_extra_attrs()
-        if extra_attrs is not None:
-            extra_attrs["attention_metadata"] = weakref.ref(self)
-        else:
+        if extra_attrs is None:
             get_global_attrs().attention_metadata = weakref.ref(self)
         # start and end indices of each sequence in the ragged query
         torch.cumsum(self.seq_lens_cuda,

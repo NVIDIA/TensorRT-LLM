@@ -633,19 +633,19 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         """
 
         assert intermediate_size % block_size == 0, "intermediate_size must be divisible by block_size."
-
         if self.enable_attention_dp:
             # If using attention DP, the MLP also uses DP instead of TP.
             mlp_tp_size = 1
         else:
             # The two math.gcd operations ensure that mlp_tp_size falls in the candidate TP sizes.
-            mlp_tp_size = math.gcd(
-                math.gcd(
-                    intermediate_size // block_size,
-                    self.mapping.tp_size,
-                ),
-                self.mapping.gpus_per_node,  # Avoid costly inter-node TP
+            tp = math.gcd(
+                intermediate_size // block_size,
+                self.mapping.tp_size,
             )
+            mlp_tp_size = math.gcd(
+                tp,
+                self.mapping.gpus_per_node,
+            ) if tp > self.mapping.gpus_per_node else tp  # Avoid costly inter-node TP
         return mlp_tp_size
 
     def _enable_min_latency_mode(self, num_tokens: int):
