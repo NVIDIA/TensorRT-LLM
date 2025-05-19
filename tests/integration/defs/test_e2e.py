@@ -1269,6 +1269,9 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('Llama3.1-70B-FP8',
                  'llama-3.1-model/Llama-3.1-70B-Instruct-FP8',
                  marks=skip_pre_hopper),
+    pytest.param('Nemotron-Super-49B-v1-FP8',
+                 'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8',
+                 marks=skip_pre_hopper),
     pytest.param('Mixtral-8x7B-NVFP4',
                  'nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1',
                  marks=skip_pre_blackwell),
@@ -1524,6 +1527,8 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("model_name,model_path", [
     ("Llama3.1-70B-BF16", "llama-3.1-model/Meta-Llama-3.1-70B"),
+    ('Nemotron-Super-49B-v1-BF16',
+     'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1'),
     ("Mixtral-8x7B-BF16", "Mixtral-8x7B-Instruct-v0.1"),
 ])
 def test_ptp_quickstart_advanced_2gpus_sm120(llm_root, llm_venv, model_name,
