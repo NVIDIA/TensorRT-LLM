@@ -650,29 +650,23 @@ class PyExecutor:
 
     def _executor_loop_pp(self):
         torch.cuda.set_device(self.device_id)
-        got_finish_signal = False
         num_dummy_request = 0
         microbatch_id = 0
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
-            while not got_finish_signal or len(self.active_requests) > 0:
+            while not len(self.active_requests) > 0:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
                 new_requests = self._fetch_new_requests()
-                got_finish_signal = self._merge_requests(
-                    new_requests) or got_finish_signal
-                if got_finish_signal and len(self.active_requests) == 0:
-                    break
 
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         len(new_requests),
                         self.new_active_requests_queue_latency_ms)
 
-                if not got_finish_signal:
-                    num_dummy_request = self._get_num_dummy_request()
+                num_dummy_request = self._get_num_dummy_request()
                 if num_dummy_request > 0:
                     self._merge_dummy_request(num_dummy_request)
                 scheduled_batch, _, _ = self._schedule()
@@ -789,20 +783,16 @@ class PyExecutor:
 
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
-        got_finish_signal = False
         num_dummy_request = 0
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
-            while not got_finish_signal or len(self.active_requests) > 0:
+            while len(self.active_requests) > 0:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
                 new_requests = self._fetch_new_requests()
-                got_finish_signal = self._merge_requests(
-                    new_requests) or got_finish_signal
-                if got_finish_signal and len(self.active_requests) == 0:
-                    break
+
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         len(new_requests),
@@ -811,8 +801,7 @@ class PyExecutor:
                 if self.kv_cache_transceiver:
                     self._check_disagg_gen_transfer_status()
 
-                if not got_finish_signal:
-                    num_dummy_request = self._get_num_dummy_request()
+                num_dummy_request = self._get_num_dummy_request()
                 if num_dummy_request > 0:
                     self._merge_dummy_request(num_dummy_request)
 
@@ -923,20 +912,15 @@ class PyExecutor:
 
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
-        got_finish_signal = False
         num_dummy_request = 0
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
-            while not got_finish_signal or len(self.active_requests) > 0:
+            while len(self.active_requests) > 0:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
                 new_requests = self._fetch_new_requests()
-                got_finish_signal = self._merge_requests(
-                    new_requests) or got_finish_signal
-                if got_finish_signal and len(self.active_requests) == 0:
-                    break
 
                 if self.kv_cache_transceiver:
                     self._check_disagg_gen_transfer_status()
@@ -946,8 +930,7 @@ class PyExecutor:
                         len(new_requests),
                         self.new_active_requests_queue_latency_ms)
 
-                if not got_finish_signal:
-                    num_dummy_request = self._get_num_dummy_request()
+                num_dummy_request = self._get_num_dummy_request()
                 if num_dummy_request > 0:
                     self._merge_dummy_request(num_dummy_request)
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
@@ -1190,7 +1173,7 @@ class PyExecutor:
 
         if not self.enable_attention_dp:
             self._update_new_active_requests_queue_latency(new_requests)
-            return new_requests
+            return self._merge_requests(new_requests)
 
         num_new_requests_all_ranks = len(new_requests)
         self.expected_num_active_requests = max(
@@ -1259,7 +1242,7 @@ class PyExecutor:
 
         if len(new_requests) == 1 and new_requests[0] is None:
             new_requests_cur_rank = new_requests
-        return new_requests_cur_rank
+        return self._merge_requests(new_requests_cur_rank)
 
     @nvtx_range("_gather_dp_requests_num")
     def _gather_dp_requests_num(self):
@@ -1280,18 +1263,10 @@ class PyExecutor:
         kv_cache_manager.flush_iteration_events()
 
     def _merge_tp_requests(self, new_requests: List[ExecutorRequest]):
-        for request in new_requests:
-            if request is None:
-                return True
         for req_item in new_requests:
-            if _is_executor_request(req_item):
-                req_id, exe_req = req_item
-                req = executor_request_to_llm_request(req_id, exe_req)
-                self.active_requests.append(req)
-            elif _is_cancel_request(req_item):
-                self.canceled_req_ids.insert(req_item)
-
-        return False
+            req_id, exe_req = req_item
+            req = executor_request_to_llm_request(req_id, exe_req)
+            self.active_requests.append(req)
 
     def _merge_dummy_request(self, num_dummy_request: int):
         llm_request_list = self.kv_cache_manager.add_dummy_requests(
@@ -1389,64 +1364,54 @@ class PyExecutor:
 
     def _merge_star_attention_requests(self,
                                        new_requests: List[ExecutorRequest]):
-        for request in new_requests:
-            if request is None:
-                return True
         for req_item in new_requests:
-            if _is_executor_request(req_item):
-                req_id, exe_req, query_token_ids = req_item
-                ctx_len0 = len(exe_req.input_token_ids)
-                ctx_blocks, position_blocks, last_block_padding_num = [
-                    exe_req.input_token_ids
-                ], [[i for i in range(ctx_len0)]], 0
-                ctx_blocks, position_blocks, last_block_padding_num = self._partition_context(
-                    exe_req.input_token_ids)
-                if self.dist.cp_rank == self.dist.cp_size - 1 and last_block_padding_num > 0:
-                    ctx_blocks[-1] = ctx_blocks[-1][:-last_block_padding_num]
-                    position_blocks[-1] = position_blocks[
-                        -1][:-last_block_padding_num]
-                #if has query
-                if query_token_ids:
-                    ctx_blocks.append(query_token_ids)
-                    position_blocks.append([
-                        i for i in range(ctx_len0, ctx_len0 +
-                                         len(query_token_ids))
-                    ])
+            req_id, exe_req, query_token_ids = req_item
+            ctx_len0 = len(exe_req.input_token_ids)
+            ctx_blocks, position_blocks, last_block_padding_num = [
+                exe_req.input_token_ids
+            ], [[i for i in range(ctx_len0)]], 0
+            ctx_blocks, position_blocks, last_block_padding_num = self._partition_context(
+                exe_req.input_token_ids)
+            if self.dist.cp_rank == self.dist.cp_size - 1 and last_block_padding_num > 0:
+                ctx_blocks[-1] = ctx_blocks[-1][:-last_block_padding_num]
+                position_blocks[-1] = position_blocks[
+                    -1][:-last_block_padding_num]
+            #if has query
+            if query_token_ids:
+                ctx_blocks.append(query_token_ids)
+                position_blocks.append([
+                    i for i in range(ctx_len0, ctx_len0 + len(query_token_ids))
+                ])
 
-                # insert the dummy block to align the number of ctx iterations of each rank
-                block_size = self.dist.cp_config['block_size']
-                total_blocks = (ctx_len0 + block_size - 1) // block_size
-                num_blocks_per_rank = (
-                    total_blocks + self.dist.cp_size -
-                    1) // self.dist.cp_size + 1  # 1 for query block
-                if len(ctx_blocks) == num_blocks_per_rank:
-                    ctx_blocks.insert(1, [])
-                    position_blocks.insert(1, [])
-                elif len(ctx_blocks) == num_blocks_per_rank + 1:
-                    # anchor + ctx_blocks + qry_block
-                    pass
-                else:
-                    print(
-                        f'rank = {self.dist.cp_rank}, len(ctx_blocks)  = {len(ctx_blocks) }, num_blocks_per_rank = {num_blocks_per_rank}'
-                    )
-                    assert False, f'invalid context partition'
+            # insert the dummy block to align the number of ctx iterations of each rank
+            block_size = self.dist.cp_config['block_size']
+            total_blocks = (ctx_len0 + block_size - 1) // block_size
+            num_blocks_per_rank = (
+                total_blocks + self.dist.cp_size -
+                1) // self.dist.cp_size + 1  # 1 for query block
+            if len(ctx_blocks) == num_blocks_per_rank:
+                ctx_blocks.insert(1, [])
+                position_blocks.insert(1, [])
+            elif len(ctx_blocks) == num_blocks_per_rank + 1:
+                # anchor + ctx_blocks + qry_block
+                pass
+            else:
+                print(
+                    f'rank = {self.dist.cp_rank}, len(ctx_blocks)  = {len(ctx_blocks) }, num_blocks_per_rank = {num_blocks_per_rank}'
+                )
+                assert False, f'invalid context partition'
 
-                # fake data for scheduler
-                ctx_blocks_list = [0] * (block_size +
-                                         self.dist.cp_config['cp_anchor_size'])
-
-                req = executor_request_to_llm_request(req_id, exe_req,
-                                                      ctx_blocks_list)
-                req.gen_iters = 0
-                req.ctx_iters = 0
-                req.ctx_blocks = ctx_blocks
-                req.ctx_position_blocks = position_blocks
-                req.query_id = query_token_ids
-                self.active_requests.append(req)
-            elif _is_cancel_request(req_item):
-                self.canceled_req_ids.insert(req_item)
-
-        return False
+            # fake data for scheduler
+            ctx_blocks_list = [0] * (block_size +
+                                     self.dist.cp_config['cp_anchor_size'])
+            req = executor_request_to_llm_request(req_id, exe_req,
+                                                  ctx_blocks_list)
+            req.gen_iters = 0
+            req.ctx_iters = 0
+            req.ctx_blocks = ctx_blocks
+            req.ctx_position_blocks = position_blocks
+            req.query_id = query_token_ids
+            self.active_requests.append(req)
 
     @nvtx_range("_merge_requests")
     def _merge_requests(self, new_requests: List[ExecutorRequest]):
@@ -1454,14 +1419,13 @@ class PyExecutor:
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
             if cp_type == 'star_attention':
-                ret = self._merge_star_attention_requests(new_requests)
+                self._merge_star_attention_requests(new_requests)
             elif cp_type == 'ring_attention':
                 raise NotImplementedError("ring attention not implemented yet")
             else:
                 raise NotImplementedError(f'unsupport cp type {cp_type}')
         else:
-            ret = self._merge_tp_requests(new_requests)
-        return ret
+            self._merge_tp_requests(new_requests)
 
     @nvtx_range("_schedule")
     def _schedule(self):
