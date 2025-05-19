@@ -414,7 +414,10 @@ class BenchRunner:
         self.work_dir = Path(tempfile.TemporaryDirectory().name)
 
         self.dataset_path = os.path.join(self.work_dir, f"data.txt")
-        self.mpirun_cmd = f"mpirun -n {self.tp_size} trtllm-llmapi-launch" if self.use_mpirun else ""
+        if self.use_mpirun:
+            self.mpirun_cmd = f"mpirun --allow-run-as-root -n {self.tp_size} trtllm-llmapi-launch"
+        else:
+            self.mpirun_cmd = ""
         self.engine_path = None
 
     def __call__(self):
