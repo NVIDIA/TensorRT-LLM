@@ -1039,28 +1039,31 @@ std::vector<executor::Request> createRequestsFromInputTensors(std::vector<InputT
 
         // Multimodal input construction
         std::optional<executor::MultimodalInput> multimodalInputOpt{std::nullopt};
-        if (inputTensors.count(InputFieldsNames::multimodalHashes) &&
-            inputTensors.count(InputFieldsNames::multimodalPositions) &&
-            inputTensors.count(InputFieldsNames::multimodalLengths))
+        if (inputTensors.count(InputFieldsNames::multimodalHashes)
+            && inputTensors.count(InputFieldsNames::multimodalPositions)
+            && inputTensors.count(InputFieldsNames::multimodalLengths))
         {
             std::vector<std::vector<executor::SizeType32>> multimodalHashes;
             std::vector<executor::SizeType32> multimodalPositions;
             std::vector<executor::SizeType32> multimodalLengths;
             // Extract multimodalHashes as a vector of vectors (2D tensor with [num_tokens, hash_len])
-            const auto& hashesTensor = inputTensors.at(InputFieldsNames::multimodalHashes).tensor;
+            auto const& hashesTensor = inputTensors.at(InputFieldsNames::multimodalHashes).tensor;
             auto hashesShape = hashesTensor->getShape();
             TLLM_CHECK_WITH_INFO(hashesShape.nbDims == 2, "multimodal_hashes tensor must be 2D (num_tokens, hash_len)");
             int64_t numTokens = hashesShape.d[0];
             int64_t hashLen = hashesShape.d[1];
             auto* data = static_cast<executor::SizeType32*>(hashesTensor->data());
             multimodalHashes.resize(numTokens);
-            for (int64_t i = 0; i < numTokens; ++i) {
+            for (int64_t i = 0; i < numTokens; ++i)
+            {
                 multimodalHashes[i].resize(hashLen);
                 std::memcpy(multimodalHashes[i].data(), data + i * hashLen, hashLen * sizeof(executor::SizeType32));
             }
             // Extract positions and lengths as 1D vectors
-            utils::extractVector<executor::SizeType32>(inputTensors, InputFieldsNames::multimodalPositions, multimodalPositions);
-            utils::extractVector<executor::SizeType32>(inputTensors, InputFieldsNames::multimodalLengths, multimodalLengths);
+            utils::extractVector<executor::SizeType32>(
+                inputTensors, InputFieldsNames::multimodalPositions, multimodalPositions);
+            utils::extractVector<executor::SizeType32>(
+                inputTensors, InputFieldsNames::multimodalLengths, multimodalLengths);
             multimodalInputOpt = executor::MultimodalInput(multimodalHashes, multimodalPositions, multimodalLengths);
         }
 
