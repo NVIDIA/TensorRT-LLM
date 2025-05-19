@@ -592,7 +592,7 @@ def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
                     expected_tokens = test_data["expected_output_ids"][
                         batch_id * beam_width + beam][input_length:]
 
-                    # Through experiemnts find out when set return_context_logits
+                    # Through experiments find out when set return_context_logits
                     # or return_generation_logits, the predicted_tokens cannot match with expected_tokens
                     compare_length = 2 if (
                         return_context_logits
