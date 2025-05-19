@@ -186,7 +186,7 @@ class TestMoeLoadBalancer(unittest.TestCase):
 
         # Setup
         mock_single_layer_impl = MagicMock()
-        layer = SingleLayerMoeLoadBalancer(mock_single_layer_impl)
+        layer = SingleLayerMoeLoadBalancer(mock_single_layer_impl, None)
 
         # Mock out torch.ops.trtllm functions
         with patch('torch.ops.trtllm.moe_load_balance_wait_gpu_stage') as mock_wait, \
@@ -197,13 +197,13 @@ class TestMoeLoadBalancer(unittest.TestCase):
             # Exercise - test each method
             # add_weight_slot
             mock_weight = MagicMock()
-            layer.add_weight_slot(1, "weight1", mock_weight)
+            layer._add_weight_slot(1, "weight1", mock_weight)
             mock_single_layer_impl.add_weight_slot.assert_called_once_with(
                 1, "weight1", mock_weight)
 
             # add_host_weight
             mock_host_weight = MagicMock()
-            layer.add_host_weight(2, "weight2", mock_host_weight)
+            layer._add_host_weight(2, "weight2", mock_host_weight)
             mock_single_layer_impl.add_host_weight.assert_called_once_with(
                 2, "weight2", mock_host_weight)
 

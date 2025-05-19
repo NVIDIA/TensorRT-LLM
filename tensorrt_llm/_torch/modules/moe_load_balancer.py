@@ -1,9 +1,161 @@
+import atexit
 import threading
-from typing import List, Optional
+from multiprocessing import shared_memory
+from typing import Callable, List, Optional
 
 import torch
+from mpi4py import MPI
 
+import tensorrt_llm
 import tensorrt_llm.bindings.internal.runtime as _tbr
+
+
+def _tensor_to_weight(t: torch.Tensor) -> _tbr.MoeWeight:
+    """
+    Convert a tensor to a MoeWeight object.
+
+    Args:
+        t: The tensor to convert
+    """
+    assert t.dim() <= 2, "t.dim() should be less than or equal to 2"
+    shape = [1, 1]
+    pitch = 1
+    if t.dim() == 2:
+        shape[0] = t.size(0)
+        shape[1] = t.size(1)
+        pitch = t.stride(0)
+    elif t.dim() == 1:
+        shape[1] = t.size(0)
+        pitch = t.size(0)
+    else:
+        pass
+    mw = _tbr.MoeWeight()
+    mw.height = shape[0]
+    mw.width = shape[1]
+    mw.pitch = pitch
+    mw.weight_ptr = t.data_ptr()
+    return mw
+
+
+class HostMoeTensorSharer:
+    """
+    A class representing a host tensor sharer.
+    """
+
+    def __init__(self, layer_id: int, shared_mpi_comm: MPI.Comm):
+        """
+        Initialize a HostMoeTensorSharer instance.
+
+        Args:
+            shared_mpi_comm: The MPI communicator for shared memory
+        """
+        self.shared_mpi_comm = shared_mpi_comm
+        self.layer_id = layer_id
+        self.shared_memory_base_name = None
+        self.host_tensor_shapes = []
+        self.host_weights = {}
+        self.own_shms = {}
+        self.all_shms = []
+
+    def set_shared_memory_base_name(self, shared_memory_base_name):
+        """
+        Set the shared memory base name for the layer.
+
+        Args:
+            shared_memory_base_name: The base name for the shared memory
+        """
+        self.shared_memory_base_name = shared_memory_base_name
+
+    def get_shared_memory_name(self, expert_id: int, name: str):
+        """
+        Get the shared memory name for the layer.
+
+        Args:
+            expert_id: The ID of the expert
+            name: The name of the weight
+        """
+        assert isinstance(self.shared_memory_base_name,
+                          str), "self.shared_memory_base_name must be a string"
+        shared_memory_name = f"{self.shared_memory_base_name}_l{self.layer_id}_e{expert_id}_{name}"
+        return shared_memory_name
+
+    def pre_register_host_tensor_with_shape(self, expert_id: int, name: str,
+                                            dtype, tensor_shape):
+        """
+        Pre-register a host tensor with shape.
+        This function is invoked by the processes that don't load the weights.
+        It just records the shape of the weight tensor, and the process that
+        loads the weights will call share_host_tensor_with_shape to share the
+        actual weight tensor. After the weight tensor is shared, e.g. after the
+        barrier in finalize_model, the processes that pre-registers the weight
+        tensor will add the weight tensor to the layer.
+
+        Args:
+            expert_id: The ID of the expert
+            name: The name of the weight
+        """
+        assert len(tensor_shape
+                   ) <= 2, "tensor_shape dim must be less than or equal to 2"
+        self.host_tensor_shapes.append((expert_id, name, dtype, tensor_shape))
+
+    def share_host_tensor_with_shape(self, expert_id: int, name: str,
+                                     t: torch.Tensor):
+        """
+        Share a host tensor with shape.
+        This function is invoked by the processes that load the weights.
+        It creates a shared memory for the weight tensor, and then shares the
+        weight tensor with the processes that pre-register the weight tensor.
+
+        Args:
+            expert_id: The ID of the expert
+            name: The name of the weight
+            t: The weight tensor
+        """
+        assert t.is_contiguous() == True, "t.is_contiguous() must be True"
+        shm_name = self.get_shared_memory_name(expert_id, name)
+        shm = shared_memory.SharedMemory(name=shm_name,
+                                         create=True,
+                                         size=t.numel() * t.element_size())
+        shm.buf[:t.numel() * t.element_size()] = t.numpy().tobytes()
+        dtype = t.dtype
+        tensor_shape = t.shape
+        t = torch.frombuffer(shm.buf,
+                             dtype=dtype).view(tensor_shape).pin_memory()
+        key = (expert_id, name)
+        assert key not in self.host_weights.keys(), f"key={key} already exists"
+        self.host_weights[key] = t
+        self.own_shms[(expert_id, name)] = shm
+        self.all_shms.append(shm)
+        atexit.register(shm.unlink)
+
+    def finalize_host_tensor_sharing(self, add_host_weight_fn: Callable = None):
+        """
+        Finalize the host tensor sharing.
+        """
+        for expert_weight_info in self.host_tensor_shapes:
+            expert_id, name, dtype, tensor_shape = expert_weight_info
+            shm_name = self.get_shared_memory_name(expert_id, name)
+            shm = shared_memory.SharedMemory(name=shm_name)
+            self.all_shms.append(shm)
+            t = torch.frombuffer(shm.buf,
+                                 dtype=dtype).view(tensor_shape).pin_memory()
+            key = (expert_id, name)
+            assert key not in self.host_weights.keys(
+            ), f"key={key} already exists"
+            self.host_weights[key] = t
+
+        if add_host_weight_fn is not None:
+            for key, t in self.host_weights.items():
+                add_host_weight_fn(key[0], key[1], t)
+
+        self.host_weights.clear()
+
+    def pre_shutdown_cleanup(self):
+        """
+        Clean up the resources before C++ shutdown and barrier
+        """
+        for shm in self.all_shms:
+            shm.close()
 
 
 class SingleLayerMoeLoadBalancer:
@@ -14,19 +166,33 @@ class SingleLayerMoeLoadBalancer:
 
     def __init__(
             self,
-            single_layer_load_balancer_impl: _tbr.SingleLayerMoeLoadBalancer):
+            single_layer_load_balancer_impl: _tbr.SingleLayerMoeLoadBalancer,
+            shared_mpi_comm: MPI.Comm):
         """
         Initialize a SingleLayerMoeLoadBalancer instance.
 
         Args:
             single_layer_load_balancer_impl: The C++ implementation of SingleLayerMoeLoadBalancer
+            shared_mpi_comm: The MPI communicator for shared memory
         """
         self.single_layer_load_balancer_impl = single_layer_load_balancer_impl
         self.single_layer_load_balancer_ptr = single_layer_load_balancer_impl.get_pointer(
         )
+        layer_id = self.single_layer_load_balancer_impl.get_layer_id()
+        self.host_tensor_sharer = HostMoeTensorSharer(shared_mpi_comm, layer_id)
 
-    def add_weight_slot(self, slot_id: int, name: str,
-                        weight_slot: _tbr.MoeWeight):
+    def set_shared_memory_base_name(self, shared_memory_base_name):
+        """
+        Set the shared memory base name for the layer.
+
+        Args:
+            shared_memory_base_name: The base name for the shared memory
+        """
+        self.host_tensor_sharer.set_shared_memory_base_name(
+            shared_memory_base_name)
+
+    def _add_weight_slot(self, slot_id: int, name: str,
+                         weight_slot: _tbr.MoeWeight):
         """
         Add a weight slot to the layer.
 
@@ -38,8 +204,20 @@ class SingleLayerMoeLoadBalancer:
         self.single_layer_load_balancer_impl.add_weight_slot(
             slot_id, name, weight_slot)
 
-    def add_host_weight(self, expert_id: int, name: str,
-                        host_weight: _tbr.MoeWeight):
+    def register_weight_slot(self, slot_id: int, name: str, t: torch.Tensor):
+        """
+        Register a weight slot to the layer.
+
+        Args:
+            slot_id: The ID of the slot
+            name: The name of the weight
+            t: The weight tensor
+        """
+        moe_weight = _tensor_to_weight(t)
+        self._add_weight_slot(slot_id, name, moe_weight)
+
+    def _add_host_weight(self, expert_id: int, name: str,
+                         host_weight: _tbr.MoeWeight):
         """
         Add a host weight to the layer.
 
@@ -51,6 +229,14 @@ class SingleLayerMoeLoadBalancer:
         self.single_layer_load_balancer_impl.add_host_weight(
             expert_id, name, host_weight)
 
+    def _add_host_weight_from_tensor(self, expert_id: int, name: str,
+                                     t: torch.Tensor):
+        """
+        Add a host weight to the layer from a tensor.
+        """
+        host_weight = _tensor_to_weight(t)
+        self._add_host_weight(expert_id, name, host_weight)
+
     def set_initial_weight_assignments(self,
                                        initial_weight_assignments: List[int]):
         """
@@ -61,6 +247,14 @@ class SingleLayerMoeLoadBalancer:
         """
         self.single_layer_load_balancer_impl.set_initial_weight_assignments(
             initial_weight_assignments)
+
+    def py_finalize_model(self):
+        """
+        Finalize the model after all layers have been added.
+        This must be called before starting any iterations.
+        """
+        self.host_tensor_sharer.finalize_host_tensor_sharing(
+            self._add_host_weight_from_tensor)
 
     def wait_for_gpu_stage(self) -> torch.Tensor:
         """
@@ -108,6 +302,12 @@ class SingleLayerMoeLoadBalancer:
         return torch.ops.trtllm.moe_load_balance_routing(
             token_selected_experts, self.single_layer_load_balancer_ptr)
 
+    def py_pre_shutdown_cleanup(self):
+        """
+        Clean up the resources before C++ shutdown and barrier
+        """
+        self.host_tensor_sharer.pre_shutdown_cleanup()
+
 
 # Global variable to store the current active MoeLoadBalancer instance
 _current_moe_load_balancer = threading.local()
@@ -119,7 +319,11 @@ class MoeLoadBalancer:
     This class can be used as a context manager to manage the lifecycle of a MoeLoadBalancer.
     """
 
-    def __init__(self, ep_rank: int, ep_size: int, layer_updates_per_iter: int):
+    def __init__(self,
+                 ep_rank: int,
+                 ep_size: int,
+                 layer_updates_per_iter: int,
+                 shared_memory_base_name: str = 'moe_shared'):
         """
         Initialize a MoeLoadBalancer instance.
 
@@ -127,6 +331,7 @@ class MoeLoadBalancer:
             ep_rank: The rank of the current process in expert parallelism
             ep_size: The total number of processes in expert parallelism
             layer_updates_per_iter: The number of layers to update per iteration
+            shared_memory_base_name: Shared memory base name
         """
         self.ep_rank = ep_rank
         self.ep_size = ep_size
@@ -134,6 +339,19 @@ class MoeLoadBalancer:
         self.load_balancer_impl = _tbr.MoeLoadBalancer(ep_rank, ep_size,
                                                        layer_updates_per_iter)
         self._previous_balancer = None
+        self.single_layer_load_balancers = []
+        self.shared_memory_base_name = shared_memory_base_name
+        self._setup_mpi_comm()
+
+    def _setup_mpi_comm(self):
+        global_mpi_comm = tensorrt_llm.mpi_comm()
+        shared_mpi_comm = global_mpi_comm.Split_type(
+            split_type=MPI.COMM_TYPE_SHARED)
+        shared_size = shared_mpi_comm.Get_size()
+        local_size = tensorrt_llm.local_mpi_size()
+        assert shared_size == local_size, \
+            f"Interesting, shared size {shared_size} is not same as local size {local_size}"
+        self.shared_mpi_comm = shared_mpi_comm
 
     def add_layer(self, expert_count: int, top_k: int,
                   slot_count_per_rank: int) -> SingleLayerMoeLoadBalancer:
@@ -150,13 +368,24 @@ class MoeLoadBalancer:
         """
         single_layer_load_balancer_impl = self.load_balancer_impl.add_layer(
             expert_count, top_k, slot_count_per_rank)
-        return SingleLayerMoeLoadBalancer(single_layer_load_balancer_impl)
+        single_layer_load_balancer = SingleLayerMoeLoadBalancer(
+            single_layer_load_balancer_impl, self.shared_mpi_comm)
+        single_layer_load_balancer.set_shared_memory_base_name(
+            self.shared_memory_base_name)
+        self.single_layer_load_balancers.append(single_layer_load_balancer)
+        return single_layer_load_balancer
 
     def finalize_model(self):
         """
         Finalize the model after all layers have been added.
         This must be called before starting any iterations.
         """
+
+        # All shared memory create before this barrier.
+        self.shared_mpi_comm.barrier()
+        # All shared memory mapping after this barrier.
+        for single_layer_load_balancer in self.single_layer_load_balancers:
+            single_layer_load_balancer.py_finalize_model()
         self.load_balancer_impl.finalize_model()
 
     def set_warm_up_iter_count(self, iter_count: int):
@@ -194,7 +423,11 @@ class MoeLoadBalancer:
         """
         Shutdown the load balancer and release resources.
         """
+        for single_layer_load_balancer in self.single_layer_load_balancers:
+            single_layer_load_balancer.py_pre_shutdown_cleanup()
         self.load_balancer_impl.shutdown()
+        # use this sync to make sure all the shm resources can be cleaned up
+        self.shared_mpi_comm.barrier()
 
     def __repr__(self):
         """

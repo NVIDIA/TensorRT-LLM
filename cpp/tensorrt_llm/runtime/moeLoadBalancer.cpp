@@ -131,7 +131,6 @@ void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* 
     // 1. Create all replica information
     std::vector<ReplicaInfo> allReplicas;
     allReplicas.reserve(totalSlotCount);
-    double totalLoadSum = 0.0; // For verification/debugging potentially
 
     for (int expertId = 0; expertId < metaInfo.expertCount; ++expertId)
     {
@@ -140,7 +139,7 @@ void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* 
         for (int replicaId = 0; replicaId < replicaCount[expertId]; ++replicaId)
         {
             allReplicas.push_back({slotSize, expertId});
-            totalLoadSum += slotSize; // Accumulate total load
+            // totalLoadSum += slotSize; // Accumulate total load
         }
     }
 
