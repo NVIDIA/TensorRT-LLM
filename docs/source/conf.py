@@ -87,7 +87,6 @@ source_suffix = {
 
 html_theme = 'nvidia_sphinx_theme'
 html_static_path = ['_static']
-html_extra_path = ["./_static/switcher.json"]
 html_theme_options = {
     "switcher": {
         "json_url": "./_static/switcher.json",
