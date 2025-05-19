@@ -73,7 +73,10 @@ def get_pp_layers(
 
     total_num_layers = num_layers
     if layer_mask is not None:
-        assert sum(layer_mask) == num_layers
+        assert sum(layer_mask) == num_layers, (
+            f"The number of enabled layers in layer_mask ({sum(layer_mask)}) "
+            f"must match the number of layers ({num_layers}) "
+            f"in KV cache manager, but get layer_mask: {layer_mask}")
         total_num_layers = len(layer_mask)
     pp_layers = mapping.pp_layers(total_num_layers)
     if layer_mask is not None:
