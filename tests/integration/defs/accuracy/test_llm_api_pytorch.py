@@ -209,7 +209,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
 
-    @pytest.mark.skip(reason="To be tested on 8 GPUs")
     @pytest.mark.skip_less_device(8)
     def test_auto_dtype_tp8(self):
         model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct"
