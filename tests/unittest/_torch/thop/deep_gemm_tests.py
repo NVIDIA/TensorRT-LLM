@@ -31,7 +31,7 @@ from utils.util import getSMVersion
 )
 @pytest.mark.parametrize(
     "m",
-    [7, 64, 128, 4096],
+    [7, 16, 64, 128, 4096],
 )
 def test_fp8_block_scale_gemm(m, k, n):
     torch.random.manual_seed(0)

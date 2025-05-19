@@ -205,6 +205,48 @@ void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, 
 }
 
 template <typename LayoutIndexType>
+void runGemmSwapAB(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d,
+    float* scales_a, float* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, uint32_t block_m,
+    uint32_t block_n, uint32_t block_k, uint32_t num_groups, uint32_t num_tma_multicast, GemmType gemm_type,
+    LayoutIndexType* grouped_layout, cudaStream_t stream, int num_sms, uint32_t smem_size)
+{
+    auto tma_a_desc = make_2d_tma_a_desc_swapAB(
+        reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m, shape_k, block_m, block_k, num_groups, gemm_type, ld_a);
+    auto tma_b_desc = make_2d_tma_b_desc_swapAB(
+        reinterpret_cast<__nv_fp8_e4m3*>(mat_b), shape_n, shape_k, block_n, block_k, num_groups, gemm_type, ld_b);
+    auto tma_scales_b_desc
+        = make_2d_tma_scales_b_desc_swapAB(scales_b, shape_n, shape_k, block_n, block_k, num_groups, gemm_type);
+    auto tma_d_desc = make_2d_tma_d_desc_swapAB(
+        reinterpret_cast<__nv_bfloat16*>(mat_d), shape_m, shape_n, block_m, block_n, num_groups, gemm_type, ld_d * 2);
+
+    constexpr uint32_t kNumTMAThreads = 128;
+    constexpr uint32_t kNumMathThreadsPerGroup = 128;
+    DG_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess);
+
+    // Cluster launch
+    cudaLaunchConfig_t config;
+    config.gridDim = num_sms;
+    config.blockDim = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(static_cast<int32_t>(block_m));
+    config.dynamicSmemBytes = smem_size;
+    config.stream = stream;
+
+    // Clusters for TMA multicast
+    cudaLaunchAttribute attr;
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim = {num_tma_multicast, 1, 1};
+    config.attrs = &attr;
+    config.numAttrs = 1;
+
+    NormalSchedulerInputSwapAB input;
+    input.shape_n = shape_n;
+    input.grouped_layout = grouped_layout;
+
+    auto status = cudaLaunchKernelEx(&config, kernel, reinterpret_cast<__nv_bfloat16*>(mat_d), scales_a, input,
+        tma_a_desc, tma_b_desc, tma_scales_b_desc, tma_d_desc);
+    DG_HOST_ASSERT(status == cudaSuccess);
+}
+
+template <typename LayoutIndexType>
 void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d, float* scales_a,
     float* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, uint32_t block_m, uint32_t block_n,
     uint32_t block_k, uint32_t num_groups, uint32_t num_tma_multicast, GemmType gemm_type,

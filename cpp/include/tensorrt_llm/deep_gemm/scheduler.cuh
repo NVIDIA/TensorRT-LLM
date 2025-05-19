@@ -740,7 +740,11 @@ struct SchedulerSelectorSwapAB
 {
     static constexpr auto select_type()
     {
-        static_assert(GT == GemmType::GroupedWithOffset, "Only GroupedWithOffset is supported for SwapAB");
+        static_assert(GT == GemmType::GroupedWithOffset || GT == GemmType::Normal,
+            "Only GroupedWithOffset and Normal are supported for SwapAB");
+        if constexpr (GT == GemmType::Normal)
+            return NormalSchedulerSwapAB<SHAPE_M, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kNumMBlocks,
+                kNumMBlocksPerGroup>();
         if constexpr (GT == GemmType::GroupedWithOffset)
             return GroupedWithOffsetSchedulerSwapAB<SHAPE_M, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast,
                 kNumMBlocks, kNumMBlocksPerGroup>();

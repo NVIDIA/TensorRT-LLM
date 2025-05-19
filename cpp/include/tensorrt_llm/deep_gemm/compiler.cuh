@@ -247,6 +247,7 @@ std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k, uint3
     {
         switch (gemm_type)
         {
+        case deep_gemm::GemmType::Normal: input_type = "NormalSchedulerInputSwapAB"; break;
         case deep_gemm::GemmType::GroupedWithOffset: input_type = "GroupedWithOffsetSchedulerInputSwapAB"; break;
         default: throw std::runtime_error("Unsupported gemm type");
         }

@@ -513,11 +513,20 @@ DeepGEMM-related behavior can be controlled by the following environment variabl
 
 For Mixture of Experts (MOE) GEMM operations, TensorRT-LLM's DeepGEMM includes the optimized `fp8_gemm_kernel_swapAB` kernel. This kernel is automatically selected based on the input dimensions and GPU type:
 
-- On H20 GPUs (SM count = 78): Uses `fp8_gemm_kernel_swapAB` when the expected m-dimension per expert is less than 64
-- On H100/H200 GPUs: Uses `fp8_gemm_kernel_swapAB` when the expected m-dimension per expert is less than 32
+- On H20 GPUs (SM count = 78): Uses `fp8_gemm_kernel_swapAB` when the expected m_per_expert is less than 64
+- On H100/H200 GPUs: Uses `fp8_gemm_kernel_swapAB` when the expected m_per_expert is less than 32
 - Otherwise, uses the original `fp8_gemm_kernel`
 
 This automatic selection provides better performance for different workload sizes across various Hopper GPUs. In our test cases, the `fp8_gemm_kernel_swapAB` kernel achieves up to 1.8x speedup for individual kernels on H20 GPUs and up to 1.3x speedup on H100 GPUs.
+
+#### Dense GEMM Optimization
+
+The same optimization has been extended to Dense GEMM operations. For regular dense matrix multiplications:
+
+- On all Hopper GPUs (H20, H100, H200): Uses `fp8_gemm_kernel_swapAB` when the m is less than 32
+- Otherwise, uses the original `fp8_gemm_kernel`
+
+This optimization delivers significant performance improvements for small batch sizes. Our benchmarks show that the `fp8_gemm_kernel_swapAB` kernel achieves up to 1.7x speedup on H20 GPUs and up to 1.8x speedup on H100 GPUs for certain matrix dimensions.
 
 ```bash
 #single-node
