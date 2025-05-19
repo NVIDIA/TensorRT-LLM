@@ -280,7 +280,7 @@ class TestNemotronH(unittest.TestCase):
                                    atol=mcore_atol,
                                    rtol=0.0)
 
-        # reference logprobs from initial implementation (commit 5ce1102a02bd2938c0c8334138371f081f55fcc1)
+        # reference logprobs from initial implementation (commit 5ce1102a02bd2938c0c8334138371f081f55fcc1 on single RTX 6000)
         initial_impl_atol = 0.2
         batching_atol = 0.2
 
