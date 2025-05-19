@@ -20,41 +20,75 @@ class TestW4A16Gemm(unittest.TestCase):
         torch.manual_seed(0)
         self.device = 'cuda'
 
-    def _run_w4a16_gemm(self, m, n, k, group_size, activation_dtype,
-                        has_pre_quant, has_zero):
-        total_groups = (k + group_size - 1) // group_size
+    def _run_w4a16_gemm(self,
+                        m,
+                        n,
+                        k,
+                        group_size,
+                        activation_dtype,
+                        quantized_weight_dtype,
+                        has_pre_quant,
+                        has_zero,
+                        use_w4a8_awq=False):
 
+        total_groups = (k + group_size - 1) // group_size
         activation = torch.randn(m,
                                  k,
                                  dtype=activation_dtype,
                                  device=self.device)
+
+        scale_zero_dtype = torch.float16 if use_w4a8_awq else activation_dtype
         scale = torch.rand(total_groups,
                            n,
-                           dtype=activation_dtype,
+                           dtype=scale_zero_dtype,
                            device=self.device)
+        zero = torch.randn(
+            total_groups, n, dtype=scale_zero_dtype,
+            device=self.device) if has_zero else None
+
         pre_quant_scale = torch.rand(1,
                                      k,
                                      dtype=activation_dtype,
                                      device=self.device)
         bias = torch.randn(1, n, dtype=activation_dtype, device=self.device)
 
-        zero = torch.randn(
-            total_groups, n, dtype=activation_dtype,
-            device=self.device) if has_zero else None
+        fp8_alpha = torch.rand(1, dtype=torch.float32,
+                               device="cuda") if use_w4a8_awq else None
+
+        num_weights_in_32_bits = 0
+        if quantized_weight_dtype == torch.int8:
+            num_weights_in_32_bits = 4
+        elif quantized_weight_dtype == torch.quint4x2:
+            num_weights_in_32_bits = 8
+        else:
+            assert False, "Unsupported weight dtype."
 
         unprocessed_int_weight = torch.randint(-2**31,
-                                               2**31, (k, n // 8),
+                                               2**31,
+                                               (k, n // num_weights_in_32_bits),
                                                dtype=torch.int32,
                                                device=self.device)
 
         unprocessed_weight = unprocessed_int_weight.view(torch.int8)
 
-        unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
-        ref_q_weight = unpacker(unprocessed_weight.cpu()).contiguous().cuda()
+        if use_w4a8_awq:
+            activation_type = torch.float8_e4m3fn
+        else:
+            activation_type = torch.float16
+
+        if quantized_weight_dtype == torch.int8:
+            ref_q_weight = unprocessed_weight
+        elif quantized_weight_dtype == torch.quint4x2:
+            # Weights must be a CPU Tensor
+            unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
+            ref_q_weight = unpacker(
+                unprocessed_weight.cpu()).contiguous().cuda()
+        else:
+            assert False, "Unsupported weight dtype."
 
         preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
-        cuda_q_weight = preprocessor(unprocessed_weight.cpu(), torch.quint4x2,
-                                     activation_dtype)
+        cuda_q_weight = preprocessor(unprocessed_weight.cpu(),
+                                     quantized_weight_dtype, activation_type)
 
         scale_ref = scale.repeat_interleave(group_size, dim=0)[:k, :]
         ref_th_weight = ref_q_weight.to(activation_dtype) * scale_ref
@@ -66,6 +100,9 @@ class TestW4A16Gemm(unittest.TestCase):
         if has_pre_quant:
             pre_quant_scale = pre_quant_scale.repeat(m, 1)
             activation = torch.mul(activation, pre_quant_scale)
+
+        if use_w4a8_awq:
+            activation *= fp8_alpha  # todo add it as alpha to kernel
 
         activation = activation.contiguous()
         scale = scale.contiguous()
@@ -88,48 +125,53 @@ class TestW4A16Gemm(unittest.TestCase):
 
         _utils.woq_assert_near_eq(ref, output, 2)
 
-    @parameterized.expand([(
-        3,
-        1024,
-        64,
-        64,
-    ), (128, 1024, 256, 64), (192, 2048, 384, 64), (256, 2048, 1024, 64),
-                           (4, 1024, 128, 128), (64, 1024, 256, 128),
-                           (384, 2048, 384, 128), (512, 2048, 1024, 128)])
-    def test_w4a16_gemm_fp16(self, m, n, k, group_size):
+    @parameterized.expand([(3, 1024, 64, 64, True, False, False),
+                           (128, 1024, 256, 64, True, False, False),
+                           (192, 2048, 384, 64, True, False, False),
+                           (256, 2048, 1024, 64, True, False, False),
+                           (4, 1024, 128, 128, True, False, False),
+                           (64, 1024, 256, 128, True, False, False),
+                           (384, 2048, 384, 128, True, False, False),
+                           (512, 2048, 1024, 128, True, False, False),
+                           (4, 1024, 128, 128, True, True, False),
+                           (64, 1024, 256, 128, True, True, False),
+                           (384, 2048, 384, 128, True, True, False),
+                           (512, 2048, 1024, 128, True, True, False)])
+    def test_matmul_fp16_int4_input(self, m, n, k, group_size, has_pre_quant,
+                                    has_zero, use_w4a8_awq):
         self._run_w4a16_gemm(m,
                              n,
                              k,
                              group_size,
                              torch.float16,
-                             True,
-                             has_zero=False)
+                             torch.quint4x2,
+                             has_pre_quant=has_pre_quant,
+                             has_zero=has_zero,
+                             use_w4a8_awq=use_w4a8_awq)
 
-    @parameterized.expand([(3, 1024, 64, 64), (128, 1024, 256, 64),
-                           (192, 2048, 384, 64), (256, 2048, 1024, 64),
-                           (4, 1024, 128, 128), (64, 1024, 256, 128),
-                           (384, 2048, 384, 128), (512, 2048, 1024, 128)])
-    def test_w4a16_gemm_bf16(self, m, n, k, group_size):
+    @parameterized.expand([(3, 1024, 64, 64, True, False, False),
+                           (128, 1024, 256, 64, True, False, False),
+                           (192, 2048, 384, 64, True, False, False),
+                           (256, 2048, 1024, 64, True, False, False),
+                           (4, 1024, 128, 128, True, False, False),
+                           (64, 1024, 256, 128, True, False, False),
+                           (384, 2048, 384, 128, True, False, False),
+                           (512, 2048, 1024, 128, True, False, False),
+                           (4, 1024, 128, 128, True, True, False),
+                           (64, 1024, 256, 128, True, True, False),
+                           (384, 2048, 384, 128, True, True, False),
+                           (512, 2048, 1024, 128, True, True, False)])
+    def test_matmul_bf16_int4_input(self, m, n, k, group_size, has_pre_quant,
+                                    has_zero, use_w4a8_awq):
         self._run_w4a16_gemm(m,
                              n,
                              k,
                              group_size,
                              torch.bfloat16,
-                             True,
-                             has_zero=False)
-
-    @parameterized.expand([(3, 1024, 64, 64), (128, 1024, 256, 64),
-                           (192, 2048, 384, 64), (256, 2048, 1024, 64),
-                           (4, 1024, 128, 128), (64, 1024, 256, 128),
-                           (384, 2048, 384, 128), (512, 2048, 1024, 128)])
-    def test_w4a16_gemm_zeros(self, m, n, k, group_size):
-        self._run_w4a16_gemm(m,
-                             n,
-                             k,
-                             group_size,
-                             torch.float16,
-                             True,
-                             has_zero=True)
+                             torch.quint4x2,
+                             has_pre_quant=has_pre_quant,
+                             has_zero=has_zero,
+                             use_w4a8_awq=use_w4a8_awq)
 
 
 if __name__ == '__main__':
