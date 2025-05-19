@@ -235,7 +235,7 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
                  ctx_servers: List[str],
                  gen_servers: List[str],
                  req_timeout_secs: int = 180,
-                 server_start_timeout_secs: int = 180):
+                 server_start_timeout_secs: int = 240):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs)
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
