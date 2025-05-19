@@ -1,4 +1,4 @@
-### Generate Text Using Eagle Decoding
+### Generate Text Using Eagle2 Decoding
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (LLM, EagleDecodingConfig, KvCacheConfig,
@@ -33,13 +33,8 @@ def main():
         max_draft_len=63,
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
-                            eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
-                                            [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
-                                            [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
-                                            [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], \
-                                            [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], \
-                                            [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]
-    )
+        use_dynamic_tree=True,
+        dynamic_tree_max_topK=10)
 
     llm = LLM(model=model,
               kv_cache_config=kv_cache_config,
