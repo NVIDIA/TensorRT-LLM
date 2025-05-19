@@ -659,11 +659,11 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
-                new_requests = self._fetch_new_requests()
+                new_requests_num = self._fetch_new_requests()
 
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
-                        len(new_requests),
+                        new_requests_num,
                         self.new_active_requests_queue_latency_ms)
 
                 num_dummy_request = self._get_num_dummy_request()
@@ -791,11 +791,11 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
-                new_requests = self._fetch_new_requests()
+                new_requests_num = self._fetch_new_requests()
 
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
-                        len(new_requests),
+                        new_requests_num,
                         self.new_active_requests_queue_latency_ms)
 
                 if self.kv_cache_transceiver:
@@ -920,14 +920,14 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
-                new_requests = self._fetch_new_requests()
+                new_requests_num = self._fetch_new_requests()
 
                 if self.kv_cache_transceiver:
                     self._check_disagg_gen_transfer_status()
 
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
-                        len(new_requests),
+                        new_requests_num,
                         self.new_active_requests_queue_latency_ms)
 
                 num_dummy_request = self._get_num_dummy_request()
@@ -1173,7 +1173,8 @@ class PyExecutor:
 
         if not self.enable_attention_dp:
             self._update_new_active_requests_queue_latency(new_requests)
-            return self._merge_requests(new_requests)
+            self._merge_requests(new_requests)
+            return len(new_requests)
 
         num_new_requests_all_ranks = len(new_requests)
         self.expected_num_active_requests = max(
@@ -1242,7 +1243,8 @@ class PyExecutor:
 
         if len(new_requests) == 1 and new_requests[0] is None:
             new_requests_cur_rank = new_requests
-        return self._merge_requests(new_requests_cur_rank)
+        self._merge_requests(new_requests_cur_rank)
+        return len(new_requests_cur_rank)
 
     @nvtx_range("_gather_dp_requests_num")
     def _gather_dp_requests_num(self):
