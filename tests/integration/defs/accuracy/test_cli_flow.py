@@ -813,7 +813,6 @@ class TestLlama3_3_70BInstruct(CliFlowAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct"
     EXAMPLE_FOLDER = "models/core/llama"
 
-    @pytest.mark.skip(reason="To be tested on 8 GPUs")
     @pytest.mark.skip_less_device(8)
     def test_auto_dtype_tp8(self):
         self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=8, dtype='auto')
