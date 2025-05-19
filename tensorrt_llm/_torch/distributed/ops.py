@@ -49,8 +49,8 @@ def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
 
 
 def get_allreduce_mnnvl_workspace(
-        mapping: Mapping,
-        dtype: torch.dtype) -> Tuple[McastGPUBuffer, torch.Tensor, int]:
+    mapping: Mapping, dtype: torch.dtype
+) -> Tuple[McastGPUBuffer, torch.Tensor, torch.Tensor, int]:
     if not hasattr(_thread_local,
                    f'allreduce_mnnvl_workspaces_{mapping.pp_rank}'):
         setattr(_thread_local, f'allreduce_mnnvl_workspaces_{mapping.pp_rank}',
@@ -61,10 +61,9 @@ def get_allreduce_mnnvl_workspace(
     allreduce_mnnvl_workspaces = getattr(
         _thread_local, f'allreduce_mnnvl_workspaces_{mapping.pp_rank}')
     if mapping not in allreduce_mnnvl_workspaces:
-        # how to set the buffer size?
         # buffer_tokens * hidden_dim * 3 * 2 * dtype.itemsize
-        stride = 3 * 2 * dtype.itemsize * mapping.tp_size
-        buffer_size_in_bytes = math.ceil(100_000_000 / stride) * stride
+        stride = 3 * 2 * dtype.itemsize
+        buffer_size_in_bytes = math.ceil(12_000_000 / stride) * stride
         max_num_elements = buffer_size_in_bytes // stride
 
         mcast_buffer = McastGPUBuffer(
@@ -382,14 +381,15 @@ class AllReduce(nn.Module):
                 and fusion_op in [AllReduceFusionOp.RESIDUAL_RMS_NORM, None]
                 and input.numel() <= self.max_num_elements_mnnvl):
             shape = input.shape
-            input = input.view(-1, input.shape[-1])
+            input = input.view(-1, shape[-1])
             output = torch.empty_like(input)
+            buffer_mnnvl = self.buffer_mnnvl.view(3, 2, -1, shape[-1])
 
             if fusion_op is None:
                 torch.ops.trtllm.lowlat_twoshot_allreduce(
                     output,
                     input,
-                    self.buffer_mnnvl,
+                    buffer_mnnvl,
                     self.buffer_flags_mnnvl,
                     True,
                 )
@@ -398,7 +398,7 @@ class AllReduce(nn.Module):
                 torch.ops.trtllm.lowlat_twoshot_allreduce(
                     output,
                     input,
-                    self.buffer_mnnvl,
+                    buffer_mnnvl,
                     self.buffer_flags_mnnvl,
                     False,
                 )
@@ -406,7 +406,7 @@ class AllReduce(nn.Module):
                 residual_out = torch.empty_like(input)
 
                 torch.ops.trtllm.lowlat_twoshot_rmsnorm(
-                    residual_out, output, self.buffer_mnnvl,
+                    residual_out, output, buffer_mnnvl,
                     all_reduce_params.norm_weight, all_reduce_params.eps,
                     residual_in, self.buffer_flags_mnnvl)
 
