@@ -92,7 +92,13 @@ class TestNemotronH(unittest.TestCase):
         tokens_per_block = 128
         head_dim = nemotron_h.config.hidden_size // nemotron_h.config.num_attention_heads
         num_layers = nemotron_h.config.hybrid_override_pattern.count("*")
+        layer_mask = [
+            char == "*" for char in nemotron_h.config.hybrid_override_pattern
+        ]
         mamba_num_layers = nemotron_h.config.hybrid_override_pattern.count("M")
+        mamba_layer_mask = [
+            char == "M" for char in nemotron_h.config.hybrid_override_pattern
+        ]
         num_kv_heads = nemotron_h.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = len(context_sequence_lengths) + 2
@@ -115,11 +121,13 @@ class TestNemotronH(unittest.TestCase):
             nemotron_h.config.n_groups,
             nemotron_h.config.mamba_head_dim,
             mamba_num_layers,
+            mamba_layer_mask,
             nemotron_h.config.torch_dtype,
             # kv cache parameters
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
+            layer_mask=layer_mask,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,

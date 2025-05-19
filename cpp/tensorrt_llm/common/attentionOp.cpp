@@ -1152,11 +1152,12 @@ int AttentionOp::mlaGeneration(
     {
         MHARunnerParams fmhaParams{};
         fmhaParams.b = batch_beam;
-        fmhaParams.qSeqLen = params.head_num;
+        fmhaParams.numGroupedHeads = params.head_num;
+        fmhaParams.qSeqLen = params.head_num * (params.acc_q_len / batch_beam);
         fmhaParams.kvSeqLen = generation_params.max_past_kv_length;
         // Disable sliding window attention when it is not needed.
         fmhaParams.slidingWindowSize = generation_params.cyclic_attention_window_size;
-        fmhaParams.totalQSeqLen = batch_beam * params.head_num;
+        fmhaParams.totalQSeqLen = batch_beam * fmhaParams.qSeqLen;
         // TODO: set it correctly for contiguous kv buffer (cross-attention).
         // fmhaParams.totalKvSeqLen = params.num_tokens;
         // Device buffer pointers.
