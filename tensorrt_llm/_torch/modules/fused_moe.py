@@ -15,6 +15,7 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 from ...quantization.utils.fp4_utils import float4_sf_dtype
 from ..distributed import allgather, reducescatter
 from ..model_config import ModelConfig
+from ..quantization.quant import MoeQuantCreator
 from ..utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
                      reswizzle_sf, swizzle_sf, unswizzle_sf)
 from .linear import TensorParallelMode, load_weight_shard
@@ -26,6 +27,98 @@ FUSED_MOE_NVFP4_INPUT_DTYPE = torch.int64
 FUSED_MOE_NVFP4_WEIGHT_DTYPE = torch.int64
 # pack weight block scales into int32, e.g. 4 x fp8 weight values
 FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE = torch.int32
+
+
+def load_fp8_block_scales_scales(quantizer, weights: Dict, expert_start,
+                                 expert_end):
+    pass
+
+
+def load_nvfp4_scales(quantizer, weights: Dict, num_experts, is_trtllm):
+    # Step1: Load input scales.
+    tmp_fc31_input_scale = torch.empty(num_experts, dtype=torch.float32)
+    tmp_fc2_input_scale = torch.empty(num_experts, dtype=torch.float32)
+    for expert_id in range(num_experts):
+        w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
+        w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
+        tmp_fc31_input_scale[expert_id].copy_(w1_input_scale[...].reshape([]))
+        tmp_fc2_input_scale[expert_id].copy_(w2_input_scale[...].reshape([]))
+
+    # fc31_input_scale is the reciprocal of the maximum of all w1 input scales and w3 input scales.
+    fc31_input_scale = tmp_fc31_input_scale.max().reciprocal()
+    # fc2_input_scale is the reciprocal of the maximum of all w2 input scales.
+    fc2_input_scale = tmp_fc2_input_scale.max().reciprocal()
+
+    if is_trtllm:
+        block_scales_dtype = torch.float8_e4m3fn
+    else:
+        block_scales_dtype = FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE
+    quantizer.block_scales_dtype = block_scales_dtype
+
+    return fc31_input_scale, fc2_input_scale
+
+
+def load_fp8_qdq_scales(quantizer, weights: Dict, num_experts, weight_mode):
+    tmp_fc31_input_scale = torch.empty(num_experts, dtype=torch.float32)
+    tmp_fc2_input_scale = torch.empty(num_experts, dtype=torch.float32)
+    for expert_id in range(num_experts):
+        if weight_mode == MoEWeightLoadingMode.VANILLA:
+            w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
+            w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
+            w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
+        elif weight_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+            w1_input_scale = weights[f"gate_up_proj_input_scale"]
+            w3_input_scale = weights[f"gate_up_proj_input_scale"]
+            w2_input_scale = weights[f"down_proj_input_scale"]
+        else:
+            raise NotImplementedError(
+                f"Unknown weight loading mode in MoE: {weight_mode}")
+
+        tmp_fc31_input_scale[expert_id].copy_(
+            max(w1_input_scale[...].reshape([]),
+                w3_input_scale[...].reshape([])))
+
+        tmp_fc2_input_scale[expert_id].copy_(w2_input_scale[...].reshape([]))
+
+    # max_fc31_input_scale is the maximum of all w1 input scales and w3 input scales.
+    # It's used to quantize fc31 input inside the MOE op
+    max_fc31_input_scale = tmp_fc31_input_scale.max()
+    # max_fc2_input_scale is the maximum of all w2 input scales.
+    max_fc2_input_scale = tmp_fc2_input_scale.max()
+
+    return max_fc31_input_scale, max_fc2_input_scale
+
+
+def load_int4_groupwise_scales(quantizer, weights: Dict, expert_start,
+                               expert_end):
+    # fc31 scales
+    # assert (len(self.interleave) == 2)
+    all_w3_input_scales = [
+        load_weight_shard(weights[f"{expert_id}.w3.input_scale"])
+        for expert_id in range(expert_start, expert_end)
+    ]
+    all_w1_input_scales = [
+        load_weight_shard(weights[f"{expert_id}.w1.input_scale"])
+        for expert_id in range(expert_start, expert_end)
+    ]
+    all_w3_w1_input_scales = torch.max(torch.stack(all_w3_input_scales),
+                                       torch.stack(all_w1_input_scales))
+    all_w3_w1_input_scales = torch.ones_like(
+        all_w3_w1_input_scales) * all_w3_w1_input_scales.max()
+    fc31_act_scale = 1 / all_w3_w1_input_scales
+    all_w3_w1_input_scales.float()
+
+    # fc2 scales
+    all_w2_input_scales = [
+        load_weight_shard(weights[f"{expert_id}.w2.input_scale"])
+        for expert_id in range(expert_start, expert_end)
+    ]
+    all_w2_input_scales = torch.stack(all_w2_input_scales).to(dtype)
+    all_w2_input_scales = torch.ones_like(
+        all_w2_input_scales) * all_w2_input_scales.max()
+    fc2_act_scale = 1 / all_w2_input_scales
+    all_w2_input_scales.float()
+    return fc31_act_scale, fc2_act_scale
 
 
 class BaseMoeRoutingMethod(nn.Module):
@@ -378,6 +471,7 @@ class FusedMoE(nn.Module):
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self._check_configs()
+        self.input_quantizer = None
 
     @property
     def has_any_quant(self):
@@ -419,7 +513,7 @@ class FusedMoE(nn.Module):
                 fc1_dequant=self.fc31_dequant,
                 fc2_quant=self.fc2_quant,
                 fc2_dequant=self.fc2_dequant,
-                fc1_input_dequant=self.fc31_input_dequant,
+                fc1_input_dequant=self.input_quantizer.scale,
             )
         elif self.has_fp8_block_scales:
             self.quant_scales = FusedMoEQuantScalesFP8BlockScales(
@@ -428,10 +522,10 @@ class FusedMoE(nn.Module):
             )
         elif self.has_nvfp4:
             self.quant_scales = FusedMoEQuantScalesNVFP4(
-                fc1_act_global=self.fc31_input_scale,
+                fc1_act_global=self.input_quantizer.scale,
                 fc1_weight_block=self.w3_w1_weight_scale,
                 fc1_global=self.fc31_alpha,
-                fc2_act_global=self.fc2_input_scale,
+                fc2_act_global=self.input_quantizer.inv_scale,
                 fc2_weight_block=self.w2_weight_scale,
                 fc2_global=self.fc2_alpha,
             )
@@ -514,6 +608,10 @@ class FusedMoE(nn.Module):
         self.has_fp8_block_scales = False
         self.has_nvfp4 = False
         self.has_w4afp8 = False
+
+        self.input_quantizer = MoeQuantCreator.create_quantizer(
+            self.quant_config, self.moe_backend)
+
         if self.quant_config and self.quant_config.quant_mode.has_any_quant(
                 exclude_kv_cache=True):
             qc = self.quant_config
@@ -535,11 +633,6 @@ class FusedMoE(nn.Module):
                                          requires_grad=False)
                 self.register_parameter("fc2_quant", fc2_quant)
 
-                fc31_input_dequant = nn.Parameter(torch.tensor(
-                    1., dtype=torch.float32),
-                                                  requires_grad=False)
-                self.register_parameter("fc31_input_dequant",
-                                        fc31_input_dequant)
             elif qc.quant_mode.has_fp8_block_scales():
                 self.has_fp8_block_scales = True
                 weight_dtype = torch.float8_e4m3fn
@@ -756,10 +849,7 @@ class FusedMoE(nn.Module):
         else:
             output_dtype = x.dtype
 
-        use_fp8_block_scaling = False
-        use_w4a8_group_scaling = False
-        weight_dtype = self.w3_w1_weight.dtype
-
+        weight_dtype = torch.quint4x2 if self.has_w4afp8 else self.w3_w1_weight.dtype
         token_selected_experts, token_final_scales = self.routing_method.apply(
             router_logits)
 
@@ -788,32 +878,15 @@ class FusedMoE(nn.Module):
 
         x_sf = None
         if self.has_any_quant:
-            if self.has_fp8_qdq:
-                x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                    x, self.fc31_input_dequant)
-            elif self.has_nvfp4:
-                if not disable_fp4_allgather() or self.use_postquant_alltoall:
-                    if isinstance(x, Fp4QuantizedTensor):
-                        x, x_sf = x.fp4_tensor, x.scaling_factor
-                        x_row = x.shape[0]
-                        # note: we use uint8 to store 2 fp4 values
-                        x_col = x.shape[1] * 2
-                    else:
-                        x_row = x.shape[0]
-                        x_col = x.shape[1]
-                        x, x_sf = torch.ops.trtllm.fp4_quantize(
-                            x, self.fc31_input_scale, self.scaling_vector_size,
-                            False)
-
-            elif self.has_fp8_block_scales:
-                use_fp8_block_scaling = True
-            elif self.has_w4afp8:
-                use_w4a8_group_scaling = True
-                weight_dtype = torch.quint4x2
-            else:
-                raise ValueError(
-                    f"unsupported quantization mode: {self.quant_config.quant_mode}"
-                )
+            x, x_sf = self.input_quantizer(x)
+            if not disable_fp4_allgather() or self.use_postquant_alltoall:
+                if isinstance(x, Fp4QuantizedTensor):
+                    x_row = x.shape[0]
+                    # note: we use uint8 to store 2 fp4 values
+                    x_col = x.shape[1] * 2
+                else:
+                    x_row = x.shape[0]
+                    x_col = x.shape[1]
 
         if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
         ) and not self.enable_alltoall:
@@ -874,8 +947,8 @@ class FusedMoE(nn.Module):
             ep_rank=ep_rank,
             cluster_size=cluster_size,
             cluster_rank=cluster_rank,
-            use_fp8_block_scaling=use_fp8_block_scaling,
-            use_w4a8_group_scaling=use_w4a8_group_scaling,
+            use_fp8_block_scaling=self.has_fp8_block_scales,
+            use_w4a8_group_scaling=self.has_w4afp8,
             min_latency_mode=cutlass_min_latency_mode,
         )
 
@@ -1068,10 +1141,9 @@ class FusedMoE(nn.Module):
         topk_group = self.routing_method.routing_impl.topk_group
         routed_scaling_factor = self.routing_method.routing_impl.routed_scaling_factor
 
+        x_val, x_scale = self.input_quantizer(x)
         if self.quant_config and self.quant_config.quant_mode.has_fp8_block_scales(
         ):
-            x_val, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x)
-
             final_hidden_states = torch.ops.trtllm.fp8_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
@@ -1092,11 +1164,7 @@ class FusedMoE(nn.Module):
                 routed_scaling_factor,
             )
         elif self.quant_config and self.quant_config.quant_mode.has_nvfp4():
-            scale_factor_use_ue8m0 = False
-            is_scale_factor_swizzled = False  # use linear layout here
-            hidden_states_fp4, hidden_states_scale_linear_fp4 = torch.ops.trtllm.fp4_quantize(
-                x, self.fc31_input_scale, 16, scale_factor_use_ue8m0,
-                is_scale_factor_swizzled)
+            hidden_states_fp4, hidden_states_scale_linear_fp4 = x_val, x_scale
 
             final_hidden_states = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 router_logits,
@@ -1366,48 +1434,23 @@ class FusedMoE(nn.Module):
             [torch.stack(all_w3_scales),
              torch.stack(all_w1_scales)], dim=-2)
         self.w3_w1_weight_scaling_factor.data.copy_(w3_w1_scales)
+        self.input_quantizer.load_weights_customized(
+            weights,
+            load_fp8_block_scales_scales,
+            device=self.w3_w1_weight.device,
+            expert_start=self.expert_start,
+            expert_end=self.expert_end)
 
     def _load_fp8_qdq_scales(self, weights: Dict):
-        # Step1: Load input scales.
-        def load_expert_fc31_input_scale_fp8_qdq(
-                w1_input_scale, w3_input_scale,
-                dst_fc31_input_scale: torch.Tensor):
-            dst_fc31_input_scale.copy_(
-                max(w1_input_scale[...].reshape([]),
-                    w3_input_scale[...].reshape([])))
+        self.input_quantizer.load_weights_customized(
+            weights,
+            load_fp8_qdq_scales,
+            device=self.w3_w1_weight.device,
+            num_experts=self.num_experts,
+            weight_mode=self.weight_loading_mode)
 
-        def load_expert_fc2_input_scale_fp8_qdq(
-                w2_input_scale, dst_fc2_input_scale: torch.Tensor):
-            dst_fc2_input_scale.copy_(w2_input_scale[...].reshape([]))
-
-        tmp_fc31_input_scale = torch.empty(self.num_experts,
-                                           dtype=torch.float32)
-        tmp_fc2_input_scale = torch.empty(self.num_experts, dtype=torch.float32)
-        for expert_id in range(self.num_experts):
-            if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
-                w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
-                w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
-                w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
-            elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-                w1_input_scale = weights[f"gate_up_proj_input_scale"]
-                w3_input_scale = weights[f"gate_up_proj_input_scale"]
-                w2_input_scale = weights[f"down_proj_input_scale"]
-            else:
-                raise NotImplementedError(
-                    f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
-                )
-
-            load_expert_fc31_input_scale_fp8_qdq(
-                w1_input_scale, w3_input_scale, tmp_fc31_input_scale[expert_id])
-
-            load_expert_fc2_input_scale_fp8_qdq(w2_input_scale,
-                                                tmp_fc2_input_scale[expert_id])
-
-        # max_fc31_input_scale is the maximum of all w1 input scales and w3 input scales.
-        # It's used to quantize fc31 input inside the MOE op
-        max_fc31_input_scale = tmp_fc31_input_scale.max()
         # max_fc2_input_scale is the maximum of all w2 input scales.
-        max_fc2_input_scale = tmp_fc2_input_scale.max()
+        max_fc2_input_scale = self.input_quantizer.inv_scale
 
         # Step2: Load weight scales and requantize w3_w1_weight.
         tmp_w3_w1_weight_scale = torch.empty(self.expert_size_per_partition,
@@ -1487,51 +1530,22 @@ class FusedMoE(nn.Module):
 
         # Step3: calculate and store final loaded weights
         self.fc31_dequant.data.copy_(tmp_w3_w1_weight_scale *
-                                     max_fc31_input_scale)
+                                     self.input_quantizer.scale)
         self.fc2_quant.data.copy_(max_fc2_input_scale.reciprocal())
         self.fc2_dequant.data.copy_(tmp_w2_weight_scale * max_fc2_input_scale)
-        self.fc31_input_dequant.data.copy_(max_fc31_input_scale)
 
     def _load_nvfp4_scales(self, weights: Dict):
-        # Step1: Load input scales.
-        tmp_fc31_input_scale = torch.empty(self.num_experts,
-                                           dtype=torch.float32)
-        tmp_fc2_input_scale = torch.empty(self.num_experts, dtype=torch.float32)
-
-        def load_expert_fc31_input_scale_nvfp4(
-                w1_input_scale, w3_input_scale,
-                dst_fc31_input_scale: torch.Tensor):
-            w1_input_scale = w1_input_scale[...].reshape([])
-            w3_input_scale = w3_input_scale[...].reshape([])
-            assert torch.allclose(
-                w1_input_scale,
-                w3_input_scale), "w1_input_scale != w3_input_scale"
-            dst_fc31_input_scale.copy_(w1_input_scale)
-
-        def load_expert_fc2_input_scale_nvfp4(
-                w2_input_scale, dst_fc2_input_scale: torch.Tensor):
-            dst_fc2_input_scale.copy_(w2_input_scale[...].reshape([]))
-
-        for expert_id in range(self.num_experts):
-            w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
-            w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
-            w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
-
-            load_expert_fc31_input_scale_nvfp4(w1_input_scale, w3_input_scale,
-                                               tmp_fc31_input_scale[expert_id])
-            load_expert_fc2_input_scale_nvfp4(w2_input_scale,
-                                              tmp_fc2_input_scale[expert_id])
-
-        # fc31_input_scale is the reciprocal of the maximum of all w1 input scales and w3 input scales.
-        self.fc31_input_scale.data.copy_(
-            tmp_fc31_input_scale.max().reciprocal())
-        # fc2_input_scale is the reciprocal of the maximum of all w2 input scales.
-        self.fc2_input_scale.data.copy_(tmp_fc2_input_scale.max().reciprocal())
-
         if self.is_trtllm():
             block_scales_dtype = torch.float8_e4m3fn
         else:
             block_scales_dtype = FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE
+
+        self.input_quantizer.load_weights_customized(
+            weights,
+            load_nvfp4_scales,
+            device=self.w3_w1_weight.device,
+            num_experts=self.num_experts,
+            is_trtllm=self.is_trtllm())
 
         # Step2: Load weight block scales and alphas.
         def load_expert_w3_w1_weight_scale_nvfp4(
@@ -1650,32 +1664,26 @@ class FusedMoE(nn.Module):
                 self.is_trtllm())
 
             load_expert_fc31_alpha_nvfp4(w1_weight_scale_2, w3_weight_scale_2,
-                                         self.fc31_input_scale.data,
+                                         self.input_quantizer.scale.data,
                                          self.fc31_alpha.data[expert_idx])
             load_expert_fc2_alpha_nvfp4(w2_weight_scale_2,
-                                        self.fc2_input_scale.data,
+                                        self.input_quantizer.inv_scale.data,
                                         self.fc2_alpha.data[expert_idx])
+
         if self.is_trtllm():
-            self.fc31_scale_c.data.copy_(self.fc2_input_scale.data *
-                                         self.fc31_alpha.data)
+            self.fc31_scale_c.data.copy_(
+                self.input_quantizer.fc2_input_scale.data *
+                self.fc31_alpha.data)
 
     def _load_int4_groupwise_scales(self, weights: Dict):
         # fc31 scales
         assert (len(self.interleave) == 2)
-        all_w3_input_scales = [
-            load_weight_shard(weights[f"{expert_id}.w3.input_scale"])
-            for expert_id in range(self.expert_start, self.expert_end)
-        ]
-        all_w1_input_scales = [
-            load_weight_shard(weights[f"{expert_id}.w1.input_scale"])
-            for expert_id in range(self.expert_start, self.expert_end)
-        ]
-        all_w3_w1_input_scales = torch.max(torch.stack(all_w3_input_scales),
-                                           torch.stack(all_w1_input_scales))
-        all_w3_w1_input_scales = torch.ones_like(
-            all_w3_w1_input_scales) * all_w3_w1_input_scales.max()
-        self.fc31_act_scale.data.copy_(1 / all_w3_w1_input_scales)
-        self.fc31_alpha.data.copy_(all_w3_w1_input_scales.float())
+        self.input_quantizer.load_weights_customized(
+            weights,
+            load_int4_groupwise_scales,
+            device=self.w3_w1_weight.device,
+            expert_start=self.expert_start,
+            expert_end=self.expert_end)
 
         all_w3_scales = [
             load_weight_shard(weights[f"{expert_id}.w3.weight_scale_inv"],
