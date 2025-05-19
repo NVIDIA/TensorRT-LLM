@@ -146,8 +146,8 @@ __global__ void fusedQKNormRopeKernel(
     for (i = 0; i < numElemsPerThread; i += 4)
     {
         // Convert back to bfloat16 format
-        __nv_bfloat162 vals0 = __float22bfloat162_rn(float2(elements[i], elements[i + 1]));
-        __nv_bfloat162 vals1 = __float22bfloat162_rn(float2(elements[i + 2], elements[i + 3]));
+        __nv_bfloat162 vals0 = __float22bfloat162_rn(make_float2(elements[i], elements[i + 1]));
+        __nv_bfloat162 vals1 = __float22bfloat162_rn(make_float2(elements[i + 2], elements[i + 3]));
 
         uint2 data;
         data.x = *reinterpret_cast<uint32_t*>(&vals0);
@@ -176,7 +176,7 @@ void launchFusedQKNormRope(void* qkv, int const* position_ids, int const num_tok
     int const totalQKHeads = num_heads_q + num_heads_k;
     int const totalWarps = num_tokens * totalQKHeads;
 
-    int const gridSize = divUp(totalWarps, warpsPerBlock);
+    int const gridSize = common::divUp(totalWarps, warpsPerBlock);
     dim3 gridDim(gridSize);
     dim3 blockDim(blockSize);
 
