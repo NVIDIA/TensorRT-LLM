@@ -914,6 +914,9 @@ class BaseLlmArgs(BaseModel):
                                    description="The backend to use.",
                                    exclude=True)
 
+    gather_generation_logits: bool = Field(
+        default=False, description="Gather generation logits.")
+
     # private fields those are unstable and just for internal use
     num_postprocess_workers: int = Field(
         default=0,
@@ -986,17 +989,11 @@ class BaseLlmArgs(BaseModel):
             moe_tp_size=self.moe_tensor_parallel_size,
             moe_ep_size=self.moe_expert_parallel_size,
             enable_attention_dp=self.enable_attention_dp,
-            cp_config=self.cp_config,
-            auto_parallel=self.auto_parallel)
-        if self.parallel_config.auto_parallel:
-            self.parallel_config.world_size = self.auto_parallel_world_size
+            cp_config=self.cp_config)
 
         self.kv_cache_config = self.kv_cache_config or KvCacheConfig()
 
         self.scheduler_config = self.scheduler_config or SchedulerConfig()
-
-        # This is used to hold th options for convert_checkpoint
-        self._convert_checkpoint_options = {}
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "BaseLlmArgs":
@@ -1062,12 +1059,15 @@ class BaseLlmArgs(BaseModel):
     def _setup(self):
         ''' This method will setup the configs right before building the model. '''
 
+        is_trt_llm_args = isinstance(self, TrtLlmArgs)
+
         assert isinstance(self.model,
                           (str, Path)), f"Invalid model: {self.model}"
 
-        self._setup_embedding_parallel_mode()
+        if is_trt_llm_args:
+            self._setup_embedding_parallel_mode()
 
-        if self.enable_build_cache:
+        if is_trt_llm_args and self.enable_build_cache:
             self.enable_build_cache = BuildCacheConfig() if isinstance(
                 self.enable_build_cache, bool) else self.enable_build_cache
             if not isinstance(self.enable_build_cache, BuildCacheConfig):
@@ -1108,24 +1108,25 @@ class BaseLlmArgs(BaseModel):
 
         self.quant_config = self.quant_config or QuantConfig()
 
-        self.calib_config = self.calib_config or CalibConfig()
+        if is_trt_llm_args:
+            self.calib_config = self.calib_config or CalibConfig()
 
-        # Note: max_batch_size and max_num_tokens in LlmArgsBase are for runtime,
+        # Note: max_batch_size and max_num_tokens in LlmArgs are for runtime,
         # which will be passed to the C++ Executor API, overwriting the values
         # from an built engine. In order to set build configuration, it is
         # recommended to use build_config instead.
         if self.build_config is not None:
             if self.max_batch_size and self.build_config.max_batch_size != self.max_batch_size:
                 logger.warning(
-                    f"Conflict detected in LlmArgsBase build_config.max_batch_size "
+                    f"Conflict detected in LlmArgs build_config.max_batch_size "
                     f"({self.build_config.max_batch_size}) != max_batch_size ({self.max_batch_size})."
-                    f"The 'max_batch_size' specified in LlmArgsBase is ignored at "
+                    f"The 'max_batch_size' specified in LlmArgs is ignored at "
                     f"engine build and will override at runtime.")
             if self.max_num_tokens and self.build_config.max_num_tokens != self.max_num_tokens:
                 logger.warning(
-                    f"Conflict detected in LlmArgsBase build_config.max_num_tokens "
-                    f"({self.build_config.max_num_tokens}) != max_num_tokens ({self.max_num_tokens})."
-                    f"The 'max_num_tokens' specified in LlmArgsBase is ignored at "
+                    f"Conflict detected in LlmArgs build_config.max_num_tokens "
+                    f"({self.build_config.max_num_tokens}) != max_batch_size ({self.max_num_tokens})."
+                    f"The 'max_num_tokens' specified in LlmArgs is ignored at "
                     f"engine build and will override at runtime.")
         else:
             self.build_config = BuildConfig()
@@ -1135,8 +1136,9 @@ class BaseLlmArgs(BaseModel):
                 self.build_config.max_num_tokens = self.max_num_tokens
 
         # TODO: remove the checker when manage weights support all data types
-        if self.fast_build and (self.quant_config.quant_algo is QuantAlgo.FP8
-                                or self.quant_config.quant_algo is None):
+        if is_trt_llm_args and self.fast_build and (
+                self.quant_config.quant_algo is QuantAlgo.FP8
+                or self.quant_config.quant_algo is None):
             self._update_plugin_config("manage_weights", True)
 
         if self.parallel_config._world_size == 1:
@@ -1149,9 +1151,12 @@ class BaseLlmArgs(BaseModel):
             if self.max_lora_rank is not None:
                 self.build_config.lora_config.max_lora_rank = self.max_lora_rank
 
+        self._setup_speculative_config()
+
         if self.enable_prompt_adapter:
             self.build_config.max_prompt_embedding_table_size = self.max_prompt_adapter_token * self.build_config.max_batch_size
 
+    def _setup_speculative_config(self):
         if self.speculative_config:
             if isinstance(self.speculative_config, LookaheadDecodingConfig):
                 lookahead_config = self.speculative_config
@@ -1380,9 +1385,6 @@ class TrtLlmArgs(BaseLlmArgs):
             "type": f"Union[{get_type_repr(BuildCacheConfig)}, bool]"
         })
 
-    gather_generation_logits: bool = Field(
-        default=False, description="Gather generation logits.")
-
     extended_runtime_perf_knob_config: Optional[
         ExtendedRuntimePerfKnobConfig] = Field(
             default=None, description="Extended runtime perf knob config.")
@@ -1399,11 +1401,15 @@ class TrtLlmArgs(BaseLlmArgs):
     # Private attributes
     _auto_parallel_config: Optional[AutoParallelConfig] = PrivateAttr(
         default=None)
+    # This is used to hold the options for convert_checkpoint
+    _convert_checkpoint_options: Dict[str,
+                                      Any] = PrivateAttr(default_factory=dict)
 
     @property
     def auto_parallel_config(self) -> AutoParallelConfig:
         return self._auto_parallel_config
 
+    @print_traceback_on_error
     def model_post_init(self, __context):
         super().model_post_init(__context)
 
@@ -1418,6 +1424,11 @@ class TrtLlmArgs(BaseLlmArgs):
             **infer_cluster_config(),
         )
 
+        self.parallel_config.auto_parallel = self.auto_parallel
+
+        if self.parallel_config.auto_parallel:
+            self.parallel_config.world_size = self.auto_parallel_world_size
+
 
 LlmArgs = TrtLlmArgs
 
@@ -1427,8 +1438,18 @@ LLMARGS_EXPLICIT_DOCSTRING = generate_api_docs_as_docstring(LlmArgs,
 
 class TorchLlmArgs(BaseLlmArgs):
 
+    # Just a dummy BuildConfig to allow code reuse with the TrtLlmArgs
+    build_config: Optional[object] = Field(
+        default=None,
+        description="Build config.",
+        exclude_from_json=True,
+        json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
+
+    @print_traceback_on_error
     def model_post_init(self, __context):
         super().model_post_init(__context)
+
+        self.model_format = _ModelFormatKind.HF
 
 
 def update_llm_args_with_extra_dict(

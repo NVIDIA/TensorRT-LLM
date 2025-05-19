@@ -133,6 +133,7 @@ def create_py_executor(executor_config: ExecutorConfig,
             executor_config.scheduler_config.context_chunking_policy
             if executor_config.scheduler_config.context_chunking_policy
             is not None else ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
+        assert chunk_unit_size is not None, "chunk_unit_size must be set"
         ctx_chunk_config = ContextChunkingConfig(chunking_policy,
                                                  chunk_unit_size)
     else:
