@@ -27,14 +27,14 @@ namespace torch_ext
 // Function for fused QK Norm and RoPE
 // This operator applies RMS normalization and RoPE to Q and K tensors in a single CUDA kernel
 void fused_qk_norm_rope(
-    torch::Tensor& qkv,               // Combined QKV tensor [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]
-    torch::Tensor& position_ids,      // Position IDs for RoPE [num_tokens]
-    int num_heads_q,                  // Number of query heads
-    int num_heads_k,                  // Number of key heads
-    int num_heads_v,                  // Number of value heads
-    int head_dim,                     // Dimension per head
-    float eps,                        // Epsilon for RMS normalization
-    float base)                       // Base for RoPE computation
+    torch::Tensor& qkv,          // Combined QKV tensor [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]
+    torch::Tensor& position_ids, // Position IDs for RoPE [num_tokens]
+    int num_heads_q,             // Number of query heads
+    int num_heads_k,             // Number of key heads
+    int num_heads_v,             // Number of value heads
+    int head_dim,                // Dimension per head
+    float eps,                   // Epsilon for RMS normalization
+    float base)                  // Base for RoPE computation
 {
     // Input validation
     TORCH_CHECK(qkv.dim() == 2, "QKV tensor must be 2D: [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]");
@@ -43,33 +43,28 @@ void fused_qk_norm_rope(
     CHECK_INPUT(qkv, torch::kBFloat16);
     CHECK_INPUT(position_ids, torch::kInt32);
 
-    const int num_tokens = qkv.size(0);
+    int const num_tokens = qkv.size(0);
     TORCH_CHECK(position_ids.size(0) == num_tokens, "Number of tokens in position_ids must match QKV");
-    
-    const int total_heads = num_heads_q + num_heads_k + num_heads_v;
-    TORCH_CHECK(qkv.size(1) == total_heads * head_dim, "QKV tensor size must match total number of heads and head dimension");
-    
+
+    int const total_heads = num_heads_q + num_heads_k + num_heads_v;
+    TORCH_CHECK(
+        qkv.size(1) == total_heads * head_dim, "QKV tensor size must match total number of heads and head dimension");
+
     auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
-    
+
     // Call the CUDA kernel
-    tensorrt_llm::kernels::launchFusedQKNormRope(
-        reinterpret_cast<__nv_bfloat16*>(qkv.data_ptr()),
-        reinterpret_cast<const int*>(position_ids.data_ptr()),
-        num_tokens,
-        num_heads_q,
-        num_heads_k,
-        num_heads_v,
-        head_dim,
-        eps,
-        base,
-        stream);
+    tensorrt_llm::kernels::launchFusedQKNormRope(reinterpret_cast<__nv_bfloat16*>(qkv.data_ptr()),
+        reinterpret_cast<int const*>(position_ids.data_ptr()), num_tokens, num_heads_q, num_heads_k, num_heads_v,
+        head_dim, eps, base, stream);
 }
 
 // Register the PyTorch operators
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("fused_qk_norm_rope(Tensor qkv, Tensor position_ids, int num_heads_q, int num_heads_k, int num_heads_v, float eps, float base) -> ()", 
-          &fused_qk_norm_rope);
+    m.def(
+        "fused_qk_norm_rope(Tensor qkv, Tensor position_ids, int num_heads_q, int num_heads_k, int num_heads_v, float "
+        "eps, float base) -> ()",
+        &fused_qk_norm_rope);
 }
 
 // Register the CUDA implementation
@@ -78,4 +73,4 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("fused_qk_norm_rope", &fused_qk_norm_rope);
 }
 
-} // namespace torch_ext 
+} // namespace torch_ext
