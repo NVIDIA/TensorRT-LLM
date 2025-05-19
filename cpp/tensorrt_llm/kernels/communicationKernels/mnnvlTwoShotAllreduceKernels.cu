@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "lowlatTwoShotAllreduceKernels.h"
+#include "mnnvlTwoShotAllreduceKernels.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/mcastDeviceMemory.h"

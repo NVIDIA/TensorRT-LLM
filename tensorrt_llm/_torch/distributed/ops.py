@@ -308,7 +308,7 @@ class MNNVLAllReduce(nn.Module):
         output = torch.empty_like(input)
         buffer_mnnvl = self.buffer_mnnvl.view(3, 2, -1, shape[-1])
 
-        if fusion_op is None:
+        if fusion_op == AllReduceFusionOp.NONE:
             torch.ops.trtllm.lowlat_twoshot_allreduce(
                 output,
                 input,
