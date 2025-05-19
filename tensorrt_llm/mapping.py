@@ -14,6 +14,8 @@
 # limitations under the License.
 from typing import List
 
+import torch
+
 
 class Mapping(object):
     '''
@@ -420,12 +422,9 @@ class Mapping(object):
         return self.moe_ep_size > 1
 
     def pp_layers(self, num_layers: int) -> List[int]:
-        base_layers = num_layers // self.pp_size
-        extra_layers = num_layers % self.pp_size
-        start_idx = self.pp_rank * base_layers + min(self.pp_rank, extra_layers)
-        layers_in_stage = base_layers + (1
-                                         if self.pp_rank < extra_layers else 0)
-        return list(range(start_idx, start_idx + layers_in_stage))
+        # If num_layers % pp_size = n != 0, first n ranks get one extra layer
+        return torch.tensor_split(torch.arange(num_layers),
+                                  self.pp_size)[self.pp_rank].tolist()
 
     def ep_experts(self, num_experts: int) -> List[int]:
         assert self.cp_size == 1
