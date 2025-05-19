@@ -120,7 +120,7 @@ class InferenceOptimizer:
         # Match rope
         # TODO (lucaslie): let's move this to perf optimization once TP sharding is improved
         # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
-        egm = match_rope_v1(egm)
+        #egm = match_rope_v1(egm)
         egm = match_rope_v2(egm)
 
         ############################################################################################

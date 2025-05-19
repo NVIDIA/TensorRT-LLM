@@ -1,76 +1,87 @@
 import types
 import warnings
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.utils.checkpoint
 from transformers import AutoModelForCausalLM
 from transformers.cache_utils import Cache
+from tensorrt_llm._torch.auto_deploy.custom_ops import apply_rotary_pos_emb_ds
 
 
+# This patched module is used to support compressed kv mla attn implementation
+@torch.inference_mode()
 def deepseek_v3_attention(
-    self,
-    hidden_states: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_value: Optional[Cache] = None,
-    output_attentions: bool = False,
-    use_cache: bool = False,
-    **kwargs,
-):
-    """DeepSeekV3Attention forward function rewritten to wrap MultiheadLatentAttention as a custom op."""
-    if "padding_mask" in kwargs:
-        warnings.warn(
-            "Passing `padding_mask` is deprecated and will be removed in v4.37. "
-            "Please make sure use `attention_mask` instead.`"
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if "padding_mask" in kwargs:
+            warnings.warn(
+                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+            )
+        bsz, q_len, _ = hidden_states.size() #[b,s,n,d]
+
+        #Generate q from hidden_states
+        if self.q_lora_rank is None:
+            q = self.q_proj(hidden_states) #[b,s,n,d]
+        else:
+            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states))) #[b,s,n,d]
+        q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2) #[b,n,s,d]
+        
+        #Generate q_pe
+        q_nope, q_pe = torch.split(
+            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        ) #[b,n,s,qk_head_dim], [b,n,s,qk_rope_head_dim]
+
+        #Generate compressed kv from hidden_states
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states) #[b,s,d]
+        compressed_kv, k_pe = torch.split(
+            compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        ) #[b,s,kv_lora_rank], [b,s,qk_rope_head_dim]
+        
+        #Generate k_pe
+        k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2) #[b,1,s,qk_rope_head_dim]
+        
+        #Deleted b projection
+        kv = (
+            self.kv_a_layernorm(compressed_kv)
+            .view(bsz, q_len, -1)
         )
-    bsz, q_len, _ = hidden_states.size()
 
-    # If else paths are determined by config.json
-    if self.q_lora_rank is None:
-        q = self.q_proj(hidden_states)
-    else:
-        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-    q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
-    q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        #KV cache logic
+        kv_seq_len = kv.shape[-2]
+        cos, sin = self.rotary_emb(kv, seq_len=kv_seq_len)
 
-    compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-    compressed_kv, k_pe = torch.split(
-        compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-    )
-    k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
-    kv = (
-        self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
-        .view(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-        .transpose(1, 2)
-    )
-    _, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-    kv_seq_len = value_states.shape[-2]
-    if past_key_value is not None:
-        raise ValueError("past_key_value is not supported")
-    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        #Apply rotary pos emb
+        q_pe, k_pe = apply_rotary_pos_emb_ds(q_pe, k_pe, cos, sin, position_ids)
+        k_pe = k_pe.squeeze(1)
 
-    # Use custom op to capture mla. This does not handle KV cache
-    # as passing transformers Cache into a custom op is throwing an error.
-    # Would not be an issue, cause we intend to replace mla op with our implementation further along the pipeline
-    attn_output = torch.ops.deepseek.fused_mla(
-        q_nope,
-        q_pe,
-        kv,
-        k_pe,
-        cos,
-        sin,
-        position_ids,
-        attention_mask,
-        self.softmax_scale,
-    )
+       # Down project q_nope
+        wkv_b_weight = self.kv_b_proj.weight.view(self.num_heads, -1, self.kv_lora_rank)
+        q_nope_proj = torch.einsum("bhsd,hdc->bhsc", q_nope, wkv_b_weight[:, :self.qk_nope_head_dim])
+        
+        # MLA ref operation
+        x = torch.ops.deepseek.mla(q_nope_proj, q_pe, kv, k_pe, attention_mask, self.softmax_scale)
 
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
-    attn_output = self.o_proj(attn_output)
+        # Up project attention scores
+        x = torch.einsum("bhsc,hdc->bhsd", x, wkv_b_weight[:, -self.v_head_dim:])
+        
+        x = x.transpose(1, 2).contiguous()
 
-    return attn_output, None, past_key_value
+        x = x.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
 
+        x = self.o_proj(x)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return x, attn_weights, past_key_value
 
 # This patched module matches exactly with HF generate
 @torch.inference_mode()

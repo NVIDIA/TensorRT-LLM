@@ -526,12 +526,12 @@ def mla(
     Reference implementation for MLA style attention that handles compressed kv.
     """
     scores = (
-        torch.einsum("bhsc,btc->bsht", q_nope, kv) + torch.einsum("bhsr,btr->bsht", q_pe, pe)
+        torch.einsum("bhsc,btc->bhst", q_nope, kv) + torch.einsum("bhsr,btr->bhst", q_pe, pe)
     ) * softmax_scale
     if attention_mask is not None:
         scores += attention_mask.unsqueeze(1)
     scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(q_nope)
-    attn_output = torch.einsum("bsht,btc->bshc", scores, kv)
+    attn_output = torch.einsum("bhst,btc->bhsc", scores, kv)
     return attn_output
 
 

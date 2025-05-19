@@ -39,7 +39,7 @@ def naive_attn(q_nope, q_pe, compressed_kv, k_pe, wkv_b, softmax_scale):
         is_causal=False,
         dropout_p=0.0,
         scale=softmax_scale,
-    ).transpose(1, 2)
+    )
 
     return x
 
@@ -58,7 +58,7 @@ def mla_attn(q_nope, q_pe, compressed_kv, k_pe, wkv_b, softmax_scale):
     x = torch.ops.deepseek.mla(q_nope_proj, q_pe, compressed_kv, k_pe, None, softmax_scale)
 
     # Up project attention scores
-    x = torch.einsum("bshc,hdc->bshd", x, wkv_b_weight[:, -v_head_dim:])
+    x = torch.einsum("bhsc,hdc->bhsd", x, wkv_b_weight[:, -v_head_dim:])
     return x
 
 
