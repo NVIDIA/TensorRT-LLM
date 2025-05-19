@@ -12,6 +12,7 @@ from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
@@ -257,7 +258,10 @@ class Llama4MoE(nn.Module):
 
     def compute_routed_output(self, hidden_states, all_rank_num_tokens,
                               cutlass_min_latency_mode):
+        use_dp_padding = False
         if self.enable_attention_dp and self.mapping.tp_size > 1:
+            # Use padding here to keep the behavior unchanged
+            use_dp_padding = True
             max_num_token_across_dp_ranks = max(all_rank_num_tokens)
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
@@ -267,7 +271,8 @@ class Llama4MoE(nn.Module):
         routed_output = self.experts(hidden_states,
                                      router_logits,
                                      cutlass_min_latency_mode,
-                                     all_rank_num_tokens=all_rank_num_tokens)
+                                     all_rank_num_tokens=all_rank_num_tokens,
+                                     use_dp_padding=use_dp_padding)
         return routed_output
 
     def forward(
@@ -720,14 +725,16 @@ class LlamaModel(DecoderModel):
 
         vocab_size = config.vocab_size
         # TODO smor- we load manually only if there is a single lora dir, need to come up with a better solution
+        self.has_custom_embed_tokens = False
         if hasattr(
                 model_config,
                 'lora_config') and model_config.lora_config is not None and len(
                     model_config.lora_config.lora_dir) == 1:
-            from tensorrt_llm.lora_manager import HfLoraLoader
             lora_loader = HfLoraLoader(model_config.lora_config.lora_dir)
-            weight = lora_loader.embed_tokens
-            vocab_size = lora_loader.vocab_size
+            if lora_loader.vocab_size != 0 and lora_loader.embed_tokens is not None:
+                vocab_size = lora_loader.vocab_size
+                weight = lora_loader.embed_tokens
+                self.has_custom_embed_tokens = True
 
         self.embed_tokens = Embedding(
             vocab_size,
@@ -738,10 +745,7 @@ class LlamaModel(DecoderModel):
             gather_output=True,
         )
 
-        if hasattr(
-                model_config,
-                'lora_config') and model_config.lora_config is not None and len(
-                    model_config.lora_config.lora_dir) == 1:
+        if self.has_custom_embed_tokens:
             with torch.no_grad():
                 if model_config.mapping.tp_size > 1:
                     weight = split_matrix_tp(

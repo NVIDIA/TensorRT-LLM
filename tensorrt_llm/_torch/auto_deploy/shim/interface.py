@@ -112,6 +112,9 @@ class AutoDeployConfig(PyTorchConfig):
     # check if we should skip loading weights
     skip_loading_weights: bool = False
 
+    # specifies the fraction of available memory to occupy for cache
+    free_mem_ratio: float = 0.8
+
     def __post_init__(self):
         super().__post_init__()
 
