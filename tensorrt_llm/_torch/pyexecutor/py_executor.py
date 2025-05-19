@@ -709,7 +709,8 @@ class PyExecutor:
                     else:
                         with torch.cuda.nvtx.range("_forward_step_last_pp"):
                             with torch.cuda.stream(self.stream):
-                                batch_outputs = self._forward_step(scheduled_batch)
+                                batch_outputs = self._forward_step(
+                                    scheduled_batch)
                                 sample_state = self._sample_async(
                                     scheduled_batch, batch_outputs)
                                 self._update_request_states(scheduled_batch)
@@ -862,8 +863,8 @@ class PyExecutor:
                     with torch.cuda.stream(self.stream):
                         batch_outputs = self._forward_step(scheduled_batch)
 
-                        sample_state = self._sample_async(scheduled_batch,
-                                                        batch_outputs)
+                        sample_state = self._sample_async(
+                            scheduled_batch, batch_outputs)
 
                         self._update_request_states(scheduled_batch)
 
@@ -1010,11 +1011,11 @@ class PyExecutor:
                     previous_tensors_device = self.previous_batch and self.previous_batch.sample_state.device
 
                     with torch.cuda.stream(self.stream):
-                        batch_outputs = self._forward_step(scheduled_batch,
-                                                        previous_tensors_device)
+                        batch_outputs = self._forward_step(
+                            scheduled_batch, previous_tensors_device)
 
-                        sample_state = self._sample_async(scheduled_batch,
-                                                        batch_outputs)
+                        sample_state = self._sample_async(
+                            scheduled_batch, batch_outputs)
 
                     self._update_request_states(scheduled_batch)
 
