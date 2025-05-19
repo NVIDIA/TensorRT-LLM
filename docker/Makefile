@@ -148,6 +148,8 @@ endif
 
 devel_%: STAGE = devel
 tritondevel_%: STAGE = tritondevel
+tritonrelease_%: STAGE = tritonrelease
+tritonrelease_%: DEVEL_IMAGE = tritondevel
 
 wheel_%: STAGE = wheel
 wheel_run: WORK_DIR = /src/tensorrt_llm
