@@ -385,16 +385,23 @@ class AllReduce(nn.Module):
             input = input.view(-1, input.shape[-1])
             output = torch.empty_like(input)
 
-            torch.ops.trtllm.lowlat_twoshot_allreduce(
-                output,
-                input,
-                self.buffer_mnnvl,
-                self.buffer_flags_mnnvl,
-                True,
-            )
             if fusion_op is None:
+                torch.ops.trtllm.lowlat_twoshot_allreduce(
+                    output,
+                    input,
+                    self.buffer_mnnvl,
+                    self.buffer_flags_mnnvl,
+                    True,
+                )
                 return output.view(shape)
             elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+                torch.ops.trtllm.lowlat_twoshot_allreduce(
+                    output,
+                    input,
+                    self.buffer_mnnvl,
+                    self.buffer_flags_mnnvl,
+                    False,
+                )
                 residual_in = all_reduce_params.residual
                 residual_out = torch.empty_like(input)
 

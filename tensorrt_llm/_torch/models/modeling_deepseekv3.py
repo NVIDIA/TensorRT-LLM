@@ -45,7 +45,7 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           LowLatencyTwoShotAllReduce, MoEAllReduce, allgather)
+                           MoEAllReduce, allgather)
 from ..model_config import ModelConfig
 from ..models.modeling_utils import ModelConfig
 from ..modules.attention import MLA
@@ -613,20 +613,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
         self.layer_idx = layer_idx
-        self.allreduce = AllReduce(self.mapping)
+        self.allreduce = AllReduce(self.mapping, dtype=config.torch_dtype)
         self.moe_allreduce = MoEAllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
-        self.use_lowlat_allreduce = (
-            os.environ.get("TRTLLM_LLAR_ENABLED", "0") == "1"
-            and (not (mapping.has_pp() or mapping.has_cp()))
-            and config.torch_dtype in [torch.bfloat16, torch.float32])
-
-        if self.use_lowlat_allreduce:
-            self.lowlat_allreduce = LowLatencyTwoShotAllReduce(
-                self.mapping,
-                init_dim=config.hidden_size,
-                dtype=config.torch_dtype)
-        self.iter_use_ll_twoshot = False
 
     def _compute_mlp_tp_size(self, intermediate_size: int,
                              block_size: int) -> int:
@@ -675,17 +664,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-
-        self.iter_use_ll_twoshot = (self.use_lowlat_allreduce
-                                    and hidden_states.size(0)
-                                    <= self.lowlat_allreduce.max_num_tokens)
         # Self Attention
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.disable_attn_allreduce or self.iter_use_ll_twoshot)),
+            all_reduce_params=AllReduceParams(
+                enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
 
@@ -721,7 +706,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             )
 
         cutlass_min_latency_mode = self._enable_min_latency_mode(
-            hidden_states.shape[0]) and (not self.iter_use_ll_twoshot)
+            hidden_states.shape[0])
 
         if cutlass_min_latency_mode:
             assert self.fusion_config.PRE_MOE_FUSION and self.fusion_config.POST_MOE_FUSION
@@ -759,24 +744,16 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             )
         else:
             if self.fusion_config.PRE_MOE_FUSION:
-                if self.iter_use_ll_twoshot:
-                    hidden_states, residual = self.lowlat_allreduce.all_reduce_res_norm(
-                        gamma=self.post_attention_layernorm.weight,
-                        x=hidden_states,
-                        residual_in=residual,
+                # moe_backend can be either CUTLASS or TRTLLM here
+                # TODO: unify the two min-latency MoE backends by enabling quant fusion
+                hidden_states, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=self.post_attention_layernorm.weight,
                         eps=self.post_attention_layernorm.variance_epsilon,
-                    )
-                else:
-                    # moe_backend can be either CUTLASS or TRTLLM here
-                    # TODO: unify the two min-latency MoE backends by enabling quant fusion
-                    hidden_states, residual = self.allreduce(
-                        hidden_states,
-                        all_reduce_params=AllReduceParams(
-                            fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                            residual=residual,
-                            norm_weight=self.post_attention_layernorm.weight,
-                            eps=self.post_attention_layernorm.variance_epsilon,
-                        ))
+                    ))
             else:
                 # No fusion
                 hidden_states, residual = self.post_attention_layernorm(
@@ -785,22 +762,14 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             hidden_states = _run_MoE(hidden_states, hidden_states_fp4=None)
 
             if self.fusion_config.POST_MOE_FUSION:
-                if self.iter_use_ll_twoshot:
-                    hidden_states, residual = self.lowlat_allreduce.all_reduce_res_norm(
-                        gamma=self.next_layer_layernorm.weight,
-                        x=hidden_states,
-                        residual_in=residual,
+                hidden_states, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=self.next_layer_layernorm.weight,
                         eps=self.next_layer_layernorm.variance_epsilon,
-                    )
-                else:
-                    hidden_states, residual = self.allreduce(
-                        hidden_states,
-                        all_reduce_params=AllReduceParams(
-                            fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                            residual=residual,
-                            norm_weight=self.next_layer_layernorm.weight,
-                            eps=self.next_layer_layernorm.variance_epsilon,
-                        ))
+                    ))
             else:
                 if self.next_layer_layernorm is not None:
                     hidden_states, residual = self.next_layer_layernorm(
@@ -815,70 +784,41 @@ class DeepseekV3DecoderLayer(DecoderLayer):
     ) -> torch.Tensor:
 
         if self.fusion_config.PRE_MLP_FUSION:
-            if self.iter_use_ll_twoshot:
-                hidden_states, residual = self.lowlat_allreduce.all_reduce_res_norm(
-                    gamma=self.post_attention_layernorm.weight,
-                    x=hidden_states,
-                    residual_in=residual,
+            act_fp4, act_sf, residual = self.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+                    residual=residual,
+                    norm_weight=self.post_attention_layernorm.weight,
+                    scale=self.mlp.gate_up_proj.input_scale,
                     eps=self.post_attention_layernorm.variance_epsilon,
-                )
-                act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
-                    hidden_states,
-                    self.mlp.gate_up_proj.input_scale,
-                    self.mlp.gate_up_proj.scaling_vector_size,
-                    False,
-                )
-            else:
-                act_fp4, act_sf, residual = self.allreduce(
-                    hidden_states,
-                    all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.
-                        RESIDUAL_RMS_NORM_QUANT_NVFP4,
-                        residual=residual,
-                        norm_weight=self.post_attention_layernorm.weight,
-                        scale=self.mlp.gate_up_proj.input_scale,
-                        eps=self.post_attention_layernorm.variance_epsilon,
-                    ),
-                )
+                ),
+            )
             hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
         else:
             # No fusion
             # We need to add twoshot allreduce here to avoid modifying MLA logic
-            if self.iter_use_ll_twoshot and not self.disable_attn_allreduce:  # Equal to disable attention allreduce
-                hidden_states = self.lowlat_allreduce(hidden_states)
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
         hidden_states = self.mlp(
             hidden_states,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.POST_MLP_FUSION or self.mlp_tp_size == 1
-                or self.iter_use_ll_twoshot)),
+                self.fusion_config.POST_MLP_FUSION or self.mlp_tp_size == 1)),
         )
 
         if self.fusion_config.POST_MLP_FUSION:
-            if self.iter_use_ll_twoshot:
-                hidden_states, residual = self.lowlat_allreduce.all_reduce_res_norm(
-                    gamma=self.next_layer_layernorm.weight,
-                    x=hidden_states,
-                    residual_in=residual,
+            hidden_states, residual = self.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=self.next_layer_layernorm.weight,
                     eps=self.next_layer_layernorm.variance_epsilon,
-                )
-            else:
-                hidden_states, residual = self.allreduce(
-                    hidden_states,
-                    all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                        residual=residual,
-                        norm_weight=self.next_layer_layernorm.weight,
-                        eps=self.next_layer_layernorm.variance_epsilon,
-                    ),
-                )
+                ),
+            )
         else:
             # Disable mlp's allreduce if use ll twoshot
-            if self.iter_use_ll_twoshot and not (self.mapping.tp_size == 1
-                                                 or self.enable_attention_dp):
-                hidden_states = self.lowlat_allreduce(hidden_states)
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
@@ -930,10 +870,6 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        # deepseek allreduce kernel is better when m < 512
-        iter_use_ll_twoshot = (self.use_lowlat_allreduce
-                               and hidden_states.size(0)
-                               <= self.lowlat_allreduce.max_num_tokens)
         inputs_embeds = self.enorm(embed_tokens(input_ids))
         hidden_states = self.hnorm(hidden_states)
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
@@ -948,33 +884,23 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.disable_attn_allreduce or iter_use_ll_twoshot)),
+            all_reduce_params=AllReduceParams(
+                enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
 
         # MTP Layer Must have sparse MOE
         if self.fusion_config.PRE_MOE_FUSION:
-            if iter_use_ll_twoshot:
-                hidden_states, residual = self.lowlat_allreduce.all_reduce_res_norm(
-                    gamma=self.post_attention_layernorm.weight,
-                    x=hidden_states,
-                    residual_in=residual,
+            hidden_states, residual = self.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=self.post_attention_layernorm.weight,
                     eps=self.post_attention_layernorm.variance_epsilon,
-                )
-            else:
-                hidden_states, residual = self.allreduce(
-                    hidden_states,
-                    all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                        residual=residual,
-                        norm_weight=self.post_attention_layernorm.weight,
-                        eps=self.post_attention_layernorm.variance_epsilon,
-                    ),
-                )
+                ),
+            )
         else:
-            if iter_use_ll_twoshot and not self.disable_attn_allreduce:
-                hidden_states = self.lowlat_allreduce(hidden_states)
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
@@ -982,33 +908,22 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         hidden_states = self.mlp(
             hidden_states,
             all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
-            final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.POST_MOE_FUSION or self.mapping.tp_size == 1
-                or iter_use_ll_twoshot)),
+            final_all_reduce_params=AllReduceParams(
+                enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
+                                      or self.mapping.tp_size == 1)),
         )
 
         if self.fusion_config.POST_MOE_FUSION:
-            if iter_use_ll_twoshot:
-                hidden_states, residual = self.lowlat_allreduce.all_reduce_res_norm(
-                    gamma=self.shared_head.norm.weight,
-                    x=hidden_states,
-                    residual_in=residual,
+            hidden_states, residual = self.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=self.shared_head.norm.weight,
                     eps=self.shared_head.norm.variance_epsilon,
-                )
-            else:
-                hidden_states, residual = self.allreduce(
-                    hidden_states,
-                    all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                        residual=residual,
-                        norm_weight=self.shared_head.norm.weight,
-                        eps=self.shared_head.norm.variance_epsilon,
-                    ),
-                )
+                ),
+            )
         else:
-            if iter_use_ll_twoshot and not (self.mapping.tp_size == 1
-                                            or self.enable_attention_dp):
-                hidden_states = self.lowlat_allreduce(hidden_states)
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
 
         logits = self.shared_head(hidden_states, lm_head, attn_metadata).float()
