@@ -163,4 +163,6 @@ struct Fused_multihead_attention_params_v2
             float* scales;
         } q, k, v;
     } sage;
+
+    fmha::cudaTmaDesc tma_desc_v;
 };
