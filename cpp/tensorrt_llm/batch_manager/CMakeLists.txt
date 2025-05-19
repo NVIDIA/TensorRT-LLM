@@ -50,12 +50,13 @@ set(SRCS
     transformerBuffers.cpp
     trtEncoderModel.cpp
     trtGptModelInflightBatching.cpp
-    trtGptModelV1.cpp
+    updateDecoderBuffers.cpp
     utils/debugUtils.cpp
     utils/inflightBatchingUtils.cpp
     utils/logitsThread.cpp
     utils/staticThreadPool.cpp
-    evictionPolicy.cpp)
+    evictionPolicy.cpp
+    cacheTransBuffer.cpp)
 
 file(GLOB_RECURSE XGRAMMAR_SRCS "${3RDPARTY_DIR}/xgrammar/cpp/*.cc")
 list(FILTER XGRAMMAR_SRCS EXCLUDE REGEX
@@ -97,19 +98,16 @@ target_compile_definitions(${BATCH_MANAGER_STATIC_TARGET}
 
 # Find and link cuFile library for kvCacheTransferManager (GDS).
 if(ENABLE_CUFILE)
-  find_library(CUFILE_LIBRARY
+  find_library(
+    CUFILE_LIBRARY
     NAMES cufile
-    HINTS
-      /usr/local/cuda-12.6/targets/x86_64-linux/lib
-      /usr/lib/x86_64-linux-gnu
-      /usr/local/lib
-  )
+    HINTS /usr/local/cuda-12.6/targets/x86_64-linux/lib
+          /usr/lib/x86_64-linux-gnu /usr/local/lib)
   if(NOT CUFILE_LIBRARY)
     message(FATAL_ERROR "Could not find cufile library inside container.")
   endif()
   target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC ${CUFILE_LIBRARY})
 endif()
-
 
 if(ENABLE_UCX)
   find_package(ucx REQUIRED)

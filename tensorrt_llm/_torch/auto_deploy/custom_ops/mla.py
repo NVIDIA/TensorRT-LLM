@@ -3,17 +3,20 @@
 from typing import List, Optional, Tuple, Union
 
 import torch
+from torch._ops import OpOverloadPacket
+from torch.fx import Node
 
 from .attention_interface import (
     AttentionDescriptor,
+    AttentionLayout,
     AttentionRegistry,
     BufferInitializerDict,
+    CacheConfig,
     CacheInitializerDict,
     MHACallable,
     PrepareMetadataCallable,
     SequenceInfo,
 )
-from .torch_attention import apply_rotary_pos_emb_ds
 from .triton_attention import _flattened_context_mha, _generate_mha
 
 Constant = Union[int, float, str, None]
@@ -70,25 +73,37 @@ def fused_flattened_mla_with_cache(
     # Apply RoPE
     if cos_sin_stacked.numel() > 0:
         # Extract cos and sin from freqs_cis
-        cos = cos_sin_stacked[0, ...]
-        sin = cos_sin_stacked[1, ...]
+        cos_base = cos_sin_stacked[0, ...]
+        sin_base = cos_sin_stacked[1, ...]
 
         # TODO: Use triton kernels for RoPE
         # TODO: Add yarn support
-        for idx in range(seq_len.shape[0]):
-            (
-                q_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
-                k_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
-            ) = apply_rotary_pos_emb_ds(
-                q_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
-                k_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
+        for i in range(seq_len.shape[0]):
+            start = seq_start[i]
+            length = seq_len[i]
+
+            # build position_ids
+            if s == 1:
+                idx = (input_pos[i] + length - 1).item()
+                pos_ids = torch.tensor(idx, device=cos_base.device)
+            else:
+                pos_ids = torch.arange(input_pos[i], input_pos[i] + length, device=cos_base.device)
+
+            cos = cos_base[pos_ids]  # [..., 1, head_dim]
+            sin = sin_base[pos_ids]
+            q_slice = q_pe[start : start + length]
+            k_slice = k_pe[start : start + length]
+
+            q_rot, k_rot = torch.ops.rope.torch_apply_rope_with_qk_interleaving(
+                q_slice,
+                k_slice,
                 cos,
                 sin,
-                torch.arange(input_pos[idx] + seq_len[idx])[-1]
-                if s == 1
-                else torch.arange(input_pos[idx] + seq_len[idx]),
                 -2,
             )
+
+            q_pe[start : start + length] = q_rot
+            k_pe[start : start + length] = k_rot
 
     # Create query_states, key_states
     query_states = torch.cat((q_nope, q_pe), dim=-1)  # [b*s,n,d]
@@ -157,6 +172,7 @@ def fused_flattened_mla_with_cache_fake(
 @torch.library.custom_op("attention::prepare_fused_mla_metadata", mutates_args=())
 def prepare_fused_mla_metadata(
     input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
@@ -176,7 +192,7 @@ def prepare_fused_mla_metadata(
 
 @prepare_fused_mla_metadata.register_fake
 def prepare_fused_mla_metadata_fake(
-    input_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
+    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
 ):
     return (
         torch.empty_like(seq_len),
@@ -194,26 +210,48 @@ class MultiHeadLatentAttention(AttentionDescriptor):
         return False
 
     @classmethod
-    def get_attention_op(cls) -> Tuple[MHACallable, int]:
-        return torch.ops.attention.fused_flattened_mla_with_cache, 4
+    def get_attention_layout(cls) -> AttentionLayout:
+        """Get the attention layout expected by the backend."""
+        return "bnsd"
+
+    @classmethod
+    def get_num_qkv_args(cls) -> int:
+        """Get the number of qkv arguments expected by the source op."""
+        return 4
+
+    @classmethod
+    def get_source_attention_op(cls) -> OpOverloadPacket:
+        return torch.ops.deepseek.fused_mla
+
+    @classmethod
+    def get_cached_attention_op(cls) -> MHACallable:
+        return torch.ops.attention.fused_flattened_mla_with_cache
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
         return torch.ops.attention.prepare_fused_mla_metadata, 4
 
     @classmethod
-    def get_cache_initializers(cls, get_mla_info) -> CacheInitializerDict:
-        attention_info = get_mla_info()
+    def get_cache_initializers(
+        cls, source_attn_node: Node, cache_config: CacheConfig
+    ) -> CacheInitializerDict:
+        q_nope_fake = source_attn_node.args[0].meta["val"]
+        q_pe_fake = source_attn_node.args[1].meta["val"]
+        kv_fake = source_attn_node.args[2].meta["val"]
+
+        num_kv_heads = kv_fake.shape[1]
+        head_dim = q_nope_fake.shape[-1]
+        rope_dim = q_pe_fake.shape[-1]
 
         def _get_k_cache(si: SequenceInfo):
             assert not si.is_paged, "Paged cache not supported for MultiHeadLatentAttention"
             return torch.empty(
                 si.num_pages,
                 si.page_size,
-                attention_info.num_kv_heads,
-                attention_info.head_dim + attention_info.rope_dim,
+                num_kv_heads,
+                head_dim + rope_dim,
                 device=si.device,
-                dtype=attention_info.cache_config.dtype or attention_info.dtype,
+                dtype=cache_config.dtype or kv_fake.dtype,
             )
 
         def _get_v_cache(si: SequenceInfo):
@@ -221,19 +259,19 @@ class MultiHeadLatentAttention(AttentionDescriptor):
             return torch.empty(
                 si.num_pages,
                 si.page_size,
-                attention_info.num_kv_heads,
-                attention_info.head_dim,
+                num_kv_heads,
+                head_dim,
                 device=si.device,
-                dtype=attention_info.cache_config.dtype or attention_info.dtype,
+                dtype=cache_config.dtype or kv_fake.dtype,
             )
 
         return {"k_cache": _get_k_cache, "v_cache": _get_v_cache}
 
     @classmethod
-    def get_global_buffer_initializers(cls, get_mla_info) -> BufferInitializerDict:
-        attention_info = get_mla_info()
-        rope_head_dim = attention_info.rope_dim
-        rope_theta = attention_info.pos_embd_config.rope_theta
+    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
+        q_pe_fake = source_attn_node.args[1].meta["val"]
+        rope_head_dim = q_pe_fake.shape[-1]
+        rope_theta: float = 10000.0  # TODO: remove once MLA is unfused
 
         def _get_cos_sin_stacked(si: SequenceInfo):
             if rope_theta is None:
@@ -245,7 +283,7 @@ class MultiHeadLatentAttention(AttentionDescriptor):
         }
 
     @classmethod
-    def get_constants(cls, get_mla_info) -> List[Constant]:
+    def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         return [None]
 
     @staticmethod

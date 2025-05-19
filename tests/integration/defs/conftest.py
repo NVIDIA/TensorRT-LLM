@@ -15,7 +15,6 @@
 # -*- coding: utf-8 -*-
 
 import datetime
-import json
 import os
 import re
 import shutil
@@ -30,6 +29,7 @@ from typing import Iterable, Sequence
 import defs.ci_profiler
 import psutil
 import pytest
+import torch
 import tqdm
 import yaml
 from _pytest.mark import ParameterSet
@@ -54,9 +54,6 @@ except ImportError:
 DEBUG_CI_STORAGE = os.environ.get("DEBUG_CI_STORAGE", False)
 GITLAB_API_USER = os.environ.get("GITLAB_API_USER")
 GITLAB_API_TOKEN = os.environ.get("GITLAB_API_TOKEN")
-EVALTOOL_REPO_URL = os.environ.get("EVALTOOL_REPO_URL")
-LLM_GATE_WAY_CLIENT_ID = os.environ.get("LLM_GATE_WAY_CLIENT_ID")
-LLM_GATE_WAY_TOKEN = os.environ.get("LLM_GATE_WAY_TOKEN")
 
 
 def print_storage_usage(path, tag, capfd):
@@ -182,6 +179,13 @@ def llm_root():
 
 
 @pytest.fixture(scope="session")
+def llm_backend_root():
+    llm_root_directory = get_llm_root()
+    llm_backend_repo_root = os.path.join(llm_root_directory, "triton_backend")
+    return llm_backend_repo_root
+
+
+@pytest.fixture(scope="session")
 def llm_datasets_root() -> str:
     return os.path.join(llm_models_root(), "datasets")
 
@@ -194,7 +198,7 @@ def llm_rouge_root() -> str:
 @pytest.fixture(scope="module")
 def bert_example_root(llm_root):
     "Get bert example root"
-    example_root = os.path.join(llm_root, "examples", "bert")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "bert")
 
     return example_root
 
@@ -202,7 +206,8 @@ def bert_example_root(llm_root):
 @pytest.fixture(scope="module")
 def enc_dec_example_root(llm_root):
     "Get encoder-decoder example root"
-    example_root = os.path.join(llm_root, "examples", "enc_dec")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "enc_dec")
 
     return example_root
 
@@ -210,7 +215,8 @@ def enc_dec_example_root(llm_root):
 @pytest.fixture(scope="module")
 def whisper_example_root(llm_root, llm_venv):
     "Get whisper example root"
-    example_root = os.path.join(llm_root, "examples", "whisper")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "whisper")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -236,7 +242,7 @@ def opt_example_root(llm_root, llm_venv):
 def llama_example_root(llm_root, llm_venv):
     "Get llama example root"
 
-    example_root = os.path.join(llm_root, "examples", "llama")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "llama")
     try:
         llm_venv.run_cmd([
             "-m", "pip", "install", "-r",
@@ -270,7 +276,7 @@ def disaggregated_example_root(llm_root, llm_venv):
 def gemma_example_root(llm_root, llm_venv):
     "Get gemma example root"
 
-    example_root = os.path.join(llm_root, "examples", "gemma")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "gemma")
     # https://nvbugs/4559583 Jax dependency broke the entire pipeline in TRT container
     # due to the dependency incompatibility with torch, which forced reinstall everything
     # and caused pipeline to fail. We manually install gemma dependency as a WAR.
@@ -361,7 +367,7 @@ def mistral_nemo_minitron_model_root(request):
 @pytest.fixture(scope="module")
 def gpt_example_root(llm_root, llm_venv):
     "Get gpt example root"
-    example_root = os.path.join(llm_root, "examples", "gpt")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "gpt")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -386,7 +392,8 @@ def gptj_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def glm_4_9b_example_root(llm_root, llm_venv):
     "Get glm-4-9b example root"
-    example_root = os.path.join(llm_root, "examples", "glm-4-9b")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "glm-4-9b")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -398,7 +405,8 @@ def glm_4_9b_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def exaone_example_root(llm_root, llm_venv):
     "Get EXAONE example root"
-    example_root = os.path.join(llm_root, "examples", "exaone")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "exaone")
 
     return example_root
 
@@ -442,7 +450,8 @@ def plugin_gen_path(llm_root):
 @pytest.fixture(scope="module")
 def internlm2_example_root(llm_root, llm_venv):
     "Get internlm2 example root"
-    example_root = os.path.join(llm_root, "examples", "internlm2")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "internlm2")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -454,7 +463,7 @@ def internlm2_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def qwen_example_root(llm_root, llm_venv):
     "Get qwen example root"
-    example_root = os.path.join(llm_root, "examples", "qwen")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "qwen")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -526,7 +535,7 @@ def eagle_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def mamba_example_root(llm_root, llm_venv):
     "Get mamba example root"
-    example_root = os.path.join(llm_root, "examples", "mamba")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "mamba")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -543,7 +552,8 @@ def mamba_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def recurrentgemma_example_root(llm_root, llm_venv):
     "Get recurrentgemma example root"
-    example_root = os.path.join(llm_root, "examples", "recurrentgemma")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "recurrentgemma")
 
     # install requirements
     llm_venv.run_cmd([
@@ -561,7 +571,8 @@ def recurrentgemma_example_root(llm_root, llm_venv):
 
 @pytest.fixture(scope="module")
 def nemotron_nas_example_root(llm_root, llm_venv):
-    example_root = os.path.join(llm_root, "examples", "nemotron_nas")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "nemotron_nas")
 
     yield example_root
 
@@ -569,7 +580,8 @@ def nemotron_nas_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def nemotron_example_root(llm_root, llm_venv):
     "Get nemotron example root"
-    example_root = os.path.join(llm_root, "examples", "nemotron")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "nemotron")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -580,7 +592,8 @@ def nemotron_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def commandr_example_root(llm_root, llm_venv):
     "Get commandr example root"
-    example_root = os.path.join(llm_root, "examples", "commandr")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "commandr")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -788,6 +801,8 @@ def multimodal_model_root(request, llm_venv):
         tllm_model_name = tllm_model_name + ".nemo"
     elif 'Llama-3.2' in tllm_model_name:
         models_root = os.path.join(llm_models_root(), 'llama-3.2-models')
+    elif 'Mistral-Small' in tllm_model_name:
+        models_root = llm_models_root()
 
     multimodal_model_root = os.path.join(models_root, tllm_model_name)
 
@@ -1659,79 +1674,6 @@ def llm_aya_23_35b_model_root(llm_venv):
     return model_root
 
 
-def evaltool_mmlu_post_process(results_path, baseline, threshold):
-    # Note: In the older version of the lm-harness result file,
-    # there are 57 values.
-    # The latest version of lm-harness includes
-    # 4 additional categories and 1 whole dataset in the result file.
-    # We need to exclude these new categories and
-    # the whole dataset when calculating the average.
-
-    with open(results_path) as f:
-        result = json.load(f)
-        acc_acc = 0.0
-        tasks_to_ignore = [
-            "mmlu_str", "mmlu_str_stem", "mmlu_str_other",
-            "mmlu_str_social_sciences", "mmlu_str_humanities"
-        ]
-        total_task = len(result['results']) - len(tasks_to_ignore)
-        assert total_task == 57
-        for sub_task in result['results']:
-            if sub_task in tasks_to_ignore:
-                continue
-            acc_acc += float(result['results'][sub_task]['exact_match,none'])
-        avg_acc = acc_acc / total_task
-        print("MMLU avg accuracy:", avg_acc)
-        assert abs(avg_acc - baseline) <= threshold
-
-
-def evaltool_wikilingua_post_process(results_path, baseline, threshold):
-    with open(results_path) as f:
-        result = json.load(f)
-        rouge_l = result['results']['wikilingua_english']['rougeL,none']
-        print("Wikilingua_english rouge_L:", rouge_l)
-        assert abs(rouge_l - baseline) <= threshold
-
-
-def evaltool_humaneval_post_process(results_path, baseline, threshold):
-    with open(results_path) as f:
-        result = json.load(f)
-        print(result)
-        acc = result[0]['humaneval']['pass@1']
-        assert abs(acc - baseline) <= threshold
-
-
-def evaltool_mtbench_post_process(results_path, baseline, threshold):
-    with open(results_path) as f:
-        get_result = False
-        for total_score in f:
-            if total_score.startswith('total'):
-                get_result = True
-                total_score = float(total_score.split(',')[1].strip())
-                assert abs(total_score - baseline) <= threshold
-        assert get_result
-
-
-@pytest.fixture(scope="module")
-def evaltool_root(llm_venv):
-    if GITLAB_API_USER is None or GITLAB_API_TOKEN is None or EVALTOOL_REPO_URL is None:
-        pytest.skip(
-            "Need to set GITLAB_API_USER, GITLAB_API_TOKEN, and EVALTOOL_REPO_URL env vars to run evaltool tests."
-        )
-    workspace = llm_venv.get_working_directory()
-    clone_dir = os.path.join(workspace, "eval-tool")
-    repo_url = f"https://{GITLAB_API_USER}:{GITLAB_API_TOKEN}@{EVALTOOL_REPO_URL}"
-    branch_name = "dev/0.9"
-
-    from evaltool.constants import EVALTOOL_SETUP_SCRIPT
-    evaltool_setup_cmd = [
-        EVALTOOL_SETUP_SCRIPT, "-b", branch_name, "-d", clone_dir, "-r",
-        repo_url
-    ]
-    call(" ".join(evaltool_setup_cmd), shell=True)
-    return clone_dir
-
-
 @pytest.fixture(scope="function")
 def engine_dir(llm_venv, capfd):
     "Get engine dir"
@@ -1825,6 +1767,8 @@ def star_attention_input_root(llm_root):
 def parametrize_with_ids(argnames: str | Sequence[str],
                          argvalues: Iterable[ParameterSet | Sequence[object]
                                              | object], **kwargs):
+    """An alternative to pytest.mark.parametrize with automatically generated test ids.
+    """
     if isinstance(argnames, str):
         argname_list = [n.strip() for n in argnames.split(",")]
     else:
@@ -1839,15 +1783,10 @@ def parametrize_with_ids(argnames: str | Sequence[str],
             case_argvalues = (case_argvalues, )
         assert len(case_argvalues) == len(argname_list)
 
-        case_id = []
-        for name, value in zip(argname_list, case_argvalues):
-            if value is None:
-                pass
-            elif isinstance(value, bool):
-                if value:
-                    case_id.append(name)
-            else:
-                case_id.append(f"{name}={value}")
+        case_id = [
+            f"{name}={value}"
+            for name, value in zip(argname_list, case_argvalues)
+        ]
         case_ids.append("-".join(case_id))
 
     return pytest.mark.parametrize(argnames, argvalues, ids=case_ids, **kwargs)
@@ -1879,19 +1818,8 @@ def skip_by_device_memory(request):
 
 def get_sm_version():
     "get compute capability"
-    with tempfile.TemporaryDirectory() as temp_dirname:
-        suffix = ".exe" if is_windows() else ""
-        # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
-        cmd = " ".join([
-            "nvidia-smi" + suffix, "--query-gpu=compute_cap",
-            "--format=csv,noheader"
-        ])
-        output = check_output(cmd, shell=True, cwd=temp_dirname)
-
-    compute_cap = output.strip().split("\n")[0]
-    sm_major, sm_minor = list(map(int, compute_cap.split(".")))
-
-    return sm_major * 10 + sm_minor
+    prop = torch.cuda.get_device_properties(0)
+    return prop.major * 10 + prop.minor
 
 
 skip_pre_ada = pytest.mark.skipif(
@@ -1907,11 +1835,17 @@ skip_pre_blackwell = pytest.mark.skipif(
     reason="This test is not supported in pre-Blackwell architecture")
 
 skip_post_blackwell = pytest.mark.skipif(
-    get_sm_version() >= 100 and get_sm_version() < 120,
+    get_sm_version() >= 100,
     reason="This test is not supported in post-Blackwell architecture")
 
 skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
                                   reason="NVLS is not supported")
+skip_no_hopper = pytest.mark.skipif(
+    get_sm_version() != 90,
+    reason="This test is only  supported in Hopper architecture")
+
+skip_no_sm120 = pytest.mark.skipif(get_sm_version() != 120,
+                                   reason="This test is for Blackwell SM120")
 
 
 def skip_fp8_pre_ada(use_fp8):
@@ -1967,22 +1901,6 @@ def get_device_memory():
         memory = int(output.strip().split()[0])
 
     return memory
-
-
-#
-# When test parameters have an empty id, older versions of pytest ignored that parameter when generating the
-# test node's ID completely. This however was actually a bug, and not expected behavior that got fixed in newer
-# versions of pytest:https://github.com/pytest-dev/pytest/pull/6607. TRT test defs however rely on this behavior
-# for quite a few test names. This is a hacky WAR that restores the old behavior back so that the
-# test names do not change. Note: This might break in a future pytest version.
-#
-# TODO: Remove this hack once the test names are fixed.
-#
-
-from _pytest.python import CallSpec2
-
-CallSpec2.id = property(
-    lambda self: "-".join(map(str, filter(None, self._idlist))))
 
 
 def pytest_addoption(parser):
@@ -2314,3 +2232,12 @@ def disaggregated_test_root(llm_root, llm_venv):
                                       "tests/integration/defs/disaggregated")
 
     return disaggregated_root
+
+
+@pytest.fixture(scope="function")
+def tritonserver_test_root(llm_root):
+    "Get tritonserver test root"
+    tritonserver_root = os.path.join(llm_root,
+                                     "tests/integration/defs/triton_server")
+
+    return tritonserver_root

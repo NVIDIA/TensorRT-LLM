@@ -88,6 +88,14 @@ class EagleConfig(LLaMAConfig):
             n_positions = hf_config.max_position_embeddings
             hidden_act = hf_config.hidden_act
             dtype = str(hf_config.torch_dtype)[6:] if dtype == 'auto' else dtype
+            if hasattr(hf_config, 'head_dim'):
+                head_dim = hf_config.head_dim
+            else:
+                head_dim = hf_config.n_embd // hf_config.n_head
+            if hasattr(hf_config, 'head_size'):
+                head_size = hf_config.head_size
+            else:
+                head_size = head_dim
 
             if speculative_config_or_dir is None:
                 hf_config_eagle = hf_config.eagle
@@ -143,6 +151,8 @@ class EagleConfig(LLaMAConfig):
             },
             'use_parallel_embedding': kwargs['use_parallel_embedding'],
             'embedding_sharding_dim': kwargs['embedding_sharding_dim'],
+            'head_dim': head_dim,
+            'head_size': head_size
         }
 
         config = {

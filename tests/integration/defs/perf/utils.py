@@ -218,13 +218,18 @@ class PerfBenchScriptTestCmds(NamedTuple):
             envs = copy.deepcopy(os.environ)
             prepare_cmds = prepare_cmd_str.split(';')
             for prepare_cmd in prepare_cmds:
-                print(f'Now running prepare data command: "{prepare_cmd}"')
-                cmd = prepare_cmd.split('>')[0]
-                dataset_file = prepare_cmd.split('>')[1].split()[0]
+                print_info(f'Now running prepare data command: "{prepare_cmd}"')
+                if '>' in prepare_cmd:
+                    cmd = prepare_cmd.split('>')[0]
+                    dataset_file = prepare_cmd.split('>')[1].split()[0]
+                else:
+                    cmd = prepare_cmd
+                    dataset_file = None
                 output += subprocess.check_output(cmd.split(),
                                                   env=envs).decode()
-                with open(f"{dataset_file}", 'w+') as f:
-                    f.write(output)
+                if dataset_file:
+                    with open(f"{dataset_file}", 'w+') as f:
+                        f.write(output)
 
         elif cmd_idx == len(self.data_cmds):
             #running build
@@ -246,7 +251,7 @@ class PerfBenchScriptTestCmds(NamedTuple):
                 output += subprocess.check_output(command, env=envs).decode()
         else:
             #running throughput
-            print(f'Now running benchmarking command: "{current_cmd_str}"')
+            print_info(f'Now running benchmarking command: "{current_cmd_str}"')
             command = self.benchmark_cmds[cmd_idx - 1 - len(self.data_cmds)]
             if self.is_python:
                 if len(mpi_cmd) > 0:
@@ -265,6 +270,20 @@ class PerfBenchScriptTestCmds(NamedTuple):
                 benchmark_cmd = mpi_cmd + command
                 output += subprocess.check_output(benchmark_cmd,
                                                   env=envs).decode()
+                # write config.json to output log
+                match = re.search(r'--engine_dir=([^\s]+)', current_cmd_str)
+                if match:
+                    engine_dir = match.group(1)
+                    print_info(
+                        f'writing config.json in {engine_dir} to output log')
+                    with open(os.path.join(engine_dir, "config.json"),
+                              "r") as f:
+                        config_content = f.read()
+                        output += "\n" + "=" * 50 + "\n"
+                        output += "ENGINE CONFIG:\n"
+                        output += "=" * 50 + "\n"
+                        output += config_content
+                        output += "\n" + "=" * 50 + "\n"
         return output
 
     def get_cmd_str(self, cmd_idx) -> List[str]:
@@ -411,7 +430,9 @@ class AbstractPerfScriptTestClass(abc.ABC):
                             print(collect_and_clean_myelin_time(output))
 
                     # Print the output log to stdout and cache it.
-                    print(buf.getvalue())
+                    # skip the output log for prepare dataset command
+                    if 'prepare_dataset' not in commands.get_cmd_str(cmd_idx):
+                        print(buf.getvalue())
                     outputs[cmd_idx] = buf.getvalue()
             else:
                 print_info(f"Reusing cached logs for command index {cmd_idx}.")

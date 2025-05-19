@@ -18,6 +18,7 @@
 #pragma once
 
 #include "dataTransceiver.h"
+#include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -41,10 +42,12 @@ class MLACacheFormatter final : public IOFormatter
 public:
     using CacheState = executor::kv_cache::CacheState;
 
-    MLACacheFormatter(BaseKVCacheManager* cacheManager)
+    MLACacheFormatter(BaseKVCacheManager* cacheManager, CacheTransBufferManager* cacheTransBufferManager)
         : mCacheManager{cacheManager}
+        , mCacheTransBufferManager{cacheTransBufferManager}
     {
         TLLM_CHECK(mCacheManager);
+        TLLM_CHECK(mCacheTransBufferManager);
     }
 
     void formatOutput(LlmRequest const& llmRequest,
@@ -70,19 +73,7 @@ public:
 
 private:
     BaseKVCacheManager* mCacheManager{};
-
-    struct ConcurrenceSendResource
-    {
-        std::unordered_map<int, runtime::ITensor::SharedPtr> mSendbuffers;
-        std::mutex mSendbuffersMutex;
-        std::condition_variable mSendbuffersCV;
-        std::atomic_int mConcurrence = 0;
-    };
-
-    ConcurrenceSendResource mConcurrenceSendResource;
-
-    std::unordered_map<std::string, runtime::ITensor::SharedPtr> mProcessToRecvBuffer;
-    std::mutex mProcessToRecvBufferMutex;
+    CacheTransBufferManager* mCacheTransBufferManager;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

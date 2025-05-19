@@ -28,9 +28,10 @@ from tensorrt_llm import Tensor
 # ufp8_type: 0 for ue8m0, 1 for ue4m3
 def float_tensor_to_e2m1_and_ufp8_scale(float_tensor: torch.Tensor,
                                         sf_vec_size,
-                                        ufp8_type: int = 1):
+                                        ufp8_type: int = 1,
+                                        is_sf_swizzled_layout: bool = True):
     value_e2m1, scale_ufp8, rep_float = torch.ops.tensorrt_llm.float_to_e2m1_and_ufp8sf_scale(
-        float_tensor, sf_vec_size, ufp8_type)
+        float_tensor, sf_vec_size, ufp8_type, is_sf_swizzled_layout)
     return value_e2m1, scale_ufp8, rep_float
 
 

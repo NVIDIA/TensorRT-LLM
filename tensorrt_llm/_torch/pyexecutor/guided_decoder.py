@@ -1,4 +1,5 @@
 import itertools
+import json
 import math
 from typing import List, Optional
 
@@ -6,33 +7,8 @@ import torch
 import xgrammar
 
 from ...bindings.executor import GuidedDecodingConfig, GuidedDecodingParams
-from .llm_request import LlmRequest
-from .resource_manager import BaseResourceManager, SlotManager
 from .scheduler import ScheduledRequests
-
-
-class GuidedDecoderResourceManager(BaseResourceManager):
-
-    def __init__(self, max_num_sequences: int):
-        self.slot_manager = SlotManager(max_num_sequences)
-
-    def get_max_resource_count(self) -> int:
-        return self.slot_manager.max_num_requests
-
-    def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
-        return int(request.guided_decoding_params is not None)
-
-    def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
-        for llm_req in itertools.chain(scheduled_batch.context_requests,
-                                       scheduled_batch.generation_requests):
-            if llm_req.guided_decoding_params is None:
-                continue
-            if llm_req.is_context_init_state and llm_req.context_current_position == llm_req.prepopulated_prompt_len:
-                self.slot_manager.add_slot(llm_req.request_id)
-
-    def free_resources(self, request: LlmRequest) -> None:
-        if request.guided_decoding_params is not None:
-            self.slot_manager.remove_slot(request.request_id)
+from .seq_slot_manager import SeqSlotManager
 
 
 class GuidedDecoder:
@@ -79,7 +55,7 @@ class GuidedDecoder:
         return math.ceil(self.vocab_size_padded / 32)
 
     def build(self, scheduled_requests: ScheduledRequests,
-              resource_manager: GuidedDecoderResourceManager) -> None:
+              resource_manager: SeqSlotManager) -> None:
         if self.guided_decoding_backend == GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR:
             for llm_req in itertools.chain(
                     scheduled_requests.context_requests,
@@ -107,6 +83,18 @@ class GuidedDecoder:
                             grammar = xgrammar.Grammar.from_ebnf(guide)
                             compiled_grammar = self.xgrammar_compiler.compile_grammar(
                                 grammar)
+                        case GuidedDecodingParams.GuideType.STRUCTURAL_TAG:
+                            structural_tag_parameters = json.loads(guide)
+                            structures = structural_tag_parameters["structures"]
+                            structures = [
+                                xgrammar.StructuralTagItem(
+                                    begin=s["begin"],
+                                    schema=json.dumps(s["schema"]),
+                                    end=s["end"]) for s in structures
+                            ]
+                            triggers = structural_tag_parameters["triggers"]
+                            compiled_grammar = self.xgrammar_compiler.compile_structural_tag(
+                                structures, triggers)
                         case _:
                             raise ValueError(
                                 f"Unrecognized guide type: {guide_type}.")
@@ -129,8 +117,7 @@ class GuidedDecoder:
                                              non_blocking=True)
 
     def execute(self, scheduled_requests: ScheduledRequests,
-                logits: torch.Tensor,
-                resource_manager: GuidedDecoderResourceManager) -> None:
+                logits: torch.Tensor, resource_manager: SeqSlotManager) -> None:
         assert logits.size(0) == len(scheduled_requests.context_requests) + len(
             scheduled_requests.generation_requests)
         torch.cuda.current_stream().wait_stream(self._stream)

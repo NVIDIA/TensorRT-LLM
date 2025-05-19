@@ -3,6 +3,7 @@
 # For the full list of built-in configuration values, see the documentation:
 # https://www.sphinx-doc.org/en/master/usage/configuration.html
 
+import importlib.util
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 import os
@@ -13,11 +14,20 @@ import pygit2
 
 sys.path.insert(0, os.path.abspath('.'))
 
-project = 'tensorrt_llm'
-copyright = '2024, NVidia'
+project = 'TensorRT-LLM'
+copyright = '2025, NVidia'
 author = 'NVidia'
 branch_name = pygit2.Repository('.').head.shorthand
 html_show_sphinx = False
+
+# Get the version from the version.py file
+version_path = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "../../tensorrt_llm/version.py"))
+spec = importlib.util.spec_from_file_location("version_module", version_path)
+version_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(version_module)
+version = version_module.__version__
+
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
@@ -72,10 +82,18 @@ source_suffix = {
     '.rst': 'restructuredtext',
     '.txt': 'markdown',
     '.md': 'markdown',
+    '.json': 'json',
 }
 
 html_theme = 'nvidia_sphinx_theme'
 html_static_path = ['_static']
+html_theme_options = {
+    "switcher": {
+        "json_url": "./_static/switcher.json",
+        "version_match": version,
+        "check_switcher": True,
+    },
+}
 
 # ------------------------  C++ Doc related  --------------------------
 # Breathe configuration

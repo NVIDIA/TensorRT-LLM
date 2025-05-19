@@ -16,8 +16,10 @@ LLM_BRANCH = env.gitlabBranch? env.gitlabBranch : params.branch
 LLM_BRANCH_TAG = LLM_BRANCH.replaceAll('/', '_')
 
 BUILD_JOBS = "32"
+BUILD_JOBS_RELEASE_X86_64 = "16"
+BUILD_JOBS_RELEASE_SBSA = "8"
 
-def createKubernetesPodConfig(type)
+def createKubernetesPodConfig(type, arch = "amd64")
 {
     def targetCould = "kubernetes-cpu"
     def containerConfig = ""
@@ -75,6 +77,7 @@ def createKubernetesPodConfig(type)
                 nodeSelector:
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux
+                  kubernetes.io/arch: ${arch}
                 containers:
                   ${containerConfig}
                   - name: jnlp
@@ -96,9 +99,10 @@ def createKubernetesPodConfig(type)
 }
 
 
-def buildImage(target, action="build", torchInstallType="skip", args="", custom_tag="", post_tag="")
+def buildImage(target, action="build", torchInstallType="skip", args="", custom_tag="", post_tag="", is_sbsa=false)
 {
-    def tag = "x86_64-${target}-torch_${torchInstallType}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}${post_tag}"
+    def arch = is_sbsa ? "sbsa" : "x86_64"
+    def tag = "${arch}-${target}-torch_${torchInstallType}${post_tag}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
     // Step 1: cloning tekit source code
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
@@ -128,15 +132,31 @@ def buildImage(target, action="build", torchInstallType="skip", args="", custom_
             }
         }
         try {
+            // Fix the build OOM issue of release builds
+            def build_jobs = BUILD_JOBS
+            if (target == "trtllm") {
+                if (arch == "x86_64") {
+                    build_jobs = BUILD_JOBS_RELEASE_X86_64
+                } else {
+                    build_jobs = BUILD_JOBS_RELEASE_SBSA
+                }
+            }
             containerGenFailure = null
             stage ("make ${target}_${action}") {
                 retry(3)
                 {
+                  // Fix the triton image pull timeout issue
+                  def TRITON_IMAGE = sh(script: "cd ${LLM_ROOT} && grep 'ARG TRITON_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+                  def TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep 'ARG TRITON_BASE_TAG=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+                  retry(3) {
+                    sh "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}"
+                  }
+
                   sh """
                   cd ${LLM_ROOT} && make -C docker ${target}_${action} \
                   TORCH_INSTALL_TYPE=${torchInstallType} \
                   IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${tag} \
-                  BUILD_WHEEL_OPTS='-j ${BUILD_JOBS}' ${args} \
+                  BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} \
                   GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote
                   """
                 }
@@ -148,7 +168,7 @@ def buildImage(target, action="build", torchInstallType="skip", args="", custom_
                   cd ${LLM_ROOT} && make -C docker ${target}_${action} \
                   TORCH_INSTALL_TYPE=${torchInstallType} \
                   IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${custom_tag} \
-                  BUILD_WHEEL_OPTS='-j ${BUILD_JOBS}' ${args} \
+                  BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} \
                   GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote
                   """
                }
@@ -164,38 +184,6 @@ def buildImage(target, action="build", torchInstallType="skip", args="", custom_
             }
             if (containerGenFailure != null) {
                 throw containerGenFailure
-            }
-        }
-    }
-}
-
-
-def triggerSBSARemoteJob(action, type)
-{
-    script
-    {
-        def parameters = """
-            token=L1_Nightly_Token
-            hostJobName=${JOB_NAME}
-            hostBuildNumber=${BUILD_NUMBER}
-            gitlabBranch=${LLM_BRANCH}
-            action=${action}
-            type=${type}
-        """.stripIndent()
-
-        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE')
-        {
-            def handle = triggerRemoteJob(
-                job: "https://prod.blsm.nvidia.com/sw-tensorrt-static-1/job/LLM/job/helpers/job/gh200-BuildImage/",
-                auth: CredentialsAuth(credentials: "STATIC_1_TOKEN"),
-                parameters: parameters,
-                pollInterval: 60,
-                abortTriggeredJob: true,
-            )
-            def status = handle.getBuildResult().toString()
-
-            if (status != "SUCCESS") {
-                error "Downstream job did not succeed"
             }
         }
     }
@@ -240,7 +228,7 @@ pipeline {
                     }
                     steps
                     {
-                        buildImage("trtllm", "push", "skip", "", LLM_BRANCH_TAG)
+                        buildImage("trtllm", env.JOB_NAME ==~ /.*PostMerge.*/ ? "push" : params.action, "skip", "", LLM_BRANCH_TAG)
                     }
                 }
                 stage("Build x86_64-skip") {
@@ -249,25 +237,16 @@ pipeline {
                     }
                     steps
                     {
-                        buildImage("devel", params.action, "skip")
+                        buildImage("tritondevel", params.action, "skip")
                     }
                 }
-                stage("Build x86_64-pre_cxx11_abi") {
+                stage("Build trtllm release-sbsa") {
                     agent {
-                        kubernetes createKubernetesPodConfig("build")
+                        kubernetes createKubernetesPodConfig("build", "arm64")
                     }
                     steps
                     {
-                        buildImage("devel", params.action, "src_non_cxx11_abi")
-                    }
-                }
-                stage("Build x86_64-cxx11_abi") {
-                    agent {
-                        kubernetes createKubernetesPodConfig("build")
-                    }
-                    steps
-                    {
-                        buildImage("devel", params.action, "src_cxx11_abi")
+                        buildImage("trtllm", env.JOB_NAME ==~ /.*PostMerge.*/ ? "push" : params.action, "skip", "", LLM_BRANCH_TAG + "-sbsa", "", true)
                     }
                 }
                 stage("Build rockylinux8 x86_64-skip-py3.10") {
@@ -276,7 +255,7 @@ pipeline {
                     }
                     steps
                     {
-                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.10.12", "", "-py310")
+                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.10.12 STAGE=tritondevel", "", "-py310")
                     }
                 }
                 stage("Build rockylinux8 x86_64-skip-py3.12") {
@@ -285,37 +264,18 @@ pipeline {
                     }
                     steps
                     {
-                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.12.3", "", "-py312")
+                        buildImage("rockylinux8", params.action, "skip", "PYTHON_VERSION=3.12.3 STAGE=tritondevel", "", "-py312")
                     }
                 }
                 stage("Build SBSA-skip") {
                     agent {
-                        kubernetes createKubernetesPodConfig("agent")
+                        kubernetes createKubernetesPodConfig("build", "arm64")
                     }
                     steps
                     {
-                        triggerSBSARemoteJob(params.action, "skip")
+                        buildImage("tritondevel", params.action, "skip", "", "", "", true)
                     }
                 }
-                // Waived due to a pytorch issue: https://github.com/pytorch/pytorch/issues/141083
-                // stage("Build SBSA-pre_cxx11_abi") {
-                //     agent {
-                //         kubernetes createKubernetesPodConfig("agent")
-                //     }
-                //     steps
-                //     {
-                //         triggerSBSARemoteJob(params.action, "src_non_cxx11_abi")
-                //     }
-                // }
-                // stage("Build SBSA-cxx11_abi") {
-                //     agent {
-                //         kubernetes createKubernetesPodConfig("agent")
-                //     }
-                //     steps
-                //     {
-                //         triggerSBSARemoteJob(params.action, "src_cxx11_abi")
-                //     }
-                // }
             }
         }
     } // stages

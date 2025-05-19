@@ -24,7 +24,7 @@ def maybe_execute_in_parallel(
         event0 (torch.cuda.Event): cuda event for fn0
         event1 (torch.cuda.Event): cuda event for fn1
         aux_stream (Optional[torch.cuda.Stream]): the second cuda stream for fn1.
-            Mutil-stream is disabled when aux_stream is None.
+            Multi-stream is disabled when aux_stream is None.
 
     Returns:
         tuple[Any, Any]: the return values of fn0() and fn1()

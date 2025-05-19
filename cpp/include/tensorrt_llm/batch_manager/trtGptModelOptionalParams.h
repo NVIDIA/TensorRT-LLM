@@ -37,13 +37,14 @@ class TrtGptModelOptionalParams
 public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
+    // 23 parameters, 23 items in initialization list
     explicit TrtGptModelOptionalParams(KvCacheConfig kvCacheConfig = KvCacheConfig{}, bool enableTrtOverlap = false,
         std::optional<std::vector<SizeType32>> deviceIds = std::nullopt, bool normalizeLogProbs = true,
         bool enableChunkedContext = true,
         PeftCacheManagerConfig const& peftCacheManagerConfig = PeftCacheManagerConfig{},
-        executor::DecodingConfig decodingConfig = executor::DecodingConfig{}, float gpuWeightsPercent = 1,
-        std::optional<SizeType32> maxBeamWidth = std::nullopt, std::optional<SizeType32> maxBatchSize = std::nullopt,
-        std::optional<SizeType32> maxNumTokens = std::nullopt,
+        executor::DecodingConfig decodingConfig = executor::DecodingConfig{}, bool useGpuDirectStorage = false,
+        float gpuWeightsPercent = 1, std::optional<SizeType32> maxBeamWidth = std::nullopt,
+        std::optional<SizeType32> maxBatchSize = std::nullopt, std::optional<SizeType32> maxNumTokens = std::nullopt,
         executor::SchedulerConfig schedulerConfig = executor::SchedulerConfig{},
         executor::ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig
         = executor::ExtendedRuntimePerfKnobConfig{},
@@ -53,7 +54,8 @@ public:
         std::optional<executor::GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         bool isLeaderInOrchMode = false,
         std::optional<std::vector<executor::AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
-        bool gatherGenerationLogits = false)
+        std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
+        bool gatherGenerationLogits = false, bool promptTableOffloading = false)
         : kvCacheConfig{std::move(kvCacheConfig)}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(std::move(deviceIds))
@@ -61,6 +63,7 @@ public:
         , enableChunkedContext{enableChunkedContext}
         , peftCacheManagerConfig(peftCacheManagerConfig)
         , decodingConfig(std::move(decodingConfig))
+        , useGpuDirectStorage(useGpuDirectStorage)
         , gpuWeightsPercent(gpuWeightsPercent)
         , maxBeamWidth(maxBeamWidth)
         , maxBatchSize(maxBatchSize)
@@ -73,7 +76,9 @@ public:
         , guidedDecodingConfig{std::move(guidedDecodingConfig)}
         , isLeaderInOrchMode{isLeaderInOrchMode}
         , additionalModelOutputs{std::move(additionalModelOutputs)}
+        , cacheTransceiverConfig{std::move(cacheTransceiverConfig)}
         , gatherGenerationLogits{gatherGenerationLogits}
+        , promptTableOffloading{promptTableOffloading}
     {
         if (guidedDecodingConfig)
         {
@@ -81,18 +86,21 @@ public:
         }
     }
 
+    // 2 parameters, 23 items in initialization list
     explicit TrtGptModelOptionalParams(executor::ExecutorConfig const& executorConfig, bool isLeaderInOrchMode)
-        : TrtGptModelOptionalParams(KvCacheConfig(executorConfig.getKvCacheConfig()), false,
+        : TrtGptModelOptionalParams(KvCacheConfig(executorConfig.getKvCacheConfig()),
+            executorConfig.getEnableTrtOverlap(),
             executorConfig.getParallelConfig().value_or(executor::ParallelConfig()).getDeviceIds(),
             executorConfig.getNormalizeLogProbs(), executorConfig.getEnableChunkedContext(),
             PeftCacheManagerConfig(executorConfig.getPeftCacheConfig().value_or(executor::PeftCacheConfig())),
             executorConfig.getDecodingConfig().value_or(executor::DecodingConfig{}),
-            executorConfig.getGpuWeightsPercent(), executorConfig.getMaxBeamWidth(), executorConfig.getMaxBatchSize(),
-            executorConfig.getMaxNumTokens(), executorConfig.getSchedulerConfig(),
-            executorConfig.getExtendedRuntimePerfKnobConfig(), executorConfig.getDebugConfig(),
-            executorConfig.getMaxSeqIdleMicroseconds(), executorConfig.getSpecDecConfig(),
-            executorConfig.getGuidedDecodingConfig(), isLeaderInOrchMode, executorConfig.getAdditionalModelOutputs(),
-            executorConfig.getGatherGenerationLogits())
+            executorConfig.getUseGpuDirectStorage(), executorConfig.getGpuWeightsPercent(),
+            executorConfig.getMaxBeamWidth(), executorConfig.getMaxBatchSize(), executorConfig.getMaxNumTokens(),
+            executorConfig.getSchedulerConfig(), executorConfig.getExtendedRuntimePerfKnobConfig(),
+            executorConfig.getDebugConfig(), executorConfig.getMaxSeqIdleMicroseconds(),
+            executorConfig.getSpecDecConfig(), executorConfig.getGuidedDecodingConfig(), isLeaderInOrchMode,
+            executorConfig.getAdditionalModelOutputs(), executorConfig.getCacheTransceiverConfig(),
+            executorConfig.getGatherGenerationLogits(), executorConfig.getPromptTableOffloading())
     {
     }
 
@@ -106,6 +114,8 @@ public:
     bool enableChunkedContext;
     PeftCacheManagerConfig peftCacheManagerConfig;
     executor::DecodingConfig decodingConfig;
+    // Use GDS to load the engines?
+    bool useGpuDirectStorage;
     // Percentage of weights on the gpu at runtime
     float gpuWeightsPercent;
     std::optional<SizeType32> maxBeamWidth;
@@ -121,7 +131,10 @@ public:
     // This rank is the leader worker in orchestrator mode
     bool isLeaderInOrchMode;
     std::optional<std::vector<executor::AdditionalModelOutput>> additionalModelOutputs;
+    std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig;
     bool gatherGenerationLogits;
+    // Whether to offload the prompt table to CPU and prefetching to GPU
+    bool promptTableOffloading;
 };
 
 } // namespace tensorrt_llm::batch_manager

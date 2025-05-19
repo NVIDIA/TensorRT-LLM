@@ -25,7 +25,7 @@ The Prompt-Lookup has 3 additional hyperparameters that you need to specify to c
 + `--max_draft_len` must be specified larger or equal to `prompt_lookup_num_tokens`.
 
 ```bash
-cd examples/llama
+cd examples/models/core/llama
 
 python3 convert_checkpoint.py \
     --model_dir=<Path To Llama-v2-13B repo> \
@@ -53,9 +53,9 @@ trtllm-build \
 + `--num_beams` can not be specified as larger than 1 since beam search is not supported in this approach yet.
 
 ```bash
-cd examples/llama
+cd examples/models/core/llama
 
-python3 ../run.py \
+python3 ../../../run.py \
     --tokenizer_dir <Path To Llama-v2-7B repo> \
     --engine_dir ./target-engine \
     --prompt_lookup_config="[10,2,[0]]" \
@@ -67,9 +67,9 @@ python3 ../run.py \
 ## Run summarization tasks
 
 ```bash
-cd examples/llama
+cd examples/models/core/llama
 
-python ../summarize.py \
+python ../../../summarize.py \
     --test_hf \
     --test_trt_llm \
     --check_accuracy \

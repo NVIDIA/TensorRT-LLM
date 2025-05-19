@@ -54,7 +54,7 @@ from utils.llm_data import llm_models_root
                 "model_kwargs": {"num_hidden_layers": 2},
             },
         ),
-        # small llama3.1-8B model with world_size 0 (no processes are spawned)
+        # small llama3.1-8B model with world_size 0 (no processes are spawned) + torch-opt
         (
             0,
             {
@@ -64,7 +64,7 @@ from utils.llm_data import llm_models_root
                 ),
                 "runtime": "demollm",
                 "attn_backend": "TritonWithFlattenedInputs",
-                "compile_backend": "torch-simple",
+                "compile_backend": "torch-opt",
                 "model_kwargs": {"num_hidden_layers": 2},
             },
         ),
@@ -73,4 +73,7 @@ from utils.llm_data import llm_models_root
 def test_build_ad(world_size: Optional[int], config: Dict):
     simple_config = SimpleConfig(**config)
     simple_config.world_size = world_size
+    simple_config.skip_loading_weights = True
+    simple_config.free_mem_ratio = 0.01  # we don't need the cache and it may cause OOM issues
+    print(f"Simple Config: {simple_config}")
     main(simple_config)

@@ -108,7 +108,7 @@ def test_llm_whisper_general(llm_venv, engine_dir, data_type,
     if use_cpp_runtime:
         print("Run inference using Python bindings of C++ runtime...")
         run_cmd = [
-            f'{whisper_example_root}/../run.py',
+            f'{whisper_example_root}/../../../run.py',
             f'--multimodal_input_file={whisper_example_audio_file}',
             f'--engine_dir={whisper_engine_dir}',
             f'--max_output_len=96',

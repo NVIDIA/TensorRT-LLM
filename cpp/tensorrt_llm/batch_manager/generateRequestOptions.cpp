@@ -16,66 +16,162 @@
  */
 
 #include "tensorrt_llm/batch_manager/generateRequestOptions.h"
+#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/utils/logitsThread.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+#include "tensorrt_llm/runtime/decoderState.h"
+#include "tensorrt_llm/runtime/runtimeKernels.h"
 
 #include <NvInferRuntimeBase.h>
-#include <cstddef>
 
 using namespace tensorrt_llm::runtime;
 
+namespace te = tensorrt_llm::executor;
+namespace tr = tensorrt_llm::runtime;
+
 namespace tensorrt_llm::batch_manager
 {
+using SizeType32 = GenerateRequestOptions::SizeType32;
+using TensorPtr = GenerateRequestOptions::TensorPtr;
 
-std::tuple<ITensor::SharedPtr, std::vector<decoder_batch::Request>, std::vector<SamplingConfig>>
+namespace
+{
+
+void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffers& inputBuffers,
+    ITensor& sequenceLengths, SizeType32 beamWidth, runtime::BufferManager const& manager,
+    runtime::CudaStream const& stream)
+{
+    auto const batchSize = contextRequests.size();
+    auto batchSlotsView = tr::ITensor::slice(inputBuffers.setupBatchSlots, 0, batchSize);
+    auto fillValuesView = tr::ITensor::slice(inputBuffers.fillValues, 0, batchSize);
+
+    auto batchSlotsRange = tr::BufferRange<SizeType32>(*batchSlotsView);
+    auto fillValuesRange = tr::BufferRange<SizeType32>(*fillValuesView);
+
+    // fill buffers on host
+    SizeType32 batchIdx{0};
+    for (auto const& llmReq : contextRequests)
+    {
+        auto const currentSequenceLen = llmReq->mPromptLen + llmReq->getMaxNumGeneratedTokens();
+        // Get position of the current sequence in the decoder
+        auto const seqSlot = llmReq->mSeqSlot.value();
+        batchSlotsRange[batchIdx] = seqSlot;
+        fillValuesRange[batchIdx] = currentSequenceLen;
+        ++batchIdx;
+    }
+
+    // copy sequence lengths
+    {
+        auto batchSlotsDeviceView = tr::ITensor::slice(inputBuffers.setupBatchSlotsDevice, 0, batchSize);
+        auto fillValuesViewDevice = tr::ITensor::slice(inputBuffers.fillValuesDevice, 0, batchSize);
+
+        manager.copy(*batchSlotsView, *batchSlotsDeviceView);
+        manager.copy(*fillValuesView, *fillValuesViewDevice);
+        tr::kernels::invokeFillBatch(sequenceLengths, *batchSlotsDeviceView, beamWidth, *fillValuesViewDevice, stream);
+    }
+}
+
+/// @brief Retrieve the embedding bias from the request. This potentially makes a copy of the tensor
+/// to the appropriate type if the input tensor does not match it.
+[[nodiscard]] TensorPtr getEmbeddingBias(nvinfer1::DataType logitsType, TensorPtr const& tensor)
+{
+    // Check that embedding bias type is same as logits type. If so, we can return the tensor right away
+    if (tensor->getDataType() == logitsType)
+    {
+        return tensor;
+    }
+
+    // Support FP32 input for FP16 embedding bias (in the case of FP8 models)
+    if (tensor->getDataType() == nvinfer1::DataType::kFLOAT && logitsType == nvinfer1::DataType::kHALF)
+    {
+        // Do a deep copy of the tensor to the expected type
+        TLLM_LOG_WARNING(
+            "Embedding bias data type must be same as model logits type, will copy the tensor from float to half");
+
+        TLLM_CHECK_WITH_INFO(
+            tensor->getMemoryType() != MemoryType::kGPU, "Embedding bias tensor needs to be in CPU memory for casting");
+
+        auto const shape = tensor->getShape();
+        TLLM_CHECK(shape.nbDims == 2); // [1, vocabSizePadded]
+        TLLM_CHECK(shape.d[0] == 1);
+        auto newTensor = tensorrt_llm::runtime::BufferManager::pinnedPool(shape, logitsType);
+
+        auto const tensorRange = BufferRange<float>(*tensor);
+        auto newTensorRange = BufferRange<half>(*newTensor);
+
+        std::transform(tensorRange.begin(), tensorRange.end(), newTensorRange.begin(),
+            [](float value) -> half { return static_cast<half>(value); });
+
+        return newTensor;
+    }
+
+    TLLM_THROW("Embedding bias data type must be same as model logits type.");
+}
+
+} // namespace
+
+std::tuple<TensorPtr, std::vector<decoder_batch::Request>, std::vector<SamplingConfig>>
 GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
-    executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
-    BufferManager const& bufferManager, nvinfer1::DataType logitsType, DecoderInputBuffers const& inputBuffers,
-    OptionalRef<RuntimeBuffers const> buffers) const
+    te::DecodingConfig const& decodingConfig, RequestVector const& contextRequests, BufferManager const& bufferManager,
+    nvinfer1::DataType logitsType, DecoderInputBuffers& inputBuffers, runtime::decoder::DecoderState& decoderState,
+    SizeType32 beamWidth, runtime::CudaStream const& stream, OptionalRef<RuntimeBuffers const> buffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(GenerateRequestOptions);
 
-    SizeType32 batchSize{0};
-    unsigned decoderInputSize{0};
-    if (!contextRequests.empty())
-    {
-        for (auto const& llmReq : contextRequests)
-        {
-            auto const& reqTokens = llmReq->getTokens(0);
-            if (llmReq->isLastContextChunk())
-            {
-                decoderInputSize += reqTokens.size();
-                ++batchSize;
-            }
-        }
-    }
-    inputBuffers.inputsIds->resize(decoderInputSize);
+    RequestVector finishedContextRequests;
+    std::copy_if(contextRequests.begin(), contextRequests.end(), std::back_inserter(finishedContextRequests),
+        [](auto const& llmReq) { return llmReq->isLastContextChunk(); });
 
-    TensorPtr batchSlotsView = runtime::ITensor::slice(inputBuffers.setupBatchSlots, 0, batchSize);
-    auto batchSlotsRange = BufferRange<SizeType32>(*batchSlotsView);
-    std::vector<decoder_batch::Request> decoderRequests;
-    decoderRequests.reserve(batchSize);
+    copySequenceLengths(
+        finishedContextRequests, inputBuffers, *decoderState.getSequenceLengths(), beamWidth, bufferManager, stream);
+
+    auto decoderRequests = createDecoderRequests(finishedContextRequests, inputBuffers.inputsIds, decodingConfig,
+        bufferManager, logitsType, modelConfig, worldConfig, buffers);
+
+    auto const batchSize = finishedContextRequests.size();
+
     std::vector<SamplingConfig> samplingConfigs;
     samplingConfigs.reserve(batchSize);
-
-    SizeType32 batchIdx{0};
-    SizeType32 inputOffset{0};
-    for (auto const& llmReq : contextRequests)
+    for (auto const& llmReq : finishedContextRequests)
     {
-        if (!llmReq->isLastContextChunk())
-        {
-            continue;
-        }
+        samplingConfigs.push_back(llmReq->mSamplingConfig);
+    }
 
+    TensorPtr batchSlotsView = runtime::ITensor::slice(inputBuffers.setupBatchSlots, 0, batchSize);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    return {std::move(batchSlotsView), std::move(decoderRequests), std::move(samplingConfigs)};
+}
+
+[[nodiscard]] std::vector<runtime::decoder_batch::Request> GenerateRequestOptions::createDecoderRequests(
+    RequestVector const& finishedContextRequests, TensorPtr const& inputIds,
+    executor::DecodingConfig const& decodingConfig, BufferManager const& bufferManager, nvinfer1::DataType logitsType,
+    runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
+    OptionalRef<RuntimeBuffers const> buffers) const
+{
+    unsigned decoderInputSize{0};
+    for (auto const& llmReq : finishedContextRequests)
+    {
+        auto const& reqTokens = llmReq->getTokens(0);
+        decoderInputSize += reqTokens.size();
+    }
+    inputIds->resize(decoderInputSize);
+
+    std::vector<decoder_batch::Request> decoderRequests;
+    decoderRequests.reserve(finishedContextRequests.size());
+
+    SizeType32 inputOffset{0};
+    for (auto const& llmReq : finishedContextRequests)
+    {
         auto const promptLen = llmReq->getPromptLen();
         auto const& reqTokens = llmReq->getTokens(0);
         TLLM_CHECK(reqTokens.size() == static_cast<decltype(reqTokens.size())>(promptLen));
-        TensorPtr inputView = ITensor::slice(inputBuffers.inputsIds, inputOffset, promptLen);
+        TensorPtr inputView = ITensor::slice(inputIds, inputOffset, promptLen);
         bufferManager.copy(reqTokens.data(), *inputView);
 
         auto decoderRequest = decoder_batch::Request{inputView, promptLen, llmReq->mMaxNewTokens, llmReq->mEndId};
@@ -145,16 +241,12 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
                 = bufferManager.copyFrom(*llmReq->getStopWordsList().value(), MemoryType::kGPU);
             decoderRequest.stopWordsList->squeeze(0);
         }
-        batchSlotsRange[batchIdx] = llmReq->mSeqSlot.value();
         decoderRequests.push_back(decoderRequest);
-        samplingConfigs.push_back(llmReq->mSamplingConfig);
 
         inputOffset += promptLen;
-        ++batchIdx;
     }
 
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return {std::move(batchSlotsView), std::move(decoderRequests), std::move(samplingConfigs)};
+    return decoderRequests;
 }
 
 std::shared_ptr<runtime::ITensor> GenerateRequestOptions::retrieveDraftLogits(tr::ModelConfig const& modelConfig,
@@ -171,7 +263,7 @@ std::shared_ptr<runtime::ITensor> GenerateRequestOptions::retrieveDraftLogits(tr
 
     if (mIsLeaderInOrchMode)
     {
-        executor::SpeculativeDecodingFastLogitsInfo fastLogitsInfo;
+        te::SpeculativeDecodingFastLogitsInfo fastLogitsInfo;
         std::memcpy(&fastLogitsInfo, tensor->data(), sizeof(fastLogitsInfo));
         auto logits = utils::targetModelReceiveLogits(fastLogitsInfo, modelConfig).value();
 
@@ -200,41 +292,5 @@ std::shared_ptr<runtime::ITensor> GenerateRequestOptions::retrieveDraftLogits(tr
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return logits;
 };
-
-GenerateRequestOptions::TensorPtr GenerateRequestOptions::getEmbeddingBias(
-    nvinfer1::DataType logitsType, TensorPtr const& tensor) const
-{
-    // Check that embedding bias type is same as logits type. If so, we can return the tensor right away
-    if (tensor->getDataType() == logitsType)
-    {
-        return tensor;
-    }
-
-    // Support FP32 input for FP16 embedding bias (in the case of FP8 models)
-    if (tensor->getDataType() == nvinfer1::DataType::kFLOAT && logitsType == nvinfer1::DataType::kHALF)
-    {
-        // Do a deep copy of the tensor to the expected type
-        TLLM_LOG_WARNING(
-            "Embedding bias data type must be same as model logits type, will copy the tensor from float to half");
-
-        TLLM_CHECK_WITH_INFO(
-            tensor->getMemoryType() != MemoryType::kGPU, "Embedding bias tensor needs to be in CPU memory for casting");
-
-        auto const shape = tensor->getShape();
-        TLLM_CHECK(shape.nbDims == 2); // [1, vocabSizePadded]
-        TLLM_CHECK(shape.d[0] == 1);
-        auto newTensor = tensorrt_llm::runtime::BufferManager::pinnedPool(shape, logitsType);
-
-        auto const tensorRange = BufferRange<float>(*tensor);
-        auto newTensorRange = BufferRange<half>(*newTensor);
-
-        std::transform(tensorRange.begin(), tensorRange.end(), newTensorRange.begin(),
-            [](float value) -> half { return static_cast<half>(value); });
-
-        return newTensor;
-    }
-
-    TLLM_THROW("Embedding bias data type must be same as model logits type.");
-}
 
 } // namespace tensorrt_llm::batch_manager

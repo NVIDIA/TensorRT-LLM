@@ -1,3 +1,4 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
 accelerate>=0.25.0
 build
 colored
@@ -19,18 +20,20 @@ pandas
 h5py==3.12.1
 StrEnum
 sentencepiece>=0.1.99
-tensorrt~=10.9.0
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-03.html#rel-25-03 uses 2.7.0a0.
-torch>=2.6.0,<=2.7.0a0
+tensorrt~=10.10.0
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-04.html#rel-25-04 uses 2.7.0a0.
+torch>=2.7.0a0,<=2.7.0
 torchvision
-nvidia-modelopt[torch]~=0.27.0
+nvidia-modelopt[torch]~=0.29.0
 nvidia-nccl-cu12
 nvidia-cuda-nvrtc-cu12
-transformers==4.51.0
+transformers~=4.51.1
 pydantic>=2.9.1
 pillow==10.3.0
 wheel<=0.45.1
 optimum
+# evaluate needs datasets>=2.0.0 which triggers datasets>3.1.0 which is not stable: https://github.com/huggingface/datasets/issues/7467
+datasets==3.1.0
 evaluate
 mpmath>=1.3.0
 click
@@ -39,8 +42,7 @@ aenum
 pyzmq
 fastapi==0.115.4
 uvicorn
-httpx
-setuptools
+setuptools<80
 ordered-set
 peft
 einops

@@ -112,7 +112,7 @@ cd cpp/build
     Take GPT-350M as an example for 2-GPU inflight batching
     ```
     mpirun -n 2 ./benchmarks/gptManagerBenchmark \
-        --engine_dir ../../examples/gpt/trt_engine/gpt2-ib/fp16/2-gpu/ \
+        --engine_dir ../../examples/models/core/gpt/trt_engine/gpt2-ib/fp16/2-gpu/ \
         --request_rate 10 \
         --dataset ../../benchmarks/cpp/preprocessed_dataset.json \
         --max_num_samples 500
@@ -125,7 +125,7 @@ cd cpp/build
 
     Currently encoder-decoder engines only support `--api executor`, `--type IFB`, `--enable_kv_cache_reuse false`, which are all default values so no specific settings required.
 
-    Prepare t5-small engine from [examples/enc_dec](/examples/enc_dec/README.md#convert-and-split-weights) for the encoder-decoder 4-GPU inflight batching example.
+    Prepare t5-small engine from [examples/models/core/enc_dec](/examples/models/core/enc_dec/README.md#convert-and-split-weights) for the encoder-decoder 4-GPU inflight batching example.
 
     Prepare the dataset suitable for engine input lengths.
     ```
@@ -147,8 +147,8 @@ cd cpp/build
     Run the benchmark
     ```
     mpirun --allow-run-as-root -np 4 ./benchmarks/gptManagerBenchmark \
-        --encoder_engine_dir ../../examples/enc_dec/tmp/trt_engines/t5-small-4gpu/bfloat16/encoder \
-        --decoder_engine_dir ../../examples/enc_dec/tmp/trt_engines/t5-small-4gpu/bfloat16/decoder \
+        --encoder_engine_dir ../../examples/models/core/enc_dec/tmp/trt_engines/t5-small-4gpu/bfloat16/encoder \
+        --decoder_engine_dir ../../examples/models/core/enc_dec/tmp/trt_engines/t5-small-4gpu/bfloat16/decoder \
         --dataset cnn_dailymail.json
     ```
 
@@ -173,7 +173,7 @@ Datasets with fixed input/output lengths for benchmarking can be generated with 
 Take GPT-350M as an example for single GPU with static batching
 ```
 ./benchmarks/gptManagerBenchmark \
-    --engine_dir ../../examples/gpt/trt_engine/gpt2/fp16/1-gpu/ \
+    --engine_dir ../../examples/models/core/gpt/trt_engine/gpt2/fp16/1-gpu/ \
     --request_rate -1 \
     --static_emulated_batch_size 32 \
     --static_emulated_timeout 100 \
@@ -213,7 +213,7 @@ CPP_LORA=chinese-llama-2-lora-13b-cpp
 EG_DIR=/tmp/lora-eg
 
 # Build lora enabled engine
-python examples/llama/convert_checkpoint.py --model_dir ${MODEL_CHECKPOINT} \
+python examples/models/core/llama/convert_checkpoint.py --model_dir ${MODEL_CHECKPOINT} \
                               --output_dir ${CONVERTED_CHECKPOINT} \
                               --dtype ${DTYPE} \
                               --tp_size ${TP} \
@@ -316,35 +316,8 @@ For detailed usage, you can do the following
 cd cpp/build
 
 # You can directly execute the binary for help information
-./benchmarks/gptSessionBenchmark --help
 ./benchmarks/bertBenchmark --help
 ```
-
-Take GPT-350M as an example for single GPU
-
-```
-./benchmarks/gptSessionBenchmark \
-    --engine_dir "../../benchmarks/gpt_350m/" \
-    --batch_size "1" \
-    --input_output_len "60,20"
-
-# Expected output:
-# [BENCHMARK] batch_size 1 input_length 60 output_length 20 latency(ms) 40.81
-```
-Take GPT-175B as an example for multiple GPUs
-```
-mpirun -n 8 ./benchmarks/gptSessionBenchmark \
-    --engine_dir "../../benchmarks/gpt_175b/" \
-    --batch_size "1" \
-    --input_output_len "60,20"
-
-# Expected output:
-# [BENCHMARK] batch_size 1 input_length 60 output_length 20 latency(ms) 792.14
-```
-
-If you want to obtain context and generation logits, you could build an enigne with `--gather_context_logits` and `--gather_generation_logits`, respectively. Enable `--gather_all_token_logits` will enable both of them.
-
-If you want to get the logits, you could run gptSessionBenchmark with `--print_all_logits`. This will print a large number of logit values and has a certain impact on performance.
 
 *Please note that the expected outputs in that document are only for reference, specific performance numbers depend on the GPU you're using.*
 

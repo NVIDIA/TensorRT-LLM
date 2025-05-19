@@ -7,7 +7,6 @@ from typing import (Generic, List, Optional, Protocol, Tuple, Type, TypeVar,
                     Union)
 
 import torch
-from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from typing_extensions import Self
 
 from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
@@ -50,6 +49,7 @@ class AttentionMetadata:
     mapping: Optional[Mapping] = None
 
     enable_flash_mla: bool = False
+    enable_paged_context_mla: bool = False
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
 
@@ -125,7 +125,6 @@ class AttentionMetadata:
     _num_generations: int = field(init=False, default=0, repr=False)
     _num_ctx_tokens: int = field(init=False, default=0, repr=False)
     _num_tokens: int = field(init=False, default=0, repr=False)
-    is_dummy_attention: bool = False
 
     def __post_init__(self) -> None:
         if self.is_cross:
@@ -145,9 +144,9 @@ class AttentionMetadata:
             ).item()
             self._num_generations = self._seq_lens.shape[0] - self.num_contexts
         if self._seq_lens_kv is not None:
-            self._num_tokens = int(self._seq_lens_kv.sum())
+            self._num_tokens = self._seq_lens_kv.sum().item()
         elif self._seq_lens is not None:
-            self._num_tokens = int(self._seq_lens.sum())
+            self._num_tokens = self._seq_lens.sum().item()
 
     @property
     def seq_lens(self) -> Optional[torch.Tensor]:
@@ -163,7 +162,16 @@ class AttentionMetadata:
         # The model executor sets seq_lens to None initially.
         if self._seq_lens is not None:
             self._seq_lens = self._seq_lens.pin_memory()
-            self._seq_lens_cuda = self._seq_lens.cuda(non_blocking=True)
+
+            if self.is_cuda_graph and self._seq_lens_cuda is not None:
+                # Very important: do not reallocate if we are using CUDA graphs.
+                # This copy is safe because the batch size is guaranteed to not
+                # change in the CUDA graph case. The seqlens can change if we
+                # are doing spec decode.
+                self._seq_lens_cuda.copy_(self._seq_lens, non_blocking=True)
+            else:
+                self._seq_lens_cuda = self._seq_lens.cuda(non_blocking=True)
+
         if self.has_cross_sub_metadata:
             self.cross._seq_lens = self._seq_lens
             self.cross._seq_lens_cuda = self._seq_lens_cuda
@@ -268,6 +276,9 @@ class AttentionMetadata:
             cuda_graph_metadata.cross = cuda_graph_metadata.cross.create_cuda_graph_metadata(
                 max_batch_size, True)
         if not sub_cross_metadata:
+            # Set to None to force the cuda graph metadata to allocate a tensor
+            # with the correct batch size. See seq_lens setter for how this works.
+            cuda_graph_metadata._seq_lens_cuda = None
             cuda_graph_metadata.seq_lens = torch.ones(
                 (max_batch_size, ), dtype=torch.int) * (1 + max_draft_tokens)
         if self.is_cross:
@@ -285,9 +296,6 @@ class AttentionMetadata:
                 )
 
         cuda_graph_metadata.num_contexts = 0
-        cuda_graph_metadata.max_num_requests = max_batch_size
-        cuda_graph_metadata.max_num_tokens = max_batch_size * (1 +
-                                                               max_draft_tokens)
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
@@ -383,7 +391,7 @@ class RopeParams:
 
         if self.scale_type == RotaryScalingType.yarn:
             rope_inv_freq = None
-            rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+            _, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
                 self.max_positions,
                 self.dim,
                 self.theta,
@@ -485,6 +493,7 @@ class AttentionBackend(Generic[TMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        skip_create_weights_in_init: bool = False,
         **kwargs,
     ):
         """
@@ -501,6 +510,14 @@ class AttentionBackend(Generic[TMetadata]):
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads or self.num_heads
         self.quant_config = quant_config
+
+    def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
+        """
+        To support mixed quantization mode, self.quant_config can be modified after __init__ is called.
+        Any states or set up related to self.quant_config must be moved to this function, which is called
+        after self.quant_config is reset.
+        """
+        self.quant_config = new_quant_config
 
     def forward(self,
                 q: torch.Tensor,
@@ -527,6 +544,18 @@ class AttentionBackend(Generic[TMetadata]):
         """
         raise NotImplementedError
 
+    @classmethod
+    def support_fused_rope(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_fused_qkv(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_mla(cls) -> bool:
+        return False
+
 
 @dataclass(kw_only=True, unsafe_hash=True)
 class MLAParams:
@@ -536,36 +565,3 @@ class MLAParams:
     qk_nope_head_dim: int = 0
     v_head_dim: int = 0
     predicted_tokens_per_seq: int = 1
-
-
-@torch.library.custom_op("trtllm::attn_dummy_fwd", mutates_args=())
-def dummy_forward(q: torch.Tensor, k: torch.Tensor,
-                  v: torch.Tensor) -> torch.Tensor:
-    """
-    Dummy attention forward function to estimate memory usage.
-    Args:
-        q (torch.Tensor): Query tensor with shape (num_q_tokens, num_heads, head_dim),.
-        k (torch.Tensor): Key tensor with shape (num_new_kv_tokens, num_kv_heads, head_dim)
-        v (torch.Tensor): Value tensor with shape (num_new_kv_tokens, num_kv_heads, head_dim)
-    Returns:
-        torch.Tensor with shape (num_q_tokens, num_heads * head_dim)
-    """
-    head_dim = q.shape[2]
-    assert q.dim() == 3
-    assert k.dim() == 3 and k.size(2) == head_dim
-    assert v.dim() == 3 and v.size(2) == head_dim
-    # This is only for memory estimation for now.
-    # NOTE: this method is not accurate while it works for most scenario.
-    o = _flash_attention_forward(q.unsqueeze(0),
-                                 k.unsqueeze(0),
-                                 v.unsqueeze(0),
-                                 attention_mask=None,
-                                 query_length=q.size(0),
-                                 is_causal=True)
-    return o.reshape(o.size(1), -1)
-
-
-@dummy_forward.register_fake
-def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    num_q_tokens = q.size(0)
-    return torch.empty_like(q).reshape(num_q_tokens, -1)

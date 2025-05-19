@@ -6,13 +6,14 @@ from typing import Dict, Literal, Optional
 import flashinfer
 import torch
 from flashinfer.jit.core import check_cuda_arch
+from typing_extensions import Self
 
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import get_global_attrs, get_model_extra_attrs
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
-                        PredefinedAttentionMask, dummy_forward)
+                        PredefinedAttentionMask)
 
 try:
     check_cuda_arch()
@@ -122,7 +123,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         super().__post_init__()
 
         if self.workspace_buffer is None:
-            self.workspace_buffer = torch.empty(256 * 1024 * 1024,
+            # Note: even though flashinfer only recommends 128 MB, we have to push it
+            # a bit higher to cover all possible CUDA graph cases. If it's too small,
+            # warmup will crash.
+            self.workspace_buffer = torch.empty(320 * 1024 * 1024,
                                                 dtype=torch.uint8,
                                                 device="cuda")
 
@@ -160,6 +164,19 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                                  device='cuda',
                                                  dtype=torch.int)
 
+    def create_cuda_graph_metadata(self,
+                                   max_batch_size: int,
+                                   sub_cross_metadata: bool = False,
+                                   max_draft_tokens: int = 0) -> Self:
+        metadata = super().create_cuda_graph_metadata(max_batch_size,
+                                                      sub_cross_metadata,
+                                                      max_draft_tokens)
+        metadata.max_num_requests = max_batch_size
+        metadata.max_num_tokens = max_batch_size * (1 + max_draft_tokens)
+        # Post init again to make sure all tensors are allocated
+        metadata.__post_init__()
+        return metadata
+
     @property
     def page_size(self) -> int:
         """
@@ -169,9 +186,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
     def prepare(self) -> None:
         extra_attrs = get_model_extra_attrs()
-        if extra_attrs is not None:
-            extra_attrs["attention_metadata"] = weakref.ref(self)
-        else:
+        if extra_attrs is None:
             get_global_attrs().attention_metadata = weakref.ref(self)
         # start and end indices of each sequence in the ragged query
         torch.cumsum(self.seq_lens_cuda,
@@ -183,11 +198,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         assert self.request_ids is not None
         block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
             self.request_ids)
-        paged_kv_indices = torch.tensor(
-            [x for block_ids in block_ids_per_seq for x in block_ids],
-            dtype=torch.int32)
-        self._paged_kv_indices[:paged_kv_indices.size(0)].copy_(
-            paged_kv_indices, non_blocking=True)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -209,13 +219,26 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                              1])
 
         # number of cache blocks used by each sequence in the cache
-        self.num_blocks = [len(block_ids) for block_ids in block_ids_per_seq]
+        # NOTE: do not use len(block_ids) - that will give you a number
+        # that can be too big if using chunked prefill/kv cache reuse
+        # since we allocate all blocks ahead of time.
+        num_blocks = ((kv_lens + self.page_size - 1) // self.page_size)
+        self.num_blocks = num_blocks.tolist()
         self.num_context_blocks = sum(self.num_blocks[:self.num_contexts])
         self.num_generation_blocks = sum(self.num_blocks[self.num_contexts:])
 
+        paged_kv_indices_list = []
+        for i, block_ids in enumerate(block_ids_per_seq):
+            paged_kv_indices_list.extend(block_ids[:self.num_blocks[i]])
+
+        paged_kv_indices = torch.tensor(paged_kv_indices_list,
+                                        dtype=torch.int32)
+
+        self._paged_kv_indices[:paged_kv_indices.size(0)].copy_(
+            paged_kv_indices, non_blocking=True)
+
         # number of tokens in the last cache block used by each sequence
-        paged_kv_last_page_len = kv_lens - (torch.Tensor(
-            self.num_blocks).int().cuda(non_blocking=True) - 1) * self.page_size
+        paged_kv_last_page_len = kv_lens - (num_blocks - 1) * self.page_size
         self._paged_kv_last_page_len[:paged_kv_last_page_len.size(0)].copy_(
             paged_kv_last_page_len, non_blocking=True)
 
@@ -246,12 +269,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                                                paged_kv_indptr_decode
                                                                .size(0)]
         elif self.num_generations == 0:
-            assert not self.is_cuda_graph
             self.paged_kv_indptr = self.paged_kv_indptr_prefill[:
                                                                 paged_kv_indptr_prefill
                                                                 .size(0)]
         else:
-            assert not self.is_cuda_graph
+            assert not self.is_cuda_graph, "Cannot mix decode/prefill with CUDA graphs"
             self.paged_kv_indptr = torch.cumsum(
                 torch.tensor([0] + self.num_blocks, dtype=torch.int32),
                 dtype=torch.int32,
@@ -313,21 +335,24 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 "Make sure you run a few warmup runs before capturing the graph!"
             )
 
-        if not self.is_cuda_graph:
-            if plan_params in self._plan_params_to_wrappers:
-                prefill_wrapper = self._plan_params_to_wrappers[
-                    plan_params].prefill_wrapper
-            else:
-                # flashinfer fa3 backend has accuracy issue in H100 PCIe
-                prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                    self.workspace_buffer, self.kv_layout, backend='fa2')
+        if plan_params in self._plan_params_to_wrappers:
+            prefill_wrapper = self._plan_params_to_wrappers[
+                plan_params].prefill_wrapper
         else:
-            prefill_wrapper = None
+            # flashinfer fa3 backend has accuracy issue in H100 PCIe
+            prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                self.kv_layout,
+                backend='fa2',
+                qo_indptr_buf=self.qo_indptr,
+                paged_kv_indptr_buf=self.paged_kv_indptr_prefill,
+                paged_kv_indices_buf=self._paged_kv_indices,
+                paged_kv_last_page_len_buf=self._paged_kv_last_page_len,
+                use_cuda_graph=self.is_cuda_graph)
 
         is_causal = plan_params.attention_mask_type == AttentionMaskType.causal
 
         def prefill_plan():
-            assert prefill_wrapper is not None, "Prefill not supported w/ CUDA graphs"
             prefill_wrapper.plan(
                 self.qo_indptr[:self.num_contexts + 1],
                 self.paged_kv_indptr_prefill[:self.num_contexts + 1],
@@ -406,16 +431,20 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        skip_create_weights_in_init: bool = False,
         **kwargs,
     ):
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
+        if not skip_create_weights_in_init:
+            self.update_quant_config(self.quant_config)
 
+    def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
+        self.quant_config = new_quant_config
         self.has_fp8_kv_cache = False
-        if quant_config and quant_config.layer_quant_mode.has_any_quant():
-            quant_mode = quant_config.layer_quant_mode
-            if quant_mode.has_fp8_kv_cache():
-                self.has_fp8_kv_cache = True
+        if self.quant_config:
+            self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
+            )
 
     def forward(self,
                 q: torch.Tensor,
@@ -464,14 +493,6 @@ def forward_pattern(
         metadata = metadata_ref() if metadata_ref is not None else None
     else:
         metadata = get_global_attrs().attention_metadata()
-
-    # This is only for memory estimation for now.
-    # NOTE: this method is not accurate while it works for most scenario.
-    if metadata is None or metadata.kv_cache_manager is None:
-        q = q.view(-1, num_heads, head_dim)
-        k = k.view(-1, num_kv_heads, head_dim)
-        v = v.view(-1, num_kv_heads, head_dim)
-        return dummy_forward(q, k, v)
 
     assert isinstance(
         metadata,

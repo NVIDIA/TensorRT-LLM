@@ -337,7 +337,7 @@ def test_llm_request():
     assert llm_request.streaming
     assert llm_request.pad_id == 99
     assert llm_request.end_id == 100
-    assert llm_request.seq_slot == None
+    assert llm_request.seq_slot is None
     assert torch.equal(llm_request.prompt_embedding_table(),
                        kwargs["prompt_embedding_table"])
     assert llm_request.prompt_vocab_size == 2
@@ -434,7 +434,7 @@ def test_trt_gpt_model_optional_params():
     assert opt_params.max_beam_width == 4
 
     assert opt_params.scheduler_config.capacity_scheduler_policy == _tb.executor.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
-    assert opt_params.scheduler_config.context_chunking_policy == None
+    assert opt_params.scheduler_config.context_chunking_policy is None
     opt_params.scheduler_config = _tb.executor.SchedulerConfig(
         _tb.executor.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         _tb.executor.ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
@@ -555,8 +555,10 @@ def test_KvCache_events_binding():
         'max_beam_width':
         1,
         'max_attention_window_vec': [10],
-        'temporary_attention_window':
-        0,
+        'temp_attention_window_inputs':
+        None,
+        'dtype':
+        _tb.DataType.FLOAT,
         'sink_token_length':
         0,
         'stream':

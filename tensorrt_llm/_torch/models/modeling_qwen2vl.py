@@ -312,18 +312,20 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         sampling_params: SamplingParams,
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data, mm_processor_kwargs = inputs.get("prompt"), \
-                        inputs.get("multi_modal_data"), inputs.get("mm_processor_kwargs", {})
+                        inputs.get("multi_modal_data", {}), inputs.get("mm_processor_kwargs", {})
 
         # NOTE: Since we are passed in Tensor images, we don't need to rescale them.
         mm_processor_kwargs['do_rescale'] = False
         processed_inputs = self._preprocess(text_prompt, mm_data,
                                             mm_processor_kwargs).to(self.device)
-
-        mm_features = self._process(
-            processed_inputs.get('pixel_values', None),
-            processed_inputs.get('pixel_values_videos', None),
-            processed_inputs.get('image_grid_thw', None),
-            processed_inputs.get('video_grid_thw', None))
+        if mm_data:
+            mm_features = self._process(
+                processed_inputs.get('pixel_values', None),
+                processed_inputs.get('pixel_values_videos', None),
+                processed_inputs.get('image_grid_thw', None),
+                processed_inputs.get('video_grid_thw', None))
+        else:
+            mm_features = None
 
         input_ids = processed_inputs['input_ids']
 
@@ -336,7 +338,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         fused_input_ids = self._postprocess(input_ids[0])
 
         return fused_input_ids.to(torch.int32).tolist(), {
-            "prompt_tuning_config": [mm_features, None, None],
+            "mm_embedding": mm_features,
             "mrope_config": mrope_config
         }
 
@@ -417,7 +419,8 @@ class Qwen2VLModelBase(PreTrainedModel):
         assert mm_embed == [] or len(
             mm_embed) == num_context_requests, error_msg
 
-        input_ids, input_embeds = fuse_input_embeds(self, input_ids, mm_embed)
+        input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
+                                                    input_ids, mm_embed)
 
         mrope_config = kwargs.get("mrope_config", {})
         if mrope_config:
@@ -437,10 +440,7 @@ class Qwen2VLModelBase(PreTrainedModel):
             inputs_embeds=input_embeds,
             return_context_logits=return_context_logits,
             mrope_config=mrope_config)
-        logger.debug(
-            f"output_ids: {(output_prob if output_prob.dim() == 2 else output_prob.unsqueeze(0)).argmax(dim=1).tolist()}"
-        )
-        logger.info(f'output shape: {output_prob.shape}')
+        logger.debug(f'output shape: {output_prob.shape}')
         return output_prob
 
 

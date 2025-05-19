@@ -15,14 +15,13 @@
 #endif
 
 #include "tensorrt_llm/batch_manager/trtGptModel.h"
-#include "modelSpec.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/trtGptModelInflightBatching.h"
-#include "tensorrt_llm/batch_manager/trtGptModelV1.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
+#include "tensorrt_llm/testing/modelSpec.h"
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -44,7 +43,7 @@ namespace
 auto const TEST_RESOURCE_PATH = fs::path{TOP_LEVEL_DIR} / "cpp/tests/resources";
 auto const ENGINE_PATH = TEST_RESOURCE_PATH / "models/rt_engine";
 auto const GPT_MODEL_PATH = ENGINE_PATH / "gpt2";
-auto const LLAMA_MODEL_PATH = ENGINE_PATH / "llama-7b-hf";
+auto const LLAMA_MODEL_PATH = ENGINE_PATH / "Llama-3.2-1B";
 } // namespace
 
 namespace tensorrt_llm::batch_manager
@@ -245,47 +244,41 @@ TEST_F(TrtGptModelTest, ForwardMaxNewTokens)
     optionalParams.maxBeamWidth = mBeamWidth;
     optionalParams.schedulerConfig = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT};
 
-    auto trtGptModelV1
-        = std::make_shared<TrtGptModelV1>(mLogger, mModelConfig, mWorldConfig, *mRawEngine, optionalParams);
-    auto trtGptModelIfb = std::make_shared<TrtGptModelInflightBatching>(
+    auto trtGptModel = std::make_shared<TrtGptModelInflightBatching>(
         mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
-    std::vector<std::shared_ptr<TrtGptModel>> trtGptModels{trtGptModelV1, trtGptModelIfb};
 
-    for (auto const& trtGptModel : trtGptModels)
+    SamplingConfig inSamplingConfig;
+    inSamplingConfig.temperature = std::vector{2.0f};
+    int correlationId = 0;
+    auto maxNewTokens = 4;
+    auto tokens = std::make_shared<std::vector<int32_t>>(256);
+    std::iota(std::begin(*tokens), std::end(*tokens), 1);
+    auto llmRequest = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false);
+
+    int correlationId2 = 2;
+    auto maxNewTokens2 = 8;
+    auto llmRequest2 = std::make_shared<LlmRequest>(correlationId2, maxNewTokens2, tokens, inSamplingConfig, false);
+
+    RequestList requestList{llmRequest, llmRequest2};
+
+    auto& manager = *mManager;
+    std::vector<bool> finished(mMaxNumRequests, false);
+
+    // Generate one token for the requests in request_table
+    // We call forward twice because the first call doesn't sync with decoder
+    SizeType32 maxNumIterations = 13;
+    forwardRequestsToCompletion(trtGptModel, requestList, maxNumIterations);
+
+    for (auto& request : requestList)
     {
-        SamplingConfig inSamplingConfig;
-        inSamplingConfig.temperature = std::vector{2.0f};
-        int correlationId = 0;
-        auto maxNewTokens = 4;
-        auto tokens = std::make_shared<std::vector<int32_t>>(256);
-        std::iota(std::begin(*tokens), std::end(*tokens), 1);
-        auto llmRequest = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false);
-
-        int correlationId2 = 2;
-        auto maxNewTokens2 = 8;
-        auto llmRequest2 = std::make_shared<LlmRequest>(correlationId2, maxNewTokens2, tokens, inSamplingConfig, false);
-
-        RequestList requestList{llmRequest, llmRequest2};
-
-        auto& manager = *mManager;
-        std::vector<bool> finished(mMaxNumRequests, false);
-
-        // Generate one token for the requests in request_table
-        // We call forward twice because the first call doesn't sync with decoder
-        SizeType32 maxNumIterations = 13;
-        forwardRequestsToCompletion(trtGptModel, requestList, maxNumIterations);
-
-        for (auto& request : requestList)
+        auto outputTokens = request->getTokens(0);
+        if (request->mRequestId == correlationId)
         {
-            auto outputTokens = request->getTokens(0);
-            if (request->mRequestId == correlationId)
-            {
-                EXPECT_EQ(outputTokens.size(), tokens->size() + maxNewTokens);
-            }
-            if (request->mRequestId == correlationId2)
-            {
-                EXPECT_EQ(outputTokens.size(), tokens->size() + maxNewTokens2);
-            }
+            EXPECT_EQ(outputTokens.size(), tokens->size() + maxNewTokens);
+        }
+        if (request->mRequestId == correlationId2)
+        {
+            EXPECT_EQ(outputTokens.size(), tokens->size() + maxNewTokens2);
         }
     }
 }
@@ -352,51 +345,44 @@ TEST_F(TrtGptModelTest, ForwardEndId)
     optionalParams.maxBeamWidth = mBeamWidth;
     optionalParams.schedulerConfig = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT};
 
-    auto trtGptModelV1
-        = std::make_shared<TrtGptModelV1>(mLogger, mModelConfig, mWorldConfig, *mRawEngine, optionalParams);
-    auto trtGptModelIfb = std::make_shared<TrtGptModelInflightBatching>(
+    auto trtGptModel = std::make_shared<TrtGptModelInflightBatching>(
         mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
-    std::vector<std::shared_ptr<TrtGptModel>> trtGptModels{trtGptModelV1, trtGptModelIfb};
 
-    for (auto trtGptModel : trtGptModels)
+    SamplingConfig inSamplingConfig;
+    inSamplingConfig.temperature = std::vector{2.0f};
+    int correlationId = 0;
+    auto maxNewTokens = 4;
+    auto endId = 107;
+    auto tokens = std::make_shared<std::vector<int32_t>>(256);
+    std::iota(std::begin(*tokens), std::end(*tokens), 1);
+    auto llmRequest = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false, endId);
+
+    int correlationId2 = 2;
+    auto maxNewTokens2 = 8;
+    auto llmRequest2
+        = std::make_shared<LlmRequest>(correlationId2, maxNewTokens2, tokens, inSamplingConfig, false, endId);
+
+    RequestList requestList{llmRequest, llmRequest2};
+
+    auto& manager = *mManager;
+    std::vector<bool> finished(mMaxNumRequests, false);
+
+    // Generate one token for the requests in request_table
+    // We call forward twice because the first call doesn't sync with decoder
+    SizeType32 maxNumIterations = 13;
+    forwardRequestsToCompletion(trtGptModel, requestList, maxNumIterations);
+
+    for (auto& request : requestList)
     {
-        SamplingConfig inSamplingConfig;
-        inSamplingConfig.temperature = std::vector{2.0f};
-        int correlationId = 0;
-        auto maxNewTokens = 4;
-        auto endId = 107;
-        auto tokens = std::make_shared<std::vector<int32_t>>(256);
-        std::iota(std::begin(*tokens), std::end(*tokens), 1);
-        auto llmRequest
-            = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false, endId);
-
-        int correlationId2 = 2;
-        auto maxNewTokens2 = 8;
-        auto llmRequest2
-            = std::make_shared<LlmRequest>(correlationId2, maxNewTokens2, tokens, inSamplingConfig, false, endId);
-
-        RequestList requestList{llmRequest, llmRequest2};
-
-        auto& manager = *mManager;
-        std::vector<bool> finished(mMaxNumRequests, false);
-
-        // Generate one token for the requests in request_table
-        // We call forward twice because the first call doesn't sync with decoder
-        SizeType32 maxNumIterations = 13;
-        forwardRequestsToCompletion(trtGptModel, requestList, maxNumIterations);
-
-        for (auto& request : requestList)
+        auto outputTokens = request->getTokens(0);
+        // endId token is generated at 2nd iteration, so expect 1 output token
+        if (request->mRequestId == correlationId)
         {
-            auto outputTokens = request->getTokens(0);
-            // endId token is generated at 2nd iteration, so expect 1 output token
-            if (request->mRequestId == correlationId)
-            {
-                EXPECT_EQ(outputTokens.size(), tokens->size() + 1);
-            }
-            if (request->mRequestId == correlationId2)
-            {
-                EXPECT_EQ(outputTokens.size(), tokens->size() + 1);
-            }
+            EXPECT_EQ(outputTokens.size(), tokens->size() + 1);
+        }
+        if (request->mRequestId == correlationId2)
+        {
+            EXPECT_EQ(outputTokens.size(), tokens->size() + 1);
         }
     }
 }
@@ -409,37 +395,31 @@ TEST_F(TrtGptModelTest, ForwardNoEoS)
     optionalParams.maxBeamWidth = mBeamWidth;
     optionalParams.schedulerConfig = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kSTATIC_BATCH};
 
-    auto trtGptModelV1
-        = std::make_shared<TrtGptModelV1>(mLogger, mModelConfig, mWorldConfig, *mRawEngine, optionalParams);
-    auto trtGptModelIfb = std::make_shared<TrtGptModelInflightBatching>(
+    auto trtGptModel = std::make_shared<TrtGptModelInflightBatching>(
         mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
-    std::vector<std::shared_ptr<TrtGptModel>> trtGptModels{trtGptModelV1, trtGptModelIfb};
 
-    for (auto trtGptModel : trtGptModels)
+    SamplingConfig inSamplingConfig;
+    inSamplingConfig.topP = {0.9};
+    inSamplingConfig.temperature = {0.6};
+    inSamplingConfig.minLength = {5};
+
+    auto tokens = std::make_shared<std::vector<int32_t>>(256);
+    std::iota(std::begin(*tokens), std::end(*tokens), 1);
+
+    RequestList requestList;
+    for (auto requestIdx = 0; requestIdx < mMaxNumRequests; requestIdx++)
     {
-        SamplingConfig inSamplingConfig;
-        inSamplingConfig.topP = {0.9};
-        inSamplingConfig.temperature = {0.6};
-        inSamplingConfig.minLength = {5};
-
-        auto tokens = std::make_shared<std::vector<int32_t>>(256);
-        std::iota(std::begin(*tokens), std::end(*tokens), 1);
-
-        RequestList requestList;
-        for (auto requestIdx = 0; requestIdx < mMaxNumRequests; requestIdx++)
-        {
-            auto llmRequest = std::make_shared<LlmRequest>(requestIdx, 8, tokens, inSamplingConfig, false, -1);
-            requestList.push_back(llmRequest);
-        }
-
-        auto& manager = *mManager;
-        std::vector<bool> finished(mMaxNumRequests, false);
-
-        // Generate one token for the requests in request_table
-        // We call forward twice because the first call doesn't sync with decoder
-        SizeType32 maxNumIterations = 13;
-        forwardRequestsToCompletion(trtGptModel, requestList, maxNumIterations);
+        auto llmRequest = std::make_shared<LlmRequest>(requestIdx, 8, tokens, inSamplingConfig, false, -1);
+        requestList.push_back(llmRequest);
     }
+
+    auto& manager = *mManager;
+    std::vector<bool> finished(mMaxNumRequests, false);
+
+    // Generate one token for the requests in request_table
+    // We call forward twice because the first call doesn't sync with decoder
+    SizeType32 maxNumIterations = 13;
+    forwardRequestsToCompletion(trtGptModel, requestList, maxNumIterations);
 }
 
 TEST_F(TrtGptModelTest, ForwardFinished)
@@ -510,134 +490,126 @@ TEST_F(TrtGptModelTest, ForwardStopWords)
     optionalParams.maxBeamWidth = mBeamWidth;
     optionalParams.schedulerConfig = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT};
 
-    auto trtGptModelIfb = std::make_shared<TrtGptModelInflightBatching>(
+    auto trtGptModel = std::make_shared<TrtGptModelInflightBatching>(
         mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
-    auto trtGptModelV1
-        = std::make_shared<TrtGptModelV1>(mLogger, mModelConfig, mWorldConfig, *mRawEngine, optionalParams);
 
-    std::vector<std::shared_ptr<TrtGptModel>> trtGptModels{trtGptModelV1, trtGptModelIfb};
+    SamplingConfig inSamplingConfig;
+    inSamplingConfig.temperature = std::vector{2.0f};
+    int correlationId = 0;
+    auto maxNewTokens = 4;
+    auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{10, 9, 8, 7, 6});
+    std::optional<SizeType32> endId(std::nullopt);
+    std::optional<SizeType32> padId(std::nullopt);
+    std::optional<TensorPtr> embeddingBias(std::nullopt);
+    std::optional<TensorPtr> badWordsList(std::nullopt);
 
-    for (auto& trtGptModel : trtGptModels)
+    auto& manager = *mManager;
+    // No stop words
     {
-        SamplingConfig inSamplingConfig;
-        inSamplingConfig.temperature = std::vector{2.0f};
-        int correlationId = 0;
-        auto maxNewTokens = 4;
-        auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{10, 9, 8, 7, 6});
-        std::optional<SizeType32> endId(std::nullopt);
-        std::optional<SizeType32> padId(std::nullopt);
-        std::optional<TensorPtr> embeddingBias(std::nullopt);
-        std::optional<TensorPtr> badWordsList(std::nullopt);
+        auto llmRequest = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false);
+        RequestList requestList{llmRequest};
+        trtGptModel->forwardAsync(requestList);
+        trtGptModel->forwardSync();
+        trtGptModel->forwardAsync(requestList);
+        trtGptModel->forwardSync();
+        trtGptModel->forwardAsync(requestList);
+        trtGptModel->forwardSync();
+        trtGptModel->forwardAsync(requestList);
+        trtGptModel->forwardSync();
+        EXPECT_EQ(requestList.front()->getState(), LlmRequestState::kGENERATION_COMPLETE);
+        EXPECT_THAT(requestList.front()->getTokens(0), ElementsAre(10, 9, 8, 7, 6, 10, 6, 10, 6));
+    }
+    // With stop words
+    {
+        TensorPtr stopWordsList = manager.cpu(ITensor::makeShape({1, 2, 3}), nvinfer1::DataType::kINT32);
+        auto stopWordsPtr = bufferCast<int32_t>(*stopWordsList);
+        // make 10, 6 10 the tokens for the stop word:
+        stopWordsPtr[0] = 10;
+        stopWordsPtr[1] = 6;
+        stopWordsPtr[2] = 10;
+        stopWordsPtr[3] = 3;
+        stopWordsPtr[4] = -1;
+        stopWordsPtr[5] = -1;
 
-        auto& manager = *mManager;
-        // No stop words
+        auto llmRequest = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false,
+            endId, padId, embeddingBias, badWordsList, stopWordsList);
+        RequestList requestList{llmRequest};
+        trtGptModel->forwardAsync(requestList);
+        trtGptModel->forwardSync();
+        trtGptModel->forwardAsync(requestList);
+        trtGptModel->forwardSync();
+        trtGptModel->forwardAsync(requestList);
+        trtGptModel->forwardSync();
+        EXPECT_EQ(requestList.front()->getState(), LlmRequestState::kGENERATION_COMPLETE);
+        EXPECT_THAT(requestList.front()->getTokens(0), ElementsAre(10, 9, 8, 7, 6, 10, 6, 10));
+    }
+
+    // With stop words
+    {
+        TensorPtr stopWordsList = manager.cpu(ITensor::makeShape({1, 2, 1}), nvinfer1::DataType::kINT32);
+        auto stopWordsPtr = bufferCast<int32_t>(*stopWordsList);
+        // make 10 is the token for the stop word:
+        stopWordsPtr[0] = 10;
+        stopWordsPtr[1] = 1;
+
+        auto llmRequest = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false,
+            endId, padId, embeddingBias, badWordsList, stopWordsList);
+        RequestList requestList{llmRequest};
+        trtGptModel->forwardAsync(requestList);
+        trtGptModel->forwardSync();
+        EXPECT_EQ(requestList.front()->getState(), LlmRequestState::kGENERATION_COMPLETE);
+        EXPECT_THAT(requestList.front()->getTokens(0), ElementsAre(10, 9, 8, 7, 6, 10));
+    }
+
+    // Multiple requests, each with different stop words
+    {
+        // Request w/o stop words
+        auto llmRequest = std::make_shared<LlmRequest>(1, maxNewTokens, tokens, inSamplingConfig, false);
+
+        TensorPtr stopWordsList2 = manager.cpu(ITensor::makeShape({1, 2, 1}), nvinfer1::DataType::kINT32);
         {
-            auto llmRequest
-                = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false);
-            RequestList requestList{llmRequest};
-            trtGptModel->forwardAsync(requestList);
-            trtGptModel->forwardSync();
-            trtGptModel->forwardAsync(requestList);
-            trtGptModel->forwardSync();
-            trtGptModel->forwardAsync(requestList);
-            trtGptModel->forwardSync();
-            trtGptModel->forwardAsync(requestList);
-            trtGptModel->forwardSync();
-            EXPECT_EQ(requestList.front()->getState(), LlmRequestState::kGENERATION_COMPLETE);
-            EXPECT_THAT(requestList.front()->getTokens(0), ElementsAre(10, 9, 8, 7, 6, 10, 6, 10, 6));
+            auto stopWordsPtr = bufferCast<int32_t>(*stopWordsList2);
+            stopWordsPtr[0] = 10;
+            stopWordsPtr[1] = 1;
         }
-        // With stop words
+        auto llmRequest2 = std::make_shared<LlmRequest>(2, maxNewTokens, tokens, inSamplingConfig, false, endId, padId,
+            embeddingBias, badWordsList, stopWordsList2);
+
+        TensorPtr stopWordsList3 = manager.cpu(ITensor::makeShape({1, 2, 3}), nvinfer1::DataType::kINT32);
         {
-            TensorPtr stopWordsList = manager.cpu(ITensor::makeShape({1, 2, 3}), nvinfer1::DataType::kINT32);
-            auto stopWordsPtr = bufferCast<int32_t>(*stopWordsList);
-            // make 10, 6 10 the tokens for the stop word:
+            auto stopWordsPtr = bufferCast<int32_t>(*stopWordsList3);
             stopWordsPtr[0] = 10;
             stopWordsPtr[1] = 6;
             stopWordsPtr[2] = 10;
             stopWordsPtr[3] = 3;
             stopWordsPtr[4] = -1;
             stopWordsPtr[5] = -1;
-
-            auto llmRequest = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false,
-                endId, padId, embeddingBias, badWordsList, stopWordsList);
-            RequestList requestList{llmRequest};
-            trtGptModel->forwardAsync(requestList);
-            trtGptModel->forwardSync();
-            trtGptModel->forwardAsync(requestList);
-            trtGptModel->forwardSync();
-            trtGptModel->forwardAsync(requestList);
-            trtGptModel->forwardSync();
-            EXPECT_EQ(requestList.front()->getState(), LlmRequestState::kGENERATION_COMPLETE);
-            EXPECT_THAT(requestList.front()->getTokens(0), ElementsAre(10, 9, 8, 7, 6, 10, 6, 10));
         }
+        auto llmRequest3 = std::make_shared<LlmRequest>(3, maxNewTokens, tokens, inSamplingConfig, false, endId, padId,
+            embeddingBias, badWordsList, stopWordsList3);
 
-        // With stop words
+        RequestList requestList{llmRequest, llmRequest2, llmRequest3};
+
+        SizeType32 maxNumIterations(5);
+        forwardRequestsToCompletion(trtGptModel, requestList, maxNumIterations);
+
+        for (auto& request : requestList)
         {
-            TensorPtr stopWordsList = manager.cpu(ITensor::makeShape({1, 2, 1}), nvinfer1::DataType::kINT32);
-            auto stopWordsPtr = bufferCast<int32_t>(*stopWordsList);
-            // make 10 is the token for the stop word:
-            stopWordsPtr[0] = 10;
-            stopWordsPtr[1] = 1;
-
-            auto llmRequest = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false,
-                endId, padId, embeddingBias, badWordsList, stopWordsList);
-            RequestList requestList{llmRequest};
-            trtGptModel->forwardAsync(requestList);
-            trtGptModel->forwardSync();
-            EXPECT_EQ(requestList.front()->getState(), LlmRequestState::kGENERATION_COMPLETE);
-            EXPECT_THAT(requestList.front()->getTokens(0), ElementsAre(10, 9, 8, 7, 6, 10));
-        }
-
-        // Multiple requests, each with different stop words
-        {
-            // Request w/o stop words
-            auto llmRequest = std::make_shared<LlmRequest>(1, maxNewTokens, tokens, inSamplingConfig, false);
-
-            TensorPtr stopWordsList2 = manager.cpu(ITensor::makeShape({1, 2, 1}), nvinfer1::DataType::kINT32);
+            auto outputTokens = request->getTokens(0);
+            if (request->mRequestId == 1)
             {
-                auto stopWordsPtr = bufferCast<int32_t>(*stopWordsList2);
-                stopWordsPtr[0] = 10;
-                stopWordsPtr[1] = 1;
+                EXPECT_EQ(outputTokens.size(), tokens->size() + maxNewTokens);
+                EXPECT_THAT(request->getTokens(0), ElementsAre(10, 9, 8, 7, 6, 10, 6, 10, 6));
             }
-            auto llmRequest2 = std::make_shared<LlmRequest>(2, maxNewTokens, tokens, inSamplingConfig, false, endId,
-                padId, embeddingBias, badWordsList, stopWordsList2);
-
-            TensorPtr stopWordsList3 = manager.cpu(ITensor::makeShape({1, 2, 3}), nvinfer1::DataType::kINT32);
+            if (request->mRequestId == 2)
             {
-                auto stopWordsPtr = bufferCast<int32_t>(*stopWordsList3);
-                stopWordsPtr[0] = 10;
-                stopWordsPtr[1] = 6;
-                stopWordsPtr[2] = 10;
-                stopWordsPtr[3] = 3;
-                stopWordsPtr[4] = -1;
-                stopWordsPtr[5] = -1;
+                EXPECT_EQ(outputTokens.size(), tokens->size() + 1);
+                EXPECT_THAT(request->getTokens(0), ElementsAre(10, 9, 8, 7, 6, 10));
             }
-            auto llmRequest3 = std::make_shared<LlmRequest>(3, maxNewTokens, tokens, inSamplingConfig, false, endId,
-                padId, embeddingBias, badWordsList, stopWordsList3);
-
-            RequestList requestList{llmRequest, llmRequest2, llmRequest3};
-
-            SizeType32 maxNumIterations(5);
-            forwardRequestsToCompletion(trtGptModel, requestList, maxNumIterations);
-
-            for (auto& request : requestList)
+            if (request->mRequestId == 3)
             {
-                auto outputTokens = request->getTokens(0);
-                if (request->mRequestId == 1)
-                {
-                    EXPECT_EQ(outputTokens.size(), tokens->size() + maxNewTokens);
-                    EXPECT_THAT(request->getTokens(0), ElementsAre(10, 9, 8, 7, 6, 10, 6, 10, 6));
-                }
-                if (request->mRequestId == 2)
-                {
-                    EXPECT_EQ(outputTokens.size(), tokens->size() + 1);
-                    EXPECT_THAT(request->getTokens(0), ElementsAre(10, 9, 8, 7, 6, 10));
-                }
-                if (request->mRequestId == 3)
-                {
-                    EXPECT_EQ(outputTokens.size(), tokens->size() + 3);
-                    EXPECT_THAT(request->getTokens(0), ElementsAre(10, 9, 8, 7, 6, 10, 6, 10));
-                }
+                EXPECT_EQ(outputTokens.size(), tokens->size() + 3);
+                EXPECT_THAT(request->getTokens(0), ElementsAre(10, 9, 8, 7, 6, 10, 6, 10));
             }
         }
     }
@@ -651,126 +623,118 @@ TEST_F(TrtGptModelTest, ForwardBadWords)
     optionalParams.maxBeamWidth = mBeamWidth;
     optionalParams.schedulerConfig = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT};
 
-    auto trtGptModelIfb = std::make_shared<TrtGptModelInflightBatching>(
+    auto trtGptModel = std::make_shared<TrtGptModelInflightBatching>(
         mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
-    auto trtGptModelV1
-        = std::make_shared<TrtGptModelV1>(mLogger, mModelConfig, mWorldConfig, *mRawEngine, optionalParams);
 
-    std::vector<std::shared_ptr<TrtGptModel>> trtGptModels{trtGptModelV1, trtGptModelIfb};
+    SamplingConfig inSamplingConfig;
+    inSamplingConfig.temperature = std::vector{2.0f};
+    int correlationId = 0;
+    auto maxNewTokens = 4;
+    auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{10, 9, 8, 7, 6});
+    std::optional<SizeType32> endId(std::nullopt);
+    std::optional<SizeType32> padId(std::nullopt);
+    std::optional<TensorPtr> embeddingBias(std::nullopt);
+    std::optional<TensorPtr> stopWordsList(std::nullopt);
 
-    for (auto& trtGptModel : trtGptModels)
+    auto& manager = *mManager;
+    // No bad words
     {
-        SamplingConfig inSamplingConfig;
-        inSamplingConfig.temperature = std::vector{2.0f};
-        int correlationId = 0;
-        auto maxNewTokens = 4;
-        auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{10, 9, 8, 7, 6});
-        std::optional<SizeType32> endId(std::nullopt);
-        std::optional<SizeType32> padId(std::nullopt);
-        std::optional<TensorPtr> embeddingBias(std::nullopt);
-        std::optional<TensorPtr> stopWordsList(std::nullopt);
+        auto llmRequest = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false);
+        RequestList requestList{llmRequest};
 
-        auto& manager = *mManager;
-        // No bad words
+        SizeType32 maxNumIterations = 5;
+        forwardRequestsToCompletion(trtGptModel, requestList, maxNumIterations);
+        EXPECT_EQ(requestList.front()->getState(), LlmRequestState::kGENERATION_COMPLETE);
+        EXPECT_THAT(requestList.front()->getTokens(0), ElementsAre(10, 9, 8, 7, 6, 10, 6, 10, 6));
+    }
+    // With bad words, multiple tokens
+    {
+        TensorPtr badWordsList = manager.cpu(ITensor::makeShape({1, 2, 3}), nvinfer1::DataType::kINT32);
+        auto badWordsPtr = bufferCast<int32_t>(*badWordsList);
+        // make 10, 6 10 the tokens for the bad word:
+        badWordsPtr[0] = 10;
+        badWordsPtr[1] = 6;
+        badWordsPtr[2] = 10;
+        badWordsPtr[3] = 3;
+        badWordsPtr[4] = -1;
+        badWordsPtr[5] = -1;
+
+        auto llmRequest = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false,
+            endId, padId, embeddingBias, badWordsList, stopWordsList);
+        RequestList requestList{llmRequest};
+        SizeType32 maxNumIterations = 5;
+        forwardRequestsToCompletion(trtGptModel, requestList, maxNumIterations);
+        EXPECT_EQ(requestList.front()->getState(), LlmRequestState::kGENERATION_COMPLETE);
+        // Token at position 7 should be different than 10
+        EXPECT_NE(requestList.front()->getTokens(0).at(7), 10);
+    }
+
+    // With bad words single token
+    {
+        TensorPtr badWordsList = manager.cpu(ITensor::makeShape({1, 2, 1}), nvinfer1::DataType::kINT32);
+        auto badWordsPtr = bufferCast<int32_t>(*badWordsList);
+        // make 10 is the token for the bad word:
+        badWordsPtr[0] = 10;
+        badWordsPtr[1] = 1;
+
+        auto llmRequest = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false,
+            endId, padId, embeddingBias, badWordsList, stopWordsList);
+        RequestList requestList{llmRequest};
+        SizeType32 maxNumIterations = 5;
+        forwardRequestsToCompletion(trtGptModel, requestList, maxNumIterations);
+        EXPECT_EQ(requestList.front()->getState(), LlmRequestState::kGENERATION_COMPLETE);
+        EXPECT_NE(requestList.front()->getTokens(0).at(5), 10);
+    }
+
+    // Multiple requests, each with different bad words
+    {
+        // Request w/o bad words
+        auto llmRequest = std::make_shared<LlmRequest>(1, maxNewTokens, tokens, inSamplingConfig, false);
+
+        TensorPtr badWordsList2 = manager.cpu(ITensor::makeShape({1, 2, 1}), nvinfer1::DataType::kINT32);
         {
-            auto llmRequest
-                = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false);
-            RequestList requestList{llmRequest};
-
-            SizeType32 maxNumIterations = 5;
-            forwardRequestsToCompletion(trtGptModel, requestList, maxNumIterations);
-            EXPECT_EQ(requestList.front()->getState(), LlmRequestState::kGENERATION_COMPLETE);
-            EXPECT_THAT(requestList.front()->getTokens(0), ElementsAre(10, 9, 8, 7, 6, 10, 6, 10, 6));
+            auto badWordsPtr = bufferCast<int32_t>(*badWordsList2);
+            badWordsPtr[0] = 10;
+            badWordsPtr[1] = 1;
         }
-        // With bad words, multiple tokens
+        auto llmRequest2 = std::make_shared<LlmRequest>(2, maxNewTokens, tokens, inSamplingConfig, false, endId, padId,
+            embeddingBias, badWordsList2, stopWordsList);
+
+        TensorPtr badWordsList3 = manager.cpu(ITensor::makeShape({1, 2, 3}), nvinfer1::DataType::kINT32);
         {
-            TensorPtr badWordsList = manager.cpu(ITensor::makeShape({1, 2, 3}), nvinfer1::DataType::kINT32);
-            auto badWordsPtr = bufferCast<int32_t>(*badWordsList);
-            // make 10, 6 10 the tokens for the bad word:
+            auto badWordsPtr = bufferCast<int32_t>(*badWordsList3);
             badWordsPtr[0] = 10;
             badWordsPtr[1] = 6;
             badWordsPtr[2] = 10;
             badWordsPtr[3] = 3;
             badWordsPtr[4] = -1;
             badWordsPtr[5] = -1;
-
-            auto llmRequest = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false,
-                endId, padId, embeddingBias, badWordsList, stopWordsList);
-            RequestList requestList{llmRequest};
-            SizeType32 maxNumIterations = 5;
-            forwardRequestsToCompletion(trtGptModel, requestList, maxNumIterations);
-            EXPECT_EQ(requestList.front()->getState(), LlmRequestState::kGENERATION_COMPLETE);
-            // Token at position 7 should be different than 10
-            EXPECT_NE(requestList.front()->getTokens(0).at(7), 10);
         }
+        auto llmRequest3 = std::make_shared<LlmRequest>(3, maxNewTokens, tokens, inSamplingConfig, false, endId, padId,
+            embeddingBias, badWordsList3, stopWordsList);
 
-        // With bad words single token
+        RequestList requestList{llmRequest, llmRequest2, llmRequest3};
+
+        SizeType32 maxNumIterations(6);
+        forwardRequestsToCompletion(trtGptModel, requestList, maxNumIterations);
+
+        for (auto& request : requestList)
         {
-            TensorPtr badWordsList = manager.cpu(ITensor::makeShape({1, 2, 1}), nvinfer1::DataType::kINT32);
-            auto badWordsPtr = bufferCast<int32_t>(*badWordsList);
-            // make 10 is the token for the bad word:
-            badWordsPtr[0] = 10;
-            badWordsPtr[1] = 1;
-
-            auto llmRequest = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false,
-                endId, padId, embeddingBias, badWordsList, stopWordsList);
-            RequestList requestList{llmRequest};
-            SizeType32 maxNumIterations = 5;
-            forwardRequestsToCompletion(trtGptModel, requestList, maxNumIterations);
-            EXPECT_EQ(requestList.front()->getState(), LlmRequestState::kGENERATION_COMPLETE);
-            EXPECT_NE(requestList.front()->getTokens(0).at(5), 10);
-        }
-
-        // Multiple requests, each with different bad words
-        {
-            // Request w/o bad words
-            auto llmRequest = std::make_shared<LlmRequest>(1, maxNewTokens, tokens, inSamplingConfig, false);
-
-            TensorPtr badWordsList2 = manager.cpu(ITensor::makeShape({1, 2, 1}), nvinfer1::DataType::kINT32);
+            auto outputTokens = request->getTokens(0);
+            if (request->mRequestId == 1)
             {
-                auto badWordsPtr = bufferCast<int32_t>(*badWordsList2);
-                badWordsPtr[0] = 10;
-                badWordsPtr[1] = 1;
+                EXPECT_EQ(outputTokens.size(), tokens->size() + maxNewTokens);
+                EXPECT_THAT(request->getTokens(0), ElementsAre(10, 9, 8, 7, 6, 10, 6, 10, 6));
             }
-            auto llmRequest2 = std::make_shared<LlmRequest>(2, maxNewTokens, tokens, inSamplingConfig, false, endId,
-                padId, embeddingBias, badWordsList2, stopWordsList);
-
-            TensorPtr badWordsList3 = manager.cpu(ITensor::makeShape({1, 2, 3}), nvinfer1::DataType::kINT32);
+            if (request->mRequestId == 2)
             {
-                auto badWordsPtr = bufferCast<int32_t>(*badWordsList3);
-                badWordsPtr[0] = 10;
-                badWordsPtr[1] = 6;
-                badWordsPtr[2] = 10;
-                badWordsPtr[3] = 3;
-                badWordsPtr[4] = -1;
-                badWordsPtr[5] = -1;
+                EXPECT_EQ(outputTokens.size(), tokens->size() + maxNewTokens);
+                EXPECT_NE(request->getTokens(0).at(5), 10);
             }
-            auto llmRequest3 = std::make_shared<LlmRequest>(3, maxNewTokens, tokens, inSamplingConfig, false, endId,
-                padId, embeddingBias, badWordsList3, stopWordsList);
-
-            RequestList requestList{llmRequest, llmRequest2, llmRequest3};
-
-            SizeType32 maxNumIterations(6);
-            forwardRequestsToCompletion(trtGptModel, requestList, maxNumIterations);
-
-            for (auto& request : requestList)
+            if (request->mRequestId == 3)
             {
-                auto outputTokens = request->getTokens(0);
-                if (request->mRequestId == 1)
-                {
-                    EXPECT_EQ(outputTokens.size(), tokens->size() + maxNewTokens);
-                    EXPECT_THAT(request->getTokens(0), ElementsAre(10, 9, 8, 7, 6, 10, 6, 10, 6));
-                }
-                if (request->mRequestId == 2)
-                {
-                    EXPECT_EQ(outputTokens.size(), tokens->size() + maxNewTokens);
-                    EXPECT_NE(request->getTokens(0).at(5), 10);
-                }
-                if (request->mRequestId == 3)
-                {
-                    EXPECT_EQ(outputTokens.size(), tokens->size() + maxNewTokens);
-                    EXPECT_NE(request->getTokens(0).at(7), 10);
-                }
+                EXPECT_EQ(outputTokens.size(), tokens->size() + maxNewTokens);
+                EXPECT_NE(request->getTokens(0).at(7), 10);
             }
         }
     }
@@ -966,8 +930,8 @@ TEST_F(TrtGptModelTest, PauseRequestStats)
     auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{1, 2, 3, 4});
     auto llmRequest = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false,
-        false, std::nullopt, std::nullopt, false, std::nullopt, false, std::nullopt, false, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        false, false, false, std::nullopt, std::nullopt, false, std::nullopt, false, std::nullopt, false, std::nullopt,
         executor::Request::kDefaultPriority, std::nullopt, std::nullopt, std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, 1, std::nullopt, std::nullopt,
         true /* returnPerfMetrics */);

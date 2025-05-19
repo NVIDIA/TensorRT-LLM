@@ -18,8 +18,9 @@ l0_a10:
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-MAX_UTILIZATION-pytorch-stress-test]
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-GUARANTEED_NO_EVICT-pytorch-stress-stage-alone]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-pytorch-stress-test]
+  - test_e2e.py::test_openai_chat_structural_tag_example
 - condition:
     ranges:
       system_gpu_count:
@@ -34,11 +35,11 @@ l0_a10:
       backend: cpp
   tests:
   # ------------- CPP tests ---------------
-  - test_cpp.py::test_model[medusa-86]
-  - test_cpp.py::test_model[redrafter-86]
-  - test_cpp.py::test_model[mamba-86]
-  - test_cpp.py::test_model[recurrentgemma-86]
-  - test_cpp.py::test_model[eagle-86]
+  - cpp/test_e2e.py::test_model[-medusa-86]
+  - cpp/test_e2e.py::test_model[-redrafter-86]
+  - cpp/test_e2e.py::test_model[-mamba-86]
+  - cpp/test_e2e.py::test_model[-recurrentgemma-86]
+  - cpp/test_e2e.py::test_model[-eagle-86]
 - condition:
     ranges:
       system_gpu_count:
@@ -62,46 +63,49 @@ l0_a10:
   - unittest/trt/model/test_mistral.py
   - unittest/trt/model/test_llama.py
   - test_e2e.py::test_gpt3_175b_1layers_build_only # 6 mins
-  - test_e2e.py::test_llmapi_load_engine_from_build_command[llama-llama-models/llama-7b-hf] # 5min
-  - test_e2e.py::test_llmapi_build_command_parameters_align[llama-llama-models-v2/TinyLlama-1.1B-Chat-v1.0]
-  - test_e2e.py::test_llmapi_load_engine_from_build_command_with_lora[llama-llama-models-v2/llama-v2-7b-hf]
-  - test_e2e.py::test_llmapi_example_quantization
-  - test_e2e.py::test_llmapi_chat_example
-  - test_e2e.py::test_llmapi_exit
-  - test_e2e.py::test_llmapi_server_example
+  - llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command[llama-llama-models/llama-7b-hf] # 5min
+  - llmapi/test_llm_e2e.py::test_llmapi_build_command_parameters_align[llama-llama-models-v2/TinyLlama-1.1B-Chat-v1.0]
+  - llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command_with_lora[llama-llama-models-v2/llama-v2-7b-hf]
+  - llmapi/test_llm_examples.py::test_llmapi_example_quantization
+  - llmapi/test_llm_examples.py::test_llmapi_chat_example
+  - llmapi/test_llm_e2e.py::test_llmapi_exit
+  - llmapi/test_llm_examples.py::test_llmapi_server_example
   - test_e2e.py::test_trtllm_serve_example
+  - test_e2e.py::test_trtllm_serve_multimodal_example
   - test_e2e.py::test_openai_misc_example
   - test_e2e.py::test_openai_completions_example
   - test_e2e.py::test_openai_chat_example
-  - test_e2e.py::test_trtllm_bench_sanity[non-streaming-FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
+  - test_e2e.py::test_openai_reasoning
+  - test_e2e.py::test_openai_chat_multimodal_example
+  - test_e2e.py::test_trtllm_bench_sanity[--non-streaming-FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_latency_sanity[FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
-  - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency]
+  - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
   - unittest/trt/quantization # 18 mins
   - accuracy/test_cli_flow.py::TestLlama7B::test_streamingllm # 2 mins
   - unittest/trt/functional # 37 mins
   - test_cache.py::test_cache_sanity # 1 sec
-  - test_e2e.py::test_llmapi_quickstart_atexit
+  - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
   - unittest/api_stability
   - unittest/bindings
   - unittest/test_model_runner_cpp.py
-  - unittest/llmapi/test_llm_perf_evaluator.py
   - unittest/llmapi/test_build_cache.py
   - unittest/llmapi/test_llm_utils.py
   - accuracy/test_cli_flow.py::TestGpt2::test_auto_dtype # 1 min
   - accuracy/test_cli_flow.py::TestGpt2::test_beam_search # 1 min
   - accuracy/test_cli_flow.py::TestGpt2::test_beam_search_large # 6 mins
+  - accuracy/test_cli_flow.py::TestGpt2::test_variable_beam_width_search # 1 mins
   - accuracy/test_cli_flow.py::TestGpt2::test_weight_streaming_ootb # 1.5 mins
   - accuracy/test_cli_flow.py::TestGpt2::test_cuda_graph # 1 min
   - accuracy/test_cli_flow.py::TestSantacoder::test_auto_dtype # 1.5 mins
   - accuracy/test_cli_flow.py::TestMamba130M::test_auto_dtype # 1 min
   - accuracy/test_cli_flow.py::TestLongAlpaca7B::test_multiblock_aggressive # 6 mins
   - accuracy/test_cli_flow.py::TestVicuna7B::test_lookahead # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[] # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[cuda_graph] # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[] # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph] # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph-chunked_context] # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph-typical_acceptance] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[cuda_graph=False] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[cuda_graph=True] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=False-chunked_context=False-typical_acceptance=False] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=False-typical_acceptance=False] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=True-typical_acceptance=False] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=False-typical_acceptance=True] # 5 mins
   - accuracy/test_cli_flow.py::TestLlama2_7B::test_auto_dtype
   - examples/test_chatglm.py::test_llm_glm_4_9b_single_gpu_summary[glm-4-9b-disable_weight_only]
   - unittest/trt/attention/test_gpt_attention_IFB.py
@@ -110,8 +114,8 @@ l0_a10:
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_cpp_runtime]
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba2-130m-float16-enable_gemm_plugin]
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-codestral-7B-v0.1-float16-enable_gemm_plugin] # 3 mins
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-MAX_UTILIZATION-trt-stress-test]
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-GUARANTEED_NO_EVICT-trt-stress-stage-alone]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-trt-stress-test]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-trt-stress-test]
 - condition:
     ranges:
       system_gpu_count:
@@ -125,9 +129,9 @@ l0_a10:
       stage: post_merge
       backend: tensorrt
   tests:
-  - test_e2e.py::test_mistral_e2e[use_py_session]
-  - test_e2e.py::test_mistral_e2e[use_cpp_session-remove_input_padding]
-  - test_e2e.py::test_mistral_e2e[use_py_session-remove_input_padding]
+  - test_e2e.py::test_mistral_e2e[use_py_session---]
+  - test_e2e.py::test_mistral_e2e[use_cpp_session-remove_input_padding--]
+  - test_e2e.py::test_mistral_e2e[use_py_session-remove_input_padding--]
   - examples/test_bert.py::test_llm_bert_general[compare_hf-disable_remove_input_padding-disable_attention_plugin-disable_context_fmha-tp:1-pp:1-float32-BertModel-bert/bert-base-uncased]
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:1-pp:1-float16-RobertaModel-bert/roberta-base]
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-disable_attention_plugin-disable_context_fmha-tp:1-pp:1-float16-RobertaForSequenceClassification-bert/twitter-roberta-base-emotion]
@@ -141,8 +145,6 @@ l0_a10:
   - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_cpp_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb8-bs8]
   - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_py_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb5-bs8]
   - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_py_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb8-bs8]
-  - test_e2e.py::test_benchmark_sanity[bert_base]
-  - test_e2e.py::test_benchmark_sanity[roberta_base]
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-130m-float16-disable_gemm_plugin] # 3 mins
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba2-130m-float16-disable_gemm_plugin]
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-codestral-7B-v0.1-float16-disable_gemm_plugin] # 4 mins
@@ -155,9 +157,8 @@ l0_a10:
   - accuracy/test_cli_flow.py::TestPhi2::test_auto_dtype # 2 mins
   - accuracy/test_cli_flow.py::TestGemma2_9BIt::test_auto_dtype
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-130m-float16-enable_gemm_plugin] # 2 mins
-  - test_e2e.py::test_llmapi_load_engine_from_build_command[llama-codellama/CodeLlama-7b-Instruct-hf] # 5min
-  - test_e2e.py::test_llmapi_load_ckpt_from_convert_command # 5min
-  - test_e2e.py::test_benchmark_sanity[t5_base]
+  - llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command[llama-codellama/CodeLlama-7b-Instruct-hf] # 5min
+  - llmapi/test_llm_e2e.py::test_llmapi_load_ckpt_from_convert_command # 5min
   - examples/test_openai.py::test_llm_openai_triton_1gpu
   - examples/test_openai.py::test_llm_openai_triton_plugingen_1gpu
   - test_e2e.py::test_build_time_benchmark_sanity

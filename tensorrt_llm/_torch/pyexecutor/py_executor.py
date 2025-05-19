@@ -18,19 +18,23 @@ import dill  # nosec B403
 import numpy as np
 import torch
 
-from tensorrt_llm._utils import global_mpi_rank, nvtx_range
-from tensorrt_llm.bindings.executor import (FinishReason, InflightBatchingStats,
+from tensorrt_llm._utils import (global_mpi_rank, is_trace_enabled, nvtx_range,
+                                 trace_func)
+from tensorrt_llm.bindings.executor import (DisServingRequestStats,
+                                            FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
-                                            RequestType, Response)
-from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
+                                            RequestStage, RequestStats,
+                                            RequestType, StaticBatchingStats)
+from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
+                                                          ReqIdsSet)
 from tensorrt_llm.logger import logger
 
 from ..distributed import Distributed
-from .decoder import Decoder, DecoderState
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
                           LlmRequestState, executor_request_to_llm_request)
 from .model_engine import ModelEngine
+from .sampler import Sampler, SampleState, SampleStateTensors
 from .scheduler import ScheduledRequests
 
 # Environment variable to specify iteration ranges for profiling start/stop.
@@ -138,7 +142,7 @@ def _gc_nvtx_watcher():
 
 @dataclasses.dataclass
 class BatchState:
-    decoder_state: DecoderState
+    sample_state: SampleState
 
     iter_start_time: float = 0
     iter_stats: IterationStats = None
@@ -156,9 +160,9 @@ class PyExecutor:
                  resource_manager,
                  scheduler,
                  model_engine: ModelEngine,
-                 decoder: Decoder,
+                 sampler: Sampler,
                  dist: Distributed,
-                 enable_overlap_scheduler: bool = False,
+                 disable_overlap_scheduler: bool = False,
                  max_input_len: int = 2048,
                  max_batch_size: int = 8,
                  max_draft_tokens: int = 0,
@@ -174,15 +178,16 @@ class PyExecutor:
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
         self.gc_nvtx_watcher_handle = _gc_nvtx_watcher()
+        self.is_warmup = False  # During warmup, we don't enable the profiler
 
         # related modules
         self.resource_manager = resource_manager
         self.scheduler = scheduler
         self.model_engine = model_engine
         self.enable_attention_dp = model_engine.enable_attention_dp
-        self.decoder = decoder
+        self.sampler = sampler
         self.dist = dist
-        self.enable_overlap_scheduler = enable_overlap_scheduler
+        self.disable_overlap_scheduler = disable_overlap_scheduler
 
         # Draft model for certain spec decode algorithms, e.g. EAGLE3
         self.draft_model_engine = draft_model_engine
@@ -194,6 +199,7 @@ class PyExecutor:
         self.max_draft_tokens = max_draft_tokens
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
         self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
+        self.enable_iter_req_stats = model_engine.pytorch_backend_config.enable_iter_req_stats
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
@@ -225,14 +231,13 @@ class PyExecutor:
         self.has_context_request = False
         self.ctx_in_transmission_requests = []
         self.previous_batch: Optional[BatchState] = None
+        self.num_scheduled_requests: int = 0
 
         # list of requests in each PP micro batch
-        self.num_micro_batches = self.dist.pp_size + enable_overlap_scheduler
+        self.num_micro_batches = self.dist.pp_size
         self.micro_batches: List[BatchStatePP
                                  | None] = [None] * self.num_micro_batches
         self.send_handles = [None] * self.num_micro_batches
-        # one handle each for metadata and serialized new_reqs buffer
-        self.send_new_reqs_handle = [None] * 2
 
         self.inflight_req_ids = ReqIdsSet()
         self.canceled_req_ids = ReqIdsSet()
@@ -251,9 +256,12 @@ class PyExecutor:
 
         self.kv_cache_transceiver = kv_cache_transceiver
         if self.dist.pp_size > 1:
-            self.event_loop = self._executor_loop_pp_overlap if enable_overlap_scheduler else self._executor_loop_pp
+            self.event_loop = self._executor_loop_pp
         else:
-            self.event_loop = self._executor_loop_overlap if enable_overlap_scheduler else self._executor_loop
+            self.event_loop = self._executor_loop if disable_overlap_scheduler else self._executor_loop_overlap
+
+        if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
+            self.event_loop = trace_func(self.event_loop)
 
         if self.draft_model_engine is not None and self.event_loop.__name__ != self._executor_loop.__name__:
             raise NotImplementedError(
@@ -349,6 +357,8 @@ class PyExecutor:
             if manager:
                 manager.shutdown()
         del self.model_engine
+        if self.draft_model_engine is not None:
+            del self.draft_model_engine
 
     def can_enqueue_requests(self) -> bool:
         """
@@ -367,10 +377,10 @@ class PyExecutor:
         if self.enable_iter_perf_stats == False:
             return []
 
-        latest_stats = tuple()
+        latest_stats = (IterationStats(), None)
         try:
             self.stats_lock.acquire()
-            latest_stats = tuple(self.stats)
+            latest_stats = self.stats
             self.stats = []
         finally:
             self.stats_lock.release()
@@ -442,7 +452,7 @@ class PyExecutor:
 
         def profile_step():
             nonlocal it, enabled, start_time
-            if it in self.profile_stop_iters:
+            if it in self.profile_stop_iters and not self.is_warmup:
                 assert enabled, "Inconsistent CUDA profiling state"
                 if enable_torch_trace:
                     torch_profiler.stop()
@@ -464,11 +474,12 @@ class PyExecutor:
                     f"currank_total_requests = {self.num_fetch_requests_cur_rank}/{self.num_fetch_requests}, "
                     f"elapsed_time = {end_time - start_time}s, "
                     f"timestamp = {formatted_timestamp}, "
+                    f"num_scheduled_requests: {self.num_scheduled_requests}, "
                     f"states = {self.model_engine.iter_states}")
 
             it += 1
 
-            if it in self.profile_start_iters:
+            if it in self.profile_start_iters and not self.is_warmup:
                 assert not enabled, "Inconsistent CUDA profiling state"
                 torch.cuda.cudart().cudaProfilerStart()
                 if enable_torch_trace:
@@ -492,15 +503,74 @@ class PyExecutor:
     def _get_init_iter_stats(self, num_new_active_requests,
                              new_active_requests_queue_latency_ms):
         stats = IterationStats()
-        stats.timestamp = ""
+        stats.timestamp = datetime.datetime.now().strftime(
+            "%m-%d-%Y %H:%M:%S.%f")
 
         stats.num_new_active_requests = num_new_active_requests
         stats.num_active_requests = len(self.active_requests)
         stats.new_active_requests_queue_latency_ms = new_active_requests_queue_latency_ms
+        stats.inflight_batching_stats = InflightBatchingStats()
+        # staticBatchingStats is not used in pytorch path
+        stats.static_batching_stats = StaticBatchingStats()
         return stats
 
+    def _populate_req_stats(
+            self, finished_requests: List[LlmRequest],
+            active_requests: List[LlmRequest],
+            scheduled_requests: ScheduledRequests
+    ) -> Optional[List[RequestStats]]:
+
+        def get_req_stats(req: LlmRequest) -> RequestStats:
+            req_stat = RequestStats()
+            req_stat.id = req.request_id
+            req_stat.context_prefill_position = req.context_current_position
+            req_stat.num_generated_tokens = req.max_beam_num_tokens - req.orig_prompt_len
+            req_stat.avg_num_decoded_tokens_per_iter = req.avg_decoded_tokens_per_iter
+            req_stat.alloc_total_blocks_per_request = req.alloc_total_blocks
+            req_stat.alloc_new_blocks_per_request = req.alloc_new_blocks
+            req_stat.reused_blocks_per_request = req.reused_blocks
+            req_stat.missed_blocks_per_request = req.missed_blocks
+            req_stat.kv_cache_hit_rate_per_request = req.kv_cache_hit_rate
+            req_stat.scheduled = req in scheduled_requests.context_requests or req in scheduled_requests.generation_requests
+            if req.llm_request_type == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY or req.llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
+                req_stat.dis_serving_stats = DisServingRequestStats()
+                req_stat.dis_serving_stats.kv_cache_transfer_ms = req.kv_cache_transfer_time_ms
+                req_stat.dis_serving_stats.kv_cache_size = req.kv_cache_size
+            return req_stat
+
+        def get_queued_req_stats(req: LlmRequest) -> RequestStats:
+            req_stat = RequestStats()
+            req_stat.id = req.request_id
+            req_stat.context_prefill_position = 0
+            req_stat.num_generated_tokens = 0
+            req_stat.avg_num_decoded_tokens_per_iter = 0
+            req_stat.alloc_total_blocks_per_request = 0
+            req_stat.alloc_new_blocks_per_request = 0
+            req_stat.reused_blocks_per_request = 0
+            req_stat.missed_blocks_per_request = 0
+            req_stat.kv_cache_hit_rate_per_request = 0
+            return req_stat
+
+        req_stats = []
+        for req in active_requests:
+            req_stat = get_req_stats(req)
+            req_stat.stage = req.stage
+            req_stats.append(req_stat)
+
+        for req in list(self.request_queue.queue):
+            req_stat = get_queued_req_stats(req)
+            req.stage = RequestStage.QUEUED
+            req_stats.append(req_stat)
+
+        for req in finished_requests:
+            req_stat = get_req_stats(req)
+            req_stat.stage = RequestStage.GENERATION_COMPLETE
+            req_stats.append(req_stat)
+
+        return req_stats
+
     def _update_iter_stats(self, stats, iter_latency_ms, num_completed_requests,
-                           scheduled_batch):
+                           scheduled_batch) -> IterationStats:
         stats.iter_latency_ms = iter_latency_ms
 
         stats.num_queued_requests = self.request_queue.qsize()
@@ -530,36 +600,47 @@ class PyExecutor:
             kv_stats_to_save.cache_hit_rate = kv_stats.cache_hit_rate
             stats.kv_cache_stats = kv_stats_to_save
 
-        model_stats = InflightBatchingStats()
-        model_stats.num_scheduled_requests = len(
+        stats.inflight_batching_stats.num_scheduled_requests = len(
             scheduled_batch.context_requests) + len(
                 scheduled_batch.generation_requests)
-        model_stats.num_context_requests = len(scheduled_batch.context_requests)
-        model_stats.num_gen_requests = len(scheduled_batch.generation_requests)
-        model_stats.num_paused_requests = len(scheduled_batch.paused_requests)
-        model_stats.avg_num_decoded_tokens_per_iter = 0
-        model_stats.num_ctx_tokens = 0
-        model_stats.micro_batch_id = 0
-        stats.inflight_batching_stats = model_stats
+        stats.inflight_batching_stats.num_context_requests = len(
+            scheduled_batch.context_requests)
+        stats.inflight_batching_stats.num_gen_requests = len(
+            scheduled_batch.generation_requests)
+        stats.inflight_batching_stats.num_paused_requests = len(
+            scheduled_batch.paused_requests)
+        stats.inflight_batching_stats.avg_num_decoded_tokens_per_iter = 0
+        stats.inflight_batching_stats.micro_batch_id = 0
         return stats
 
-    def _append_iter_stats(self, stats):
+    def _append_iter_stats(self,
+                           stats: IterationStats,
+                           req_stats: Optional[List[RequestStats]] = None):
+
         try:
             self.stats_lock.acquire()
-            self.stats.append(stats)
+            self.stats.append((stats, req_stats))
         finally:
             self.stats_lock.release()
 
     def _process_iter_stats(self, finished_requests: list[LlmRequest],
+                            active_requests: List[LlmRequest],
                             batch_state: BatchState):
         iter_end_time = time.time()
         iter_latency_ms = iter_end_time - batch_state.iter_start_time
         if batch_state.iter_stats is None:
             return
+
+        req_stats = self._populate_req_stats(
+            finished_requests, active_requests,
+            batch_state.sample_state.scheduled_requests) if (
+                self.enable_iter_req_stats
+                and self.enable_iter_perf_stats) else None
+
         self._append_iter_stats(
             self._update_iter_stats(
                 batch_state.iter_stats, iter_latency_ms, len(finished_requests),
-                batch_state.decoder_state.scheduled_requests))
+                batch_state.sample_state.scheduled_requests), req_stats)
 
     def _executor_loop_cleanup(self):
         with self.response_cv:
@@ -596,96 +677,12 @@ class PyExecutor:
                     self._merge_dummy_request(num_dummy_request)
                 scheduled_batch, _, _ = self._schedule()
 
-                if self.enable_attention_dp:
-                    tp_batch_sizes = self.dist.tp_allgather(
-                        scheduled_batch.batch_size)
-                    can_queue = 0 not in tp_batch_sizes
-                else:
-                    can_queue = scheduled_batch.batch_size > 0
-                    if not can_queue:
-                        assert len(self.inflight_req_ids) > 0, (
-                            "fail to schedule any pending request, probably run out of resource"
-                        )
-
-                if not can_queue:
-                    self.micro_batches[microbatch_id] = None
-                else:
-                    # TODO: add pause_requests together with inflight_req_ids and handle draft_tokens
-                    self._add_inflight_ids(scheduled_batch)
-                    self.resource_manager.prepare_resources(scheduled_batch)
-
-                    # Stage 1: Forward + (decoding) pass ([should be] async)
-                    if self.dist.is_last_pp_rank:
-                        decoder_state = self._forward_step_last_pp(
-                            scheduled_batch, microbatch_id)
-                    else:
-                        decoder_state = self._forward_step_inter_pp(
-                            scheduled_batch)
-
-                    batch_state = BatchStatePP(
-                        decoder_state=decoder_state,
-                        iter_start_time=iter_start_time,
-                        iter_stats=iter_stats,
-                        microbatch_id=microbatch_id,
-                    )
-
-                    if num_dummy_request > 0:
-                        self._finish_dummy_request(scheduled_batch)
-                    self.micro_batches[microbatch_id] = batch_state
-
-                # Stage 2: Handle previous batch that only processed forward_step
-                # marching forward in the microbatch slots
-                prev_microbatch_id = (microbatch_id +
-                                      1) % self.num_micro_batches
-                previous_batch = self.micro_batches[prev_microbatch_id]
-                finished_requests = []
-                if previous_batch is not None:
-                    if not self.dist.is_last_pp_rank:
-                        self._handle_previous_batch_inter_pp(previous_batch)
-
-                    self._update_requests(previous_batch.decoder_state)
-                    self._handle_cancelled_requests()
-                    finished_requests = self._handle_responses()
-                    previous_scheduled_batch = previous_batch.decoder_state.scheduled_requests
-                    self.resource_manager.update_resources(
-                        previous_scheduled_batch)
-                    self._remove_inflight_ids(previous_scheduled_batch)
-
-                microbatch_id = prev_microbatch_id
-                self._gather_dp_requests_num()
-
-                if self.enable_iter_perf_stats and previous_batch is not None:
-                    self._process_iter_stats(finished_requests, previous_batch)
-        self._executor_loop_cleanup()
-
-    def _executor_loop_pp_overlap(self):
-        torch.cuda.set_device(self.device_id)
-        got_finish_signal = False
-        num_dummy_request = 0
-        microbatch_id = 0
-        with self._profiler() as profile_step:
-            iter_start_time = time.time()
-            iter_stats = None
-            while not got_finish_signal or len(self.active_requests) > 0:
-                profile_step()
-                if self.enable_iter_perf_stats:
-                    iter_start_time = time.time()
-                new_requests = self._fetch_new_requests()
-                got_finish_signal = self._merge_requests(
-                    new_requests) or got_finish_signal
-                if got_finish_signal and len(self.active_requests) == 0:
-                    break
-
-                if self.enable_iter_perf_stats:
-                    iter_stats = self._get_init_iter_stats(
-                        len(new_requests),
-                        self.new_active_requests_queue_latency_ms)
-
-                if not got_finish_signal:
-                    num_dummy_request = self._get_num_dummy_request()
-                if num_dummy_request > 0:
-                    self._merge_dummy_request(num_dummy_request)
-                scheduled_batch, _, _ = self._schedule()
+                self.num_scheduled_requests = scheduled_batch.batch_size
+                logger.debug(
+                    f'has {len(self.active_requests)} active_request, '
+                    f'scheduled {len(scheduled_batch.context_requests)} context requests and '
+                    f'{len(scheduled_batch.generation_requests)} generation requests'
+                )
 
                 if self.enable_attention_dp:
                     tp_batch_sizes = self.dist.tp_allgather(
@@ -706,16 +703,20 @@ class PyExecutor:
 
                     # Stage 1: Async forward (all ranks) and decoding pass (last rank only)
                     if not self.dist.is_last_pp_rank:
-                        decoder_state = self._forward_step_inter_pp(
+                        sample_state = self._forward_step_inter_pp(
                             scheduled_batch)
                     else:
                         with torch.cuda.nvtx.range("_forward_step_last_pp"):
                             batch_outputs = self._forward_step(scheduled_batch)
-                            decoder_state = self._decode_async(
+                            sample_state = self._sample_async(
                                 scheduled_batch, batch_outputs)
+                            self._update_request_states(scheduled_batch)
 
+                    if self.enable_iter_perf_stats:
+                        iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
+                            'num_ctx_tokens']
                     batch_state = BatchStatePP(
-                        decoder_state=decoder_state,
+                        sample_state=sample_state,
                         iter_start_time=iter_start_time,
                         iter_stats=iter_stats,
                         microbatch_id=microbatch_id,
@@ -723,7 +724,7 @@ class PyExecutor:
 
                     if num_dummy_request > 0:
                         self._finish_dummy_request(
-                            decoder_state.scheduled_requests)
+                            sample_state.scheduled_requests)
                     self.micro_batches[microbatch_id] = batch_state
 
                 # Stage 2: Communicate new tokens for previous batch between ranks
@@ -739,14 +740,13 @@ class PyExecutor:
                         torch.cuda.nvtx.range_push(
                             "_handle_new_tokens_inter_pp")
                         # Receive tokens from previous pp rank (w.r.t model forward direction)
-                        self.dist.recv_tensor(
-                            previous_batch.decoder_state.
-                            new_tensors_host["new_tokens_host"],
+                        self.dist.recv_tensor_list(
+                            previous_batch.sample_state.host.values(),
                             src=self.dist.prev_pp_rank,
                             tag=prev_microbatch_id)
                     else:
                         torch.cuda.nvtx.range_push("_handle_new_tokens_last_pp")
-                        previous_batch.decoder_state.decoder_event.synchronize()
+                        previous_batch.sample_state.sampler_event.synchronize()
 
                     # Send tokens to next pp rank (w.r.t model forward direction)
                     # Second last rank does not need to since last rank has original decoded tokens
@@ -754,9 +754,8 @@ class PyExecutor:
                         if self.send_handles[prev_microbatch_id] is not None:
                             self.send_handles[prev_microbatch_id].Wait()
                         self.send_handles[
-                            prev_microbatch_id] = self.dist.isend_tensor(
-                                previous_batch.decoder_state.
-                                new_tensors_host["new_tokens_host"],
+                            prev_microbatch_id] = self.dist.isend_tensor_list(
+                                previous_batch.sample_state.host.values(),
                                 dest=self.dist.next_pp_rank,
                                 tag=prev_microbatch_id)
                     torch.cuda.nvtx.range_pop()
@@ -769,10 +768,10 @@ class PyExecutor:
                 finished_requests = []
                 if previous_batch is not None:
                     with torch.cuda.nvtx.range("_handle_previous_batch_pp"):
-                        self._update_requests(previous_batch.decoder_state)
+                        self._update_requests(previous_batch.sample_state)
                         self._handle_cancelled_requests()
                         finished_requests = self._handle_responses()
-                        previous_scheduled_batch = previous_batch.decoder_state.scheduled_requests
+                        previous_scheduled_batch = previous_batch.sample_state.scheduled_requests
                         self.resource_manager.update_resources(
                             previous_scheduled_batch)
                         self._remove_inflight_ids(previous_scheduled_batch)
@@ -783,7 +782,9 @@ class PyExecutor:
                 self._gather_dp_requests_num()
 
                 if self.enable_iter_perf_stats and previous_batch is not None:
-                    self._process_iter_stats(finished_requests, previous_batch)
+                    self._process_iter_stats(finished_requests,
+                                             self.active_requests,
+                                             previous_batch)
         self._executor_loop_cleanup()
 
     def _executor_loop(self):
@@ -829,11 +830,18 @@ class PyExecutor:
                             "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                         )
                         self.kv_cache_transceiver.check_context_transfer_status(
-                            True)
+                            1)
                 else:
                     assert scheduled_batch.batch_size > 0, (
                         "fail to schedule any pending request, "
                         "probably run out of resource.")
+
+                self.num_scheduled_requests = scheduled_batch.batch_size
+                logger.debug(
+                    f'has {len(self.active_requests)} active_request, '
+                    f'scheduled {len(scheduled_batch.context_requests)} context requests and '
+                    f'{len(scheduled_batch.generation_requests)} generation requests'
+                )
 
                 self._pause_requests(scheduled_batch.paused_requests)
 
@@ -851,11 +859,16 @@ class PyExecutor:
 
                     batch_outputs = self._forward_step(scheduled_batch)
 
+                    sample_state = self._sample_async(scheduled_batch,
+                                                      batch_outputs)
+
+                    self._update_request_states(scheduled_batch)
+
                     ctx_transmission_reqs = self._send_disagg_ctx_cache(
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
 
-                    self._decode(scheduled_batch, batch_outputs)
+                    self._update_requests(sample_state)
 
                     if self.kv_cache_transceiver:
                         # For context only req in transmission, we reset the state since decoder might have changed it
@@ -874,9 +887,11 @@ class PyExecutor:
                 self._gather_dp_requests_num()
 
                 if self.enable_iter_perf_stats:
+                    iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
+                        'num_ctx_tokens']
                     self._process_iter_stats(
-                        finished_requests,
-                        BatchState(decoder_state=DecoderState(
+                        finished_requests, self.active_requests,
+                        BatchState(sample_state=SampleState(
                             scheduled_requests=scheduled_batch),
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
@@ -892,16 +907,10 @@ class PyExecutor:
                     continue
                 req.py_last_draft_tokens = req.py_draft_tokens
                 max_draft_len = self.model_engine.spec_config.max_draft_tokens
-                max_seq_len = self.model_engine.max_seq_len
 
-                # Subtract 1 to account for the token we will add on this forward
-                # pass.
-                draft_len = min(max_seq_len - 1 - req.get_num_tokens(0),
-                                max_draft_len)
-
-                if draft_len > 0:
-                    req.py_draft_tokens = [0] * draft_len
-                    req.py_draft_pages_allocated = draft_len
+                if max_draft_len > 0:
+                    req.py_draft_tokens = [0] * max_draft_len
+                    req.py_draft_pages_allocated = max_draft_len
                 else:
                     req.py_draft_tokens = None
                     req.py_draft_pages_allocated = 0
@@ -955,12 +964,13 @@ class PyExecutor:
                             "num_fitting_reqs =0 and fitting_disagg_gen_init_requests is empty , may not have enough kvCache"
                         )
                         self.kv_cache_transceiver.check_context_transfer_status(
-                            True)
+                            1)
                 else:
                     assert scheduled_batch.batch_size > 0, (
                         "fail to schedule any pending request, "
                         "probably run out of resource.")
 
+                self.num_scheduled_requests = scheduled_batch.batch_size
                 logger.debug(
                     f'has {len(self.active_requests)} active_request, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
@@ -994,23 +1004,28 @@ class PyExecutor:
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
 
-                    previous_new_tensors_device = self.previous_batch and self.previous_batch.decoder_state.new_tensors_device
+                    previous_tensors_device = self.previous_batch and self.previous_batch.sample_state.device
 
-                    batch_outputs = self._forward_step(
-                        scheduled_batch, previous_new_tensors_device)
+                    batch_outputs = self._forward_step(scheduled_batch,
+                                                       previous_tensors_device)
+
+                    sample_state = self._sample_async(scheduled_batch,
+                                                      batch_outputs)
+
+                    self._update_request_states(scheduled_batch)
 
                     ctx_transmission_reqs = self._send_disagg_ctx_cache(
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
 
-                    decoder_state = self._decode_async(scheduled_batch,
-                                                       batch_outputs)
-
                     if num_dummy_request > 0:
                         self._finish_dummy_request(scheduled_batch)
+
                     has_previous_batch = self.previous_batch is not None
                     if has_previous_batch:
-                        self._process_previous_batch()
+                        previous_batch_size = self.previous_batch.sample_state.scheduled_requests.batch_size
+                        if previous_batch_size > 0:  # first previous batch size is 0
+                            self._process_previous_batch()
                         self.previous_batch: Optional[BatchState] = None
 
                     # Separate chunked requests so we can handle them in _update_requests w/o relying on the request state.
@@ -1024,8 +1039,12 @@ class PyExecutor:
                         if r.get_context_remaining_length() == 0
                     ]
 
+                    if self.enable_iter_perf_stats:
+                        iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
+                            'num_ctx_tokens']
+
                     self.previous_batch = BatchState(
-                        decoder_state=decoder_state,
+                        sample_state=sample_state,
                         iter_start_time=iter_start_time,
                         iter_stats=iter_stats,
                         ctx_transmission_reqs=ctx_transmission_reqs)
@@ -1037,7 +1056,7 @@ class PyExecutor:
         self._executor_loop_cleanup()
 
     def _process_previous_batch(self):
-        self._update_requests(self.previous_batch.decoder_state)
+        self._update_requests(self.previous_batch.sample_state)
 
         if self.kv_cache_transceiver and self.previous_batch.ctx_transmission_reqs:
             for req in self.previous_batch.ctx_transmission_reqs:
@@ -1045,65 +1064,22 @@ class PyExecutor:
 
         self._handle_cancelled_requests()
         finished_requests = self._handle_responses()
-        scheduled_requests = self.previous_batch.decoder_state.scheduled_requests
+        scheduled_requests = self.previous_batch.sample_state.scheduled_requests
         self.resource_manager.update_resources(scheduled_requests)
         if self.enable_kv_cache_events:
             self._add_kv_cache_events()
 
         if self.enable_iter_perf_stats:
-            self._process_iter_stats(finished_requests, self.previous_batch)
+            self._process_iter_stats(finished_requests, self.active_requests,
+                                     self.previous_batch)
 
     @nvtx_range("_forward_step_inter_pp")
-    def _forward_step_inter_pp(self, scheduled_batch) -> DecoderState:
+    def _forward_step_inter_pp(self, scheduled_batch) -> SampleState:
         batch_outputs = self._forward_step(scheduled_batch)
-        tokens_shape = batch_outputs["hidden_states"].shape[:-1]
-        new_tokens_host = torch.empty(tokens_shape,
-                                      dtype=torch.int64,
-                                      device='cpu',
-                                      pin_memory=True)
-        return DecoderState(
-            scheduled_requests=scheduled_batch,
-            new_tensors_host={"new_tokens_host": new_tokens_host})
-
-    @nvtx_range("_forward_step_last_pp")
-    def _forward_step_last_pp(self, scheduled_batch,
-                              microbatch_id) -> DecoderState:
-        batch_outputs = self._forward_step(scheduled_batch)
-        decoder_state = self._decode_async(scheduled_batch, batch_outputs)
-
-        if self.send_handles[microbatch_id] is not None:
-            self.send_handles[microbatch_id].Wait()
-        decoder_state.decoder_event.synchronize()
-
-        self.send_handles[microbatch_id] = self.dist.isend_tensor(
-            decoder_state.new_tensors_host["new_tokens_host"],
-            dest=self.dist.next_pp_rank,
-            tag=microbatch_id)
-
-        return decoder_state
-
-    @nvtx_range("_handle_previous_batch_inter_pp")
-    def _handle_previous_batch_inter_pp(
-            self, previous_batch_state: BatchStatePP) -> None:
-        new_tokens_host = previous_batch_state.decoder_state.new_tensors_host[
-            "new_tokens_host"]
-        prev_microbatch_id = previous_batch_state.microbatch_id
-        # Receive tokens from prev pp rank w.r.t model forward direction
-        self.dist.recv_tensor(
-            new_tokens_host,
-            src=self.dist.prev_pp_rank,
-            tag=prev_microbatch_id  # not necessary and may discard
-        )
-
-        # Send tokens to next pp rank w.r.t model forward direction
-        # Second last rank not need since last rank has original decoded tokens
-        if not self.dist.is_second_last_pp_rank:
-            if self.send_handles[prev_microbatch_id] is not None:
-                self.send_handles[prev_microbatch_id].Wait()
-            self.send_handles[prev_microbatch_id] = self.dist.isend_tensor(
-                tensor=new_tokens_host,
-                dest=self.dist.next_pp_rank,
-                tag=prev_microbatch_id)
+        sample_state = self._sample_async(scheduled_batch, batch_outputs)
+        self._update_request_states(scheduled_batch)
+        sample_state.sampler_event.synchronize()
+        return sample_state
 
     def _update_new_active_requests_queue_latency(self, new_requests):
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -1116,20 +1092,32 @@ class PyExecutor:
                             req_id)
 
     @nvtx_range("_broadcast_new_requests")
-    def _broadcast_new_requests(self, new_requests):
+    def _broadcast_new_requests(
+        self,
+        new_requests: List[ExecutorRequest],
+        py_request_objects: tuple[str, dict] = None
+    ) -> tuple[List[ExecutorRequest], Optional[tuple[str, dict]]]:
+        """Broadcasts new_requests and optional Python-only metadata (`py_request_objects`) across pipeline stages.
+           `py_request_objects` is a tuple of (attribute_name, {request_id: object}).
+        """
+        payloads = (new_requests, py_request_objects
+                    ) if py_request_objects is not None else new_requests
+
         if not self.dist.has_pp:
-            return self.dist.broadcast(new_requests, root=0)
+            result = self.dist.broadcast(payloads, root=0)
+            return result if isinstance(result, tuple) else (result, None)
 
         # broadcast within first tp group before send/recv chain to other tp groups
         if self.dist.tp_size > 1 and self.dist.is_first_pp_rank:
-            new_requests = self.dist.tp_broadcast(new_requests, root=0)
+            payloads = self.dist.tp_broadcast(payloads, root=0)
 
         # tag = [0, num_micro_batches - 1] used for new_tokens send/recv
         tag = self.num_micro_batches
 
         # 1. send metadata: len(num_requests) and serialized buffer size
+        new_requests = payloads[0] if isinstance(payloads, tuple) else payloads
         if self.dist.is_first_pp_rank and len(new_requests) > 0:
-            buf = np.array(bytearray(dill.dumps(new_requests)))
+            buf = np.array(bytearray(dill.dumps(payloads)))
             buf_size = len(buf)
         else:
             buf, buf_size = None, 0
@@ -1139,10 +1127,7 @@ class PyExecutor:
             self.dist.recv(metadata_arr, self.dist.prev_pp_rank, tag)
 
         if not self.dist.is_last_pp_rank:
-            if self.send_new_reqs_handle[0] is not None:
-                self.send_new_reqs_handle[0].Wait()
-            self.send_new_reqs_handle[0] = self.dist.isend(
-                metadata_arr, self.dist.next_pp_rank, tag)
+            self.dist.send(metadata_arr, self.dist.next_pp_rank, tag)
 
         # 2. send serialized buffer when new requests is not empty
         num_new_requests = metadata_arr[0]
@@ -1153,16 +1138,18 @@ class PyExecutor:
                 self.dist.recv(buf, self.dist.prev_pp_rank, tag)
 
             if not self.dist.is_last_pp_rank:
-                if self.send_new_reqs_handle[1] is not None:
-                    self.send_new_reqs_handle[1].Wait()
-                self.send_new_reqs_handle[1] = self.dist.isend(
-                    buf, self.dist.next_pp_rank, tag)
+                self.dist.send(buf, self.dist.next_pp_rank, tag)
 
             if not self.dist.is_first_pp_rank:
-                new_requests = dill.loads(buf.tobytes())  # nosec B301
+                buf_data = dill.loads(buf.tobytes())  # nosec B301
+                if isinstance(buf_data, tuple):
+                    new_requests, py_request_objects = buf_data
+                else:
+                    new_requests = buf_data
+
                 assert len(new_requests) == num_new_requests
 
-        return new_requests
+        return new_requests, py_request_objects
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(self):
@@ -1181,7 +1168,25 @@ class PyExecutor:
                 self.request_queue, timeout,
                 total_max_num_active_requests - total_num_active_requests)
 
-        new_requests = self._broadcast_new_requests(new_requests)
+        if self.dist.rank == 0:
+            py_request_objects = self._collect_py_objects_from_requests(
+                new_requests, "py_logits_post_processors")
+        else:
+            py_request_objects = None
+
+        if self.dist.rank == 0:
+            # Preserve original `new_requests` on rank 0 since it may contain
+            # Python-only objects (e.g., custom logits processors) not serializable by pybind.
+            _ = self._broadcast_new_requests(new_requests, py_request_objects)
+        else:
+            new_requests, py_request_objects = self._broadcast_new_requests(
+                new_requests, py_request_objects)
+
+        if py_request_objects and (self.dist.tp_size > 1
+                                   or self.dist.has_pp) and self.dist.rank > 0:
+            attr_name, req_obj_dict = py_request_objects
+            self._attach_py_objects_to_requests(new_requests, attr_name,
+                                                req_obj_dict)
 
         if not self.enable_attention_dp:
             self._update_new_active_requests_queue_latency(new_requests)
@@ -1252,7 +1257,7 @@ class PyExecutor:
         self.num_fetch_requests_cur_rank = self.num_fetch_requests_cur_rank + len(
             new_requests_cur_rank)
 
-        if len(new_requests) == 1 and new_requests[0] == None:
+        if len(new_requests) == 1 and new_requests[0] is None:
             new_requests_cur_rank = new_requests
         return new_requests_cur_rank
 
@@ -1282,7 +1287,6 @@ class PyExecutor:
             if _is_executor_request(req_item):
                 req_id, exe_req = req_item
                 req = executor_request_to_llm_request(req_id, exe_req)
-                req.is_dummy = False
                 self.active_requests.append(req)
             elif _is_cancel_request(req_item):
                 self.canceled_req_ids.insert(req_item)
@@ -1298,21 +1302,52 @@ class PyExecutor:
             if self.has_context_request else self.max_draft_tokens,
         )
         for llm_request in llm_request_list:
-            llm_request.is_dummy = True
+            llm_request.is_attention_dp_dummy = True
         self.active_requests += llm_request_list
 
     def _finish_dummy_request(self, scheduled_requests: ScheduledRequests):
         for req in scheduled_requests.context_requests:
-            if req.is_dummy:
+            if req.is_attention_dp_dummy:
                 req.state = LlmRequestState.GENERATION_COMPLETE
         for req in scheduled_requests.generation_requests:
-            if req.is_dummy:
+            if req.is_attention_dp_dummy:
                 req.state = LlmRequestState.GENERATION_COMPLETE
         for req in self.active_requests[:]:
-            if req.is_dummy:
+            if req.is_attention_dp_dummy:
                 self.inflight_req_ids.erase(req.request_id)
                 self._terminate_request(req)
                 self.active_requests.remove(req)
+
+    def _collect_py_objects_from_requests(
+            self, requests, attribute_name: str) -> Optional[tuple[str, dict]]:
+        """WAR to gather dynamic Python-only attributes (e.g., custom logits processors)
+        that cannot be handled by pybind serialization during MP communication.
+
+        Returns:
+            A tuple of (attribute_name, {request_id: object}) or None.
+        """
+        req_id_to_obj = {}
+        for item in requests:
+            if item is None:
+                continue
+            req_id, req = item[:2]
+            obj = getattr(req, attribute_name, None)
+            if obj is not None:
+                req_id_to_obj[req_id] = obj
+        return None if not req_id_to_obj else (attribute_name, req_id_to_obj)
+
+    def _attach_py_objects_to_requests(self, requests, attribute_name: str,
+                                       py_request_objects: dict):
+        """Attaches Python-only objects (e.g., dynamic attributes not handled by pybind)
+        to each request.
+        """
+        for item in requests:
+            if item is None:
+                continue
+            req_id, req = item[:2]
+            py_obj = py_request_objects.get(req_id)
+            if py_obj is not None:
+                setattr(req, attribute_name, py_obj)
 
     def _partition_context(self, ctx_ids_list):
         ctx_ids = torch.tensor(ctx_ids_list).unsqueeze(0)
@@ -1407,7 +1442,6 @@ class PyExecutor:
                 req.ctx_blocks = ctx_blocks
                 req.ctx_position_blocks = position_blocks
                 req.query_id = query_token_ids
-                req.is_dummy = False
                 self.active_requests.append(req)
             elif _is_cancel_request(req_item):
                 self.canceled_req_ids.insert(req_item)
@@ -1493,6 +1527,12 @@ class PyExecutor:
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
+        cache_trans_complete_requests = []
+        for req in scheduled_batch.generation_requests:
+            if req.is_disagg_generation_transmission_complete:
+                cache_trans_complete_requests.append(req)
+        if len(cache_trans_complete_requests) > 0:
+            self._setup_sampler_step(cache_trans_complete_requests)
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
@@ -1538,8 +1578,10 @@ class PyExecutor:
         for req in scheduled_ctx_requests:
             if req.is_context_only_request and req.is_context_finished:
                 self.kv_cache_transceiver.respond_and_send_async(req)
+                self.resource_manager.resource_managers[
+                    "seq_slot_manager"].free_resources(req)
 
-        self.kv_cache_transceiver.check_context_transfer_status(False)
+        self.kv_cache_transceiver.check_context_transfer_status(0)
 
         # Keep track of ctx requests that are in transmission
         ctx_transmission_reqs = [
@@ -1551,8 +1593,7 @@ class PyExecutor:
 
     def _forward_step(self,
                       scheduled_requests,
-                      new_tensors_device: Optional[Dict[str,
-                                                        torch.Tensor]] = None):
+                      new_tensors_device: Optional[SampleStateTensors] = None):
 
         @nvtx_range(
             f"[Executor] _forward_step: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
@@ -1565,8 +1606,6 @@ class PyExecutor:
         try:
             outputs = forward(scheduled_requests, self.resource_manager,
                               new_tensors_device)
-            self._setup_decoder(scheduled_requests, outputs)
-            self._update_request_states(scheduled_requests)
             return outputs
         except Exception as e:
             traceback.print_exc()
@@ -1581,7 +1620,7 @@ class PyExecutor:
             request.move_to_next_context_chunk()
             if request.get_context_remaining_length() == 0:
                 request.state = LlmRequestState.GENERATION_IN_PROGRESS
-            if request.is_dummy:
+            if request.is_attention_dp_dummy:
                 request.state = LlmRequestState.GENERATION_COMPLETE
 
     def _update_request_states_star_attention(
@@ -1606,46 +1645,36 @@ class PyExecutor:
         else:
             self._update_request_states_tp(scheduled_requests)
 
-    @nvtx_range("_decode")
-    def _decode(self, scheduled_batch, batch_outputs):
+    @nvtx_range("_sample_async")
+    def _sample_async(self, scheduled_batch,
+                      batch_outputs) -> SampleState | None:
         try:
             if batch_outputs is not None:
-                self.decoder.decode(scheduled_batch, batch_outputs)
+                return self.sampler.sample_async(scheduled_batch, batch_outputs)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
-            logger.error(f"Encountered an error in decode: {error_msg}")
+            logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
-    @nvtx_range("_setup_decoder")
-    def _setup_decoder(self, scheduled_batch, batch_outputs):
+    @nvtx_range("_setup_sampler_step")
+    def _setup_sampler_step(self, requests):
         try:
-            self.decoder.setup_decoder(scheduled_batch, batch_outputs)
+            return self.sampler.setup_sampler_step(requests)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
-            logger.error(f"Encountered an error in setup_decoder: {error_msg}")
-            self._handle_errors(error_msg)
-
-    @nvtx_range("_decode_async")
-    def _decode_async(self, scheduled_batch, batch_outputs) -> DecoderState:
-        try:
-            if batch_outputs is not None:
-                return self.decoder.decode_async(scheduled_batch, batch_outputs)
-        except Exception as e:
-            traceback.print_exc()
-            error_msg = str(e)
-            logger.error(f"Encountered an error in decode: {error_msg}")
+            logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
     @nvtx_range("_update_requests")
-    def _update_requests(self, decoder_state: DecoderState):
+    def _update_requests(self, sample_state: SampleState):
         try:
-            self.decoder.update_requests(decoder_state)
+            self.sampler.update_requests(sample_state)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
-            logger.error(f"Encountered an error in decode: {error_msg}")
+            logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
     @nvtx_range("_prepare_draft_batch")
@@ -1727,7 +1756,6 @@ class PyExecutor:
                     draft_batch.context_requests.append(new_request)
 
                 new_request.py_stop_words_list = request.py_stop_words_list
-                new_request.is_dummy = False
 
             return draft_batch, req_id_to_num_rejected_tokens
 
@@ -1757,14 +1785,15 @@ class PyExecutor:
             hidden_states = spec_metadata.get_hidden_states(
                 draft_batch, num_rejected_tokens)
 
-            extra_model_inputs = {'hidden_states': hidden_states}
-
             if spec_metadata.spec_dec_mode.is_eagle3():
-                # Another eagle3 hack. Eagle3 checkpoints don't have embed_tokens,
-                # so we need to provide them some other way. We can get rid of this
-                # hack if we provide our own preprocessed eagle3 checkpoints.
-                extra_model_inputs[
-                    'embed_tokens'] = self.model_engine.model.model.embed_tokens
+                # Hack for eagle3. We might need to run a matmul to reduce
+                # the dimensionality of the hidden states on the first pass
+                # through the draft model. Shape dependent control flow will
+                # not work with CUDA graphs. So we just do it here.
+                hidden_states = self.draft_model_engine.model.apply_eagle3_fc(
+                    hidden_states)
+
+            extra_model_inputs = {'hidden_states': hidden_states}
 
             outputs = self.draft_model_engine.forward(
                 draft_batch,
@@ -1774,9 +1803,11 @@ class PyExecutor:
             if spec_metadata.spec_dec_mode.is_eagle3():
                 outputs['d2t'] = self.draft_model_engine.model.model.d2t.data
 
+            sample_state = self._sample_async(draft_batch, outputs)
+
             self._update_request_states(draft_batch)
 
-            self._decode(draft_batch, outputs)
+            self._update_requests(sample_state)
 
             def _process_decoded_tokens():
                 new_requests = []
@@ -1792,22 +1823,29 @@ class PyExecutor:
 
                 return new_requests
 
+            # The TRTLLM attention kernels cannot handle generation requests with
+            # different seqlens. No issues with flashinfer, should we look into removing
+            # this? Just needs proper kernel support.
+            def _pad_to_max_draft_tokens():
+                for req in scheduled_requests.generation_requests:
+                    max_draft_tokens = spec_metadata.max_draft_tokens
+                    num_draft_tokens = len(req.py_draft_tokens)
+                    req.py_draft_tokens.extend(
+                        0 for _ in range(max_draft_tokens - num_draft_tokens))
+
             new_requests = _process_decoded_tokens()
             if not new_requests:
+                _pad_to_max_draft_tokens()
                 return
 
             draft_batch.generation_requests = new_requests
             draft_batch.context_requests = []
 
             for _ in range(spec_metadata.max_draft_tokens - 1):
-                draft_spec_metadata = self.draft_model_engine.spec_metadata
+                draft_spec_metadata = self.draft_model_engine.last_spec_metadata
                 hidden_states = draft_spec_metadata.get_hidden_states(
                     draft_batch)
                 extra_model_inputs = {'hidden_states': hidden_states}
-                if spec_metadata.spec_dec_mode.is_eagle3():
-                    # See note above.
-                    extra_model_inputs[
-                        'embed_tokens'] = self.model_engine.model.model.embed_tokens
 
                 outputs = self.draft_model_engine.forward(
                     draft_batch,
@@ -1817,13 +1855,16 @@ class PyExecutor:
                 if spec_metadata.spec_dec_mode.is_eagle3():
                     outputs[
                         'd2t'] = self.draft_model_engine.model.model.d2t.data
+                sample_state = self._sample_async(draft_batch, outputs)
                 self._update_request_states(draft_batch)
-                self._decode(draft_batch, outputs)
+                self._update_requests(sample_state)
 
                 new_requests = _process_decoded_tokens()
                 if not new_requests:
-                    return
+                    break
                 draft_batch.generation_requests = new_requests
+
+            _pad_to_max_draft_tokens()
 
         except Exception as e:
             traceback.print_exc()
@@ -1858,7 +1899,7 @@ class PyExecutor:
 
         cancelled_responses = {}
         left_requests = []
-        # Tracks canceled requests for proper handling in overlap mode during `decoder.update_requests`.
+        # Tracks canceled requests for proper handling in overlap mode during `sampler.update_requests`.
         self.canceled_requests = []
         for request in self.active_requests:
             req_id = request.py_request_id
@@ -1919,7 +1960,7 @@ class PyExecutor:
         for request in self.active_requests:
             req_id = request.py_request_id
             # no responses for dummy request, and finish it
-            if request.is_dummy:
+            if request.is_attention_dp_dummy:
                 requests_to_terminate.append(request)
                 continue
 
@@ -1927,7 +1968,7 @@ class PyExecutor:
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first token has already been emitted by context server
                 if request.is_disagg_generation_transmission_in_progress or (
-                        self.enable_overlap_scheduler
+                        not self.disable_overlap_scheduler
                         and request.py_decoding_iter <= 1):
                     new_active_requests.append(request)
                     continue

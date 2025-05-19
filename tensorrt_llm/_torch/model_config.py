@@ -22,12 +22,17 @@ class ModelConfig(Generic[TConfig]):
     quant_config: QuantConfig = field(default_factory=QuantConfig)
     # TODO(qijun): support per linear layer quantization
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
-    skip_create_weights: bool = False
+    # Delay weights creation to DecoderModelForCausalLM.__post_init__
+    # to support mixed quantization.
+    skip_create_weights_in_init: bool = False
     is_generation: bool = True
     max_num_tokens: int = 8192
     moe_max_num_tokens: Optional[int] = None
 
     attn_backend: str = 'TRTLLM'
+    moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
+
+    extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
 
     def __post_init__(self):
         if self.pretrained_config and hasattr(self.pretrained_config,
@@ -94,28 +99,50 @@ class ModelConfig(Generic[TConfig]):
 
             json_quant_configs = quant_config_dict['quantization']
 
-            def _load_json_quant_config(key: str):
-                if key in json_quant_configs:
-                    return json_quant_configs[key]
-                return None
-
-            quant_config.quant_algo = _load_json_quant_config('quant_algo')
-            quant_config.kv_cache_quant_algo = _load_json_quant_config(
-                'kv_cache_quant_algo')
-            quant_config.group_size = _load_json_quant_config('group_size')
-            quant_config.exclude_modules = _load_json_quant_config(
-                'exclude_modules')
+            quant_config.quant_algo = json_quant_configs.get('quant_algo', None)
+            quant_config.kv_cache_quant_algo = json_quant_configs.get(
+                'kv_cache_quant_algo', None)
+            quant_config.group_size = json_quant_configs.get('group_size', None)
+            quant_config.exclude_modules = json_quant_configs.get(
+                'exclude_modules', None)
 
             if quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
                 mixed_quant_config_file = model_dir / 'quant_cfg.json'
                 with open(mixed_quant_config_file) as fm:
-                    mixed_quant_config = json.load(fm)
-                    mixed_quant_config = mixed_quant_config['quantized_layers']
-                    for k in mixed_quant_config:
+                    mixed_quant_configs = json.load(fm)
+                    # kv_cache_quant_algo is global regardless of MIXED_PRECISION
+                    kv_cache_quant_algo = mixed_quant_configs[
+                        'kv_cache_quant_algo']
+                    mixed_quant_configs = mixed_quant_configs[
+                        'quantized_layers']
+                    if kv_cache_quant_algo is not None and quant_config.kv_cache_quant_algo is not None:
+                        if kv_cache_quant_algo != quant_config.kv_cache_quant_algo:
+                            raise RuntimeError(
+                                f"The kvcache config in 'quant_cfg.json', {kv_cache_quant_algo},"
+                                f"is different from 'hf_quant_config.json', {quant_config.kv_cache_quant_algo}!"
+                            )
+                    kv_cache_quant_algo = kv_cache_quant_algo or quant_config.kv_cache_quant_algo
+
+                    for layer in mixed_quant_configs:
                         config = QuantConfig()
-                        config.quant_algo = mixed_quant_config[k]['quant_algo']
-                        mixed_quant_config[k] = config
-                layer_quant_config = mixed_quant_config
+                        config.kv_cache_quant_algo = kv_cache_quant_algo
+                        config.quant_algo = mixed_quant_configs[layer][
+                            'quant_algo']
+                        config.group_size = mixed_quant_configs[layer].get(
+                            'group_size', None)
+                        mixed_quant_configs[layer] = config
+                layer_quant_config = mixed_quant_configs
+            elif quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
+                if quant_config.group_size is None:
+                    quant_config.group_size = 128
+
+            if kwargs.get(
+                    'moe_backend'
+            ) == 'TRTLLM' and quant_config.quant_algo == "FP8_BLOCK_SCALES" and quant_config.exclude_modules is None:
+                quant_config.exclude_modules = [
+                    "*kv_b_proj*", "*k_b_proj*", "*eh_proj"
+                ]
+
         # quantized ckpt in other formats
         elif hasattr(pretrained_config, "quantization_config"):
             hf_quant_config = pretrained_config.quantization_config
@@ -124,29 +151,37 @@ class ModelConfig(Generic[TConfig]):
                     "quant_method") == "fp8" and hf_quant_config.get(
                         "weight_block_size", []):
                 quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
-                quant_config.exclude_modules = ["*eh_proj"]
+                if kwargs.get('moe_backend') == 'TRTLLM':
+                    # TODO: This is a hack. Remove after fp8 bmm is integrated.
+                    quant_config.exclude_modules = [
+                        "*kv_b_proj*", "*k_b_proj*", "*eh_proj"
+                    ]
+                else:
+                    quant_config.exclude_modules = ["*eh_proj"]
+
+                block_size = hf_quant_config.get("weight_block_size", [])
+                assert tuple(block_size) == (
+                    128,
+                    128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
+                quant_config.group_size = block_size[0]
 
         return cls(pretrained_config=pretrained_config,
                    quant_config=quant_config,
                    quant_config_dict=layer_quant_config,
                    **kwargs)
 
-    def get_bindings_model_config(
-            self,
-            tensor_parallelism: int = 1,
-            context_parallelism: int = 1) -> "ModelConfigCpp":
+    def get_bindings_model_config(self) -> "ModelConfigCpp":
         """
         This method is used to construct the bindings config for the model.
         Currently it adheres to gptJsonConfig.cpp::createModelConfig, which assumes
         that an engine has been created.
         """
         # TODO smor- this isn't robust, and currently tested for LlamaConfig only
-        # TODO smor- currently parallelism is not supported, set default to 1
         # TODO smor- currently assuming no rnn layers, no MOE
         from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 
         num_heads = self.pretrained_config.num_attention_heads // (
-            tensor_parallelism * context_parallelism)
+            self.mapping.tp_size * self.mapping.cp_size)
 
         model_config_cpp = ModelConfigCpp(
             vocab_size=self.pretrained_config.vocab_size,
@@ -158,7 +193,27 @@ class ModelConfig(Generic[TConfig]):
             data_type=torch_dtype_to_binding(
                 self.pretrained_config.torch_dtype))
 
-        mlp_hidden_size = self.pretrained_config.intermediate_size // tensor_parallelism
+        mlp_hidden_size = None
+        if self.pretrained_config.intermediate_size is not None:
+            mlp_hidden_size = self.pretrained_config.intermediate_size // self.mapping.tp_size
+        else:
+            # TODO: once tensorrt_llm._torch.AutoConfig is implemented, the following logic
+            # should be moved to tensorrt_llm._torch.AutoConfig of the relevant modeling_xxx file
+            if hasattr(self.pretrained_config, "architectures"
+                       ) and self.pretrained_config.architectures is not None:
+                architectures = self.pretrained_config.architectures
+                if len(architectures
+                       ) == 1 and architectures[0] == "DeciLMForCausalLM":
+                    mlp_hidden_size = self._infer_nemotron_ffn_mult()
+                else:
+                    raise ValueError(
+                        f"Inferring mlp hidden size for model architecture: {architectures} isn't supported yet"
+                    )
+        if mlp_hidden_size is None:
+            raise ValueError(
+                f"Failed to infer mlp hidden size for model: {self.pretrained_config.model_type}"
+            )
+
         if "head_size" in self.pretrained_config:
             head_size = self.pretrained_config.head_size
         else:
@@ -168,3 +223,18 @@ class ModelConfig(Generic[TConfig]):
         model_config_cpp.size_per_head = head_size
 
         return model_config_cpp
+
+    def _infer_nemotron_ffn_mult(self):
+        # TODO smor: this is a hack to support Nemotron-Super-49B-v1 with LoRA, tracked by TRTLLM-5045 ticket
+        # Nemotron-NAS has variable ffn_mult for each layer, we need to find the maximum
+        # so that we don't set a too small mlp_hidden_size. This solution leads to a memory
+        # consumption that is higher than required.
+        biggest_ffn_mult = max(
+            [x.ffn.ffn_mult for x in self.pretrained_config.block_configs])
+
+        from tensorrt_llm._torch.models.modeling_nemotron_nas import \
+            _ffn_mult_to_intermediate_size
+        mlp_hidden_size = _ffn_mult_to_intermediate_size(
+            biggest_ffn_mult, self.pretrained_config.hidden_size)
+
+        return mlp_hidden_size

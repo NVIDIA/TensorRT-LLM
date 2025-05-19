@@ -42,12 +42,23 @@ from prompt_lookup.run_dtm_pld import run_dtm_pld
 
 
 def main(args):
+    is_integration_test = os.getenv('INTEGRATION_TEST', '0') == '1'
+    if is_integration_test:
+        logger.info(
+            "Running in integration test mode - will only run one batch and skip accuracy checks"
+        )
+        logger.info(
+            "Setting max_ite=1 and check_accuracy=False for integration test")
+        args.max_ite = 1
+        args.check_accuracy = False
+
     runtime_rank = tensorrt_llm.mpi_rank()
     logger.set_level(args.log_level)
 
     test_hf = args.test_hf and runtime_rank == 0  # only run hf on rank 0
     test_trt_llm = args.test_trt_llm
-    model_name, model_version = read_model_name(args.engine_dir)
+    model_name, model_version = read_model_name(
+        args.engine_dir if not test_hf else args.hf_model_dir, test_hf)
     if args.hf_model_dir is None:
         logger.warning(
             "hf_model_dir is not specified. Try to infer from model_name, but this may be incorrect."
@@ -110,7 +121,8 @@ def main(args):
     dataset = load_dataset(dataset_name,
                            dataset_revision,
                            cache_dir=args.dataset_cache_dir,
-                           split=dataset_split)
+                           split=dataset_split,
+                           trust_remote_code=True)
     dataset = dataset.shuffle(args.random_seed)
 
     max_batch_size = args.batch_size
@@ -535,7 +547,8 @@ def main(args):
                 enable_chunked_context=args.enable_chunked_context,
                 multi_block_mode=args.multi_block_mode,
                 cuda_graph_mode=args.cuda_graph_mode,
-                gather_generation_logits=args.eval_ppl)
+                gather_generation_logits=args.eval_ppl,
+                use_gpu_direct_storage=args.use_gpu_direct_storage)
         runner_kwargs.update(
             enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
         if args.prompt_lookup_config is not None:
@@ -866,6 +879,10 @@ if __name__ == '__main__':
         help=
         "evaluate.load('rouge') will attempt to pull rouge package from HF. Use cached rouge can avoid network outage of host or HF."
     )
+    parser.add_argument("--use_gpu_direct_storage",
+                        default=False,
+                        action="store_true",
+                        help="Use GPUDirect Storage (GDS) to load the engine")
     parser = add_common_args(parser)
     args = parser.parse_args()
 

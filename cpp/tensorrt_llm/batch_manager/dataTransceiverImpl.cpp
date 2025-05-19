@@ -142,8 +142,8 @@ void DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
     if (cacheFormatter != nullptr)
     {
         auto* cacheManager = cacheFormatter->getCacheManager();
-        auto blockRange = kv_cache_manager::BlockRange(
-            *cacheManager, cacheManager->getNewlyAllocatedBlockIds(llmRequest.mRequestId));
+        auto blockRange
+            = kv_cache_manager::BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
         requestInfo = RequestInfo(requestId, blockRange.getBlockHashes(), mSelfState);
     }
 

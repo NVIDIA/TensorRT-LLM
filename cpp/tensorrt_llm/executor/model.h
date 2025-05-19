@@ -18,7 +18,6 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
-#include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/logitsPostProcessor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
@@ -45,6 +44,9 @@ public:
     {
         terminateRequest(llmRequest, false);
     }
+
+    /// @brief Terminate request in the next forwardSync call that includes the request.
+    virtual void terminateRequestSync(LlmRequestPtr const& llmRequest, FinishReason finishReason) = 0;
 
     /// @brief Function that synchronizes the decoder
     virtual void forwardSync() = 0;

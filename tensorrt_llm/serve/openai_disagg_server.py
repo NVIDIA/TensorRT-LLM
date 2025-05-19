@@ -17,12 +17,14 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
+from tensorrt_llm.llmapi.disagg_utils import RouterConfig
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
                                                 CompletionRequest,
                                                 CompletionResponse,
                                                 DisaggregatedParams,
                                                 ErrorResponse)
+from tensorrt_llm.serve.router import create_router
 from tensorrt_llm.version import __version__ as VERSION
 
 logging.basicConfig(level=logging.INFO)
@@ -36,11 +38,14 @@ class OpenAIDisaggServer:
                  ctx_servers: List[str] = None,
                  gen_servers: List[str] = None,
                  req_timeout_secs: int = 180,
-                 server_start_timeout_secs: int = 180):
+                 server_start_timeout_secs: int = 180,
+                 ctx_router_config: Optional[RouterConfig] = None,
+                 gen_router_config: Optional[RouterConfig] = None):
+
         self.ctx_servers = ctx_servers
         self.gen_servers = gen_servers
-        self.ctx_server_idx = 0
-        self.gen_server_idx = 0
+        self.ctx_router = create_router(ctx_router_config, ctx_servers)
+        self.gen_router = create_router(gen_router_config, gen_servers)
 
         if (len(self.gen_servers) == 0):
             raise ValueError("At least one generation server must be provided")
@@ -97,24 +102,28 @@ class OpenAIDisaggServer:
     async def merge_streaming_responses(self, ctx_response,
                                         gen_server: str,
                                         gen_req: Union[CompletionRequest, ChatCompletionRequest]):
-        # First yield the context response if it's not None
-        if ctx_response is not None:
-            # Remove the disaggregated params from the context response
-            data = ctx_response.model_dump()
-            del data['choices'][0]['disaggregated_params']
-            data = json.dumps(data)
-            yield f"data: {data}\n\n".encode('utf-8')
+        try:
+            # First yield the context response if it's not None
+            if ctx_response is not None:
+                # Remove the disaggregated params from the context response
+                data = ctx_response.model_dump()
+                del data['choices'][0]['disaggregated_params']
+                data = json.dumps(data)
+                yield f"data: {data}\n\n".encode('utf-8')
 
-        # Then yield the generation responses
-        if isinstance(gen_req, CompletionRequest):
-            gen_response = await self.send_completion_request(gen_server, gen_req)
-        elif isinstance(gen_req, ChatCompletionRequest):
-            gen_response = await self.send_chat_request(gen_server, gen_req)
-        else:
-            raise TypeError("Invalid request type: {type(gen_req).__name__}")
+            # Then yield the generation responses
+            if isinstance(gen_req, CompletionRequest):
+                gen_response = await self.send_completion_request(gen_server, gen_req)
+            elif isinstance(gen_req, ChatCompletionRequest):
+                gen_response = await self.send_chat_request(gen_server, gen_req)
+            else:
+                raise TypeError("Invalid request type: {type(gen_req).__name__}")
 
-        async for chunk in gen_response.body_iterator:
-            yield chunk
+            async for chunk in gen_response.body_iterator:
+                yield chunk
+
+        finally:
+            await self.gen_router.finish_request(gen_req)
 
     async def openai_completion(self, req: CompletionRequest) -> Response:
         try:
@@ -158,21 +167,25 @@ class OpenAIDisaggServer:
         if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
             return None
 
-        ctx_server = self.get_next_server(self.ctx_servers, "context")
-        logging.info("Sending request to ctx server: %s", ctx_server)
+        try:
+            if request_type == "chat":
+                ctx_req.max_completion_tokens = 1
+            elif request_type == "completion":
+                ctx_req.max_tokens = 1
+            ctx_req.disaggregated_params = DisaggregatedParams(request_type="context_only")
+            ctx_req.stream = False
+            ctx_req.stream_options = None
 
-        if request_type == "chat":
-            ctx_req.max_completion_tokens = 1
-        elif request_type == "completion":
-            ctx_req.max_tokens = 1
-        ctx_req.disaggregated_params = DisaggregatedParams(request_type="context_only")
-        ctx_req.stream = False
-        ctx_req.stream_options = None
+            ctx_server, _ = await self.ctx_router.get_next_server(ctx_req)
+            logging.info("Sending request to ctx server: %s", ctx_server)
 
-        if request_type == "chat":
-            return await self.send_chat_request(ctx_server, ctx_req)
-        elif request_type == "completion":
-            return await self.send_completion_request(ctx_server, ctx_req)
+            if request_type == "chat":
+                response = await self.send_chat_request(ctx_server, ctx_req)
+            else:
+                response = await self.send_completion_request(ctx_server, ctx_req)
+            return response  # Don't forget to return the response if needed
+        finally:
+            await self.ctx_router.finish_request(ctx_req)
 
     async def _process_generation_server_request(self, gen_req, ctx_response):
         if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
@@ -192,16 +205,19 @@ class OpenAIDisaggServer:
         gen_req.disaggregated_params.request_type = "generation_only"
 
         # Pick a generation server and send request
-        gen_server = self.get_next_server(self.gen_servers, "generation")
+        gen_server, _ = await self.gen_router.get_next_server(gen_req)
         logging.info("Sending request to gen server: %s", gen_server)
 
         if not gen_req.stream:
-            if isinstance(gen_req, CompletionRequest):
-                gen_response = await self.send_completion_request(gen_server, gen_req)
-            elif isinstance(gen_req, ChatCompletionRequest):
-                gen_response = await self.send_chat_request(gen_server, gen_req)
+            try:
+                if isinstance(gen_req, CompletionRequest):
+                    gen_response = await self.send_completion_request(gen_server, gen_req)
+                elif isinstance(gen_req, ChatCompletionRequest):
+                    gen_response = await self.send_chat_request(gen_server, gen_req)
 
-            return gen_response
+                return gen_response
+            finally:
+                await self.gen_router.finish_request(gen_req)
         else:
             # Return a streaming response that combines both context and generation responses
             return StreamingResponse(
@@ -216,22 +232,6 @@ class OpenAIDisaggServer:
                                 log_level="info",
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
         await uvicorn.Server(config).serve()
-
-    def get_next_server(self, servers: List[str], server_type: str) -> str:
-        """Round-robin selection of next available server"""
-        if not servers:
-            raise ValueError(f"No {server_type} servers available")
-
-        # Pick context and gen servers in round-robin fashion
-        # TODO: In future, use endpoint to monitor load and pick the least loaded server
-        if server_type == "context":
-            server = servers[self.ctx_server_idx]
-            self.ctx_server_idx = (self.ctx_server_idx + 1) % len(servers)
-        else:
-            server = servers[self.gen_server_idx]
-            self.gen_server_idx = (self.gen_server_idx + 1) % len(servers)
-
-        return server
 
     async def create_generator(self, url: str, request: Union[CompletionRequest, ChatCompletionRequest], end_point: str):
         async with self.session.post(url + end_point, json=request.model_dump(exclude_unset=True)) as response:

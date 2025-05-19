@@ -4,7 +4,7 @@ This document shows how to build and run a [Arctic](https://huggingface.co/Snowf
 
 The TensorRT-LLM Arctic implementation is based on the LLaMA model, with Mixture of Experts (MoE) enabled. The implementation can
 be found in [llama/model.py](../../../../tensorrt_llm/models/llama/model.py).
-See the LLaMA example [`examples/llama`](../../../llama) for details.
+See the LLaMA example [`examples/models/core/llama`](../../../llama) for details.
 
 - [Arctic](#arctic)
   - [Download model checkpoints](#download-model-checkpoints)
@@ -80,7 +80,7 @@ Test your engine with the [run.py](../run.py) script:
 mpirun -n ${TP} --allow-run-as-root python ../../../run.py --engine_dir ./tmp/trt_engines/${ENGINE} --tokenizer_dir tmp/hf_checkpoints/${HF_MODEL} --max_output_len 20 --input_text "The future of AI is" |& tee tmp/trt_engines/${ENGINE}_run.log
 ```
 
-For more examples see [`examples/llama/README.md`](../../../llama/README.md)
+For more examples see [`examples/models/core/llama/README.md`](../../../llama/README.md)
 
 
 ### OOTB

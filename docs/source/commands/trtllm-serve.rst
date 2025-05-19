@@ -66,6 +66,44 @@ Another example uses ``curl``:
     :language: bash
     :linenos:
 
+Multimodal Serving
+~~~~~~~~~~~~~~~~~
+
+For multimodal models (e.g., Qwen2-VL), you'll need to create a configuration file and start the server with additional options:
+
+First, create a configuration file:
+
+.. code-block:: bash
+
+   cat >./extra-llm-api-config.yml<<EOF
+   kv_cache_config:
+       enable_block_reuse: false
+       free_gpu_memory_fraction: 0.6
+   EOF
+
+Then, start the server with the configuration file:
+
+.. code-block:: bash
+
+   trtllm-serve Qwen/Qwen2-VL-7B-Instruct \
+       --extra_llm_api_options ./extra-llm-api-config.yml \
+       --backend pytorch
+
+Completions API
+~~~~~~~~~~~~~~~
+
+You can query Completions API with any http clients, a typical example is OpenAI Python client:
+
+.. literalinclude:: ../../../examples/serve/openai_completion_client_for_multimodal.py
+    :language: python
+    :linenos:
+
+Another example uses ``curl``:
+
+.. literalinclude:: ../../../examples/serve/curl_completion_client_for_multimodal.sh
+    :language: bash
+    :linenos:
+
 Benchmark
 ---------
 

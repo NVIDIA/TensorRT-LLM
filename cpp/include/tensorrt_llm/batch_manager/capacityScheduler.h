@@ -97,12 +97,6 @@ public:
         RequestList const& activeRequests) const;
 
 private:
-    /// @return {fitsKvCache, fitsPeft}
-    std::pair<bool, bool> trySchedulingRequestMaxUtilization(kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
-        OptionalRef<BasePeftCacheManager const> peftCacheManager, std::shared_ptr<LlmRequest> const& req,
-        RequestVector& scheduledRequests, SizeType32& numScheduledBlocks, SizeType32& numScheduledPeftPages,
-        std::unordered_set<uint64_t>& seenTaskIds) const;
-
     SizeType32 mMaxNumRequests;
     /// @brief Boolean that indicates if multiple micro batches might be in flight
     bool mManyMicroBatches;

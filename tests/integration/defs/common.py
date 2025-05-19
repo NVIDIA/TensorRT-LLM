@@ -24,13 +24,13 @@ from packaging import version
 from .trt_test_alternative import check_call, check_output, exists, is_windows
 
 
-def venv_check_call(venv, cmd, env=None):
+def venv_check_call(venv, cmd, running_log=None, env=None):
 
     def _war_check_call(*args, **kwargs):
         kwargs["cwd"] = venv.get_working_directory()
         return check_call(*args, **kwargs)
 
-    venv.run_cmd(cmd, caller=_war_check_call, env=env)
+    venv.run_cmd(cmd, caller=_war_check_call, running_log=running_log, env=env)
 
 
 def venv_check_output(venv, cmd):
@@ -298,7 +298,7 @@ def convert_weights(llm_venv,
             example_name = "gpt"
         elif "llama" in model_path:
             example_name = "llama"
-        script = f"{example_root}/../{example_name}/convert_checkpoint.py"
+        script = f"{example_root}/../models/core/{example_name}/convert_checkpoint.py"
         convert_cmd = [
             f"{script}",
             "--model_dir",
@@ -313,7 +313,7 @@ def convert_weights(llm_venv,
             example_name = "gpt"
         elif "llama" in model_path:
             example_name = "llama"
-        script = f"{example_root}/../{example_name}/convert_checkpoint.py"
+        script = f"{example_root}/../models/core/{example_name}/convert_checkpoint.py"
         convert_cmd = [
             f"{script}",
             "--model_dir",
@@ -530,37 +530,17 @@ def similar(a, b, threshold=0.8):
     return similarity_score(a, b) >= threshold
 
 
-def generate_build_cmd(example_root, *args, **kwargs):
-    "generate build command"
-    build_cmd = [f"{example_root}/build.py"]
-    dtype = kwargs.get("dtype")
-
-    for key, value in kwargs.items():
-        if isinstance(value, bool):
-            if value:
-                if ('plugin' in key) and (not "lookup" in key):
-                    build_cmd.extend([f"--{key}", dtype])
-                else:
-                    build_cmd.append(f"--{key}")
-        else:
-            build_cmd.extend([f"--{key}", f"{value}"])
-
-    for arg in args:
-        build_cmd.append(f"--{arg}")
-
-    return build_cmd
-
-
 def generate_summary_cmd(example_root, *args, **kwargs):
     "generate summary command"
-    summary_cmd = [
-        f"{example_root}/../summarize.py", "--test_trt_llm", "--check_accuracy"
-    ]
+    summarize_script = f"{example_root}/../../../summarize.py" if "core" in example_root else f"{example_root}/../summarize.py"
+    summary_cmd = [summarize_script, "--test_trt_llm", "--check_accuracy"]
 
     for key, value in kwargs.items():
         if isinstance(value, bool):
             if value:
                 summary_cmd.append(f"--{key}")
+        elif isinstance(value, list):  # Support max_attention_window
+            summary_cmd.extend([f"--{key}", *map(str, value)])
         else:
             summary_cmd.extend([f"--{key}", f"{value}"])
 
@@ -568,23 +548,6 @@ def generate_summary_cmd(example_root, *args, **kwargs):
         summary_cmd.append(f"--{arg}")
 
     return summary_cmd
-
-
-def generate_mmlu_cmd(example_root, *args, **kwargs):
-    "generate mmlu command"
-    mmlu_cmd = [f"{example_root}/../mmlu_llmapi.py", "--check_accuracy"]
-
-    for key, value in kwargs.items():
-        if isinstance(value, bool):
-            if value:
-                mmlu_cmd.append(f"--{key}")
-        else:
-            mmlu_cmd.extend([f"--{key}", f"{value}"])
-
-    for arg in args:
-        mmlu_cmd.append(f"--{arg}")
-
-    return mmlu_cmd
 
 
 def generate_deterministic_cmd(example_root, *args, **kwargs):
@@ -628,8 +591,9 @@ def quantize_data(llm_venv,
     else:
         output_dir = os.path.join(output_dir, "no_kv_cache")
 
+    quantize_script = f"{example_root}/../../../quantization/quantize.py" if "core" in example_root else f"{example_root}/../quantization/quantize.py"
     quantize_cmd = [
-        f"{example_root}/../quantization/quantize.py",
+        quantize_script,
         f"--model_dir={model_dir}",
         f"--dtype={dtype}",
         f"--qformat={qformat}",
@@ -858,8 +822,9 @@ def test_multi_lora_support(
         ]
 
     print("Run inference with C++ runtime with pybind...")
+    run_script = f"{example_root}/../../../run.py" if "core" in example_root else f"{example_root}/../run.py"
     run_cmd = [
-        f"{example_root}/../run.py",
+        run_script,
         f"--tokenizer_dir={hf_model_dir}",
         f"--engine_dir={engine_dir}",
         "--input_text",
@@ -943,7 +908,18 @@ def get_dummy_spec_decoding_heads(hf_model_dir,
     )
 
     quant_cfg = getattr(mtq, "FP8_DEFAULT_CFG")
+    # Following quantizers are needed for KV cache quantization.
     quant_cfg["quant_cfg"]["*output_quantizer"] = {
+        "num_bits": (4, 3),
+        "axis": None,
+        "enable": True,
+    }
+    quant_cfg["quant_cfg"]["*k_bmm_quantizer"] = {
+        "num_bits": (4, 3),
+        "axis": None,
+        "enable": True,
+    }
+    quant_cfg["quant_cfg"]["*v_bmm_quantizer"] = {
         "num_bits": (4, 3),
         "axis": None,
         "enable": True,

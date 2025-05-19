@@ -16,13 +16,9 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/executor/executor.h"
-#include "tensorrt_llm/runtime/cudaEvent.h"
-#include "tensorrt_llm/runtime/cudaStream.h"
-#include "tensorrt_llm/runtime/iStatefulGptDecoder.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/utils/sessionUtils.h"
+
 #include <optional>
 
 namespace tensorrt_llm::runtime::decoder_batch
@@ -41,7 +37,6 @@ public:
         , inputLen(inputLen)
         , maxNewTokens{maxNewTokens}
         , endId{endId}
-        , generatedTokensPerEngineStep(1)
     {
     }
 
@@ -50,12 +45,12 @@ public:
     SizeType32 inputLen; // Input length without draft tokens, increasing with generation steps
 
     // optional parameters
-    std::optional<SizeType32> maxNewTokens;  // maximum number of tokens to generate for this request
-    std::optional<SizeType32> endId;         // end token id
-    SizeType32 generatedTokensPerEngineStep; //
-    TensorPtr embeddingBias;                 // [vocabSizePadded], on gpu
-    TensorPtr badWordsList;                  // [2, badWordsLength] on gpu
-    TensorPtr stopWordsList;                 // [2, stopWordsLength] on gpu
+    std::optional<SizeType32> maxNewTokens;     // maximum number of tokens to generate for this request
+    std::optional<SizeType32> endId;            // end token id
+    SizeType32 generatedTokensPerEngineStep{1}; //
+    TensorPtr embeddingBias;                    // [vocabSizePadded], on gpu
+    TensorPtr badWordsList;                     // [2, badWordsLength] on gpu
+    TensorPtr stopWordsList;                    // [2, stopWordsLength] on gpu
 
     //! Optional parameters for speculative decoding
     BufferPtr draftTokens;                // [generatedTokensPerEngineStep - 1] on gpu

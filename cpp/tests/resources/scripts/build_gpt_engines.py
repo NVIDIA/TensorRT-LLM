@@ -17,18 +17,15 @@
 import argparse
 import os
 import platform
+import shutil
 import sys
 from pathlib import Path
 from typing import Optional
 
-from build_engines_utils import init_model_spec_module, run_command, wincopy
-
-init_model_spec_module()
-import shutil
-
-import model_spec
+from build_engines_utils import run_command, wincopy
 
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.bindings.internal.testing import ModelSpec, QuantMethod
 
 
 def convert_ckpt(model_dir: str,
@@ -37,7 +34,7 @@ def convert_ckpt(model_dir: str,
                  world_size: int = 1,
                  dtype: str = 'float16'):
     convert_cmd = [
-        sys.executable, "examples/gpt/convert_checkpoint.py",
+        sys.executable, "examples/models/core/gpt/convert_checkpoint.py",
         f"--model_dir={model_dir}", f"--output_dir={output_dir}",
         f"--dtype={dtype}", f"--tp_size={world_size}"
     ] + list(args)
@@ -147,25 +144,6 @@ def build_engines(model_cache: Optional[str] = None,
     tp_pp_cp_dir = f"tp{tp_size}-pp{pp_size}-cp{cp_size}-gpu"
     tp_dir = f"{world_size}-gpu"
 
-    print("\nConverting to fp32")
-    fp32_ckpt_dir = ckpt_dir / 'fp32' / tp_dir
-    convert_ckpt(str(hf_dir),
-                 str(fp32_ckpt_dir),
-                 world_size=tp_size,
-                 dtype='float32')
-
-    input_file = 'input_tokens.npy'
-    print("\nBuilding fp32 engines")
-    model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.FLOAT)
-    build_engine(
-        str(fp32_ckpt_dir),
-        str(engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir))
-    model_spec_obj.use_gpt_plugin()
-    build_engine(
-        str(fp32_ckpt_dir),
-        str(engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir),
-        '--gpt_attention_plugin=float32', '--context_fmha=enable')
-
     print("\nConverting to fp16")
     fp16_ckpt_dir = ckpt_dir / 'fp16' / tp_dir
     convert_ckpt(str(hf_dir),
@@ -174,21 +152,8 @@ def build_engines(model_cache: Optional[str] = None,
                  dtype='float16')
 
     print("\nBuilding fp16 engines")
-    model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
-    build_engine(
-        str(fp16_ckpt_dir),
-        str(engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir))
-    model_spec_obj.use_gpt_plugin()
-    build_engine(
-        str(fp16_ckpt_dir),
-        str(engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir),
-        '--gpt_attention_plugin=float16')
-    model_spec_obj.use_packed_input()
-    build_engine(
-        str(fp16_ckpt_dir),
-        str(engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir),
-        '--gpt_attention_plugin=float16', '--remove_input_padding=enable')
 
+    input_file = 'input_tokens.npy'
     # this engine can be use for in-flight batching
     ifb_base_args = [
         '--gpt_attention_plugin=float16',
@@ -210,7 +175,7 @@ def build_engines(model_cache: Optional[str] = None,
         else:
             assert False, f"Unsupported kv_cache_type: {kv_cache_type}"
 
-    model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
+    model_spec_obj = ModelSpec(input_file, _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.use_packed_input()
@@ -290,10 +255,10 @@ def build_engines(model_cache: Optional[str] = None,
                  dtype='float16')
 
     print("\nBuilding fp16 SQ engines")
-    model_spec_current = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
+    model_spec_current = ModelSpec(input_file, _tb.DataType.HALF)
     model_spec_current.use_gpt_plugin()
     model_spec_current.use_packed_input()
-    model_spec_current.set_quant_method(model_spec.QuantMethod.SMOOTH_QUANT)
+    model_spec_current.set_quant_method(QuantMethod.SMOOTH_QUANT)
 
     for kv_cache_type in [_tb.KVCacheType.DISABLED, _tb.KVCacheType.PAGED]:
         model_spec_current.set_kv_cache_type(kv_cache_type)

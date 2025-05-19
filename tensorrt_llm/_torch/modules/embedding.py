@@ -59,6 +59,8 @@ class LMHead(Linear):
                 local_in_features -= self.padding_size
         self.in_features = local_in_features
         self.out_features = local_out_features
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
 
         weight_shape = (self.out_features, self.in_features)
         self.weight = Parameter(torch.empty(weight_shape, dtype=dtype))
@@ -66,7 +68,7 @@ class LMHead(Linear):
 
     @property
     def vocab_size_padded(self) -> int:
-        if self.tp_mode == TensorParallelMode.COLUMN:
+        if self.tp_mode == TensorParallelMode.COLUMN and self.gather_output:
             return self.out_features * self.tp_size
         else:
             return self.out_features
@@ -82,6 +84,16 @@ class LMHead(Linear):
                 and self.padding_size > 0):
             output = output[..., :-self.padding_size]
 
+        return output
+
+    def skip_forward(
+            self,
+            input: torch.Tensor,
+            *,
+            all_reduce_params: Optional[AllReduceParams] = None
+    ) -> torch.Tensor:
+        output_shape = input.shape[:-1] + (self.num_embeddings, )
+        output = input.new_empty(output_shape)
         return output
 
     def load_weights(self, weights: List[Dict]):
@@ -169,4 +181,13 @@ class Embedding(LMHead):
                     if self.padding_size > 0:
                         output = output[..., :-self.padding_size]
 
+        return output
+
+    def skip_forward(self, input):
+        output_shape = input.shape[:] + (self.embedding_dim, )
+        output = torch.empty(
+            output_shape,
+            dtype=self.dtype,
+            device=input.device,
+        )
         return output

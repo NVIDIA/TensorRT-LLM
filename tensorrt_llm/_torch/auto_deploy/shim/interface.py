@@ -28,9 +28,25 @@ class CachedSequenceInterface:
         return (*self.info.args, *self._caches.values())
 
     @property
+    def args_original(self) -> Tuple[torch.Tensor, ...]:
+        """Return the original graph arguments expected by the model."""
+        return self.info.args_original
+
+    @property
     def dynamic_shapes(self) -> Tuple[Dict[int, Any], ...]:
         """Return the dynamic shapes of all graph arguments owned by this interface (all static)."""
         return self.info.dynamic_shapes + ({},) * len(self._caches)
+
+    @property
+    def original_dynamic_shapes(self) -> Tuple[Dict[int, Any], ...]:
+        """Return the dynamic shapes of the original graph arguments."""
+        return self.info.original_dynamic_shapes
+
+    def to(self, *args, **kwargs) -> None:
+        self.info.to(*args, **kwargs)
+        if self._caches:
+            for cache in self._caches.values():
+                cache.to(*args, **kwargs)
 
     def add_cache(self, name: str, get_cache: GetCacheCallable) -> None:
         """Add a cache initializer to the cache interface."""
@@ -71,6 +87,9 @@ GetInferenceModel = Callable[[CachedSequenceInterface], nn.Module]
 
 @dataclass
 class AutoDeployConfig(PyTorchConfig):
+    # model factory to choose from
+    model_factory: str = "hf"  # only 'hf' supported for "trtllm" runtime
+
     ### MODEL EXTRA KWARGS ###
     # Extra kwargs for the model config class to customize the model config. Those arguments will
     # take precedence over the default values or config values in the model config file in the HF
@@ -93,6 +112,9 @@ class AutoDeployConfig(PyTorchConfig):
     # check if we should skip loading weights
     skip_loading_weights: bool = False
 
+    # specifies the fraction of available memory to occupy for cache
+    free_mem_ratio: float = 0.8
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -101,3 +123,6 @@ class AutoDeployConfig(PyTorchConfig):
         # gets replaced by the user provided one. We don't want that though.
         f_default = self.__dataclass_fields__["model_kwargs"].default_factory()
         setattr(self, "model_kwargs", {**f_default, **getattr(self, "model_kwargs")})
+
+        # TODO (https://github.com/NVIDIA/TensorRT-LLM/issues/4364) support overlap scheduler
+        self.disable_overlap_scheduler = True

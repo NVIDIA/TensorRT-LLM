@@ -28,12 +28,13 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     std::optional<SizeType32> maxNumTokens, std::optional<ParallelConfig> parallelConfig,
     std::optional<PeftCacheConfig> const& peftCacheConfig,
     std::optional<LogitsPostProcessorConfig> logitsPostProcessorConfig, std::optional<DecodingConfig> decodingConfig,
-    float gpuWeightPercent, std::optional<SizeType32> maxQueueSize,
+    bool useGpuDirectStorage, float gpuWeightPercent, std::optional<SizeType32> maxQueueSize,
     ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig, std::optional<DebugConfig> debugConfig,
     SizeType32 recvPollPeriodMs, uint64_t maxSeqIdleMicroseconds,
     std::optional<SpeculativeDecodingConfig> specDecConfig, std::optional<GuidedDecodingConfig> guidedDecodingConfig,
-    std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs, bool gatherGenerationLogits,
-    bool useVariableBeamWidthSearch)
+    std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs,
+    std::optional<CacheTransceiverConfig> cacheTransceiverConfig, bool gatherGenerationLogits,
+    bool promptTableOffloading, bool enableTrtOverlap)
     : mMaxBeamWidth(maxBeamWidth)
     , mSchedulerConfig(std::move(schedulerConfig))
     , mKvCacheConfig(std::move(kvCacheConfig))
@@ -48,6 +49,7 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     , mPeftCacheConfig(peftCacheConfig)
     , mLogitsPostProcessorConfig(std::move(logitsPostProcessorConfig))
     , mDecodingConfig(std::move(decodingConfig))
+    , mUseGpuDirectStorage((useGpuDirectStorage))
     , mGpuWeightsPercent(gpuWeightPercent)
     , mMaxQueueSize(maxQueueSize)
     , mExtendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig)
@@ -57,14 +59,18 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     , mSpeculativeDecodingConfig(specDecConfig)
     , mGuidedDecodingConfig(std::move(guidedDecodingConfig))
     , mAdditionalModelOutputs(std::move(additionalModelOutputs))
+    , mCacheTransceiverConfig(std::move(cacheTransceiverConfig))
     , mGatherGenerationLogits(gatherGenerationLogits)
-    , mUseVariableBeamWidthSearch(useVariableBeamWidthSearch)
+    , mPromptTableOffloading(promptTableOffloading)
+    , mEnableTrtOverlap(enableTrtOverlap)
 {
     TLLM_CHECK(iterStatsMaxIterations >= 0);
     TLLM_CHECK(requestStatsMaxIterations >= 0);
     TLLM_CHECK(mMaxBeamWidth > 0);
     TLLM_CHECK(maxSeqIdleMicroseconds > 0);
 }
+
+// getters
 
 SizeType32 ExecutorConfig::getMaxBeamWidth() const
 {
@@ -146,6 +152,11 @@ std::optional<DecodingConfig> ExecutorConfig::getDecodingConfig() const
     return mDecodingConfig;
 }
 
+bool ExecutorConfig::getUseGpuDirectStorage() const
+{
+    return mUseGpuDirectStorage;
+}
+
 float ExecutorConfig::getGpuWeightsPercent() const
 {
     return mGpuWeightsPercent;
@@ -191,15 +202,27 @@ std::optional<std::vector<AdditionalModelOutput>> ExecutorConfig::getAdditionalM
     return mAdditionalModelOutputs;
 }
 
+std::optional<CacheTransceiverConfig> ExecutorConfig::getCacheTransceiverConfig() const
+{
+    return mCacheTransceiverConfig;
+}
+
 bool ExecutorConfig::getGatherGenerationLogits() const
 {
     return mGatherGenerationLogits;
 }
 
-bool ExecutorConfig::getUseVariableBeamWidthSearch() const
+bool ExecutorConfig::getPromptTableOffloading() const
 {
-    return mUseVariableBeamWidthSearch;
+    return mPromptTableOffloading;
 }
+
+bool ExecutorConfig::getEnableTrtOverlap() const
+{
+    return mEnableTrtOverlap;
+}
+
+// setters
 
 void ExecutorConfig::setMaxBeamWidth(SizeType32 maxBeamWidth)
 {
@@ -276,6 +299,11 @@ void ExecutorConfig::setDecodingConfig(DecodingConfig const& decodingConfig)
     mDecodingConfig = decodingConfig;
 }
 
+void ExecutorConfig::setUseGpuDirectStorage(bool const& useGpuDirectStorage)
+{
+    mUseGpuDirectStorage = useGpuDirectStorage;
+}
+
 void ExecutorConfig::setGpuWeightsPercent(float const& gpuWeightsPercent)
 {
     mGpuWeightsPercent = gpuWeightsPercent;
@@ -323,14 +351,24 @@ void ExecutorConfig::setAdditionalModelOutputs(std::vector<AdditionalModelOutput
     mAdditionalModelOutputs = additionalModelOutputs;
 }
 
+void ExecutorConfig::setCacheTransceiverConfig(CacheTransceiverConfig const& cacheTransceiverConfig)
+{
+    mCacheTransceiverConfig = cacheTransceiverConfig;
+}
+
 void ExecutorConfig::setGatherGenerationLogits(bool gatherGenerationLogits)
 {
     mGatherGenerationLogits = gatherGenerationLogits;
 }
 
-void ExecutorConfig::setUseVariableBeamWidthSearch(bool useVariableBeamWidthSearch)
+void ExecutorConfig::setPromptTableOffloading(bool promptTableOffloading)
 {
-    mUseVariableBeamWidthSearch = useVariableBeamWidthSearch;
+    mPromptTableOffloading = promptTableOffloading;
+}
+
+void ExecutorConfig::setEnableTrtOverlap(bool enableTrtOverlap)
+{
+    mEnableTrtOverlap = enableTrtOverlap;
 }
 
 } // namespace tensorrt_llm::executor

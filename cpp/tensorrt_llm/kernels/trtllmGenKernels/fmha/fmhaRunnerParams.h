@@ -141,6 +141,38 @@ enum class TileScheduler
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+enum class MultiCtasKvMode
+{
+    // No multiCtasKvMode.
+    Disabled = 0,
+    // Do the reduction through the global memory and atomic counters.
+    GmemReduction,
+    // Do the reduction through the CGA remote shared memory.
+    CgaSmemReduction
+};
+
+// Helper function to check if the multiCtasKv is enabled.
+inline bool isMultiCtasKvEnabled(MultiCtasKvMode multiCtasKvMode)
+{
+    return multiCtasKvMode != MultiCtasKvMode::Disabled;
+}
+
+// Helper function to check the multiCtasKvMode type.
+
+#define MULTI_CTAS_KV_MODE_FUNCTION(Type)                                                                              \
+    inline bool is##Type(MultiCtasKvMode multiCtasKvMode)                                                              \
+    {                                                                                                                  \
+        return (multiCtasKvMode == MultiCtasKvMode::Type);                                                             \
+    }
+
+MULTI_CTAS_KV_MODE_FUNCTION(Disabled)
+MULTI_CTAS_KV_MODE_FUNCTION(GmemReduction)
+MULTI_CTAS_KV_MODE_FUNCTION(CgaSmemReduction)
+
+#undef MULTI_CTAS_KV_MODE_FUNCTION
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 struct TllmGenFmhaRunnerParams
 {
     // Input layout.
@@ -192,6 +224,9 @@ struct TllmGenFmhaRunnerParams
     // The scratch space for each CtaKv when the multiCtasKv mode is enabled.
     // PartialO, partialMax and partialSum will be stored to the scratch space.
     void* multiCtasKvScratchPtr;
+    // The softmax stats buffer.
+    // The softmax max/sum values will be stored to the buffer if it is not nullptr.
+    float2* softmaxStatsPtr;
     // The output buffer.
     void* oPtr;
     // The output scaling factor buffer.
@@ -271,8 +306,10 @@ struct TllmGenSelectKernelParams
     FmhaKernelType mKernelType;
     // The headDimV per CTA, which is only used by MLA generation kernels currently.
     int mHeadDimPerCtaV;
-    // Enable the multiCtasKvMode or not.
-    bool mMultiCtasKvMode;
+    // The multiCtasKvMode.
+    MultiCtasKvMode mMultiCtasKvMode;
+    // Force using GmemRedution for the multiCtasKvMode.
+    bool mForceGmemReduction;
     // Reuse smemK for V or not (only work with MLA generation kernels).
     bool mReuseSmemKForV;
     // Do we need to select a new kernel as the parameters have been updated.
@@ -288,7 +325,9 @@ struct TllmGenSelectKernelParams
     TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
         : mKernelType(params.mKernelType)
         , mHeadDimPerCtaV(params.mHeadDimV)
-        , mMultiCtasKvMode(params.mMultiCtasKvMode)
+        // Note the CgaSmemReduction will be enabled based on the heuristic.
+        , mMultiCtasKvMode(params.mMultiCtasKvMode ? MultiCtasKvMode::GmemReduction : MultiCtasKvMode::Disabled)
+        , mForceGmemReduction(false)
         , mReuseSmemKForV(false)
         , mSelectNewKernel(false)
         , mTileScheduler(params.mTileScheduler)

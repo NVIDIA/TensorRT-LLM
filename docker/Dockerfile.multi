@@ -1,9 +1,15 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
-ARG BASE_TAG=25.03-py3
+ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
+ARG BASE_TAG=25.04-py3
+ARG TRITON_BASE_TAG=25.04-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
+
+# Add NVIDIA EULA and AI Terms labels
+LABEL com.nvidia.eula="https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/"
+LABEL com.nvidia.ai-terms="https://www.nvidia.com/en-us/agreements/enterprise-software/product-specific-terms-for-ai-products/"
 
 # https://www.gnu.org/software/bash/manual/html_node/Bash-Startup-Files.html
 # The default values come from `nvcr.io/nvidia/pytorch`
@@ -64,7 +70,29 @@ RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh
 
 # Install OpenCV with FFMPEG support
 RUN pip3 uninstall -y opencv && rm -rf /usr/local/lib/python3*/dist-packages/cv2/
-RUN pip3 install opencv-python-headless --force-reinstall --no-deps
+RUN pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir
+
+
+FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
+
+FROM devel AS tritondevel
+
+COPY --from=triton /opt/tritonserver/backends/python /opt/tritonserver/backends/python
+COPY --from=triton /opt/tritonserver/lib /opt/tritonserver/lib
+COPY --from=triton /opt/tritonserver/include /opt/tritonserver/include
+COPY --from=triton /opt/tritonserver/bin /opt/tritonserver/bin
+COPY --from=triton /opt/tritonserver/caches /opt/tritonserver/caches
+COPY docker/common/install_triton.sh install_triton.sh
+RUN bash ./install_triton.sh && rm install_triton.sh
+
+# Install NIXL
+COPY docker/common/install_nixl.sh install_nixl.sh
+RUN bash ./install_nixl.sh && rm install_nixl.sh
+
+# Install etcd
+COPY docker/common/install_etcd.sh install_etcd.sh
+RUN bash ./install_etcd.sh && rm install_etcd.sh
+
 
 FROM ${DEVEL_IMAGE} AS wheel
 WORKDIR /src/tensorrt_llm
@@ -93,18 +121,20 @@ WORKDIR /app/tensorrt_llm
 COPY --from=wheel /src/tensorrt_llm/build/tensorrt_llm*.whl .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install tensorrt_llm*.whl && \
-    rm tensorrt_llm*.whl
+    rm tensorrt_llm*.whl && \
+    pip cache purge
+
 COPY README.md ./
 COPY docs docs
 COPY cpp/include include
+
 RUN ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/bin")') bin && \
     test -f bin/executorWorker && \
     ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/libs")') lib && \
     test -f lib/libnvinfer_plugin_tensorrt_llm.so && \
     echo "/app/tensorrt_llm/lib" > /etc/ld.so.conf.d/tensorrt_llm.conf && \
-    ldconfig
-# Test LD configuration
-RUN ! ( ldd -v bin/executorWorker | grep tensorrt_llm | grep -q "not found" )
+    ldconfig && \
+    ! ( ldd -v bin/executorWorker | grep tensorrt_llm | grep -q "not found" )
 
 ARG SRC_DIR=/src/tensorrt_llm
 COPY --from=wheel ${SRC_DIR}/benchmarks benchmarks
@@ -112,17 +142,18 @@ ARG CPP_BUILD_DIR=${SRC_DIR}/cpp/build
 COPY --from=wheel \
      ${CPP_BUILD_DIR}/benchmarks/bertBenchmark \
      ${CPP_BUILD_DIR}/benchmarks/gptManagerBenchmark \
-     ${CPP_BUILD_DIR}/benchmarks/gptSessionBenchmark \
      ${CPP_BUILD_DIR}/benchmarks/disaggServerBenchmark \
      benchmarks/cpp/
+
 COPY examples examples
 RUN chmod -R a+w examples && \
     rm -v \
       benchmarks/cpp/bertBenchmark.cpp \
       benchmarks/cpp/gptManagerBenchmark.cpp \
-      benchmarks/cpp/gptSessionBenchmark.cpp \
       benchmarks/cpp/disaggServerBenchmark.cpp \
-      benchmarks/cpp/CMakeLists.txt
+      benchmarks/cpp/CMakeLists.txt && \
+    rm -rf /root/.cache/pip
+
 ARG GIT_COMMIT
 ARG TRT_LLM_VER
 ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \

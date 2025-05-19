@@ -295,6 +295,14 @@ if __name__ == '__main__':
         args.n_positions = hf_config.max_position_embeddings
         args.dtype = str(
             hf_config.torch_dtype)[6:] if args.dtype == 'auto' else args.dtype
+        if 'head_dim' in hf_config:
+            args.head_dim = hf_config.head_dim
+        else:
+            args.head_dim = args.n_embd // args.n_head
+        if 'head_size' in hf_config:
+            args.head_size = hf_config.head_size
+        else:
+            args.head_size = args.head_dim
 
         if args.eagle_model_dir is None:
             hf_config_eagle = hf_config.eagle
@@ -305,6 +313,14 @@ if __name__ == '__main__':
             args.n_kv_head_eagle = hf_config_eagle['num_key_value_heads']
             args.rms_norm_eps_eagle = hf_config_eagle['rms_norm_eps']
             args.n_positions_eagle = hf_config_eagle['max_position_embeddings']
+            if 'head_dim' in hf_config_eagle:
+                args.head_dim_eagle = hf_config_eagle['head_dim']
+            else:
+                args.head_dim_eagle = args.n_embd_eagle // args.n_head_eagle
+            if 'head_size' in hf_config_eagle:
+                args.head_size_eagle = hf_config_eagle['head_size']
+            else:
+                args.head_size_eagle = args.head_dim_eagle
         else:
             hf_config_eagle = LlamaConfig.from_pretrained(args.eagle_model_dir)
             args.n_head_eagle = hf_config_eagle.num_attention_heads
@@ -314,6 +330,14 @@ if __name__ == '__main__':
             args.n_kv_head_eagle = hf_config_eagle.num_key_value_heads
             args.rms_norm_eps_eagle = hf_config_eagle.rms_norm_eps
             args.n_positions_eagle = hf_config_eagle.max_position_embeddings
+            if 'head_dim' in hf_config_eagle:
+                args.head_dim_eagle = hf_config_eagle.head_dim
+            else:
+                args.head_dim_eagle = args.n_embd_eagle // args.n_head_eagle
+            if 'head_size' in hf_config_eagle:
+                args.head_size_eagle = hf_config_eagle.head_size
+            else:
+                args.head_size_eagle = args.head_dim_eagle
 
     elif args.meta_ckpt_dir is not None:
         assert False, "meta ckpt is not supported yet"
@@ -370,6 +394,8 @@ if __name__ == '__main__':
         },
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
+        'head_dim': args.head_dim_eagle,
+        'head_size': args.head_size_eagle
     }
 
     config = {
@@ -402,7 +428,9 @@ if __name__ == '__main__':
         'max_draft_len': args.max_draft_len,
         'num_eagle_layers': args.num_eagle_layers,
         'max_non_leaves_per_layer': args.max_non_leaves_per_layer,
-        'eagle_net_config': eagle_net_config
+        'eagle_net_config': eagle_net_config,
+        'head_dim': args.head_dim,
+        'head_size': args.head_size
     }
 
     assert args.max_draft_len <= 256, "args.max_draft_len > 256 is not supported"

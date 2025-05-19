@@ -7,7 +7,7 @@ from torch import nn
 
 from tensorrt_llm.mapping import Mapping
 
-from ..custom_ops import IS_FLASHINFER_AVAIABLE
+from ..custom_ops import IS_FLASHINFER_AVAILABLE
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
@@ -16,7 +16,7 @@ from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 
 
 def swiglu(x):
-    if IS_FLASHINFER_AVAIABLE:
+    if IS_FLASHINFER_AVAILABLE:
         # WAR for flashinfer activation since it does not support custom op properly
         from ..custom_ops import flashinfer_silu_and_mul
         return flashinfer_silu_and_mul(x)
@@ -36,7 +36,7 @@ class GatedMLP(nn.Module):
                  dtype: Optional[torch.dtype] = None,
                  config: Optional[ModelConfig] = None,
                  overridden_tp_size: Optional[int] = None,
-                 is_expert: bool = False,
+                 reduce_output: bool = True,
                  layer_idx: Optional[int] = None):
         super().__init__()
         self.layer_idx = layer_idx
@@ -73,9 +73,12 @@ class GatedMLP(nn.Module):
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
             quant_config=config.get_quant_config(),
-            is_expert=is_expert,
-            skip_create_weights=config.skip_create_weights,
+            reduce_output=False,
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
         )
+        self.down_lora = LoraLayer([LoraModuleType.MLP_4H_TO_H],
+                                   [self.hidden_size])
+
         self.down_proj = Linear(
             self.intermediate_size,
             self.hidden_size,
@@ -84,54 +87,74 @@ class GatedMLP(nn.Module):
             mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
-            is_expert=is_expert,
-            skip_create_weights=config.skip_create_weights,
+            reduce_output=reduce_output,
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
+            lora=self.down_lora,
         )
 
         # These two modules are mutually exclusive - either splitted_gate_up_lora or fused_gate_up_lora will be used,
         # but never both at the same time. splitted_gate_up_lora handles gate and up separately while fused_gate_up_lora
         # handles them as a single fused operation.
         self.splitted_gate_up_lora = LoraLayer(
-            [LoraModuleType.MLP_H_TO_4H, LoraModuleType.MLP_GATE],
-            [self.intermediate_size, self.intermediate_size])
-        self.fused_gate_up_lora = LoraLayer([LoraModuleType.MLP_GATE_UP],
-                                            [2 * self.intermediate_size])
-        self.down_lora = LoraLayer([LoraModuleType.MLP_4H_TO_H],
-                                   [self.hidden_size])
+            [LoraModuleType.MLP_H_TO_4H, LoraModuleType.MLP_GATE], [
+                self.intermediate_size // mapping.tp_size,
+                self.intermediate_size // mapping.tp_size
+            ])
+        self.fused_gate_up_lora = LoraLayer(
+            [LoraModuleType.MLP_GATE_UP],
+            [2 * self.intermediate_size // mapping.tp_size])
 
     def forward(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         all_rank_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
-        min_latency_mode: Optional[bool] = False,
         lora_params: Optional[dict] = None,
+        **kwargs,
     ) -> torch.Tensor:
+        if bool(lora_params):
+            return self.forward_lora(x, all_rank_num_tokens,
+                                     final_all_reduce_params, lora_params)
+
         if self.activation == F.silu:
             h1 = self.gate_up_proj(x)
-            if lora_params is not None:
-                assert self.layer_idx is not None, "layer_idx is required for lora"
-                h1_lora = self.splitted_gate_up_lora(x, lora_params,
-                                                     self.layer_idx)
-                if h1_lora is not None:
-                    h1 = h1 + h1_lora
-
-                h1_lora = self.fused_gate_up_lora(x, lora_params,
-                                                  self.layer_idx)
-
-                if h1_lora is not None:
-                    h1 = h1 + h1_lora
 
             h2 = swiglu(h1)
             output = self.down_proj(h2,
-                                    all_reduce_params=final_all_reduce_params)
-            if lora_params is not None:
-                output_lora = self.down_lora(h2, lora_params, self.layer_idx)
-                if output_lora is not None:
-                    output = output + output_lora
-
+                                    all_reduce_params=final_all_reduce_params,
+                                    layer_idx=self.layer_idx)
             return output
         else:
             raise NotImplementedError(
                 f"Activation {self.activation} not yet implemented for fused GatedMLP"
             )
+
+    def forward_lora(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        all_rank_num_tokens=None,
+        final_all_reduce_params: Optional[AllReduceParams] = None,
+        lora_params: Optional[dict] = None,
+    ) -> torch.Tensor:
+        assert lora_params is not None
+        assert self.layer_idx is not None, "layer_idx is required for lora"
+        assert self.activation == F.silu
+
+        h1 = self.gate_up_proj(x)
+
+        h1_lora = self.splitted_gate_up_lora(x, lora_params, self.layer_idx)
+
+        if h1_lora is not None:
+            h1 = h1 + h1_lora
+
+        h1_lora = self.fused_gate_up_lora(x, lora_params, self.layer_idx)
+        if h1_lora is not None:
+            h1 = h1 + h1_lora
+
+        h2 = swiglu(h1)
+        output = self.down_proj(h2,
+                                all_reduce_params=final_all_reduce_params,
+                                lora_params=lora_params,
+                                layer_idx=self.layer_idx)
+
+        return output

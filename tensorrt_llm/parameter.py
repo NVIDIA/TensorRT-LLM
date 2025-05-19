@@ -265,6 +265,9 @@ class Parameter:
     def _regularize_value(self, value):
         if isinstance(value, np.ndarray):
             return value
+
+        elif isinstance(value, torch.distributed.tensor.DTensor):
+            return value.to_local().cpu().numpy()
         elif isinstance(value, torch.Tensor):
             return torch_to_numpy(value)
         raise TypeError(

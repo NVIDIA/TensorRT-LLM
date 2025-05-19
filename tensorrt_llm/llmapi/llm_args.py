@@ -12,10 +12,15 @@ from pydantic import BaseModel, Field, validator
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
+from tensorrt_llm.lora_manager import (LoraConfig,
+                                       get_default_trtllm_modules_to_hf_modules)
+
 from .._utils import mpi_rank
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
 # yapf: disable
 from ..bindings.executor import BatchingType as _BatchingType
+from ..bindings.executor import \
+    CacheTransceiverConfig as _CacheTransceiverConfig
 from ..bindings.executor import \
     CapacitySchedulerPolicy as _CapacitySchedulerPolicy
 from ..bindings.executor import ContextChunkingPolicy as _ContextChunkingPolicy
@@ -52,6 +57,7 @@ class _ParallelConfig:
     pp_size: int = 1
     cp_size: int = 1
     gpus_per_node: int = 8
+    moe_cluster_size: int = 1
     moe_tp_size: int = 1
     moe_ep_size: int = 1
     cp_config: dict = field(default_factory=dict)
@@ -119,6 +125,7 @@ class _ParallelConfig:
                        cp_size=self.cp_size,
                        cp_config=self.cp_config,
                        enable_attention_dp=self.enable_attention_dp,
+                       moe_cluster_size=self.moe_cluster_size,
                        moe_tp_size=self.moe_tp_size,
                        moe_ep_size=self.moe_ep_size,
                        auto_parallel=self.auto_parallel)
@@ -231,6 +238,9 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
 class MTPDecodingConfig(DecodingBaseConfig):
     num_nextn_predict_layers: Optional[int] = 1
+    use_relaxed_acceptance_for_thinking: Optional[bool] = False
+    relaxed_topk: Optional[int] = 1
+    relaxed_delta: Optional[float] = 0.
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -636,6 +646,19 @@ class ExtendedRuntimePerfKnobConfig(BaseModel, PybindMirror):
         return res
 
 
+@PybindMirror.mirror_pybind_fields(_CacheTransceiverConfig)
+class CacheTransceiverConfig(BaseModel, PybindMirror):
+    """
+    Configuration for the cache transceiver.
+    """
+    max_num_tokens: Optional[int] = Field(
+        default=None,
+        description="The max number of tokens the transfer buffer can fit.")
+
+    def _to_pybind(self):
+        return _CacheTransceiverConfig(max_num_tokens=self.max_num_tokens)
+
+
 @dataclass
 class _ModelWrapper:
     model: Union[str, Path]
@@ -729,6 +752,11 @@ class LlmArgs(BaseModel):
     gpus_per_node: Optional[int] = Field(
         default=None, description="The number of GPUs per node.")
 
+    moe_cluster_parallel_size: Optional[int] = Field(
+        default=None,
+        description="The cluster parallel size for MoE models's expert weights."
+    )
+
     moe_tensor_parallel_size: Optional[int] = Field(
         default=None,
         description="The tensor parallel size for MoE models's expert weights.")
@@ -760,13 +788,22 @@ class LlmArgs(BaseModel):
     # LoRA arguments
     enable_lora: bool = Field(default=False, description="Enable LoRA.")
 
-    max_lora_rank: Optional[int] = Field(default=None,
-                                         description="The maximum LoRA rank.")
+    max_lora_rank: Optional[int] = Field(
+        default=None,
+        description="The maximum LoRA rank.",
+        deprecated="Use lora_config.max_lora_rank instead.")
 
-    max_loras: int = Field(default=4, description="The maximum number of LoRA.")
+    max_loras: int = Field(default=4,
+                           description="The maximum number of LoRA.",
+                           deprecated="Use lora_config.max_loras instead.")
 
-    max_cpu_loras: int = Field(default=4,
-                               description="The maximum number of LoRA on CPU.")
+    max_cpu_loras: int = Field(
+        default=4,
+        description="The maximum number of LoRA on CPU.",
+        deprecated="Use lora_config.max_cpu_loras instead.")
+
+    lora_config: Optional[LoraConfig] = Field(
+        default=None, description="LoRA configuration for the model.")
 
     # Prompt adapter arguments
     enable_prompt_adapter: bool = Field(default=False,
@@ -837,6 +874,9 @@ class LlmArgs(BaseModel):
     scheduler_config: Optional[SchedulerConfig] = Field(
         default=None, description="Scheduler config.")
 
+    cache_transceiver_config: Optional[CacheTransceiverConfig] = Field(
+        default=None, description="Cache transceiver config.")
+
     # Speculative decoding parameters
     speculative_config: Optional[Union[
         LookaheadDecodingConfig, MedusaDecodingConfig, EagleDecodingConfig,
@@ -887,6 +927,11 @@ class LlmArgs(BaseModel):
         description="The postprocess tokenizer directory.",
         alias="_postprocess_tokenizer_dir")
 
+    reasoning_parser: Optional[str] = Field(
+        default=None,
+        description="The parser to separate reasoning content from output.",
+        alias="_reasoning_parser")
+
     # TODO[Superjomn]: To deprecate this config.
     decoding_config: Optional[object] = Field(
         default=None,
@@ -925,6 +970,9 @@ class LlmArgs(BaseModel):
             self.gpus_per_node = torch.cuda.device_count()
         assert self.gpus_per_node is not None
 
+        if self.moe_cluster_parallel_size is None:
+            self.moe_cluster_parallel_size = -1
+
         if self.moe_tensor_parallel_size is None:
             self.moe_tensor_parallel_size = -1
 
@@ -936,6 +984,7 @@ class LlmArgs(BaseModel):
             pp_size=self.pipeline_parallel_size,
             cp_size=self.context_parallel_size,
             gpus_per_node=self.gpus_per_node,
+            moe_cluster_size=self.moe_cluster_parallel_size,
             moe_tp_size=self.moe_tensor_parallel_size,
             moe_ep_size=self.moe_expert_parallel_size,
             enable_attention_dp=self.enable_attention_dp,
@@ -1106,7 +1155,9 @@ class LlmArgs(BaseModel):
         if self.parallel_config._world_size == 1:
             self.build_config.plugin_config.nccl_plugin = None
 
-        if self.enable_lora:
+        self._ensure_lora_config_consistency()
+
+        if self.enable_lora and self.lora_config is None and self.backend != 'pytorch':
             self.build_config.plugin_config.lora_plugin = 'auto'
             if self.max_lora_rank is not None:
                 self.build_config.lora_config.max_lora_rank = self.max_lora_rank
@@ -1164,13 +1215,52 @@ class LlmArgs(BaseModel):
                 self.speculative_config = MTPConfig(
                     num_nextn_predict_layers=self.speculative_config.
                     num_nextn_predict_layers,
-                    max_batch_size=self.build_config.max_batch_size)
+                    max_batch_size=self.build_config.max_batch_size,
+                    use_relaxed_acceptance_for_thinking=self.speculative_config.
+                    use_relaxed_acceptance_for_thinking,
+                    relaxed_topk=self.speculative_config.relaxed_topk,
+                    relaxed_delta=self.speculative_config.relaxed_delta)
             else:
                 raise ValueError(
                     f"Speculative config type not recognized: {self.speculative_config}"
                 )
         else:
             self.decoding_config = None
+
+    def _ensure_lora_config_consistency(self):
+        if self.lora_config:
+            if self.max_lora_rank is not None:
+                logger.warning(
+                    "max_lora_rank is ignored when lora_config is provided.")
+            if self.max_loras != self.lora_config.max_loras:
+                logger.warning(
+                    "max_loras is ignored when lora_config is provided.")
+            if self.max_cpu_loras != self.lora_config.max_cpu_loras:
+                logger.warning(
+                    "max_cpu_loras is ignored when lora_config is provided.")
+
+            if len(self.lora_config.lora_dir) == 0:
+                # TODO [TRTLLM-5173]
+                logger.warning(
+                    "lora_dir is empty, so custom embedding or lm head will not be applied."
+                )
+
+        if self.enable_lora and self.lora_config is not None and self.backend == 'pytorch':
+            logger.warning(
+                "enable_lora is ignored when lora_config is provided for pytorch backend."
+            )
+
+        if self.lora_config is not None:
+            if len(self.lora_config.lora_dir) == 0 and len(
+                    self.lora_config.lora_target_modules) == 0:
+                logger.warning(
+                    "Both lora_dir and lora_target_modules are empty, so all LoRA modules will be expected. "
+                    "This will lead to serious memory consumption. Please provide either lora_dir or lora_target_modules if this behavior is not what you expect."
+                )
+                default_trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules(
+                )
+                self.lora_config.lora_target_modules = list(
+                    default_trtllm_modules_to_hf_modules.keys())
 
     @property
     def _build_config_mutable(self) -> bool:
@@ -1203,6 +1293,7 @@ class LlmArgs(BaseModel):
             pp_size=mapping.pp_size,
             cp_size=mapping.cp_size,
             gpus_per_node=mapping.gpus_per_node,
+            moe_cluster_size=mapping.moe_cluster_size,
             moe_tp_size=mapping.moe_tp_size,
             moe_ep_size=mapping.moe_ep_size)
 
@@ -1212,6 +1303,7 @@ class LlmArgs(BaseModel):
         tp_size = pretrained_config.mapping.tp_size
         pp_size = pretrained_config.mapping.pp_size
         cp_size = pretrained_config.mapping.cp_size
+        moe_cluster_size = pretrained_config.mapping.moe_cluster_size
         moe_tp_size = pretrained_config.mapping.moe_tp_size
         moe_ep_size = pretrained_config.mapping.moe_ep_size
         world_size = pretrained_config.mapping.world_size
@@ -1235,12 +1327,14 @@ class LlmArgs(BaseModel):
                 f"auto parallel with world_size {self.parallel_config.world_size} does not support checkpoint with "
                 "world_size {world_size} > 1")
         if not self.parallel_config.auto_parallel:
-            self.parallel_config = _ParallelConfig(tp_size=tp_size,
-                                                   pp_size=pp_size,
-                                                   cp_size=cp_size,
-                                                   gpus_per_node=gpus_per_node,
-                                                   moe_tp_size=moe_tp_size,
-                                                   moe_ep_size=moe_ep_size)
+            self.parallel_config = _ParallelConfig(
+                tp_size=tp_size,
+                pp_size=pp_size,
+                cp_size=cp_size,
+                gpus_per_node=gpus_per_node,
+                moe_cluster_size=moe_cluster_size,
+                moe_tp_size=moe_tp_size,
+                moe_ep_size=moe_ep_size)
 
     def _setup_embedding_parallel_mode(self):
         if self.embedding_parallel_mode == 'NONE':
@@ -1301,6 +1395,7 @@ def update_llm_args_with_extra_dict(
         "batching_type": BatchingType,
         "extended_runtime_perf_knob_config": ExtendedRuntimePerfKnobConfig,
         "pytorch_backend_config": PyTorchConfig,
+        "cache_transceiver_config": CacheTransceiverConfig,
     }
     for field, field_type in field_mapping.items():
         if field in llm_args_dict:

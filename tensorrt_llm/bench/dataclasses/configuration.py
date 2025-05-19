@@ -55,6 +55,8 @@ class RuntimeConfig(BaseModel):
             self.world_config.gpus_per_node,
             "moe_expert_parallel_size":
             self.world_config.ep_size,
+            "moe_cluster_parallel_size":
+            self.world_config.cluster_size,
             "trust_remote_code":
             True,
             "kv_cache_config":
@@ -154,6 +156,7 @@ class ExecutorWorldConfig(BaseModel):
     gpus_per_node: Optional[int] = None
     leader_mode: bool = False
     ep_size: Optional[int] = None
+    cluster_size: Optional[int] = None
 
     @model_validator(mode="after")
     def validate_world_size(self) -> ExecutorWorldConfig:

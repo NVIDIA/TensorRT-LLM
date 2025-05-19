@@ -12,7 +12,6 @@
 
 #include "common.h"
 
-#include "modelSpec.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -20,6 +19,7 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
+#include "tensorrt_llm/testing/modelSpec.h"
 #include "tests/utils/common.h"
 
 #include <gtest/gtest.h>
@@ -576,8 +576,7 @@ void TestData::verifyLogProbs(bool computeLogProbs, bool streaming, bool exclude
 }
 
 void TestData::validateContextLogits(bool getContextLogits, SizeType32 inputLength, SizeType32 beamWidth,
-    std::optional<executor::Tensor> const& contextLogits, SizeType32 vocabSizePadded, SizeType32 batchId,
-    executor::BatchingType batchingType)
+    std::optional<executor::Tensor> const& contextLogits, SizeType32 vocabSizePadded, SizeType32 batchId)
 {
     if (getContextLogits)
     {
@@ -587,7 +586,7 @@ void TestData::validateContextLogits(bool getContextLogits, SizeType32 inputLeng
         EXPECT_EQ(contextLogits.value().getShape()[1], vocabSizePadded);
         auto const expectedContextLogits = this->expectedContextLogits[batchId];
 
-        if (batchingType != executor::BatchingType::kSTATIC && beamWidth == 1)
+        if (beamWidth == 1)
         {
             cudaDeviceSynchronize(); // Make sure the logits copy is complete.
             EXPECT_TRUE(compareLogits(*expectedContextLogits, *(executor::detail::toITensor(contextLogits.value()))));
@@ -602,7 +601,7 @@ void TestData::validateContextLogits(bool getContextLogits, SizeType32 inputLeng
 void TestData::validateGenerationLogits(bool getGenLogits, bool isFinal, bool streaming, bool excludeInputFromOutput,
     SizeType32 inputLength, SizeType32 maxOutputLen, SizeType32 beamWidth, executor::BeamTokens const& beamTokens,
     std::optional<executor::Tensor> const& genLogits, SizeType32 vocabSizePadded, SizeType32 batchId,
-    executor::BatchingType batchingType, bool const returnAllGeneratedTokens)
+    bool const returnAllGeneratedTokens)
 {
     auto const numReturnBeams = beamTokens.size();
 
@@ -619,7 +618,7 @@ void TestData::validateGenerationLogits(bool getGenLogits, bool isFinal, bool st
         // 2. streaming: [maxOutputLen (or 1), beamWidth, vocabSizePadded]
         auto const& outputGenerationLogits = executor::detail::toITensor(genLogits.value());
 
-        if (streaming && batchingType != executor::BatchingType::kSTATIC)
+        if (streaming)
         {
             EXPECT_EQ(genLogits.value().getShape()[1], numReturnBeams);
             EXPECT_EQ(beamWidth, 1); // Only support streaming && beamWidth == 1
@@ -653,7 +652,7 @@ void TestData::validateGenerationLogits(bool getGenLogits, bool isFinal, bool st
             EXPECT_EQ(genLogits.value().getShape()[0], numReturnBeams);
             EXPECT_EQ(genLogits.value().getShape()[1], maxOutputLen);
 
-            if (isFinal && batchingType != executor::BatchingType::kSTATIC && beamWidth == 1)
+            if (isFinal && beamWidth == 1)
             {
                 cudaDeviceSynchronize(); // Make sure the logits copy is complete.
                 EXPECT_TRUE(compareLogits(*expectedGenerationLogits, *outputGenerationLogits));

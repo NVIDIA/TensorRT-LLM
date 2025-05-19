@@ -33,31 +33,6 @@
 #      not supported in Slurm mode, you need to download the model and put it in
 #      the LOCAL_MODEL directory.
 
-export prepare_dataset="$SOURCE_ROOT/benchmarks/cpp/prepare_dataset.py"
-export data_path="$WORKDIR/token-norm-dist.txt"
-
-echo "Preparing dataset..."
-srun -l \
-    -N 1 \
-    -n 1 \
-    --container-image=${CONTAINER_IMAGE} \
-    --container-name="prepare-name" \
-    --container-mounts=${MOUNT_DIR}:${MOUNT_DEST} \
-    --container-workdir=${WORKDIR} \
-    --export=ALL \
-    --mpi=pmix \
-    bash -c "
-        $PROLOGUE
-        python3 $prepare_dataset \
-            --tokenizer=$LOCAL_MODEL \
-            --stdout token-norm-dist \
-            --num-requests=100 \
-            --input-mean=128 \
-            --output-mean=128 \
-            --input-stdev=0 \
-            --output-stdev=0 > $data_path
-    "
-
 echo "Starting trtllm-serve..."
 # Just launch trtllm-serve job with trtllm-llmapi-launch command.
 srun -l \
@@ -75,5 +50,6 @@ srun -l \
          trtllm-serve $LOCAL_MODEL \
             --tp_size 16 \
             --backend pytorch \
+            --host 0.0.0.0 \
             ${ADDITIONAL_OPTIONS}
     "

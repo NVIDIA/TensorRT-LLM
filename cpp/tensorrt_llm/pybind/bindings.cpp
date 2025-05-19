@@ -24,7 +24,6 @@
 #include <vector>
 
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
-#include "tensorrt_llm/batch_manager/trtGptModel.h"
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/pybind/batch_manager/algorithms.h"
@@ -35,8 +34,10 @@
 #include "tensorrt_llm/pybind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/pybind/executor/bindings.h"
 #include "tensorrt_llm/pybind/runtime/bindings.h"
+#include "tensorrt_llm/pybind/testing/modelSpecBinding.h"
 #include "tensorrt_llm/pybind/userbuffers/bindings.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
@@ -101,6 +102,16 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
                 auto& world = tensorrt_llm::mpi::MpiComm::world();
                 tensorrt_llm::mpi::MpiComm::setSession(world.split(color, rank));
             });
+
+    py::classh<tr::CudaStream>(m, "CudaStream")
+        .def(py::init(
+                 [](py::object py_stream)
+                 {
+                     cudaStream_t stream = reinterpret_cast<cudaStream_t>(py_stream.cast<uintptr_t>());
+                     return tr::CudaStream{stream};
+                 }),
+            py::arg("stream_ptr"))
+        .def("get_device", &tr::CudaStream::getDevice);
 
     // Create submodule for executor bindings.
     py::module_ executor_submodule = m.def_submodule("executor", "Executor bindings");
@@ -306,7 +317,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
             py::arg("num_heads"), py::arg("hidden_size"), py::arg("data_type"))
         .def_property_readonly("vocab_size", &tr::ModelConfig::getVocabSize)
         .def("vocab_size_padded", &tr::ModelConfig::getVocabSizePadded, py::arg("world_size"))
-        .def("num_layers", &tr::ModelConfig::getNbLayers, py::arg("pipeline_parallelism") = 1)
+        .def("num_layers", &tr::ModelConfig::getNbLayers, py::arg("pipeline_parallelism") = 1,
+            py::arg("pipeline_parallelism_rank") = 0)
         .def("num_attention_layers", &tr::ModelConfig::getNbAttentionLayers, py::arg("pipeline_parallelism") = 1,
             py::arg("pipeline_parallelism_rank") = 0)
         .def("num_rnn_layers", &tr::ModelConfig::getNbRnnLayers, py::arg("pipeline_parallelism") = 1,
@@ -492,11 +504,6 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .value("DISAGG_GENERATION_TRANS_COMPLETE", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE)
         .value("DISAGG_CONTEXT_INIT_AND_TRANS", tb::LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
 
-    py::enum_<tb::TrtGptModelType>(m, "TrtGptModelType")
-        .value("V1", tb::TrtGptModelType::V1)
-        .value("InflightBatching", tb::TrtGptModelType::InflightBatching)
-        .value("InflightFusedBatching", tb::TrtGptModelType::InflightFusedBatching);
-
     auto gptModelParamsGetState = [&kvCacheConfigGetState](tb::TrtGptModelOptionalParams const& params)
     {
         auto kvCacheState = kvCacheConfigGetState(params.kvCacheConfig);
@@ -527,9 +534,11 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("enable_chunked_context", &tb::TrtGptModelOptionalParams::enableChunkedContext)
         .def_readwrite("normalize_log_probs", &tb::TrtGptModelOptionalParams::normalizeLogProbs)
         .def_readwrite("decoding_config", &tb::TrtGptModelOptionalParams::decodingConfig)
+        .def_readwrite("use_gpu_direct_storage", &tb::TrtGptModelOptionalParams::useGpuDirectStorage)
         .def_readwrite("gpu_weights_percent", &tb::TrtGptModelOptionalParams::gpuWeightsPercent)
         .def_readwrite("max_beam_width", &tb::TrtGptModelOptionalParams::maxBeamWidth)
         .def_readwrite("scheduler_config", &tb::TrtGptModelOptionalParams::schedulerConfig)
+        .def_readwrite("cache_transceiver_config", &tb::TrtGptModelOptionalParams::cacheTransceiverConfig)
         .def(py::pickle(gptModelParamsGetState, gptModelParamsSetState));
 
     py::class_<tr::MemoryCounters>(m, "MemoryCounters")
@@ -543,6 +552,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 
     auto mInternalRuntime = mInternal.def_submodule("runtime", "Runtime internal bindings");
     tensorrt_llm::pybind::runtime::initBindings(mInternalRuntime);
+
+    auto mInternalTesting = mInternal.def_submodule("testing", "Testing internal bindings");
+    tensorrt_llm::pybind::testing::initBindings(mInternalTesting);
 
     auto mInternalBatchManager = mInternal.def_submodule("batch_manager", "Batch manager internal bindings");
     tpb::initBindings(mInternalBatchManager);

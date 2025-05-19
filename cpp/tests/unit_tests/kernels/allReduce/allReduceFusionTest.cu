@@ -49,7 +49,7 @@ __global__ void residual_add_kernel(DType* data, DType* residual, int size)
 template <typename DType>
 void residual_add(DType* data, DType* residual, int size, cudaStream_t stream)
 {
-    residual_add_kernel<<<size / 128, 128, 0, stream>>>(data, residual, size);
+    residual_add_kernel<<<(size + 127) / 128, 128, 0, stream>>>(data, residual, size);
 }
 
 template <typename DType>
@@ -64,7 +64,7 @@ __global__ void quantize_to_fp8_kernel(DType* data, __nv_fp8_e4m3* data_fp8, int
 template <typename DType>
 void quantize_to_fp8(DType* data, __nv_fp8_e4m3* data_fp8, int size, float* scale_factor, cudaStream_t stream)
 {
-    quantize_to_fp8_kernel<<<size / 128, 128, 0, stream>>>(data, data_fp8, size, scale_factor);
+    quantize_to_fp8_kernel<<<(size + 127) / 128, 128, 0, stream>>>(data, data_fp8, size, scale_factor);
 }
 
 template <typename T>
@@ -569,6 +569,57 @@ TEST(Kernel_AllReduceFusion, AllReduceAccuracyFixedTokenNum)
     }
 }
 
+TEST(Kernel_AllReduceFusion, AllReduceFusionAccuracyDifferentHiddenDim)
+{
+#define TEST_AR_FUSION(DType, FusionPattern)                                                                           \
+    {                                                                                                                  \
+        using Runner = TestRunner<DType, FusionPattern>;                                                               \
+        int iter = 10;                                                                                                 \
+        std::vector<int> candidate_hidden_dim{64, 128, 256, 384, 512, 640, 768, 896};                                  \
+        int min_token_num = 1;                                                                                         \
+        int max_token_num = 2048;                                                                                      \
+        for (auto hidden_dim : candidate_hidden_dim)                                                                   \
+        {                                                                                                              \
+            Runner runner(max_token_num, hidden_dim);                                                                  \
+            for (int token_num = min_token_num; token_num <= max_token_num; token_num *= 2)                            \
+            {                                                                                                          \
+                if (rank == 0)                                                                                         \
+                {                                                                                                      \
+                    printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);                     \
+                }                                                                                                      \
+                for (int i = 0; i < iter; ++i)                                                                         \
+                {                                                                                                      \
+                    runner.reset_io();                                                                                 \
+                    runner.run_once(&Runner::run_kernel, token_num, hidden_dim);                                       \
+                    runner.verify(token_num, hidden_dim);                                                              \
+                }                                                                                                      \
+                if (rank == 0)                                                                                         \
+                {                                                                                                      \
+                    printf("\033[32mPass!\033[0m\n");                                                                  \
+                }                                                                                                      \
+            }                                                                                                          \
+        }                                                                                                              \
+    }
+    auto& comm = mpi::MpiComm::world();
+    auto world_size = comm.getSize();
+    auto rank = comm.getRank();
+    if (world_size % 2)
+    {
+        TLLM_LOG_WARNING("world size is not a multiple of 2, return");
+        return;
+    }
+    int const arch = tensorrt_llm::common::getSMVersion();
+    if (arch >= 100)
+    {
+        TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant);
+    }
+    else
+    {
+        TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
+    }
+#undef TEST_AR_FUSION
+}
+
 TEST(Kernel_AllReduceFusion, AllReduceFusionAccuracyDifferentDType)
 {
 #define TEST_AR_FUSION(DType, FusionPattern)                                                                           \
@@ -592,6 +643,7 @@ TEST(Kernel_AllReduceFusion, AllReduceFusionAccuracyDifferentDType)
         }                                                                                                              \
     }
 
+    int const arch = tensorrt_llm::common::getSMVersion();
     auto& comm = mpi::MpiComm::world();
     auto world_size = comm.getSize();
     auto rank = comm.getRank();
@@ -606,66 +658,78 @@ TEST(Kernel_AllReduceFusion, AllReduceFusionAccuracyDifferentDType)
     for (auto hidden_dim : candidate_hidden_dim)
     {
         TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kAllReduce);
-        TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kAllReduce);
-        TEST_AR_FUSION(float, ar_fusion::AllReduceFusionPattern::kAllReduce);
         TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm);
-        TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm);
-        TEST_AR_FUSION(float, ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm);
         TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
-        TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
+        if (arch >= 100)
+        {
+            TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant);
+        }
+        TEST_AR_FUSION(float, ar_fusion::AllReduceFusionPattern::kAllReduce);
+        TEST_AR_FUSION(float, ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm);
         TEST_AR_FUSION(float, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
-        TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant);
-        TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant);
+#if defined(ENABLE_BF16)
+        TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kAllReduce);
+        TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm);
+        TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
+        if (arch >= 100)
+        {
+            TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant);
+        }
+#endif
     }
 #undef TEST_AR_FUSION
 }
 
 TEST(Kernel_AllReduceFusion, Perf)
 {
-    using Runner = TestRunner<half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant>;
-    auto& comm = mpi::MpiComm::world();
-    auto world_size = comm.getSize();
-    auto rank = comm.getRank();
-    if (world_size % 2)
+    int const arch = tensorrt_llm::common::getSMVersion();
+    if (arch >= 100)
     {
-        TLLM_LOG_WARNING("world size is not a multiple of 2, return");
-        return;
-    }
-    int warmup = 100, iter = 300;
-    int hidden_dim = 7168;
-    std::vector<int> candidate_token_num{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
-    int max_token_num = 2048;
-    Runner runner(max_token_num, hidden_dim);
-    for (auto token_num : candidate_token_num)
-    {
-        auto latency = runner.benchmark(&Runner::run_kernel, warmup, iter, token_num, hidden_dim);
-        if (rank == 0)
+        using Runner = TestRunner<half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant>;
+        auto& comm = mpi::MpiComm::world();
+        auto world_size = comm.getSize();
+        auto rank = comm.getRank();
+        if (world_size % 2)
         {
-            TLLM_LOG_INFO(
-                "token_num %-4d, hidden_dim %-4d, fusion kernel latency %4.4fus", token_num, hidden_dim, latency);
+            TLLM_LOG_WARNING("world size is not a multiple of 2, return");
+            return;
         }
-        auto nccl_latency = runner.benchmark(&Runner::run_nccl_allreduce, warmup, iter, token_num, hidden_dim);
-        if (rank == 0)
+        int warmup = 100, iter = 300;
+        int hidden_dim = 7168;
+        std::vector<int> candidate_token_num{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
+        int max_token_num = 2048;
+        Runner runner(max_token_num, hidden_dim);
+        for (auto token_num : candidate_token_num)
         {
-            TLLM_LOG_INFO("nccl allreduce latency %4.4fus", nccl_latency);
-        }
-        auto residual_latency = runner.benchmark(&Runner::run_residual_add, warmup, iter, token_num, hidden_dim);
-        if (rank == 0)
-        {
-            TLLM_LOG_INFO("residual add latency %4.4fus", residual_latency);
-        }
-        auto rms_latency = runner.benchmark(&Runner::run_rms_norm, warmup, iter, token_num, hidden_dim);
-        if (rank == 0)
-        {
-            TLLM_LOG_INFO("rms norm latency %4.4fus", rms_latency);
-        }
-        auto quant_latency = runner.benchmark(&Runner::run_fp4_quant, warmup, iter, token_num, hidden_dim);
-        if (rank == 0)
-        {
-            TLLM_LOG_INFO("fp4 quant latency %4.4fus", quant_latency);
-            auto tot_latency = nccl_latency + residual_latency + rms_latency + quant_latency;
-            TLLM_LOG_INFO("fusion kernel latency %4.4fus, nccl + ops latency %4.4fus, total speedup %2.4fx", latency,
-                tot_latency, tot_latency / latency);
+            auto latency = runner.benchmark(&Runner::run_kernel, warmup, iter, token_num, hidden_dim);
+            if (rank == 0)
+            {
+                TLLM_LOG_INFO(
+                    "token_num %-4d, hidden_dim %-4d, fusion kernel latency %4.4fus", token_num, hidden_dim, latency);
+            }
+            auto nccl_latency = runner.benchmark(&Runner::run_nccl_allreduce, warmup, iter, token_num, hidden_dim);
+            if (rank == 0)
+            {
+                TLLM_LOG_INFO("nccl allreduce latency %4.4fus", nccl_latency);
+            }
+            auto residual_latency = runner.benchmark(&Runner::run_residual_add, warmup, iter, token_num, hidden_dim);
+            if (rank == 0)
+            {
+                TLLM_LOG_INFO("residual add latency %4.4fus", residual_latency);
+            }
+            auto rms_latency = runner.benchmark(&Runner::run_rms_norm, warmup, iter, token_num, hidden_dim);
+            if (rank == 0)
+            {
+                TLLM_LOG_INFO("rms norm latency %4.4fus", rms_latency);
+            }
+            auto quant_latency = runner.benchmark(&Runner::run_fp4_quant, warmup, iter, token_num, hidden_dim);
+            if (rank == 0)
+            {
+                TLLM_LOG_INFO("fp4 quant latency %4.4fus", quant_latency);
+                auto tot_latency = nccl_latency + residual_latency + rms_latency + quant_latency;
+                TLLM_LOG_INFO("fusion kernel latency %4.4fus, nccl + ops latency %4.4fus, total speedup %2.4fx",
+                    latency, tot_latency, tot_latency / latency);
+            }
         }
     }
 }

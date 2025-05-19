@@ -2,13 +2,19 @@
 
 This document explains how to build and run the C++ tests, and the included [resources](resources).
 
-## All-in-one script
+## Pytest Scripts
 
-The Pytest script [test_cpp.py](../../tests/integration/defs/test_cpp.py) builds TRT-LLM, builds engines, and generates expected outputs and executes the C++ tests all in one go.
+The unit tests can be launched via the Pytest script in [test_unit_tests.py](../../tests/integration/defs/cpp/test_unit_tests.py). These do not require engines to be built. The Pytest script will also build TRT-LLM.
+
+The Pytest scripts in [test_e2e.py](../../tests/integration/defs/cpp/test_e2e.py) and [test_multi_gpu.py](../../tests/integration/defs/cpp/test_multi_gpu.py) build TRT-LLM, build engines, and generate expected outputs and execute the end-to-end C++ tests all in one go.
+`test_e2e.py` and `test_multi_gpu.py` contain single and multi-device tests, respectively.
+
 To get an overview of the tests and their parameterization, call:
 
 ```bash
-pytest tests/integration/defs/test_cpp.py --collect-only
+pytest tests/integration/defs/cpp/test_unit_tests.py --collect-only
+pytest tests/integration/defs/cpp/test_e2e.py --collect-only
+pytest tests/integration/defs/cpp/test_multi_gpu.py --collect-only
 ```
 
 All tests take the number of the CUDA architecture of the GPU you wish to use as a parameter e.g. 90 for Hopper.
@@ -19,13 +25,13 @@ Example calls could look like this:
 ```bash
 export LLM_MODELS_ROOT="/path/to/model_cache"
 
-pytest tests/integration/defs/test_cpp.py::test_unit_tests[90]
+pytest tests/integration/defs/cpp/test_unit_tests.py::test_unit_tests[runtime-90]
 
-pytest tests/integration/defs/test_cpp.py::test_model[llama-90]
+pytest tests/integration/defs/cpp/test_e2e.py::test_model[llama-90]
 
-pytest tests/integration/defs/test_cpp.py::test_benchmarks[gpt-90]
+pytest tests/integration/defs/cpp/test_e2e.py::test_benchmarks[gpt-90]
 
-pytest tests/integration/defs/test_cpp.py::test_multi_gpu[90]
+pytest tests/integration/defs/cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[gpt-mpi_kvcache-90]
 ```
 
 ## Manual steps
@@ -50,7 +56,7 @@ Single tests can be executed from `CPP_BUILD_DIR/tests`, e.g.
 
 ### End-to-end tests
 
-`gptSessionTest`,`trtGptModelRealDecoderTest` and `executorTest` require pre-built TensorRT engines, which are loaded in the tests. They also require data files which are stored in [cpp/tests/resources/data](resources/data).
+`trtGptModelRealDecoderTest` and `executorTest` require pre-built TensorRT engines, which are loaded in the tests. They also require data files which are stored in [cpp/tests/resources/data](resources/data).
 
 #### Build engines
 
@@ -59,10 +65,8 @@ The weights and built engines are stored under [cpp/tests/resources/models](reso
 To build the engines from the top-level directory:
 
 ```bash
-PYTHONPATH=examples/gpt:$PYTHONPATH python3 cpp/tests/resources/scripts/build_gpt_engines.py
-PYTHONPATH=examples/gptj:$PYTHONPATH python3 cpp/tests/resources/scripts/build_gptj_engines.py
-PYTHONPATH=examples/llama:$PYTHONPATH python3 cpp/tests/resources/scripts/build_llama_engines.py
-PYTHONPATH=examples/chatglm:$PYTHONPATH python3 cpp/tests/resources/scripts/build_chatglm_engines.py
+PYTHONPATH=examples/models/core/gpt:$PYTHONPATH python3 cpp/tests/resources/scripts/build_gpt_engines.py
+PYTHONPATH=examples/models/core/llama:$PYTHONPATH python3 cpp/tests/resources/scripts/build_llama_engines.py
 PYTHONPATH=examples/medusa:$PYTHONPATH python3 cpp/tests/resources/scripts/build_medusa_engines.py
 PYTHONPATH=examples/eagle:$PYTHONPATH python3 cpp/tests/resources/scripts/build_eagle_engines.py
 PYTHONPATH=examples/redrafter:$PYTHONPATH python3 cpp/tests/resources/scripts/build_redrafter_engines.py
@@ -71,13 +75,7 @@ PYTHONPATH=examples/redrafter:$PYTHONPATH python3 cpp/tests/resources/scripts/bu
 It is possible to build engines with tensor and pipeline parallelism for LLaMA using 4 GPUs.
 
 ```bash
-PYTHONPATH=examples/llama python3 cpp/tests/resources/scripts/build_llama_engines.py --only_multi_gpu
-```
-
-If there is an issue finding model_spec.so in engine building, manually build model_spec.so by
-
-```bash
-make -C cpp/build/ modelSpec
+PYTHONPATH=examples/models/core/llama python3 cpp/tests/resources/scripts/build_llama_engines.py --only_multi_gpu
 ```
 
 #### Generate expected output
@@ -86,9 +84,7 @@ End-to-end tests read inputs and expected outputs from Numpy files located at [c
 
 ```bash
 PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_gpt_output.py
-PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_gptj_output.py
 PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_llama_output.py
-PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_chatglm_output.py
 PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_medusa_output.py
 PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_eagle_output.py
 PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_redrafter_output.py
@@ -107,7 +103,7 @@ PYTHONPATH=examples mpirun -n 4 python3 cpp/tests/resources/scripts/generate_exp
 After building the engines and generating the expected output execute the tests
 
 ```bash
-./$CPP_BUILD_DIR/tests/gptSessionTest
+./$CPP_BUILD_DIR/tests/batch_manager/trtGptModelRealDecoderTest
 ```
 
 ### Run all tests with ctest

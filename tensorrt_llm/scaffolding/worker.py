@@ -1,6 +1,5 @@
 from abc import ABC
-from copy import deepcopy
-from typing import Callable, List, Optional, Union
+from typing import Callable
 
 import openai
 from transformers import AutoTokenizer
@@ -8,6 +7,7 @@ from transformers import AutoTokenizer
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.executor import GenerationExecutor
 from tensorrt_llm.llmapi.llm import LLM
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 from .task import GenerationTask, Task, TaskStatus
@@ -65,25 +65,19 @@ class OpenaiWorker(Worker):
         self,
         async_client: openai.AsyncOpenAI,
         model: str,
-        max_tokens: int = 2048,
-        temperature: float = 0.9,
-        top_p: Optional[float] = None,
     ):
         self.model = model
         self.async_client = async_client
-        self.max_tokens = max_tokens
-        self.temperature = temperature
-        self.top_p = top_p
 
-    def combine_params_with_generation_task(self, params: dict,
-                                            task: GenerationTask):
-        params["prompt"] = task.input_str
-
-        add_param_if_not_none(params, "max_tokens",
-                              [task.max_tokens, self.max_tokens])
-        add_param_if_not_none(params, "temperature",
-                              [task.temperature, self.temperature])
-        add_param_if_not_none(params, "top_p", [task.top_p, self.top_p])
+    def convert_task_params(self, task: GenerationTask):
+        params = {
+            "model": self.model,
+            "prompt": task.input_str,
+        }
+        add_param_if_not_none(params, "max_tokens", [task.max_tokens])
+        add_param_if_not_none(params, "temperature", [task.temperature])
+        add_param_if_not_none(params, "top_p", [task.top_p])
+        return params
 
     def fill_generation_task_with_response(self, task: GenerationTask,
                                            response: openai.Completion):
@@ -91,12 +85,7 @@ class OpenaiWorker(Worker):
         task.logprobs = response.choices[0].logprobs
 
     async def generation_handler(self, task: GenerationTask) -> TaskStatus:
-        params = {}
-
-        # Set required parameters
-        params["model"] = self.model
-
-        self.combine_params_with_generation_task(params, task)
+        params = self.convert_task_params(task)
 
         # Make the API call
         try:
@@ -120,17 +109,12 @@ class OpenaiWorker(Worker):
 # worker inherit from OpenaiWorker
 # add TRT-LLM openai server special params
 class TRTOpenaiWorker(OpenaiWorker):
-    # just manager the TRT-LLM openai server special params
-    def __init__(self, top_k: Optional[float] = None, **kwargs):
-        self.top_k = top_k
-        super().__init__(**kwargs)
 
-    def combine_params_with_generation_task(self, params: dict,
-                                            task: GenerationTask):
-        super().combine_params_with_generation_task(params, task)
-        extra_body = {}
-        add_param_if_not_none(extra_body, "top_k", [task.top_k, self.top_k])
-        params["extra_body"] = extra_body
+    def convert_task_params(self, task: GenerationTask):
+        params = super().convert_task_params(task)
+        if task.top_k is not None:
+            params["extra_body"] = {"top_k": task.top_k}
+        return params
 
 
 class TRTLLMWorker(Worker):
@@ -139,33 +123,27 @@ class TRTLLMWorker(Worker):
         self,
         llm: LLM,
         tokenizer: AutoTokenizer,
-        max_num_tokens: int = 2048,
-        temperature: float = 0.9,
-        top_p: Optional[float] = None,
-        topk: Optional[float] = None,
-        stop: Optional[Union[str, List[str]]] = None,
     ):
         self.llm = llm
         self.tokenizer = tokenizer
-        self.default_sampling_params = SamplingParams(max_tokens=max_num_tokens,
-                                                      temperature=temperature,
-                                                      top_p=top_p,
-                                                      top_k=topk,
-                                                      stop=stop)
-
-        self.default_sampling_params._setup(self.tokenizer)
         self.own_llm = False
 
     @classmethod
-    def init_with_new_llm(cls,
-                          model_dir: str,
-                          backend: str = None,
-                          max_batch_size: int = 32,
-                          **kwargs):
+    def init_with_new_llm(
+        cls,
+        model_dir: str,
+        backend: str = "pytorch",
+        max_batch_size: int = 32,
+        max_num_tokens: int = 4096,
+        kv_cache_free_gpu_memory_fraction: float = 0.9,
+        disable_overlap_scheduler: bool = False,
+    ):
         pytorch_backend_config = PyTorchConfig(
-            mixed_decoder=True,
-            enable_overlap_scheduler=True,
+            mixed_sampler=True,
+            disable_overlap_scheduler=disable_overlap_scheduler,
         )
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction, )
 
         tokenizer = AutoTokenizer.from_pretrained(
             model_dir,
@@ -180,27 +158,25 @@ class TRTLLMWorker(Worker):
                   backend=backend,
                   tokenizer=tokenizer,
                   pytorch_backend_config=pytorch_backend_config,
+                  kv_cache_config=kv_cache_config,
                   max_batch_size=max_batch_size,
-                  max_num_tokens=kwargs.get("max_num_tokens", 2048))
+                  max_num_tokens=max_num_tokens)
 
-        worker = cls(llm, tokenizer, **kwargs)
+        worker = cls(llm, tokenizer)
         worker.own_llm = True
         return worker
 
-    def combine_sampling_params_with_generation_task(self,
-                                                     task: GenerationTask):
-        sampling_params = deepcopy(self.default_sampling_params)
-
-        add_attr_if_not_none(sampling_params, "max_tokens", [task.max_tokens])
-        add_attr_if_not_none(sampling_params, "temperature", [task.temperature])
-        add_attr_if_not_none(sampling_params, "top_p", [task.top_p])
-        add_attr_if_not_none(sampling_params, "top_k", [task.top_k])
-
+    def convert_task_params(self, task: GenerationTask):
+        sampling_params = SamplingParams(
+            max_tokens=task.max_tokens,
+            temperature=task.temperature,
+            top_p=task.top_p,
+            top_k=task.top_k,
+            return_context_logits=task.return_context_logits)
         return sampling_params
 
     async def generation_handler(self, task: GenerationTask) -> TaskStatus:
-        sampling_params = self.combine_sampling_params_with_generation_task(
-            task)
+        sampling_params = self.convert_task_params(task)
 
         result = await self.llm.generate_async(task.input_str,
                                                sampling_params=sampling_params)
@@ -209,6 +185,7 @@ class TRTLLMWorker(Worker):
         task.cumulative_logprob = result.outputs[0].cumulative_logprob
         task.logprobs = result.outputs[0].logprobs
         task.output_str = result.outputs[0].text
+        task.context_logits = result.context_logits
 
         # TODO: error handle
         return TaskStatus.SUCCESS

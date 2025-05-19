@@ -126,6 +126,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
     if (mUseTllmGen)
     {
         TLLM_LOG_DEBUG("Running TRTLLM-GEN context FMHA kernel.");
+        TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
         // Convert from MHAFixedParams + MHARunnerParams to TllmGenFmhaRunnerParams
         void const* kvPoolPtr = nullptr;
         void const* kvPageIdxPtr = nullptr;
@@ -189,10 +190,9 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.mScaleQ = mFixedParams.qScaling;
         if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_PAGED_KV)
         {
-            auto const [freeMemory, totalMemory] = tensorrt_llm::common::getDeviceMemoryInfo(false);
             // The kv cache should be based on the maximum headDim of K and V due to paddings.
             int maxHeadDimKv = std::max(tllmRunnerParams.mHeadDimQk, tllmRunnerParams.mHeadDimV);
-            tllmRunnerParams.mNumPagesInMemPool = totalMemory
+            tllmRunnerParams.mNumPagesInMemPool = mTllmGenFMHARunner->getTotalDeviceMemory()
                 / (tllmRunnerParams.mNumHeadsKv * tllmRunnerParams.mNumTokensPerPage * maxHeadDimKv
                     * get_size_in_bytes(mFixedParams.dataType));
         }

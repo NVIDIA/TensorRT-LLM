@@ -1,10 +1,12 @@
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.lora_manager import HfLoraLoader
+from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
@@ -41,7 +43,7 @@ def _create_linear_from_configs(model_config: ModelConfig[PretrainedConfig],
         tensor_parallel_mode=TensorParallelMode.COLUMN,
         gather_output=True,
         quant_config=model_config.get_quant_config(),
-        skip_create_weights=model_config.skip_create_weights,
+        skip_create_weights_in_init=model_config.skip_create_weights_in_init,
     )
 
 
@@ -75,8 +77,12 @@ class LinearAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        lora_params: Optional[dict] = None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        if lora_params is not None:
+            raise NotImplementedError(
+                "LinearAttention with LoRA is not supported yet")
         return self.linear_attn(hidden_states)
 
 
@@ -87,7 +93,12 @@ class LinearMLP(nn.Module):
         super().__init__()
         self.linear_mlp = _create_linear_from_configs(model_config, config)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self,
+                hidden_states: torch.Tensor,
+                lora_params: Optional[dict] = None) -> torch.Tensor:
+        if lora_params is not None:
+            raise NotImplementedError(
+                "LinearMLP with LoRA is not supported yet")
         return self.linear_mlp(hidden_states)
 
 
@@ -121,7 +132,8 @@ class NemotronNASDecoderLayer(DecoderLayer):
                         self.block_config.ffn.ffn_mult, config.hidden_size),
                     bias=False,
                     dtype=config.torch_dtype,
-                    config=model_config)
+                    config=model_config,
+                    layer_idx=layer_idx)
 
     def forward(
         self,
@@ -147,7 +159,7 @@ class NemotronNASDecoderLayer(DecoderLayer):
             # Fully Connected
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(hidden_states, **kwargs)
             hidden_states = residual + hidden_states
 
         return hidden_states
@@ -165,11 +177,35 @@ class NemotronNASModel(DecoderModel):
             for block in config.block_configs
         ]
 
+        vocab_size = config.vocab_size
+        self.has_custom_embed_tokens = False
+        if hasattr(
+                model_config,
+                'lora_config') and model_config.lora_config is not None and len(
+                    model_config.lora_config.lora_dir) == 1:
+            lora_loader = HfLoraLoader(model_config.lora_config.lora_dir)
+            if lora_loader.vocab_size != 0 and lora_loader.embed_tokens is not None:
+                vocab_size = lora_loader.vocab_size
+                weight = lora_loader.embed_tokens
+                self.has_custom_embed_tokens = True
+
         self.embed_tokens = Embedding(
-            config.vocab_size,
+            vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
         )
+
+        if self.has_custom_embed_tokens:
+            with torch.no_grad():
+                if model_config.mapping.tp_size > 1:
+                    weight = split_matrix_tp(
+                        weight,
+                        model_config.mapping.tp_size,
+                        model_config.mapping.tp_rank,
+                        dim=0)  # split by vocabulary dimension
+                x = weight.to(self.embed_tokens.dtype)
+                self.embed_tokens.weight.data.copy_(x)
+
         self.layers = nn.ModuleList([
             NemotronNASDecoderLayer(model_config, block_config, layer_idx)
             for layer_idx, block_config in enumerate(config.block_configs)

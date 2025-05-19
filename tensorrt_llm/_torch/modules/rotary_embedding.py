@@ -3,7 +3,7 @@ from typing import List
 import torch
 from torch import nn
 
-from ..attention_backend import IS_FLASHINFER_AVAIABLE
+from ..attention_backend import IS_FLASHINFER_AVAILABLE
 from ..attention_backend.interface import RopeParams
 
 
@@ -34,7 +34,7 @@ class RotaryEmbedding(nn.Module):
         This is useful if q_len = k_len, in which case we may RoPE q and k with the same cos and sin values.
         However, if k is cached without positional embedding, we need to apply rope to q and k with different values, so we need a separate call for each.
         """
-        if IS_FLASHINFER_AVAIABLE and len(targets) == 2:
+        if IS_FLASHINFER_AVAILABLE and len(targets) == 2:
             from ..custom_ops import \
                 flashinfer_apply_rope_with_cos_sin_cache_inplace
             q = targets[0]

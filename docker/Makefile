@@ -25,10 +25,15 @@ STAGE              ?=
 # Set this to define a custom image name and tag
 IMAGE_WITH_TAG     ?= $(IMAGE_NAME)$(if $(STAGE),/$(STAGE)):$(IMAGE_TAG)
 PUSH_TO_STAGING    ?= 1
-DOCKER_BUILD_OPTS  ?= --pull
+DOCKER_BUILD_OPTS  ?= --pull --load
 DOCKER_BUILD_ARGS  ?=
 DOCKER_PROGRESS    ?= auto
 CUDA_ARCHS         ?=
+PLATFORM           ?= $(shell uname -m | grep -q 'aarch64' && echo "arm64" || echo "amd64")
+ifeq ($(PLATFORM), arm64)
+  CUDA_ARCHS = '90-real;100-real;120-real'
+endif
+
 BUILD_WHEEL_OPTS   ?=
 BUILD_WHEEL_ARGS   ?= $(shell grep 'ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))
 TORCH_INSTALL_TYPE ?= skip
@@ -41,6 +46,7 @@ GIT_COMMIT         ?= $(shell git rev-parse HEAD)
 TRT_LLM_VERSION    ?= $(shell grep '^__version__' ../tensorrt_llm/version.py | grep -o '=.*' | tr -d '= "')
 GITHUB_MIRROR      ?=
 PYTHON_VERSION     ?=
+NGC_STAGING_REPO   ?= nvcr.io/nvstaging/tensorrt-llm
 
 define add_local_user
 	docker build \
@@ -63,7 +69,7 @@ endef
 %_build: DEVEL_IMAGE = $(if $(findstring 1,$(JENKINS_DEVEL)),$(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"'))
 %_build:
 	@echo "Building docker image: $(IMAGE_WITH_TAG)"
-	DOCKER_BUILDKIT=1 docker build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
+	docker buildx build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
 		--progress $(DOCKER_PROGRESS) \
 		$(if $(BASE_IMAGE), --build-arg BASE_IMAGE=$(BASE_IMAGE)) \
 		$(if $(BASE_TAG), --build-arg BASE_TAG=$(BASE_TAG)) \
@@ -105,10 +111,19 @@ endef
 
 DOCKER_RUN_OPTS   ?= --rm -it --ipc=host --ulimit memlock=-1 --ulimit stack=67108864
 DOCKER_RUN_ARGS   ?=
-GPU_OPTS          ?= --gpus=all
+# Check if NVIDIA_VISIBLE_DEVICES is set and not empty
+NVIDIA_VISIBLE_DEVICES_VAL = $(shell echo $$NVIDIA_VISIBLE_DEVICES)
+ifeq ($(NVIDIA_VISIBLE_DEVICES_VAL),)
+  # If empty or not set, use all GPUs
+  GPU_OPTS ?= --gpus=all
+else
+  # If set, use the specified devices
+  GPU_OPTS ?= --gpus='"device=$(NVIDIA_VISIBLE_DEVICES_VAL)"'
+endif
 SOURCE_DIR        ?= $(shell readlink -f ..)
 CODE_DIR          ?= /code/tensorrt_llm
 CCACHE_DIR        ?= ${CODE_DIR}/cpp/.ccache
+CONAN_DIR         ?= ${CODE_DIR}/cpp/.conan
 RUN_CMD           ?=
 CONTAINER_NAME    ?= tensorrt_llm
 WORK_DIR          ?= $(CODE_DIR)
@@ -126,6 +141,7 @@ endif
     		--volume $(SOURCE_DIR):$(CODE_DIR) \
     		--env "CCACHE_DIR=${CCACHE_DIR}" \
     		--env "CCACHE_BASEDIR=${CODE_DIR}" \
+    	    --env "CONAN_HOME=${CONAN_DIR}" \
     		--workdir $(WORK_DIR) \
     		--hostname $(shell hostname)-$* \
     		--name $(CONTAINER_NAME)-$*-$(USER_NAME) \
@@ -133,6 +149,7 @@ endif
     		$(IMAGE_WITH_TAG)$(IMAGE_TAG_SUFFIX) $(RUN_CMD)
 
 devel_%: STAGE = devel
+tritondevel_%: STAGE = tritondevel
 
 wheel_%: STAGE = wheel
 wheel_run: WORK_DIR = /src/tensorrt_llm
@@ -152,23 +169,55 @@ jenkins-aarch64_%: STAGE = devel
 jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell grep 'LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 jenkins-rockylinux8_%: STAGE = devel
 jenkins-rockylinux8_%: BASE_IMAGE = nvidia/cuda
-jenkins-rockylinux8_%: BASE_TAG = 12.8.1-devel-rockylinux8
+jenkins-rockylinux8_%: BASE_TAG = 12.9.0-devel-rockylinux8
 
 rockylinux8_%: STAGE = devel
 rockylinux8_%: BASE_IMAGE = nvidia/cuda
-rockylinux8_%: BASE_TAG = 12.8.1-devel-rockylinux8
+rockylinux8_%: BASE_TAG = 12.9.0-devel-rockylinux8
 
 # For x86_64 and aarch64
 ubuntu22_%: STAGE = devel
 ubuntu22_%: BASE_IMAGE = nvidia/cuda
-ubuntu22_%: BASE_TAG = 12.8.1-devel-ubuntu22.04
+ubuntu22_%: BASE_TAG = 12.9.0-devel-ubuntu22.04
 
 trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0
-trtllm_%: DEVEL_IMAGE = $(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
+trtllm_%: DEVEL_IMAGE = $(shell \
+    if [ "$(PLATFORM)" = "amd64" ]; then \
+        grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"'; \
+    elif [ "$(PLATFORM)" = "arm64" ]; then \
+        grep 'LLM_SBSA_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"'; \
+    fi)
 trtllm_%: IMAGE_NAME = $(shell grep 'IMAGE_NAME = ' ../jenkins/BuildDockerImage.groovy | grep -o '".*"' | tr -d '"')
-trtllm_%: IMAGE_TAG = $(shell git rev-parse --abbrev-ref HEAD | tr '/' '_')
+trtllm_%: IMAGE_TAG = $(shell git rev-parse --abbrev-ref HEAD | tr '/' '_')-$(PLATFORM)
 trtllm_run: WORK_DIR = /app/tensorrt_llm
+
+# This requires a docker installation with multi-platform support
+ngc-devel_%: STAGE = devel
+ngc-devel_%: DOCKER_BUILD_OPTS = --pull --builder=multi-builder --platform linux/arm64,linux/amd64
+ngc-devel_%: IMAGE_NAME = $(NGC_STAGING_REPO)
+ngc-devel_%: IMAGE_TAG = $(TRT_LLM_VERSION)
+
+ngc-devel_push: DOCKER_BUILD_ARGS = --push
+ngc-devel_push: ngc-devel_build ;
+
+ngc-release_%: STAGE = release
+ngc-release_%: DOCKER_BUILD_OPTS = --pull --load --platform linux/$(PLATFORM)
+ngc-release_%: DEVEL_IMAGE = $(NGC_STAGING_REPO)/devel:$(TRT_LLM_VERSION)
+ngc-release_%: IMAGE_NAME = nvcr.io/nvstaging/tensorrt-llm
+ngc-release_%: IMAGE_TAG = $(TRT_LLM_VERSION)-$(PLATFORM)
+
+ngc-manifest_%: STAGE = release
+ngc-manifest_%: IMAGE_NAME = $(NGC_STAGING_REPO)
+ngc-manifest_%: IMAGE_TAG = $(TRT_LLM_VERSION)
+
+ngc-manifest_create:
+	docker manifest create $(IMAGE_WITH_TAG) \
+  		--amend $(IMAGE_WITH_TAG)-amd64 \
+  		--amend $(IMAGE_WITH_TAG)-arm64
+
+ngc-manifest_push:
+	docker manifest push $(IMAGE_WITH_TAG)
 
 build: devel_build ;
 
@@ -176,4 +225,4 @@ push: devel_push ;
 
 run: devel_run ;
 
-.PHONY: build push run
+.PHONY: build push run ngc-manifest_create ngc-manifest_push

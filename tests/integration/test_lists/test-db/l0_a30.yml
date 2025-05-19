@@ -39,10 +39,17 @@ l0_a30:
       backend: cpp
   tests:
   # ------------- CPP tests ---------------
-  - test_cpp.py::test_unit_tests[80]
-  - test_cpp.py::test_model[gpt-80]
-  - test_cpp.py::test_model[gpt_executor-80]
-  - test_cpp.py::test_benchmarks[gpt-80]
+  - cpp/test_unit_tests.py::test_unit_tests[batch_manager-80]
+  - cpp/test_unit_tests.py::test_unit_tests[common-80]
+  - cpp/test_unit_tests.py::test_unit_tests[executor-80]
+  - cpp/test_unit_tests.py::test_unit_tests[kernels-80]
+  - cpp/test_unit_tests.py::test_unit_tests[layers-80]
+  - cpp/test_unit_tests.py::test_unit_tests[runtime-80]
+  - cpp/test_unit_tests.py::test_unit_tests[thop-80]
+  - cpp/test_unit_tests.py::test_unit_tests[utils-80]
+  - cpp/test_e2e.py::test_model[-gpt-80]
+  - cpp/test_e2e.py::test_model[-gpt_executor-80]
+  - cpp/test_e2e.py::test_model[-gpt_tests-80]
 - condition:
     ranges:
       system_gpu_count:
@@ -132,10 +139,9 @@ l0_a30:
   - accuracy/test_cli_flow.py::TestLlama7B::test_manage_weights # 2 mins
   - accuracy/test_llm_api.py::TestQwen2_7BInstruct::test_weight_only
   - examples/test_llama.py::test_llm_llama_v2_1gpu_auto_parallel[llama-v2-7b-hf] # 15 mins
-  - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization] # 5 mins
+  - accuracy/test_cli_flow.py::TestMistral7B::test_beam_search # 5 mins
   - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization_long] # 6 mins
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:2-disable_fp8]
-  - examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone_3.0_7.8b_instruct-float16-nb:1] # ? mins
   - examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone_3.0_7.8b_instruct-float16-nb:4] # ? mins
   - examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone_deep_2.4b-float16-nb:4]
   - examples/test_exaone.py::test_llm_exaone_2gpu[exaone_3.0_7.8b_instruct-float16-nb:1] # ? mins
@@ -143,3 +149,78 @@ l0_a30:
   - examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[no_streaming-gpt2-use_cpp_session-use_tokens-draft_len_4-float16-bs2] # 1 min
   - examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[no_streaming-gpt2-use_cpp_session-use_logits-draft_len_4-float16-bs2] # 1 min
   - examples/test_prompt_lookup.py::test_llm_prompt_lookup_1gpu[no_streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-prompt_lookup_num_tokens_8-float16-bs2] # 1 min
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a30*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: cpp
+  tests:
+  - cpp/test_e2e.py::test_benchmarks[gpt-80]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a30*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: triton
+  tests:
+  - triton_server/test_triton.py::test_gpt[gpt]
+  - triton_server/test_triton.py::test_opt[opt]
+  - triton_server/test_triton.py::test_llama[llama]
+  - triton_server/test_triton.py::test_gptj[gptj]
+  - triton_server/test_triton.py::test_mistral[mistral]
+  - triton_server/test_triton.py::test_whisper[whisper]
+  - triton_server/test_triton.py::test_t5_ib[t5-ib]
+  - triton_server/test_triton.py::test_mistral_ib[mistral-ib]
+  - triton_server/test_triton.py::test_mistral_ib_streaming[mistral-ib-streaming]
+  - triton_server/test_triton.py::test_mistral_ib_mm[mistral-ib-mm]
+  - triton_server/test_triton.py::test_gpt_ib_streaming[gpt-ib-streaming]
+  - triton_server/test_triton.py::test_cpp_unit_tests[cpp-unit-tests]
+  - triton_server/test_triton.py::test_python_bls_unit_tests[python-bls-unit-tests]
+  - triton_server/test_triton.py::test_python_preproc_unit_tests[python-preproc-unit-tests]
+  - triton_server/test_triton.py::test_fill_template[fill-template]
+  - triton_server/test_triton.py::test_python_multimodal_encoders_unit_tests[python-multimodal-encoders-unit-tests]
+  - triton_server/test_triton.py::test_triton_extensive[triton-extensive]
+  - triton_server/test_triton.py::test_llmapi_unit_tests[llmapi-unit-tests]
+  - triton_server/test_triton_llm.py::test_mistral_v1_7b_python_backend[accuracy]
+  - triton_server/test_triton_llm.py::test_mistral_v1_7b_python_backend[e2e]
+  - triton_server/test_triton_llm.py::test_gpt_350m_python_backend[accuracy]
+  - triton_server/test_triton_llm.py::test_gpt_350m_python_backend[e2e]
+  - triton_server/test_triton_llm.py::test_gpt_350m_ifb[test_basic-False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-max_utilization-1-1-1-True-tensorrt_llm_bls]
+  - triton_server/test_triton_llm.py::test_llama_v2_7b_ifb[batched_inputs-False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-max_utilization-1-1-1-True-tensorrt_llm_bls]
+  - triton_server/test_triton_llm.py::test_llava[False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-max_utilization-1-1-1-False-tensorrt_llm_bls]
+  - triton_server/test_triton_llm.py::test_medusa_vicuna_7b_ifb[False-1-medusa-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-max_utilization-1-1-1-False-ensemble]
+  - triton_server/test_triton_llm.py::test_eagle_vicuna_7b_ifb[False-1-eagle-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-max_utilization-1-1-1-False-ensemble]
+  - triton_server/test_triton_llm.py::test_llama_v2_7b_ifb[test_stop_words-False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-max_utilization-1-1-1-True-tensorrt_llm_bls]
+  - triton_server/test_triton_llm.py::test_mistral_v1_7b_ifb[False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-max_utilization-4096-1-1-1-False-ensemble]
+  - triton_server/test_triton_llm.py::test_mistral_v1_multi_models[False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-max_utilization-4096-1-1-1-False-ensemble]
+  - triton_server/test_triton_llm.py::test_gpt_350m_speculative_decoding_return_logits[False-1-False-True-True-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.2-max_utilization-1-1-1-False-ensemble]
+  - triton_server/test_triton_llm.py::test_t5_small_enc_dec_ifb[test_basic-False-1-top_k_top_p-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-guaranteed_no_evict-4096-1-1-1-False-tensorrt_llm_bls]
+  - triton_server/test_triton_llm.py::test_gpt_speculative_decoding_bls[False-False-1-False-True-True-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.2-guaranteed_no_evict-1-1-1-False-ensemble]
+  - triton_server/test_triton_llm.py::test_benchmark_core_model[llama_v2_7b-False-1-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-max_utilization-4096-1-1-1-False]
+  - triton_server/test_triton_llm.py::test_benchmark_core_model[gptj_6b-False-1-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-max_utilization-4096-1-1-1-False]
+  - triton_server/test_triton_llm.py::test_gpt_speculative_decoding_bls[True-False-1-False-True-True-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.2-max_utilization-1-1-1-False-ensemble]
+  - triton_server/test_triton_llm.py::test_gpt_speculative_decoding_bls[True-False-1-False-True-True-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.2-guaranteed_no_evict-1-1-1-False-ensemble]
+  - triton_server/test_triton_llm.py::test_whisper_large_v3_ifb[True-1-top_k_top_p-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.2-0.5-guaranteed_no_evict-24000-1-1-1-False-ensemble]
+  - triton_server/test_triton_llm.py::test_llava_onevision[test_video-False-1-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.2-guaranteed_no_evict-1-1-1-False-tensorrt_llm_bls]
+  - triton_server/test_triton_llm.py::test_llava_onevision[test_basic-False-1-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.2-max_utilization-1-1-1-False-tensorrt_llm_bls]
+  - triton_server/test_triton_llm.py::test_tiny_llama_1b_guided_decoding[xgrammar-tensorrtllm-True-1-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-guaranteed_no_evict-1-1-1-False-ensemble-accuracy]
+  - triton_server/test_triton_llm.py::test_tiny_llama_1b_guided_decoding[xgrammar-python-True-1-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-guaranteed_no_evict-1-1-1-False-ensemble-accuracy]
+  - triton_server/test_triton_llm.py::test_gpt_disaggregated_serving_bls[test_basic-False-1-top_k_top_p-False-True-True-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.2-max_utilization-1-1-1-True-tensorrt_llm_bls]
+  - triton_server/test_triton_llm.py::test_llama_v2_70b_ifb_lad[7-7-7-False-1-lookahead-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-max_utilization-1-1-1-False-ensemble]
+  - triton_server/test_triton_llm.py::test_llmapi_backend[1-0-disableDecoupleMode-tensorrt_llm]
+  - triton_server/test_triton_llm.py::test_llmapi_backend[1-0-enableDecoupleMode-tensorrt_llm]
+  - triton_server/test_triton_rcca.py::test_mistral_beam_search[rcca_4714407-True-10-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-guaranteed_no_evict-1-1-1-False-ensemble]
+  - triton_server/test_triton_rcca.py::test_rcca_bug_4934893[Temperature:0.5-TOP_P:0.95-TOP_K:10-False-1-False-True-False-0-2048-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-max_utilization-1-1-1-False-ensemble]

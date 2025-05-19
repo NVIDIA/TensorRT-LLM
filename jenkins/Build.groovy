@@ -16,7 +16,7 @@ AARCH64_TRIPLE = "aarch64-linux-gnu"
 
 LLM_DOCKER_IMAGE = env.dockerImage
 
-AGENT_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.01-py3-x86_64-ubuntu24.04-trt10.8.0.43-skip-devel-202503131720-8877"
+AGENT_IMAGE = env.dockerImage
 
 POD_TIMEOUT_SECONDS = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
 
@@ -50,7 +50,7 @@ def BUILD_CONFIGS = [
   // Vanilla TARNAME is used for packaging in runLLMPackage
   // cmake-vars cannot be empty, so passing (default) multi-device configuration.
   (CONFIG_LINUX_X86_64_VANILLA) : [
-    (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --micro_benchmarks",
+    (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --micro_benchmarks",
     (TARNAME) : "TensorRT-LLM.tar.gz",
     (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;120-real",
   ],
@@ -74,6 +74,18 @@ def BUILD_CONFIGS = [
     (TARNAME) : "llvm-TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;120-real",
   ],
+]
+
+@Field
+def GITHUB_PR_API_URL = "github_pr_api_url"
+@Field
+def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
+@Field
+def ACTION_INFO = "action_info"
+def globalVars = [
+    (GITHUB_PR_API_URL): null,
+    (CACHED_CHANGED_FILE_LIST): null,
+    (ACTION_INFO): null,
 ]
 
 // TODO: Move common variables to an unified location
@@ -180,7 +192,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                     claimName: sw-tensorrt-pvc
     """
     if (arch == "arm64") {
-        // WAR: PVC mount is not setup on GH200 machines, use a small local cache as a WAR
+        // PVC mount isn't supported on aarch64 platform. Use NFS as a WAR.
         pvcVolume = """
                 - name: sw-tensorrt-pvc
                   nfs:
@@ -402,26 +414,33 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
         trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, "cp312")
     }
 
-    sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]} --benchmarks --extra-make-targets modelSpec"
+    withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
+        sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]} --benchmarks"
+    }
     if (is_linux_x86_64) {
         sh "cd ${LLM_ROOT} && python3 scripts/build_cpp_examples.py"
+
+        // Build tritonserver artifacts
+        def llmPath = sh (script: "realpath ${LLM_ROOT}",returnStdout: true).trim()
+        sh "cd ${LLM_ROOT}/triton_backend/inflight_batcher_llm && mkdir build && cd build && cmake .. -DTRTLLM_DIR=${llmPath} -DUSE_CXX11_ABI=ON && make -j${BUILD_JOBS} install"
     }
 
     // Step 3: packaging wheels into tarfile
     sh "cp ${LLM_ROOT}/build/tensorrt_llm-*.whl TensorRT-LLM/"
 
-    // Step 4: packaging benchmark and required cpp dependencies into tarfile
+    // Step 4: packaging tritonserver artifacts into tarfile
+    if (is_linux_x86_64) {
+        sh "mkdir -p TensorRT-LLM/triton_backend/inflight_batcher_llm/"
+        sh "cp ${LLM_ROOT}/triton_backend/inflight_batcher_llm/build/libtriton_tensorrtllm.so TensorRT-LLM/triton_backend/inflight_batcher_llm/"
+        sh "cp ${LLM_ROOT}/triton_backend/inflight_batcher_llm/build/trtllmExecutorWorker TensorRT-LLM/triton_backend/inflight_batcher_llm/"
+    }
+
+    // Step 5: packaging benchmark and required cpp dependencies into tarfile
     sh "mkdir -p TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/benchmarks/bertBenchmark TensorRT-LLM/benchmarks/cpp"
-    sh "cp ${LLM_ROOT}/cpp/build/benchmarks/gptSessionBenchmark TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/benchmarks/gptManagerBenchmark TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/libtensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
-    sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.so TensorRT-LLM/benchmarks/cpp"
-
-    // Copy model_spec.so (pybinding for ModelSpec) since various tests will need it.
-    sh "mkdir -p TensorRT-LLM/src/cpp/tests/batch_manager"
-    sh "cp ${LLM_ROOT}/cpp/build/tests/batch_manager/model_spec.so TensorRT-LLM/src/cpp/tests/batch_manager/"
 
     if (is_linux_x86_64) {
         sh "rm -rf ${tarName}"
@@ -469,7 +488,9 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
     }
     sh "bash -c 'git config --global --add safe.directory \"*\"'"
     // Because different architectures involve different macros, a comprehensive test is conducted here.
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c \"cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${extra_args}\"")
+    withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c \"cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${extra_args}\"")
+    }
 }
 
 def prepareBuildLib(pipeline, triple, pre_cxx11abi)
@@ -482,7 +503,6 @@ def prepareBuildLib(pipeline, triple, pre_cxx11abi)
     if ((triple == X86_64_TRIPLE && pre_cxx11abi) || (triple == AARCH64_TRIPLE && !pre_cxx11abi)) {
         libraries += [
             "ucx_wrapper",
-            "nvrtc_wrapper",
         ]
     }
 
@@ -496,8 +516,6 @@ def prepareBuildLib(pipeline, triple, pre_cxx11abi)
         } else if (library_name == "executor") {
             libdir = "tensorrt_llm/executor"
             is_static = true
-        } else if (library_name == "nvrtc_wrapper") {
-            libdir = "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper"
         } else if (library_name == "internal_cutlass_kernels"){
             libdir = "tensorrt_llm/kernels/internal_cutlass_kernels"
             is_static = true
@@ -589,7 +607,7 @@ def runLLMPackage(pipeline, archTriple, tarFileName, linuxPkgName)
     sh "cd ${llmPath} && ls -alh"
 }
 
-def launchStages(pipeline, cpu_arch, enableFailFast)
+def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
 {
     stage("Show Environment") {
         sh "env | sort"
@@ -598,9 +616,13 @@ def launchStages(pipeline, cpu_arch, enableFailFast)
         echo "gitlabCommit: ${env.gitlabCommit}"
         echo "alternativeTRT: ${env.alternativeTRT}"
         echo "Using GitLab repo: ${LLM_REPO}. Commit: ${env.gitlabCommit}"
+
+        echo "env.globalVars is: ${env.globalVars}"
+        globalVars = trtllm_utils.updateMapWithJson(pipeline, globalVars, env.globalVars, "globalVars")
+        globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(pipeline, globalVars[ACTION_INFO])
     }
 
-    def wheelDockerImage = env.wheelDockerImage
+    def wheelDockerImage = env.wheelDockerImagePy310
     if (!wheelDockerImage && cpu_arch == AARCH64_TRIPLE) {
         wheelDockerImage = env.dockerImage
     }
@@ -714,7 +736,7 @@ pipeline {
     stages {
         stage("BuildJob") {
             steps {
-                launchStages(this, params.targetArch, params.enableFailFast)
+                launchStages(this, params.targetArch, params.enableFailFast, globalVars)
             }
         }
     } // stage

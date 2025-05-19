@@ -1,19 +1,19 @@
 ### Get KV Cache Events
 
-import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+from tensorrt_llm.llmapi import KvCacheConfig
 
 
 def main():
-    pytorch_config = PyTorchConfig(enable_overlap_scheduler=True,
+    pytorch_config = PyTorchConfig(autotuner_enabled=False,
                                    kv_cache_dtype='auto')
 
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
               tensor_parallel_size=2,
               pytorch_backend_config=pytorch_config,
-              kv_cache_config=trtllm.KvCacheConfig(enable_block_reuse=True,
-                                                   event_buffer_max_size=1024),
+              kv_cache_config=KvCacheConfig(enable_block_reuse=True,
+                                            event_buffer_max_size=1024),
               backend="pytorch")
 
     # Sample prompts having a common prefix.
@@ -42,7 +42,8 @@ def main():
     print(kv_events)
 
     # Got output like follows:
-    # {'event_id': 0, 'data': {'type': 'created', 'num_blocks_per_cache_level': [101230, 0]}}, {'event_id': 1, 'data': {'type': 'stored', 'parent_hash': None, 'blocks': [{'type': 'stored_block', 'block_hash': 4203099703668305365, 'tokens': [{'type': 'unique_token', 'token_id': 1, 'token_extra_id': 0}, ...
+    # [{'event_id': 0, 'data': {'type': 'created', 'num_blocks_per_cache_level': [101230, 0]}},
+    #  {'event_id': 1, 'data': {'type': 'stored', 'parent_hash': None, 'blocks': [{'type': 'stored_block', 'block_hash': 4203099703668305365, 'tokens': [{'type': 'unique_token', 'token_id': 1, 'token_extra_id': 0}, ...
 
 
 if __name__ == '__main__':

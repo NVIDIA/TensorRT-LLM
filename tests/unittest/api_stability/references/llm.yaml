@@ -14,6 +14,9 @@ methods:
       embedding_parallel_mode:
         annotation: str
         default: SHARDING_ALONG_VOCAB
+      moe_cluster_parallel_size:
+        annotation: Optional[int]
+        default: null
       # Engine building
       build_config:
         annotation: Optional[tensorrt_llm.builder.BuildConfig]
@@ -40,6 +43,9 @@ methods:
       decoding_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.DecodingConfig]
         default: null
+      cache_transceiver_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig]
+        default: null
       # Misc
       backend:
         annotation: Optional[str]
@@ -65,24 +71,27 @@ methods:
       workspace:
         annotation: Optional[str]
         default: null
+      # LoRA
+      max_lora_rank:
+        annotation: Optional[int]
+        default: null
+      max_loras:
+        annotation: int
+        default: 4
+      max_cpu_loras:
+        annotation: int
+        default: 4
       kwargs:
         annotation: Any
         default: inspect._empty
-
     return_annotation: None
   generate:
     parameters:
-      # TODO [TRTLLM-3925]
       disaggregated_params:
-        annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
+        annotation: Union[tensorrt_llm.disaggregated_params.DisaggregatedParams, Sequence[tensorrt_llm.disaggregated_params.DisaggregatedParams], NoneType]
         default: null
       kv_cache_retention_config:
-        annotation: Optional[tensorrt_llm.bindings.executor.KvCacheRetentionConfig]
-        default: null
-      queries:
-        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt,
-          Sequence[Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]],
-          NoneType]
+        annotation: Union[tensorrt_llm.bindings.executor.KvCacheRetentionConfig, Sequence[tensorrt_llm.bindings.executor.KvCacheRetentionConfig], NoneType]
         default: null
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
@@ -92,10 +101,6 @@ methods:
         default: null
       kv_cache_retention_config:
         annotation: Optional[tensorrt_llm.bindings.executor.KvCacheRetentionConfig]
-        default: null
-      queries:
-        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt,
-          NoneType]
         default: null
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
   get_kv_cache_events:

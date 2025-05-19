@@ -269,15 +269,14 @@ DECLARE_MMHA_NORMAL_AND_PAGED(__nv_bfloat16);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename T>
-inline int estimate_min_multi_block_count(int max_timesteps, int max_dynamic_shmem_per_block)
+inline int estimate_min_multi_block_count(int max_timesteps, int max_dynamic_shmem_per_block, int num_bytes_per_elt)
 {
     auto const qk_elts = static_cast<int>((max_timesteps + 1 + 4 - 1) / 4);
     int size_per_elts = 16;
 #ifndef MMHA_USE_FP32_ACUM_FOR_LOGITS
-    if (sizeof(T) != 4)
+    if (num_bytes_per_elt != 4)
     {
-        size_per_elts += 4 * sizeof(T);
+        size_per_elts += 4 * num_bytes_per_elt;
     }
 #endif
     int elts_per_block = max_dynamic_shmem_per_block / size_per_elts;

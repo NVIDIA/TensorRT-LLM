@@ -48,7 +48,7 @@ class LLaMAForCausalLM (DecoderModelForCausalLM):
 
 
 Then, in the convert_checkpoint.py script in the
-[`examples/llama/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama/) directory of the GitHub repo,
+[`examples/models/core/llama/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama/) directory of the GitHub repo,
 the logic can be greatly simplified. Even if the model definition code of TensorRT-LLM LLaMA class is changed due to some reason, the `from_hugging_face` API will keep the same, thus the existing workflow using this interface will not be affected.
 
 
@@ -68,7 +68,7 @@ In the 0.9 release, only LLaMA is refactored. Since popular LLaMA (and its varia
 
 
 In future releases, there might be `from_jax`, `from_nemo`, `from_keras` or other factory methods for different training checkpoints added.
-For example, the Gemma 2B model and the convert_checkpoint.py file in the [`examples/gemma`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gemma/)
+For example, the Gemma 2B model and the convert_checkpoint.py file in the [`examples/models/core/gemma`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/gemma/)
 directory support JAX and Keras formats in addition to Hugging Face. The model developers can choose to implement **any subset** of these factory methods for the models they contributed to TensorRT-LLM.
 
 

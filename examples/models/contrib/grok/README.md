@@ -22,7 +22,7 @@ The grok-1 model requires a node with 8x80GB GPU memory(at least).
 
 ## Overview
 
-The TensorRT-LLM Grok-1 implementation can be found in [tensorrt_llm/models/grok/model.py](../../../../tensorrt_llm/models/grok/model.py). The TensorRT-LLM Grok-1 example code is located in [`examples/grok`](./). There is one main file:
+The TensorRT-LLM Grok-1 implementation can be found in [tensorrt_llm/models/grok/model.py](../../../../tensorrt_llm/models/grok/model.py). The TensorRT-LLM Grok-1 example code is located in [`examples/models/contrib/grok`](./). There is one main file:
 
 * [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the Grok-1 model into tensorrt-llm checkpoint format.
 
@@ -38,7 +38,7 @@ In addition, there are two shared files in the parent folder [`examples`](../../
 
 ## Usage
 
-The TensorRT-LLM Grok-1 example code locates at [examples/grok](./). It takes xai weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
+The TensorRT-LLM Grok-1 example code locates at [examples/models/contrib/grok](./). It takes xai weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
 
 ### Build TensorRT engine(s)
 

@@ -66,7 +66,7 @@ def test_llm_glm_4_9b_single_gpu_summary(glm_4_9b_example_root,
                     model_temp_dir)
 
     summary_cmd = [
-        f"{glm_4_9b_example_root}/../summarize.py", "--test_trt_llm",
+        f"{glm_4_9b_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", f"{model_temp_dir}", "--data_type", "fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}",
         f"--dataset_dir={llm_datasets_root}", f"--rouge_dir={llm_rouge_root}"

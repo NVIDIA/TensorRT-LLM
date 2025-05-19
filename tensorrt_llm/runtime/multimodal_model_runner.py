@@ -357,6 +357,14 @@ class MultimodalModelRunner:
         self.stream = torch.cuda.Stream(torch.cuda.current_device())
         torch.cuda.set_stream(self.stream)
 
+        if self.args.mm_embedding_offloading is None:
+            self.args.mm_embedding_offloading = self.args.enable_chunked_context
+        elif self.args.mm_embedding_offloading and not self.args.enable_chunked_context:
+            logger.warning(
+                "mm_embedding_offloading requires enable_chunked_context to be True. Setting mm_embedding_offloading to None."
+            )
+            self.args.mm_embedding_offloading = None
+
         # parse model type from visual engine config
         with open(os.path.join(self.visual_engine_dir, "config.json"),
                   "r") as f:
@@ -405,6 +413,13 @@ class MultimodalModelRunner:
             if self.num_frames is None:
                 self.num_frames = 8
             assert self.args.video_path is None or self.args.image_path is None
+        if self.model_type == "pixtral":
+            hf_config = AutoConfig.from_pretrained(self.args.hf_model_dir)
+            self.image_size = hf_config.vision_config.image_size
+            self.patch_size = hf_config.vision_config.patch_size
+            self.vocab_size = hf_config.text_config.vocab_size
+            self.image_token_index = hf_config.image_token_index
+            self.spatial_merge_size = hf_config.spatial_merge_size
 
         self.audio_input_names = self.audio_output_names = None
         if self.model_type == "mllama":
@@ -609,6 +624,10 @@ class MultimodalModelRunner:
             self.processor = AutoProcessor.from_pretrained(
                 self.args.hf_model_dir, trust_remote_code=True, num_crops=16)
 
+        elif 'pixtral' in self.model_type:
+            self.processor = AutoProcessor.from_pretrained(
+                self.args.hf_model_dir)
+
         elif 'internlm' in self.model_type:
             image_size = 490
             self.processor = transforms.Compose([
@@ -788,6 +807,7 @@ class MultimodalModelRunner:
                     kv_cache_free_gpu_memory_fraction,
                     cross_kv_cache_fraction=cross_kv_cache_fraction,
                     multi_block_mode=self.args.multi_block_mode,
+                    mm_embedding_offloading=self.args.mm_embedding_offloading,
                 )
                 self.model_config = self.model.model_config
             self.runtime_mapping = self.model.mapping
@@ -886,6 +906,33 @@ class MultimodalModelRunner:
             audio_mask = audio.new_ones(*audio.shape[:2])
             audio_mask[-1, -pad:] = 0
             other_audio_inputs['attention_mask'] = audio_mask.bool()
+        elif self.model_type == 'pixtral':
+            # Hold on to pixel_values and input_ids.
+            dtype = str_dtype_to_torch(self.vision_precision)
+            pixel_values = image["pixel_values"].to(device="cuda", dtype=dtype)
+            input_ids = image["input_ids"].to(device="cuda")
+
+            # Shape of pixel values from the processor varies with the raw image.
+            # So we create a new tensor with a fixed shape as expected by the vision
+            # encoder and create a corresponding attention mask.
+            image_size = self.image_size
+            patch_size = self.patch_size
+            d_min = torch.finfo(dtype).min
+            num_patches = (image_size // patch_size)
+            image = torch.full((1, 3, image_size, image_size),
+                               fill_value=0,
+                               dtype=dtype,
+                               device="cuda")
+            attention_mask = torch.full((1, num_patches, num_patches),
+                                        fill_value=d_min,
+                                        dtype=dtype,
+                                        device="cuda")
+            h, w = pixel_values.shape[-2:]
+            image[..., :h, :w] = pixel_values
+            attention_mask[..., :h // patch_size, :w // patch_size] = 0
+            other_vision_inputs = {
+                "attention_mask": attention_mask,
+            }
         elif self.model_type == 'llava_next':
             input = image
             image = input['pixel_values']
@@ -1099,6 +1146,17 @@ class MultimodalModelRunner:
                 audio_features = audio_features.unsqueeze(0).repeat(
                     self.args.batch_size, 1, 1)
             length = input_ids.shape[1]
+
+        elif self.model_type == 'pixtral':
+            relevant_patch_size = self.patch_size * self.spatial_merge_size
+            output_img_size = self.image_size // relevant_patch_size
+            visual_features = visual_features.reshape(
+                output_img_size, output_img_size,
+                -1)[:h // relevant_patch_size, :w //
+                    relevant_patch_size].flatten(0, 1)
+            input_ids = self.ptuning_setup_pixtral(input_ids=input_ids)
+            length = input_ids.shape[1]
+
         elif self.model_type == 'llava_next':
             visual_features = LlavaNextUtils.rearrange_image_features(
                 visual_features, self.image_newlines["image_newline"],
@@ -1199,7 +1257,7 @@ class MultimodalModelRunner:
                 torch.int32)
 
         if self.model_type in [
-                'fuyu', 'kosmos-2', 'phi-3-vision', 'llava_next'
+                'fuyu', 'kosmos-2', 'phi-3-vision', 'llava_next', 'pixtral'
         ]:
             return input_ids, input_lengths, [
                 visual_features
@@ -1366,7 +1424,8 @@ class MultimodalModelRunner:
                 num_beams=self.args.num_beams,
                 lora_uids=self.args.lora_task_uids,
                 output_sequence_lengths=False,
-                return_dict=False)
+                return_dict=False,
+                mm_embedding_offloading=self.args.mm_embedding_offloading)
         elif self.model_type == "mllama":
             # When image is passed:
             # the shape of visual_features is [bs, 1, 4, 1025, hidden_size]
@@ -1557,6 +1616,17 @@ class MultimodalModelRunner:
         self.stream.synchronize()
 
         image_embeds = visual_outputs[self.vision_output_names[0]]
+
+        if self.args.mm_embedding_offloading:
+            # CUDA Stream Overlapping Requirements:
+            # 1. Both memory copy stream and kernel execution stream must be non-default streams
+            # 2. For host<->device transfers (H2D/D2H), host memory MUST be page-locked (pinned)
+            pinned_embeds = torch.empty_like(image_embeds,
+                                             device='cpu',
+                                             pin_memory=True)
+            pinned_embeds.copy_(image_embeds, non_blocking=True)
+            image_embeds = pinned_embeds
+
         image_atts = torch.ones(image_embeds.size()[:-1],
                                 dtype=torch.long).to(image.device)
 
@@ -1955,6 +2025,20 @@ class MultimodalModelRunner:
             res_input_ids.append(cur_input_ids)
         return res_input_ids
 
+    def ptuning_setup_pixtral(self, input_ids):
+        # input_ids obtained from processor has token_ids for text as well as image tokens
+        # where each image token is represented the same image_token_index (10 for this model).
+        image_token_index = self.image_token_index
+        vocab_size = self.vocab_size
+        # Replace all image tokens with a unique token_id > text_vacab_size.
+        # This shall be used to lookup the prompt table.
+        replacer = vocab_size
+        for i in range(len(input_ids[0])):
+            if input_ids[0][i] == image_token_index:
+                input_ids[0][i] = replacer
+                replacer += 1
+        return input_ids
+
     def ptuning_setup_llava_next(self, visual_features, pre_prompt,
                                  post_prompt):
         input_ids = []
@@ -2021,7 +2105,15 @@ class MultimodalModelRunner:
                 prompt_table = prompt_table.cuda().to(
                     dtype=str_dtype_to_torch(self.model_config.dtype))
             else:
-                prompt_table = prompt_table.cuda().to(dtype=self.model.dtype)
+                if self.args.mm_embedding_offloading:
+                    # CUDA Stream Overlapping Requirements:
+                    # 1. Both memory copy stream and kernel execution stream must be non-default streams
+                    # 2. For host<->device transfers (H2D/D2H), host memory MUST be page-locked (pinned)
+                    prompt_table = prompt_table.pin_memory().to(
+                        dtype=self.model.dtype)
+                else:
+                    prompt_table = prompt_table.cuda().to(
+                        dtype=self.model.dtype)
         else:
             prompt_table = torch.empty([1, hidden_size]).cuda()
             task_vocab_size = torch.zeros([1]).cuda()
@@ -2313,6 +2405,18 @@ class MultimodalModelRunner:
                                    audios=[raw_audio],
                                    return_tensors="pt")
 
+        elif 'pixtral' in self.model_type:
+            # Send image and text prompt to processor.
+            pre_prompt = "<s>[INST][IMG]"
+            if input_text is None:
+                input_text = "What is in the image?"
+            post_prompt = "[/INST]"
+            prompt = pre_prompt + input_text + post_prompt
+            dtype = str_dtype_to_torch(self.vision_precision)
+            image = self.processor(text=prompt,
+                                   images=[raw_image],
+                                   return_tensors="pt").to(dtype)
+
         elif 'internvl' in self.model_type:
             pre_prompt = "<|system|>\n你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型，英文名叫InternVL, 是一个有用无害的人工智能助手。<|end|><|user|>\n<image>\n"
             if input_text is None:
@@ -2497,7 +2601,8 @@ class MultimodalModelRunner:
             post_prompt = [post_prompt] * self.args.batch_size
         if self.model_type not in [
                 'fuyu', 'pix2struct', 'kosmos-2', 'vila', 'phi-3-vision',
-                'phi-4-multimodal', 'llava_next', 'internvl', 'llava_onevision'
+                'phi-4-multimodal', 'llava_next', 'internvl', 'llava_onevision',
+                'pixtral'
         ]:
             if image is not None:
                 if image.dim() == 5:

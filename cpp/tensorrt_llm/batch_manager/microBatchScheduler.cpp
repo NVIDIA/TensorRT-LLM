@@ -179,6 +179,7 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
     RequestVector contextRequests, generationRequests;
     SizeType32 batchNumTokens{0};
     SizeType32 scheduledReqSize{0};
+    SizeType32 scheduledBeamWidth{0}; // 0 means no request is scheduled
 
     RequestVector contextsToBeChunked;
     SizeType32 numChunkedTokens{0};
@@ -256,12 +257,24 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         }
         else // (llmReq->isGenerationInProgressState())
         {
-            reqNumTokens = llmReq->mSamplingConfig.beamWidth + llmReq->getNumDraftTokens();
+            auto const reqBeamWidth = llmReq->getBeamWidthByIter();
+            reqNumTokens = reqBeamWidth + llmReq->getNumDraftTokens();
             if (maxNumTokensRuntime && batchNumTokens + reqNumTokens > maxNumTokensRuntime.value())
             {
                 break;
             }
-            TLLM_LOG_DEBUG("generation request scheduled: ID %u", llmReq->mRequestId);
+            if (scheduledBeamWidth == 0) // set `scheduledBeamWidth` when the first request is scheduled
+            {
+                scheduledBeamWidth = reqBeamWidth;
+            }
+            else if (scheduledBeamWidth != reqBeamWidth) // Skip request with different beam width
+            {
+                TLLM_LOG_DEBUG(
+                    "generation request skipped: ID %u since its beam width (%d) is different from scheduled ones (%d)",
+                    llmReq->mRequestId, reqBeamWidth, scheduledBeamWidth);
+                continue;
+            }
+            TLLM_LOG_DEBUG("generation request scheduled: ID %u with beam width %d", llmReq->mRequestId, reqBeamWidth);
             generationRequests.emplace_back(llmReq);
             batchNumTokens += reqNumTokens;
         }

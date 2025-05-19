@@ -4,16 +4,18 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch._prims_common import DeviceLikeType
 
+from tensorrt_llm._utils import nvtx_range
+
 from ...._utils import mpi_rank, mpi_world_size
 from ....bindings.executor import ExecutorConfig
 from ....bindings.internal.batch_manager import CacheType
 from ....mapping import Mapping
 from ...distributed import MPIDist
 from ...pyexecutor.config import PyTorchConfig
-from ...pyexecutor.decoder import TorchDecoder
 from ...pyexecutor.model_engine import ModelEngine
 from ...pyexecutor.py_executor import PyExecutor
 from ...pyexecutor.resource_manager import KVCacheManager, ResourceManager
+from ...pyexecutor.sampler import TorchSampler
 from ...pyexecutor.scheduler import (
     BindCapacityScheduler,
     BindMicroBatchScheduler,
@@ -90,7 +92,7 @@ class ADEngine(ModelEngine):
 
         # construct model factory
         model_kwargs = {"max_position_embeddings": seq_info.max_seq_len, **ad_config.model_kwargs}
-        factory = ModelFactoryRegistry.get("hf")(
+        factory = ModelFactoryRegistry.get(ad_config.model_factory)(
             model=model,
             model_kwargs=model_kwargs,
             skip_loading_weights=ad_config.skip_loading_weights,
@@ -136,6 +138,7 @@ class ADEngine(ModelEngine):
         # start fresh with fixed seed
         torch.manual_seed(1234)
 
+    @nvtx_range("ad_prepare_inputs")
     def _prepare_inputs(
         self, scheduled_requests: ScheduledRequests, resource_manager: ResourceManager
     ) -> bool:
@@ -288,8 +291,8 @@ def create_autodeploy_executor(
     )
     scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
 
-    # search decoder with speculative decoding
-    decoder = TorchDecoder(max_seq_len=max_seq_len)
+    # search sampler with speculative decoding
+    sampler = TorchSampler(max_seq_len=max_seq_len)
 
     # creating the executor object
     py_config: PyTorchConfig = executor_config.pytorch_backend_config
@@ -297,9 +300,9 @@ def create_autodeploy_executor(
         resource_manager,
         scheduler,
         model_engine=engine,
-        decoder=decoder,
+        sampler=sampler,
         dist=mpi_dist,
-        enable_overlap_scheduler=py_config.enable_overlap_scheduler,
+        disable_overlap_scheduler=py_config.disable_overlap_scheduler,
         max_input_len=executor_config.max_input_len,
         max_batch_size=executor_config.max_batch_size,
         max_draft_tokens=executor_config.speculative_config.max_draft_tokens

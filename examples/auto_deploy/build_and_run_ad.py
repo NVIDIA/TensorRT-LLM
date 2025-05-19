@@ -39,20 +39,30 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
 
     # setup AD config
     ad_config = AutoDeployConfig(
-        use_cuda_graph=config.compile_backend == "torch-opt",
-        torch_compile_enabled=config.compile_backend == "torch-opt",
+        # Both torch-opt and torch-cudagraph invoke cudagraphs
+        use_cuda_graph=config.compile_backend in ["torch-opt", "torch-cudagraph"],
+        # Both torch-opt and torch-compile invoke torch.compile
+        torch_compile_enabled=config.compile_backend in ["torch-opt", "torch-compile"],
+        model_factory=config.model_factory,
         model_kwargs=config.model_kwargs,
         attn_backend=config.attn_backend,
         mla_backend=config.mla_backend,
         skip_loading_weights=config.skip_loading_weights,
         cuda_graph_max_batch_size=config.max_batch_size,
+        free_mem_ratio=config.free_mem_ratio,
     )
     ad_logger.info(f"AutoDeploy Config: {ad_config}")
 
     # TODO: let's see if prefetching can't be done through the LLM api?
     # I believe the "classic workflow" invoked via the LLM api can do that.
     # put everything into the HF model Factory and try pre-fetching the checkpoint
-    factory = ModelFactoryRegistry.get("hf")(model=config.model, model_kwargs=config.model_kwargs)
+    factory = ModelFactoryRegistry.get(config.model_factory)(
+        model=config.model,
+        model_kwargs=config.model_kwargs,
+        tokenizer_kwargs=config.tokenizer_kwargs,
+        skip_loading_weights=config.skip_loading_weights,
+    )
+    ad_logger.info(f"Prefetched model : {factory.model}")
 
     # construct llm high-level interface object
     llm_lookup = {
@@ -60,11 +70,12 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
         "trtllm": LLM,
     }
     llm = llm_lookup[config.runtime](
-        model=factory.ckpt_path,
+        model=factory.model,
         backend="autodeploy",
         build_config=build_config,
         pytorch_backend_config=ad_config,
         tensor_parallel_size=config.world_size,
+        tokenizer=factory.init_tokenizer() if config.customize_tokenizer else None,
     )
 
     return llm
@@ -97,13 +108,23 @@ def main(config: Optional[SimpleConfig] = None):
 
     # run a benchmark for the model with batch_size == config.benchmark_bs
     if config.benchmark:
-        token_ids = torch.randint(0, 100, (config.benchmark_bs, config.benchmark_isl)).tolist()
-        sampling_params = SamplingParams(max_tokens=config.benchmark_osl, top_k=None)
-        keys = ["compile_backend", "attn_backend", "mla_backend"]
+        keys = [
+            "compile_backend",
+            "attn_backend",
+            "mla_backend",
+            "benchmark_bs",
+            "benchmark_isl",
+            "benchmark_osl",
+            "benchmark_num",
+        ]
         benchmark(
-            lambda: llm.generate(token_ids, sampling_params=sampling_params, use_tqdm=False),
-            config.benchmark_num,
-            "Benchmark with " + ", ".join(f"{k}={getattr(config, k)}" for k in keys),
+            func=lambda: llm.generate(
+                torch.randint(0, 100, (config.benchmark_bs, config.benchmark_isl)).tolist(),
+                sampling_params=SamplingParams(max_tokens=config.benchmark_osl, top_k=None),
+                use_tqdm=False,
+            ),
+            num_runs=config.benchmark_num,
+            log_prefix="Benchmark with " + ", ".join(f"{k}={getattr(config, k)}" for k in keys),
             results_path=config.benchmark_results_path,
         )
     llm.shutdown()

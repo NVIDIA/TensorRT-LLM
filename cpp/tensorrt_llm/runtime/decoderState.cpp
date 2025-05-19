@@ -182,7 +182,6 @@ void DecoderState::setup(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeT
     TLLM_CHECK(maxBeamWidth > 0);
     TLLM_CHECK(mMaxDecodingEngineTokens > 0);
     TLLM_CHECK(maxSequenceLength > 0);
-    mActualBatchSize = maxBatchSize;
     mMaxBatchSize = maxBatchSize;
     mMaxBeamWidth = maxBeamWidth;
     mMaxSequenceLength = maxSequenceLength;
@@ -314,7 +313,7 @@ void DecoderState::setupSpeculativeDecoding(SpeculativeDecodingMode const& specu
         auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
 
         auto const probsShape = ITensor::makeShape(
-            {mMaxBatchSize, mMaxBeamWidth, mMaxSequenceLength, static_cast<SizeType32>(vocabSizePadded)});
+            {mMaxBatchSize, mMaxDecodingEngineTokens, mMaxBeamWidth, static_cast<SizeType32>(vocabSizePadded)});
         dInput.externalDraftTokensInputs->draftProbs->reshape(probsShape);
         dInput.externalDraftTokensInputs->targetProbs->reshape(probsShape);
         dInput.externalDraftTokensInputs->draftLogits->reshape(
@@ -418,18 +417,18 @@ void DecoderState::disableLookahead(RequestVector const& genRequests)
 
 TensorPtr DecoderState::getFinishedSum() const
 {
-    return ITensor::slice(mJointDecodingOutput->finishedSum, 0, mActualBatchSize);
+    return ITensor::slice(mJointDecodingOutput->finishedSum, 0, mMaxBatchSize);
 }
 
 TensorPtr DecoderState::getFinishReasons() const
 {
-    return ITensor::slice(mJointDecodingOutput->finishReasons, 0, mActualBatchSize);
+    return ITensor::slice(mJointDecodingOutput->finishReasons, 0, mMaxBatchSize);
 }
 
 TensorPtr DecoderState::getIds() const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto tensor = ITensor::slice(mJointDecodingOutput->ids, 0, mActualBatchSize);
+    auto tensor = ITensor::slice(mJointDecodingOutput->ids, 0, mMaxBatchSize);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return tensor;
 }
@@ -446,7 +445,7 @@ TensorPtr DecoderState::getIds(SizeType32 batchIdx) const
 TensorPtr DecoderState::getGatheredIds() const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto tensor = ITensor::slice(mJointDecodingOutput->gatheredIds, 0, mActualBatchSize);
+    auto tensor = ITensor::slice(mJointDecodingOutput->gatheredIds, 0, mMaxBatchSize);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return tensor;
 }
@@ -462,12 +461,12 @@ TensorPtr DecoderState::getGatheredIds(SizeType32 batchIdx) const
 
 TensorPtr DecoderState::getParentIds() const
 {
-    return ITensor::slice(mJointDecodingOutput->parentIds, 0, mActualBatchSize);
+    return ITensor::slice(mJointDecodingOutput->parentIds, 0, mMaxBatchSize);
 }
 
 TensorPtr DecoderState::getCumLogProbs() const
 {
-    return ITensor::slice(mJointDecodingOutput->cumLogProbs, 0, mActualBatchSize);
+    return ITensor::slice(mJointDecodingOutput->cumLogProbs, 0, mMaxBatchSize);
 }
 
 TensorPtr DecoderState::getCumLogProbs(SizeType32 batchIdx) const
@@ -479,7 +478,7 @@ TensorPtr DecoderState::getCumLogProbs(SizeType32 batchIdx) const
 
 TensorPtr DecoderState::getLogProbs() const
 {
-    return ITensor::slice(mJointDecodingOutput->logProbs, 0, mActualBatchSize);
+    return ITensor::slice(mJointDecodingOutput->logProbs, 0, mMaxBatchSize);
 }
 
 TensorPtr DecoderState::getLogProbs(SizeType32 batchIdx) const
@@ -529,17 +528,6 @@ TensorPtr DecoderState::getFinishedSteps() const
     return mFinishedSteps;
 }
 
-SizeType32 DecoderState::getActualBatchSize() const
-{
-    return mActualBatchSize;
-}
-
-void DecoderState::setActualBatchSize(SizeType32 actualBatchSize)
-{
-    TLLM_CHECK(actualBatchSize <= mMaxBatchSize);
-    mActualBatchSize = actualBatchSize;
-}
-
 SizeType32 DecoderState::getMaxBeamWidth() const
 {
     return mMaxBeamWidth;
@@ -572,15 +560,13 @@ std::vector<SizeType32> const& DecoderState::getNumDecodingEngineTokens() const
 
 SizeType32 DecoderState::getNumDecodingEngineTokens(SizeType32 batchIdx) const
 {
-    TLLM_CHECK_WITH_INFO(
-        batchIdx < mActualBatchSize, "Batch index %d out of bounds (max %d)", batchIdx, mActualBatchSize);
+    TLLM_CHECK_WITH_INFO(batchIdx < mMaxBatchSize, "Batch index %d out of bounds (max %d)", batchIdx, mMaxBatchSize);
     return mNumDecodingEngineTokens[batchIdx];
 }
 
 void DecoderState::setNumDecodingEngineTokens(SizeType32 batchIdx, SizeType32 numTokens)
 {
-    TLLM_CHECK_WITH_INFO(
-        batchIdx < mActualBatchSize, "Batch index %d out of bounds (max %d)", batchIdx, mActualBatchSize);
+    TLLM_CHECK_WITH_INFO(batchIdx < mMaxBatchSize, "Batch index %d out of bounds (max %d)", batchIdx, mMaxBatchSize);
     mNumDecodingEngineTokens[batchIdx] = numTokens;
 }
 

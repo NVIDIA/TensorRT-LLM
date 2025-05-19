@@ -5,6 +5,7 @@ import sys
 
 import cloudpickle
 import pytest
+from defs.conftest import skip_no_hopper
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
@@ -109,13 +110,13 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
 
     # Context worker
     worker_pytorch_configs.append(
-        PyTorchConfig(enable_overlap_scheduler=False,
+        PyTorchConfig(disable_overlap_scheduler=True,
                       kv_cache_dtype="auto",
                       use_cuda_graph=enable_cuda_graph))
 
     # Generation worker
     worker_pytorch_configs.append(
-        PyTorchConfig(enable_overlap_scheduler=generation_overlap,
+        PyTorchConfig(disable_overlap_scheduler=not generation_overlap,
                       kv_cache_dtype="auto",
                       use_cuda_graph=enable_cuda_graph))
 
@@ -199,6 +200,7 @@ def test_disaggregated_simple_llama(model, generation_overlap,
         ])
 
 
+@skip_no_hopper
 @pytest.mark.parametrize("model", ["DeepSeek-V3-Lite-fp8/fp8"])
 @pytest.mark.parametrize("generation_overlap", [False, True])
 @pytest.mark.parametrize("enable_cuda_graph", [False, True])
@@ -213,6 +215,96 @@ def test_disaggregated_simple_deepseek(model, generation_overlap,
             539, 3085, 344, 270, 6102, 294, 14251, 33, 369, 16235, 539, 3085,
             344
         ])
+
+
+@pytest.mark.parametrize("model", ["DeepSeek-V3-Lite-fp8/fp8"])
+@pytest.mark.parametrize("enable_cuda_graph", [False])
+@pytest.mark.parametrize("generation_overlap", [False])
+def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
+                                              generation_overlap):
+    # Test the case where the context worker capacity is exceeded and
+    # needs to wait for the generation worker to complete.
+    worker_pytorch_configs = []
+
+    # Context worker
+    worker_pytorch_configs.append(
+        PyTorchConfig(disable_overlap_scheduler=True,
+                      kv_cache_dtype="auto",
+                      use_cuda_graph=enable_cuda_graph))
+
+    # Generation worker
+    worker_pytorch_configs.append(
+        PyTorchConfig(disable_overlap_scheduler=not generation_overlap,
+                      kv_cache_dtype="auto",
+                      use_cuda_graph=enable_cuda_graph))
+
+    kv_cache_configs = [KvCacheConfig(max_tokens=128) for _ in range(2)]
+    model_names = [model_path(model) for _ in range(2)]
+    ranks = [0, 1]
+    worker_args = list(
+        zip(kv_cache_configs, worker_pytorch_configs, model_names, ranks))
+
+    port_name = MPI.Open_port()
+    MPI.Publish_name('my_port', port_name)
+
+    prompt = "European Union is a political and economic union of 27 countries. The European Union is headquartered in Brussels, Belgium. The first president of the European Union was Jean-Claude Juncker. The current president is Ursula von der Leyen. The European Union is a major economic and political entity."
+
+    with MPIPoolExecutor(max_workers=2, env={"TRTLLM_USE_MPI_KVCACHE":
+                                             "1"}) as executor:
+        futures = []
+        try:
+            for worker_arg in worker_args:
+                future = executor.submit(worker_entry_point, *worker_arg)
+                futures.append(future)
+        except Exception as e:
+            print(f"Error in worker {worker_arg}: {e}")
+            raise e
+
+        try:
+            print("Launched all the workers.")
+            intercomm = MPI.COMM_SELF.Accept(port_name)
+
+            for _ in range(2):
+                intercomm.recv(tag=MPI_READY)
+                print("Received ready signal.")
+            max_tokens = 25
+
+            requests = []
+            # Send 256 requests to make sure the context worker is saturated
+            for _ in range(256):
+                requests.append(
+                    (prompt, SamplingParams(max_tokens=1),
+                     DisaggregatedParams(request_type="context_only")))
+
+            intercomm.send(requests, dest=0, tag=MPI_REQUEST)
+
+            for _ in range(len(requests)):
+                output = intercomm.recv(source=0, tag=MPI_RESULT)
+                assert output[0].disaggregated_params is not None
+                assert output[
+                    0].disaggregated_params.request_type == "context_only"
+                assert len(output[0].token_ids) == 1
+
+                generation_request_disagg_params = output[
+                    0].disaggregated_params
+                generation_request_disagg_params.request_type = "generation_only"
+                requests = []
+                requests.append((prompt, SamplingParams(max_tokens=max_tokens),
+                                 generation_request_disagg_params))
+
+                intercomm.send(requests, dest=1, tag=MPI_REQUEST)
+                output = intercomm.recv(source=1, tag=MPI_RESULT)
+
+        finally:
+            # Send termination requests
+            intercomm.send(None, dest=0, tag=MPI_REQUEST)
+            intercomm.send(None, dest=1, tag=MPI_REQUEST)
+            print("Sent termination requests to the workers.")
+
+            # Wait for all futures to complete
+            for future in futures:
+                future.result()
+            print("All workers terminated.")
 
 
 if __name__ == "__main__":

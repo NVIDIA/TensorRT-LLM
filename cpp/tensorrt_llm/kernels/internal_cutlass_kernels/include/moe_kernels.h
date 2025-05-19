@@ -17,11 +17,11 @@
 
 #pragma once
 #include "cutlass/gemm/gemm.h"
+#include "moe_gemm_kernels.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_gemm_kernels.h"
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
 #endif
@@ -86,6 +86,8 @@ struct MOEParallelismConfig
     int tp_rank = 0;
     int ep_size = 1;
     int ep_rank = 0;
+    int cluster_size = 1;
+    int cluster_rank = 0;
 
     MOEParallelismConfig() = default;
 
@@ -94,6 +96,8 @@ struct MOEParallelismConfig
         , tp_rank(tp_rank)
         , ep_size(ep_size)
         , ep_rank(ep_rank)
+        , cluster_size(1)
+        , cluster_rank(0)
     {
         // Do some basic sanity checks
         TLLM_CHECK(tp_rank < tp_size);
@@ -104,16 +108,38 @@ struct MOEParallelismConfig
         TLLM_CHECK(ep_size >= 1);
     }
 
+    MOEParallelismConfig(int tp_size, int tp_rank, int ep_size, int ep_rank, int cluster_size, int cluster_rank)
+        : tp_size(tp_size)
+        , tp_rank(tp_rank)
+        , ep_size(ep_size)
+        , ep_rank(ep_rank)
+        , cluster_size(cluster_size)
+        , cluster_rank(cluster_rank)
+    {
+        // Do some basic sanity checks
+        TLLM_CHECK(tp_rank < tp_size);
+        TLLM_CHECK(tp_rank >= 0);
+        TLLM_CHECK(tp_size >= 1);
+        TLLM_CHECK(ep_rank < ep_size);
+        TLLM_CHECK(ep_rank >= 0);
+        TLLM_CHECK(ep_size >= 1);
+        TLLM_CHECK(cluster_rank < cluster_size);
+        TLLM_CHECK(cluster_rank >= 0);
+        TLLM_CHECK(cluster_size >= 1);
+        TLLM_CHECK(ep_size == 1 || cluster_size == 1);
+    }
+
     bool operator==(MOEParallelismConfig const& other) const
     {
         return tp_size == other.tp_size && tp_rank == other.tp_rank && ep_size == other.ep_size
-            && ep_rank == other.ep_rank;
+            && ep_rank == other.ep_rank && cluster_size == other.cluster_size && cluster_rank == other.cluster_rank;
     }
 
     friend std::ostream& operator<<(std::ostream& os, MOEParallelismConfig const& config)
     {
         os << "tp_size: " << config.tp_size << ", tp_rank: " << config.tp_rank << ", ep_size: " << config.ep_size
-           << ", ep_rank: " << config.ep_rank;
+           << ", ep_rank: " << config.ep_rank << ", cluster_size: " << config.cluster_size
+           << ", cluster_rank: " << config.cluster_rank;
         return os;
     }
 };
@@ -532,6 +558,7 @@ private:
     static TmaWarpSpecializedGroupedGemmInput computeStridesTmaWarpSpecialized(int64_t const* expert_first_token_offset,
         TmaWarpSpecializedGroupedGemmInput layout_info, int64_t num_tokens, int64_t expanded_num_tokens, int64_t gemm_n,
         int64_t gemm_k, int const num_experts_per_node, T const* in, WeightType const* weights,
+        TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const* w4a8_weight_scale_flat,
         float const* fp8_dequant, TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_scale_flat,
         QuantParams::FP4Inputs::GemmInputs fp4_inputs, T const* bias, UnfusedGemmOutputType* output,
         cudaStream_t stream);
@@ -596,6 +623,7 @@ private:
         QuantParams& quant_params, cudaStream_t stream);
 
     T const* applyPrequantScale(void* smoothed_act, void const* permuted_data, void const* prequant_scales,
+        int const* permuted_token_selected_experts, int64_t const* num_valid_tokens_ptr,
         int64_t const expanded_num_rows, int64_t const seq_len, bool const use_awq, cudaStream_t stream);
 
     CubKeyValueSorter sorter_;
@@ -668,7 +696,7 @@ public:
         mWType = wtype;
         mOType = otype;
         mNumExperts = num_experts;
-        mNumExpertsPerNode = num_experts / parallelism_config.ep_size;
+        mNumExpertsPerNode = num_experts / (parallelism_config.ep_size * parallelism_config.tp_size);
         mK = k;
         mExpertHiddenSize = hidden_size;
         mExpertInterSize = inter_size;

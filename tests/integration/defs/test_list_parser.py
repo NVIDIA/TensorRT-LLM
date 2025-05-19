@@ -477,7 +477,10 @@ def get_test_name_corrections_v2(
     return ret
 
 
-def apply_test_list_corrections(test_list, corrections, test_prefix=None):
+def apply_test_list_corrections(test_list,
+                                corrections,
+                                items,
+                                test_prefix=None):
     """
     Attempt to correct invalid test names in a test list.
 
@@ -508,7 +511,10 @@ def apply_test_list_corrections(test_list, corrections, test_prefix=None):
     #with open(test_list, "w") as f:
     #    f.write(contents)
 
-    pytest.exit(
+    # Clear the items list to prevent pytest from listing collected tests
+    items.clear()
+
+    raise pytest.UsageError(
         "Exiting early since --apply-test-list-correction was specified.")
 
 
@@ -579,7 +585,8 @@ def parse_and_validate_test_list(
         )
 
         if apply_test_list_correction and corrections:
-            apply_test_list_corrections(test_list, corrections, test_prefix)
+            apply_test_list_corrections(test_list, corrections, items,
+                                        test_prefix)
 
         output_dir = config.getoption("--output-dir")
         if record_invalid_tests and corrections:

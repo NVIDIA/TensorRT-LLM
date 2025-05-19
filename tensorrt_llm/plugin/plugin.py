@@ -28,7 +28,8 @@ import tensorrt as trt
 from .._ipc_utils import IpcMemory, can_access_peer
 from .._utils import get_sm_version
 from ..bindings.internal.runtime import (lamport_initialize,
-                                         lamport_initialize_all)
+                                         lamport_initialize_all,
+                                         max_workspace_size_lowprecision)
 from ..logger import logger
 from ..mapping import Mapping
 
@@ -704,14 +705,26 @@ class CustomAllReduceHelper:
         )
 
     @staticmethod
-    def max_workspace_size_auto(tp_size: int) -> int:
-        if force_all_reduce_deterministic():
+    def max_workspace_size_auto(tp_size: int,
+                                support_deterministic=True) -> int:
+        if force_all_reduce_deterministic() and support_deterministic:
             workspace_size = os.getenv("FORCE_ALLREDUCE_KERNEL_WORKSPACE_SIZE",
                                        "1000000000")
             return int(workspace_size)
         if tp_size <= 2:
             return 16_000_000
         return 8_000_000
+
+    @staticmethod
+    def max_workspace_size_lowprecision(tp_size: int) -> int:
+        return max_workspace_size_lowprecision(tp_size)
+
+    @staticmethod
+    def initialize_lowprecision_buffers(workspace: "torch.tensor",
+                                        tp_size: int) -> None:
+        import torch
+        return torch.ops.trtllm.initialize_static_lowprecision_buffers(
+            workspace, tp_size)
 
     @staticmethod
     def allocate_workspace(mapping: Mapping,
@@ -746,7 +759,7 @@ class CustomAllReduceHelper:
                 lamport_buffers_0.local_ptr,
                 lamport_buffers_1.local_ptr,
                 lamport_buffers_2.local_ptr,
-                size * mapping.tp_size,
+                lamport_buffers_size,
             )
         buffers = [
             ipc_buffers_ping, ipc_buffers_pong, ipc_barriers_in,
@@ -763,6 +776,37 @@ class CustomAllReduceHelper:
             device="cpu")
 
     @staticmethod
+    def allocate_lowprecision_workspace(
+            mapping: Mapping,
+            size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
+        import torch
+
+        # Force pull mode and disable lamport when force deterministic is enabled, for reducing device memory usage.
+        is_p2p_supported = can_access_peer(mapping)
+        ipc_buffers_size = size
+        ipc_buffers_ping = IpcMemory(mapping, ipc_buffers_size,
+                                     is_p2p_supported)
+        ipc_buffers_pong = IpcMemory(mapping, ipc_buffers_size,
+                                     is_p2p_supported)
+        ipc_barriers_in = IpcMemory(
+            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2,
+            is_p2p_supported)
+        ipc_barriers_out = IpcMemory(
+            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2,
+            is_p2p_supported)
+        buffers = [
+            ipc_buffers_ping, ipc_buffers_pong, ipc_barriers_in,
+            ipc_barriers_out
+        ]
+
+        return buffers, torch.tensor(
+            ipc_buffers_ping.serialize() + ipc_buffers_pong.serialize() +
+            ipc_barriers_in.serialize() + ipc_barriers_out.serialize() + [0] +
+            [0],
+            dtype=torch.int64,
+            device="cpu")
+
+    @staticmethod
     def allocate_allreduce_fusion_workspace(
             mapping: Mapping,
             size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
@@ -775,9 +819,7 @@ class CustomAllReduceHelper:
         lamport_buffers_size = size * mapping.tp_size
         lamport_buffers = IpcMemory(mapping, 3 * lamport_buffers_size,
                                     is_p2p_supported)
-        rank = mapping.rank
-        tp_rank = mapping.tp_rank
-        if rank == tp_rank and is_p2p_supported:
+        if is_p2p_supported:
             lamport_initialize(
                 lamport_buffers.local_ptr,
                 3 * lamport_buffers_size,

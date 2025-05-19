@@ -15,7 +15,7 @@
 import math
 import weakref
 from collections import OrderedDict
-from enum import IntEnum, IntFlag, auto
+from enum import IntEnum
 from functools import partial
 from typing import List, Optional, Sequence, Tuple, Union
 
@@ -1147,7 +1147,7 @@ def gemm_swiglu(input: Tensor,
 
     p_dtype = default_net().plugin_config.gemm_swiglu_plugin
     if p_dtype == "fp8":
-        assert bias == None, "fp8 gemm_swiglu does not support bias yet"
+        assert bias is None, "fp8 gemm_swiglu does not support bias yet"
 
     pf_type = trt.PluginField(
         "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
@@ -2790,7 +2790,7 @@ def embedding(input: Tensor,
     # Distribute embedding lookup table across multiple GPU
     if tp_size > 1 and tp_group is not None:
         if sharding_dim == 0:  # TP on vocab_size dimension
-            if tp_rank == None:
+            if tp_rank is None:
                 raise ValueError(
                     "Rank cannot be none for tensor parallelism on vocab dim")
 
@@ -3873,46 +3873,31 @@ def unbind(input: Tensor, dim: int = 0):
 
 
 class AllReduceStrategy(IntEnum):
-    """
-    Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h
-             they must be kept in sync
-    """
     NCCL = 0
-    ONESHOT = 1
-    TWOSHOT = 2
-    UB = 3
-    AUTO = 4
+    MIN_LATENCY = 1
+    UB = 2
+    AUTO = 3
+    ONESHOT = 4
+    TWOSHOT = 5
+    LOWPRECISION = 6
 
 
-class AllReduceConfig(IntFlag):
-    """
-    Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h
-             they must be kept in sync
-    """
-    USE_MEMCPY = auto()
-    PUSH_MODE = auto()
-
-
-class AllReduceFusionOp(IntFlag):
-    """
-    Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h
-             they must be kept in sync
-    """
+class AllReduceFusionOp(IntEnum):
     NONE = 0
     RESIDUAL_RMS_NORM = 1
     LAST_PROCESS_FOR_UB = 2
     RESIDUAL_RMS_PREPOST_NORM = 3
     RESIDUAL_RMS_NORM_QUANT_FP8 = 4
     RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5
-    MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 6
-    RESIDUAL_RMS_NORM_AND_QUANT_NVFP4 = 7
+    RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6
+    RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7
+    MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
 
 
 class AllReduceParams():
 
     def __init__(self,
                  strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
-                 config: AllReduceConfig = AllReduceConfig(0),
                  fusion_op: AllReduceFusionOp = AllReduceFusionOp.NONE,
                  bias: Optional[Tensor] = None,
                  residual: Optional[Tensor] = None,
@@ -3922,7 +3907,6 @@ class AllReduceParams():
                  eps: float = 1e-06,
                  enable_allreduce: bool = True):
         self.strategy = strategy
-        self.config = config
         self.fusion_op = fusion_op
         self.bias = bias
         self.residual = residual
@@ -3932,7 +3916,8 @@ class AllReduceParams():
         self.eps = eps
         # For torch path only, has no effect on TRT path
         self.enable_allreduce = enable_allreduce
-        assert fusion_op == AllReduceFusionOp.NONE or (residual is not None)
+        assert fusion_op == AllReduceFusionOp.NONE.value or (residual
+                                                             is not None)
 
     def has_affine(self):
         return 1 if self.norm_weight is not None else 0
@@ -3969,10 +3954,6 @@ def create_allreduce_plugin(
         "strategy", np.array([int(all_reduce_params.strategy)], np.int8),
         trt.PluginFieldType.INT8)
     pfc.append(p_strategy)
-    p_config = trt.PluginField(
-        "config", np.array([int(all_reduce_params.config)], np.int8),
-        trt.PluginFieldType.INT8)
-    pfc.append(p_config)
     p_fusion_op = trt.PluginField(
         "fusion_op", np.array([int(all_reduce_params.fusion_op)], np.int8),
         trt.PluginFieldType.INT8)
@@ -3981,7 +3962,6 @@ def create_allreduce_plugin(
         "eps", np.array([float(all_reduce_params.eps)], np.float32),
         trt.PluginFieldType.FLOAT32)
     pfc.append(p_eps)
-
     p_affine = trt.PluginField(
         "affine", np.array([int(all_reduce_params.has_affine())], np.int8),
         trt.PluginFieldType.INT8)
@@ -4372,7 +4352,7 @@ def gemm_allreduce(a: Tensor,
         assert a.dtype == trt.fp8
         assert b.dtype == trt.fp8
 
-    if output_dtype == None:
+    if output_dtype is None:
         output_dtype = str_dtype_to_trt(
             default_net().plugin_config.gemm_allreduce_plugin)
     assert output_dtype in [trt.float16, trt.bfloat16]
@@ -4470,7 +4450,10 @@ def bert_attention(tensor: Tensor,
                    sage_attn: bool = False,
                    sage_attn_q_block_size: int = 0,
                    sage_attn_k_block_size: int = 0,
-                   sage_attn_v_block_size: int = 0) -> Tuple[Tensor]:
+                   sage_attn_v_block_size: int = 0,
+                   cp_group: list[int] = None,
+                   cp_size: int = 1,
+                   cp_rank: int = 0) -> Tuple[Tensor]:
     '''
     Add an operation that performs the multi-head attention in BERT.
 
@@ -4537,6 +4520,15 @@ def bert_attention(tensor: Tensor,
         sage_attn_v_quant_size: int = 0
             dynamic quant block size along sequence dimension of v tensor. Each quant block will share one scale.
 
+        cp_group: list[int] = None
+            The communication group for context parallel
+
+        cp_size: int = 1
+            The communication size for context parallel
+
+        cp_rank: int = 0
+            The communication rank for context parallel
+
     Returns:
         The tensor produced by that layer.
     '''
@@ -4591,10 +4583,31 @@ def bert_attention(tensor: Tensor,
         np.array(sage_attn_v_block_size, dtype=np.int32),
         trt.PluginFieldType.INT32)
 
+    if cp_size > 1:
+        # transpose q,k,v inside qkv to make kv contiguous, which is required by ring attention
+        # (b, s, 3d)
+        query, key, value = chunk(tensor, 3, dim=-1)
+        bs = shape(query, 0)
+        seq_len = shape(query, 1)
+        # (b, s, d) -> (b, s, 2d) -> (2b, s, d)
+        kv = concat([key, value],
+                    dim=-1).view(concat((2 * bs, seq_len, query.shape[-1])))
+        tensor = concat((query, kv),
+                        dim=0).view(concat((bs, seq_len, query.shape[-1] * 3)))
+
+    cp_size = trt.PluginField("cp_size", np.array(cp_size, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_rank = trt.PluginField("cp_rank", np.array(cp_rank, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_group = cp_group or [0]
+    cp_group = np.array(cp_group, dtype=np.int32)
+    cp_group = trt.PluginField("cp_group", cp_group, trt.PluginFieldType.INT32)
+
     pfc = trt.PluginFieldCollection([
         nheads, head_size, q_scaling, context_fmha_type, pf_type,
         do_relative_attention, max_distance, remove_padding, sage_attn,
-        sage_attn_q_block_size, sage_attn_k_block_size, sage_attn_v_block_size
+        sage_attn_q_block_size, sage_attn_k_block_size, sage_attn_v_block_size,
+        cp_size, cp_rank, cp_group
     ])
 
     attn_plug = attn_plg_creator.create_plugin("padding_attn", pfc)
@@ -4793,6 +4806,7 @@ class RopeEmbeddingUtils:
             beta_slow: int = 1,
             mscale: float = 1.0,
             mscale_all_dim: float = 1.0,
+            duplicate_data: bool = True,
             dtype=np.float32):
 
         # Copy from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/main/modeling_deepseek.py
@@ -4850,23 +4864,25 @@ class RopeEmbeddingUtils:
         inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high,
                                                     dim // 2).astype(dtype)
         inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
-        t = np.arange(num_pos, dtype=dtype)
-
-        freqs = np.outer(t, inv_freq)
+        sinusoid_inp = np.expand_dims(np.einsum("i , j -> i j",
+                                                np.arange(num_pos, dtype=dtype),
+                                                inv_freq,
+                                                dtype=dtype),
+                                      axis=-1)
 
         _mscale = float(
             yarn_get_mscale(scaling_factor, mscale) /
             yarn_get_mscale(scaling_factor, mscale_all_dim))
 
-        emb = np.concatenate((freqs, freqs), axis=-1)
+        if duplicate_data:
+            emb = np.concatenate((sinusoid_inp, sinusoid_inp), axis=-2)
+        else:
+            emb = sinusoid_inp
 
         concat = np.concatenate((np.cos(emb) * _mscale, np.sin(emb) * _mscale),
                                 axis=-1)
 
-        concat = concat.reshape((num_pos, 2, dim))
-        concat = np.transpose(concat, (0, 2, 1))
-
-        return concat.reshape((1, -1)).astype(dtype)
+        return inv_freq, concat.reshape((1, -1)).astype(dtype)
 
     @staticmethod
     def rotate_every_two(tensor: Tensor) -> Tensor:

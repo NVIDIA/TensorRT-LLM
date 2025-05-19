@@ -21,6 +21,13 @@ from defs.common import (convert_weights, test_multi_lora_support,
 from defs.trt_test_alternative import check_call
 
 
+@pytest.fixture(scope="module", autouse=True)
+def disable_unified_converter():
+    os.environ['TRTLLM_DISABLE_UNIFIED_CONVERTER'] = '1'
+    yield
+    del os.environ['TRTLLM_DISABLE_UNIFIED_CONVERTER']
+
+
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize(
     "llm_granite_model_root",
@@ -31,7 +38,6 @@ def test_llm_granite(llama_example_root, llm_granite_model_root,
                      engine_dir, dtype):
     print("Converting checkpoint...")
     model_name = os.path.basename(llm_granite_model_root)
-    os.environ['TRTLLM_DISABLE_UNIFIED_CONVERTER'] = '1'
 
     ckpt_dir = convert_weights(
         llm_venv=llm_venv,
@@ -59,7 +65,7 @@ def test_llm_granite(llama_example_root, llm_granite_model_root,
 
     print("Run engines...")
     summary_cmd = [
-        f"{llama_example_root}/../summarize.py",
+        f"{llama_example_root}/../../../summarize.py",
         f"--engine_dir={engine_dir}",
         f"--hf_model_dir={llm_granite_model_root}",
         f"--dataset_dir={llm_datasets_root}",
@@ -72,8 +78,6 @@ def test_llm_granite(llama_example_root, llm_granite_model_root,
     ]
     venv_mpi_check_call(llm_venv, ["mpirun", "-n", "1", "--allow-run-as-root"],
                         summary_cmd)
-
-    del os.environ['TRTLLM_DISABLE_UNIFIED_CONVERTER']
 
 
 @pytest.mark.parametrize(
@@ -94,7 +98,6 @@ def test_granite_bf16_lora(llama_example_root,
     # TODO: Enable fp8 quantization when ModelOpt changes for Granite are available.
     print("Converting checkpoint...")
     model_name = os.path.basename(llm_granite_model_root)
-    os.environ['TRTLLM_DISABLE_UNIFIED_CONVERTER'] = '1'
     dtype = 'bfloat16'
 
     ckpt_dir = convert_weights(

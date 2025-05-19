@@ -13,8 +13,8 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (PeftCacheConfig,
                                                              PeftCacheManager)
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
-from tensorrt_llm.bindings.internal.batch_manager import (
-    PeftTaskNotCachedException, RequestVector)
+from tensorrt_llm.bindings.internal.batch_manager import \
+    PeftTaskNotCachedException
 
 LoraModule = tensorrt_llm.bindings.LoraModule
 LoraModuleType = tensorrt_llm.bindings.LoraModuleType
@@ -38,9 +38,6 @@ class TestResourceManager(unittest.TestCase):
         """
         Setup the lora test data resources
         """
-        # TODO smor- this should be ported to a different place, ideally run once
-        # in a similar way to the cpp tests fixutres.
-
         cpp_script_dir = os.path.join(cls.CPP_RESOURCES_DIR, "scripts")
 
         generate_lora_data_args_tp1 = [
@@ -258,7 +255,6 @@ class TestResourceManager(unittest.TestCase):
         Returns:
             tuple: (weights tensor, config tensor) formatted correctly for the C++ implementation.
         """
-        # TODO smor- change from custom path configuration to relative path
         lora_weights = np.load(self.TP1_WEIGHTS_PATH).astype(np.float16)
         lora_weights = np.expand_dims(lora_weights, axis=0)
         lora_config = np.load(self.TP1_CONFIG_PATH)
@@ -303,8 +299,8 @@ class TestResourceManager(unittest.TestCase):
             model_config=self.model_config,
         )
 
-        empty_context = RequestVector()
-        empty_generation = RequestVector()
+        empty_context = []
+        empty_generation = []
         expected_empty_table = peft_cache_manager.ensure_batch(
             empty_context, empty_generation)
         self.assertEqual(expected_empty_table, {})
@@ -328,9 +324,9 @@ class TestResourceManager(unittest.TestCase):
 
         peft_cache_manager.add_request_peft(lora_request)
 
-        context_batch = RequestVector()
+        context_batch = []
         context_batch.append(lora_request)
-        generation_batch = RequestVector()
+        generation_batch = []
 
         result = peft_cache_manager.ensure_batch(context_batch,
                                                  generation_batch)
@@ -364,9 +360,9 @@ class TestResourceManager(unittest.TestCase):
 
         peft_cache_manager.add_request_peft(lora_request)
 
-        context_batch = RequestVector()
+        context_batch = []
         context_batch.append(lora_request)
-        generation_batch = RequestVector()
+        generation_batch = []
 
         result = peft_cache_manager.ensure_batch(context_batch,
                                                  generation_batch)

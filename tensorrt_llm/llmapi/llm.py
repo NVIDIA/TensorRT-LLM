@@ -10,8 +10,11 @@ from typing import Any, List, Literal, Optional, Sequence, Union
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
+from tensorrt_llm.inputs.data import TextPrompt
+from tensorrt_llm.inputs.registry import DefaultInputProcessor
+
 from .. import bindings as tllm
-from .._utils import global_mpi_rank, nvtx_range_debug
+from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..builder import EngineConfig
 from ..disaggregated_params import DisaggregatedParams
@@ -189,9 +192,10 @@ class LLM:
                                      Sequence[LoRARequest]]] = None,
         prompt_adapter_request: Optional[Union[
             PromptAdapterRequest, Sequence[PromptAdapterRequest]]] = None,
-        queries: Optional[Union[PromptInputs, Sequence[PromptInputs]]] = None,
-        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
-        disaggregated_params: Optional[DisaggregatedParams] = None,
+        kv_cache_retention_config: Optional[Union[
+            KvCacheRetentionConfig, Sequence[KvCacheRetentionConfig]]] = None,
+        disaggregated_params: Optional[Union[
+            DisaggregatedParams, Sequence[DisaggregatedParams]]] = None,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -206,10 +210,10 @@ class LLM:
                 LoRA request to use for generation, if any. Defaults to None.
             prompt_adapter_request (tensorrt_llm.executor.request.PromptAdapterRequest, Sequence[tensorrt_llm.executor.request.PromptAdapterRequest], optional):
                 Prompt Adapter request to use for generation, if any. Defaults to None.
-            queries (tensorrt_llm.inputs.data.PromptInputs, Sequence[tensorrt_llm.inputs.data.PromptInputs], optional): The query text or token ids. Defaults to None.
-                it can be single prompt or batched prompts. it is used for star attention to run long context tasks.
-            kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, optional): Configuration for the request's retention in the KV Cache. Defaults to None.
-            disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
+            kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, Sequence[tensorrt_llm.bindings.executor.KvCacheRetentionConfig], optional):
+                Configuration for the request's retention in the KV Cache. Defaults to None.
+            disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, Sequence[tensorrt_llm.disaggregated_params.DisaggregatedParams], optional):
+                Disaggregated parameters. Defaults to None.
         Returns:
             Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
         """
@@ -220,37 +224,26 @@ class LLM:
 
         if unbatched:
             inputs = [inputs]
-            if queries:
-                queries = [queries]
 
         inputs = [prompt_inputs(i) for i in inputs]
-        if queries:
-            queries = [prompt_inputs(i) for i in queries]
+
+        def _item_at(maybe_batched: Union[Any, Sequence[Any]], pos: int) -> Any:
+            if isinstance(maybe_batched, list):
+                return maybe_batched[pos]
+            else:
+                return maybe_batched
 
         futures = []
         for i, request_inputs in enumerate(inputs):
-            if isinstance(sampling_params, list):
-                sp = sampling_params[i]
-            else:
-                sp = sampling_params
-            if isinstance(lora_request, list):
-                lora_req = lora_request[i]
-            else:
-                lora_req = lora_request
-            if isinstance(prompt_adapter_request, list):
-                pa_req = prompt_adapter_request[i]
-            else:
-                pa_req = prompt_adapter_request
-            request_queries = None if queries is None else queries[i]
             future = self.generate_async(
                 request_inputs,
-                queries=request_queries,
-                sampling_params=sp,
-                lora_request=lora_req,
-                prompt_adapter_request=pa_req,
-                kv_cache_retention_config=kv_cache_retention_config,
-                streaming=False,
-                disaggregated_params=disaggregated_params)
+                sampling_params=_item_at(sampling_params, i),
+                lora_request=_item_at(lora_request, i),
+                prompt_adapter_request=_item_at(prompt_adapter_request, i),
+                kv_cache_retention_config=_item_at(kv_cache_retention_config,
+                                                   i),
+                disaggregated_params=_item_at(disaggregated_params, i),
+                streaming=False)
             futures.append(future)
 
         for future in tqdm(futures,
@@ -272,7 +265,6 @@ class LLM:
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
-        queries: Optional[PromptInputs] = None,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
         _postproc_params: Optional[PostprocParams] = None,
@@ -287,17 +279,12 @@ class LLM:
             lora_request (tensorrt_llm.executor.request.LoRARequest, optional): LoRA request to use for generation, if any. Defaults to None.
             prompt_adapter_request (tensorrt_llm.executor.request.PromptAdapterRequest, optional): Prompt Adapter request to use for generation, if any. Defaults to None.
             streaming (bool): Whether to use the streaming mode for the generation. Defaults to False.
-            queries (tensorrt_llm.inputs.data.PromptInputs, optional): The query text or token ids. Defaults to None.
-                It can be single prompt or batched prompts. it is used for star attention to run long context tasks.
             kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, optional): Configuration for the request's retention in the KV Cache. Defaults to None.
             disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
 
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
-        print_colored_debug(
-            f"rank {global_mpi_rank()} generate_async: {inputs}\n", "green")
-
         sampling_params = self._prepare_sampling_params(sampling_params)
 
         if sampling_params.n > self.args.build_config.max_batch_size:
@@ -306,30 +293,38 @@ class LLM:
             )
 
         inputs = prompt_inputs(inputs)
-        if queries is not None:
-            queries = prompt_inputs(queries)
+
+        if not inputs.get("prompt") and inputs.get(
+                "prompt_token_ids") and inputs.get(
+                    "multi_modal_data") and not isinstance(
+                        self.input_processor, DefaultInputProcessor):
+            # VLMs need to process/tokenize the prompt in their own way
+            prompt = self.tokenizer.decode(inputs['prompt_token_ids'])
+            inputs = TextPrompt(
+                prompt=prompt,
+                multi_modal_data=inputs.get("multi_modal_data"),
+                mm_processor_kwargs=inputs.get("mm_processor_kwargs"))
+            if sampling_params.add_special_tokens:
+                logger.debug(
+                    "Setting add_special_tokens to False because prompt_token_ids were provided to generate. VLMs will re-encode the prompt."
+                )
+                sampling_params.add_special_tokens = False
 
         query_token_ids = None
-        prompt_tuning_config = None
+        multimodal_embedding = None
         mrope_config = None
         if "prompt_token_ids" in inputs:
             prompt_token_ids = inputs['prompt_token_ids']
             prompt = None
-            if queries is not None:
-                query_token_ids = queries['prompt_token_ids']
+            query_token_ids = inputs.get("query_token_ids", None)
         elif "prompt" in inputs:
             prompt_token_ids, extra_processed_inputs = self.input_processor(
                 inputs, sampling_params)
             prompt = inputs['prompt']
-            if queries is not None:
-                query_token_ids, _ = self.input_processor(
-                    queries, sampling_params)
-            if (extra_processed_inputs is not None
-                    and 'prompt_tuning_config' in extra_processed_inputs):
-                prompt_tuning_config = extra_processed_inputs.get(
-                    'prompt_tuning_config')
-            if (extra_processed_inputs is not None
-                    and 'mrope_config' in extra_processed_inputs):
+            if extra_processed_inputs is not None:
+                query_token_ids = extra_processed_inputs.get('query_token_ids')
+                multimodal_embedding = extra_processed_inputs.get(
+                    'mm_embedding')
                 mrope_config = extra_processed_inputs.get('mrope_config')
         else:
             raise TypeError(
@@ -350,7 +345,7 @@ class LLM:
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
             streaming=streaming,
-            prompt_tuning_config=prompt_tuning_config,
+            multimodal_embedding=multimodal_embedding,
             mrope_config=mrope_config,
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
@@ -447,6 +442,15 @@ class LLM:
                         "tokenizer is required to reset end_id if it is None, or you can explicitly specify the end_id for sampling_params"
                     )
                 sampling_params._setup(self.tokenizer)
+            # auto enabled context and/or generation logits flags, as they are required by logprob computation for TRT backend.
+            if self.args.backend not in ["pytorch", "autodeploy"]:
+                if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
+                    sampling_params.return_context_logits = True
+                    sampling_params._context_logits_auto_enabled = True
+                if sampling_params.logprobs and not sampling_params.return_generation_logits:
+                    sampling_params.return_generation_logits = True
+                    sampling_params._generation_logits_auto_enabled = True
+
             return sampling_params
         else:
             raise TypeError(
@@ -456,7 +460,19 @@ class LLM:
     def _check_arguments(self, prompt_len: int, query_len: int,
                          sampling_params: SamplingParams) -> None:
 
-        if self.args.backend in ['pytorch', 'autodeploy']:
+        if self.args.backend == "pytorch":
+            # TODO: remove these checks after PyTorch backend
+            # fully support TopK prompt and generation logprobs.
+            if sampling_params.prompt_logprobs:
+                raise ValueError(
+                    f"`prompt_logprobs` in sampling_params is not supported in the PyTorch backend yet. Received `prompt_logprobs={sampling_params.prompt_logprobs}`. Please unset this field."
+                )
+            if sampling_params.logprobs and sampling_params.logprobs > 1:
+                raise ValueError(
+                    f"PyTorch backend currently only supports `logprobs=1`. Received `logprobs={sampling_params.logprobs}` (Top{sampling_params.logprobs} logprobs). Please set `logprobs=1` in `sampling_params` instead."
+                )
+            return
+        elif self.args.backend == "autodeploy":
             return
 
         build_config = self.args.build_config
@@ -470,15 +486,27 @@ class LLM:
 
         if (not self.args.enable_chunked_prefill) and (
                 prompt_len / self.args.parallel_config.cp_size + query_len +
-                sampling_params.max_tokens > max_seq_len):
+            (sampling_params.max_tokens or 0) > max_seq_len):
             raise ValueError(
                 f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and query length ({query_len}) max_tokens ({sampling_params.max_tokens}) should not exceed "
                 f"max_seq_len ({build_config.max_seq_len})")
 
-        if sampling_params.beam_width > build_config.max_beam_width:
+        if sampling_params.use_beam_search and sampling_params.n > build_config.max_beam_width:
             raise ValueError(
-                f"sampling_params's beam_width ({sampling_params.beam_width}) should not exceed max_beam_width ({build_config.max_beam_width})"
+                f"sampling_params's n ({sampling_params.n}) should not exceed max_beam_width ({build_config.max_beam_width}) when use_beam_search is True"
             )
+
+        if sampling_params.prompt_logprobs and not build_config.gather_context_logits:
+            raise ValueError(
+                f"`sampling_params's prompt_logprobs={sampling_params.prompt_logprobs}` requires `gather_context_logits=True` "
+                f"in the `BuildConfig` when constructing the LLM. "
+                f"Example: LLM(..., build_config=BuildConfig(gather_context_logits=True))."
+            )
+
+        if sampling_params.logprobs and not self.args.gather_generation_logits:
+            raise ValueError(
+                f"`sampling_params.logprobs={sampling_params.logprobs}` requires `gather_generation_logits=True` "
+                f"to be passed explicitly to the `LLM()` constructor.")
 
     def _build_model(self):
         model_loader = CachedModelLoader(self.args,
@@ -498,7 +526,7 @@ class LLM:
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
-        self.input_processor = create_input_processor(self.args.model,
+        self.input_processor = create_input_processor(self._hf_model_dir,
                                                       self.tokenizer)
         self.tokenizer = self.input_processor.tokenizer
 
@@ -514,9 +542,21 @@ class LLM:
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
             gather_generation_logits=self.args.gather_generation_logits)
+        if self.args.backend is None:
+            # also set executor_config.max_seq_len in TRT workflow, to deduce default max_tokens
+            if max_seq_len is not None:
+                executor_config.max_seq_len = max_seq_len
+            else:
+                engine_config = EngineConfig.from_json_file(self._engine_dir /
+                                                            "config.json")
+                executor_config.max_seq_len = engine_config.build_config.max_seq_len
         if self.args.kv_cache_config is not None:
             executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
                 self.args.kv_cache_config)
+        if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
+            # Disable KV cache reuse for deterministic mode
+            executor_config.kv_cache_config.enable_block_reuse = False
+            executor_config.kv_cache_config.enable_partial_reuse = False
         if self.args.peft_cache_config is not None:
             executor_config.peft_cache_config = PybindMirror.maybe_to_pybind(
                 self.args.peft_cache_config)
@@ -551,7 +591,9 @@ class LLM:
         if self.args.extended_runtime_perf_knob_config is not None:
             executor_config.extended_runtime_perf_knob_config = PybindMirror.maybe_to_pybind(
                 self.args.extended_runtime_perf_knob_config)
-
+        if self.args.cache_transceiver_config is not None:
+            executor_config.cache_transceiver_config = PybindMirror.maybe_to_pybind(
+                self.args.cache_transceiver_config)
         from tensorrt_llm._torch.pyexecutor.config import update_executor_config
         update_executor_config(
             executor_config,
@@ -581,7 +623,8 @@ class LLM:
                 num_postprocess_workers=self.args.num_postprocess_workers,
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
-            is_llm_executor=True)
+            is_llm_executor=True,
+            lora_config=self.args.lora_config)
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
         if self.args.skip_tokenizer_init:
@@ -594,8 +637,31 @@ class LLM:
         if self.runtime_context is not None:
             return self.runtime_context.tokenizer
 
+        # TODO smor- need to refine what is the desired behavior if lora is enabled
+        # in terms of the tokenizer initialization process
+        if hasattr(
+                self.args, "backend"
+        ) and self.args.backend == "pytorch" and self.args.lora_config is not None:
+            num_lora_dirs = len(self.args.lora_config.lora_dir)
+            if num_lora_dirs == 1:
+                tokenizer_path = self.args.lora_config.lora_dir[0]
+                try:
+                    tokenizer = ModelLoader.load_hf_tokenizer(
+                        tokenizer_path,
+                        trust_remote_code=self.args.trust_remote_code,
+                        use_fast=self.args.tokenizer_mode != 'slow')
+                    if tokenizer is None:
+                        tokenizer_path = self.args.model
+                    else:
+                        return tokenizer
+                except Exception:
+                    tokenizer_path = self.args.model
+            else:
+                tokenizer_path = self.args.model
+        else:
+            tokenizer_path = self.args.model
         return ModelLoader.load_hf_tokenizer(
-            self.args.model,
+            tokenizer_path,
             trust_remote_code=self.args.trust_remote_code,
             use_fast=self.args.tokenizer_mode != 'slow')
 
@@ -619,8 +685,21 @@ class LLM:
         logger.info(f"Save model to {engine_dir}")
         if self._engine_dir is None:
             raise RuntimeError("The engine is not built yet.")
-        if self._engine_dir.absolute() != os.path.abspath(engine_dir):
+
+        if self._engine_dir.absolute() == os.path.abspath(engine_dir):
+            return
+
+        if not self.mpi_session or not self.mpi_session.is_comm_session():
             shutil.copytree(self._engine_dir, engine_dir, dirs_exist_ok=True)
+        else:
+            # NFS is fragile, so we copy files one by one
+            target_engine_dir = Path(engine_dir)
+            target_engine_dir.mkdir(parents=True, exist_ok=True)
+            # copy files one by one
+            for file in self._engine_dir.iterdir():
+                print_colored_debug(
+                    f"Copying {file} to {target_engine_dir / file.name}\n")
+                shutil.copy(file, target_engine_dir / file.name)
 
     def shutdown(self) -> None:
         if hasattr(self, "_executor") and self._executor is not None:
