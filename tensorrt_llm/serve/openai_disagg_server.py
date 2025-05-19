@@ -162,21 +162,49 @@ class OpenAIDisaggServer:
             logging.exception(exception)
             raise HTTPException(status_code=500, detail=f"Internal server error {str(exception)}")
 
-    async def _send_disagg_request(self, req: Union[CompletionRequest, ChatCompletionRequest]):
-        ctx_server = None
-        gen_server = None
-        ctx_req = None
-        ctx_finished = False
+    async def _send_context_request(self, ctx_server: str, ctx_req: Union[CompletionRequest, ChatCompletionRequest]):
+        if isinstance(ctx_req, ChatCompletionRequest):
+            ctx_req.max_completion_tokens = 1
+        elif isinstance(ctx_req, CompletionRequest):
+            ctx_req.max_tokens = 1
+
+        ctx_req.disaggregated_params = DisaggregatedParams(request_type="context_only")
+        ctx_req.stream = False
+        ctx_req.stream_options = None
+
+        logging.info("Sending request to ctx server: %s", ctx_server)
         try:
+            if isinstance(ctx_req, ChatCompletionRequest):
+                ctx_response = await self.send_chat_request(ctx_server, ctx_req)
+            else:
+                assert isinstance(ctx_req, CompletionRequest)
+                ctx_response = await self.send_completion_request(ctx_server, ctx_req)
+        finally:
+            await self.ctx_router.finish_request(ctx_req)
+
+        choices = ctx_response.choices
+        if len(choices) > 1:
+            raise ValueError("Disagg server returned more than one choice. This is currently not supported in disaggregated server.")
+        if choices[0].disaggregated_params is None:
+            raise ValueError("Context server did not return disaggregated params")
+
+        return ctx_response
+
+    async def _send_disagg_request(self, req: Union[CompletionRequest, ChatCompletionRequest]):
+        gen_server = None
+        need_ctx = False
+        try:
+            # Determine if need context server
             condition = self.conditional_disagg_config
             if condition is not None:
                 assert isinstance(self.gen_router, KvCacheAwareRouter)
+                # Query kv cache status and select a best gen_server.
+                # The server is reserved for generation request
                 gen_server, info = await self.gen_router.get_next_server(req)
                 match_length = sum(info["matches"])
                 total_length = sum(len(token_list) for token_list in info["token_lists"])
                 if match_length == 0 or total_length - match_length > condition.max_local_prefill_length:
-                    ctx_req = copy.deepcopy(req)
-                    ctx_server, _ = await self.ctx_router.get_next_server(ctx_req)
+                    need_ctx = True
             elif os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
                 # Hard-code first token, ctx_request_id for testing
                 req.disaggregated_params = DisaggregatedParams(
@@ -188,41 +216,20 @@ class OpenAIDisaggServer:
                 # Since KV cache for prompt tokens will be uninitialized, need to ignore eos
                 req.ignore_eos = True
             else:
+                need_ctx = True
+
+            if need_ctx:
                 ctx_req = copy.deepcopy(req)
                 ctx_server, _ = await self.ctx_router.get_next_server(ctx_req)
-
-            if ctx_server is not None:
-                if isinstance(ctx_req, ChatCompletionRequest):
-                    ctx_req.max_completion_tokens = 1
-                elif isinstance(ctx_req, CompletionRequest):
-                    ctx_req.max_tokens = 1
-
-                ctx_req.disaggregated_params = DisaggregatedParams(request_type="context_only")
-                ctx_req.stream = False
-                ctx_req.stream_options = None
-
-                logging.info("Sending request to ctx server: %s", ctx_server)
-                if isinstance(ctx_req, ChatCompletionRequest):
-                    ctx_response = await self.send_chat_request(ctx_server, ctx_req)
-                else:
-                    assert isinstance(ctx_req, CompletionRequest)
-                    ctx_response = await self.send_completion_request(ctx_server, ctx_req)
-                await self.ctx_router.finish_request(ctx_req)
-                ctx_finished = True
-
-                choices = ctx_response.choices
-                if len(choices) > 1:
-                    raise ValueError("Disagg server returned more than one choice. This is currently not supported in disaggregated server.")
-                if choices[0].disaggregated_params is None:
-                    raise ValueError("Context server did not return disaggregated params")
-
+                # TODO: add ctx_server info into generation request for pre-registration
+                ctx_response = await self._send_context_request(ctx_server, ctx_req)
                 # Append disaggregates parameters to generation request
-                req.disaggregated_params = choices[0].disaggregated_params
+                req.disaggregated_params = ctx_response.choices[0].disaggregated_params
                 req.disaggregated_params.request_type = "generation_only"
             else:
                 ctx_response = None
 
-            # Pick a generation server and send request
+            # Pick a generation server if haven't reserved one, and send request
             if gen_server is None:
                 gen_server, _ = await self.gen_router.get_next_server(req)
             logging.info("Sending request to gen server: %s", gen_server)
@@ -242,8 +249,6 @@ class OpenAIDisaggServer:
                     media_type="text/event-stream"
                 )
         except:
-            if ctx_server is not None and not ctx_finished:
-                await self.ctx_router.finish_request(ctx_req)
             if gen_server is not None:
                 await self.gen_router.finish_request(req)
             raise
