@@ -655,7 +655,7 @@ class PyExecutor:
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
-            while not len(self.active_requests) > 0:
+            while len(self.active_requests) > 0:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
