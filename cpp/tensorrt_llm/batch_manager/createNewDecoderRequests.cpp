@@ -132,15 +132,34 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
     OptionalRef<RuntimeBuffers const> buffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(CreateNewDecoderRequests);
 
     auto const& decoderStream = decoder.getDecoderStream();
     auto& decoderState = decoder.getDecoderState();
-    auto [batchSlots, decoderRequests, samplingConfigs] = generateRequestOptions(
-        modelConfig, worldConfig, decodingConfig, contextRequests, bufferManager, logitsType, inputBuffers, decoderState,
-        beamWidth, runtimeStream, buffers);
 
-    auto batchSlotsRange = BufferRange<SizeType32>(*batchSlots);
-    auto const localBatchSize = batchSlots->getSize();
+    RequestVector finishedContextRequests;
+    std::copy_if(contextRequests.begin(), contextRequests.end(), std::back_inserter(finishedContextRequests),
+        [](auto const& llmReq) { return llmReq->isLastContextChunk(); });
+
+    copySequenceLengths(finishedContextRequests, inputBuffers, *decoderState.getSequenceLengths(), beamWidth,
+        bufferManager, runtimeStream);
+
+    auto decoderRequests = createDecoderRequests(finishedContextRequests, inputBuffers.inputsIds, decodingConfig,
+        bufferManager, logitsType, modelConfig, worldConfig, buffers);
+
+    auto const batchSize = finishedContextRequests.size();
+
+    std::vector<SamplingConfig> samplingConfigs;
+    samplingConfigs.reserve(batchSize);
+    for (auto const& llmReq : finishedContextRequests)
+    {
+        samplingConfigs.push_back(llmReq->mSamplingConfig);
+    }
+
+    TensorPtr batchSlotsView = runtime::ITensor::slice(inputBuffers.setupBatchSlots, 0, batchSize);
+
+    auto batchSlotsRange = BufferRange<SizeType32>(*batchSlotsView);
+    auto const localBatchSize = batchSlotsView->getSize();
     for (size_t bi = 0; bi < localBatchSize; ++bi)
     {
         newRequest(batchSlotsRange[bi], decoderRequests[bi], samplingConfigs[bi], modelConfig, decoderState,
@@ -148,7 +167,7 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return std::make_tuple(batchSlots, decoderRequests, samplingConfigs);
+    return {std::move(batchSlotsView), std::move(decoderRequests), std::move(samplingConfigs)};
 }
 
 void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder_batch::Request const& request,
@@ -237,7 +256,8 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     setupWords(dJointInput.badWordsLists, request.badWordsList, dJointInput.badWordsPtrs, dJointInput.badWordsLens,
         dJointInput.maxBadWordsLen, batchSlot);
 
-    TensorPtr const sequenceLimitLength{ITensor::slice(constPointerCast(dJointInput.sequenceLimitLength), batchSlot, 1)};
+    TensorPtr const sequenceLimitLength{
+        ITensor::slice(constPointerCast(dJointInput.sequenceLimitLength), batchSlot, 1)};
     runtime::kernels::invokeFill(*sequenceLimitLength, inputLength + maxNewTokens, decoderStream);
 
     TensorPtr const inputLengths{ITensor::slice(constPointerCast(dJointInput.lengths), batchSlot, 1)};
@@ -546,40 +566,6 @@ void CreateNewDecoderRequests::newRequestEagle(SizeType32 batchIdx, runtime::dec
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-std::tuple<TensorPtr, std::vector<decoder_batch::Request>, std::vector<SamplingConfig>>
-CreateNewDecoderRequests::generateRequestOptions(tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
-    te::DecodingConfig const& decodingConfig, RequestVector const& contextRequests, BufferManager const& bufferManager,
-    nvinfer1::DataType logitsType, DecoderInputBuffers& inputBuffers, runtime::decoder::DecoderState& decoderState,
-    SizeType32 beamWidth, runtime::CudaStream const& stream, OptionalRef<RuntimeBuffers const> buffers) const
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    NVTX3_SCOPED_RANGE(generateRequestOptions);
-
-    RequestVector finishedContextRequests;
-    std::copy_if(contextRequests.begin(), contextRequests.end(), std::back_inserter(finishedContextRequests),
-        [](auto const& llmReq) { return llmReq->isLastContextChunk(); });
-
-    copySequenceLengths(
-        finishedContextRequests, inputBuffers, *decoderState.getSequenceLengths(), beamWidth, bufferManager, stream);
-
-    auto decoderRequests = createDecoderRequests(finishedContextRequests, inputBuffers.inputsIds, decodingConfig,
-        bufferManager, logitsType, modelConfig, worldConfig, buffers);
-
-    auto const batchSize = finishedContextRequests.size();
-
-    std::vector<SamplingConfig> samplingConfigs;
-    samplingConfigs.reserve(batchSize);
-    for (auto const& llmReq : finishedContextRequests)
-    {
-        samplingConfigs.push_back(llmReq->mSamplingConfig);
-    }
-
-    TensorPtr batchSlotsView = runtime::ITensor::slice(inputBuffers.setupBatchSlots, 0, batchSize);
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return {std::move(batchSlotsView), std::move(decoderRequests), std::move(samplingConfigs)};
 }
 
 [[nodiscard]] std::vector<runtime::decoder_batch::Request> CreateNewDecoderRequests::createDecoderRequests(

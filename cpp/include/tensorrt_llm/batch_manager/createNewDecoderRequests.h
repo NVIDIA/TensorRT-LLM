@@ -74,9 +74,9 @@ public:
     std::tuple<TensorPtr, std::vector<runtime::decoder_batch::Request>, std::vector<runtime::SamplingConfig>>
     operator()(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
         executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
-        runtime::BufferManager const& bufferManager, nvinfer1::DataType logitsType,
-        DecoderInputBuffers& inputBuffers, GptDecoderBatched& decoder, CudaStream const& runtimeStream,
-        SizeType32 maxSequenceLength, SizeType32 beamWidth, OptionalRef<RuntimeBuffers const> buffers) const;
+        runtime::BufferManager const& bufferManager, nvinfer1::DataType logitsType, DecoderInputBuffers& inputBuffers,
+        GptDecoderBatched& decoder, CudaStream const& runtimeStream, SizeType32 maxSequenceLength, SizeType32 beamWidth,
+        OptionalRef<RuntimeBuffers const> buffers) const;
 
     //! @brief Initialize the decoder at `batchSlot` with a new `request`. Exposed only for static batching via
     //! GptDecoderBatched::newBatch()
@@ -112,13 +112,6 @@ private:
     //! @brief Setups decoder internal tensors for new Eagle request
     static void newRequestEagle(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
         runtime::ModelConfig const& modelConfig, DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream);
-
-    [[nodiscard]] std::tuple<TensorPtr, std::vector<runtime::decoder_batch::Request>, std::vector<runtime::SamplingConfig>>
-    generateRequestOptions(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
-        executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
-        runtime::BufferManager const& bufferManager, nvinfer1::DataType logitsType, DecoderInputBuffers& inputBuffers,
-        runtime::decoder::DecoderState& decoderState, SizeType32 beamWidth, runtime::CudaStream const& stream,
-        OptionalRef<RuntimeBuffers const> buffers = std::nullopt) const;
 
     [[nodiscard]] std::vector<runtime::decoder_batch::Request> createDecoderRequests(
         RequestVector const& finishedContextRequests, TensorPtr const& inputIds,
