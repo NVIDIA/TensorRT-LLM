@@ -98,6 +98,7 @@ else:
         'bin/executorWorker', 'libs/libtensorrt_llm.so', 'libs/libth_common.so',
         'libs/libnvinfer_plugin_tensorrt_llm.so',
         'libs/libtensorrt_llm_ucx_wrapper.so', 'libs/libdecoder_attention_0.so',
+        'libs/libtensorrt_llm_nixl_wrapper.so',
         'libs/libdecoder_attention_1.so', 'bindings.*.so', "include/**/*"
     ]
 
