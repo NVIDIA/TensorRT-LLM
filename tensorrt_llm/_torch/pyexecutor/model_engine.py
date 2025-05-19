@@ -291,7 +291,6 @@ class PyTorchModelEngine(ModelEngine):
         self.batch_size = batch_size
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
-        self.stream = torch.cuda.Stream()
 
         self.mapping = mapping
         if mapping.has_pp():
