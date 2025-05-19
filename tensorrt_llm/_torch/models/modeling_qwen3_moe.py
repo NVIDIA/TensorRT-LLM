@@ -9,7 +9,6 @@ from transformers import Qwen3MoeConfig
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from ..model_config import ModelConfig
-from ..models.modeling_utils import MissingLayer
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import FusedMoE, RenormalizeMoeRoutingMethod
@@ -69,16 +68,12 @@ class Qwen3MoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_dim)
 
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        if self.enable_attention_dp and len(all_rank_num_tokens) > 1:
-            max_num_token = max(all_rank_num_tokens)
-            hidden_states = torch.nn.functional.pad(
-                hidden_states,
-                (0, 0, 0, max_num_token - hidden_states.shape[0]))
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states,
             router_logits,
-            all_rank_num_tokens=all_rank_num_tokens)
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=False)
 
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
             final_hidden_states = self.allreduce(
@@ -199,7 +194,7 @@ class Qwen3MoEModel(DecoderModel):
             # When attention_dp is enabled, we cannot do all_reduce since
             # the problem size of different ranks are different.
             # So, we don't do parallelism here.
-            self.embed_tokens = nn.Embedding(
+            self.embed_tokens = Embedding(
                 config.pretrained_config.vocab_size,
                 config.pretrained_config.hidden_size,
                 dtype=config.pretrained_config.torch_dtype)
@@ -339,6 +334,6 @@ class Qwen3MoeForCausalLM(DecoderModelForCausalLM[Qwen3MoEModel,
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
-            elif not isinstance(self.model.layers[idx + 1], MissingLayer):
+            else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm

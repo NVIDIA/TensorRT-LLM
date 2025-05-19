@@ -16,7 +16,7 @@ import pytest
 
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig, SamplingParams
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -57,6 +57,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     def test_chunked_prefill(self, attn_backend):
+        pytest.skip("https://nvbugspro.nvidia.com/bug/5285881")
         pytorch_config = PyTorchConfig(attn_backend=attn_backend, )
         llm = LLM(self.MODEL_PATH,
                   enable_chunked_prefill=True,
@@ -182,12 +183,30 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
+    def test_fp8_llm_decoder(self):
+        model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
+        pytorch_config = PyTorchConfig(enable_trtllm_decoder=True)
+        llm = LLM(model_path, pytorch_backend_config=pytorch_config)
+        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+
+        sampling_params = SamplingParams(
+            temperature=0.8,
+            top_p=0.95,
+        )
+
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_acc_spec="temperature=0.8,top_p=0.95")
+
 
 class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_device_not_contain(["H100", "B200"])
+    @pytest.mark.skip_device_not_contain(["H100", "H200", "B200"])
     def test_fp8_tp4(self):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
         with LLM(model_path, tensor_parallel_size=4) as llm:
@@ -293,7 +312,7 @@ class TestMixtral8x7B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(2)
-    @pytest.mark.skip_device_not_contain(["H100", "B200"])
+    @pytest.mark.skip_device_not_contain(["H100", "H200", "B200"])
     def test_fp8_tp2(self):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Mixtral-8x7B-Instruct-v0.1-fp8"
         with LLM(model_path, tensor_parallel_size=2) as llm:
@@ -388,7 +407,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_device_not_contain(["H100"])
+    @pytest.mark.skip_device_not_contain(["H100", "H200"])
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False, False),
                            (True, False, False, False),
@@ -435,8 +454,26 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["H100"])
+    def test_fp8_block_scales_cuda_graph_padding(self):
+        # OOM on H100 with default free_gpu_memory_fraction=0.9
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+        pytorch_config = PyTorchConfig(disable_overlap_scheduler=False,
+                                       use_cuda_graph=True,
+                                       cuda_graph_max_batch_size=512,
+                                       cuda_graph_padding_enabled=True)
+        llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+                  kv_cache_config=kv_cache_config,
+                  pytorch_backend_config=pytorch_config)
+        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+        with llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_device_not_contain(["H100", "H200"])
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False, False),
                            (True, False, False, False),
@@ -812,10 +849,13 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-H-8B-Base-8K"
     MODEL_PATH = f"{llm_models_root()}/Nemotron-H-8B-Base-8K"
 
-    @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5264431")
     def test_auto_dtype(self):
+        # TODO: remove max_batch_size after mamba cache manager is supported
+        # ToDo: check 47b and 56b model
         kv_cache_config = KvCacheConfig(enable_block_reuse=False)
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 max_batch_size=128) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)

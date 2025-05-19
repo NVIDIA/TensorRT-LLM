@@ -184,16 +184,22 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             }
         }
 
-        if (!CloudManager.isNodeOnline(nodeName)){
-            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-                error "Cannot find a node that is idle to run the test for ${stageName}"
+        stage('Checking if the Node is Online') {
+            def counter = 0
+            while (!CloudManager.isNodeOnline(nodeName) && counter < 12) {
+                sleep(time: 10, unit: 'MINUTES')  // Wait 10 minutes to check status of the node again
+                counter++
+            }
+
+            if (CloudManager.isNodeOnline(nodeName)) {
+                // TODO: pass in the gpu numbers instead of hard code it to 1
+                def dockerArgs = "--gpus 1 --cap-add=SYS_ADMIN --ipc=host --security-opt seccomp=unconfined  -u root:root -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
+                slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, false)
+                executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
+            } else {
+                echo "The node does not come online in 2 hours, terminating the job"
             }
         }
-
-        // TODO: pass in the gpu numbers instead of hard code it to 1
-        def dockerArgs = "--gpus 1 --cap-add=SYS_ADMIN --ipc=host --security-opt seccomp=unconfined  -u root:root -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
-        slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, false)
-        executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
     } finally {
         cleanUpNodeResources(pipeline, cluster, nodeName)
         CloudManager.destroyNode(nodeName)
@@ -629,7 +635,7 @@ def launchTestListCheck(pipeline)
             sh "tar -zxf ${tarName}"
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def llmSrc = "${llmPath}/TensorRT-LLM/src"
-            sh "python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa"
+            sh "NVIDIA_TRITON_SERVER_VERSION=25.04 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -748,8 +754,12 @@ def renderTestDB(testContext, llmSrc, stageName) {
         // If stageName contains "-CPP-", add "backend=cpp" to makoArgs
         // At this point, only tests with backend=cpp or unspecified backend will be run
         makoArgs += ["backend=cpp"]
+    } else if (stageName.contains("-Triton-")) {
+        // If stageName contains "-Triton-", add "backend=triton" to makoArgs
+        // At this point, only tests with backend=triton or unspecified backend will be run
+        makoArgs += ["backend=triton"]
     } else {
-        // If stageName does not contain "-PyTorch-", "-TensorRT-", or "-CPP-", do not add any backend
+        // If stageName does not contain "-PyTorch-", "-TensorRT-", "-CPP-", or "-Triton-", do not add any backend
         // At this point, all tests will be run
         // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
     }
@@ -904,6 +914,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (!skipInstallWheel) {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
         }
+
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "mkdir -p /opt/tritonserver/backends/tensorrtllm")
+        def isAarch64 = config.contains("aarch64")
+        if (!isAarch64) {
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && cp TensorRT-LLM/triton_backend/inflight_batcher_llm/libtriton_tensorrtllm.so /opt/tritonserver/backends/tensorrtllm/")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && cp TensorRT-LLM/triton_backend/inflight_batcher_llm/trtllmExecutorWorker /opt/tritonserver/backends/tensorrtllm/")
+        }
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
     }
 
@@ -996,10 +1013,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         testList = "${testList}_${splitId}"
         def testCmdLine = [
             "LLM_ROOT=${llmSrc}",
+            "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
             "LLM_MODELS_ROOT=${MODEL_CACHE_DIR}",
+            "MODEL_CACHE_DIR=${MODEL_CACHE_DIR}",
             extraInternalEnv,
             "pytest",
             "-v",
+            "--timeout-method=thread",
             "--apply-test-list-correction",
             "--splitting-algorithm least_duration",
             "--timeout=${pytestTestTimeout}",
@@ -1109,7 +1129,7 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
         sh """
             ls -all ${stageName}/
             if ! grep -q '<testcase' ${stageName}/results.xml; then
-                rm ${stageName}/results.xml
+                rm ${stageName}/results.xml || true
             fi
         """
         def llmPath = sh (script: "realpath .", returnStdout: true).trim()
@@ -1401,14 +1421,19 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A30-TensorRT-[Post-Merge]-1": ["a30", "l0_a30", 1, 2],
         "A30-TensorRT-[Post-Merge]-2": ["a30", "l0_a30", 2, 2],
         "A30-CPP-[Post-Merge]-1": ["a30", "l0_a30", 1, 1],
+        "A30-Triton-Python-[Post-Merge]-1": ["a30", "l0_a30", 1, 2],
+        "A30-Triton-Python-[Post-Merge]-2": ["a30", "l0_a30", 2, 2],
         "A100X-TensorRT-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
         "A100X-TensorRT-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
+        "A100X-Triton-Python-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
+        "A100X-Triton-Python-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
         "L40S-TensorRT-[Post-Merge]-1": ["l40s", "l0_l40s", 1, 2],
         "L40S-TensorRT-[Post-Merge]-2": ["l40s", "l0_l40s", 2, 2],
         "H100_PCIe-PyTorch-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-TensorRT-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 2],
         "H100_PCIe-TensorRT-[Post-Merge]-2": ["h100-cr", "l0_h100", 2, 2],
+        "B200_PCIe-Triton-Python-[Post-Merge]-1": ["b100-ts2", "l0_b200", 1, 1],
         "DGX_H100-4_GPUs-PyTorch-[Post-Merge]": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-TensorRT-[Post-Merge]": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A100_80GB_PCIE-TensorRT-Perf": ["a100-80gb-pcie", "l0_perf", 1, 1],

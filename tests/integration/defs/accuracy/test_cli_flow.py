@@ -429,13 +429,13 @@ class TestLlama2_7B(CliFlowAccuracyTestHarness):
     def test_tp2cp2(self):
         self.run(tp_size=2, cp_size=2)
 
-    @skip_pre_ada
+    @skip_pre_hopper
     def test_fp8_gemm_plugin(self):
         self.run(quant_algo=QuantAlgo.FP8,
                  kv_cache_quant_algo=QuantAlgo.FP8,
                  extra_build_args=["--gemm_plugin=fp8"])
 
-    @skip_pre_ada
+    @skip_pre_hopper
     @skip_post_blackwell
     def test_fp8_gemm_swiglu_plugin(self):
         # gemm_swiglu_plugin=fp8 is not supported on SM 100.
@@ -444,7 +444,7 @@ class TestLlama2_7B(CliFlowAccuracyTestHarness):
             kv_cache_quant_algo=QuantAlgo.FP8,
             extra_build_args=["--gemm_plugin=fp8", "--gemm_swiglu_plugin=fp8"])
 
-    @skip_pre_ada
+    @skip_pre_hopper
     @skip_post_blackwell
     def test_fp8_low_latency_gemm_plugin(self):
         # low_latency_gemm_plugin=fp8 is not supported on SM 100.
@@ -1146,6 +1146,17 @@ class TestQwen2_0_5BInstruct(CliFlowAccuracyTestHarness):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
                         MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.FP8)
+
+
+class TestQwen2_1_5B(CliFlowAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen2-1.5B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen2-1.5B"
+    EXAMPLE_FOLDER = "models/core/qwen"
+
+    @pytest.mark.skip_less_device(4)
+    def test_auto_dtype_cp4(self):
+        "RCCA: https://nvbugs/5170106"
+        self.run(dtype='auto', cp_size=4)
 
 
 class TestQwen2_7BInstruct(CliFlowAccuracyTestHarness):

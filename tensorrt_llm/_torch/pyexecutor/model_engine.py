@@ -17,6 +17,8 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
+from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
+from tensorrt_llm._torch.speculative.mtp import SampleStateTensorsMTP
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
 from tensorrt_llm.bindings.executor import GuidedDecodingConfig
@@ -35,12 +37,12 @@ from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
 from ..compilation.utils import set_enable_piecewise_cuda_graph_capture_flag
 from ..distributed import MPIDist
+from ..distributed.communicator import init_pp_comm
 from ..metadata import KVCacheParams
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      timing)
-from ..pipeline_interface import PipelineInterface
 from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
 from ..utils import set_torch_compiling, with_model_extra_attrs
 from .config import LoadFormat, PyTorchConfig
@@ -64,7 +66,7 @@ class ModelEngine(ABC):
     @abstractmethod
     def forward(self, scheduled_requests: ScheduledRequests,
                 resource_manager: ResourceManager,
-                new_tensors_device: Optional[Dict[str, torch.Tensor]],
+                new_tensors_device: Optional[SampleStateTensors],
                 extra_model_inputs: Optional[Dict[str, Any]]):
         raise NotImplementedError
 
@@ -292,7 +294,7 @@ class PyTorchModelEngine(ModelEngine):
 
         self.mapping = mapping
         if mapping.has_pp():
-            PipelineInterface.init_pp_comm(mapping)
+            init_pp_comm(mapping)
         self.dist = dist
         self.pytorch_backend_config = pytorch_backend_config
         self.spec_config = spec_config
@@ -430,11 +432,10 @@ class PyTorchModelEngine(ModelEngine):
             self.previous_kv_lens_offsets_cuda = torch.zeros((batch_size, ),
                                                              dtype=torch.int,
                                                              device='cuda')
-            self.without_logits = self.spec_config.spec_dec_mode.without_logits(
-            )
+            self.is_mtp = self.spec_config.spec_dec_mode.is_mtp()
             self.max_draft_len = spec_config.max_draft_tokens
         else:
-            self.without_logits = False
+            self.is_mtp = False
             self.max_draft_len = 0
         self.iter_counter = 0
 
@@ -777,6 +778,8 @@ class PyTorchModelEngine(ModelEngine):
             [max_req_id + i + 1 for i in range(padding_size)],
             is_gen=True,
             max_num_draft_tokens=self.max_draft_len)
+        for req in generation_requests:
+            req.is_cuda_graph_dummy = True
         scheduled_requests.generation_requests.extend(generation_requests)
         return generation_requests
 
@@ -855,13 +858,8 @@ class PyTorchModelEngine(ModelEngine):
         else:
             spec_metadata = None
 
-        pipeline_interface = None
-        if not self.mapping.is_first_pp_rank():
-            pipeline_interface = self.model.create_pipeline_interface(
-                batch_size)
         self._cuda_graphs[batch_size] = DecodingCUDAGraphRunner(
-            batch_size, "cuda", attn_metadata, spec_metadata,
-            pipeline_interface, self.mapping.has_pp())
+            batch_size, "cuda", attn_metadata, spec_metadata)
         return self._cuda_graphs[batch_size]
 
     def __del__(self) -> None:
@@ -978,7 +976,7 @@ class PyTorchModelEngine(ModelEngine):
         """
         Return the maximum number of sequences that the model supports. PyExecutor need this to compute max_num_active_requests
         """
-        num_batches = self.mapping.pp_size if self.mapping.has_pp() else 1
+        num_batches = self.mapping.pp_size
         return num_batches * self.batch_size
 
     def _preprocess_inputs(self, inputs: Dict[str, Any]):
@@ -1013,7 +1011,7 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager: KVCacheManager,
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
-            new_tensors_device: Optional[Dict[str, torch.Tensor]] = None):
+            new_tensors_device: Optional[SampleStateTensors] = None):
         """
         Prepare inputs for Pytorch Model.
         """
@@ -1066,12 +1064,11 @@ class PyTorchModelEngine(ModelEngine):
         new_tokens_device, new_tokens_lens_device, next_draft_tokens_device = None, None, None
         if new_tensors_device is not None:
             # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
-            new_tokens_device = new_tensors_device["new_tokens_device"]
-            if self.without_logits:
-                new_tokens_lens_device = new_tensors_device[
-                    "new_tokens_lens_device"]  # [batch]
-                next_draft_tokens_device = new_tensors_device[
-                    "next_draft_tokens_device"]  # [batch, draft_len]
+            new_tokens_device = new_tensors_device.new_tokens
+            if self.is_mtp:
+                assert isinstance(new_tensors_device, SampleStateTensorsMTP)
+                new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
+                next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
 
         # Requests with draft tokens are treated like extend requests.
         extend_requests = []
@@ -1157,19 +1154,25 @@ class PyTorchModelEngine(ModelEngine):
                       len(position_ids) + len(generation_requests))))
         for request in generation_requests:
             if new_tokens_device is None or request.py_batch_idx is None:
-                input_ids.append(request.get_last_tokens(0))
+                # the request has no previous tensor:
+                # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
+                # (2) request.py_batch_idx is None, which means the request has no previous batch.
+                # the second condition includes dummy generation requests created for CUDA graph padding.
+                # these dummy generation requests should be at the end of generation_requests.
+                # skip adding their input_ids so that new_tokens_device can be aligned to the correct positions.
+                if not request.is_cuda_graph_dummy:
+                    input_ids.append(request.get_last_tokens(0))
                 past_seen_token_num = request.max_beam_num_tokens - 1
             else:
+                # the request has previous tensor
+                previous_batch_indices.append(request.py_batch_idx)
                 past_seen_token_num = request.max_beam_num_tokens
+
             request_ids.append(request.py_request_id)
             position_ids.append(past_seen_token_num)
             num_cached_tokens_per_seq.append(past_seen_token_num)
             prompt_lengths.append(request.py_prompt_len)
             draft_lens.append(0)
-
-            # skip dummy generation requests created in CUDA graph mode
-            if request.py_batch_idx is not None and new_tokens_device is not None:
-                previous_batch_indices.append(request.py_batch_idx)
 
             request.py_batch_idx = batch_idx
             batch_idx += 1
@@ -1328,13 +1331,6 @@ class PyTorchModelEngine(ModelEngine):
                     attn_metadata.num_tokens)
                 attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
-        if self.mapping.has_pp():
-            pipeline_interface = None
-            if not self.mapping.is_first_pp_rank():
-                pipeline_interface = self.model.create_pipeline_interface(
-                    inputs['input_ids'].shape[0])
-            inputs['pipeline_interface'] = pipeline_interface
-
         num_generation_tokens = len(generation_requests) + len(
             extend_requests) + sum(draft_lens)
         self.iter_states['num_ctx_requests'] = num_ctx_requests
@@ -1463,13 +1459,6 @@ class PyTorchModelEngine(ModelEngine):
                 all_rank_num_tokens = self.dist.tp_allgather(
                     attn_metadata.num_tokens)
                 attn_metadata.all_rank_num_tokens = all_rank_num_tokens
-
-        if self.mapping.has_pp():
-            pipeline_interface = None
-            if self.mapping.pp_rank > 0:
-                pipeline_interface = self.model.create_pipeline_interface(
-                    inputs['input_ids'].shape[0])
-            inputs['pipeline_interface'] = pipeline_interface
 
         return inputs, None
 
@@ -1822,12 +1811,10 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager: KVCacheManager,
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
-            new_tensors_device: Optional[Dict[str, torch.Tensor]] = None):
+            new_tensors_device: Optional[SampleStateTensors] = None):
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
             cp_type = self.mapping.cp_config['cp_type']
             if 'star_attention' == cp_type:
-                assert not self.mapping.has_pp(
-                ), "Star attention does not support pipeline parallel yet"
                 return self._prepare_star_attention_inputs(
                     scheduled_requests, kv_cache_manager, attn_metadata)
             else:
@@ -1842,7 +1829,7 @@ class PyTorchModelEngine(ModelEngine):
     def forward(self,
                 scheduled_requests: ScheduledRequests,
                 resource_manager: ResourceManager,
-                new_tensors_device: Optional[Dict[str, torch.Tensor]] = None,
+                new_tensors_device: Optional[SampleStateTensors] = None,
                 extra_model_inputs: Optional[Dict[str, Any]] = None):
 
         kv_cache_manager = resource_manager.get_resource_manager(
@@ -1865,15 +1852,7 @@ class PyTorchModelEngine(ModelEngine):
                 inputs.update(extra_model_inputs)
             self.last_spec_metadata = spec_metadata
 
-            if not self.mapping.is_first_pp_rank():
-                inputs['pipeline_interface'].recv()
-            if not self.mapping.is_last_pp_rank():
-                pp_interface = self._forward_step_intermediate(inputs)
-                pp_interface.send()
-                return self._post_forward_intermediate(inputs, pp_interface,
-                                                       gather_ids)
-            else:
-                return self._forward_step(inputs, gather_ids)
+            return self._forward_step(inputs, gather_ids)
 
         with self._maybe_pad_batch(scheduled_requests,
                                    kv_cache_manager) as scheduled_requests:
@@ -1900,38 +1879,18 @@ class PyTorchModelEngine(ModelEngine):
             self.iter_counter += 1
 
             if maybe_graph is None:
-                if not self.mapping.is_first_pp_rank():
-                    inputs['pipeline_interface'].recv()
-                if not self.mapping.is_last_pp_rank():
-                    pp_interface = self._forward_step_intermediate(inputs)
-                    pp_interface.send()
-                    outputs = self._post_forward_intermediate(
-                        inputs, pp_interface, gather_ids)
-                else:
-                    outputs = self._forward_step(inputs, gather_ids)
+                outputs = self._forward_step(inputs, gather_ids)
             else:
                 if maybe_graph.needs_capture():
-                    if not self.mapping.is_last_pp_rank():
-                        capture_fn = lambda inputs: self._forward_step_intermediate(
-                            inputs)
-                    else:
-                        capture_fn = lambda inputs: self._forward_step(
-                            inputs, gather_ids=gather_ids)
-
-                    pool = maybe_graph.capture(capture_fn,
-                                               self._cuda_graph_mem_pool,
-                                               extra_model_inputs)
+                    pool = maybe_graph.capture(
+                        lambda inputs: self._forward_step(
+                            inputs, gather_ids=gather_ids),
+                        self._cuda_graph_mem_pool,
+                        extra_model_inputs,
+                    )
                     self._cuda_graph_mem_pool = pool
 
-                if not self.mapping.is_first_pp_rank():
-                    inputs['pipeline_interface'].recv()
                 outputs = maybe_graph.run(inputs, extra_model_inputs)
-                if not self.mapping.is_last_pp_rank():
-                    pp_interface = PipelineInterface(*outputs)
-                    pp_interface.send()
-                    outputs = self._post_forward_intermediate(inputs,
-                                                              pp_interface,
-                                                              gather_ids=None)
 
             # Note: To overlap the CPU and GPU computation as much as possible,
             # guided_decoder.build should be called immediately after the launch of the single step;
@@ -1959,7 +1918,7 @@ class PyTorchModelEngine(ModelEngine):
     def _forward_step(self, inputs: Dict[str, Any],
                       gather_ids: Optional[torch.Tensor]) -> Dict[str, Any]:
         inputs = self._preprocess_inputs(inputs)
-        if self.without_logits:
+        if self.is_mtp:
             outputs = self.model_forward(**inputs)
             return outputs
 
@@ -1973,40 +1932,6 @@ class PyTorchModelEngine(ModelEngine):
             return {'logits': logits[gather_ids]}
         else:
             return {'logits': logits}
-
-    @nvtx_range("_forward_step_intermediate")
-    def _forward_step_intermediate(self, inputs: Dict[str, Any]):
-        pipeline_interface = self.model_forward(**inputs)
-        return pipeline_interface
-
-    @nvtx_range("_post_forward_intermediate")
-    def _post_forward_intermediate(self, inputs: Dict[str, Any],
-                                   pipeline_interface: PipelineInterface,
-                                   gather_ids: Optional[torch.Tensor]):
-        """
-        Instead of returning the logits for intermediate pipeline stages, we return the hidden states at last tokens.
-        This is useful to allocate the new tokens to recv from previous pipeline stage.
-        """
-        attn_metadata = inputs['attn_metadata']
-        hidden_states = pipeline_interface['hidden_states']
-        if len(hidden_states.shape) == 1:  # During run without KV cache
-            hidden_states = hidden_states.unsqueeze(0)
-
-        if gather_ids is None:
-            if attn_metadata is not None:
-                last_tokens = torch.cumsum(
-                    attn_metadata.seq_lens_cuda,
-                    dim=0,
-                    dtype=torch.long,
-                ) - 1
-                hidden_states = hidden_states[last_tokens]
-            else:
-                hidden_states = hidden_states[-1]
-
-        if gather_ids is not None:
-            return {'hidden_states': hidden_states[gather_ids]}
-        else:
-            return {'hidden_states': hidden_states}
 
     def _init_userbuffers(self, hidden_size):
         if self.mapping.tp_size <= 1:

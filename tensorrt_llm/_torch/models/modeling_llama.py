@@ -11,8 +11,8 @@ from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
-from tensorrt_llm._torch.pipeline_interface import PipelineInterface
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
@@ -35,9 +35,7 @@ from ..modules.rms_norm import RMSNorm
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             EagerFusionConfig, MissingLayer,
-                             register_auto_model, support_pp,
-                             unpack_hidden_states)
+                             EagerFusionConfig, register_auto_model)
 
 
 class Llama4Attention(Attention):
@@ -260,7 +258,10 @@ class Llama4MoE(nn.Module):
 
     def compute_routed_output(self, hidden_states, all_rank_num_tokens,
                               cutlass_min_latency_mode):
+        use_dp_padding = False
         if self.enable_attention_dp and self.mapping.tp_size > 1:
+            # Use padding here to keep the behavior unchanged
+            use_dp_padding = True
             max_num_token_across_dp_ranks = max(all_rank_num_tokens)
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
@@ -270,7 +271,8 @@ class Llama4MoE(nn.Module):
         routed_output = self.experts(hidden_states,
                                      router_logits,
                                      cutlass_min_latency_mode,
-                                     all_rank_num_tokens=all_rank_num_tokens)
+                                     all_rank_num_tokens=all_rank_num_tokens,
+                                     use_dp_padding=use_dp_padding)
         return routed_output
 
     def forward(
@@ -420,8 +422,8 @@ class Llama4DecoderLayer(DecoderLayer):
                 ))
         else:
             # Fully Connected
-            hidden_states, residual = unpack_hidden_states(
-                self.post_attention_layernorm(hidden_states, residual))
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
 
         hidden_states = self.feed_forward(
             hidden_states,
@@ -468,8 +470,8 @@ class Llama4DecoderLayer(DecoderLayer):
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
         elif self.next_layer_layernorm:
-            hidden_states, residual = unpack_hidden_states(
-                self.next_layer_layernorm(hidden_states, residual))
+            hidden_states, residual = self.next_layer_layernorm(
+                hidden_states, residual)
 
         return hidden_states, residual
 
@@ -646,13 +648,13 @@ class Eagle3LlamaDecoderLayer(DecoderLayer):
         return hidden_states, residual
 
 
-@support_pp
 class Llama4Model(DecoderModel):
 
     def __init__(self, model_config: ModelConfig[LlamaConfig]):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
         self.padding_idx = config.pad_token_id
+        self.num_hidden_layers = config.num_hidden_layers
         self.aux_stream = torch.cuda.Stream()
 
         if self.model_config.mapping.enable_attention_dp:
@@ -686,30 +688,21 @@ class Llama4Model(DecoderModel):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        pipeline_interface: Optional[PipelineInterface] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         lora_params=None,
     ) -> torch.Tensor:
-        if self.model_config.mapping.is_first_pp_rank():
-            if (input_ids is None) ^ (inputs_embeds is not None):
-                raise ValueError(
-                    "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
-                )
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+            )
 
-            if inputs_embeds is None:
-                inputs_embeds = self.embed_tokens(input_ids)
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
 
-            hidden_states = inputs_embeds
-            residual = None
-        else:
-            if pipeline_interface is None:
-                raise ValueError(
-                    "pipeline_interface is required for non-first pp rank.")
-            hidden_states, residual = pipeline_interface
-            hidden_states, residual = self.local_layers()[0].input_layernorm(
-                hidden_states, residual)
+        hidden_states = inputs_embeds
+        residual = None
 
-        for decoder_layer in self.local_layers():
+        for decoder_layer in self.layers[:self.num_hidden_layers]:
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
@@ -719,30 +712,29 @@ class Llama4Model(DecoderModel):
                 lora_params=lora_params,
             )
 
-        if self.model_config.mapping.is_last_pp_rank():
-            return hidden_states
-        else:
-            return PipelineInterface(hidden_states, residual)
+        return hidden_states
 
 
-@support_pp
 class LlamaModel(DecoderModel):
 
     def __init__(self, model_config: ModelConfig[LlamaConfig]):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
         self.padding_idx = config.pad_token_id
+        self.num_hidden_layers = config.num_hidden_layers
 
         vocab_size = config.vocab_size
         # TODO smor- we load manually only if there is a single lora dir, need to come up with a better solution
+        self.has_custom_embed_tokens = False
         if hasattr(
                 model_config,
                 'lora_config') and model_config.lora_config is not None and len(
                     model_config.lora_config.lora_dir) == 1:
-            from tensorrt_llm.lora_manager import HfLoraLoader
             lora_loader = HfLoraLoader(model_config.lora_config.lora_dir)
-            weight = lora_loader.embed_tokens
-            vocab_size = lora_loader.vocab_size
+            if lora_loader.vocab_size != 0 and lora_loader.embed_tokens is not None:
+                vocab_size = lora_loader.vocab_size
+                weight = lora_loader.embed_tokens
+                self.has_custom_embed_tokens = True
 
         self.embed_tokens = Embedding(
             vocab_size,
@@ -753,10 +745,7 @@ class LlamaModel(DecoderModel):
             gather_output=True,
         )
 
-        if hasattr(
-                model_config,
-                'lora_config') and model_config.lora_config is not None and len(
-                    model_config.lora_config.lora_dir) == 1:
+        if self.has_custom_embed_tokens:
             with torch.no_grad():
                 if model_config.mapping.tp_size > 1:
                     weight = split_matrix_tp(
@@ -783,28 +772,21 @@ class LlamaModel(DecoderModel):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        pipeline_interface: Optional[PipelineInterface] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         lora_params=None,
     ) -> torch.Tensor:
-        if self.model_config.mapping.is_first_pp_rank():
-            if (input_ids is None) ^ (inputs_embeds is not None):
-                raise ValueError(
-                    "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
-                )
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+            )
 
-            if inputs_embeds is None:
-                inputs_embeds = self.embed_tokens(input_ids)
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
 
-            hidden_states = inputs_embeds
-            residual = None
-        else:
-            if pipeline_interface is None:
-                raise ValueError(
-                    "pipeline_interface is required for non-first pp rank.")
-            hidden_states, residual = pipeline_interface
+        hidden_states = inputs_embeds
+        residual = None
 
-        for decoder_layer in self.local_layers():
+        for decoder_layer in self.layers[:self.num_hidden_layers]:
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
@@ -814,11 +796,8 @@ class LlamaModel(DecoderModel):
                 lora_params=lora_params,
             )
 
-        if self.model_config.mapping.is_last_pp_rank():
-            hidden_states, _ = self.norm(hidden_states, residual)
-            return hidden_states
-        else:
-            return PipelineInterface(hidden_states, residual)
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
 
 
 @register_auto_model("LlamaForCausalLM")
@@ -869,7 +848,7 @@ class Llama4ForCausalLM(DecoderModelForCausalLM[Llama4Model, Llama4Config]):
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
-            elif not isinstance(self.model.layers[idx + 1], MissingLayer):
+            else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
 
@@ -947,19 +926,19 @@ class Llama4ForConditionalGeneration(Llama4ForCausalLM):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: Optional[bool] = False,
         spec_metadata: Optional[SpecMetadata] = None,
-        pipeline_interface: Optional[PipelineInterface] = None,
         **kwargs,
     ) -> torch.Tensor:
         mm_embed = kwargs.get("multi_modal_data", [])
         input_ids, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
                                                      input_ids, mm_embed)
-        logits = super().forward(attn_metadata,
-                                 input_ids,
-                                 position_ids,
-                                 inputs_embeds,
-                                 spec_metadata=spec_metadata,
-                                 return_context_logits=return_context_logits,
-                                 pipeline_interface=pipeline_interface)
+        logits = super().forward(
+            attn_metadata,
+            input_ids,
+            position_ids,
+            inputs_embeds,
+            spec_metadata=spec_metadata,
+            return_context_logits=return_context_logits,
+        )
         return logits
 
 

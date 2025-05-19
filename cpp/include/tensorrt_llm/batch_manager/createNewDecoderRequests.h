@@ -17,10 +17,8 @@
 
 #pragma once
 
-#include "common.h"
 #include "tensorrt_llm/common/algorithm.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/request.h"
@@ -29,8 +27,9 @@ namespace tensorrt_llm::runtime
 {
 class DecodingInput;
 class DecodingOutput;
+class GptDecoderBatched;
+class SamplingConfig;
 class SpeculativeDecodingMode;
-// class GptDecoderBatched;
 } // namespace tensorrt_llm::runtime
 
 namespace tensorrt_llm::batch_manager
