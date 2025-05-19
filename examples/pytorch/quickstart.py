@@ -1,5 +1,6 @@
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
+import torch
 
 
 def main():
@@ -9,15 +10,21 @@ def main():
         "The capital of France is",
         "The future of AI is",
     ]
-    sampling_params = SamplingParams(max_tokens=32)
+    sampling_params = SamplingParams(max_tokens=32, return_context_logits=True)
 
-    llm = LLM(model='TinyLlama/TinyLlama-1.1B-Chat-v1.0')
+    llm = LLM(model='./converted-classification-model/')
     outputs = llm.generate(prompts, sampling_params)
 
+    tllm_logits = []
     for i, output in enumerate(outputs):
         prompt = output.prompt
-        generated_text = output.outputs[0].text
-        print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+        tllm_logit = output.context_logits.cpu()
+        print(f"Prompt: {prompt!r}, Context logits: {tllm_logit}")
+        tllm_logits += [tllm_logit]
+    # Stack the output
+    tllm_logits = torch.stack(tllm_logits)
+    print(tllm_logits)
+    print(f"shape: {tllm_logits.shape}")
 
 
 if __name__ == '__main__':

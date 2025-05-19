@@ -162,23 +162,25 @@ class BertPooler(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-
-        # We "pool" the model by simply taking the hidden state corresponding
-        # to the first token.
         if attn_metadata is not None:
-            #NOTE: select the first tokens
-            offset = attn_metadata.seq_lens_cuda
-            selected_tokens = torch.cumsum(
-                attn_metadata.seq_lens_cuda,
-                dim=0,
-                dtype=torch.long,
-            ) - offset
-            hidden_states = hidden_states[selected_tokens]
+            # Average pooling with attention metadata (for variable-length sequences)
+            pooled_output = []
+            start_idx = 0
+            for seq_len in attn_metadata.seq_lens_cuda:
+                # Extract the sequence and average pool its tokens
+                seq = hidden_states[start_idx : start_idx + seq_len]
+                pooled_seq = seq.mean(dim=0)  # Average over tokens
+                pooled_output.append(pooled_seq)
+                start_idx += seq_len
+            pooled_output = torch.stack(pooled_output, dim=0)
         else:
-            # hidden_states: [B, N, H]
-            hidden_states = hidden_states[:, 0]
-        pooled_output = self.dense(hidden_states)
-        pooled_output = self.activation(pooled_output)
+            # Standard average pooling for fixed-length sequences
+            # hidden_states shape: [batch_size, seq_len, hidden_size]
+            pooled_output = hidden_states.mean(dim=1)  # Average over sequence length
+
+        # Apply dense layer and activation
+        #pooled_output = self.dense(pooled_output)
+        #pooled_output = self.activation(pooled_output)
         return pooled_output
 
 
