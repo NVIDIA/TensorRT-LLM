@@ -136,7 +136,7 @@ The modules in the diagram are:
 | Optimize CUTLASS Flow: Sparse Experts as GEMMs            |   249    | The code is not open-source yet due to the dependency with internal base environment and we are planning to make it decoupled from internal base environment thus to be able to open-source in the future.|
 | Introduce EP4TP2 for better workload balance              |   253    | Use `--tp 8 --ep 4` when benchmarking                                                                                                                       |
 | Introduce moe_backend=TRTLLM, EP2TP4 for better balance   |   299    | [PR #4280](https://github.com/NVIDIA/TensorRT-LLM/pull/4280)                                                                                          |
-| Optimize Fuse_A_GEMM and Router_GEMM                      |   340    | WIP: [PR #4115](https://github.com/NVIDIA/TensorRT-LLM/pull/4115)                                                                                          |
+| Optimize Fuse_A_GEMM and Router_GEMM                      |   340    | WIP                                                                                          |
 | Relax Acceptance                                          |   **368**    | [deepseek_v3#multi-token-prediction-mtp](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/deepseek_v3#multi-token-prediction-mtp)     |
 
 ### System Level optimizations
@@ -232,7 +232,7 @@ We developed a custom Fuse_A_GEMM that prefetches the majority of its weights in
 <img src="../media/tech_blog1_fuse_a_gemm.png?raw=true" alt="tech_blog1_fuse_a_gemm" width="500" height="auto">
 
 ##### RouterGEMM
-By leveraging our internal AI code generator, we automatically generate an optimized RouterGEMM kernel, which delivers substantial improvements over the default GEMM implementation when [num_tokens <=30](https://github.com/NVIDIA/TensorRT-LLM/pull/4115/files#diff-006ae982200a5ef2b27f4aedb526025e64406d3c2fadde329ea745793fac04edR303:~:text=and%20hidden_states.-,size,-(0))
+By leveraging our internal AI code generator, we automatically generate an optimized RouterGEMM kernel, which delivers substantial improvements over the default GEMM implementation when num_tokens <=30.
 
 <img src="../media/tech_blog1_router_gemm.png?raw=true" alt="tech_blog1_router_gemm" width="500" height="auto">
 
