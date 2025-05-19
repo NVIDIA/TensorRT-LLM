@@ -651,7 +651,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
     def _enable_min_latency_mode(self, num_tokens: int):
         return (num_tokens <= 128 and self.fusion_config.POST_MOE_FUSION
                 and self.is_nvfp4 and self.model_config.moe_backend == 'CUTLASS'
-                and not self.mapping.is_multi_node())
+                and not self.mapping.is_multi_node()
+                and self.allreduce.mnnvl_allreduce is None)
 
     def forward(
         self,

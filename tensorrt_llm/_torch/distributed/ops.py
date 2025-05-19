@@ -264,6 +264,78 @@ def reducescatter(
     return output
 
 
+class MNNVLAllReduce(nn.Module):
+    """A specialized AllReduce implementation for Multi-Node NVLink communication.
+
+    This class handles the MNNVL-specific allreduce operations, which can be more efficient
+    for certain operations when using NVLink for multi-node communication.
+    """
+
+    def __init__(self, mapping: Mapping, dtype: torch.dtype):
+        super().__init__()
+        self.mapping = mapping
+        self.dtype = dtype
+        self.enable_mnnvl = (os.environ.get("TRTLLM_MNNVL_AR_ENABLED",
+                                            "0") == "1"
+                             and dtype in [torch.bfloat16, torch.float32]
+                             and (not mapping.has_cp()))
+
+        if self.enable_mnnvl:
+            self.mcast_buffer_mnnvl, self.buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = get_allreduce_mnnvl_workspace(
+                self.mapping, dtype)
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        all_reduce_params: AllReduceParams,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        """Forward pass for MNNVL AllReduce.
+
+        Args:
+            input (torch.Tensor): Input tensor to be reduced
+            all_reduce_params (Optional[AllReduceParams]): Parameters for fused operations
+
+        Returns:
+            Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s)
+        """
+        if not self.enable_mnnvl or input.numel() > self.max_num_elements_mnnvl:
+            return None
+
+        fusion_op = all_reduce_params.fusion_op
+
+        shape = input.shape
+        input = input.view(-1, shape[-1])
+        output = torch.empty_like(input)
+        buffer_mnnvl = self.buffer_mnnvl.view(3, 2, -1, shape[-1])
+
+        if fusion_op is None:
+            torch.ops.trtllm.lowlat_twoshot_allreduce(
+                output,
+                input,
+                buffer_mnnvl,
+                self.buffer_flags_mnnvl,
+                True,
+            )
+            return output.view(shape)
+        elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+            torch.ops.trtllm.lowlat_twoshot_allreduce(
+                output,
+                input,
+                buffer_mnnvl,
+                self.buffer_flags_mnnvl,
+                False,
+            )
+            residual_in = all_reduce_params.residual
+            residual_out = torch.empty_like(input)
+
+            torch.ops.trtllm.lowlat_twoshot_rmsnorm(
+                residual_out, output, buffer_mnnvl,
+                all_reduce_params.norm_weight, all_reduce_params.eps,
+                residual_in, self.buffer_flags_mnnvl)
+            return output.view(shape), residual_out.view(shape)
+        return None
+
+
 class AllReduce(nn.Module):
 
     def __init__(self,
@@ -315,10 +387,6 @@ class AllReduce(nn.Module):
         self.mapping = mapping
         self.workspace = None
         self.strategy = strategy
-        self.enable_mnnvl = False
-        self.buffer_mnnvl = None
-        self.buffer_flags_mnnvl = None
-        self.max_num_elements_mnnvl = 0
 
         self.force_low_precision_env = os.environ.get(
             "FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY")
@@ -329,13 +397,9 @@ class AllReduce(nn.Module):
                     allocate_low_presicion_allreduce_workspace(self.mapping)
                 self.workspace = get_allreduce_workspace(self.mapping)
 
-            self.enable_mnnvl = (os.environ.get("TRTLLM_MNNVL_AR_ENABLED",
-                                                "0") == "1"
-                                 and dtype in [torch.bfloat16, torch.float32]
-                                 and (not mapping.has_cp()))
-            if self.enable_mnnvl:
-                self.mcast_buffer_mnnvl, self.buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = get_allreduce_mnnvl_workspace(
-                    self.mapping, dtype)
+            # Initialize MNNVL AllReduce if needed
+            self.mnnvl_allreduce = MNNVLAllReduce(mapping,
+                                                  dtype) if dtype else None
 
     def forward(
         self,
@@ -371,47 +435,17 @@ class AllReduce(nn.Module):
                                          == False):
             return input
 
-        # Assume using no fusion allreduce here
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
-        fusion_op = all_reduce_params.fusion_op
+        # Try MNNVL AllReduce first if available
+        if self.mnnvl_allreduce:
+            mnnvl_output = self.mnnvl_allreduce(
+                input, all_reduce_params=all_reduce_params)
+            if mnnvl_output is not None:
+                return mnnvl_output
 
-        if (self.enable_mnnvl
-                and fusion_op in [AllReduceFusionOp.RESIDUAL_RMS_NORM, None]
-                and input.numel() <= self.max_num_elements_mnnvl):
-            shape = input.shape
-            input = input.view(-1, shape[-1])
-            output = torch.empty_like(input)
-            buffer_mnnvl = self.buffer_mnnvl.view(3, 2, -1, shape[-1])
-
-            if fusion_op is None:
-                torch.ops.trtllm.lowlat_twoshot_allreduce(
-                    output,
-                    input,
-                    buffer_mnnvl,
-                    self.buffer_flags_mnnvl,
-                    True,
-                )
-                return output.view(shape)
-            elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
-                torch.ops.trtllm.lowlat_twoshot_allreduce(
-                    output,
-                    input,
-                    buffer_mnnvl,
-                    self.buffer_flags_mnnvl,
-                    False,
-                )
-                residual_in = all_reduce_params.residual
-                residual_out = torch.empty_like(input)
-
-                torch.ops.trtllm.lowlat_twoshot_rmsnorm(
-                    residual_out, output, buffer_mnnvl,
-                    all_reduce_params.norm_weight, all_reduce_params.eps,
-                    residual_in, self.buffer_flags_mnnvl)
-
-                return output.view(shape), residual_out.view(shape)
-
+        # Fall back to regular AllReduce if MNNVL is not available or not applicable
         output = torch.ops.trtllm.allreduce(
             input=input,
             residual=all_reduce_params.residual,
