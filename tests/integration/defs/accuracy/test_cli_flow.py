@@ -803,17 +803,13 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
     @skip_pre_ada
     @skip_post_blackwell
     def test_fp8_rowwise_meta_recipe(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+        self.run(quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
                  extra_acc_spec="meta_recipe",
                  extra_convert_args=["--use_meta_fp8_rowwise_recipe"])
 
     @pytest.mark.parametrize("max_gpu_percent", [0.1, 1.0])
     def test_weight_streaming(self, max_gpu_percent: float):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 extra_build_args=["--weight_streaming"],
+        self.run(extra_build_args=["--weight_streaming"],
                  extra_summarize_args=["--gpu_weights_percent=0"])
 
         for gpu_percent in [0.1, 0.5, 0.9, 1]:
@@ -823,16 +819,12 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
             self.evaluate()
 
     def test_cyclic_kv_cache(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 extra_acc_spec="max_attention_window_size=960",
+        self.run(extra_acc_spec="max_attention_window_size=960",
                  extra_summarize_args=["--max_attention_window_size=960"])
 
     @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5166352")
-    # TODO: Add MMLU benchmark when restoring the test
     def test_cyclic_kv_cache_beam_search(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME)],
-                 extra_acc_spec="max_attention_window_size=960;beam_width=4",
+        self.run(extra_acc_spec="max_attention_window_size=960;beam_width=4",
                  extra_build_args=["--max_beam_width=4"],
                  extra_summarize_args=[
                      "--max_attention_window_size=960", "--num_beams=4"
