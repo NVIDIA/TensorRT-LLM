@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@emma_move_funcs']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.Exception
 import groovy.transform.Field
@@ -396,7 +396,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
 
 pipeline {
     agent {
-        kubernetes trtllm_utils.createKubernetesPodConfig(type: "agent")
+        kubernetes createKubernetesPodConfig("agent")
     }
 
     parameters {
