@@ -1046,19 +1046,17 @@ std::vector<executor::Request> createRequestsFromInputTensors(std::vector<InputT
             std::vector<std::vector<executor::SizeType32>> multimodalHashes;
             std::vector<executor::SizeType32> multimodalPositions;
             std::vector<executor::SizeType32> multimodalLengths;
-            // Extract multimodalHashes as a vector of vectors
-            // (Assume extractVector can be used for 1D, for 2D you may need a custom extraction or flatten+reshape)
-            // Here, we assume multimodal_hashes is stored as a 2D tensor (batch, hash_len)
+            // Extract multimodalHashes as a vector of vectors (2D tensor with [num_tokens, hash_len])
             const auto& hashesTensor = inputTensors.at(InputFieldsNames::multimodalHashes).tensor;
             auto hashesShape = hashesTensor->getShape();
-            if (hashesShape.nbDims == 2) {
-                int64_t batch = hashesShape.d[0];
-                int64_t hashLen = hashesShape.d[1];
-                auto* data = static_cast<executor::SizeType32*>(hashesTensor->data());
-                multimodalHashes.resize(batch);
-                for (int64_t i = 0; i < batch; ++i) {
-                    multimodalHashes[i].assign(data + i * hashLen, data + (i + 1) * hashLen);
-                }
+            TLLM_CHECK_WITH_INFO(hashesShape.nbDims == 2, "multimodal_hashes tensor must be 2D (num_tokens, hash_len)");
+            int64_t numTokens = hashesShape.d[0];
+            int64_t hashLen = hashesShape.d[1];
+            auto* data = static_cast<executor::SizeType32*>(hashesTensor->data());
+            multimodalHashes.resize(numTokens);
+            for (int64_t i = 0; i < numTokens; ++i) {
+                multimodalHashes[i].resize(hashLen);
+                std::memcpy(multimodalHashes[i].data(), data + i * hashLen, hashLen * sizeof(executor::SizeType32));
             }
             // Extract positions and lengths as 1D vectors
             utils::extractVector<executor::SizeType32>(inputTensors, InputFieldsNames::multimodalPositions, multimodalPositions);
