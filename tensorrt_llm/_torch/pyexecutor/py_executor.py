@@ -928,9 +928,9 @@ class PyExecutor:
             # Set draft tokens here to make the KV cache manager
             # and scheduler aware of them.
             for req in self.active_requests:
-                # Comment this to enable providing draft tokens in context phase.
-                #if req.state != LlmRequestState.GENERATION_IN_PROGRESS:
-                #    continue
+                # TODO: enable draft tokens in context phase
+                if req.state != LlmRequestState.GENERATION_IN_PROGRESS:
+                    continue
                 req.py_last_draft_tokens = req.py_draft_tokens
                 max_draft_len = self.model_engine.spec_config.max_draft_tokens
 
