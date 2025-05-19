@@ -789,6 +789,8 @@ class FusedMoE(nn.Module):
         assert token_selected_experts.dtype == torch.int32
 
         if self.apply_router_weight_on_input:
+            assert self.routing_method.top_k == 1, "Current workaround only supports top-1 routing"
+            assert x.dtype != torch.float8_e4m3fn, "Current workaround for apply_router_weight_on_input does not support fp8 input"
             x = x * token_final_scales.to(x.dtype)
             # TODO: remove this once we have correct fusedmoe kernel ready
             token_final_scales = None
@@ -951,7 +953,11 @@ class FusedMoE(nn.Module):
             assert use_dp_padding is not None
             num_rows = sum(all_rank_num_tokens)
         else:
-            num_rows = x.shape[0]
+            if isinstance(x, Fp4QuantizedTensor):
+                num_rows = x.fp4_tensor.shape[0]
+            else:
+                num_rows = x.shape[0]
+
         # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
         num_chunks = (num_rows + self.moe_max_num_tokens -
                       1) // self.moe_max_num_tokens
@@ -1534,9 +1540,18 @@ class FusedMoE(nn.Module):
             dst_fc2_input_scale.copy_(w2_input_scale[...].reshape([]))
 
         for expert_id in range(self.num_experts):
-            w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
-            w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
-            w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
+            if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
+                w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
+                w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
+            elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                w1_input_scale = weights["gate_up_proj_input_scale"]
+                w3_input_scale = weights["gate_up_proj_input_scale"]
+                w2_input_scale = weights["down_proj_input_scale"]
+            else:
+                raise NotImplementedError(
+                    f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
+                )
 
             load_expert_fc31_input_scale_nvfp4(w1_input_scale, w3_input_scale,
                                                tmp_fc31_input_scale[expert_id])
