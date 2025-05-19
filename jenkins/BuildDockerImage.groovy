@@ -184,47 +184,20 @@ pipeline {
                 stage("Build trtllm release-sbsa") {
                     {
                         kubernetes trtllm_utils.createKubernetesPodConfig(
-<<<<<<< HEAD
                             image = DOCKER_DIND_IMAGE,
                             type = "build",
                             arch = "arm64"
                             cpuRequest = BUILD_CORES_REQUESTED,
                             cpuLimit = BUILD_CORES_LIMIT,
                             memoryRequest = BUILD_MEMORY_REQUESTED,
-                            memoryLimit = BUILD_MEMORY_LIMIT
-=======
-                            image: DOCKER_DIND_IMAGE,
-                            type: "build",
-                            cpuRequest: BUILD_CORES_REQUESTED,
-                            cpuLimit: BUILD_CORES_LIMIT,
-                            memoryRequest: BUILD_MEMORY_REQUESTED,
-                            memoryLimit: BUILD_MEMORY_LIMIT,
->>>>>>> 4e95dba5 (Try to fix errors when build docker image)
+                            memoryLimit = BUILD_MEMORY_LIMIT,
+
                         )
                     }
                     steps
                     {
-<<<<<<< HEAD
                         buildImage("trtllm", env.JOB_NAME ==~ /.*PostMerge.*/ ? "push" : params.action, "skip", "", LLM_BRANCH_TAG + "-sbsa", "", true)
-=======
-                        buildImage("devel", params.action, "src_non_cxx11_abi")
-                    }
-                }
-                stage("Build x86_64-cxx11_abi") {
-                    agent {
-                        kubernetes trtllm_utils.createKubernetesPodConfig(
-                            image: DOCKER_DIND_IMAGE,
-                            type: "build",
-                            cpuRequest: BUILD_CORES_REQUESTED,
-                            cpuLimit: BUILD_CORES_LIMIT,
-                            memoryRequest: BUILD_MEMORY_REQUESTED,
-                            memoryLimit: BUILD_MEMORY_LIMIT,
-                        )
-                    }
-                    steps
-                    {
-                        buildImage("devel", params.action, "src_cxx11_abi")
->>>>>>> 4e95dba5 (Try to fix errors when build docker image)
+
                     }
                 }
                 stage("Build rockylinux8 x86_64-skip-py3.10") {
