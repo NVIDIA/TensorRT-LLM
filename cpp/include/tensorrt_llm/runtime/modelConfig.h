@@ -167,8 +167,6 @@ public:
         LayerType layerType, SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
     {
         TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: %d", pipelineParallelism);
-        auto const numBaseLayers = mNbLayers / pipelineParallelism;
-        auto const numExtraLayers = mNbLayers % pipelineParallelism;
         auto const firstLocalLayer = getFirstLocalLayer(pipelineParallelism, pipelineParallelismRank);
         auto const numLocalLayers = getNbLayers(pipelineParallelism, pipelineParallelismRank);
         auto const firstLocalLayerIt = mLayerTypes.cbegin() + firstLocalLayer;
