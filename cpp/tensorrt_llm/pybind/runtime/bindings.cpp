@@ -193,76 +193,6 @@ public:
     }
 };
 
-//! \brief Wrapper class for McastDeviceMemory to facilitate PyTorch tensor creation.
-//! It manages a buffer accessible via unicast or multicast for multi-node communication.
-class McastGPUBuffer
-{
-public:
-    // Disallow copy construction and assignment
-    McastGPUBuffer(McastGPUBuffer const&) = delete;
-    McastGPUBuffer& operator=(McastGPUBuffer const&) = delete;
-
-    //! \brief Constructor for McastGpuBuffer.
-    //! \param bufSize The total size of the buffer in bytes.
-    //! \param groupSize The number of ranks in the communication group.
-    //! \param groupRank The rank of the local process within the group.
-    //! \param device The CUDA device for buffer allocation.
-    //! \param mnNvlink Flag indicating if multi-node NVLink is used.
-    McastGPUBuffer(size_t bufSize, uint32_t groupSize, uint32_t groupRank, at::Device device, bool mnNvlink)
-        : mMcastDeviceMemory(bufSize, groupSize, groupRank, device.index(), mnNvlink)
-        , mGroupSize(groupSize)
-        , mGroupRank(groupRank)
-        , mBufSize(bufSize)
-        , mLocalDevice(device)
-    {
-    }
-
-    //! \brief Returns a PyTorch tensor view of the unicast buffer portion for a specific rank.
-    //! \param rank The target rank for the unicast pointer.
-    //! \param sizes The desired shape (dimensions) of the tensor.
-    //! \param dtype The data type of the tensor elements.
-    //! \param storageOffset The offset in elements from the start of the buffer.
-    //! \return An ATen tensor wrapping the unicast buffer section.
-    at::Tensor getUCBuffer(uint32_t rank, c10::IntArrayRef sizes, c10::ScalarType dtype, int64_t storageOffset)
-    {
-        size_t const numel = std::accumulate(sizes.begin(), sizes.end(), 1UL, std::multiplies<size_t>());
-        size_t const elementSize = c10::elementSize(dtype);
-        size_t const reqSize = (numel + storageOffset) * elementSize;
-        TORCH_CHECK(reqSize <= mBufSize, "McastGpuBuffer::getUcBuffer: the requested size (", reqSize,
-            " bytes) exceeds the allocated size (", mBufSize, " bytes)");
-        auto* dataPtr = static_cast<uint8_t*>(mMcastDeviceMemory.getUnicastPtr(rank)) + storageOffset * elementSize;
-
-        auto options = at::TensorOptions().dtype(dtype).device(mLocalDevice);
-        return at::for_blob(dataPtr, sizes).options(options).target_device(mLocalDevice).make_tensor();
-    }
-
-    //! \brief Returns a PyTorch tensor view of the multicast buffer portion.
-    //! \param sizes The desired shape (dimensions) of the tensor.
-    //! \param dtype The data type of the tensor elements.
-    //! \param storageOffset The offset in elements from the start of the buffer.
-    //! \return An ATen tensor wrapping the multicast buffer section.
-    at::Tensor getMCBuffer(c10::IntArrayRef sizes, c10::ScalarType dtype, int64_t storageOffset)
-    {
-        size_t const numel = std::accumulate(sizes.begin(), sizes.end(), 1UL, std::multiplies<size_t>());
-        size_t const elementSize = c10::elementSize(dtype);
-        size_t const reqSize = (numel + storageOffset) * elementSize;
-        TORCH_CHECK(reqSize <= mBufSize, "McastGpuBuffer::getMcBuffer: the requested size (", reqSize,
-            " bytes) exceeds the allocated size (", mBufSize, " bytes)");
-        auto* dataPtr = static_cast<uint8_t*>(mMcastDeviceMemory.getMulticastPtr()) + storageOffset * elementSize;
-
-        auto options = at::TensorOptions().dtype(dtype).device(mLocalDevice);
-        return at::for_blob(dataPtr, sizes).options(options).target_device(mLocalDevice).make_tensor();
-    }
-
-private:
-    //!< Underlying memory manager for multi-node communication.
-    tensorrt_llm::runtime::McastDeviceMemory mMcastDeviceMemory;
-    uint32_t mGroupSize;     //!< Size of the communication group.
-    uint32_t mGroupRank;     //!< Rank of the current process.
-    size_t mBufSize;         //!< Total size of the managed buffer.
-    at::Device mLocalDevice; //!< The local CUDA device.
-};
-
 namespace tensorrt_llm::pybind::runtime
 {
 
@@ -471,10 +401,10 @@ void initBindings(pybind11::module_& m)
         [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
         "Calculate the maximum workspace size needed for low precision all-reduce operations");
 
-    py::class_<McastGPUBuffer>(m, "McastGPUBuffer")
+    py::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
         .def(py::init<size_t, uint32_t, uint32_t, at::Device, bool>())
-        .def("get_uc_buffer", &McastGPUBuffer::getUCBuffer)
-        .def("get_mc_buffer", &McastGPUBuffer::getMCBuffer);
+        .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer)
+        .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer);
 
     py::enum_<tensorrt_llm::kernels::AllReduceFusionOp>(m, "AllReduceFusionOp")
         .value("NONE", tensorrt_llm::kernels::AllReduceFusionOp::NONE)
