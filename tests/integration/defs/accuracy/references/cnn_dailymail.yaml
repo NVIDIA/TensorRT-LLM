@@ -137,6 +137,8 @@ meta-llama/Llama-3.2-1B:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 27.029
+  - quant_algo: FP8
+    accuracy: 27.029
   - quant_algo: FP8_PER_CHANNEL_PER_TOKEN
     accuracy: 27.257
   - quant_algo: FP8_PER_CHANNEL_PER_TOKEN
