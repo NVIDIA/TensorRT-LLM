@@ -1415,7 +1415,6 @@ def test_ptp_quickstart_advanced_deepseek_v3_2nodes_8gpus(
         "trtllm-llmapi-launch",
         "python3",
         str(example_root / "quickstart_advanced.py"),
-        "--enable_overlap_scheduler",
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
         "--moe_ep_size=8",

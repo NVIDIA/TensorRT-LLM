@@ -259,7 +259,13 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
         elif is_nemotron_hybrid(config):
             config = model_engine.model.model_config.pretrained_config
             num_layers = config.hybrid_override_pattern.count("*")
+            layer_mask = [
+                char == "*" for char in config.hybrid_override_pattern
+            ]
             mamba_num_layers = config.hybrid_override_pattern.count("M")
+            mamba_layer_mask = [
+                char == "M" for char in config.hybrid_override_pattern
+            ]
             kv_cache_manager = MambaHybridCacheManager(
                 # mamba cache parameters
                 config.hidden_size,
@@ -269,11 +275,13 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
                 config.n_groups,
                 config.mamba_head_dim,
                 mamba_num_layers,
+                mamba_layer_mask,
                 config.torch_dtype,
                 # kv cache parameters
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
                 num_layers=num_layers,
+                layer_mask=layer_mask,
                 num_kv_heads=num_key_value_heads,
                 head_dim=head_dim,
                 tokens_per_block=executor_config.tokens_per_block,
