@@ -169,10 +169,8 @@ public:
         TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: %d", pipelineParallelism);
         auto const numBaseLayers = mNbLayers / pipelineParallelism;
         auto const numExtraLayers = mNbLayers % pipelineParallelism;
-        auto const firstLocalLayer
-            = pipelineParallelismRank * numBaseLayers + std::min(pipelineParallelismRank, numExtraLayers);
-        // If num_layers % pp_size = n != 0, first n ranks get one extra layer
-        auto const numLocalLayers = numBaseLayers + (pipelineParallelismRank < numExtraLayers ? 1 : 0);
+        auto const firstLocalLayer = getFirstLocalLayer(pipelineParallelism, pipelineParallelismRank);
+        auto const numLocalLayers = getNbLayers(pipelineParallelism, pipelineParallelismRank);
         auto const firstLocalLayerIt = mLayerTypes.cbegin() + firstLocalLayer;
         return std::count(firstLocalLayerIt, firstLocalLayerIt + numLocalLayers, layerType);
     }
