@@ -76,7 +76,9 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
         return;
     int token = blockIdx.x;
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
+#endif
 
     uint32_t* offset_access_ptr = &buffer_flags[3];
     // Buffer size is M * N, and we need two buffers for reduce-scatter and allgather
@@ -130,7 +132,10 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
             mcast_ptr[input_offset + buffer_M * token_dim + global_token * token_dim + elt] = fromFloat<T>(accum);
         }
     }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
+#endif
 
     input_ptrs[rank][clear_offset + buffer_M * token_dim + token * token_dim + elt] = fromFloat<T>(-0.f);
 
@@ -299,7 +304,7 @@ template <int DIM, int NUM_THREADS, int NUM_INPUTS, typename T_OUT, typename T_I
 __global__ void __launch_bounds__(128, 1) RMSNorm(T_IN* input_plus_residual, T_OUT* output_norm, T_IN* buffer_input,
     T_IN* gamma, float epsilon, T_IN* residual, int batch_size, uint32_t* buffer_flags)
 {
-
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     static bool const LAMPORT = true;
 
     extern __shared__ uint8_t smem[];
@@ -500,6 +505,7 @@ __global__ void __launch_bounds__(128, 1) RMSNorm(T_IN* input_plus_residual, T_O
         *(offset_access_ptr) = 0;
     }
     __syncthreads();
+#endif
 }
 
 template <int H_DIM>
