@@ -173,6 +173,7 @@ class PyExecutor:
         self.device_id = torch.cuda.current_device()
         self.global_rank = global_mpi_rank()
         self.request_queue = queue.Queue()
+        self.stream = torch.cuda.Stream()
 
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
@@ -707,10 +708,11 @@ class PyExecutor:
                             scheduled_batch)
                     else:
                         with torch.cuda.nvtx.range("_forward_step_last_pp"):
-                            batch_outputs = self._forward_step(scheduled_batch)
-                            sample_state = self._sample_async(
-                                scheduled_batch, batch_outputs)
-                            self._update_request_states(scheduled_batch)
+                            with torch.cuda.stream(self.stream):
+                                batch_outputs = self._forward_step(scheduled_batch)
+                                sample_state = self._sample_async(
+                                    scheduled_batch, batch_outputs)
+                                self._update_request_states(scheduled_batch)
 
                     if self.enable_iter_perf_stats:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
@@ -857,12 +859,13 @@ class PyExecutor:
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
 
-                    batch_outputs = self._forward_step(scheduled_batch)
+                    with torch.cuda.stream(self.stream):
+                        batch_outputs = self._forward_step(scheduled_batch)
 
-                    sample_state = self._sample_async(scheduled_batch,
-                                                      batch_outputs)
+                        sample_state = self._sample_async(scheduled_batch,
+                                                        batch_outputs)
 
-                    self._update_request_states(scheduled_batch)
+                        self._update_request_states(scheduled_batch)
 
                     ctx_transmission_reqs = self._send_disagg_ctx_cache(
                         scheduled_batch.context_requests
@@ -1006,11 +1009,12 @@ class PyExecutor:
 
                     previous_tensors_device = self.previous_batch and self.previous_batch.sample_state.device
 
-                    batch_outputs = self._forward_step(scheduled_batch,
-                                                       previous_tensors_device)
+                    with torch.cuda.stream(self.stream):
+                        batch_outputs = self._forward_step(scheduled_batch,
+                                                        previous_tensors_device)
 
-                    sample_state = self._sample_async(scheduled_batch,
-                                                      batch_outputs)
+                        sample_state = self._sample_async(scheduled_batch,
+                                                        batch_outputs)
 
                     self._update_request_states(scheduled_batch)
 
@@ -1075,10 +1079,11 @@ class PyExecutor:
 
     @nvtx_range("_forward_step_inter_pp")
     def _forward_step_inter_pp(self, scheduled_batch) -> SampleState:
-        batch_outputs = self._forward_step(scheduled_batch)
-        sample_state = self._sample_async(scheduled_batch, batch_outputs)
-        self._update_request_states(scheduled_batch)
-        sample_state.sampler_event.synchronize()
+        with torch.cuda.stream(self.stream):
+            batch_outputs = self._forward_step(scheduled_batch)
+            sample_state = self._sample_async(scheduled_batch, batch_outputs)
+            self._update_request_states(scheduled_batch)
+            sample_state.sampler_event.synchronize()
         return sample_state
 
     def _update_new_active_requests_queue_latency(self, new_requests):

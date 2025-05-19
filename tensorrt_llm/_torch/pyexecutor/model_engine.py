@@ -1910,11 +1910,10 @@ class PyTorchModelEngine(ModelEngine):
             return outputs
 
     def model_forward(self, **kwargs):
-        with torch.cuda.stream(self.stream):
-            if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
-                return trace_func(self.model.forward)(**kwargs)
-            else:
-                return self.model.forward(**kwargs)
+        if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
+            return trace_func(self.model.forward)(**kwargs)
+        else:
+            return self.model.forward(**kwargs)
 
     @nvtx_range("_forward_step")
     def _forward_step(self, inputs: Dict[str, Any],
