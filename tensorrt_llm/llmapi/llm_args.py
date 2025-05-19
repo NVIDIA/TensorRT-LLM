@@ -228,6 +228,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     num_eagle_layers: Optional[int] = None
     max_non_leaves_per_layer: Optional[int] = None
     pytorch_eagle_weights_path: Optional[str] = None
+    eagle3_one_model: Optional[bool] = True
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -1207,8 +1208,10 @@ class LlmArgs(BaseModel):
                     from tensorrt_llm._torch.speculative import Eagle3Config
                     self.speculative_config = Eagle3Config(
                         max_draft_tokens=self.speculative_config.max_draft_len,
-                        eagle_weights_path=self.speculative_config.
-                        pytorch_eagle_weights_path)
+                        draft_model_path=self.speculative_config.
+                        pytorch_eagle_weights_path,
+                        eagle3_one_model=self.speculative_config.
+                        eagle3_one_model)
 
             elif isinstance(self.speculative_config, MTPDecodingConfig):
                 from tensorrt_llm._torch.speculative import MTPConfig

@@ -253,6 +253,19 @@ def initialize_dummy_weights(
         elif torch.is_floating_point(param):
             param.uniform_(low, high, generator=generator)
 
+    def _set_next_layer_layernorm(model):
+        if not hasattr(model, 'layers'):
+            return
+
+        for idx, layer in enumerate(model.layers):
+            if idx == len(model.layers) - 1:
+                layer.next_layer_layernorm = model.norm
+            else:
+                layer.next_layer_layernorm = model.layers[idx +
+                                                          1].input_layernorm
+
+    _set_next_layer_layernorm(model.model)
+
 
 KV_CACHE_MANAGER_KEY = 'kv_cache_manager'
 DRAFT_KV_CACHE_MANAGER_KEY = 'draft_kv_cache_manager'
@@ -726,6 +739,7 @@ class PyTorchModelEngine(ModelEngine):
             return get_spec_metadata(
                 self.spec_config,
                 self.batch_size,
+                max_num_tokens=self.max_num_tokens,
                 spec_resource_manager=spec_resource_manager)
 
         if self.spec_metadata is not None:
@@ -733,6 +747,7 @@ class PyTorchModelEngine(ModelEngine):
         self.spec_metadata = get_spec_metadata(
             self.spec_config,
             self.batch_size,
+            max_num_tokens=self.max_num_tokens,
             spec_resource_manager=spec_resource_manager)
         return self.spec_metadata
 
@@ -929,6 +944,12 @@ class PyTorchModelEngine(ModelEngine):
                     weights = load_weights(checkpoint_dir, self.mapping)
 
                 model.load_weights(weights)
+
+                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
+                ):
+                    weights = load_weights(self.spec_config.draft_model_path,
+                                           self.mapping)
+                    model.load_draft_weights(weights)
 
             elif load_format == LoadFormat.DUMMY:
                 initialize_dummy_weights(model)

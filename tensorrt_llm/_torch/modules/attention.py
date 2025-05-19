@@ -1,6 +1,6 @@
 import math
 from enum import IntEnum
-from typing import Optional, cast
+from typing import Optional, Union, cast
 
 import torch
 from torch import nn
@@ -15,6 +15,7 @@ from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
+from ..utils import Fp4QuantizedTensor
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
@@ -47,6 +48,7 @@ class Attention(nn.Module):
         config: Optional[ModelConfig] = None,
         qk_norm_type: QkNormType = QkNormType.none,
         q_scaling: float = 1.0,
+        is_llama4: bool = False,
     ):
         """
         Initialize the Attention module.
@@ -116,10 +118,14 @@ class Attention(nn.Module):
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
+            use_llama4_qkv=is_llama4,
         )
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
+        # o_proj is not feasible for trtllm-gen kernel because tileK in the kernel is 512.
+        # The kernel requires K to be multiple of 512.
+        # hidden_size is 5120, with TP8 we have local in_features (K) = 640.
         self.o_proj = Linear(
             tp_size * self.q_size,
             self.hidden_size,
@@ -201,7 +207,7 @@ class Attention(nn.Module):
     def forward(
         self,
         position_ids: Optional[torch.LongTensor],
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, Fp4QuantizedTensor],
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,

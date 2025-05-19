@@ -73,6 +73,8 @@ class RuntimeConfig(BaseModel):
             self.settings_config.max_batch_size,
             "max_num_tokens":
             self.settings_config.max_num_tokens,
+            "enable_chunked_prefill":
+            self.settings_config.chunking
         }
 
         backend_config_map = {

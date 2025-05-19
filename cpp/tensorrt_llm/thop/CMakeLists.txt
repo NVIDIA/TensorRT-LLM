@@ -58,6 +58,9 @@ add_library(
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
   groupRmsNormOp.cpp
+  llama4GemmSwiGLU.cpp
+  llama4RouterGemm.cpp
+  llama4QKVGemm.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
   moeOp.cpp
