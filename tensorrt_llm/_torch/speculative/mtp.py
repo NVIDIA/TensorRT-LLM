@@ -9,7 +9,8 @@ from tensorrt_llm.bindings.executor import FinishReason
 from ..attention_backend import AttentionMetadata
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import SampleState, SampleStateTensors, TorchSampler
+from ..pyexecutor.sampler import (SampleStateTensors, SampleStateTorch,
+                                  TorchSampler)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 
@@ -21,7 +22,7 @@ class SampleStateTensorsMTP(SampleStateTensors):
 
 
 @dataclass(frozen=True, kw_only=True)
-class SampleStateMTP(SampleState):
+class SampleStateMTP(SampleStateTorch):
     device: SampleStateTensorsMTP
     host: SampleStateTensorsMTP
 
