@@ -208,8 +208,7 @@ void GptDecoderBatched::prepareForward(
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto const& jointOutputIdsShape = mDecoderState->getJointDecodingOutput().ids->getShape();
-    auto const maxBeamWidth = jointOutputIdsShape.d[1];
+    auto const maxBeamWidth = mDecoderState->getMaxBeamWidth();
     auto const speculativeDecodingMode = mDecoderState->getSpeculativeDecodingMode();
 
     auto& dInput = mDecoderState->getJointDecodingInput();

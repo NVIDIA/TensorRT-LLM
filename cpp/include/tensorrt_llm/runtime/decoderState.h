@@ -144,6 +144,8 @@ public:
     //! @returns [maxTokensPerStep, batchSize, beamWidth], finished states of type FinishedState, on gpu
     [[nodiscard]] TensorPtr getFinishedSteps() const;
 
+    [[nodiscard]] SizeType32 getMaxBatchSize() const;
+
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
 
     [[nodiscard]] SizeType32 getMaxSequenceLength() const;
