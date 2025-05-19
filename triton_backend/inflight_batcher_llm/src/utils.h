@@ -104,6 +104,11 @@ struct InputFieldsNames
     static constexpr char const* mropeRotaryCosSin = "mrope_rotary_cos_sin";
     static constexpr char const* mropePositionDeltas = "mrope_position_deltas";
 
+    // MultimodalInput
+    static constexpr char const* multimodalHashes = "multimodal_hashes";
+    static constexpr char const* multimodalPositions = "multimodal_positions";
+    static constexpr char const* multimodalLengths = "multimodal_lengths";
+
     // LoraConfig
     static constexpr char const* loraTaskId = "lora_task_id";
     static constexpr char const* loraWeights = "lora_weights";
