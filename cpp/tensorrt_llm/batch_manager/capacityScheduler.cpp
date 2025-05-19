@@ -150,6 +150,13 @@ StaticBatchScheduler::StaticBatchScheduler(
 {
 }
 
+PrefillFirstScheduler::PrefillFirstScheduler(
+    SizeType32 maxNumRequests, LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState)
+    : BaseCapacityScheduler(noScheduleUntilState, noScheduleAfterState)
+    , mMaxNumRequests(maxNumRequests)
+{
+}
+
 std::tuple<RequestVector, RequestVector> MaxRequestsScheduler::operator()(RequestList const& activeRequests) const
 {
     RequestVector scheduledRequests;
@@ -180,6 +187,151 @@ std::tuple<RequestVector, RequestVector> StaticBatchScheduler::operator()(
     OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const
 {
     return this->impl<true>(kvCacheManager, crossKvCacheManager, peftCacheManager, activeRequests);
+}
+
+std::tuple<RequestVector, RequestVector> PrefillFirstScheduler::operator()(
+    kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
+    OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
+    OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const
+{
+    RequestVector scheduledRequests;
+
+    auto reservedBlocks = kv_cache_manager::NoEvictScheduledBlocksManager(kvCacheManager);
+    auto reservedCrossBlocks = crossKvCacheManager
+        ? std::optional(kv_cache_manager::NoEvictScheduledBlocksManager(*crossKvCacheManager))
+        : std::nullopt;
+    // SizeType32 claimedPeftPages{0};
+    std::unordered_set<uint64_t> uniqTaskIds{};
+    RequestVector pendingRequests;
+    RequestVector pendingDisGenInitRequests;
+    pendingRequests.reserve(activeRequests.size());
+    pendingDisGenInitRequests.reserve(activeRequests.size());
+
+    // Now check if we can add pending requests
+    // auto const maxPeftCachePages
+    //     = peftCacheManager ? peftCacheManager->getMaxDevicePages() : std::numeric_limits<SizeType32>::max();
+
+    // The optimization of delaying requests won't work for variable window attention
+    bool skippingIsRelevant = (!kvCacheManager.getBlockManager().isVariableWindow())
+        && (!crossKvCacheManager || !crossKvCacheManager->getBlockManager().isVariableWindow());
+
+    // Keep track of blocks contributed by requests in context phase
+    std::unordered_set<BlockKey, BlockKeyHasher> newlyContributedContextBlocks;
+    std::unordered_set<BlockKey, BlockKeyHasher> newlyContributedCrossContextBlocks;
+    // if constexpr (!StaticBatchScheduling)
+    // {
+    if (skippingIsRelevant)
+    {
+        std::tie(newlyContributedContextBlocks, newlyContributedCrossContextBlocks)
+            = prefillWithChunkedContextsAlreadyExecuting(activeRequests, kvCacheManager, crossKvCacheManager);
+    }
+    // }
+
+    // If StaticBatchScheduling == true check if we can add pending requests only when no requests are active.
+    // Otherwise, add just check that we can add pending requests.
+    // if (!StaticBatchScheduling || scheduledRequests.size() == 0)
+    // {
+    // Now check if we can add pending requests
+    // auto availablePeftPages = maxPeftCachePages - claimedPeftPages;
+
+    // Loop over pending requests and add them if they can be scheduled
+    // Start by trying to include disagg generation init requests
+    for (auto const& requests : {pendingRequests, pendingDisGenInitRequests})
+    {
+        for (auto const& req : requests)
+        {
+            // if context request can reuse blocks contributed by another context request, skip
+            // if (!StaticBatchScheduling && skippingIsRelevant && !req->isDisaggGenerationInitState()
+            if (skippingIsRelevant && !req->isDisaggGenerationInitState()
+                && beneficialToSkip(req, kvCacheManager, crossKvCacheManager, newlyContributedContextBlocks,
+                    newlyContributedCrossContextBlocks))
+            {
+                continue;
+            }
+
+            if (scheduledRequests.size() >= static_cast<std::size_t>(mMaxNumRequests))
+            {
+                break;
+            }
+            else if (req->isContextInitState() || req->isDisaggGenerationInitState())
+            {
+                bool enoughBlocks = reservedBlocks.enoughAvailableBlocks(*req);
+                bool enoughCrossBlocks = reservedCrossBlocks ? reservedCrossBlocks->enoughAvailableBlocks(*req) : true;
+                // bool reqHasLora = req->getLoraTaskId().has_value();
+                // bool isNewTask = reqHasLora && !uniqTaskIds.count(req->getLoraTaskId().value());
+                // auto neededPeftPages = isNewTask && peftCacheManager ? peftCacheManager->determineNumPages(req) : 0;
+
+                if (enoughBlocks && enoughCrossBlocks)
+                {
+                    scheduledRequests.emplace_back(req);
+                    reservedBlocks.decrementReservedBlocks(*req);
+                    if (reservedCrossBlocks)
+                        reservedCrossBlocks->decrementReservedBlocks(*req);
+                    // availablePeftPages -= neededPeftPages;
+                    // if (isNewTask)
+                    // {
+                    //     uniqTaskIds.insert(req->getLoraTaskId().value());
+                    // }
+                }
+                else if (!enoughBlocks || !enoughCrossBlocks)
+                {
+                    // If one requests fails to be scheduled, break
+                    break;
+                }
+            }
+        }
+    }
+    // }
+
+    if (scheduledRequests.size() >= 0)
+    {
+        // If we have scheduled context requests, return them
+        return {std::move(scheduledRequests), RequestVector{}};
+    }
+
+    // If a request is already in progress, include it
+    // If it's been allocated, it had resource to run to completion
+    // Also keep track of blocks needed to drive all in-progress requests to completion
+    for (auto const& req : activeRequests)
+    {
+        // if request cannot be scheduled yet or request should no longer be scheduled, skip
+        if (
+            // Allow disagg_generation_init requests to be scheduled, so that we'll allocate their KV cache
+            !req->isDisaggGenerationInitState()
+            && (!req->hasReachedState(getNoScheduleUntilState()) || req->hasReachedState(getNoScheduleAfterState())))
+        {
+            continue;
+        }
+
+        if (scheduledRequests.size() >= static_cast<std::size_t>(mMaxNumRequests))
+        {
+            break;
+        }
+        else if (req->isGenerationInProgressState())
+        {
+            scheduledRequests.emplace_back(req);
+            reservedBlocks.decrementReservedBlocks(*req);
+            if (reservedCrossBlocks)
+                reservedCrossBlocks->decrementReservedBlocks(*req);
+            // bool const reqHasLora = req->getLoraTaskId().has_value();
+            // bool const isNewTask = reqHasLora && !uniqTaskIds.count(req->getLoraTaskId().value());
+            // if (isNewTask)
+            // {
+            //     // claimedPeftPages += peftCacheManager ? peftCacheManager->determineNumPages(req) : 0;
+            //     uniqTaskIds.insert(req->getLoraTaskId().value());
+            // }
+        }
+        else if (req->isDisaggGenerationInitState())
+        {
+            pendingDisGenInitRequests.emplace_back(req);
+        }
+        else
+        {
+            pendingRequests.emplace_back(req);
+        }
+    }
+
+    return {std::move(scheduledRequests), RequestVector{}};
 }
 
 std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::operator()(
@@ -476,6 +628,10 @@ CapacityScheduler::CapacityScheduler(SizeType32 maxNumRequests,
     {
         mScheduler = StaticBatchScheduler{maxNumRequests, noScheduleUntilState, noScheduleAfterState};
     }
+    else if (capacitySchedulerPolicy == executor::CapacitySchedulerPolicy::kPrefill_First)
+    {
+        mScheduler = PrefillFirstScheduler{maxNumRequests, noScheduleUntilState, noScheduleAfterState};
+    }
     else
     {
         throw std::runtime_error("Unsupported capacity scheduler policy");
@@ -505,6 +661,11 @@ std::tuple<RequestVector, RequestVector, RequestVector> CapacityScheduler::opera
             }
             else if constexpr (std::is_same_v<std::decay_t<decltype(scheduler)>, GuaranteedNoEvictScheduler>
                 || std::is_same_v<std::decay_t<decltype(scheduler)>, StaticBatchScheduler>)
+            {
+                std::tie(tmpFittingRequests, pausedRequests)
+                    = scheduler(*kvCacheManager, crossKvCacheManager, peftCacheManager, activeRequests);
+            }
+            else if constexpr (std::is_same_v<std::decay_t<decltype(scheduler)>, PrefillFirstScheduler>)
             {
                 std::tie(tmpFittingRequests, pausedRequests)
                     = scheduler(*kvCacheManager, crossKvCacheManager, peftCacheManager, activeRequests);

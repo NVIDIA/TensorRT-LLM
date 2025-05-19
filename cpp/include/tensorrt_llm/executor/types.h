@@ -204,7 +204,10 @@ enum class CapacitySchedulerPolicy
 
     /// @brief kSTATIC_BATCH does not schedule new requests until all requests in current batch are completed.
     /// Similar to kGUARANTEED_NO_EVICT, requests will run to completion without eviction.
-    kSTATIC_BATCH = 2
+    kSTATIC_BATCH = 2,
+
+    /// @brief kPrefill_First prioritize context requests over generation requests.
+    kPrefill_First = 3
 };
 
 std::ostream& operator<<(std::ostream& os, CapacitySchedulerPolicy policy);
