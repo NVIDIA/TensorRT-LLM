@@ -661,6 +661,9 @@ class PyExecutor:
                     iter_start_time = time.time()
                 new_requests_num = self._fetch_new_requests()
 
+                if len(self.active_requests) == 0:
+                    break
+
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         new_requests_num,
@@ -670,11 +673,7 @@ class PyExecutor:
                 if num_dummy_request > 0:
                     self._merge_dummy_request(num_dummy_request)
 
-                if len(self.active_requests) == 0:
-                    break
-
                 scheduled_batch, _, _ = self._schedule()
-
                 self.num_scheduled_requests = scheduled_batch.batch_size
                 logger.debug(
                     f'has {len(self.active_requests)} active_request, '
@@ -797,6 +796,9 @@ class PyExecutor:
                     iter_start_time = time.time()
                 new_requests_num = self._fetch_new_requests()
 
+                if len(self.active_requests) == 0:
+                    break
+
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         new_requests_num,
@@ -808,9 +810,6 @@ class PyExecutor:
                 num_dummy_request = self._get_num_dummy_request()
                 if num_dummy_request > 0:
                     self._merge_dummy_request(num_dummy_request)
-
-                if len(self.active_requests) == 0:
-                    break
 
                 if self.draft_model_engine is not None:
                     self._prepare_draft_requests()
@@ -929,6 +928,9 @@ class PyExecutor:
                     iter_start_time = time.time()
                 new_requests_num = self._fetch_new_requests()
 
+                if len(self.active_requests) == 0:
+                    break
+
                 if self.kv_cache_transceiver:
                     self._check_disagg_gen_transfer_status()
 
@@ -940,9 +942,6 @@ class PyExecutor:
                 num_dummy_request = self._get_num_dummy_request()
                 if num_dummy_request > 0:
                     self._merge_dummy_request(num_dummy_request)
-
-                if len(self.active_requests) == 0:
-                    break
 
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
                 )
