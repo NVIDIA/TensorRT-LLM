@@ -171,7 +171,7 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
         reinterpret_cast<uint32_t*>(buffer_flags.data_ptr()), wait_for_results);
 
 at::Tensor twoShotAllReduceDispatch(tensorrt_llm::runtime::McastDeviceMemory* mcast_mem, at::Tensor& output,
-    at::Tensor& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, bool wait_for_results)
+    at::Tensor const& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, bool wait_for_results)
 {
     TORCH_CHECK(input.is_contiguous(), "two_shot_all_reduce: input must be contiguous.");
     auto world_size = mcast_mem->getWorldSize();
@@ -509,8 +509,8 @@ __global__ void __launch_bounds__(128, 1) RMSNorm(T_IN* input_plus_residual, T_O
 }
 
 template <int H_DIM>
-void _rmsnorm(torch::Tensor& prenorm_output, torch::Tensor& normed_output, torch::Tensor& input, torch::Tensor& gamma,
-    double epsilon, torch::Tensor& residual, torch::Tensor& buffer_flags)
+void _rmsnorm(torch::Tensor& prenorm_output, torch::Tensor& normed_output, torch::Tensor const& input,
+    torch::Tensor const& gamma, double epsilon, torch::Tensor const& residual, torch::Tensor& buffer_flags)
 {
 
     // input to rmsnorm is the buffer in the twoshot ar
@@ -572,8 +572,8 @@ void _rmsnorm(torch::Tensor& prenorm_output, torch::Tensor& normed_output, torch
 }
 } // namespace
 
-void twoShotRMSNorm(torch::Tensor& prenorm_output, torch::Tensor& normed_output, torch::Tensor& input,
-    torch::Tensor& gamma, double epsilon, torch::Tensor& residual, torch::Tensor& buffer_flags)
+void twoShotRMSNorm(torch::Tensor& prenorm_output, torch::Tensor& normed_output, torch::Tensor const& input,
+    torch::Tensor const& gamma, double epsilon, torch::Tensor const& residual, torch::Tensor& buffer_flags)
 {
     int dim = normed_output.sizes()[1];
     switch (dim)

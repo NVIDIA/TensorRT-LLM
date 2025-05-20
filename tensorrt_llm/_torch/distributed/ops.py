@@ -61,9 +61,13 @@ def get_allreduce_mnnvl_workspace(
     allreduce_mnnvl_workspaces = getattr(
         _thread_local, f'allreduce_mnnvl_workspaces_{mapping.pp_rank}')
     if mapping not in allreduce_mnnvl_workspaces:
-        # buffer_tokens * hidden_dim * 3 * 2 * dtype.itemsize
+        # buffer shape: [3, 2, buffer_tokens, hidden_dim]
         stride = 3 * 2 * dtype.itemsize
-        buffer_size_in_bytes = math.ceil(11_010_048 / stride) * stride
+        # LCM for hidden_dim: 2048, 4096, 5120, 7168, 8192 = 286720
+        # max_num_elements must be a multiple of 286720
+        lcm_hidden_dim = 286720
+        buffer_size_in_bytes = math.ceil(
+            12_000_000 / (lcm_hidden_dim * stride)) * (lcm_hidden_dim * stride)
         max_num_elements = buffer_size_in_bytes // stride
 
         mcast_buffer = McastGPUBuffer(
@@ -304,6 +308,10 @@ class MNNVLAllReduce(nn.Module):
         fusion_op = all_reduce_params.fusion_op
 
         shape = input.shape
+
+        if self.buffer_mnnvl.shape[-1] % shape[-1] != 0:
+            return None
+
         input = input.view(-1, shape[-1])
         output = torch.empty_like(input)
         buffer_mnnvl = self.buffer_mnnvl.view(3, 2, -1, shape[-1])
