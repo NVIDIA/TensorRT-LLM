@@ -243,6 +243,7 @@ class TrtllmAttentionWrapper:
         q: torch.Tensor,
         k: Optional[torch.Tensor] = None,
         v: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None,
         out_dtype: Optional[torch.dtype] = None,
         is_fused_qkv: bool = True,
         update_kv_cache: bool = True,
@@ -332,10 +333,23 @@ class TrtllmAttentionWrapper:
             else:
                 raise ValueError("Unexpected attention mask type")
 
-        output = torch.ops.trtllm.attention(
+        if output is None:
+            num_tokens = q.size(0)
+            attention_input_type = (AttentionInputType(
+                self.attention_input_type) if self.attention_input_type
+                                    is not None else AttentionInputType.mixed)
+            if out_dtype is None:
+                out_dtype = q.dtype
+            is_gen_only = attention_input_type == AttentionInputType.generation_only
+            v_head_size = self.head_size if not self.is_mla_enable else self.kv_lora_rank if is_gen_only else self.v_head_dim
+            output = q.new_empty((num_tokens, self.num_heads * v_head_size),
+                                 dtype=out_dtype)
+
+        torch.ops.trtllm.attention_inplace(
             q,
             k,
             v,
+            output,
             out_dtype,
             self.workspace,
             self.sequence_length,
@@ -395,6 +409,7 @@ class TrtllmAttentionWrapper:
             self.mla_context_kv_cache_block_offsets,
             self.attention_chunk_size,
         )
+
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
         return output
@@ -756,6 +771,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         attention_window_size: Optional[int] = None,
         mla_context_paged_kv: Optional[torch.Tensor] = None,
         mla_context_kv_cache_block_offsets: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         assert isinstance(
@@ -819,6 +835,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         output = self.wrapper.run(q,
                                   k,
                                   v,
+                                  output=output,
                                   out_dtype=out_dtype,
                                   is_fused_qkv=not metadata.is_cross
                                   and k is None,
