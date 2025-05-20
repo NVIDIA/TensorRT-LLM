@@ -7,11 +7,25 @@ This document shows how to build and run a model using Prompt-Lookup speculative
 We provide two styles of workflow to run Prompt-Lookup (named V1 and V2 respectively) now. V1 is in TRT workflow and similar to the Draft-Target-Model workflow, running in orchestrator mode and calling `runner.generate()` multiple times to get outputs, which is more flexible for customizing but slightly more overhead. V2 is in pytorch workflow and similar to the Look-Ahead workflow, running in leader mode and calling `runner.generate()` only one time to get outputs, which provides higher performance but fixed process.
 
 The Prompt-Lookup has 3 additional hyperparameters that you need to specify to control the process of generation:
-- `prompt_lookup_num_tokens`: the number of tokens we extract from input prompt or previous generated output as draft tokens in one iteration, which the range is from 4 to 10 in common usage (default value: 4). Empirically, the larger the value is, the higher acceptance rate but higher overhead is expected at the same time, so the right balance based on the models and application scenarios needs to be found.
-- `max_matching_ngram_size`: the number of tokens we get from the tail of the input prompt or generated output as a pattern, which is used to match in input prompt or previous generated output (default value: 2). Empirically, the larger the value is, the more precise context can be matched from the existed sequence, indicating higher acceptance rate, but the higher probability of miss-match and higher overhead appear, which fall back to normal generation (one token per iteration).
+- `prompt_lookup_num_tokens`: the maximum number of tokens provided as draft tokens in one iteration, which is usually from 4 to 10 in common usage (default value: 4). Empirically, the larger the value is, the higher acceptance rate but higher overhead is expected at the same time, so the right balance based on the models and application scenarios needs to be found.
+- `max_matching_ngram_size`: the maximum number of tokens extracted from the tail of the input prompt or generated output as a pattern, which is used to search corresponding draft tokens (default value: 2). Empirically, the larger the value is, the more precise context can be matched from the existed sequence, indicating higher acceptance rate, but the higher probability of miss-match and higher overhead appear, which fall back to normal generation (one token per iteration).
 - `device_list`: the index list of device(s) to run the model in V1 workflow. The length of it must be the same as the TP size of the draft model engine. For instances, `device_list=[0]` means using tp_size=1 and GPU 0 for the model, `device_list=[4,5,6,7]` means using tp=4 and GPU from 4 to 7 for the model. This parameter is neddless in V2 workflow.
 
-Example: Assume current tokens are [..., t1, t2, t3, t4]. Further assume lookup pool has the following key-value pairs: [{[t3, t4]: [t5, t6, t7], {[t2, t3, t4]: [t7, t8, t9]]. If `prompt_lookup_num_tokens` == 2 and `max_matching_ngram_size` == 2, [t5, t6] would be returned. If `prompt_lookup_num_tokens` == 2 and `max_matching_ngram_size` == 3, [t5, t6, t7] would be returned.  If `prompt_lookup_num_tokens` == 3 and `max_matching_ngram_size` == 2, [t7, t8] would be returned.
++ For example, the process of getting draft tokens using `prompt_lookup_num_tokens=2` and `max_matching_ngram_size=4` with a sentence `prefix=[..., t1, t2, t3, t4]` is like below:
+
+```Python
+pattern = prefix[:-2]                               # pattern=[t3, t4] (length=2)
+if pattern in pool and len(pool[pattern]) == 4:     # assuming it is {(t3, t4): (t5, t6, t7, t8)}
+    return pool[pattern]                            # draft token = [t5, t6, t7, t8]
+elif pattern in pool and len(pool[pattern]) == <4:  # assuming it is {(t3, t4): (t9, t10, t11)}
+    return pool[pattern]                            # draft token = [t9, t10, t11]
+pattern = prefix[:-1]                               # Try shorter pattern if no candidate of length=2 exists, pattern=[t4] (length=1)
+if pattern in pool and len(pool[pattern]) == 4:     # The same process as above
+    return pool[pattern]
+elif pattern in pool and len(pool[pattern]) == <4:
+    return pool[pattern]
+return None                                         # No any candidate exists
+```
 
 ## Support Matrix
   * GPU Compute Capability >= 8.0 (Ampere or newer)

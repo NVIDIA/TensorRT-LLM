@@ -41,29 +41,29 @@ class NGramPoolManager(BaseResourceManager):
     """
     This class maintains the pattern-matches pairs for NGram drafter.
 
-    For example, one of the existed pairs could be: ["I","love"] -> [["apple", "because", "it", "is"], ["banana", "and"]]
+    For example, one of the existed pairs could be: ["I","love"] -> [["apple", "because", "it", "is"], ["banana", "and"]].
 
     Here we call ["I","love"] as `pattern`, and [["apple", "because", "it", "is"], ["banana", "and"]] as `matches`.
 
-    `pattern` is a list of token_ids. The pool will provide corresponding draft tokens from the matches if the pattern appears at the tail of the sentence during generation.
+    `pattern` is a list of token_ids. The pool provides corresponding draft tokens from the matches if the pattern appears at the tail of the sentence during generation.
 
     `matches` is a list of candidate draft token_ids attaching to a pattern.
 
     Arguments:
         prompt_lookup_num_tokens: int
-            The length maximum of tokens for draft (can be understood as length maximum of output draft tokens)
+            The length maximum of draft tokens (can be understood as length maximum of output draft tokens).
 
         max_matching_ngram_size: int
-            The length maximum of tokens for searching (can be understood as length maximum of input tokens for search)
+            The length maximum of searching tokens (can be understood as length maximum of input tokens to search).
 
-        is_keep_all (bool) = True
-            Whether to save all candidate pattern-matches pairs
+        is_keep_all: bool = True
+            Whether to keep all candidate pattern-matches pairs, only one match is kept for each pattern if False.
 
         is_use_oldest: bool = True
-            Whether to provide the oldest match when pattern is hit
+            Whether to provide the oldest match when pattern is hit, the newest one is provided if False.
 
         is_public_pool: bool = True
-            Whether to use a common pool for all requests
+            Whether to use a common pool for all requests, or the pool is private for each request if False.
 
     Members:
         pool: dict[tuple[int], OrderedSet[int]] or dict[int, dict[tuple[int], OrderedSet[int]]]
@@ -78,10 +78,11 @@ class NGramPoolManager(BaseResourceManager):
 
         self.max_num_requests = max_num_requests
         self.max_num_draft_tokens = config.max_draft_tokens
+
         self.prompt_lookup_num_tokens = config.prompt_lookup_num_tokens
         self.max_matching_ngram_size = config.max_matching_ngram_size
         self.is_keep_all = config.is_keep_all
-        self.is_use_oldest = config.is_use_oldest  # TODO: remove this argument
+        self.is_use_oldest = config.is_use_oldest  # TODO: remove this if updating strategy is supported
         self.is_public_pool = config.is_public_pool
         self.pool = {}
         self.start_index = {}

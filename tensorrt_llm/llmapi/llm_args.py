@@ -238,19 +238,30 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
 
 class NGramDecodingConfig(DecodingBaseConfig):
-    ''' A class used to enable ngram speculative decoding.
-    '''
+    """
+    Configuration for NGram drafter speculative decoding.
 
-    # Number of draft tokens to generate
+    Arguments:
+        prompt_lookup_num_tokens: int
+                The length maximum of draft tokens (can be understood as length maximum of output draft tokens).
+
+        max_matching_ngram_size: int
+            The length maximum of searching tokens (can be understood as length maximum of input tokens to search).
+
+        is_keep_all: bool = True
+            Whether to keep all candidate pattern-matches pairs, only one match is kept for each pattern if False.
+
+        is_use_oldest: bool = True
+            Whether to provide the oldest match when pattern is hit, the newest one is provided if False.
+
+        is_public_pool: bool = True
+            Whether to use a common pool for all requests, or the pool is private for each request if False.
+    """
+
     prompt_lookup_num_tokens: int = 2
-    # Maximum size of ngram to match (number of tokens)
     max_matching_ngram_size: int = 4
-    # If True, all key-value pairs are kept,
-    # If False, only youngest (if is_use_oldest==False) or oldest is kept
     is_keep_all: bool = True
-    # Whether youngest or oldest key-value pair should be used (if multiple ngram matches exist)
     is_use_oldest: bool = True
-    # Whether a public pool for all requests or private pool for each request should be used
     is_public_pool: bool = True
 
     @classmethod
@@ -271,6 +282,13 @@ class MTPDecodingConfig(DecodingBaseConfig):
         return cls(**data)
 
     decoding_type: ClassVar[str] = "MTP"
+
+
+SpeculativeConfig = (LookaheadDecodingConfig
+                     | MedusaDecodingConfig
+                     | EagleDecodingConfig
+                     | MTPDecodingConfig
+                     | NGramDecodingConfig)
 
 
 class PybindMirror(ABC):
@@ -902,14 +920,8 @@ class LlmArgs(BaseModel):
         default=None, description="Cache transceiver config.")
 
     # Speculative decoding parameters
-    speculative_config: (None
-                         | LookaheadDecodingConfig
-                         | MedusaDecodingConfig
-                         | EagleDecodingConfig
-                         | MTPDecodingConfig
-                         | NGramDecodingConfig) = Field(
-                             default=None,
-                             description="Speculative decoding config.")
+    speculative_config: Optional[SpeculativeConfig] = Field(
+        default=None, description="Speculative decoding config.")
 
     batching_type: Optional[BatchingType] = Field(default=None,
                                                   description="Batching type.")

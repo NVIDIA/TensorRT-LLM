@@ -203,11 +203,6 @@ def main():
         generated_text = output.outputs[0].text
         print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
-    if args.print_iter_log:
-        stats = llm.get_stats()
-        for stat in stats:
-            print(stat)
-
 
 if __name__ == '__main__':
     main()
