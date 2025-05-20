@@ -17,7 +17,6 @@
 #include "tensorrt_llm/runtime/mcastDeviceMemory.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
-#include "tensorrt_llm/thop/thUtils.h"
 
 #include <array>
 #include <cstddef>
