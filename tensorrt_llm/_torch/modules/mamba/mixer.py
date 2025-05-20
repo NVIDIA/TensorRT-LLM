@@ -313,6 +313,7 @@ class MambaMixer(nn.Module):
                 B = rearrange(B, "b (g n) -> b g n", g=self.tp_ngroups)
                 C = rearrange(C, "b (g n) -> b g n", g=self.tp_ngroups)
                 x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.head_dim)
+                z = rearrange(z, "b (h p) -> b h p", p=self.head_dim)
 
                 y = selective_state_update(
                     ssm_states_out,
@@ -322,7 +323,7 @@ class MambaMixer(nn.Module):
                     B,
                     C,
                     D,
-                    z=None,
+                    z=z,
                     dt_bias=dt_bias,
                     dt_softplus=self.delta_softplus,
                 )
@@ -330,7 +331,7 @@ class MambaMixer(nn.Module):
                 y = rearrange(y, "b h p -> b (h p)")
 
                 # gated norm
-                y = self.norm(y, z)
+                y = self.norm(y)
 
             # copy new ssm states
             if not is_warmup:
