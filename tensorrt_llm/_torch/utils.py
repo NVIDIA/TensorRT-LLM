@@ -9,8 +9,6 @@ import torch
 
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 
-from .pipeline_interface import PipelineInterface
-
 is_torch_compiling_flag = False
 
 aux_stream_name_list = ['Attention', 'MoeShared', 'MoeChunkingOverlap']
@@ -85,8 +83,6 @@ def make_weak_ref(x):
         return {k: make_weak_ref(v) for k, v in x.items()}
     elif isinstance(x, (int, float, bool)):
         return x
-    elif isinstance(x, PipelineInterface):
-        return tuple(make_weak_ref(tensor) for tensor in x)
     else:
         raise TypeError(f"Invalid type {type(x)} to make weak ref")
 

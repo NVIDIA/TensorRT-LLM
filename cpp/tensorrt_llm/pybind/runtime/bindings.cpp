@@ -16,8 +16,10 @@
  */
 
 #include "bindings.h"
+#include "moeBindings.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
+#include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/delayStream.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
@@ -393,6 +395,10 @@ void initBindings(pybind11::module_& m)
             tensorrt_llm::kernels::invokeDelayStreamKernel(delay_micro_secs, stream);
         },
         "Delay kernel launch on the default stream");
+    m.def(
+        "max_workspace_size_lowprecision",
+        [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
+        "Calculate the maximum workspace size needed for low precision all-reduce operations");
 
     py::enum_<tensorrt_llm::kernels::AllReduceFusionOp>(m, "AllReduceFusionOp")
         .value("NONE", tensorrt_llm::kernels::AllReduceFusionOp::NONE)
@@ -413,6 +419,9 @@ void initBindings(pybind11::module_& m)
         .value("UB", tensorrt_llm::kernels::AllReduceStrategyType::UB)
         .value("ONESHOT", tensorrt_llm::kernels::AllReduceStrategyType::ONESHOT)
         .value("TWOSHOT", tensorrt_llm::kernels::AllReduceStrategyType::TWOSHOT);
+
+    // Initialize MoeLoadBalancer bindings
+    initMoeBindings(m);
 }
 
 } // namespace tensorrt_llm::pybind::runtime

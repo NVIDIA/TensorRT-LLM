@@ -40,6 +40,7 @@ from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
+from ..modules.embedding import Embedding, LMHead
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import (VisionTower, VisionTowerDynamicS2,
                                           VisionTowerS2)
@@ -559,18 +560,19 @@ def init_mm_projector(model_type_or_path: str,
         return mm_projector
 
 
-def _resize_embeds(old_embeddings, new_num_tokens):
+def _resize_embeds(old_embeddings: Embedding, new_num_tokens: int):
     # build new embeddings
-    old_num_tokens, old_embedding_dim = old_embeddings.weight.size()
-    new_embeddings = nn.Embedding(
-        new_num_tokens,
-        old_embedding_dim,
-        device=old_embeddings.weight.device,
+    new_embeddings = Embedding(
+        num_embeddings=new_num_tokens,
+        embedding_dim=old_embeddings.embedding_dim,
         dtype=old_embeddings.weight.dtype,
-    )
+        mapping=old_embeddings.mapping,
+        tensor_parallel_mode=old_embeddings.tp_mode,
+        gather_output=old_embeddings.gather_output,
+    ).to("cuda")
 
     # copy weights
-    num_tokens_to_copy = min(old_num_tokens, new_num_tokens)
+    num_tokens_to_copy = min(old_embeddings.num_embeddings, new_num_tokens)
     new_embeddings.weight.data[:
                                num_tokens_to_copy, :] = old_embeddings.weight.data[:
                                                                                    num_tokens_to_copy, :]
@@ -583,30 +585,24 @@ def _resize_embeds(old_embeddings, new_num_tokens):
     return old_embeddings
 
 
-def _resize_lm_head(old_lm_head, new_num_tokens):
+def _resize_lm_head(old_lm_head: LMHead, new_num_tokens: int):
     # build new lm head
-    old_num_tokens, old_lm_head_dim = old_lm_head.weight.size()
-    new_lm_head_shape = (old_lm_head_dim, new_num_tokens)
-    has_new_lm_head_bias = old_lm_head.bias is not None
-    new_lm_head = nn.Linear(
-        *new_lm_head_shape,
-        bias=has_new_lm_head_bias,
-        device=old_lm_head.weight.device,
+    new_lm_head = LMHead(
+        num_embeddings=new_num_tokens,
+        embedding_dim=old_lm_head.embedding_dim,
         dtype=old_lm_head.weight.dtype,
-    )
+        mapping=old_lm_head.mapping,
+        tensor_parallel_mode=old_lm_head.tp_mode,
+        gather_output=old_lm_head.gather_output,
+    ).to("cuda")
 
-    # copy weights and bias
-    num_tokens_to_copy = min(old_num_tokens, new_num_tokens)
+    # copy weights
+    num_tokens_to_copy = min(old_lm_head.num_embeddings, new_num_tokens)
     new_lm_head.weight.data[:
                             num_tokens_to_copy, :] = old_lm_head.weight.data[:
                                                                              num_tokens_to_copy, :]
     old_lm_head.weight.data = new_lm_head.weight.data
 
-    if has_new_lm_head_bias:
-        new_lm_head.bias.data[:
-                              num_tokens_to_copy] = old_lm_head.bias.data[:
-                                                                          num_tokens_to_copy]
-        old_lm_head.bias.data = new_lm_head.bias.data
     return old_lm_head
 
 
@@ -644,7 +640,7 @@ def init_llm(
     llm = AutoModelForCausalLM.from_config(llm_model_config)
     if llm_cfg.vocab_size != len(tokenizer):
         warnings.warn(
-            "LLM have a different vocab size than tokenizer. Consider update the LLM checkpoint with the tokenizer's vocab size with resize_token_embeddings()."
+            "LLM have a different vocab size than tokenizer. Consider update the LLM checkpoint with the tokenizer's vocab size with _resize_token_embeddings()."
         )
 
     model_config.pretrained_config.hidden_size = llm.config.hidden_size

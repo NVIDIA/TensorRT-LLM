@@ -8,6 +8,7 @@ from transformers import AutoConfig, PretrainedConfig
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
+from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.mamba.mixer import MambaMixer
 from ..modules.mlp import MLP
@@ -89,7 +90,7 @@ class TransformerLayer(Attention):
                                attn_metadata=attn_metadata)
 
 
-class NemotronHLayer(nn.Module):
+class NemotronHLayer(DecoderLayer):
 
     def __init__(
         self,
@@ -134,6 +135,7 @@ class NemotronHLayer(nn.Module):
 
     def forward(
         self,
+        position_ids: torch.LongTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
@@ -161,23 +163,8 @@ class NemotronHModel(DecoderModel):
         )
 
         # create layers
-        mlp_idx = 0
-        mamba_idx = 0
-        transformer_idx = 0
         layers = []
-        for layer_type in config.hybrid_override_pattern:
-            # calculate layer index based on type
-            if layer_type == "M":
-                layer_idx = mamba_idx
-                mamba_idx += 1
-            elif layer_type == "-":
-                layer_idx = mlp_idx
-                mlp_idx += 1
-            elif layer_type == "*":
-                layer_idx = transformer_idx
-                transformer_idx += 1
-            else:
-                ValueError(f"{layer_type} is not supported")
+        for layer_idx, layer_type in enumerate(config.hybrid_override_pattern):
             layers.append(NemotronHLayer(model_config, layer_idx, layer_type))
         self.layers = nn.ModuleList(layers)
 
@@ -207,7 +194,7 @@ class NemotronHModel(DecoderModel):
         hidden_states = inputs_embeds
 
         for layer in self.layers:
-            hidden_states = layer(hidden_states, attn_metadata)
+            hidden_states = layer(position_ids, hidden_states, attn_metadata)
 
         hidden_states = self.norm_f(hidden_states)
 

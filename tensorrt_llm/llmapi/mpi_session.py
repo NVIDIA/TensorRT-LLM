@@ -328,6 +328,9 @@ class RemoteMpiCommSessionClient(MpiSession):
             return self.queue.get()  # should get a True if success
         return False
 
+    def abort(self):
+        self.shutdown()
+
     def shutdown(self, wait=True):
         if self._is_shutdown:
             return
@@ -344,7 +347,7 @@ class RemoteMpiCommSessionClient(MpiSession):
         finally:
             self._is_shutdown = True
 
-    def abort(self):
+    def shutdown_abort(self, grace: float = 60, reason=None):
         self.shutdown()
 
 
@@ -411,7 +414,7 @@ class RemoteMpiCommSessionServer():
                 print_colored_debug(
                     f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received shutdown signal\n",
                     "green")
-                self.session.shutdown()
+                self.session.shutdown_abort()
                 break
             else:
                 print_colored_debug(

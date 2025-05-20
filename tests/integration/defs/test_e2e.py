@@ -41,7 +41,6 @@ if TEST_MEM_USAGE:
     os.environ['TLLM_LOG_LEVEL'] = 'INFO'
 
 _MEM_FRACTION_50 = 0.5
-_MEM_FRACTION_90 = 0.90
 _MEM_FRACTION_95 = 0.95
 
 
@@ -72,7 +71,7 @@ def _get_mem_info_from_log(file, ranks_num):
 def _get_kv_mem_size_candidate(used_Gib, fraction):
     import torch
     _, total = torch.cuda.mem_get_info()
-    return (total / (1 << 30)) * fraction - used_Gib
+    return (total / (1 << 30) - used_Gib) * fraction
 
 
 def _check_mem_usage(file, mem_info, ranks_num=1):
@@ -320,6 +319,67 @@ def test_mistral_e2e(llama_example_root, llama_tokenizer_model_root, llm_venv,
     venv_check_call(llm_venv, run_cmd)
 
 
+@pytest.mark.parametrize("model_name,model_path", [
+    ("DeepSeek-R1-Distill-Qwen-1.5B", "DeepSeek-R1-Distill-Qwen-1.5B"),
+])
+def test_qwen_e2e_cpprunner_large_new_tokens(model_name, model_path, llm_venv,
+                                             qwen_example_root, cmodel_dir,
+                                             engine_dir):
+    "RCCA: https://nvbugs/5238105"
+    model_dir = convert_weights(
+        llm_venv=llm_venv,
+        example_root=qwen_example_root,
+        cmodel_dir=cmodel_dir,
+        model=model_name,
+        model_path=f"{llm_models_root()}/{model_path}",
+    )
+
+    build_cmd = [
+        "trtllm-build", f"--checkpoint_dir={model_dir}",
+        f"--output_dir={engine_dir}", f"--gemm_plugin=float16",
+        "--max_num_tokens=32768"
+    ]
+
+    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+
+    from transformers import AutoTokenizer
+
+    from tensorrt_llm.runtime import PYTHON_BINDINGS
+
+    if PYTHON_BINDINGS:
+        from tensorrt_llm.runtime import ModelRunnerCpp
+    tokenizer = AutoTokenizer.from_pretrained(
+        f"{llm_models_root()}/{model_path}",
+        trust_remote_code=True,
+        use_fast=False)
+
+    message = r"<｜begin▁of▁sentence｜><｜User｜>The operation $\otimes$ is defined for all nonzero numbers by $a \otimes b = \frac{a^{2}}{b}$. Determine $[(1 \otimes 2) \otimes 3] - [1 \otimes (2 \otimes 3)]$. Let's think step by step and output the final answer within \boxed{}.<｜Assistant｜>"
+
+    inputs = tokenizer(message, return_tensors='pt',
+                       add_special_tokens=False)['input_ids']
+
+    runner = ModelRunnerCpp.from_dir(engine_dir=f"{engine_dir}",
+                                     max_input_len=128,
+                                     max_output_len=4096,
+                                     max_batch_size=8)
+
+    outputs = runner.generate(inputs,
+                              end_id=tokenizer.eos_token_id,
+                              pad_id=tokenizer.pad_token_id,
+                              temperature=0.6,
+                              top_p=1.0,
+                              top_k=1024,
+                              max_new_tokens=1024,
+                              return_dict=True,
+                              min_length=1,
+                              num_return_sequences=4,
+                              output_sequence_lengths=True)
+
+    seq_lengths = outputs['sequence_lengths']
+    assert not (seq_lengths == 0).any(
+    ), f"Found zero length in sequence_lengths tensor: {seq_lengths}"
+
+
 def trtllm_bench_prolog(
         llm_root,
         llm_venv,
@@ -524,7 +584,7 @@ def test_trtllm_bench_pytorch_backend_sanity(llm_root, llm_venv,
         f"--dataset {dataset_path} --backend 'pytorch'"
 
     mapping = {
-        "Meta-Llama-3.1-8B": 18.9,
+        "Meta-Llama-3.1-8B": 19.4,
         "Llama-3.1-8B-Instruct-FP8": 12.0,
         "Meta-Llama-3.1-8B-NVFP4": 10.2
     }
@@ -702,8 +762,8 @@ def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
             streaming=streaming)
 
         benchmark_cmd = \
-            f"trtllm-bench --model {model_path} throughput " \
-            f"--dataset {dataset_path} --iteration_log {iteration_log}"
+            f"trtllm-bench --model {model_name} --model_path {model_path} " \
+            f"throughput --dataset {dataset_path} --iteration_log {iteration_log}"
 
         if streaming:
             benchmark_cmd += " --streaming"
@@ -1258,6 +1318,7 @@ def test_ptp_quickstart(llm_root, llm_venv):
     ("Llama3.2-11B-BF16", "llama-3.2-models/Llama-3.2-11B-Vision"),
     ("Nemotron4_4B-BF16", "nemotron/Minitron-4B-Base"),
     ("Nemotron-H-8B", "Nemotron-H-8B-Base-8K"),
+    ("Qwen3-30B-A3B", "Qwen3/Qwen3-30B-A3B"),
     pytest.param('Llama3.1-8B-NVFP4',
                  'nvfp4-quantized/Meta-Llama-3.1-8B',
                  marks=skip_pre_blackwell),
@@ -1270,8 +1331,14 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('Llama3.1-70B-FP8',
                  'llama-3.1-model/Llama-3.1-70B-Instruct-FP8',
                  marks=skip_pre_hopper),
+    pytest.param('Nemotron-Super-49B-v1-FP8',
+                 'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8',
+                 marks=skip_pre_hopper),
     pytest.param('Mixtral-8x7B-NVFP4',
                  'nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1',
+                 marks=skip_pre_blackwell),
+    pytest.param('Mixtral-8x7B-FP8',
+                 'Mixtral-8x7B-Instruct-v0.1-fp8',
                  marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
@@ -1298,13 +1365,14 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
                                          dir="./",
                                          delete=True,
                                          delete_on_close=True) as running_log:
-            llm_venv.run_cmd([
+            cmds = [
                 str(example_root / "quickstart_advanced.py"),
                 "--enable_chunked_prefill",
-                "--model_dir",
-                f"{llm_models_root()}/{model_path}",
-            ],
-                             running_log=running_log)
+                f"--model_dir={llm_models_root()}/{model_path}",
+            ]
+            if "Qwen3" in model_name:
+                cmds.append(f"--kv_cache_fraction=0.6")
+            llm_venv.run_cmd(cmds, running_log=running_log)
             if model_name in mapping:
                 _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0])
 
@@ -1350,7 +1418,6 @@ def test_ptp_quickstart_advanced_deepseek_v3_2nodes_8gpus(
         "trtllm-llmapi-launch",
         "python3",
         str(example_root / "quickstart_advanced.py"),
-        "--enable_overlap_scheduler",
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
         "--moe_ep_size=8",
@@ -1525,6 +1592,8 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("model_name,model_path", [
     ("Llama3.1-70B-BF16", "llama-3.1-model/Meta-Llama-3.1-70B"),
+    ('Nemotron-Super-49B-v1-BF16',
+     'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1'),
     ("Mixtral-8x7B-BF16", "Mixtral-8x7B-Instruct-v0.1"),
 ])
 def test_ptp_quickstart_advanced_2gpus_sm120(llm_root, llm_venv, model_name,
