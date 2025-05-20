@@ -45,7 +45,8 @@ class OpenAIDisaggServer:
                  server_start_timeout_secs: int = 180,
                  ctx_router_config: Optional[RouterConfig] = None,
                  gen_router_config: Optional[RouterConfig] = None,
-                 conditional_disagg_config: Optional[ConditionalDisaggConfig] = None):
+                 conditional_disagg_config: Optional[ConditionalDisaggConfig] = None,
+                 metadata_server_cfg: MetadataServerConfig = None):
 
         self.ctx_servers = ctx_servers
         self.gen_servers = gen_servers
