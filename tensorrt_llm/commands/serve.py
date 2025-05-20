@@ -1,5 +1,4 @@
 import asyncio
-import enum
 import os
 import signal  # Added import
 import subprocess  # nosec B404
@@ -9,6 +8,7 @@ from typing import Any, List, Optional
 import click
 import torch
 import yaml
+from strenum import StrEnum
 from torch.cuda import device_count
 
 from tensorrt_llm._torch.llm import LLM as PyTorchLLM
@@ -34,7 +34,7 @@ def _signal_handler_cleanup_child(signum, frame):
     global _child_p_global
     if _child_p_global and _child_p_global.poll() is None:
         # Using print for safety in signal handlers
-        print(
+        logger.info(
             f"Parent process (PID {os.getpid()}) received signal {signal.Signals(signum).name}. Terminating child process (PID {_child_p_global.pid})."
         )
         _child_p_global.terminate()
@@ -42,23 +42,23 @@ def _signal_handler_cleanup_child(signum, frame):
             _child_p_global.wait(
                 timeout=10)  # Allow 10 seconds for graceful termination
         except subprocess.TimeoutExpired:
-            print(
+            logger.info(
                 f"Child process (PID {_child_p_global.pid}) did not terminate gracefully after signal. Killing."
             )
             _child_p_global.kill()
             try:
                 _child_p_global.wait(timeout=10)  # Allow 10 seconds for kill
             except subprocess.TimeoutExpired:
-                print(
+                logger.info(
                     f"Child process (PID {_child_p_global.pid}) failed to die even after kill command from signal handler."
                 )
 
         if _child_p_global.poll() is not None:
-            print(
+            logger.info(
                 f"Child process (PID {_child_p_global.pid}) confirmed terminated due to signal {signal.Signals(signum).name}."
             )
         else:
-            print(
+            logger.info(
                 f"Child process (PID {_child_p_global.pid}) is still running after cleanup attempt for signal {signal.Signals(signum).name}."
             )
 
@@ -405,7 +405,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
                     f"rank{global_mpi_rank()} should not have executor")
 
 
-class DisaggLauncherEnvs(enum.StrEnum):
+class DisaggLauncherEnvs(StrEnum):
     TLLM_DISAGG_INSTANCE_IDX = "TLLM_DISAGG_INSTANCE_IDX"
     TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT = "TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT"
 

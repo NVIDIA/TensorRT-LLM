@@ -1,10 +1,11 @@
 import asyncio
 import concurrent.futures
-import enum
 import os
 from concurrent.futures import ProcessPoolExecutor
 from queue import Empty, Queue
 from typing import Any, Callable, List, NamedTuple, Optional
+
+from strenum import StrEnum
 
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.bindings.executor import Response
@@ -16,7 +17,7 @@ from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
 from ..llmapi.utils import print_colored_debug
 
 
-class LlmLauncherEnvs(enum.StrEnum):
+class LlmLauncherEnvs(StrEnum):
     # Spawn a process for the LLM-API Proxy
     TLLM_SPAWN_PROXY_PROCESS = "TLLM_SPAWN_PROXY_PROCESS"
     TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR = "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"
