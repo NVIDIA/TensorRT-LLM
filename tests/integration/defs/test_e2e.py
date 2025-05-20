@@ -1337,6 +1337,9 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('Mixtral-8x7B-NVFP4',
                  'nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1',
                  marks=skip_pre_blackwell),
+    pytest.param('Mixtral-8x7B-FP8',
+                 'Mixtral-8x7B-Instruct-v0.1-fp8',
+                 marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")

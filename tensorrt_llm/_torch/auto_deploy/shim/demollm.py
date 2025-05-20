@@ -372,7 +372,7 @@ class DemoLLM(LLM):
         self.mpi_session = None
         self.runtime_context = None
         self._tokenizer = self._try_load_tokenizer()
-        self.input_processor = create_input_processor(model, self.tokenizer)
+        self.input_processor = create_input_processor(None, self.tokenizer)
 
         # construct sequence info object
         seq_info = SequenceInfo(

@@ -29,6 +29,7 @@ namespace
 {
 
 auto constexpr LLAMA_INPUT_FILE = "input_tokens_llama.npy";
+auto constexpr LLAMA_VOCAB_SIZE_PADDED = 128256;
 auto constexpr LLAMA_END_ID = 128001;
 auto constexpr LLAMA_PAD_ID = 128001;
 
@@ -520,6 +521,7 @@ TEST_P(DisaggParamsTest, DisaggTokenComparison)
     // set defaults and adjust if needed by different models
     fs::path inputPath = DATA_PATH / "input_tokens.npy";
     ModelIds modelIds{50256, 50256};
+    SizeType32 vocabSizePadded{50257}; // gpt vocabSizePadded
     bool isSpeculativeDecoding{false};
 
     // NOTE: This can be used to disable checks for certain prompt batch entries
@@ -557,6 +559,7 @@ TEST_P(DisaggParamsTest, DisaggTokenComparison)
         || modelName == "llama_tp1_pp2_cp1" || modelName == "llama_tp2_pp1_cp1" || modelName == "llama_tp1_pp1_cp1")
     {
         inputPath = DATA_PATH / LLAMA_INPUT_FILE;
+        vocabSizePadded = LLAMA_VOCAB_SIZE_PADDED;
 
         auto const resultsPath
             = LLAMA_DATA_PATH / ((beamWidth == 1) ? "sampling" : "beam_search_" + std::to_string(beamWidth));
@@ -618,8 +621,6 @@ TEST_P(DisaggParamsTest, DisaggTokenComparison)
             }
         }
     }
-
-    SizeType32 constexpr vocabSizePadded{50257}; // gpt vocabSizePadded
 
     // Returning logits will bring higher latency
     if (streaming && (outConfig.returnContextLogits || outConfig.returnGenerationLogits))
@@ -756,6 +757,7 @@ TEST_P(DisaggOrchestratorParamsTest, DisaggTokenComparison)
     // set defaults and adjust if needed by different models
     fs::path inputPath = DATA_PATH / "input_tokens.npy";
     ModelIds modelIds{50256, 50256};
+    SizeType32 vocabSizePadded{50257}; // gpt vocabSizePadded
     bool isSpeculativeDecoding{false};
 
     // NOTE: This can be used to disable checks for certain prompt batch entries
@@ -764,6 +766,7 @@ TEST_P(DisaggOrchestratorParamsTest, DisaggTokenComparison)
         || modelName == "llama_tp1_pp2" || modelName == "llama_tp2_pp1" || modelName == "llama_tp1_pp1")
     {
         inputPath = DATA_PATH / LLAMA_INPUT_FILE;
+        vocabSizePadded = LLAMA_VOCAB_SIZE_PADDED;
 
         auto const resultsPath
             = LLAMA_DATA_PATH / ((beamWidth == 1) ? "sampling" : "beam_search_" + std::to_string(beamWidth));
@@ -826,8 +829,6 @@ TEST_P(DisaggOrchestratorParamsTest, DisaggTokenComparison)
             }
         }
     }
-
-    SizeType32 constexpr vocabSizePadded{50257}; // gpt vocabSizePadded
 
     // Returning logits will bring higher latency
     if (streaming && (outConfig.returnContextLogits || outConfig.returnGenerationLogits))
@@ -920,6 +921,7 @@ TEST_P(ConditionalDisaggParamsTest, DisaggTokenComparison)
     // set defaults and adjust if needed by different models
     fs::path inputPath = DATA_PATH / "input_tokens.npy";
     ModelIds modelIds{50256, 50256};
+    SizeType32 vocabSizePadded{50257}; // gpt vocabSizePadded
     bool isSpeculativeDecoding{false};
 
     // NOTE: This can be used to disable checks for certain prompt batch entries
@@ -935,6 +937,7 @@ TEST_P(ConditionalDisaggParamsTest, DisaggTokenComparison)
     else if (modelName == "llama_tp1_pp1_cp1")
     {
         inputPath = DATA_PATH / LLAMA_INPUT_FILE;
+        vocabSizePadded = LLAMA_VOCAB_SIZE_PADDED;
 
         auto const resultsPath
             = LLAMA_DATA_PATH / ((beamWidth == 1) ? "sampling" : "beam_search_" + std::to_string(beamWidth));
@@ -947,8 +950,6 @@ TEST_P(ConditionalDisaggParamsTest, DisaggTokenComparison)
     {
         TLLM_THROW("Unrecognized modelName");
     }
-
-    SizeType32 constexpr vocabSizePadded{50257}; // gpt vocabSizePadded
 
     auto executorConfig = ExecutorConfig(maxBeamWidth);
     FloatType freeGpuMemoryFraction = 0.9f;
@@ -1115,8 +1116,11 @@ INSTANTIATE_TEST_SUITE_P(GptSingleDeviceDisaggSymmetricExecutorMixedTest, Disagg
         testing::Values(1)),
     generateTestNameDisaggParams);
 
-INSTANTIATE_TEST_SUITE_P(ConditionalDisaggSymmetricExecutorTest, ConditionalDisaggParamsTest,
-    testing::Combine(testing::Values("gpt", "llama_tp1_pp1_cp1")), generateTestNameCondDisaggParams);
+INSTANTIATE_TEST_SUITE_P(GptConditionalDisaggSymmetricExecutorTest, ConditionalDisaggParamsTest,
+    testing::Combine(testing::Values("gpt")), generateTestNameCondDisaggParams);
+
+INSTANTIATE_TEST_SUITE_P(LlamaConditionalDisaggSymmetricExecutorTest, ConditionalDisaggParamsTest,
+    testing::Combine(testing::Values("llama_tp1_pp1_cp1")), generateTestNameCondDisaggParams);
 
 INSTANTIATE_TEST_SUITE_P(LlamaTP2DisaggSymmetricExecutorTest, DisaggParamsTest,
     testing::Combine(testing::Values(4),
