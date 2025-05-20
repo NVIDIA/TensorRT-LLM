@@ -25,24 +25,6 @@
 namespace ada_blockwise_gemm
 {
 
-template <typename T, typename access_type=cute::uint128_t, int num_elements_in_row = 128>
-struct DefaultSwizzleConfiguration
-{
-    __inline__  static constexpr int constexpr_log2(int n) {
-        return ((n < 2) ? 0 : 1 + constexpr_log2(n / 2));
-    }
-    static constexpr int element_bytes = sizeof(T);
-    static constexpr int access_bytes = sizeof(access_type);
-    static constexpr int num_elements_in_vector = access_bytes / element_bytes;
-    static constexpr int num_elements_in_32banks = 32 * 4 / element_bytes;
-
-    static constexpr int MBase = constexpr_log2(num_elements_in_vector);
-    static constexpr int BBits = constexpr_log2(num_elements_in_32banks) - MBase;
-    static constexpr int SShifts = constexpr_log2(num_elements_in_row) - MBase;
-
-    using Swizzle = cute::Swizzle<BBits, MBase, SShifts>;
-};
-
 template <typename Element, typename Layout, int Alignment, int SizeK>
 struct DefaultGemm_TensorOpSm80_OperandA;
 
@@ -55,20 +37,15 @@ struct DefaultGemm_TensorOpSm80_OperandA<cute::float_e4m3_t,
                                          cutlass::layout::RowMajor, 16, 128>
 {
     // Smem
-    using swizzle = DefaultSwizzleConfiguration<cute::float_e4m3_t, cute::uint128_t, 128>::Swizzle;
-    CUTE_STATIC_ASSERT(swizzle::num_bits == 3);
-    CUTE_STATIC_ASSERT(swizzle::num_base == 4);
-    CUTE_STATIC_ASSERT(swizzle::num_shft == 3);
-
-    using smem_layout = cute::Layout<cute::Shape<cute::_8, cute::_128>, cute::Stride<cute::_128, cute::_1>>; // 8x128
-    using SmemLayoutAtom = decltype(cute::composition(swizzle{}, smem_layout{}));
+    using smem_layout = cute::Layout<cute::Shape<cute::_8, cute::_128>, cute::Stride<cute::_128, cute::_1>>; 
+    using SmemLayoutAtom = decltype(cute::composition(cute::Swizzle<3, 4, 3>{}, smem_layout{}));
     using SmemCopyAtom = cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, cute::float_e4m3_t>;
 
     // Gmem
     using copy_atom = decltype(cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, cute::float_e4m3_t>{});
-    using thr_layout = decltype(cute::Layout<cute::Shape<cute::_16, cute::_8>, cute::Stride<cute::_8, cute::_1>>{}); // threads layout 16x8
-    using val_layout = decltype(cute::Layout<cute::Shape<cute::_1, cute::_16>>{}); // each thread loads 16 elements
-    using GmemTiledCopy = decltype(cute::make_tiled_copy(copy_atom{}, thr_layout{}, val_layout{}));  // tile_mn = 16x128
+    using thr_layout = decltype(cute::Layout<cute::Shape<cute::_16, cute::_8>, cute::Stride<cute::_8, cute::_1>>{}); 
+    using val_layout = decltype(cute::Layout<cute::Shape<cute::_1, cute::_16>>{}); 
+    using GmemTiledCopy = decltype(cute::make_tiled_copy(copy_atom{}, thr_layout{}, val_layout{}));  
 };
 
 template <>
@@ -76,20 +53,15 @@ struct DefaultGemm_TensorOpSm80_OperandA<cute::float_e4m3_t,
                                          cutlass::layout::ColumnMajor, 16, 128>
 {
     // Smem
-    using swizzle = DefaultSwizzleConfiguration<cute::float_e4m3_t, cute::uint128_t, 128>::Swizzle;
-    CUTE_STATIC_ASSERT(swizzle::num_bits == 3);
-    CUTE_STATIC_ASSERT(swizzle::num_base == 4);
-    CUTE_STATIC_ASSERT(swizzle::num_shft == 3);
-
-    using smem_layout = cute::Layout<cute::Shape<cute::_8, cute::_128>, cute::Stride<cute::_128, cute::_1>>; // 8x128
-    using SmemLayoutAtom = decltype(cute::composition(swizzle{}, smem_layout{}));
+    using smem_layout = cute::Layout<cute::Shape<cute::_8, cute::_128>, cute::Stride<cute::_128, cute::_1>>; 
+    using SmemLayoutAtom = decltype(cute::composition(cute::Swizzle<3, 4, 3>{}, smem_layout{}));
     using SmemCopyAtom = cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, cute::float_e4m3_t>;
 
     // Gmem
     using copy_atom = decltype(cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, cute::float_e4m3_t>{});
-    using thr_layout = decltype(cute::Layout<cute::Shape<cute::_16, cute::_8>, cute::Stride<cute::_1, cute::_16>>{}); // threads layout 16x8
-    using val_layout = decltype(cute::Layout<cute::Shape<cute::_16, cute::_1>>{}); // each thread loads 16 elements
-    using GmemTiledCopy = decltype(cute::make_tiled_copy(copy_atom{}, thr_layout{}, val_layout{}));  // tile_mn = 16x128
+    using thr_layout = decltype(cute::Layout<cute::Shape<cute::_16, cute::_8>, cute::Stride<cute::_1, cute::_16>>{}); 
+    using val_layout = decltype(cute::Layout<cute::Shape<cute::_16, cute::_1>>{}); 
+    using GmemTiledCopy = decltype(cute::make_tiled_copy(copy_atom{}, thr_layout{}, val_layout{}));  
 };
 
 template <>

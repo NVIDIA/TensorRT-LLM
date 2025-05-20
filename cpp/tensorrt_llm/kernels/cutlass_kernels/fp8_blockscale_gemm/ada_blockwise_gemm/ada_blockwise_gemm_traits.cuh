@@ -82,12 +82,9 @@ struct AdaBlockwiseGemmTraits
         cute::Shape<cute::Int<ScaleMsPerTile>, cute::Int<ScaleNsPerTile>, cute::Int<ScaleKsPerTile>>; 
 
     // MMA atom arch and layout
-    using TiledMma = std::conditional_t<
-        std::is_same_v<ElementType, cute::bfloat16_t>,
-        DefaultGemm_TensorOp_MMA<cute::bfloat16_t, cutlass::arch::Sm80>::TiledMma,
-        DefaultGemm_TensorOp_MMA<cute::float_e4m3_t, cutlass::arch::Sm89>::TiledMma>;
+    using TiledMma = DefaultGemm_TensorOp_MMA<cute::float_e4m3_t, cutlass::arch::Sm89>::TiledMma;
     
-    static constexpr int kBlockKSmem = std::is_same_v<ElementType, cute::bfloat16_t> ? 32 : 128;
+    static constexpr int kBlockKSmem = 128;
     // A memory copy operand
     using DefaultOperandA
         = DefaultGemm_TensorOpSm80_OperandA<ElementA, cutlass::layout::RowMajor, AlignmentA, kBlockKSmem>;
@@ -116,7 +113,7 @@ struct AdaBlockwiseGemmTraits
     using SmemLayoutAtomO = decltype(cute::composition(
         cute::Swizzle<3,3,3>{},
         cute::Layout<cute::Shape <cute::_8,cute::Shape <cute::_8, cute::_8>>,
-               cute::Stride<cute::_8,cute::Stride<cute::_1,cute::_64>>>{}));  //  8x64
+               cute::Stride<cute::_8,cute::Stride<cute::_1,cute::_64>>>{}));  
 
     using SmemCopyAtomR2S = cute::Copy_Atom<cute::AutoVectorizingCopy, ElementOutput>;
     using SmemCopyAtomS2R = cute::Copy_Atom<cute::UniversalCopy<cute::uint128_t>, ElementOutput>;

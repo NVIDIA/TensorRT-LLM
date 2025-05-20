@@ -18,7 +18,6 @@
 
 #include "ada_blockwise_gemm_traits.cuh"
 
-#define ENABLE_FP8_BLOCK_SCALING 1
 namespace ada_blockwise_gemm
 {
 
@@ -156,22 +155,22 @@ struct AdaBlockwiseGemmKernel
             typename KT::SmemLayoutB{});                                                        // (BLK_N, BLK_K, Stage)
         cute::Tensor sO = cute::make_tensor(
             cute::make_smem_ptr(shared_storage.smem_o.data()), typename KT::SmemLayoutO{});     // (BLK_M, BLK_N)
-#if ENABLE_FP8_BLOCK_SCALING
+
         cute::Tensor sScaleA = cute::make_tensor(
             cute::make_smem_ptr(shared_storage.smem_scale_a.data()), typename KT::SmemLayoutScaleA{}); // (BLK_M, BLK_K, Stage)
         cute::Tensor sScaleB = cute::make_tensor(
             cute::make_smem_ptr(shared_storage.smem_scale_b.data()), typename KT::SmemLayoutScaleB{}); // (BLK_N, BLK_K, Stage)
-#endif
+
 
         // (1) first step, get the B_res and B_gate
 
         // (1.1) get partition for gmem -> smem
         cute::Tensor gA = gA_mk(cute::_, cute::_, block_m_idx, cute::_);     // (BLK_M, BLK_K, k)
         cute::Tensor gB = gB_nk(cute::_, cute::_, block_n_idx, cute::_);     // (BLK_N, BLK_K, k)
-#if ENABLE_FP8_BLOCK_SCALING
+
         cute::Tensor gScaleA = gScaleA_mk(cute::_, cute::_, block_m_idx, cute::_);
         cute::Tensor gScaleB = gScaleB_nk(cute::_, cute::_, block_n_idx, cute::_);
-#endif
+
 
 
         typename KT::GmemTiledCopyA gmem_tiled_copy_A;
@@ -184,7 +183,7 @@ struct AdaBlockwiseGemmKernel
         cute::Tensor tBgB = gmem_thr_copy_B.partition_S(gB);  // (BCPY,BCPY_N,BCPY_K,k)
         cute::Tensor tBsB = gmem_thr_copy_B.partition_D(sB);  // (BCPY,BCPY_N,BCPY_K,Stage)
 
-#if ENABLE_FP8_BLOCK_SCALING
+
         typename KT::GmemTiledCopyScaleA gmem_tiled_copy_ScaleA;
         typename KT::GmemTiledCopyScaleB gmem_tiled_copy_ScaleB;
         auto gmem_thr_copy_ScaleA = gmem_tiled_copy_ScaleA.get_slice(thread_idx);
@@ -194,7 +193,7 @@ struct AdaBlockwiseGemmKernel
         cute::Tensor tAsScaleA = gmem_thr_copy_ScaleA.partition_D(sScaleA);  // (ACPY,ACPY_M,ACPY_K,Stage)
         cute::Tensor tBgScaleB = gmem_thr_copy_ScaleB.partition_S(gScaleB);  // (BCPY,BCPY_N,BCPY_K,k)
         cute::Tensor tBsScaleB = gmem_thr_copy_ScaleB.partition_D(sScaleB);  // (BCPY,BCPY_N,BCPY_K,Stage)
-#endif
+
 
         // Allocate predicate tensors for input and fc weight (actually we only need input predicate tensor)
         cute::Tensor tApA =
@@ -231,10 +230,10 @@ struct AdaBlockwiseGemmKernel
         // (1.2) prefetch gmem -> smem
         cute::clear(tAsA);                                           // we don't need to clear tBsB..
         cute::clear(tBsB);
-#if ENABLE_FP8_BLOCK_SCALING
+
         cute::clear(tAsScaleA);
         cute::clear(tBsScaleB);
-#endif
+
         auto k_tile_iter = cute::make_coord_iterator(cute::size<2>(gA)); // emm, iter start from 0
         int k_tile_count = cute::size<2>(gA);
         CUTLASS_PRAGMA_UNROLL
@@ -248,12 +247,12 @@ struct AdaBlockwiseGemmKernel
                tAsA(cute::_, cute::_, cute::_, k_pipe));
             cute::copy_if(gmem_tiled_copy_B, tBpB, tBgB(cute::_, cute::_, cute::_, *k_tile_iter),
                 tBsB(cute::_, cute::_, cute::_, k_pipe));
-#if ENABLE_FP8_BLOCK_SCALING
+
             cute::copy_if(gmem_tiled_copy_ScaleA, tApA, tAgScaleA(cute::_, cute::_, cute::_, *k_tile_iter),
                 tAsScaleA(cute::_, cute::_, cute::_, k_pipe));
             cute::copy_if(gmem_tiled_copy_ScaleB, tBpB, tBgScaleB(cute::_, cute::_, cute::_, *k_tile_iter),
                 tBsScaleB(cute::_, cute::_, cute::_, k_pipe));
-#endif
+
             cute::cp_async_fence();
             k_tile_count--;
             if (k_tile_count > 0)
@@ -295,7 +294,7 @@ struct AdaBlockwiseGemmKernel
         CUTE_STATIC_ASSERT_V(cute::size<1>(tOsB) == cute::size<1>(tCrB_write)); // CPY_N
         CUTE_STATIC_ASSERT_V(cute::size<2>(tOsB) == cute::size<2>(tCrB_write)); // CPY_K
 
-#if ENABLE_FP8_BLOCK_SCALING
+
         typename KT::SmemCopyAtomScaleA smem_tiled_copy_ScaleA;
         typename KT::SmemCopyAtomScaleB smem_tiled_copy_ScaleB;
         auto smem_thr_copy_ScaleA = smem_tiled_copy_ScaleA.get_thread_slice(thread_idx);
@@ -305,7 +304,7 @@ struct AdaBlockwiseGemmKernel
         cute::Tensor tCrScaleA = cute::make_fragment_like(tOsScaleA(cute::_, cute::_, cute::_, 0));
         cute::Tensor tOsScaleB = smem_thr_copy_ScaleB.partition_S(sScaleB);
         cute::Tensor tCrScaleB = cute::make_fragment_like(tOsScaleB(cute::_, cute::_, cute::_, 0));
-#endif  
+  
 
         // (1.5) mainloop
         // Current pipe index in smem to read from
@@ -315,10 +314,10 @@ struct AdaBlockwiseGemmKernel
 
         cute::Tensor tOsA_read = tOsA(cute::_, cute::_, cute::_, smem_pipe_read);
         cute::Tensor tOsB_read = tOsB(cute::_, cute::_, cute::_, smem_pipe_read);
-#if ENABLE_FP8_BLOCK_SCALING
+
         cute::Tensor tOsScaleA_read = tOsScaleA(cute::_, cute::_, cute::_, smem_pipe_read);
         cute::Tensor tOsScaleB_read = tOsScaleB(cute::_, cute::_, cute::_, smem_pipe_read);
-#endif
+
 
         constexpr int K_BLOCK_MAX = cute::size<2>(tCrA);
         // prefetch register pipeline
@@ -345,10 +344,10 @@ struct AdaBlockwiseGemmKernel
                     {
                         tOsA_read = tOsA(cute::_, cute::_, cute::_, smem_pipe_read);
                         tOsB_read = tOsB(cute::_, cute::_, cute::_, smem_pipe_read);
-#if ENABLE_FP8_BLOCK_SCALING
+
                         tOsScaleA_read = tOsScaleA(cute::_, cute::_, cute::_, smem_pipe_read);
                         tOsScaleB_read = tOsScaleB(cute::_, cute::_, cute::_, smem_pipe_read);
-#endif
+
                         cute::cp_async_wait<KT::Stages - 2>();
                         __syncthreads();
                     }
@@ -369,22 +368,22 @@ struct AdaBlockwiseGemmKernel
                            tAsA(cute::_, cute::_, cute::_, smem_pipe_write));
                         cute::copy_if(gmem_tiled_copy_B, tBpB, tBgB(cute::_, cute::_, cute::_, *k_tile_iter),
                             tBsB(cute::_, cute::_, cute::_, smem_pipe_write));
-#if ENABLE_FP8_BLOCK_SCALING    
+    
                         cute::copy_if(gmem_tiled_copy_ScaleA, tApA, tAgScaleA(cute::_, cute::_, cute::_, *k_tile_iter),
                             tAsScaleA(cute::_, cute::_, cute::_, smem_pipe_write));
                         cute::copy_if(gmem_tiled_copy_ScaleB, tBpB, tBgScaleB(cute::_, cute::_, cute::_, *k_tile_iter),
                             tBsScaleB(cute::_, cute::_, cute::_, smem_pipe_write));
-#endif
+
                         cute::cp_async_fence();
                         if (k_tile_count - 1 > 0)
                         {
                             ++k_tile_iter;
                         }
 
-#if ENABLE_FP8_BLOCK_SCALING    
+    
                         cute::copy(smem_tiled_copy_ScaleA, tOsScaleA_read, tCrScaleA);
                         cute::copy(smem_tiled_copy_ScaleB, tOsScaleB_read, tCrScaleB);
-#endif
+
                         // Advance the pipe -- Doing it here accounts for K_BLOCK_MAX = 1 (no rmem pipe)
                         smem_pipe_write = smem_pipe_read;
                         ++smem_pipe_read;
@@ -394,9 +393,9 @@ struct AdaBlockwiseGemmKernel
                     cute::gemm(tiled_mma, temp_accum, tCrA(cute::_, cute::_, k_block), tCrB(cute::_, cute::_, k_block),
                         temp_accum);
                 });
-#if ENABLE_FP8_BLOCK_SCALING
+
             promote(accum, temp_accum, tCrScaleA, tCrScaleB);
-#endif
+
         }
         // load tail
         cute::for_each(cute::make_int_sequence<KT::Stages - 2>{},
@@ -412,10 +411,10 @@ struct AdaBlockwiseGemmKernel
                         {
                             tOsA_read = tOsA(cute::_, cute::_, cute::_, smem_pipe_read);
                             tOsB_read = tOsB(cute::_, cute::_, cute::_, smem_pipe_read);
-#if ENABLE_FP8_BLOCK_SCALING
+
                             tOsScaleA_read = tOsScaleA(cute::_, cute::_, cute::_, smem_pipe_read);
                             tOsScaleB_read = tOsScaleB(cute::_, cute::_, cute::_, smem_pipe_read);
-#endif
+
                             cute::cp_async_wait<KT::Stages - 3 - WaitIndex_t::value>();
                             __syncthreads();
                         }
@@ -427,10 +426,10 @@ struct AdaBlockwiseGemmKernel
                             tCrB_write(cute::_, cute::_, k_block_next));
                         if (k_block == 0)
                         {
-#if ENABLE_FP8_BLOCK_SCALING
+
                             cute::copy(smem_tiled_copy_ScaleA, tOsScaleA_read, tCrScaleA);
                             cute::copy(smem_tiled_copy_ScaleB, tOsScaleB_read, tCrScaleB);
-#endif
+
                             // only update smem_pipe_read
                             ++smem_pipe_read;
                             smem_pipe_read = (smem_pipe_read == KT::Stages) ? 0 : smem_pipe_read;
@@ -439,9 +438,9 @@ struct AdaBlockwiseGemmKernel
                         cute::gemm(tiled_mma, temp_accum, tCrA(cute::_, cute::_, k_block),
                             tCrB(cute::_, cute::_, k_block), temp_accum);
                     });
-#if ENABLE_FP8_BLOCK_SCALING
+
                 promote(accum, temp_accum, tCrScaleA, tCrScaleB);
-#endif
+
             });
         // mma tail
         cute::clear(temp_accum);
@@ -456,19 +455,17 @@ struct AdaBlockwiseGemmKernel
                     tCrB_write(cute::_, cute::_, k_block_next));
                 if (k_block == 0)
                 {
-#if ENABLE_FP8_BLOCK_SCALING
+
                     cute::copy(smem_tiled_copy_ScaleA, tOsScaleA_read, tCrScaleA);
                     cute::copy(smem_tiled_copy_ScaleB, tOsScaleB_read, tCrScaleB);
-#endif
+
                 }
                 // Thread-level register gemm for k_block
                 cute::gemm(
                     tiled_mma, temp_accum, tCrA(cute::_, cute::_, k_block), tCrB(cute::_, cute::_, k_block), temp_accum);
             });
-#if ENABLE_FP8_BLOCK_SCALING
-        promote(accum, temp_accum, tCrScaleA, tCrScaleB);
-#endif
 
+        promote(accum, temp_accum, tCrScaleA, tCrScaleB);
 
         // (4) push all the result to smem
         // (4.1) convert result from ElementAccum to ElementA
