@@ -819,7 +819,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 ),
             )
         else:
-            # Disable mlp's allreduce if use ll twoshot
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)

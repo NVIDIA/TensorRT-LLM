@@ -125,8 +125,6 @@ public:
     //! \param mnNvlink Flag indicating if multi-node NVLink is used.
     McastGPUBuffer(size_t bufSize, uint32_t groupSize, uint32_t groupRank, at::Device device, bool mnNvlink)
         : mMcastDeviceMemory(bufSize, groupSize, groupRank, device.index(), mnNvlink)
-        , mGroupSize(groupSize)
-        , mGroupRank(groupRank)
         , mBufSize(bufSize)
         , mLocalDevice(device)
     {
@@ -172,8 +170,6 @@ public:
 private:
     //!< Underlying memory manager for multi-node communication.
     tensorrt_llm::runtime::McastDeviceMemory mMcastDeviceMemory;
-    uint32_t mGroupSize;     //!< Size of the communication group.
-    uint32_t mGroupRank;     //!< Rank of the current process.
     size_t mBufSize;         //!< Total size of the managed buffer.
     at::Device mLocalDevice; //!< The local CUDA device.
 };
