@@ -77,9 +77,7 @@ def torch_ref_rms_norm_rope(qkv,
                                  is_neox=False).to(qkv.device)
 
     # Apply RoPE to the normalized Q and K
-    [q_rope, k_rope] = rotary_emb(position_ids,
-                                  [q_normalized, k_normalized])
-
+    [q_rope, k_rope] = rotary_emb(position_ids, [q_normalized, k_normalized])
 
     # Combine Q, K, V back together
     result = torch.cat([q_rope, k_rope, v], dim=1)
@@ -93,7 +91,7 @@ num_heads_groups = [
     (16, 8, 8),  # Qwen3-0.6B, Qwen3-1.7B
     (32, 8, 8),  # Qwen3-4B, Qwen3-8B, Qwen3-30B-A3B
     (40, 8, 8),  # Qwen3-14B
-    (64, 8, 8)   # Qwen3-32B, Qwen3-235B-A22B
+    (64, 8, 8)  # Qwen3-32B, Qwen3-235B-A22B
 ]
 num_tokens_list = [3, 8, 32, 256]
 dtypes = [torch.bfloat16]  # TODO: support float16
@@ -156,34 +154,6 @@ def test_fused_qk_norm_rope(head_dim, num_heads_group, num_tokens, dtype):
     # Set tolerance based on dtype - bfloat16 needs higher tolerance
     atol = 1e-2 if dtype == torch.float16 else 1e-1  # Higher tolerance for bfloat16
 
-    # breakpoint()
-    # Split output into q,k,v components based on head counts
-    q_size = num_heads_q * head_dim
-    k_size = num_heads_k * head_dim
-    num_heads_v * head_dim
-
-    q = output[2, :q_size]
-    k = output[2, q_size:q_size + k_size]
-    v = output[2, q_size + k_size:]
-
-    q_ref = ref_output[2, :q_size]
-    k_ref = ref_output[2, q_size:q_size + k_size]
-    v_ref = ref_output[2, q_size + k_size:]
-
-    q_orig = qkv_copy[2, :q_size]
-    k_orig = qkv_copy[2, q_size:q_size + k_size]
-    v_orig = qkv_copy[2, q_size + k_size:]
-
-    print("Query:", q)
-    print("Query Ref:", q_ref)
-    print("Query Orig:", q_orig)
-    print("Key:", k)
-    print("Key Ref:", k_ref)
-    print("Key Orig:", k_orig)
-    print("Value:", v)
-    print("Value Ref:", v_ref)
-    print("Value Orig:", v_orig)
-
     # Compare outputs from custom kernel vs reference implementation
     torch.testing.assert_close(
         output,
@@ -193,5 +163,3 @@ def test_fused_qk_norm_rope(head_dim, num_heads_group, num_tokens, dtype):
         msg=
         f"Failed with head_dim={head_dim}, num_heads=({num_heads_q},{num_heads_k},{num_heads_v}), num_tokens={num_tokens}, dtype={dtype}"
     )
-
-    print("Passed")

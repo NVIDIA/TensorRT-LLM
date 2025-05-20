@@ -79,7 +79,6 @@ __global__ void fusedQKNormRopeKernel(
     int i = 0;
 
     // Load vectorized elements
-#pragma unroll
     for (; i < numVecPerThread * 4; i += 4)
     {
         uint2 data;
@@ -101,7 +100,6 @@ __global__ void fusedQKNormRopeKernel(
         sumOfSquares += elements[i + 3] * elements[i + 3];
     }
     // Load remaining elements
-#pragma unroll
     for (; i < numElemsPerThread; i++)
     {
         elements[i] = __bfloat162float(qkv[offsetThread + i]);
@@ -144,7 +142,6 @@ __global__ void fusedQKNormRopeKernel(
     }
 
     // Store vectorized elements
-    #pragma unroll
     for (i = 0; i < numVecPerThread * 4; i += 4)
     {
         // Convert back to bfloat16 format
@@ -161,7 +158,6 @@ __global__ void fusedQKNormRopeKernel(
         *outputPtr = data;
     }
     // Store remaining elements
-    #pragma unroll
     for (; i < numElemsPerThread; i++)
     {
         qkv[offsetThread + i] = __float2bfloat16_rn(elements[i]);
