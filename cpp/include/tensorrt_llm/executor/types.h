@@ -502,8 +502,8 @@ enum class FinishReason
 //! \brief Enum describing the transfer mode for KV cache.
 enum class KvCacheTransferMode
 {
-    DRAM                 = 0, //!< Copy to/from CPU memory (original approach).
-    GDS                  = 1, //!< Attempt GPUDirect Storage (cuFile).
+    DRAM = 0,                 //!< Copy to/from CPU memory (original approach).
+    GDS = 1,                  //!< Attempt GPUDirect Storage (cuFile).
     POSIX_DEBUG_FALLBACK = 2, //!< Force a POSIX read/write for debugging.
 };
 

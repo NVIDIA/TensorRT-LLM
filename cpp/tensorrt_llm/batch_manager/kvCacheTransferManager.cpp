@@ -282,46 +282,6 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadBlock, BlockPtr cons
     std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::optional<std::string> directory)
 {
-    if (mPendingOffloads.find(offloadBlock->getBlockId()) == mPendingOffloads.end())
-    {
-        auto const srcPtr = computeBlockPointer(src, pools, poolIdx);
-        auto dstPtr = computeBlockPointer(dst, pools, poolIdx);
-        if (numTokensToCopy <= 0 || srcPtr->getDataType() == nvinfer1::DataType::kINT4
-            || srcPtr->getDataType() == nvinfer1::DataType::kFP4)
-        {
-            // numTokensToCopy <= 0 indicates entire block should be copied.
-            // Partial copy has not been implemented yet for data types INT4 and FP4
-            (isOffload ? mOffloadManager : mOnboardManager).copy(*srcPtr, *dstPtr);
-        }
-        else
-        {
-            int const tokensPerBlock = pools[poolIdx].tokensPerBlock;
-            if (numTokensToCopy >= tokensPerBlock)
-            {
-                (isOffload ? mOffloadManager : mOnboardManager).copy(*srcPtr, *dstPtr);
-            }
-            else
-            {
-                auto stream = (isOffload ? mOffloadManager : mOnboardManager).getStream().get();
-                int const numLayers = pools[poolIdx].numLayers;
-                int const kvFactor = pools[poolIdx].kvFactor;
-                int const numHeads = pools[poolIdx].numKvHeads;
-                int const sizePerHead = pools[poolIdx].sizePerHead;
-                auto shape = srcPtr->getShape();
-                TLLM_LOG_DEBUG("block.Shape = %s", srcPtr->toString(shape).c_str());
-                TLLM_CHECK_WITH_INFO(
-                    shape.nbDims == 4, "Expected KVCache block to have 4 dimensions, but it has %d", shape.nbDims);
-                TLLM_CHECK_WITH_INFO((shape.d[0] == 1) && (shape.d[1] == numLayers) && (shape.d[2] == kvFactor)
-                        && (shape.d[3] == numHeads * tokensPerBlock * sizePerHead),
-                    "Block shape is incorrect");
-                TLLM_CHECK_WITH_INFO(numTokensToCopy <= tokensPerBlock,
-                    "numTokensToCopy (%d) must be <= tokensPerBlock (%d)", numTokensToCopy, tokensPerBlock);
-                tk::kvCacheBlockPartialCopy(
-                    *dstPtr, *srcPtr, numLayers, numHeads, tokensPerBlock, sizePerHead, numTokensToCopy, stream);
-            }
-        }
-    }
-
     if (mPendingOffloads.find(offloadBlock->getBlockId()) != mPendingOffloads.end())
     {
         mOnboardManager.getStream().wait(mPendingOffloads[offloadBlock->getBlockId()]);
