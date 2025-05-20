@@ -4,7 +4,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
 from enum import Enum, EnumMeta
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
+from typing import (Any, ClassVar, Dict, List, Literal, Optional, TypeAlias,
+                    Union)
 
 import torch
 import yaml
@@ -282,13 +283,6 @@ class MTPDecodingConfig(DecodingBaseConfig):
         return cls(**data)
 
     decoding_type: ClassVar[str] = "MTP"
-
-
-SpeculativeConfig = (LookaheadDecodingConfig
-                     | MedusaDecodingConfig
-                     | EagleDecodingConfig
-                     | MTPDecodingConfig
-                     | NGramDecodingConfig)
 
 
 class PybindMirror(ABC):
@@ -920,7 +914,14 @@ class LlmArgs(BaseModel):
         default=None, description="Cache transceiver config.")
 
     # Speculative decoding parameters
-    speculative_config: Optional[SpeculativeConfig] = Field(
+    SpeculativeConfig: TypeAlias = Optional[Union[
+        LookaheadDecodingConfig,
+        MedusaDecodingConfig,
+        EagleDecodingConfig,
+        MTPDecodingConfig,
+        NGramDecodingConfig,
+    ]]
+    speculative_config: SpeculativeConfig = Field(
         default=None, description="Speculative decoding config.")
 
     batching_type: Optional[BatchingType] = Field(default=None,

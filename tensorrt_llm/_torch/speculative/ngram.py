@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from itertools import chain
 from typing import List
 
 from ordered_set import OrderedSet
@@ -89,8 +88,7 @@ class NGramPoolManager(BaseResourceManager):
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         # Update pool and provide draft tokens for the requests
-        for request in chain(scheduled_batch.context_requests,
-                             scheduled_batch.generation_requests):
+        for request in scheduled_batch.generation_requests:
             num_draft_tokens = 0 if request.py_last_draft_tokens is None else \
                 len(request.py_last_draft_tokens)
             num_accepted_tokens = getattr(request,
