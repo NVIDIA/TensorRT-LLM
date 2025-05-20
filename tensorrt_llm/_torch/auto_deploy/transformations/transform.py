@@ -155,7 +155,7 @@ class InferenceOptimizer:
         ############################################################################################
 
         # load weights
-        self.factory.load_or_random_init(egm, mmap=True, map_location=cm.device)
+        self.factory.load_or_random_init(egm, device=cm.device)
 
         # move remaining parts to device
         move_to_device(egm, cm.device)
