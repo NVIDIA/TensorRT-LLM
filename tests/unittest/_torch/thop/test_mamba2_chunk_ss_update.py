@@ -102,11 +102,12 @@ class TestFunctional(unittest.TestCase):
                 torch.cumsum(last_token_ids, dim=0, dtype=torch.int32)
             ],
                                    dim=0)
-            seq_idx = torch.cat([
-                i * torch.ones(s, dtype=torch.int32, device=device)
-                for i, s in enumerate(last_token_ids)
-            ],
-                                dim=0).unsqueeze(0)
+            seq_idx = torch.repeat_interleave(
+                torch.arange(len(last_token_ids),
+                             dtype=torch.int32,
+                             device=device),
+                last_token_ids,
+                output_size=cu_seqlens[-1]).unsqueeze(0)
             input_batch_size = 1
             input_seq_len = cu_seqlens[-1]
         else:
