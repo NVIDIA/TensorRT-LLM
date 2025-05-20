@@ -13,7 +13,7 @@ from .selective_state_update import selective_state_update
 from .ssd_combined import mamba_chunk_scan_combined
 
 
-class MambaMixer(nn.Module):
+class Mamba2Mixer(nn.Module):
 
     def __init__(
         self,
@@ -62,7 +62,6 @@ class MambaMixer(nn.Module):
         self.delta_rank = delta_rank
         self.delta_softplus = delta_softplus
         self.remove_padding = remove_padding
-        self.is_mamba2 = True
         self.apply_silu = apply_silu
 
         # tp

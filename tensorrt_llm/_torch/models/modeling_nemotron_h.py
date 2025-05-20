@@ -10,7 +10,7 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.mamba.mixer import MambaMixer
+from ..modules.mamba.mixer import Mamba2Mixer
 from ..modules.mlp import MLP
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
@@ -115,17 +115,17 @@ class NemotronHLayer(DecoderLayer):
         )
 
         if layer_type == "M":
-            self.mixer = MambaMixer(d_model=config.hidden_size,
-                                    d_state=config.ssm_state_size,
-                                    d_conv=config.conv_kernel,
-                                    expand=config.expand,
-                                    n_groups=config.n_groups,
-                                    head_dim=config.mamba_head_dim,
-                                    chunk_size=config.chunk_size,
-                                    layer_idx=layer_idx,
-                                    rms_norm_eps=config.rms_norm_eps,
-                                    dtype=config.torch_dtype,
-                                    config=model_config)
+            self.mixer = Mamba2Mixer(d_model=config.hidden_size,
+                                     d_state=config.ssm_state_size,
+                                     d_conv=config.conv_kernel,
+                                     expand=config.expand,
+                                     n_groups=config.n_groups,
+                                     head_dim=config.mamba_head_dim,
+                                     chunk_size=config.chunk_size,
+                                     layer_idx=layer_idx,
+                                     rms_norm_eps=config.rms_norm_eps,
+                                     dtype=config.torch_dtype,
+                                     config=model_config)
         elif layer_type == "-":
             self.mixer = MLPLayer(model_config, layer_idx)
         elif layer_type == "*":
