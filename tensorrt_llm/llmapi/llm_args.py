@@ -238,10 +238,19 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
 
 class NGramDecodingConfig(DecodingBaseConfig):
+    ''' A class used to enable ngram speculative decoding.
+    '''
+
+    # Number of draft tokens to generate
     prompt_lookup_num_tokens: int = 2
+    # Maximum size of ngram to match (number of tokens)
     max_matching_ngram_size: int = 4
+    # If True, all key-value pairs are kept,
+    # If False, only youngest (if is_use_oldest==False) or oldest is kept
     is_keep_all: bool = True
+    # Whether youngest or oldest key-value pair should be used (if multiple ngram matches exist)
     is_use_oldest: bool = True
+    # Whether a public pool for all requests or private pool for each request should be used
     is_public_pool: bool = True
 
     @classmethod
@@ -893,10 +902,15 @@ class LlmArgs(BaseModel):
         default=None, description="Cache transceiver config.")
 
     # Speculative decoding parameters
-    speculative_config: Optional[Union[
-        LookaheadDecodingConfig, MedusaDecodingConfig, EagleDecodingConfig,
-        MTPDecodingConfig, NGramDecodingConfig]] = Field(
-            default=None, description="Speculative decoding config.")
+    speculative_config: (
+        None
+        | LookaheadDecodingConfig
+        | MedusaDecodingConfig
+        | EagleDecodingConfig
+        | MTPDecodingConfig
+        | NGramDecodingConfig
+        ) = Field(
+        default=None, description="Speculative decoding config.")
 
     batching_type: Optional[BatchingType] = Field(default=None,
                                                   description="Batching type.")
