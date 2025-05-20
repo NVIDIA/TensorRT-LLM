@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import override
 
 import torch
 
@@ -49,7 +50,7 @@ class SampleState:
 
 class Sampler(ABC):
 
-    def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
+    def setup_sampler_step(self, scheduled_requests: ScheduledRequests) -> None:
         pass
 
     @abstractmethod
@@ -68,11 +69,13 @@ class EarlyStopSampler(Sampler):
     such as encoder-only model (e.g., BERT) or reward models that only need context phase.
     """
 
+    @override
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleState:
         return SampleState(scheduled_requests=scheduled_requests,
                            logits=model_outputs['logits'])
 
+    @override
     def update_requests(self, state: SampleState) -> None:
         scheduled_requests = state.scheduled_requests
         assert (not scheduled_requests.generation_requests)
@@ -228,6 +231,7 @@ class TorchSampler(Sampler):
 
         return False
 
+    @override
     def update_requests(self, state: SampleState) -> None:
         if state.sampler_event:
             state.sampler_event.synchronize()
@@ -386,6 +390,7 @@ class TorchSampler(Sampler):
             host=SampleStateTensors(new_tokens=new_tokens_host),
             sampler_event=sampler_event)
 
+    @override
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleState:
         if self.mixed_sampler:
@@ -396,8 +401,8 @@ class TorchSampler(Sampler):
 
 class TorchStarAttentionSampler(TorchSampler):
 
-    def update_one_request(self, request: LlmRequest,
-                           new_tokens_list: list[int], logits: torch.Tensor):
+    def _update_one_request(self, request: LlmRequest,
+                            new_tokens_list: list[int], logits: torch.Tensor):
         beam_idx = 0
 
         output_token_idx = request.output_token_idx
@@ -417,6 +422,7 @@ class TorchStarAttentionSampler(TorchSampler):
         if request.state != LlmRequestState.GENERATION_COMPLETE:
             request.py_decoding_iter += 1
 
+    @override
     def update_requests(self, state: SampleState):
         if state.sampler_event:
             state.sampler_event.synchronize()
@@ -425,10 +431,10 @@ class TorchStarAttentionSampler(TorchSampler):
 
         for request in state.scheduled_requests.context_requests:
             if request.state == LlmRequestState.GENERATION_IN_PROGRESS:
-                self.update_one_request(request, new_tokens_list, logits)
+                self._update_one_request(request, new_tokens_list, logits)
 
         for request in state.scheduled_requests.generation_requests:
-            self.update_one_request(request, new_tokens_list, logits)
+            self._update_one_request(request, new_tokens_list, logits)
 
 
 class Algorithms:
@@ -556,13 +562,14 @@ class TRTLLMSampler(Sampler):
         self.algs.make_decoding_batch_input_output = MakeDecodingBatchInputOutput(
         )
 
-    def setup_sampler_step(self, requests):
+    @override
+    def setup_sampler_step(self, scheduled_requests: ScheduledRequests) -> None:
         batch_slots, decoder_requests, sampling_configs = self.algs.generate_request_options(
             self.model_config, self.world_config, self.decoding_config,
-            requests, self.store["buffer_manager"], self.logits_datatype,
-            self.store["decoder_input_buffers"],
-            self.algs.decoder.decoder_state, self.beam_width,
-            self.store["cuda_stream"])
+            scheduled_requests.context_requests, self.store["buffer_manager"],
+            self.logits_datatype, self.store["decoder_input_buffers"],
+            self.algs.decoder.decoder_state,
+            self.beam_width(scheduled_requests), self.store["cuda_stream"])
 
         if len(decoder_requests):
             self.algs.create_new_decoder_requests(
@@ -583,6 +590,7 @@ class TRTLLMSampler(Sampler):
             return req.sampling_config.beam_width
         raise ValueError("No beam width found")
 
+    @override
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleStateTRTLLM:
         batch_size = scheduled_requests.batch_size
@@ -590,7 +598,7 @@ class TRTLLMSampler(Sampler):
 
         logits = model_outputs["logits"].reshape((batch_size, beam_width, -1))
 
-        self.setup_sampler_step(scheduled_requests.context_requests)
+        self.setup_sampler_step(scheduled_requests)
 
         # Note: In runtimeBuffers.cpp, num_context_logits is set to:
         #       numContextLogits.at(batchIdx) = modelConfig.computeContextLogits() ? contextChunkSize : 1;
@@ -654,6 +662,7 @@ class TRTLLMSampler(Sampler):
                                  host=host,
                                  sampler_event=sampler_event)
 
+    @override
     def update_requests(self, state: SampleStateTRTLLM):
         assert isinstance(state, SampleStateTRTLLM)
 
