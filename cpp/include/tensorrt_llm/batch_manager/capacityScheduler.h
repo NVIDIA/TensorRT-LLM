@@ -126,7 +126,7 @@ private:
     SizeType32 mMaxNumRequests;
 };
 
-/// @brief Schedule requests using the Prefill_First policy
+/// @brief Schedule requests using the PREFILL_FIRST policy
 class PrefillFirstScheduler : public BaseCapacityScheduler
 {
 public:

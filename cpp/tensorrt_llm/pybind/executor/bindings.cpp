@@ -90,7 +90,8 @@ void initBindings(pybind11::module_& m)
     py::enum_<tle::CapacitySchedulerPolicy>(m, "CapacitySchedulerPolicy")
         .value("MAX_UTILIZATION", tle::CapacitySchedulerPolicy::kMAX_UTILIZATION)
         .value("GUARANTEED_NO_EVICT", tle::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT)
-        .value("STATIC_BATCH", tle::CapacitySchedulerPolicy::kSTATIC_BATCH);
+        .value("STATIC_BATCH", tle::CapacitySchedulerPolicy::kSTATIC_BATCH)
+        .value("PREFILL_FIRST", tle::CapacitySchedulerPolicy::kPREFILL_FIRST);
 
     py::enum_<tle::ContextChunkingPolicy>(m, "ContextChunkingPolicy")
         .value("EQUAL_PROGRESS", tle::ContextChunkingPolicy::kEQUAL_PROGRESS)
