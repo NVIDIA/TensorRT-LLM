@@ -1,56 +1,11 @@
 # Copyright (c) 2024, Tri Dao.
 # causal_conv1d_update, adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
-# causal_conv1d_varlen_states, adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_varlen.py
 
 from typing import Optional
 
 import torch
 
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
-
-
-def causal_conv1d_fwd(xBC: torch.Tensor, conv1d_weight: torch.Tensor,
-                      conv1d_bias: torch.Tensor) -> torch.Tensor:
-
-    slot_mapping = None
-    remove_padding = True
-    apply_silu = True
-    is_paged_state = False
-
-    conv_dim = conv1d_weight.shape[0]
-    d_conv = conv1d_weight.shape[1]
-    seq_len = [xBC.shape[2]]
-
-    host_context_lengths = torch.as_tensor(seq_len, dtype=torch.int32).cuda()
-    host_request_types = torch.zeros_like(host_context_lengths).cuda()
-    last_token_ids = torch.cumsum(host_context_lengths,
-                                  dim=0,
-                                  dtype=torch.int32).cuda()
-
-    conv_states_in = torch.zeros(1, d_conv - 1, conv_dim).cuda()
-
-    y_new, _ = torch.ops.trtllm.mamba_conv1d(
-        # xBC is [S, dim]
-        xBC.squeeze(0).permute(1, 0).contiguous(),
-        # conv_weight is [1, d_conv, dim]
-        conv1d_weight.unsqueeze(0).permute(0, 2, 1).contiguous(),
-        conv1d_bias,
-        conv_states_in,
-        host_request_types,
-        last_token_ids,
-        host_context_lengths,
-        slot_mapping,
-        conv_dim,
-        d_conv,
-        0,
-        0,
-        remove_padding,
-        apply_silu,
-        is_paged_state,
-    )
-
-    y_new = y_new.unsqueeze(0).permute(0, 2, 1).contiguous()
-    return y_new
 
 
 def causal_conv1d_fn(x: torch.Tensor,
