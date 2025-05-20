@@ -461,7 +461,7 @@ class MambaCacheManager(BaseResourceManager):
     def __init__(self, d_model: int, d_state: int, d_conv: int, expand: int,
                  n_groups: int, head_dim: int, num_layers: int,
                  max_batch_size: int, mapping: Mapping,
-                 conv1d_state_dtype: torch.dtype) -> None:
+                 dtype: torch.dtype) -> None:
 
         # get tp size
         tp_size = mapping.tp_size
@@ -488,9 +488,9 @@ class MambaCacheManager(BaseResourceManager):
                 num_layers,
                 max_batch_size,
                 conv_dim,
-                d_conv,
+                d_conv - 1,
             ],
-            dtype=conv1d_state_dtype,
+            dtype=dtype,
             device=device,
         )
 
@@ -503,7 +503,7 @@ class MambaCacheManager(BaseResourceManager):
                 d_state,
                 head_dim,
             ],
-            dtype=torch.float32,
+            dtype=dtype,
             device=device,
         )
 
@@ -571,7 +571,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         mamba_n_groups: int,
         mamba_head_dim: int,
         mamba_num_layers: int,
-        mamba_conv1d_state_dtype: torch.dtype,
+        mamba_cache_dtype: torch.dtype,
         # kv cache parameters
         kv_cache_config: KvCacheConfigCpp,
         kv_cache_type: CacheTypeCpp,
@@ -598,8 +598,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         MambaCacheManager.__init__(self, mamba_d_model, mamba_d_state,
                                    mamba_d_conv, mamba_expand, mamba_n_groups,
                                    mamba_head_dim, mamba_num_layers,
-                                   max_batch_size, mapping,
-                                   mamba_conv1d_state_dtype)
+                                   max_batch_size, mapping, mamba_cache_dtype)
 
         # initialize kv cache manager
         KVCacheManager.__init__(self,

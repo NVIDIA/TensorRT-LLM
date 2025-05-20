@@ -7,10 +7,10 @@ from torch import nn
 from ...attention_backend import AttentionMetadata
 from ...model_config import ModelConfig
 from ..linear import Linear, TensorParallelMode
-from .causal_conv1d import causal_conv1d_update, causal_conv1d_varlen_states
+from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .selective_state_update import selective_state_update
-from .ssd_combined import mamba_split_conv1d_scan_combined
+from .ssd_combined import mamba_chunk_scan_combined
 
 
 class MambaMixer(nn.Module):
@@ -213,41 +213,59 @@ class MambaMixer(nn.Module):
                     dim=0,
                 ).to(torch.int32).to(torch.device("cuda")))
 
-                conv_states_out = causal_conv1d_varlen_states(
-                    xbc, cu_seqlens, state_len=self.d_conv)
+                seq_idx = torch.repeat_interleave(
+                    torch.arange(len(split_seq_lens[req_type]),
+                                 dtype=torch.int32,
+                                 device=cu_seqlens.device),
+                    cu_seqlens.diff(),
+                    output_size=cu_seqlens[-1]).unsqueeze(0)
+
+                conv_states_out = torch.empty_like(
+                    conv_states[indices, ...]) if not is_warmup else None
+                xbc = causal_conv1d_fn(
+                    xbc.transpose(0, 1),
+                    self.conv1d.weight.permute(0, 1).contiguous(),
+                    self.conv1d.bias,
+                    activation="silu",
+                    conv_states=conv_states_out,
+                    query_start_loc=cu_seqlens).transpose(0, 1)
 
                 if not is_warmup:
                     conv_states.index_copy_(0, indices, conv_states_out)
 
-                # Temporary fix to make mamba layer close to original implementation
-                ctx_seq_lens = split_seq_lens[req_type].tolist()
-                ctx_zxbcdt = torch.split(split_zxbcdt[req_type],
-                                         ctx_seq_lens,
-                                         dim=0)
-                split_y = []
-                split_ssm_states = []
-                for i in range(len(ctx_zxbcdt)):
-                    y, ssm_states_out = mamba_split_conv1d_scan_combined(
-                        ctx_zxbcdt[i].unsqueeze(0),
-                        self.conv1d.weight.permute(0, 1).contiguous(),
-                        self.conv1d.bias,
-                        self.dt_bias,
-                        self.A,
-                        D=self.D,
-                        chunk_size=self.chunk_size,
-                        activation="silu",
-                        headdim=self.head_dim,
-                        ngroups=self.tp_ngroups,
-                        norm_before_gate=False,
-                        initial_states=None,
-                        return_final_states=True,
-                    )
+                x, B, C = torch.split(xbc.unsqueeze(0), [
+                    self.tp_d_inner,
+                    self.tp_ngroups * self.d_state,
+                    self.tp_ngroups * self.d_state,
+                ],
+                                      dim=-1)
 
-                    split_y.append(y.squeeze(0))
-                    split_ssm_states.append(ssm_states_out)
+                x = rearrange(x, "b l (h p) -> b l h p", h=self.tp_nheads)
+                dt = dt.unsqueeze(0)
+                B = rearrange(B, "b l (g n) -> b l g n", g=self.tp_ngroups)
+                C = rearrange(C, "b l (g n) -> b l g n", g=self.tp_ngroups)
+                z = rearrange(z.unsqueeze(0),
+                              "b l (h p) -> b l h p",
+                              h=self.tp_nheads)
 
-                y = torch.cat(split_y, dim=0)
-                ssm_states_out = torch.cat(split_ssm_states, dim=0)
+                y, ssm_states_out = mamba_chunk_scan_combined(
+                    x,
+                    dt,
+                    self.A,
+                    B,
+                    C,
+                    chunk_size=self.chunk_size,
+                    D=self.D,
+                    z=z,
+                    dt_bias=self.dt_bias,
+                    initial_states=None,
+                    dt_softplus=self.delta_softplus,
+                    cu_seqlens=cu_seqlens,
+                    seq_idx=seq_idx,
+                    return_varlen_states=True,
+                    return_final_states=False,
+                )
+                y = rearrange(y, "b l h p -> (b l) (h p)")
 
                 # norm
                 y = self.norm(y)
