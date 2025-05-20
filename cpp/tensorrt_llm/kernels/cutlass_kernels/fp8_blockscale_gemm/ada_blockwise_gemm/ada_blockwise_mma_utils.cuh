@@ -31,11 +31,11 @@
  **************************************************************************************************/
 
 #pragma once
-#include <cutlass/arch/mma.h>
-#include <cute/layout.hpp>
 #include "cute/atom/mma_atom.hpp"
 #include <cute/arch/mma.hpp>
 #include <cute/config.hpp>
+#include <cute/layout.hpp>
+#include <cutlass/arch/mma.h>
 
 // Config
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890))
@@ -53,22 +53,19 @@ struct SM89_16x8x32_F32F8F8F32_TN
     using BRegisters = uint32_t[2];
     using CRegisters = float[4];
 
-    CUTE_HOST_DEVICE static void fma(float& d0, float& d1, float& d2, float& d3,
-                                     uint32_t const& a0, uint32_t const& a1,
-                                     uint32_t const& a2, uint32_t const& a3,
-                                     uint32_t const& b0, uint32_t const& b1,
-                                     float const& c0, float const& c1,
-                                     float const& c2, float const& c3)
+    CUTE_HOST_DEVICE static void fma(float& d0, float& d1, float& d2, float& d3, uint32_t const& a0, uint32_t const& a1,
+        uint32_t const& a2, uint32_t const& a3, uint32_t const& b0, uint32_t const& b1, float const& c0,
+        float const& c1, float const& c2, float const& c3)
     {
 #if defined(CUTE_ARCH_MMA_F32_SM89_ENABLED)
-        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-                     "{%0,  %1,  %2,  %3},"
-                     "{%4,  %5,  %6,  %7},"
-                     "{%8,  %9},"
-                     "{%10, %11, %12, %13};\n"
-                     : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-                     : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
-                       "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+            "{%0,  %1,  %2,  %3},"
+            "{%4,  %5,  %6,  %7},"
+            "{%8,  %9},"
+            "{%10, %11, %12, %13};\n"
+            : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(c0), "f"(c1), "f"(c2), "f"(c3));
 #else
         CUTE_INVALID_CONTROL_PATH(
             "Attempting to use SM89_16x8x32_F32F8F8F32_TN without "
@@ -85,12 +82,10 @@ struct MMA_Traits<SM89_16x8x32_F32F8F8F32_TN>
     using ValTypeB = float_e4m3_t;
     using ValTypeC = float;
 
-    using Shape_MNK = Shape<_16,_8,_32>;
-    using ThrID   = Layout<_32>;
-    using ALayout = Layout<Shape <Shape < _4,_8>,Shape < _4,_2,  _2>>,
-                           Stride<Stride<_64,_1>,Stride<_16,_8,_256>>>;
-    using BLayout = Layout<Shape <Shape < _4,_8>, Shape <_4,  _2>>,
-                           Stride<Stride<_32,_1>, Stride<_8,_128>>>;
+    using Shape_MNK = Shape<_16, _8, _32>;
+    using ThrID = Layout<_32>;
+    using ALayout = Layout<Shape<Shape<_4, _8>, Shape<_4, _2, _2>>, Stride<Stride<_64, _1>, Stride<_16, _8, _256>>>;
+    using BLayout = Layout<Shape<Shape<_4, _8>, Shape<_4, _2>>, Stride<Stride<_32, _1>, Stride<_8, _128>>>;
     using CLayout = SM80_16x8_Row;
 };
 
@@ -122,7 +117,7 @@ struct DefaultGemm_TensorOp_MMA<cute::float_e4m3_t, cutlass::arch::Sm89>
     using TiledMma = cute::TiledMMA<MMA_Atom_Arch, ThreadLayoutMNK, ValLayoutMNK>;
 };
 
-// kTileM = 16 
+// kTileM = 16
 // template <>
 // struct DefaultGemm_TensorOp_MMA<cute::bfloat16_t, cutlass::arch::Sm80>
 // {

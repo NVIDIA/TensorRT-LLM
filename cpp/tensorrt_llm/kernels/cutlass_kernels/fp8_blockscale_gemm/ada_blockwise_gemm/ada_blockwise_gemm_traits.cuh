@@ -33,21 +33,18 @@ using namespace cutlass::gemm;
 namespace ada_blockwise_gemm
 {
 
-template <typename ElementType, typename OutElementType,
-          typename AccumElementType, typename BlockScaleElementType, int Stages_,
-          int TileM_, int TileN_, int TileK_>
+template <typename ElementType, typename OutElementType, typename AccumElementType, typename BlockScaleElementType,
+    int Stages_, int TileM_, int TileN_, int TileK_>
 struct AdaBlockwiseGemmTraits
 {
     using ElementA = ElementType;
     using LayoutA = cutlass::layout::RowMajor;
-    static constexpr int AlignmentA =
-        128 / cutlass::sizeof_bits<ElementA>::value;
+    static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
 
     using ElementB = ElementType;
     using LayoutB = cutlass::layout::ColumnMajor;
-    static constexpr int AlignmentB =
-        128 / cutlass::sizeof_bits<ElementB>::value;
-        
+    static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+
     using ElementAccum = AccumElementType;
     using ElementBlockScale = BlockScaleElementType;
     using ElementOutput = OutElementType;
@@ -76,14 +73,14 @@ struct AdaBlockwiseGemmTraits
 
     static_assert(ScaleKsPerTile >= 1, "ScaleKsPerTile must be greater than or equal to 1");
 
-    using ScaleGranularity =
-        cute::Shape<cute::Int<ScaleGranularityM>, cute::Int<ScaleGranularityN>, cute::Int<ScaleGranularityK>>;
-    using ScalePerTileShape =
-        cute::Shape<cute::Int<ScaleMsPerTile>, cute::Int<ScaleNsPerTile>, cute::Int<ScaleKsPerTile>>; 
+    using ScaleGranularity
+        = cute::Shape<cute::Int<ScaleGranularityM>, cute::Int<ScaleGranularityN>, cute::Int<ScaleGranularityK>>;
+    using ScalePerTileShape
+        = cute::Shape<cute::Int<ScaleMsPerTile>, cute::Int<ScaleNsPerTile>, cute::Int<ScaleKsPerTile>>;
 
     // MMA atom arch and layout
     using TiledMma = DefaultGemm_TensorOp_MMA<cute::float_e4m3_t, cutlass::arch::Sm89>::TiledMma;
-    
+
     static constexpr int kBlockKSmem = 128;
     // A memory copy operand
     using DefaultOperandA
@@ -110,15 +107,15 @@ struct AdaBlockwiseGemmTraits
     using GmemTiledCopyScaleB = typename CopyTraitsScaleB::GmemTiledCopyScale;
 
     // Output memory copy operand
-    using SmemLayoutAtomO = decltype(cute::composition(
-        cute::Swizzle<3,3,3>{},
-        cute::Layout<cute::Shape <cute::_8,cute::Shape <cute::_8, cute::_8>>,
-               cute::Stride<cute::_8,cute::Stride<cute::_1,cute::_64>>>{}));  
+    using SmemLayoutAtomO = decltype(cute::composition(cute::Swizzle<3, 3, 3>{},
+        cute::Layout<cute::Shape<cute::_8, cute::Shape<cute::_8, cute::_8>>,
+            cute::Stride<cute::_8, cute::Stride<cute::_1, cute::_64>>>{}));
 
     using SmemCopyAtomR2S = cute::Copy_Atom<cute::AutoVectorizingCopy, ElementOutput>;
     using SmemCopyAtomS2R = cute::Copy_Atom<cute::UniversalCopy<cute::uint128_t>, ElementOutput>;
     using GmemCopyAtomR2G = cute::Copy_Atom<cute::UniversalCopy<cute::uint128_t>, ElementOutput>;
-    using SmemThrLayoutS2R = cute::Layout<cute::Shape<cute::Int<8>, cute::Int<16>>, cute::Stride<cute::Int<16>, cute::_1>>;
+    using SmemThrLayoutS2R
+        = cute::Layout<cute::Shape<cute::Int<8>, cute::Int<16>>, cute::Stride<cute::Int<16>, cute::_1>>;
     using SmemValLayoutS2R = cute::Layout<cute::Shape<cute::Int<1>, cute::Int<8>>>;
     using SmemTiledCopyS2R = decltype(cute::make_tiled_copy(SmemCopyAtomS2R{}, SmemThrLayoutS2R{}, SmemValLayoutS2R{}));
 
@@ -139,11 +136,11 @@ struct AdaBlockwiseGemmTraits
         SmemLayoutAtomO{}, cute::make_shape(cute::shape<0>(TileShape{}), cute::shape<1>(TileShape{})))); // BLK_M, BLK_N
 
     using SmemLayoutScaleA = decltype(cute::tile_to_shape(SmemLayoutAtomScaleA{},
-        cute::make_shape(
-            cute::shape<0>(ScalePerTileShape{}), cute::shape<2>(ScalePerTileShape{}), cute::Int<Stages>{}))); // BLK_M, BLK_K, Stages
+        cute::make_shape(cute::shape<0>(ScalePerTileShape{}), cute::shape<2>(ScalePerTileShape{}),
+            cute::Int<Stages>{}))); // BLK_M, BLK_K, Stages
     using SmemLayoutScaleB = decltype(cute::tile_to_shape(SmemLayoutAtomScaleB{},
-        cute::make_shape(
-            cute::shape<1>(ScalePerTileShape{}), cute::shape<2>(ScalePerTileShape{}), cute::Int<Stages>{}))); // BLK_N, BLK_K, Stages
+        cute::make_shape(cute::shape<1>(ScalePerTileShape{}), cute::shape<2>(ScalePerTileShape{}),
+            cute::Int<Stages>{}))); // BLK_N, BLK_K, Stages
 
     // we need at least 2 stages..
     static_assert(Stages >= 2);
@@ -170,14 +167,14 @@ struct AdaBlockwiseGemmTraits
 
         Params() {}
 
-        Params(GemmCoord problem_size_, ElementA const* ptr_a_,
-               ElementB const* ptr_b_, 
-               ElementOutput* ptr_output_,
-               BlockScaleElementType const* ptr_scale_a_,
-               BlockScaleElementType const* ptr_scale_b_)
-            : problem_size(problem_size_), ptr_a(ptr_a_), ptr_b(ptr_b_),
-               ptr_output(ptr_output_),
-              ptr_scale_a(ptr_scale_a_), ptr_scale_b(ptr_scale_b_)
+        Params(GemmCoord problem_size_, ElementA const* ptr_a_, ElementB const* ptr_b_, ElementOutput* ptr_output_,
+            BlockScaleElementType const* ptr_scale_a_, BlockScaleElementType const* ptr_scale_b_)
+            : problem_size(problem_size_)
+            , ptr_a(ptr_a_)
+            , ptr_b(ptr_b_)
+            , ptr_output(ptr_output_)
+            , ptr_scale_a(ptr_scale_a_)
+            , ptr_scale_b(ptr_scale_b_)
         {
         }
     };
@@ -191,12 +188,14 @@ struct AdaBlockwiseGemmTraits
         float const* ptr_scale_a;
         float const* ptr_scale_b;
 
-        Arguments(GemmCoord problem_size_, void const* ptr_a_,
-                  void const* ptr_b_,  void* ptr_d_,
-                  float const* ptr_scale_a_, float const* ptr_scale_b_)
-            : problem_size(problem_size_), ptr_a(ptr_a_), ptr_b(ptr_b_),
-              ptr_d(ptr_d_), ptr_scale_a(ptr_scale_a_),
-              ptr_scale_b(ptr_scale_b_)
+        Arguments(GemmCoord problem_size_, void const* ptr_a_, void const* ptr_b_, void* ptr_d_,
+            float const* ptr_scale_a_, float const* ptr_scale_b_)
+            : problem_size(problem_size_)
+            , ptr_a(ptr_a_)
+            , ptr_b(ptr_b_)
+            , ptr_d(ptr_d_)
+            , ptr_scale_a(ptr_scale_a_)
+            , ptr_scale_b(ptr_scale_b_)
         {
         }
     };
@@ -206,13 +205,10 @@ struct AdaBlockwiseGemmTraits
         auto ptr_a = reinterpret_cast<ElementA const*>(args.ptr_a);
         auto ptr_b = reinterpret_cast<ElementB const*>(args.ptr_b);
         auto ptr_d = reinterpret_cast<ElementOutput*>(args.ptr_d);
-        auto ptr_scale_a =
-            reinterpret_cast<ElementBlockScale const*>(args.ptr_scale_a);
-        auto ptr_scale_b =
-            reinterpret_cast<ElementBlockScale const*>(args.ptr_scale_b);
+        auto ptr_scale_a = reinterpret_cast<ElementBlockScale const*>(args.ptr_scale_a);
+        auto ptr_scale_b = reinterpret_cast<ElementBlockScale const*>(args.ptr_scale_b);
 
-        Params params(args.problem_size, ptr_a, ptr_b, ptr_d,
-                      ptr_scale_a, ptr_scale_b);
+        Params params(args.problem_size, ptr_a, ptr_b, ptr_d, ptr_scale_a, ptr_scale_b);
 
         return params;
     }

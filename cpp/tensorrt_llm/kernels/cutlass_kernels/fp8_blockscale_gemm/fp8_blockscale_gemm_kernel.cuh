@@ -27,12 +27,12 @@
 #include <string>
 #include <vector>
 
+#include "ada_blockwise_gemm/ada_blockwise_gemm.cuh"
 #include "fp8_blockscale_mma_utils.cuh"
 #include "fp8_blockscale_tma_utils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/deep_gemm/fp8_gemm.cuh"
-#include "ada_blockwise_gemm/ada_blockwise_gemm.cuh"
 
 namespace kernel_utils
 {
@@ -1652,22 +1652,20 @@ void gemm_dispatch_sm89(void* mat_a, void* mat_b, void* mat_d, float* scales_a, 
     using ElementBlockScale = float;
     static constexpr int Stages = 4;
     using TileShape = cutlass::gemm::GemmShape<32, 128, 128>; // only support 32x128x128 for now
-    using KT = ada_blockwise_gemm::AdaBlockwiseGemmTraits<
-        ElementInput, ElementOutput, ElementAccum, ElementBlockScale, Stages,
-        TileShape::kM, TileShape::kN, TileShape::kK>;
+    using KT = ada_blockwise_gemm::AdaBlockwiseGemmTraits<ElementInput, ElementOutput, ElementAccum, ElementBlockScale,
+        Stages, TileShape::kM, TileShape::kN, TileShape::kK>;
     using Gemm = ada_blockwise_gemm::AdaBlockwiseGemm<KT>;
 
     int gemm_m = shape_m;
     int gemm_n = shape_n;
-    int gemm_k = shape_k;   
-    typename KT::Arguments args({gemm_m, gemm_n, gemm_k}, mat_a, mat_b, mat_d, scales_a,
-                       scales_b);
+    int gemm_k = shape_k;
+    typename KT::Arguments args({gemm_m, gemm_n, gemm_k}, mat_a, mat_b, mat_d, scales_a, scales_b);
 
     Gemm gemm{};
 
     auto status = gemm.can_implement(args);
-    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess,
-        "This kernel is not supported. Last CUDA error is: %s", cutlassGetStatusString(status));
+    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "This kernel is not supported. Last CUDA error is: %s",
+        cutlassGetStatusString(status));
 
     status = gemm.initialize(args);
     TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess,
@@ -1676,7 +1674,6 @@ void gemm_dispatch_sm89(void* mat_a, void* mat_b, void* mat_d, float* scales_a, 
     status = gemm.run(stream);
     TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess,
         "Failed to run the CUTLASS kernel. Last CUDA error is: %s", cutlassGetStatusString(status));
-
 }
 
 void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b, __nv_bfloat16* mat_d, int ld_d,

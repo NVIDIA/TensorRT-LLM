@@ -25,7 +25,10 @@
 
 #include "ada_blockwise_gemm_kernel.cuh"
 
-#define CUTLASS_HOST_TRACE(x) { std::cout << __FILE__ << ":" << __LINE__ << "  " << x << std::endl; }
+#define CUTLASS_HOST_TRACE(x)                                                                                          \
+    {                                                                                                                  \
+        std::cout << __FILE__ << ":" << __LINE__ << "  " << x << std::endl;                                            \
+    }
 
 namespace ada_blockwise_gemm
 {
@@ -36,9 +39,8 @@ CUTLASS_GLOBAL void run_global(typename GemmKernel::Params params)
     // Dynamic shared memory base pointer
     extern __shared__ int SharedStorageBase[];
     // Declare pointer to dynamic shared memory.
-    typename GemmKernel::SharedStorage* shared_storage =
-        reinterpret_cast<typename GemmKernel::SharedStorage*>(
-            SharedStorageBase);
+    typename GemmKernel::SharedStorage* shared_storage
+        = reinterpret_cast<typename GemmKernel::SharedStorage*>(SharedStorageBase);
 
     GemmKernel::invoke(params, *shared_storage);
 }
@@ -57,7 +59,10 @@ struct AdaBlockwiseGemm
     /// Kernel parameters object
     typename GemmKernel::Params params_;
 
-    AdaBlockwiseGemm() : params_() {}
+    AdaBlockwiseGemm()
+        : params_()
+    {
+    }
 
     using Arguments = typename GemmKernel::Arguments;
 
@@ -72,24 +77,21 @@ struct AdaBlockwiseGemm
         cudaError_t result;
         if (kSmemSize > (48 << 10))
         {
-            result = cudaFuncSetAttribute(
-                run_global<GemmKernel>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize);
+            result
+                = cudaFuncSetAttribute(run_global<GemmKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize);
 
             if (result != cudaSuccess)
             {
                 // Call cudaGetLastError() to clear the error bit
                 result = cudaGetLastError();
-                CUTLASS_HOST_TRACE("  cudaFuncSetAttribute() returned error "
-                                   << cudaGetErrorString(result));
+                CUTLASS_HOST_TRACE("  cudaFuncSetAttribute() returned error " << cudaGetErrorString(result));
                 return -1;
             }
         }
 
         int max_active_blocks = -1;
         result = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &max_active_blocks, run_global<GemmKernel>, kThreadCount,
-            kSmemSize);
+            &max_active_blocks, run_global<GemmKernel>, kThreadCount, kSmemSize);
 
         if (result != cudaSuccess)
         {
@@ -110,20 +112,17 @@ struct AdaBlockwiseGemm
     {
         if (kSmemSize > (48 << 10))
         {
-            cudaError_t result = cudaFuncSetAttribute(
-                run_global<GemmKernel>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize);
+            cudaError_t result
+                = cudaFuncSetAttribute(run_global<GemmKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize);
 
             if (result != cudaSuccess)
             {
                 // Call cudaGetLastError() to clear the error bit
                 result = cudaGetLastError();
-                CUTLASS_HOST_TRACE("  cudaFuncSetAttribute() returned error "
-                                   << cudaGetErrorString(result));
+                CUTLASS_HOST_TRACE("  cudaFuncSetAttribute() returned error " << cudaGetErrorString(result));
                 return Status::kInvalid;
             }
         }
-
 
         if (args.problem_size.n() % KT::kTileN != 0)
         {
@@ -140,8 +139,7 @@ struct AdaBlockwiseGemm
         return Status::kSuccess;
     }
 
-    Status initialize(Arguments const& args, void* workspace = nullptr,
-                      cudaStream_t stream = nullptr)
+    Status initialize(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr)
     {
 
         params_ = GemmKernel::to_underlying_arguments(args);
@@ -164,8 +162,7 @@ struct AdaBlockwiseGemm
         cudaError_t result = cudaGetLastError();
         if (result != cudaSuccess)
         {
-            CUTLASS_HOST_TRACE("  grid launch failed with error "
-                               << cudaGetErrorString(result));
+            CUTLASS_HOST_TRACE("  grid launch failed with error " << cudaGetErrorString(result));
             return Status::kErrorInternal;
         }
 
