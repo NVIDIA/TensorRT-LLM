@@ -13,11 +13,14 @@ BASE_ZMQ_CLASSES = {
     "collections": ["OrderedDict"],
     "datetime": ["timedelta"],
     "pathlib": ["PosixPath"],
+    "llmapi.run_llm_with_postproc": ["perform_faked_oai_postprocess"
+                                     ],  # only used in tests
     ### starting import of torch models classes. They are used in test_llm_multi_gpu.py.
     "tensorrt_llm._torch.models.modeling_bert":
     ["BertForSequenceClassification"],
     "tensorrt_llm._torch.models.modeling_clip": ["CLIPVisionModel"],
     "tensorrt_llm._torch.models.modeling_deepseekv3": ["DeepseekV3ForCausalLM"],
+    "tensorrt_llm._torch.models.modeling_gemma3": ["Gemma3ForCausalLM"],
     "tensorrt_llm._torch.models.modeling_llama": [
         "Eagle3LlamaForCausalLM",
         "LlamaForCausalLM",
@@ -70,7 +73,6 @@ BASE_ZMQ_CLASSES = {
     ],
     "tensorrt_llm.executor.utils": ["ErrorResponse", "WorkerCommIpcAddrs"],
     "tensorrt_llm.executor.worker": ["ExecutorBindingsWorker", "worker_main"],
-    "tensorrt_llm.llmapi._perf_evaluator": ["perform_faked_oai_postprocess"],
     "tensorrt_llm.llmapi.llm_args": [
         "_ModelFormatKind", "_ParallelConfig", "CalibConfig",
         "CapacitySchedulerPolicy", "KvCacheConfig", "LlmArgs",
@@ -92,9 +94,6 @@ BASE_ZMQ_CLASSES = {
         "completion_response_post_processor", "CompletionPostprocArgs",
         "ChatPostprocArgs"
     ],
-    # There are 23 model classes need to be included with the similar module pattern , so use wildcards instead.
-    # They are used in test_llm_multi_gpu.py.
-    "tensorrt_llm._torch.models.": ["*"],
     "torch._utils": ["_rebuild_tensor_v2"],
     "torch.storage": ["_load_from_bytes"],
 }
@@ -122,18 +121,13 @@ class Unpickler(pickle.Unpickler):
 
     # only import approved classes, this is the security boundary.
     def find_class(self, module, name):
-        if not self._class_in_approved_list(module, name):
+        if name not in self.approved_imports.get(module, []):
             # If this is triggered when it shouldn't be, then the module
             # and class should be added to the approved_imports. If the class
             # is being used as part of a routine scenario, then it should be added
             # to the appropriate base classes above.
             raise ValueError(f"Import {module} | {name} is not allowed")
         return super().find_class(module, name)
-
-    def _class_in_approved_list(self, module, name):
-        if module.startswith("tensorrt_llm._torch.models."):
-            return True
-        return name in BASE_ZMQ_CLASSES.get(module, [])
 
 
 # these are taken from the pickle module to allow for this to be a drop in replacement
