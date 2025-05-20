@@ -153,21 +153,22 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
             [](CreateNewDecoderRequests& self, tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
                 executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
                 tr::BufferManager const& bufferManager, nvinfer1::DataType logitsType,
-                DecoderInputBuffers& inputBuffers, runtime::GptDecoderBatched& decoder,
-                tensorrt_llm::runtime::CudaStream const& runtimeStream, SizeType32 maxSequenceLength,
+                DecoderInputBuffers& inputBuffers, runtime::decoder::DecoderState& decoderState,
+                tensorrt_llm::runtime::CudaStream const& runtimeStream,
+                tensorrt_llm::runtime::CudaStream const& decoderStream, SizeType32 maxSequenceLength,
                 SizeType32 beamWidth, OptionalRef<MedusaBuffers const> medusaBuffers = std::nullopt)
             {
-                auto [batchSlots, decoderRequests, samplingConfigs]
-                    = self(modelConfig, worldConfig, decodingConfig, contextRequests, bufferManager, logitsType,
-                        inputBuffers, decoder, runtimeStream, maxSequenceLength, beamWidth, medusaBuffers);
+                auto [batchSlots, decoderRequests, samplingConfigs] = self(modelConfig, worldConfig, decodingConfig,
+                    contextRequests, bufferManager, logitsType, inputBuffers, decoderState, runtimeStream,
+                    decoderStream, maxSequenceLength, beamWidth, medusaBuffers);
 
                 return std::tuple{
                     runtime::Torch::tensor(batchSlots), std::move(decoderRequests), std::move(samplingConfigs)};
             },
             py::arg("model_config"), py::arg("world_config"), py::arg("decoding_config"), py::arg("context_requests"),
-            py::arg("buffer_manager"), py::arg("logits_type"), py::arg("decoder_input_buffers"), py::arg("decoder"),
-            py::arg("runtime_stream"), py::arg("max_sequence_length"), py::arg("beam_width"),
-            py::arg("medusa_buffers") = std::nullopt)
+            py::arg("buffer_manager"), py::arg("logits_type"), py::arg("decoder_input_buffers"),
+            py::arg("decoder_state"), py::arg("runtime_stream"), py::arg("decoder_stream"),
+            py::arg("max_sequence_length"), py::arg("beam_width"), py::arg("medusa_buffers") = std::nullopt)
         .def("name", [](CreateNewDecoderRequests const&) { return CreateNewDecoderRequests::name; });
 
     py::class_<UpdateDecoderBuffers>(m, UpdateDecoderBuffers::name)

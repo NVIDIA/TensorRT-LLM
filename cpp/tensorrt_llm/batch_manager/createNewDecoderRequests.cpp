@@ -126,14 +126,11 @@ std::tuple<TensorPtr, std::vector<runtime::decoder_batch::Request>, std::vector<
 CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
     executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
     runtime::BufferManager const& bufferManager, nvinfer1::DataType logitsType, DecoderInputBuffers& inputBuffers,
-    GptDecoderBatched& decoder, CudaStream const& runtimeStream, SizeType32 maxSequenceLength, SizeType32 beamWidth,
-    OptionalRef<MedusaBuffers const> medusaBuffers) const
+    runtime::decoder::DecoderState& decoderState, CudaStream const& runtimeStream, CudaStream const& decoderStream,
+    SizeType32 maxSequenceLength, SizeType32 beamWidth, OptionalRef<MedusaBuffers const> medusaBuffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(CreateNewDecoderRequests);
-
-    auto const& decoderStream = decoder.getDecoderStream();
-    auto& decoderState = decoder.getDecoderState();
 
     RequestVector finishedContextRequests;
     std::copy_if(contextRequests.begin(), contextRequests.end(), std::back_inserter(finishedContextRequests),
@@ -143,7 +140,7 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
         bufferManager, runtimeStream);
 
     auto decoderRequests = createDecoderRequests(finishedContextRequests, inputBuffers.inputsIds, decodingConfig,
-        decoderState, bufferManager, logitsType, modelConfig, worldConfig, runtimeStream, *decoderStream,
+        decoderState, bufferManager, logitsType, modelConfig, worldConfig, runtimeStream, decoderStream,
         maxSequenceLength, medusaBuffers);
 
     auto const batchSize = finishedContextRequests.size();

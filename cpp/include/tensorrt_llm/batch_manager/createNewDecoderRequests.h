@@ -75,8 +75,8 @@ public:
     operator()(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
         executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
         runtime::BufferManager const& bufferManager, nvinfer1::DataType logitsType, DecoderInputBuffers& inputBuffers,
-        GptDecoderBatched& decoder, CudaStream const& runtimeStream, SizeType32 maxSequenceLength, SizeType32 beamWidth,
-        OptionalRef<MedusaBuffers const> medusaBuffers) const;
+        runtime::decoder::DecoderState& decoderState, CudaStream const& runtimeStream, CudaStream const& decoderStream,
+        SizeType32 maxSequenceLength, SizeType32 beamWidth, OptionalRef<MedusaBuffers const> medusaBuffers) const;
 
     //! @brief Initialize the decoder at `batchSlot` with a new `request`. Exposed only for static batching via
     //! GptDecoderBatched::newBatch()

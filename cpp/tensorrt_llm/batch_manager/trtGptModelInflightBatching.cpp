@@ -1765,8 +1765,9 @@ void TrtGptModelInflightBatching::setupDecoderStep(
         auto const logitsType = mRuntime->getEngine().getTensorDataType("logits");
 
         auto [batchSlots, decoderRequests, samplingConfigs] = (*mCreateNewDecoderRequests)(mModelConfig, mWorldConfig,
-            mDecodingConfig, contextRequests, mRuntime->getBufferManager(), logitsType, inputBuffers, *mDecoder,
-            mRuntime->getStream(), getMaxSequenceLen(), mOperatingBeamWidth, buffers.medusaBuffers);
+            mDecodingConfig, contextRequests, mRuntime->getBufferManager(), logitsType, inputBuffers,
+            mDecoder->getDecoderState(), mRuntime->getStream(), *mDecoder->getDecoderStream(), getMaxSequenceLen(),
+            mOperatingBeamWidth, buffers.medusaBuffers);
 
         if (!decoderRequests.empty())
         {
