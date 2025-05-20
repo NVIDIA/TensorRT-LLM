@@ -164,7 +164,14 @@ class Llama4Linear(Linear):
             self.post_load_weights_hook(self)
 
     # Override apply_linear instead of forward so that we can reuse the AllReduce/AllGather logic in the parent class.
-    def apply_linear(self, input, weight, bias) -> torch.Tensor:
+    def apply_linear(
+        self,
+        input,
+        weight,
+        bias,
+        lora_params: Optional[dict] | None = None,
+        layer_idx: Optional[int] | None = None,
+    ) -> torch.Tensor:
 
         # Quantize the input if it is not already in float8_e4m3fn.
         # We cannot do this when enable_fused_gemm_swiglu is True and num_tokens > 16 because the default path
@@ -270,7 +277,7 @@ class Llama4Linear(Linear):
                 )
 
         # Otherwise, call the default apply_linear method.
-        return super().apply_linear(input, weight, bias)
+        return super().apply_linear(input, weight, bias, lora_params, layer_idx)
 
     # Set the position_ids for the next call to apply_linear.
     def set_position_ids(self, position_ids: Optional[torch.LongTensor] = None):
@@ -355,10 +362,9 @@ class Llama4GatedMLP(GatedMLP):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         all_rank_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
-        min_latency_mode: Optional[bool] = False,
+        cutlass_min_latency_mode: Optional[bool] = False,
         lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
-
         # Use the special or trtllm-gen gemm+swiglu kernel for FC13+swiglu when num_tokens <= 16.
         # We cannot use the parent's forward method because it applies swiglu() after calling gate_up_proj.
         if self.gate_up_proj.has_fp8_qdq \
@@ -374,7 +380,7 @@ class Llama4GatedMLP(GatedMLP):
             x,
             all_rank_num_tokens,
             final_all_reduce_params,
-            min_latency_mode,
+            cutlass_min_latency_mode,
             lora_params,
         )
 
@@ -661,7 +667,7 @@ class Llama4FusedMoE(FusedMoE):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        min_latency_mode: bool = False,
+        cutlass_min_latency_mode: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         x_high: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -681,7 +687,8 @@ class Llama4FusedMoE(FusedMoE):
         if x_high is not None and x.dtype == torch.float8_e4m3fn:
             x = x_high
 
-        return super().forward(x, router_logits, min_latency_mode, output_dtype)
+        return super().forward(x, router_logits, cutlass_min_latency_mode,
+                               output_dtype)
 
 
 class Llama4MoE(nn.Module):

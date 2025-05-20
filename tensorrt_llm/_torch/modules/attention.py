@@ -41,7 +41,6 @@ class Attention(nn.Module):
         num_key_value_heads: int,
         max_position_embeddings: int,
         bias: bool,
-        aux_stream: Optional[torch.cuda.Stream] = None,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
         layer_idx: Optional[int] = None,
         dtype: torch.dtype = None,
@@ -122,9 +121,6 @@ class Attention(nn.Module):
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
-        # o_proj is not feasible for trtllm-gen kernel because tileK in the kernel is 512.
-        # The kernel requires K to be multiple of 512.
-        # hidden_size is 5120, with TP8 we have local in_features (K) = 640.
         self.o_proj = Linear(
             tp_size * self.q_size,
             self.hidden_size,

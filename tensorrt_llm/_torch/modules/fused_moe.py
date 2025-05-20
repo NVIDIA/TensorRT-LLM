@@ -391,7 +391,6 @@ class FusedMoE(nn.Module):
 
         if self.is_trtllm():
             # trtllm_gen backend only support min-latency mode now
-            assert not self.apply_router_weight_on_input, "TRTLLM backend does not support applying router weight on input yet."
             assert not self.reduce_results
             assert self.quant_config and (
                 self.quant_config.quant_mode.has_nvfp4()
@@ -416,18 +415,6 @@ class FusedMoE(nn.Module):
         if not self.has_any_quant:
             return
         if self.has_fp8_qdq:
-            if self.fc31_dequant.device.type == 'meta':
-                self.fc31_dequant.data = self.fc31_dequant.to(
-                    torch.device('cuda')).data
-            if self.fc2_quant.device.type == 'meta':
-                self.fc2_quant.data = self.fc2_quant.to(
-                    torch.device('cuda')).data
-            if self.fc2_dequant.device.type == 'meta':
-                self.fc2_dequant.data = self.fc2_dequant.to(
-                    torch.device('cuda')).data
-            if self.fc31_input_dequant.device.type == 'meta':
-                self.fc31_input_dequant.data = self.fc31_input_dequant.to(
-                    torch.device('cuda')).data
             self.quant_scales = FusedMoEQuantScalesFP8(
                 fc1_dequant=self.fc31_dequant,
                 fc2_quant=self.fc2_quant,

@@ -863,7 +863,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         lm_head: Linear,
         embed_tokens: Embedding,
         attn_metadata: AttentionMetadata,
-        spec_metadata: SpecMetadata,
+        spec_metadata: MTPSpecMetadata,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 

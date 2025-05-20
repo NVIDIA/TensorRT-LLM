@@ -62,6 +62,7 @@ class GatedMLP(nn.Module):
             tp_size=tp_size,
             pp_size=pp_size,
         )
+
         self.gate_up_proj = Linear(
             self.hidden_size,
             self.intermediate_size * 2,
@@ -74,6 +75,7 @@ class GatedMLP(nn.Module):
             quant_config=config.get_quant_config(),
             reduce_output=reduce_output,
             skip_create_weights_in_init=config.skip_create_weights_in_init)
+
         self.down_lora = LoraLayer([LoraModuleType.MLP_4H_TO_H],
                                    [self.hidden_size])
 
@@ -107,6 +109,7 @@ class GatedMLP(nn.Module):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         all_rank_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
+        cutlass_min_latency_mode: Optional[bool] = False,
         lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
