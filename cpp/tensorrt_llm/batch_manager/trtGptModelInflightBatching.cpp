@@ -1766,7 +1766,7 @@ void TrtGptModelInflightBatching::setupDecoderStep(
 
         auto [batchSlots, decoderRequests, samplingConfigs] = (*mCreateNewDecoderRequests)(mModelConfig, mWorldConfig,
             mDecodingConfig, contextRequests, mRuntime->getBufferManager(), logitsType, inputBuffers, *mDecoder,
-            mRuntime->getStream(), getMaxSequenceLen(), mOperatingBeamWidth, buffers);
+            mRuntime->getStream(), getMaxSequenceLen(), mOperatingBeamWidth, buffers.medusaBuffers);
 
         if (!decoderRequests.empty())
         {

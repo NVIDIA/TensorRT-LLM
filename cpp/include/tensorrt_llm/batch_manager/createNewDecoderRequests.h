@@ -44,7 +44,7 @@ class DecoderState;
 
 namespace tensorrt_llm::batch_manager
 {
-class RuntimeBuffers;
+class MedusaBuffers;
 class DecoderInputBuffers;
 
 class CreateNewDecoderRequests : Algorithm
@@ -76,7 +76,7 @@ public:
         executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
         runtime::BufferManager const& bufferManager, nvinfer1::DataType logitsType, DecoderInputBuffers& inputBuffers,
         GptDecoderBatched& decoder, CudaStream const& runtimeStream, SizeType32 maxSequenceLength, SizeType32 beamWidth,
-        OptionalRef<RuntimeBuffers const> buffers) const;
+        OptionalRef<MedusaBuffers const> medusaBuffers) const;
 
     //! @brief Initialize the decoder at `batchSlot` with a new `request`. Exposed only for static batching via
     //! GptDecoderBatched::newBatch()
@@ -119,7 +119,7 @@ private:
         runtime::BufferManager const& bufferManager, nvinfer1::DataType logitsType,
         runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
         runtime::CudaStream const& runtimeStream, runtime::CudaStream const& decoderStream,
-        SizeType32 maxSequenceLength, OptionalRef<RuntimeBuffers const> buffers) const;
+        SizeType32 maxSequenceLength, OptionalRef<MedusaBuffers const> medusaBuffers) const;
 
     [[nodiscard]] std::shared_ptr<runtime::ITensor> retrieveDraftLogits(runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, std::shared_ptr<runtime::ITensor> const& tensor,

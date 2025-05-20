@@ -33,8 +33,6 @@
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/updateDecoderBuffers.h"
 #include "tensorrt_llm/runtime/decoderState.h"
-#include "tensorrt_llm/runtime/decodingInput.h"
-#include "tensorrt_llm/runtime/decodingOutput.h"
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchView.h"
 
@@ -157,11 +155,11 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
                 tr::BufferManager const& bufferManager, nvinfer1::DataType logitsType,
                 DecoderInputBuffers& inputBuffers, runtime::GptDecoderBatched& decoder,
                 tensorrt_llm::runtime::CudaStream const& runtimeStream, SizeType32 maxSequenceLength,
-                SizeType32 beamWidth, OptionalRef<RuntimeBuffers const> buffers = std::nullopt)
+                SizeType32 beamWidth, OptionalRef<MedusaBuffers const> medusaBuffers = std::nullopt)
             {
                 auto [batchSlots, decoderRequests, samplingConfigs]
                     = self(modelConfig, worldConfig, decodingConfig, contextRequests, bufferManager, logitsType,
-                        inputBuffers, decoder, runtimeStream, maxSequenceLength, beamWidth, buffers);
+                        inputBuffers, decoder, runtimeStream, maxSequenceLength, beamWidth, medusaBuffers);
 
                 return std::tuple{
                     runtime::Torch::tensor(batchSlots), std::move(decoderRequests), std::move(samplingConfigs)};
@@ -169,7 +167,7 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
             py::arg("model_config"), py::arg("world_config"), py::arg("decoding_config"), py::arg("context_requests"),
             py::arg("buffer_manager"), py::arg("logits_type"), py::arg("decoder_input_buffers"), py::arg("decoder"),
             py::arg("runtime_stream"), py::arg("max_sequence_length"), py::arg("beam_width"),
-            py::arg("buffers") = std::nullopt)
+            py::arg("medusa_buffers") = std::nullopt)
         .def("name", [](CreateNewDecoderRequests const&) { return CreateNewDecoderRequests::name; });
 
     py::class_<UpdateDecoderBuffers>(m, UpdateDecoderBuffers::name)

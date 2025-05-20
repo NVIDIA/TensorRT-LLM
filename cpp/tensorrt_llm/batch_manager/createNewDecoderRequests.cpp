@@ -19,7 +19,6 @@
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/medusaBuffers.h"
-#include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/utils/logitsThread.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
@@ -33,7 +32,6 @@
 #include "tensorrt_llm/runtime/utils/speculativeChoicesUtils.h"
 
 #include <NvInferRuntimeBase.h>
-#include <cstddef>
 
 using namespace tensorrt_llm::runtime;
 
@@ -129,7 +127,7 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
     executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
     runtime::BufferManager const& bufferManager, nvinfer1::DataType logitsType, DecoderInputBuffers& inputBuffers,
     GptDecoderBatched& decoder, CudaStream const& runtimeStream, SizeType32 maxSequenceLength, SizeType32 beamWidth,
-    OptionalRef<RuntimeBuffers const> buffers) const
+    OptionalRef<MedusaBuffers const> medusaBuffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(CreateNewDecoderRequests);
@@ -146,7 +144,7 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
 
     auto decoderRequests = createDecoderRequests(finishedContextRequests, inputBuffers.inputsIds, decodingConfig,
         decoderState, bufferManager, logitsType, modelConfig, worldConfig, runtimeStream, *decoderStream,
-        maxSequenceLength, buffers);
+        maxSequenceLength, medusaBuffers);
 
     auto const batchSize = finishedContextRequests.size();
 
@@ -567,7 +565,7 @@ void CreateNewDecoderRequests::newRequestEagle(SizeType32 batchIdx, runtime::dec
     BufferManager const& bufferManager, nvinfer1::DataType logitsType, runtime::ModelConfig const& modelConfig,
     runtime::WorldConfig const& worldConfig, runtime::CudaStream const& runtimeStream,
     runtime::CudaStream const& decoderStream, SizeType32 maxSequenceLength,
-    OptionalRef<RuntimeBuffers const> buffers) const
+    OptionalRef<MedusaBuffers const> medusaBuffers) const
 {
     unsigned decoderInputSize{0};
     for (auto const& llmReq : finishedContextRequests)
@@ -617,12 +615,12 @@ void CreateNewDecoderRequests::newRequestEagle(SizeType32 batchIdx, runtime::dec
         }
         if (modelConfig.getSpeculativeDecodingMode().isMedusa())
         {
-            TLLM_CHECK(buffers);
-            llmReq->mSamplingConfig.topKMedusaHeads = {buffers->medusaBuffers->mTopKs};
+            TLLM_CHECK(medusaBuffers);
+            llmReq->mSamplingConfig.topKMedusaHeads = {medusaBuffers->mTopKs};
             // FIXME: we must set medusa paths and tree ids not from seq slot, but from llmRequest?
             // When multiple microbatches buffers are used, runtime buffers can not be addressed with seqSlot.
-            decoderRequest.medusaPaths = ITensor::slice(buffers->medusaBuffers->medusaPathsDevice, 0, 1);
-            decoderRequest.medusaTreeIds = ITensor::slice(buffers->medusaBuffers->medusaTreeIdsDevice, 0, 1);
+            decoderRequest.medusaPaths = ITensor::slice(medusaBuffers->medusaPathsDevice, 0, 1);
+            decoderRequest.medusaTreeIds = ITensor::slice(medusaBuffers->medusaTreeIdsDevice, 0, 1);
         }
         else if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
         {
