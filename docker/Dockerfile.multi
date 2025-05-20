@@ -87,7 +87,6 @@ COPY --from=triton /opt/tritonserver/bin /opt/tritonserver/bin
 COPY --from=triton /opt/tritonserver/caches /opt/tritonserver/caches
 COPY docker/common/install_triton.sh install_triton.sh
 RUN bash ./install_triton.sh && rm install_triton.sh
-RUN rm -rf /opt/tritonserver/backends/tensorrtllm
 
 # Install NIXL
 COPY docker/common/install_nixl.sh install_nixl.sh
@@ -163,10 +162,16 @@ ARG TRT_LLM_VER
 ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
     TRT_LLM_VERSION=${TRT_LLM_VER}
 
+FROM wheel AS tritonbuild
+
+WORKDIR /src/tensorrt_llm
+RUN pip install /src/tensorrt_llm/build/tensorrt_llm*.whl
+COPY ./triton_backend/ ./triton_backend/
+RUN bash ./triton_backend/inflight_batcher_llm/scripts/build.sh
+
 
 FROM release AS tritonrelease
 
 WORKDIR /app/tensorrt_llm
-COPY ./cpp/ ./cpp
 COPY ./triton_backend/ ./triton_backend/
-RUN bash ./triton_backend/inflight_batcher_llm/scripts/build.sh
+COPY --from=tritonbuild /opt/tritonserver/backends/tensorrtllm /opt/tritonserver/backends/tensorrtllm
