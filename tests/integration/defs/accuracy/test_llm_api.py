@@ -277,3 +277,16 @@ class TestQwen2_5_7BInstruct(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @pytest.mark.skip(reason="https://nvbugs/5280461")
+    @skip_pre_ada
+    def test_fp8_kvcache(self):
+        "RCCA: https://nvbugs/5065080"
+        quant_config = QuantConfig(QuantAlgo.FP8,
+                                   kv_cache_quant_algo=QuantAlgo.FP8)
+        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)

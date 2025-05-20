@@ -1,4 +1,5 @@
 import math
+import weakref
 from enum import IntEnum
 from typing import Optional, cast
 
@@ -15,6 +16,7 @@ from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
+from ..utils import get_model_extra_attrs
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
@@ -277,6 +279,47 @@ class Attention(nn.Module):
             "Please override the `apply_qk_norm` method in the subclass.")
 
 
+def extract_extra_attrs(layer_idx: str):
+    extra_attrs = get_model_extra_attrs()
+    assert extra_attrs is not None, "Model extra attrs is not set"
+
+    metadata_ref = extra_attrs.get("attention_metadata", None)
+    assert metadata_ref is not None, "Attention metadata is not set"
+    metadata = metadata_ref()
+    assert isinstance(
+        metadata,
+        TrtllmAttentionMetadata,
+    )
+
+    mla_layers = extra_attrs.get("mla_layers", None)
+    assert mla_layers is not None, "MLA layers is not registered"
+    mla_layer_ref = mla_layers.get(layer_idx, None)
+    assert mla_layer_ref is not None, f"Cannot find MLA layer for layer {layer_idx}"
+    mla_layer = mla_layer_ref()
+    assert isinstance(
+        mla_layer,
+        MLA), "MLA layer must be a subclass of MLA or an instance of MLA"
+
+    return metadata, mla_layer
+
+
+@torch.library.custom_op("trtllm::mla_custom_op", mutates_args=())
+def mla_custom_op(
+    position_ids: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    layer_idx: str,
+) -> torch.Tensor:
+    metadata, mla_layer = extract_extra_attrs(layer_idx)
+
+    return mla_layer.forward_impl(position_ids, hidden_states, metadata)
+
+
+@mla_custom_op.register_fake
+def _(position_ids, hidden_states, layer_idx):
+    _, mla_layer = extract_extra_attrs(layer_idx)
+    return mla_layer.forward_impl_fake(hidden_states)
+
+
 class MLA(nn.Module):
 
     def __init__(
@@ -324,6 +367,7 @@ class MLA(nn.Module):
         """
         super().__init__()
         self.layer_idx = layer_idx
+        self.layer_idx_str = str(layer_idx)
         self.dtype = dtype
 
         self.hidden_size = hidden_size
@@ -350,6 +394,14 @@ class MLA(nn.Module):
             self.is_lite = False
 
         assert pos_embd_params is not None, "pos_embd_params must be provided in MLA"
+
+        self.register_to_config = False
+        if config is not None:
+            if "mla_layers" not in config.extra_attrs:
+                config.extra_attrs["mla_layers"] = {}
+            config.extra_attrs["mla_layers"][self.layer_idx_str] = weakref.ref(
+                self)
+            self.register_to_config = True
 
         # tensor parallel
         config = config or ModelConfig()
@@ -584,12 +636,17 @@ class MLA(nn.Module):
                                                    self.qk_rope_head_dim)
         return k_pe
 
-    def forward(
+    def forward_impl_fake(self, hidden_states: torch.Tensor):
+        num_tokens = hidden_states.shape[0]
+        hidden_size = self.o_proj.in_features
+        return hidden_states.new_empty([num_tokens, hidden_size],
+                                       dtype=hidden_states.dtype)
+
+    def forward_impl(
         self,
-        position_ids: Optional[torch.LongTensor],
+        position_ids: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        all_reduce_params: Optional[AllReduceParams] = None,
     ) -> torch.Tensor:
         """
         Forward pass for the MLA module.
@@ -692,8 +749,6 @@ class MLA(nn.Module):
         else:
             attn_output = attn_output_gen
 
-        attn_output = self.o_proj(attn_output,
-                                  all_reduce_params=all_reduce_params)
         return attn_output
 
     def _maybe_concat_qkv(self, q, k, v):
@@ -987,3 +1042,20 @@ class MLA(nn.Module):
 
         # [seq, num_heads * v_head_dim]
         return attn_output.flatten(1, 2)
+
+    def forward(
+        self,
+        position_ids: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        all_reduce_params: Optional[AllReduceParams] = None,
+    ) -> torch.Tensor:
+        if self.register_to_config:
+            attn_output = torch.ops.trtllm.mla_custom_op(
+                position_ids, hidden_states, self.layer_idx_str)
+        else:
+            attn_output = self.forward_impl(position_ids, hidden_states,
+                                            attn_metadata)
+        attn_output = self.o_proj(attn_output,
+                                  all_reduce_params=all_reduce_params)
+        return attn_output

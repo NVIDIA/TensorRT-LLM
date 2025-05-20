@@ -67,19 +67,30 @@ def get_pp_layers(
     num_layers: int,
     mapping: Mapping,
     spec_config: Optional["SpecConfig"] = None,
+    layer_mask: Optional[List[bool]] = None,
 ) -> Tuple[List[int], int]:
     from ..speculative.utils import get_num_spec_layers
 
-    pp_layers = mapping.pp_layers(num_layers)
+    total_num_layers = num_layers
+    if layer_mask is not None:
+        assert sum(layer_mask) == num_layers, (
+            f"The number of enabled layers in layer_mask ({sum(layer_mask)}) "
+            f"must match the number of layers ({num_layers}) "
+            f"in KV cache manager, but get layer_mask: {layer_mask}")
+        total_num_layers = len(layer_mask)
+    pp_layers = mapping.pp_layers(total_num_layers)
+    if layer_mask is not None:
+        pp_layers = [i for i in pp_layers if layer_mask[i]]
     if spec_config is not None:
         num_spec_layers = get_num_spec_layers(spec_config)
-        num_layers += num_spec_layers
+        total_num_layers += num_spec_layers
         if mapping.is_last_pp_rank():
-            pp_layers.extend(range(num_layers - num_spec_layers, num_layers))
+            pp_layers.extend(
+                range(total_num_layers - num_spec_layers, total_num_layers))
     if len(pp_layers) == 0:
         # Don't support empty KV cache for now, provide at least 1 layer
         pp_layers.append(0)
-    return pp_layers, num_layers
+    return pp_layers, total_num_layers
 
 
 class KVCacheManager(BaseResourceManager):
@@ -100,12 +111,17 @@ class KVCacheManager(BaseResourceManager):
         mapping: Mapping,
         dtype: DataType = DataType.HALF,
         spec_config: Optional["SpecConfig"] = None,
+        layer_mask: Optional[List[bool]] = None,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
-        self.pp_layers, self.num_layers = get_pp_layers(num_layers, mapping,
-                                                        spec_config)
+        self.pp_layers, self.num_layers = get_pp_layers(
+            num_layers,
+            mapping,
+            spec_config=spec_config,
+            layer_mask=layer_mask,
+        )
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {
             idx: offset
@@ -127,9 +143,8 @@ class KVCacheManager(BaseResourceManager):
 
             self.num_kv_heads_per_layer = []
             if self.num_local_layers > 0:
-                for kv_head in num_kv_heads[self.
-                                            pp_layers[0]:self.pp_layers[-1] +
-                                            1]:
+                for i in self.pp_layers:
+                    kv_head = num_kv_heads[i]
                     if kv_head is not None:
                         self.num_kv_heads_per_layer.append(
                             (kv_head + tp_size - 1) // tp_size)
@@ -480,10 +495,20 @@ class KVCacheManager(BaseResourceManager):
 
 class MambaCacheManager(BaseResourceManager):
 
-    def __init__(self, d_model: int, d_state: int, d_conv: int, expand: int,
-                 n_groups: int, head_dim: int, num_layers: int,
-                 max_batch_size: int, mapping: Mapping,
-                 conv1d_state_dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int,
+        d_conv: int,
+        expand: int,
+        n_groups: int,
+        head_dim: int,
+        num_layers: int,
+        max_batch_size: int,
+        mapping: Mapping,
+        conv1d_state_dtype: torch.dtype,
+        layer_mask: Optional[List[bool]] = None,
+    ) -> None:
 
         # get tp size
         tp_size = mapping.tp_size
@@ -504,7 +529,11 @@ class MambaCacheManager(BaseResourceManager):
         # conv and ssm states device
         device = torch.device("cuda")
 
-        pp_layers, num_layers = get_pp_layers(num_layers, mapping)
+        pp_layers, num_layers = get_pp_layers(
+            num_layers,
+            mapping,
+            layer_mask=layer_mask,
+        )
         num_local_layers = len(pp_layers)
         self.mamba_layer_offsets = {
             idx: offset
@@ -602,12 +631,14 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         mamba_n_groups: int,
         mamba_head_dim: int,
         mamba_num_layers: int,
+        mamba_layer_mask: List[bool],
         mamba_conv1d_state_dtype: torch.dtype,
         # kv cache parameters
         kv_cache_config: KvCacheConfigCpp,
         kv_cache_type: CacheTypeCpp,
         *,
         num_layers: int,
+        layer_mask: List[bool],
         num_kv_heads: Union[int, List[Optional[int]]],
         head_dim: int,
         tokens_per_block: int,
@@ -624,25 +655,37 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         assert not kv_cache_config.enable_block_reuse, "mamba hybrid cache requires block reuse to be disabled in KV cache config"
 
         # initialize mamba cache manager
-        MambaCacheManager.__init__(self, mamba_d_model, mamba_d_state,
-                                   mamba_d_conv, mamba_expand, mamba_n_groups,
-                                   mamba_head_dim, mamba_num_layers,
-                                   max_batch_size, mapping,
-                                   mamba_conv1d_state_dtype)
+        MambaCacheManager.__init__(
+            self,
+            mamba_d_model,
+            mamba_d_state,
+            mamba_d_conv,
+            mamba_expand,
+            mamba_n_groups,
+            mamba_head_dim,
+            mamba_num_layers,
+            max_batch_size,
+            mapping,
+            mamba_conv1d_state_dtype,
+            mamba_layer_mask,
+        )
 
         # initialize kv cache manager
-        KVCacheManager.__init__(self,
-                                kv_cache_config,
-                                kv_cache_type,
-                                num_layers=num_layers,
-                                num_kv_heads=num_kv_heads,
-                                head_dim=head_dim,
-                                tokens_per_block=tokens_per_block,
-                                max_seq_len=max_seq_len,
-                                max_batch_size=max_batch_size,
-                                mapping=mapping,
-                                dtype=dtype,
-                                spec_config=spec_config)
+        KVCacheManager.__init__(
+            self,
+            kv_cache_config,
+            kv_cache_type,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            mapping=mapping,
+            dtype=dtype,
+            spec_config=spec_config,
+            layer_mask=layer_mask,
+        )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         self.prepare_mamba_resources(scheduled_batch)
