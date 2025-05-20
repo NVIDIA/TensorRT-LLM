@@ -11,6 +11,8 @@ The Prompt-Lookup has 3 additional hyperparameters that you need to specify to c
 - `max_matching_ngram_size`: the number of tokens we get from the tail of the input prompt or generated output as a pattern, which is used to match in input prompt or previous generated output (default value: 2). Empirically, the larger the value is, the more precise context can be matched from the existed sequence, indicating higher acceptance rate, but the higher probability of miss-match and higher overhead appear, which fall back to normal generation (one token per iteration).
 - `device_list`: the index list of device(s) to run the model in V1 workflow. The length of it must be the same as the TP size of the draft model engine. For instances, `device_list=[0]` means using tp_size=1 and GPU 0 for the model, `device_list=[4,5,6,7]` means using tp=4 and GPU from 4 to 7 for the model. This parameter is neddless in V2 workflow.
 
+Example: Assume current tokens are [..., t1, t2, t3, t4]. Further assume lookup pool has the following key-value pairs: [{[t3, t4]: [t5, t6, t7], {[t2, t3, t4]: [t7, t8, t9]]. If `prompt_lookup_num_tokens` == 2 and `max_matching_ngram_size` == 2, [t5, t6] would be returned. If `prompt_lookup_num_tokens` == 2 and `max_matching_ngram_size` == 3, [t5, t6, t7] would be returned.  If `prompt_lookup_num_tokens` == 3 and `max_matching_ngram_size` == 2, [t7, t8] would be returned.
+
 ## Support Matrix
   * GPU Compute Capability >= 8.0 (Ampere or newer)
   * FP16 / BF16 / FP8

@@ -296,7 +296,7 @@ struct InflightBatchingStats
 };
 
 /// @brief Struct that holds speculative decoding stats
-struct SpecDecStats
+struct SpecDecodingStats
 {
     /// @brief Total number of proposed draft tokens for all requests
     SizeType64 numDraftTokens;
@@ -361,7 +361,7 @@ struct IterationStats
     /// @brief Stats specific to inflight batching
     std::optional<InflightBatchingStats> inflightBatchingStats;
     /// @brief Stats specific to speculative decoding
-    std::optional<SpecDecStats> specDecStats;
+    std::optional<SpecDecodingStats> specDecStats;
 };
 
 /// @brief Enum class that represents the state of a request

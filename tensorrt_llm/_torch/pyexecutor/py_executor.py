@@ -24,7 +24,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
                                             RequestStage, RequestStats,
-                                            RequestType, SpecDecStats,
+                                            RequestType, SpecDecodingStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
@@ -516,7 +516,7 @@ class PyExecutor:
         spec_resource_manager = self.resource_manager.resource_managers.get(
             "spec_resource_manager")
         if spec_resource_manager is not None:
-            stats.specdec_stats = SpecDecStats()
+            stats.specdec_stats = SpecDecodingStats()
         return stats
 
     def _populate_req_stats(

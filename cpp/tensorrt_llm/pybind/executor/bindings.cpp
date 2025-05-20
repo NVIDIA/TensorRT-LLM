@@ -132,14 +132,14 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("micro_batch_id", &tle::InflightBatchingStats::microBatchId)
         .def_readwrite("avg_num_decoded_tokens_per_iter", &tle::InflightBatchingStats::avgNumDecodedTokensPerIter);
 
-    py::class_<tle::SpecDecStats>(m, "SpecDecStats")
+    py::class_<tle::SpecDecodingStats>(m, "SpecDecodingStats")
         .def(py::init<>())
-        .def_readwrite("num_draft_tokens", &tle::SpecDecStats::numDraftTokens)
-        .def_readwrite("num_accepted_tokens", &tle::SpecDecStats::numAcceptedTokens)
-        .def_readwrite("num_requests_with_draft_tokens", &tle::SpecDecStats::numRequestsWithDraftTokens)
-        .def_readwrite("acceptance_length", &tle::SpecDecStats::acceptanceLength)
-        .def_readwrite("iter_latency_ms", &tle::SpecDecStats::iterLatencyMS)
-        .def_readwrite("draft_overhead", &tle::SpecDecStats::draftOverhead);
+        .def_readwrite("num_draft_tokens", &tle::SpecDecodingStats::numDraftTokens)
+        .def_readwrite("num_accepted_tokens", &tle::SpecDecodingStats::numAcceptedTokens)
+        .def_readwrite("num_requests_with_draft_tokens", &tle::SpecDecodingStats::numRequestsWithDraftTokens)
+        .def_readwrite("acceptance_length", &tle::SpecDecodingStats::acceptanceLength)
+        .def_readwrite("iter_latency_ms", &tle::SpecDecodingStats::iterLatencyMS)
+        .def_readwrite("draft_overhead", &tle::SpecDecodingStats::draftOverhead);
 
     py::class_<tle::IterationStats>(m, "IterationStats")
         .def(py::init<>())

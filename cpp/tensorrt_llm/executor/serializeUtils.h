@@ -465,9 +465,9 @@ T deserialize(std::istream& is)
     {
         return Serialization::deserializeInflightBatchingStats(is);
     }
-    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::SpecDecStats>)
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::SpecDecodingStats>)
     {
-        return Serialization::deserializeSpecDecStats(is);
+        return Serialization::deserializeSpecDecodingStats(is);
     }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::IterationStats>)
     {

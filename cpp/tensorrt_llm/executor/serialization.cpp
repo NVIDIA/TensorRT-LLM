@@ -1727,8 +1727,8 @@ size_t Serialization::serializedSize(InflightBatchingStats const& inflightBatchi
     return totalSize;
 }
 
-// SpecDecStats
-SpecDecStats Serialization::deserializeSpecDecStats(std::istream& is)
+// SpecDecodingStats
+SpecDecodingStats Serialization::deserializeSpecDecodingStats(std::istream& is)
 {
     auto numDraftTokens = su::deserialize<SizeType64>(is);
     auto numAcceptedTokens = su::deserialize<SizeType64>(is);
@@ -1737,11 +1737,11 @@ SpecDecStats Serialization::deserializeSpecDecStats(std::istream& is)
     auto iterLatencyMS = su::deserialize<double>(is);
     auto draftOverhead = su::deserialize<double>(is);
 
-    return SpecDecStats{
+    return SpecDecodingStats{
         numDraftTokens, numAcceptedTokens, numRequestsWithDraftTokens, acceptanceLength, iterLatencyMS, draftOverhead};
 }
 
-void Serialization::serialize(SpecDecStats const& state, std::ostream& os)
+void Serialization::serialize(SpecDecodingStats const& state, std::ostream& os)
 {
     su::serialize(state.numDraftTokens, os);
     su::serialize(state.numAcceptedTokens, os);
@@ -1751,7 +1751,7 @@ void Serialization::serialize(SpecDecStats const& state, std::ostream& os)
     su::serialize(state.draftOverhead, os);
 }
 
-size_t Serialization::serializedSize(SpecDecStats const& state)
+size_t Serialization::serializedSize(SpecDecodingStats const& state)
 {
     size_t totalSize = 0;
     totalSize += su::serializedSize(state.numDraftTokens);
@@ -1790,7 +1790,7 @@ IterationStats Serialization::deserializeIterationStats(std::istream& is)
     auto crossKvCacheStats = su::deserialize<std::optional<KvCacheStats>>(is);
     auto staticBatchingStats = su::deserialize<std::optional<StaticBatchingStats>>(is);
     auto inflightBatchingStats = su::deserialize<std::optional<InflightBatchingStats>>(is);
-    auto specdecStats = su::deserialize<std::optional<SpecDecStats>>(is);
+    auto specdecStats = su::deserialize<std::optional<SpecDecodingStats>>(is);
 
     return IterationStats{timestamp, iter, iterLatencyMS, newActiveRequestsQueueLatencyMS, numNewActiveRequests,
         numActiveRequests, numQueuedRequests, numCompletedRequests, maxNumActiveRequests, maxBatchSizeStatic,
