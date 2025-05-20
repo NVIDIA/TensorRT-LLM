@@ -6,6 +6,8 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+
 
 def causal_conv1d_fwd(xBC: torch.Tensor, conv1d_weight: torch.Tensor,
                       conv1d_bias: torch.Tensor) -> torch.Tensor:
@@ -49,9 +51,6 @@ def causal_conv1d_fwd(xBC: torch.Tensor, conv1d_weight: torch.Tensor,
 
     y_new = y_new.unsqueeze(0).permute(0, 2, 1).contiguous()
     return y_new
-
-
-PAD_SLOT_ID = -1000000  # TODO: check if this matters. resource_manager.py::add_dummy_requests uses similar value to pad requests to batch size.
 
 
 def causal_conv1d_fn(x: torch.Tensor,

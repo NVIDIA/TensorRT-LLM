@@ -19,7 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modules.mamba.causal_conv1d import PAD_SLOT_ID
+from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 
 from .softplus import softplus
 
