@@ -192,10 +192,6 @@ void launchFusedQKNormRope(void* qkv, int const* position_ids, int const num_tok
         fusedQKNormRopeKernel<128><<<gridDim, blockDim, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv),
             position_ids, num_tokens, num_heads_q, num_heads_k, num_heads_v, eps, base);
         break;
-    case 256:
-        fusedQKNormRopeKernel<256><<<gridDim, blockDim, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv),
-            position_ids, num_tokens, num_heads_q, num_heads_k, num_heads_v, eps, base);
-        break;
     default:
         // Unsupported head dimension
         TLLM_THROW("Unsupported head dimension for fusedQKNormRope: %d", head_dim);
