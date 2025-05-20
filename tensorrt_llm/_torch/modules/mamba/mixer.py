@@ -222,13 +222,13 @@ class MambaMixer(nn.Module):
 
                 current_conv_states = torch.empty_like(
                     conv_states[indices, ...]) if not is_warmup else None
-                xbc = causal_conv1d_fn(
-                    xbc.transpose(0, 1),
-                    self.conv1d.weight.permute(0, 1).contiguous(),
-                    self.conv1d.bias,
-                    activation="silu",
-                    conv_states=current_conv_states,
-                    query_start_loc=cu_seqlens).transpose(0, 1)
+                xbc = causal_conv1d_fn(xbc.transpose(0, 1),
+                                       self.conv1d.weight,
+                                       self.conv1d.bias,
+                                       activation="silu",
+                                       conv_states=current_conv_states,
+                                       query_start_loc=cu_seqlens).transpose(
+                                           0, 1)
 
                 x, B, C = torch.split(xbc.unsqueeze(0), [
                     self.tp_d_inner,
@@ -273,13 +273,9 @@ class MambaMixer(nn.Module):
                     current_ssm_states = ssm_states[indices]
 
                 # update conv states
-                xbc = causal_conv1d_update(
-                    xbc,
-                    current_conv_states,
-                    # TODO: just permute and contiguous when loading weights
-                    self.conv1d.weight.permute(0, 1).contiguous(),
-                    self.conv1d.bias,
-                    "silu")
+                xbc = causal_conv1d_update(xbc, current_conv_states,
+                                           self.conv1d.weight, self.conv1d.bias,
+                                           "silu")
 
                 x, B, C = torch.split(
                     xbc,
