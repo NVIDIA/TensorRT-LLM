@@ -195,11 +195,13 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
     has_ngram_drafter = isinstance(spec_config, NGramConfig)
 
+    # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=executor_config.enable_chunked_context,
         cache_reuse=executor_config.kv_cache_config.enable_block_reuse,
         has_speculative_draft_tokens=has_draft_model_engine
         or has_ngram_drafter,
+        chunk_unit_size=executor_config.tokens_per_block,
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 

@@ -197,6 +197,8 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds access.
         tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
         tllmRunnerParams.mSfStartTokenIdx = 0;
+        // For mla chunked prefill
+        tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(runnerParams.softmaxStatsPtr);
         tllmRunnerParams.stream = runnerParams.stream;
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }

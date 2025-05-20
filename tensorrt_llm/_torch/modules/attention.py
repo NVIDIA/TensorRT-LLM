@@ -922,6 +922,175 @@ class MLA(nn.Module):
 
         return attn_output
 
+    def forward_context_with_chunked_prefill(
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        attn_metadata: TrtllmAttentionMetadata,
+        position_ids: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
+        trtllm_attention = cast(TrtllmAttention, self.mha)
+
+        # split current q into q_nope and q_pe
+        q_nope, q_pe = q.view([
+            -1, self.num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim
+        ]).split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        # apply rope to current q_pe and k_pe
+        assert position_ids is not None
+        assert position_ids.dim() == 1 or (position_ids.dim() == 2
+                                           and position_ids.shape[0] == 1)
+        assert self.rotary_emb is not None
+        assert self.rotary_emb.head_dim == self.qk_rope_head_dim
+        assert q_pe.shape[0] == k_pe.shape[0]
+        q_pe = q_pe.contiguous().view(-1,
+                                      self.num_heads * self.qk_rope_head_dim)
+        q_pe, k_pe = self.rotary_emb(
+            position_ids[..., :attn_metadata.num_ctx_tokens], [q_pe, k_pe])
+
+        # build q for attention op
+        q_view = q.view(-1, self.num_heads,
+                        self.qk_nope_head_dim + self.qk_rope_head_dim)
+        q_view[:, :,
+               self.qk_nope_head_dim:] = q_pe.view(-1, self.num_heads,
+                                                   self.qk_rope_head_dim)
+        q = q_view.view(
+            -1,
+            self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim))
+        assert q.is_contiguous()
+
+        # determine the number of loop
+        chunk_unit_size = attn_metadata.runtime_features.chunk_unit_size
+        chunked_loop_num = attn_metadata.max_ctx_cached_token_len // chunk_unit_size
+        # [token_q, num_heads, 2] -> [token_q, num_heads] float2
+        softmax_stats_tensor = torch.empty(
+            (chunk_unit_size, self.num_heads, 2),
+            dtype=torch.float,
+            device=q.device,
+        )
+        temp_softmax_stats_tensor = torch.empty(
+            (chunk_unit_size, self.num_heads, 2),
+            dtype=torch.float,
+            device=q.device,
+        )
+        attn_output = None
+        for loop_idx in range(chunked_loop_num):
+            # {b, chunked_unit_size, h, kv_lora_rank + qk_rope_head_dim}
+            # fetch `loop_idx` chunk from kv cache
+            chunked_latent_cache = trtllm_attention.load_chunked_kv_cache_for_mla(
+                metadata=attn_metadata, chunked_idx=loop_idx, out_dtype=q.dtype)
+            assert chunked_latent_cache.shape[
+                1] == attn_metadata.runtime_features.chunk_unit_size
+            chunked_compressed_kv, chunked_k_pe = chunked_latent_cache.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+
+            chunked_compressed_kv = chunked_compressed_kv.contiguous()
+            # up proj to uncompressed kv
+            chunked_kv = self.kv_b_proj(chunked_compressed_kv)
+            chunked_k_nope, chunked_v = chunked_kv.split([
+                self.num_heads * self.qk_nope_head_dim,
+                self.num_heads * self.v_head_dim
+            ],
+                                                         dim=-1)
+            chunked_k_nope = chunked_k_nope.view(-1, self.num_heads,
+                                                 self.qk_nope_head_dim)
+            chunked_v = chunked_v.view(-1, self.num_heads, self.v_head_dim)
+            # build full_kv
+            # full_kv {B, 2, chunk_size / tokens_per_block, h, tokens_per_block, kv_dim + rope_dim}
+            tokens_per_block = attn_metadata.kv_cache_manager.tokens_per_block
+            full_kv = torch.zeros([
+                attn_metadata.num_contexts, 2,
+                (chunk_unit_size + tokens_per_block - 1) // tokens_per_block,
+                self.num_heads, tokens_per_block,
+                max(self.qk_nope_head_dim + self.qk_rope_head_dim,
+                    self.v_head_dim)
+            ],
+                                  dtype=q.dtype,
+                                  device=q.device)
+            mla_kv_cache_block_offsets = trtllm_attention.set_chunked_kv_cache_for_mla(
+                full_kv, chunked_k_nope, chunked_v, chunked_k_pe, attn_metadata)
+
+            out_scale = None
+            temp_attn_output = self.mha.forward(
+                q,
+                None,
+                None,
+                attn_metadata,
+                attention_input_type=AttentionInputType.context_only,
+                latent_cache=None,
+                out_scale=out_scale,
+                mla_context_paged_kv=full_kv,
+                mla_context_kv_cache_block_offsets=mla_kv_cache_block_offsets,
+                softmax_stats_tensor=temp_softmax_stats_tensor,
+            )
+            # merge attn result
+            if loop_idx == 0:
+                attn_output = temp_attn_output
+                softmax_stats_tensor = temp_softmax_stats_tensor
+            else:
+                trtllm_attention.merge_attention_for_mla(
+                    attn_output, temp_attn_output, softmax_stats_tensor,
+                    temp_softmax_stats_tensor, attn_metadata)
+
+        # deal with the uncached kv
+        kv = self.kv_b_proj(compressed_kv)
+        k_nope, v = kv.split([
+            self.num_heads * self.qk_nope_head_dim,
+            self.num_heads * self.v_head_dim
+        ],
+                             dim=-1)
+
+        k_pe = k_pe.contiguous()
+        # append paged kv cache for mla
+        # we may finish it inside the attention op by passing latent_cache
+        trtllm_attention.append_paged_kv_cache_for_mla(
+            compressed_kv,
+            k_pe,
+            attn_metadata,
+        )
+
+        # final round of attention
+
+        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
+        out_scale = None  # Currently we use BF16 MHA for context phase
+
+        tokens_per_block = attn_metadata.kv_cache_manager.tokens_per_block
+        full_kv = torch.zeros([
+            attn_metadata.num_contexts, 2,
+            (chunk_unit_size + tokens_per_block - 1) // tokens_per_block,
+            self.num_heads, tokens_per_block,
+            max(self.qk_nope_head_dim + self.qk_rope_head_dim, self.v_head_dim)
+        ],
+                              dtype=q.dtype,
+                              device=q.device)
+        mla_kv_cache_block_offsets = trtllm_attention.set_chunked_kv_cache_for_mla(
+            full_kv, k_nope, v, k_pe, attn_metadata)
+
+        temp_attn_output = self.mha.forward(
+            q,
+            None,
+            None,
+            attn_metadata,
+            attention_input_type=AttentionInputType.context_only,
+            latent_cache=None,
+            out_scale=out_scale,
+            mla_context_paged_kv=full_kv,
+            mla_context_kv_cache_block_offsets=mla_kv_cache_block_offsets,
+            softmax_stats_tensor=temp_softmax_stats_tensor,
+        )
+
+        if attn_output is None:
+            attn_output = temp_attn_output
+        else:
+            trtllm_attention.merge_attention_for_mla(attn_output,
+                                                     temp_attn_output,
+                                                     softmax_stats_tensor,
+                                                     temp_softmax_stats_tensor,
+                                                     attn_metadata)
+
+        return attn_output
+
     def forward_context(
         self,
         q: torch.Tensor,
@@ -934,7 +1103,10 @@ class MLA(nn.Module):
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
-            if trtllm_attention.has_cached_kv_for_mla_context(attn_metadata):
+            if trtllm_attention.is_mla_context_paged_kv_cache_enabled():
+                return self.forward_context_with_chunked_prefill(
+                    q, compressed_kv, k_pe, attn_metadata, position_ids)
+            elif trtllm_attention.has_cached_kv_for_mla_context(attn_metadata):
                 return self.forward_context_with_cached_kv(
                     q, latent_cache, attn_metadata, output)
         return self.forward_context_default(q, compressed_kv, k_pe,
