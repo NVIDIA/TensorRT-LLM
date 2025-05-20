@@ -268,6 +268,10 @@ class TorchSampler(Sampler):
             } for token, logprob in zip(tokens, log_probs.tolist())]
             request.py_result.append_log_probs([token_log_probs])
 
+        if hasattr(scheduled_requests, 'chunked_requests'):
+            request_idx += len(scheduled_requests.chunked_requests)
+            token_idx += len(scheduled_requests.chunked_requests)
+
         for request in scheduled_requests.context_requests:
             if request.get_context_remaining_length() != 0:
                 advance_idx()
@@ -281,9 +285,6 @@ class TorchSampler(Sampler):
                 handle_logits(request, [new_token])
                 request.py_decoding_iter += 1
             advance_idx()
-
-        if hasattr(scheduled_requests, 'chunked_requests'):
-            request_idx += len(scheduled_requests.chunked_requests)
 
         extend_requests = []
         generation_requests = []
