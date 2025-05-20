@@ -88,7 +88,7 @@ GetInferenceModel = Callable[[CachedSequenceInterface], nn.Module]
 @dataclass
 class AutoDeployConfig(PyTorchConfig):
     # model factory to choose from
-    model_factory: str = "hf"  # only 'hf' supported for "trtllm" runtime
+    model_factory: str = "AutoModelForCausalLM"
 
     ### MODEL EXTRA KWARGS ###
     # Extra kwargs for the model config class to customize the model config. Those arguments will

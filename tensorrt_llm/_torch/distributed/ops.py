@@ -1,4 +1,5 @@
 import math
+import os
 import threading
 from typing import List, Optional, Tuple, Union
 
@@ -26,6 +27,22 @@ def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
         )
         allreduce_workspaces[mapping] = (ipc_buffers, workspace)
     return allreduce_workspaces[mapping][1]
+
+
+def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
+    if not hasattr(_thread_local, 'lowprecision_allreduce_workspaces'):
+        _thread_local.lowprecision_allreduce_workspaces = {}
+    lowprecision_allreduce_workspaces = _thread_local.lowprecision_allreduce_workspaces
+    if mapping not in lowprecision_allreduce_workspaces:
+        ipc_buffers, workspace = CustomAllReduceHelper.allocate_lowprecision_workspace(
+            mapping,
+            CustomAllReduceHelper.max_workspace_size_lowprecision(
+                mapping.tp_size),
+        )
+        lowprecision_allreduce_workspaces[mapping] = (ipc_buffers, workspace)
+        CustomAllReduceHelper.initialize_lowprecision_buffers(
+            workspace, mapping.tp_size)
+    return
 
 
 def userbuffers_allreduce_finalize(
@@ -209,38 +226,52 @@ class AllReduce(nn.Module):
         Args:
             mapping (Mapping):  The parallel mapping config.
             strategy (AllReduceStrategy):
-                Three types of all-reduce strategies are supported:
-                - UB: AllReduce uses user-buffer based all-reduce kernel. Supported ops:
-                    - RESIDUAL_RMS_NORM
-                    - RESIDUAL_RMS_NORM_QUANT_FP8
-                    - RESIDUAL_RMS_NORM_QUANT_NVFP4
+                The following all-reduce strategies are supported:
 
-                - NCCL: AllReduce delegates all-reduce to NCCL MIN_LATENCY mode kernel. Supported ops:
-                    - NONE (AllReduce only)
-                    - RESIDUAL_RMS_NORM
+                - UB: AllReduce uses user-buffer based all-reduce kernel.
 
-                - MIN_LATENCY: AllReduce uses MIN_LATENCY mode kernel. Supported ops:
-                    - NONE (AllReduce only)
-                    - RESIDUAL_RMS_NORM
-                    - RESIDUAL_RMS_NORM_QUANT_FP8
-                    - RESIDUAL_RMS_NORM_QUANT_NVFP4
-                    - RESIDUAL_RMS_NORM_OUT_QUANT_FP8
-                    - RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
+                - NCCL: Use NCCL allreduce.
+
+                - MIN_LATENCY: AllReduce uses MIN_LATENCY mode kernel.
 
                 - AUTO: AUTO chooses between NCCL and MIN_LATENCY mode based on a heuristic policy.
+
+                - LOWPRECISION: AllReduce quantizes data to lower precision for transmission.
+                  Should only be used on topologies with PCIe switches and without NVLink.
+                  This strategy may result in some precision loss but can improve performance
+                  on specific hardware configurations.
+
+            All strategies support the following operations:
+                - NONE (AllReduce only)
+                - RESIDUAL_RMS_NORM
+                - RESIDUAL_RMS_NORM_QUANT_FP8
+                - RESIDUAL_RMS_NORM_QUANT_NVFP4
+                - RESIDUAL_RMS_NORM_OUT_QUANT_FP8
+                - RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
+
+            Note: NCCL, UB, and LOWPRECISION strategies only support consequent kernel calls
+        instead of fused operations.
 
         Note:
             For the reference implementation for each pattern, please refer to the following unit test:
             https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/unittest/_torch/multi_gpu/test_allreduce.py
+
+            The LOWPRECISION strategy can be selected either by directly specifying it in the constructor
+            or by setting the environment variable FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY when using
+            the AUTO strategy.
         """
 
         self.mapping = mapping
         self.workspace = None
         self.strategy = strategy
 
+        self.force_low_precision_env = os.environ.get(
+            "FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY")
         if self.mapping.tp_size > 1:
             # When Strategy is UB, it is guaranteed that the workspace is not used.
             if self.strategy != AllReduceStrategy.UB:
+                if self.strategy == AllReduceStrategy.LOWPRECISION or self.force_low_precision_env is not None:
+                    allocate_low_presicion_allreduce_workspace(self.mapping)
                 self.workspace = get_allreduce_workspace(self.mapping)
 
     def forward(
