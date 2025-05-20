@@ -1490,7 +1490,11 @@ class PyExecutor:
                 or req.is_disagg_generation_transmission_in_progress else 1
                 for req in self.active_requests
             ])
+
         num_dummy_request = self.expected_num_active_requests - num_active_request
+        if num_dummy_request <= 0:
+            return
+
         llm_request_list = self.kv_cache_manager.add_dummy_requests(
             request_ids=list(range(num_dummy_request)),
             is_gen=not self.has_context_request,
