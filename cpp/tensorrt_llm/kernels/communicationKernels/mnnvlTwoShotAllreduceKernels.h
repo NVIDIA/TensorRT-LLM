@@ -14,19 +14,48 @@
  * limitations under the License.
  */
 #pragma once
-#include "tensorrt_llm/runtime/mcastDeviceMemory.h"
-#include "tensorrt_llm/runtime/torchUtils.h"
-#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
+#include <NvInferRuntime.h>
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <torch/extension.h>
 
-namespace tensorrt_llm::kernels
+namespace tensorrt_llm::kernels::mnnvl
 {
-torch::Tensor twoShotAllReduceDispatch(tensorrt_llm::runtime::McastDeviceMemory* mcast_mem, at::Tensor& output,
-    at::Tensor const& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, bool wait_for_results);
-void twoShotRMSNorm(torch::Tensor& prenorm_output, torch::Tensor& normed_output, torch::Tensor const& input,
-    torch::Tensor const& gamma, double epsilon, torch::Tensor const& residual, torch::Tensor& buffer_flags);
-} // namespace tensorrt_llm::kernels
+struct AllReduceParams
+{
+    int nranks;
+    int rank;
+    nvinfer1::DataType dtype;
+    int buffer_M;
+    int num_tokens;
+    int token_dim;
+    void** buffer_ptrs_dev;
+    void* multicast_ptr;
+    void* buffer_flags;
+    bool wait_for_results;
+
+    void* input;
+    void* output;
+    cudaStream_t stream;
+};
+
+void twoshot_allreduce_op(AllReduceParams const& params);
+
+struct RMSNormParams
+{
+    void* residual_output;
+    void* output;
+    void const* input;
+    void const* gamma;
+    double epsilon;
+    void* residual;
+    uint32_t* buffer_flags;
+    int batch;
+    int hidden_dim;
+    cudaStream_t stream;
+    nvinfer1::DataType dtype;
+};
+
+void twoshot_rmsnorm_op(RMSNormParams const& params);
+} // namespace tensorrt_llm::kernels::mnnvl
