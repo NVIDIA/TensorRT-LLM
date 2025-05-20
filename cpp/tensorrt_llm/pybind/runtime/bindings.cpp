@@ -16,6 +16,7 @@
  */
 
 #include "bindings.h"
+#include "moeBindings.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
@@ -418,6 +419,9 @@ void initBindings(pybind11::module_& m)
         .value("UB", tensorrt_llm::kernels::AllReduceStrategyType::UB)
         .value("ONESHOT", tensorrt_llm::kernels::AllReduceStrategyType::ONESHOT)
         .value("TWOSHOT", tensorrt_llm::kernels::AllReduceStrategyType::TWOSHOT);
+
+    // Initialize MoeLoadBalancer bindings
+    initMoeBindings(m);
 }
 
 } // namespace tensorrt_llm::pybind::runtime

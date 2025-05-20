@@ -366,21 +366,9 @@ full:B200/perf/test_perf.py::test_perf[t5_3b] SKIP (bert_attention_plugin does n
 full:B200/perf/test_perf.py::test_perf[t5_base] SKIP (bert_attention_plugin does not support SM >= 100)
 full:B200/perf/test_perf.py::test_perf[t5_large] SKIP (bert_attention_plugin does not support SM >= 100)
 
-full:B40/perf/test_perf.py::test_perf[quant:w4a8_awq] SKIP (https://nvbugspro.nvidia.com/bug/5161074)
-full:B40/perf/test_perf.py::test_perf[quant:int8_sq_per_tensor] SKIP (https://nvbugspro.nvidia.com/bug/5161074)
-full:B40/perf/test_perf.py::test_perf[quant:int8_sq_per_token_channel] SKIP (https://nvbugspro.nvidia.com/bug/5161074)
-full:B40/perf/test_perf.py::test_perf[bart_large_cnn] SKIP (bert_attention_plugin does not support SM >= 100)
-full:B40/perf/test_perf.py::test_perf[bert_large] SKIP (bert_attention_plugin does not support SM >= 100)
-full:B40/perf/test_perf.py::test_perf[flan_t5_base] SKIP (bert_attention_plugin does not support SM >= 100)
-full:B40/perf/test_perf.py::test_perf[flan_t5_large] SKIP (bert_attention_plugin does not support SM >= 100)
-full:B40/perf/test_perf.py::test_perf[flan_t5_xl] SKIP (bert_attention_plugin does not support SM >= 100)
-full:B40/perf/test_perf.py::test_perf[flan_t5_xxl] SKIP (bert_attention_plugin does not support SM >= 100)
-full:B40/perf/test_perf.py::test_perf[mbart_large_50_many_to_one_mmt] SKIP (bert_attention_plugin does not support SM >= 100)
-full:B40/perf/test_perf.py::test_perf[roberta_base] SKIP (bert_attention_plugin does not support SM >= 100)
-full:B40/perf/test_perf.py::test_perf[t5_11b] SKIP (bert_attention_plugin does not support SM >= 100)
-full:B40/perf/test_perf.py::test_perf[t5_3b] SKIP (bert_attention_plugin does not support SM >= 100)
-full:B40/perf/test_perf.py::test_perf[t5_base] SKIP (bert_attention_plugin does not support SM >= 100)
-full:B40/perf/test_perf.py::test_perf[t5_large] SKIP (bert_attention_plugin does not support SM >= 100)
+full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[quant:w4a8_awq] SKIP (https://nvbugspro.nvidia.com/bug/5161074)
+full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[quant:int8_sq_per_tensor] SKIP (https://nvbugspro.nvidia.com/bug/5161074)
+full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[quant:int8_sq_per_token_channel] SKIP (https://nvbugspro.nvidia.com/bug/5161074)
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-recurrentgemma-2b-use_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5174573)
 accuracy/test_llm_api.py::TestMistral_Nemo_12B_Base::test_fp8 SKIP (https://nvbugspro.nvidia.com/bug/5181262)
 examples/test_qwen.py::test_llm_qwen_moe_single_gpu_summary[qwen1.5_moe_a2.7b_chat-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha] SKIP (https://nvbugs/5180961)
@@ -423,8 +411,11 @@ perf/test_perf.py::test_perf[t5-bench-float16-input_output_len:128,20-gpus:2] SK
 perf/test_perf.py::test_perf[t5-bench-float16-maxbs:1-input_output_len:128,20-gpus:2] SKIP
 perf/test_perf.py::test_perf[gpt_20b-bench-float16-maxbs:8-input_output_len:128,128-reqs:80-gpus:8] SKIP
 perf/test_perf.py::test_perf[gpt_20b-bench-float16-maxbs:8-input_output_len:512,32-reqs:80-gpus:8] SKIP
-full:B40/perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float16-input_output_len:128,128-quant:fp8] SKIP #https://nvbugspro.nvidia.com/bug/5150255
-full:B200/perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float16-input_output_len:128,128-quant:fp8] SKIP #https://nvbugspro.nvidia.com/bug/5150255
+full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float8-input_output_len:128,128] SKIP (https://nvbugspro.nvidia.com/bug/5150255)
+full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-tp:2-gpus:2] SKIP #https://docs.google.com/spreadsheets/d/1EvwCcJ5o2zmhVxFFxAAz-49UzswMlfN2y5K37Fkyw7A/edit?gid=907483661#gid=907483661
+full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[llama_v3.3_nemotron_49b-bench-pytorch-bfloat16-input_output_len:128,128-tp:2-gpus:2] SKIP #https://docs.google.com/spreadsheets/d/1EvwCcJ5o2zmhVxFFxAAz-49UzswMlfN2y5K37Fkyw7A/edit?gid=907483661#gid=907483661
+full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp4-bench-pytorch-float4-input_output_len:128,128] SKIP #https://docs.google.com/spreadsheets/d/1EvwCcJ5o2zmhVxFFxAAz-49UzswMlfN2y5K37Fkyw7A/edit?gid=907483661#gid=907483661
+full:B200/perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float16-input_output_len:128,128-quant:fp8] SKIP (https://nvbugspro.nvidia.com/bug/5150255)
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-recurrentgemma-2b-use_paged_cache-int8_sq-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5232405)
 accuracy/test_cli_flow.py::TestLlama3_2_1B::test_cyclic_kv_cache SKIP (https://nvbugs/5231310)
 accuracy/test_cli_flow.py::TestSantacoder::test_auto_dtype SKIP (https://nvbugs/5231468)
