@@ -270,7 +270,7 @@ class MambaMixer(nn.Module):
                 # get conv and ssm states for decode
                 if not is_warmup:
                     current_conv_states = conv_states[indices]
-                    current_ssm_states = ssm_states[indices].transpose(2, 3)
+                    current_ssm_states = ssm_states[indices]
 
                 # update conv states
                 xbc = causal_conv1d_update(
@@ -324,8 +324,7 @@ class MambaMixer(nn.Module):
             # copy new conv and ssm states
             if not is_warmup:
                 conv_states.index_copy_(0, indices, current_conv_states)
-                ssm_states.index_copy_(0, indices,
-                                       current_ssm_states.transpose(2, 3))
+                ssm_states.index_copy_(0, indices, current_ssm_states)
 
             # append output
             out.append(y)
