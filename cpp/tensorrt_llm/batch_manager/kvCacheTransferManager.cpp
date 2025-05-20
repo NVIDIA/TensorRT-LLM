@@ -282,6 +282,13 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadBlock, BlockPtr cons
     std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::optional<std::string> directory)
 {
+    if (mPendingOffloads.find(offloadBlock->getBlockId()) == mPendingOffloads.end())
+    {
+        TLLM_LOG_DEBUG("Skipping onboard for block %d because it was never previously offloaded to disk",
+            offloadBlock->getBlockId());
+        return;
+    }
+
     if (mPendingOffloads.find(offloadBlock->getBlockId()) != mPendingOffloads.end())
     {
         mOnboardManager.getStream().wait(mPendingOffloads[offloadBlock->getBlockId()]);
