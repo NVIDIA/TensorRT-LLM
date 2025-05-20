@@ -352,11 +352,12 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
                  gen_servers: List[str],
                  req_timeout_secs: int = 180,
                  server_start_timeout_secs: int = 180,
-                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
+                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                 tokens_per_block: int = 32):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs)
-        self.ctx_router = KvCacheAwareRouter(ctx_servers)
-        self.gen_router = KvCacheAwareRouter(gen_servers)
+        self.ctx_router = KvCacheAwareRouter(ctx_servers, tokens_per_block)
+        self.gen_router = KvCacheAwareRouter(gen_servers, tokens_per_block)
         self.model_name = model_name
 
     async def multi_round_request(self,
@@ -536,6 +537,30 @@ def test_workers_conditional_disaggregation(disaggregated_test_root,
         asyncio.run(tester.test_multi_round_request(prompts))
 
 
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
+                         indirect=True)
+def test_workers_conditional_disaggregation_deepseek_v3_lite_bf16(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    config_file = os.path.join(
+        disaggregated_test_root,
+        'test_configs/disagg_config_cache_reuse_deepseek_v3.yaml')
+    model_root = f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16"
+    src_dst_dict = {
+        deepseek_v3_model_root: model_root,
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    with background_workers(llm_venv, config_file,
+                            2) as (ctx_servers, gen_servers):
+        tester = ConditionalWorkerTester(ctx_servers, gen_servers)
+        prompts = load_default_prompts(disaggregated_example_root)
+        asyncio.run(tester.test_multi_round_request(prompts))
+
+
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
 def test_workers_kv_cache_events(disaggregated_test_root,
@@ -570,15 +595,15 @@ def test_workers_kv_cache_aware_router(disaggregated_test_root,
 
 
 @skip_no_hopper
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
-def test_workers_kv_cache_aware_router_deepseek_v3_lite_fp8(
+def test_workers_kv_cache_aware_router_deepseek_v3_lite_bf16(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         deepseek_v3_model_root):
     config_file = os.path.join(
         disaggregated_test_root,
         'test_configs/disagg_config_cache_aware_balance_deepseek_v3.yaml')
-    model_root = f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8"
+    model_root = f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16"
     src_dst_dict = {
         deepseek_v3_model_root: model_root,
     }
@@ -592,7 +617,8 @@ def test_workers_kv_cache_aware_router_deepseek_v3_lite_fp8(
         os.chdir(llm_venv.get_working_directory())
         tester = KvCacheAwareRouterTester(ctx_servers,
                                           gen_servers,
-                                          model_name="DeepSeek-V3-Lite/fp8")
+                                          model_name="DeepSeek-V3-Lite/bf16",
+                                          tokens_per_block=64)
         prompts = load_default_prompts(disaggregated_example_root)
         asyncio.run(tester.test_multi_round_request(prompts, 4, 4))
 
