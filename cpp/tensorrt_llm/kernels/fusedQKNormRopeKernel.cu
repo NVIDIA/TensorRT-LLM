@@ -78,10 +78,10 @@ __global__ void fusedQKNormRopeKernel(
     // Load elements and compute sum of squares
     int i = 0;
 
+    // Load vectorized elements
 #pragma unroll
     for (; i < numVecPerThread * 4; i += 4)
     {
-        // Load 4 bfloat16 elements using LDG.64
         uint2 data;
         data = *reinterpret_cast<uint2 const*>(&qkv[offsetThread + i]);
 
@@ -100,7 +100,8 @@ __global__ void fusedQKNormRopeKernel(
         sumOfSquares += elements[i + 2] * elements[i + 2];
         sumOfSquares += elements[i + 3] * elements[i + 3];
     }
-
+    // Load remaining elements
+#pragma unroll
     for (; i < numElemsPerThread; i++)
     {
         elements[i] = __bfloat162float(qkv[offsetThread + i]);
@@ -142,8 +143,9 @@ __global__ void fusedQKNormRopeKernel(
         applyRoPE(elements[i], elements[i + 1], cosTheta, sinTheta);
     }
 
-    // Write back to original tensor
-    for (i = 0; i < numElemsPerThread; i += 4)
+    // Store vectorized elements
+    #pragma unroll
+    for (i = 0; i < numVecPerThread * 4; i += 4)
     {
         // Convert back to bfloat16 format
         __nv_bfloat162 vals0 = __float22bfloat162_rn(make_float2(elements[i], elements[i + 1]));
@@ -157,6 +159,12 @@ __global__ void fusedQKNormRopeKernel(
         int writeOffset = offsetThread + i;
         uint2* outputPtr = reinterpret_cast<uint2*>(&qkv[writeOffset]);
         *outputPtr = data;
+    }
+    // Store remaining elements
+    #pragma unroll
+    for (; i < numElemsPerThread; i++)
+    {
+        qkv[offsetThread + i] = __float2bfloat16_rn(elements[i]);
     }
 }
 

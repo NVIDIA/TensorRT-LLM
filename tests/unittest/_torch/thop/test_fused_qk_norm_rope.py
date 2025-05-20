@@ -77,16 +77,9 @@ def torch_ref_rms_norm_rope(qkv,
                                  is_neox=False).to(qkv.device)
 
     # Apply RoPE to the normalized Q and K
-    # RotaryEmbedding expects [batch_size, seq_len, ...] format, so we unsqueeze to add a batch dimension
-    # and then squeeze to get back to the original format
-    [q_rope, k_rope
-     ] = rotary_emb(position_ids.unsqueeze(0),
-                    [q_normalized.unsqueeze(0),
-                     k_normalized.unsqueeze(0)])
+    [q_rope, k_rope] = rotary_emb(position_ids,
+                                  [q_normalized, k_normalized])
 
-    # Reshape back to 2D
-    q_rope = q_rope.squeeze(0)
-    k_rope = k_rope.squeeze(0)
 
     # Combine Q, K, V back together
     result = torch.cat([q_rope, k_rope, v], dim=1)
@@ -94,16 +87,15 @@ def torch_ref_rms_norm_rope(qkv,
     return result
 
 
-head_dims = [128]  #[64, 128]
+head_dims = [64, 128]
 # (Q heads, K heads, V heads)
 num_heads_groups = [
-    (1, 1, 1),
-    # (16, 8, 8),  # Qwen3-0.6B, Qwen3-1.7B
-    # (32, 8, 8),  # Qwen3-4B, Qwen3-8B, Qwen3-30B-A3B
-    # (40, 8, 8),  # Qwen3-14B
-    # (64, 8, 8)   # Qwen3-32B, Qwen3-235B-A22B
+    (16, 8, 8),  # Qwen3-0.6B, Qwen3-1.7B
+    (32, 8, 8),  # Qwen3-4B, Qwen3-8B, Qwen3-30B-A3B
+    (40, 8, 8),  # Qwen3-14B
+    (64, 8, 8)   # Qwen3-32B, Qwen3-235B-A22B
 ]
-num_tokens_list = [1]  #, 3, 8, 32, 256]
+num_tokens_list = [3, 8, 32, 256]
 dtypes = [torch.bfloat16]  # TODO: support float16
 
 
@@ -152,6 +144,8 @@ def test_fused_qk_norm_rope(head_dim, num_heads_group, num_tokens, dtype):
     torch.ops.trtllm.fused_qk_norm_rope(qkv, position_ids, num_heads_q,
                                         num_heads_k, num_heads_v, head_dim, eps,
                                         base)
+    # Check for CUDA errors
+    torch.cuda.synchronize()
     output = qkv  # This op is inplace
 
     # Compute reference output using TensorRT-LLM modules
@@ -168,17 +162,17 @@ def test_fused_qk_norm_rope(head_dim, num_heads_group, num_tokens, dtype):
     k_size = num_heads_k * head_dim
     num_heads_v * head_dim
 
-    q = output[:, :q_size]
-    k = output[:, q_size:q_size + k_size]
-    v = output[:, q_size + k_size:]
+    q = output[2, :q_size]
+    k = output[2, q_size:q_size + k_size]
+    v = output[2, q_size + k_size:]
 
-    q_ref = ref_output[:, :q_size]
-    k_ref = ref_output[:, q_size:q_size + k_size]
-    v_ref = ref_output[:, q_size + k_size:]
+    q_ref = ref_output[2, :q_size]
+    k_ref = ref_output[2, q_size:q_size + k_size]
+    v_ref = ref_output[2, q_size + k_size:]
 
-    q_orig = qkv_copy[:, :q_size]
-    k_orig = qkv_copy[:, q_size:q_size + k_size]
-    v_orig = qkv_copy[:, q_size + k_size:]
+    q_orig = qkv_copy[2, :q_size]
+    k_orig = qkv_copy[2, q_size:q_size + k_size]
+    v_orig = qkv_copy[2, q_size + k_size:]
 
     print("Query:", q)
     print("Query Ref:", q_ref)
