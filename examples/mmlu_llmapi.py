@@ -253,8 +253,8 @@ def parse_args():
     parser.add_argument("--enable_chunked_prefill",
                         action="store_true",
                         help="Exercises the chunked prefill inference feature.")
-    parser.add_argument('--enable_overlap_scheduler',
-                        default=False,
+    parser.add_argument('--disable_overlap_scheduler',
+                        default=True,
                         action='store_true')
     parser.add_argument(
         '--kv_cache_free_gpu_memory_fraction',
@@ -317,7 +317,7 @@ def main():
         config = PyTorchConfig(
             attn_backend=args.attn_backend,
             moe_backend=args.moe_backend,
-            enable_overlap_scheduler=args.enable_overlap_scheduler,
+            disable_overlap_scheduler=args.disable_overlap_scheduler,
             torch_compile_enabled=args.torch_compile)
         llm = tensorrt_llm._torch.LLM(
             model=args.hf_model_dir,

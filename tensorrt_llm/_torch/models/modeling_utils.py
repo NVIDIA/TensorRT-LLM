@@ -21,6 +21,7 @@ from ..attention_backend import AttentionMetadata
 from ..distributed.communicator import pp_recv, pp_send
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
+from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding, LMHead
 from ..modules.fused_moe import FusedMoE
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
@@ -205,6 +206,63 @@ def forward_before_send(forward_fn):
         return output
 
     return forward_before_send_fn
+
+
+class MissingLayer(torch.nn.Identity):
+    """Signature of missing layers in pipeline parallel setup."""
+
+    def __init__(self):
+        super().__init__()
+
+
+class MissingDecoderLayer(MissingLayer, DecoderLayer):
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return hidden_states, residual
+
+    def is_missing(self) -> bool:
+        return True
+
+
+def missing_layer_parameter(name: str, model: torch.nn.Module) -> bool:
+    """ Check if a layer parameter is missing if when pp is enabled.
+        A layer parameter is missing if either:
+            1. The model itself is a MissingLayer, or
+            2. It has a submodule that is a MissingLayer.
+    """
+    if isinstance(model, MissingLayer):
+        return True
+
+    return any(
+        name.startswith(missing_layer_name)
+        for missing_layer_name in _get_missing_layer_names(model))
+
+
+# Static cache to store missing layer names for each model instance
+_model_to_missing_layer_names: Dict[int, List[str]] = {}
+
+
+def _get_missing_layer_names(model: torch.nn.Module) -> List[str]:
+    """ Get the missing layer names of a given model when pp is enabled.
+    """
+    model_id = id(model)
+    if model_id in _model_to_missing_layer_names:
+        return _model_to_missing_layer_names[model_id]
+
+    missing_layer_names = []
+    for name, module in model.named_modules():
+        if isinstance(module, MissingLayer):
+            # Add trailing dot to ensure exact prefix matching
+            missing_layer_names.append(name + '.')
+
+    # Cache the result
+    _model_to_missing_layer_names[model_id] = missing_layer_names
+    return missing_layer_names
 
 
 class PPInitCaller(type):

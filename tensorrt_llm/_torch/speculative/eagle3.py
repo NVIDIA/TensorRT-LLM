@@ -12,7 +12,7 @@ from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, allreduce_argmax
 from ..pyexecutor.sampler import SampleState, SampleStateTensors, TorchSampler
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
-from .mtp import MTPDecoder
+from .mtp import MTPSampler
 
 
 @dataclass
@@ -234,7 +234,7 @@ class Eagle3Decoder(TorchSampler):
                            decoder_event=decoder_event)
 
 
-class Eagle3OneModelDecoder(MTPDecoder):
+class Eagle3OneModelDecoder(MTPSampler):
 
     def __init__(self, max_seq_len: int, config: Eagle3Config):
         super().__init__(max_seq_len, None)

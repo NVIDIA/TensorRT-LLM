@@ -71,22 +71,6 @@ def get_num_tokens(x: torch.Tensor) -> int:
         x, Fp4QuantizedTensor) else x.shape[0]
 
 
-class LlamaRotaryEmbedding(RotaryEmbedding):
-
-    def __init__(
-        self,
-        config: LlamaConfig,
-        device: Optional[torch.device] = None,
-    ):
-        super().__init__(
-            config,
-            head_dim=config.hidden_size // config.num_attention_heads,
-            num_attention_heads=config.num_attention_heads,
-            max_position_embeddings=config.max_position_embeddings,
-            device=device,
-            rope_type="default" if config.rope_scaling is None else "llama3")
-
-
 class Llama4Linear(Linear):
     """
     A wrapper around Linear because we may optionally use min-latency kernels depending on input shapes.
@@ -104,7 +88,7 @@ class Llama4Linear(Linear):
         quant_config: Optional[QuantConfig] = None,
         weights_loading_config: Optional[WeightsLoadingConfig] = None,
         reduce_output: bool = True,
-        skip_create_weights: bool = False,
+        skip_create_weights_in_init: bool = False,
         use_custom_cublas_mm: bool = False,
         enable_fused_gemm_swiglu: bool = False,
         enable_fused_gemm_attn_scaling: bool = False,
@@ -122,7 +106,7 @@ class Llama4Linear(Linear):
             quant_config,
             weights_loading_config,
             reduce_output,
-            skip_create_weights,
+            skip_create_weights_in_init,
             use_custom_cublas_mm,
         )
         self.enable_fused_gemm_swiglu = enable_fused_gemm_swiglu
@@ -326,7 +310,7 @@ class Llama4GatedMLP(GatedMLP):
                     weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
                 quant_config=config.get_quant_config(),
                 reduce_output=reduce_output,
-                skip_create_weights=config.skip_create_weights,
+                skip_create_weights_in_init=config.skip_create_weights_in_init,
                 enable_fused_gemm_swiglu=True,
                 enable_trtllm_gen=True,
             )
@@ -351,7 +335,7 @@ class Llama4GatedMLP(GatedMLP):
                 tensor_parallel_mode=TensorParallelMode.ROW,
                 quant_config=config.get_quant_config(),
                 reduce_output=reduce_output,
-                skip_create_weights=config.skip_create_weights,
+                skip_create_weights_in_init=config.skip_create_weights_in_init,
                 enable_trtllm_gen=True,
                 post_load_weights_hook=partial(post_load_weights_hook,
                                                self.gate_up_proj),
@@ -457,7 +441,8 @@ class Llama4Attention(Attention):
                 weights_loading_config=WeightsLoadingConfig(
                     weight_mode=WeightMode.FUSED_QKV_LINEAR),
                 quant_config=model_config.get_quant_config(),
-                skip_create_weights=model_config.skip_create_weights,
+                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init,
                 enable_fused_gemm_attn_scaling=self.
                 enable_fused_gemm_attn_scaling,
                 enable_trtllm_gen=True,
@@ -505,13 +490,6 @@ class Llama4Attention(Attention):
         mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
     ):
-        # if self.attn_temperature_tuning and self.qkv_proj.use_llama4_qkv and num_tokens <= 8:
-        #     assert position_ids is not None, "attn_temperature_tuning requires position_ids"
-        #     assert self.floor_scale == 8192.0 and self.attn_scale == 0.1, "floor_scale and attn_scale should be 8192.0 and 0.1"
-        #     qkv = self.qkv_proj(hidden_states, position_ids=position_ids)
-        # else:
-        #     qkv = self.qkv_proj(hidden_states)
-
         qkv = self.qkv_proj(hidden_states)
 
         q, k, v = qkv, None, None
@@ -1454,34 +1432,17 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
         input_ids: torch.LongTensor = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        pipeline_interface: Optional[PipelineInterface] = None,
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if self._supports_pp and self.pp_size > 1:
-            output = self.model(
-                input_ids=input_ids,
-                attn_metadata=attn_metadata,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                pipeline_interface=pipeline_interface,
-                spec_metadata=spec_metadata,
-            )
-
-            # No need to compute logits for non-last PP ranks
-            if self.pp_rank < self.pp_size - 1:
-                return output
-            else:
-                hidden_states = output
-        else:
-            hidden_states = self.model(
-                input_ids=input_ids,
-                attn_metadata=attn_metadata,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                spec_metadata=spec_metadata,
-            )
+        hidden_states = self.model(
+            input_ids=input_ids,
+            attn_metadata=attn_metadata,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            spec_metadata=spec_metadata,
+        )
 
         if self.draft_model is not None:
             # get logits
@@ -1632,35 +1593,18 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
         input_ids: torch.LongTensor = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        pipeline_interface: Optional[PipelineInterface] = None,
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         if self.is_eagle3_one_model:
-            if self._supports_pp and self.pp_size > 1:
-                output = self.model(
-                    input_ids=input_ids,
-                    attn_metadata=attn_metadata,
-                    position_ids=position_ids,
-                    inputs_embeds=inputs_embeds,
-                    pipeline_interface=pipeline_interface,
-                    spec_metadata=spec_metadata,
-                )
-
-                # No need to compute logits for non-last PP ranks
-                if self.pp_rank < self.pp_size - 1:
-                    return output
-                else:
-                    hidden_states = output
-            else:
-                hidden_states = self.model(
-                    input_ids=input_ids,
-                    attn_metadata=attn_metadata,
-                    position_ids=position_ids,
-                    inputs_embeds=inputs_embeds,
-                    spec_metadata=spec_metadata,
-                )
+            hidden_states = self.model(
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                spec_metadata=spec_metadata,
+            )
 
             if self.draft_model is not None:
                 # get logits
@@ -1698,8 +1642,7 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
                 position_ids,
                 inputs_embeds,
                 spec_metadata=spec_metadata,
-                return_context_logits=return_context_logits,
-                pipeline_interface=pipeline_interface)
+                return_context_logits=return_context_logits)
             return logits
 
     def infer_max_seq_len(self):
