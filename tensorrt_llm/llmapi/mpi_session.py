@@ -179,9 +179,6 @@ class MpiPoolSession(MpiSession):
 class MpiCommSession(MpiSession):
 
     def __init__(self, comm=None, n_workers: int = 1):
-        if not external_mpi_comm_available(n_workers):
-            raise RuntimeError('The LLM instance should be launched by mpirun.')
-
         self.comm = comm
         self.n_workers = n_workers
         self.thread_pool: Optional[ThreadPoolExecutor] = None
