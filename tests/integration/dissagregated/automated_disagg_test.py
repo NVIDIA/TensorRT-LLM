@@ -25,8 +25,9 @@ class DisaggregatedTester:
             "trtllm-serve", self.config['model_path'], "--host", "localhost",
             "--port",
             str(port), "--backend", "pytorch", "--extra_llm_api_options",
-            self.config['extra_llm_api_path'], "--metadata_server_config_file",
-            self.config['etcd_config_path'], "--server_role", "CONTEXT"
+            self.config['extra_llm_context_api_path'],
+            "--metadata_server_config_file", self.config['etcd_config_path'],
+            "--server_role", "CONTEXT"
         ]
 
         env = os.environ.copy()
@@ -49,8 +50,9 @@ class DisaggregatedTester:
             "trtllm-serve", self.config['model_path'], "--host", "localhost",
             "--port",
             str(port), "--backend", "pytorch", "--extra_llm_api_options",
-            self.config['extra_llm_api_path'], "--metadata_server_config_file",
-            self.config['etcd_config_path'], "--server_role", "GENERATION"
+            self.config['extra_llm_generation_api_path'],
+            "--metadata_server_config_file", self.config['etcd_config_path'],
+            "--server_role", "GENERATION"
         ]
 
         env = os.environ.copy()
@@ -259,6 +261,33 @@ class DisaggregatedTester:
             except psutil.NoSuchProcess:
                 pass
 
+    def create_config_files(self):
+        """Create necessary configuration files."""
+        # Create context config file
+        context_config_content = """pytorch_backend_config:
+  enable_overlap_scheduler: False
+cache_transceiver_config:
+  max_num_tokens: 2048"""
+
+        context_config_path = "examples/disaggregated/context_extra-llm-api-config.yml"
+        os.makedirs(os.path.dirname(context_config_path), exist_ok=True)
+        with open(context_config_path, 'w') as file:
+            file.write(context_config_content)
+
+        # Create generation config file
+        generation_config_content = """cache_transceiver_config:
+  max_num_tokens: 2048"""
+
+        generation_config_path = "examples/disaggregated/gen_extra-llm-api-config.yml"
+        with open(generation_config_path, 'w') as file:
+            file.write(generation_config_content)
+
+        # Update config paths
+        self.config['extra_llm_context_api_path'] = context_config_path
+        self.config['extra_llm_generation_api_path'] = generation_config_path
+
+        return True
+
     def run_complete_test(self) -> bool:
         """Run the complete automated test."""
         try:
@@ -323,9 +352,13 @@ def parse_args():
                         default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
                         help="Path to the model")
     parser.add_argument(
-        "--extra-llm-api-path",
-        default="examples/disaggregated/extra-llm-api-config.yml",
-        help="Path to extra LLM API config")
+        "--extra_llm_context_api_path",
+        default="examples/disaggregated/context_extra-llm-api-config.yml",
+        help="Path to extra LLM context API config")
+    parser.add_argument(
+        "--extra_llm_generation_api_path",
+        default="examples/disaggregated/gen_extra-llm-api-config.yml",
+        help="Path to extra LLM generation API config")
     parser.add_argument("--etcd-config-path",
                         default="examples/disaggregated/etcd_config.yaml",
                         help="Path to etcd config")
@@ -347,7 +380,8 @@ if __name__ == "__main__":
 
     config = {
         "model_path": args.model_path,
-        "extra_llm_api_path": args.extra_llm_api_path,
+        "extra_llm_context_api_path": args.extra_llm_context_api_path,
+        "extra_llm_generation_api_path": args.extra_llm_generation_api_path,
         "etcd_config_path": args.etcd_config_path,
         "disagg_config_path": args.disagg_config_path,
         "client_script_path": args.client_script_path,
