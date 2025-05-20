@@ -3,7 +3,8 @@ import os
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List
+from functools import lru_cache
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -170,6 +171,7 @@ def reswizzle_sf(sf: torch.Tensor,
     return sf_out_swizzle
 
 
+@lru_cache(maxsize=None)
 def next_positive_power_of_2(x: int) -> int:
     if x < 1:
         return 1
@@ -177,6 +179,7 @@ def next_positive_power_of_2(x: int) -> int:
     return 1 << (x - 1).bit_length()
 
 
+@lru_cache(maxsize=None)
 def last_positive_power_of_2(x: int) -> int:
     next = next_positive_power_of_2(x)
     if next == x:
@@ -189,7 +192,8 @@ def nearest_in_buckets(x: int, buckets: List[int]) -> int:
     return min(max(next_positive_power_of_2(x), buckets[0]), buckets[-1])
 
 
-def get_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
+@lru_cache(maxsize=None)
+def get_power_of_2_num_tokens_buckets(max_num_tokens) -> Tuple[int]:
     max_num_tokens = next_positive_power_of_2(max_num_tokens)
     num_token_buckets = []
     m = max_num_tokens
@@ -200,7 +204,8 @@ def get_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
     return tuple(num_token_buckets)
 
 
-def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
+@lru_cache(maxsize=None)
+def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> Tuple[int]:
     max_num_tokens = last_positive_power_of_2(max_num_tokens)
     num_token_buckets = []
     m = max_num_tokens

@@ -531,6 +531,48 @@ class PyTorchModelEngine(ModelEngine):
                 result = None
             return result
 
+        def get_autotune_warmup_request():
+            available_tokens = kv_cache_manager.get_num_available_tokens(
+                self.max_draft_len)
+            num_tokens_per_request = min(
+                min(available_tokens, self.max_seq_len - 1),
+                self.max_num_tokens)
+
+            available_blocks = kv_cache_manager.get_num_free_blocks()
+
+            # We create multiple requests with the possible maximum sequence length
+            # which should be num_tokens_per_request computed with the constraints.
+            request_num_pre = self.max_num_tokens // num_tokens_per_request
+            request_len_remainder = self.max_num_tokens % num_tokens_per_request
+
+            if request_num_pre + 1 > available_blocks:
+                return None, None
+
+            requests = kv_cache_manager.add_dummy_requests(
+                request_ids=list(range(request_num_pre)),
+                token_nums=[num_tokens_per_request] * request_num_pre,
+                is_gen=False,
+                max_num_draft_tokens=self.max_draft_len)
+
+            if request_len_remainder > 0:
+                final_request = kv_cache_manager.add_dummy_requests(
+                    request_ids=[request_num_pre],
+                    token_nums=[request_len_remainder],
+                    is_gen=False,
+                    max_num_draft_tokens=self.max_draft_len)
+
+                requests += final_request
+
+            if spec_resource_manager is not None:
+                spec_resource_manager.add_dummy_requests(
+                    request_ids=list(range(request_num_pre + 1)))
+
+            result = ScheduledRequests()
+            result.context_requests = requests
+            result.generation_requests = []
+
+            return result, _create_extra_inputs(1, self.max_num_tokens)
+
         @contextlib.contextmanager
         def release_batch(result):
             try:
@@ -618,26 +660,18 @@ class PyTorchModelEngine(ModelEngine):
 
             if self.pytorch_backend_config.autotuner_enabled:
                 with no_cuda_graph(), autotune():
-                    available_tokens = kv_cache_manager.get_num_available_tokens(
-                        self.max_draft_len)
-                    num_tokens_per_request = min(
-                        min(available_tokens, self.max_seq_len - 1),
-                        self.max_num_tokens)
-                    with release_batch(
-                            get_torch_compile_warmup_request(
-                                1, num_tokens_per_request)) as batch:
+                    result, extra_model_inputs = get_autotune_warmup_request()
+                    with release_batch(result) as batch:
                         if batch is None:
                             # No KV cache space!
                             pass
                         else:
                             logger.info(
                                 f"Run autotuning warmup for batch size={1}")
-                            self.forward(
-                                batch,
-                                new_tensors_device=None,
-                                resource_manager=resource_manager,
-                                extra_model_inputs=_create_extra_inputs(
-                                    1, num_tokens_per_request))
+                            self.forward(batch,
+                                         new_tensors_device=None,
+                                         resource_manager=resource_manager,
+                                         extra_model_inputs=extra_model_inputs)
                             torch.cuda.synchronize()
 
                     logger.info(f"Autotuner Cache size after warmup " +

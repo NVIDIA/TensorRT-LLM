@@ -131,11 +131,13 @@ def fused_moe(
 
     tuner = AutoTuner.get()
 
+    # 8192 is an sufficient upper bound for moe kernels
+    tune_upper_bound = 8192
     # TODO: only profile for min_latency_mode = False due to the error in the moe_kernels
     tuning_config = TuningConfig(dynamic_tensors=(
         # input, dim 0, all valid buckets, map a seq_len to power of 2 bucket index
-        (0, 0, ((8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1),
-                next_positive_power_of_2)),
+        (0, 0, (get_power_of_2_num_tokens_buckets(tune_upper_bound),
+                lambda x: min(next_positive_power_of_2(x), tune_upper_bound))),
         # min_latency_tensor, dim 0, (0 for False, 1 for True), map to it self
         (2, 0, ((0, ), lambda x: x)),
     ))
@@ -321,7 +323,7 @@ def nvfp4_gemm(
 
     tuning_config = TuningConfig(
         dynamic_tensors=((0, 0, (
-            lambda x: get_power_of_2_num_tokens_buckets(8192)
+            lambda x: get_power_of_2_num_tokens_buckets(x)
             if not to_userbuffers else get_last_power_of_2_num_tokens_buckets(
                 x), lambda x: next_positive_power_of_2(x)
             if not to_userbuffers else last_positive_power_of_2(x))), ),
