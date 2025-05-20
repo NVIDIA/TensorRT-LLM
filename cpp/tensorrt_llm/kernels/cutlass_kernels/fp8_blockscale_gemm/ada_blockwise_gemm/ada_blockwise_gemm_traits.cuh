@@ -113,7 +113,10 @@ struct AdaBlockwiseGemmTraits
     using GmemTiledCopyScaleB = typename CopyTraitsScaleB::GmemTiledCopyScale;
 
     // Output memory copy operand
-    using SmemLayoutAtomO = cute::Layout<cute::Shape<cute::_8, cute::_64>, cute::Stride<cute::_64, cute::_1>>;
+    using SmemLayoutAtomO = decltype(cute::composition(
+        cute::Swizzle<3,3,3>{},
+        cute::Layout<cute::Shape <cute::_8,cute::Shape <cute::_8, cute::_8>>,
+               cute::Stride<cute::_8,cute::Stride<cute::_1,cute::_64>>>{}));  //  8x64
 
     using SmemCopyAtomR2S = cute::Copy_Atom<cute::AutoVectorizingCopy, ElementOutput>;
     using SmemCopyAtomS2R = cute::Copy_Atom<cute::UniversalCopy<cute::uint128_t>, ElementOutput>;
