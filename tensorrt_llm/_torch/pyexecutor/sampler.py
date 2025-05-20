@@ -83,8 +83,10 @@ class EarlyStopSampler(Sampler):
             request.set_finished_reason(FinishReason.LENGTH, 0)
             logits = state.logits[idx]
             if logits.ndim == 1:
-                # For BERT: Add vocab_size axis to be compatible with LogitsStorage.
-                logits = logits.unsqueeze(-1)
+                # For BERT: Add axis to be compatible with LogitsStorage
+                # (LogitsStorage will interpret this dim as the prompt_len which
+                # is not relevant for outputting logits of encoder only model).
+                logits = logits.unsqueeze(0)
             request.py_result.append_context_logits(logits)
 
 
