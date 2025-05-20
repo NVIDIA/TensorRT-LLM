@@ -220,18 +220,15 @@ class MambaMixer(nn.Module):
                     cu_seqlens.diff(),
                     output_size=cu_seqlens[-1]).unsqueeze(0)
 
-                conv_states_out = torch.empty_like(
+                current_conv_states = torch.empty_like(
                     conv_states[indices, ...]) if not is_warmup else None
                 xbc = causal_conv1d_fn(
                     xbc.transpose(0, 1),
                     self.conv1d.weight.permute(0, 1).contiguous(),
                     self.conv1d.bias,
                     activation="silu",
-                    conv_states=conv_states_out,
+                    conv_states=current_conv_states,
                     query_start_loc=cu_seqlens).transpose(0, 1)
-
-                if not is_warmup:
-                    conv_states.index_copy_(0, indices, conv_states_out)
 
                 x, B, C = torch.split(xbc.unsqueeze(0), [
                     self.tp_d_inner,
@@ -248,7 +245,7 @@ class MambaMixer(nn.Module):
                               "b l (h p) -> b l h p",
                               h=self.tp_nheads)
 
-                y, ssm_states_out = mamba_chunk_scan_combined(
+                y, current_ssm_states = mamba_chunk_scan_combined(
                     x,
                     dt,
                     self.A,
@@ -267,29 +264,22 @@ class MambaMixer(nn.Module):
                 )
                 y = rearrange(y, "b l h p -> (b l) (h p)")
 
-                # norm
-                y = self.norm(y)
-
             # decode
             else:
 
                 # get conv and ssm states for decode
                 if not is_warmup:
-                    conv_states_in = conv_states[indices]
-                    ssm_states_in = ssm_states[indices]
+                    current_conv_states = conv_states[indices]
+                    current_ssm_states = ssm_states[indices].transpose(2, 3)
 
                 # update conv states
                 xbc = causal_conv1d_update(
                     xbc,
-                    conv_states_in,
+                    current_conv_states,
                     # TODO: just permute and contiguous when loading weights
                     self.conv1d.weight.permute(0, 1).contiguous(),
                     self.conv1d.bias,
                     "silu")
-
-                # copy new conv states
-                if not is_warmup:
-                    conv_states.index_copy_(0, indices, conv_states_in)
 
                 x, B, C = torch.split(
                     xbc,
@@ -300,8 +290,6 @@ class MambaMixer(nn.Module):
                     ],
                     dim=-1,
                 )
-
-                ssm_states_out = ssm_states_in.transpose(2, 3)
 
                 A = repeat(self.A,
                            "h -> h p n",
@@ -316,7 +304,7 @@ class MambaMixer(nn.Module):
                 z = rearrange(z, "b (h p) -> b h p", p=self.head_dim)
 
                 y = selective_state_update(
-                    ssm_states_out,
+                    current_ssm_states,
                     x_reshaped,
                     dt,
                     A,
@@ -330,13 +318,14 @@ class MambaMixer(nn.Module):
 
                 y = rearrange(y, "b h p -> b (h p)")
 
-                # gated norm
-                y = self.norm(y)
+            # gated norm
+            y = self.norm(y)
 
-            # copy new ssm states
+            # copy new conv and ssm states
             if not is_warmup:
-                ssm_states_out = ssm_states_out.transpose(2, 3)
-                ssm_states.index_copy_(0, indices, ssm_states_out)
+                conv_states.index_copy_(0, indices, current_conv_states)
+                ssm_states.index_copy_(0, indices,
+                                       current_ssm_states.transpose(2, 3))
 
             # append output
             out.append(y)
