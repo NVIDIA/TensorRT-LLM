@@ -232,6 +232,9 @@ class ADEngine(ModelEngine):
 
         return {"logits": logits_flat}
 
+    def __del__(self):
+        dist.cleanup()
+
 
 def create_autodeploy_executor(
     executor_config: ExecutorConfig, checkpoint_dir: str = None, engine_dir: str = None
