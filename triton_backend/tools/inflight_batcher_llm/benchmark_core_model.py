@@ -168,8 +168,9 @@ def test_performance(client,
         print(f"[INFO] Total Latency: {latency} ms")
 
         # TODO(kaiyu): support `extract_print_stats` for http
+        # TODO(achartier): support `extract_print_stats` for LLMAPI
         data_dict = None
-        if FLAGS.protocol == "grpc":
+        if FLAGS.protocol == "grpc" and not FLAGS.test_llmapi:
             request_latencies = 0.0
             for latency in user_data._latencies:
                 request_latencies += latency
