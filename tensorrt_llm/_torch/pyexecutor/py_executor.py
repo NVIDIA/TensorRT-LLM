@@ -661,9 +661,6 @@ class PyExecutor:
                     iter_start_time = time.time()
                 new_requests_num = self._fetch_new_requests()
 
-                if len(self.active_requests) == 0:
-                    break
-
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         new_requests_num,
@@ -782,6 +779,10 @@ class PyExecutor:
                     self._process_iter_stats(finished_requests,
                                              self.active_requests,
                                              previous_batch)
+
+                if len(self.active_requests) == 0:
+                    break
+
         self._executor_loop_cleanup()
 
     def _executor_loop(self):
@@ -795,10 +796,6 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
                 new_requests_num = self._fetch_new_requests()
-
-                if len(self.active_requests) == 0:
-                    break
-
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         new_requests_num,
@@ -891,6 +888,9 @@ class PyExecutor:
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
 
+                if len(self.active_requests) == 0:
+                    break
+
         self._executor_loop_cleanup()
 
     def _prepare_draft_requests(self):
@@ -927,9 +927,6 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
                 new_requests_num = self._fetch_new_requests()
-
-                if len(self.active_requests) == 0:
-                    break
 
                 if self.kv_cache_transceiver:
                     self._check_disagg_gen_transfer_status()
@@ -1045,6 +1042,9 @@ class PyExecutor:
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
+
+                if len(self.active_requests) == 0:
+                    break
 
         self._executor_loop_cleanup()
 
