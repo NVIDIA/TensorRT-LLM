@@ -1046,7 +1046,7 @@ std::vector<torch::Tensor> moe_allreduce(torch::Tensor const& residual, torch::T
     return {norm_out, residual_out};
 }
 
-at::Tensor lowlatTwoShotAllReduce(
+at::Tensor mnnvlTwoShotAllReduce(
     at::Tensor& output, at::Tensor& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, bool wait_for_results)
 {
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
@@ -1059,10 +1059,10 @@ at::Tensor lowlatTwoShotAllReduce(
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "lowlat_twoshot_allreduce(Tensor(output!) output, Tensor(input!) input, Tensor(comm_buf!) comm_buffer, "
+        "mnnvl_twoshot_allreduce(Tensor(output!) output, Tensor(input!) input, Tensor(comm_buf!) comm_buffer, "
         "Tensor(buffer_flags!) buffer_flags, bool wait_for_result) -> Tensor");
     m.def(
-        "lowlat_twoshot_rmsnorm(Tensor prenorm_output, Tensor normed_output, Tensor input, Tensor gamma, "
+        "mnnvl_twoshot_rmsnorm(Tensor prenorm_output, Tensor normed_output, Tensor input, Tensor gamma, "
         "float epsilon, Tensor residual, Tensor buffer_flags) -> ()");
     m.def(
         "allreduce("
@@ -1093,8 +1093,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("lowlat_twoshot_allreduce", &torch_ext::lowlatTwoShotAllReduce);
-    m.impl("lowlat_twoshot_rmsnorm", &tensorrt_llm::kernels::twoShotRMSNorm);
+    m.impl("mnnvl_twoshot_allreduce", &torch_ext::mnnvlTwoShotAllReduce);
+    m.impl("mnnvl_twoshot_rmsnorm", &tensorrt_llm::kernels::twoShotRMSNorm);
     m.impl("allreduce", &torch_ext::allreduce);
     m.impl("moe_allreduce", &torch_ext::moe_allreduce);
 }

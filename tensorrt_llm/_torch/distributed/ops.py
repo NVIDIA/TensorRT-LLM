@@ -317,7 +317,7 @@ class MNNVLAllReduce(nn.Module):
         buffer_mnnvl = self.buffer_mnnvl.view(3, 2, -1, shape[-1])
 
         if fusion_op == AllReduceFusionOp.NONE:
-            torch.ops.trtllm.lowlat_twoshot_allreduce(
+            torch.ops.trtllm.mnnvl_twoshot_allreduce(
                 output,
                 input,
                 buffer_mnnvl,
@@ -326,7 +326,7 @@ class MNNVLAllReduce(nn.Module):
             )
             return output.view(shape)
         elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
-            torch.ops.trtllm.lowlat_twoshot_allreduce(
+            torch.ops.trtllm.mnnvl_twoshot_allreduce(
                 output,
                 input,
                 buffer_mnnvl,
@@ -336,7 +336,7 @@ class MNNVLAllReduce(nn.Module):
             residual_in = all_reduce_params.residual
             residual_out = torch.empty_like(input)
 
-            torch.ops.trtllm.lowlat_twoshot_rmsnorm(
+            torch.ops.trtllm.mnnvl_twoshot_rmsnorm(
                 residual_out, output, buffer_mnnvl,
                 all_reduce_params.norm_weight, all_reduce_params.eps,
                 residual_in, self.buffer_flags_mnnvl)
