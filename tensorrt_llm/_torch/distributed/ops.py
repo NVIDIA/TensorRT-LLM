@@ -1,3 +1,4 @@
+import logging
 import math
 import os
 import threading
@@ -14,6 +15,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 _thread_local = threading.local()
+logger = logging.getLogger(__name__)
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:

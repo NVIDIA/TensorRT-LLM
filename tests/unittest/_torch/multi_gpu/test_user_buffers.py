@@ -35,7 +35,8 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 
 def init_userbuffers_allocator(tp_size, rank, max_ub_size):
     ub.initialize_userbuffers_manager(tp_size, 1, 1, rank,
-                                      torch.cuda.device_count(), max_ub_size)
+                                      torch.cuda.device_count(), max_ub_size,
+                                      False)
 
 
 def create_userbuffers_tensor(shape, dtype):
