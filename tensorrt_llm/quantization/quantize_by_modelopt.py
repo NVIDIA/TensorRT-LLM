@@ -104,9 +104,11 @@ KV_CACHE_CFG = {
     },
 }
 
-KV_QUANT_CFG_CHOICES = {
-    "fp8": "FP8_KV_CFG",
-    "nvfp4": "NVFP4_KV_CFG",
+KV_CACHE_CFG_FP8 = {
+    k: {
+        **v, "num_bits": (4, 3)
+    }
+    for k, v in KV_CACHE_CFG.items()
 }
 
 
@@ -683,7 +685,6 @@ def quantize_and_export(*,
         )
         raise e
 
-    import modelopt.torch.quantization as mtq
     from modelopt.torch.export import export_tensorrt_llm_checkpoint
 
     from tensorrt_llm.models.convert_utils import infer_dtype
@@ -758,12 +759,8 @@ def quantize_and_export(*,
                     }
 
             if kv_cache_dtype is not None:
-                if kv_cache_dtype == "fp8":
-                    kv_cache_quant_cfg = getattr(
-                        mtq, KV_QUANT_CFG_CHOICES[kv_cache_dtype])["quant_cfg"]
-                    quant_cfg["quant_cfg"].update(kv_cache_quant_cfg)
-                else:
-                    quant_cfg["quant_cfg"].update(KV_CACHE_CFG)  # type: ignore
+                updates = KV_CACHE_CFG_FP8 if kv_cache_dtype == "fp8" else KV_CACHE_CFG
+                quant_cfg["quant_cfg"].update(updates)
 
             # Gemma 7B has accuracy regression using alpha 1. We set 0.5 instead.
             if model_type == "gemma" and "int8_sq" in qformat:
