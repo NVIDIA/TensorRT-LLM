@@ -120,17 +120,15 @@ from utils.llm_data import llm_models_root
                 "compile_backend": "torch-simple",
             },
         ),
-        # Deepseek-V3 with torch-simple backend + simple runtime + reduced number of layer + skip loading weights
+        # Phi3-mini-4k with torch-opt backend + simple runtime
         param_with_device_count(
-            4,
+            2,
             {
                 "model": _hf_model_dir_or_hub_id(
-                    f"{llm_models_root()}/DeepSeek-V3",
-                    "deepseek-ai/DeepSeek-V3",
+                    f"{llm_models_root()}/Phi-3/Phi-3-mini-4k-instruct",
+                    "microsoft/Phi-3-mini-4k-instruct",
                 ),
-                "compile_backend": "torch-simple",
-                "model_kwargs": {"num_hidden_layers": 5},
-                "skip_loading_weights": "True",
+                "compile_backend": "torch-opt",
             },
         ),
     ],
