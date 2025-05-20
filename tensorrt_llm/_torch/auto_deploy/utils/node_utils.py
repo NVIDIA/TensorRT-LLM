@@ -1,5 +1,6 @@
 """Common utils for torch fx graph transformation."""
 
+import operator
 from dataclasses import dataclass
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
@@ -320,3 +321,22 @@ def bfs(
                 visited.add(next_node)
                 queue.append(next_node)
     raise RuntimeError(f"Could not find node with target condition {target}.")
+
+
+def extract_output_tuple(node: Node, count: int = 2):
+    """
+    Extract up to `count` outputs from a tuple-producing node.
+    Returns a list of length `count`, with None if an output isn't found.
+    """
+    results = []
+    for idx in range(count):
+        user_node = next(
+            (
+                u
+                for u in node.users
+                if u.op == "call_function" and u.target == operator.getitem and u.args[1] == idx
+            ),
+            None,
+        )
+        results.append(user_node)
+    return results

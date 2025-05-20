@@ -64,7 +64,6 @@ public:
     SizeType32 batchSize;
     //! The beam widths of each request, [batchSize]
     std::vector<SizeType32> beamWidths;
-
     //! The maximum value in the `stopWordsLens` tensor
     SizeType32 maxStopWordsLen;
     //! The maximum value in the `badWordsLens` tensor
@@ -97,6 +96,8 @@ public:
     //! Parameters for beam search
     //! KV cache index for beam search, [batchSize, beamWidth, maxSeqLen] on gpu
     TensorPtr cacheIndirection;
+    //! Steps of each request, for Variable-Beam-Width-Search, [batchSize]
+    std::optional<std::vector<SizeType32>> generationSteps;
 
     // Medusa
     class MedusaInputs

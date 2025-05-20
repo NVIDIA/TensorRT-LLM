@@ -2,20 +2,24 @@
 
 set -ex
 
-TRT_VER="10.9.0.34"
+TRT_VER="10.10.0.31"
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-03.html#rel-25-03
-CUDA_VER="12.8" # 12.8.1
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-04.html#rel-25-04
+CUDA_VER="12.9" # 12.9.0
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
-CUDNN_VER="9.8.0.87-1"
-NCCL_VER="2.25.1-1+cuda12.8"
-CUBLAS_VER="12.8.4.1-1"
+CUDNN_VER="9.9.0.52-1"
+# NCCL version 2.26.3 used in the NGC PyTorch 25.04 image but not existing in public.
+# Use NCCL version 2.26.5 instead.
+NCCL_VER="2.26.5-1+cuda12.9"
+# cuBLAS version 12.9.0.2 used in the NGC PyTorch 25.04 image but not existing in public.
+# Use cuBLAS version 12.9.0.13 instead.
+CUBLAS_VER="12.9.0.13-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
-NVRTC_VER="12.8.93-1"
-CUDA_RUNTIME="12.8.90-1"
-CUDA_DRIVER_VERSION="570.124.06-1.el8"
+NVRTC_VER="12.9.41-1"
+CUDA_RUNTIME="12.9.37-1"
+CUDA_DRIVER_VERSION="575.51.03-1.el8"
 
 for i in "$@"; do
     case $i in
@@ -86,7 +90,7 @@ install_rockylinux_requirements() {
         "libnccl-${NCCL_VER}.${ARCH1}" \
         "libnccl-devel-${NCCL_VER}.${ARCH1}" \
         "cuda-compat-${CUBLAS_CUDA_VERSION}-${CUDA_DRIVER_VERSION}.${ARCH1}" \
-        "cuda-toolkit-12-8-config-common-${CUDA_RUNTIME}.noarch" \
+        "cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch" \
         "cuda-toolkit-12-config-common-${CUDA_RUNTIME}.noarch" \
         "cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch" \
         "libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}" \
@@ -102,7 +106,7 @@ install_rockylinux_requirements() {
         libnccl-${NCCL_VER}.${ARCH1}.rpm \
         libnccl-devel-${NCCL_VER}.${ARCH1}.rpm \
         cuda-compat-${CUBLAS_CUDA_VERSION}-${CUDA_DRIVER_VERSION}.${ARCH1}.rpm \
-        cuda-toolkit-12-8-config-common-${CUDA_RUNTIME}.noarch.rpm \
+        cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch.rpm \
         cuda-toolkit-12-config-common-${CUDA_RUNTIME}.noarch.rpm \
         cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch.rpm \
         libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}.rpm \
@@ -117,14 +121,15 @@ install_rockylinux_requirements() {
 install_tensorrt() {
     PY_VERSION=$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[0:2])))')
     PARSED_PY_VERSION=$(echo "${PY_VERSION//./}")
-    TRT_CUDA_VERSION="12.8"
+    TRT_CUDA_VERSION=${CUDA_VER}
+    TRT_VER_SHORT=$(echo $TRT_VER | cut -d. -f1-3)
 
     if [ -z "$RELEASE_URL_TRT" ];then
         ARCH=${TRT_TARGETARCH}
         if [ -z "$ARCH" ];then ARCH=$(uname -m);fi
         if [ "$ARCH" = "arm64" ];then ARCH="aarch64";fi
         if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
-        RELEASE_URL_TRT="https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.9.0/tars/TensorRT-${TRT_VER}.Linux.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz"
+        RELEASE_URL_TRT="https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/${TRT_VER_SHORT}/tars/TensorRT-${TRT_VER}.Linux.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz"
     fi
 
     wget --no-verbose ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar

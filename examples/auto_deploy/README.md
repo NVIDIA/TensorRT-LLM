@@ -67,21 +67,21 @@ The exported graph then undergoes a series of automated transformations, includi
 
 **Bring Your Own Model**: AutoDeploy leverages `torch.export` and dynamic graph pattern matching, enabling seamless integration for a wide variety of models without relying on hard-coded architectures.
 
-Additionally, we have officially verified and fully optimized support for the following models:
+Additionally, we have officially verified support for the following models:
 
 <details>
 <summary>Click to expand supported models list</summary>
 
-| Model Series | HF Model Card | Precision | World Size | Runtime | Compile Backend || Attention Backend |||
-|--------------|----------------------|-----------|------------|---------|-----------------|--------------------|--------|----------|----------|
-|              |               |           |            |         | torch-simple    | torch-opt          | TritonWithFlattenedInputs | FlashInfer | MultiHeadLatentAttention |
-| LLaMA        | meta-llama/Llama-2-7b-chat-hf<br>meta-llama/Meta-Llama-3.1-8B-Instruct<br>meta-llama/Llama-3.1-70B-Instruct<br>codellama/CodeLlama-13b-Instruct-hf | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | n/a |
-| Nvidia Minitron | nvidia/Llama-3_1-Nemotron-51B-Instruct<br>nvidia/Llama-3.1-Minitron-4B-Width-Base<br>nvidia/Llama-3.1-Minitron-4B-Depth-Base | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | n/a |
-| Nvidia Model Optimizer | nvidia/Llama-3.1-8B-Instruct-FP8<br>nvidia/Llama-3.1-405B-Instruct-FP8 | FP8 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | n/a |
-| DeepSeek     | deepseek-ai/DeepSeek-R1-Distill-Llama-70B | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | n/a |
-| Mistral      | mistralai/Mixtral-8x7B-Instruct-v0.1<br>mistralai/Mistral-7B-Instruct-v0.3 | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | n/a |
-| BigCode      | bigcode/starcoder2-15b | FP32 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | n/a |
-| Deepseek-V3      | deepseek-ai/DeepSeek-V3 | BF16 | 1,2,4 | demollm | ✅ | ❌ | n/a | n/a | ✅ |
+| Model Series | HF Model Card | Model Factory | Precision | World Size | Runtime | Compile Backend ||| Attention Backend |||
+|--------------|----------------------|----------------|-----------|------------|---------|-----------------|--------------------|--------------------|--------------------|----------|----------|
+|              |               |            |           |            |         | torch-simple    | torch-compile    | torch-opt          | TritonWithFlattenedInputs | FlashInfer | MultiHeadLatentAttention |
+| LLaMA        | meta-llama/Llama-2-7b-chat-hf<br>meta-llama/Meta-Llama-3.1-8B-Instruct<br>meta-llama/Llama-3.1-70B-Instruct<br>codellama/CodeLlama-13b-Instruct-hf | AutoModelForCausalLM | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | ✅ | n/a |
+| Nvidia Minitron | nvidia/Llama-3_1-Nemotron-51B-Instruct<br>nvidia/Llama-3.1-Minitron-4B-Width-Base<br>nvidia/Llama-3.1-Minitron-4B-Depth-Base | AutoModelForCausalLM | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | ✅ | n/a |
+| Nvidia Model Optimizer | nvidia/Llama-3.1-8B-Instruct-FP8<br>nvidia/Llama-3.1-405B-Instruct-FP8 | AutoModelForCausalLM | FP8 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | ✅ | n/a |
+| DeepSeek     | deepseek-ai/DeepSeek-R1-Distill-Llama-70B | AutoModelForCausalLM | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | ✅ | n/a |
+| Mistral      | mistralai/Mixtral-8x7B-Instruct-v0.1<br>mistralai/Mistral-7B-Instruct-v0.3 | AutoModelForCausalLM | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | ✅ | n/a |
+| BigCode      | bigcode/starcoder2-15b | AutoModelForCausalLM | FP32 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | ✅ | n/a |
+| Deepseek-V3      | deepseek-ai/DeepSeek-V3 | AutoModelForCausalLM | BF16 | 1,2,4 | demollm | ✅ | ❌ | ❌ | n/a | n/a | ✅ |
 
 </details>
 
@@ -89,22 +89,30 @@ Additionally, we have officially verified and fully optimized support for the fo
 
 AutoDeploy runs natively with the entire `TRT-LLM` stack via the `LLM` API. In addition, we provide a light-weight wrapper of the `LLM` API for onboarding and debugging new models:
 
-- **TRT-LLM runtime**: A robust, production-grade runtime optimized for high-performance inference. Enable it with `"runtime": "trtllm"` in the configuration.
-- **Lightweight development environment**: A lightweight runtime wrapper designed for development and testing, featuring a naive scheduler and KV-cache manager for simplified debugging and testing. Activate it using `"runtime": "demollm"` in the configuration.
+| `"runtime"` | Description |
+|-------------|-------------|
+| `trtllm`    | A robust, production-grade runtime optimized for high-performance inference. |
+| `demollm`   | A lightweight runtime wrapper designed for development and testing, featuring a naive scheduler and KV-cache manager for simplified debugging and testing. |
 
 ### Compile Backends
 
 AutoDeploy supports multiple backends for compiling the exported Torch graph:
 
-- **torch-simple:** Exports the graph without additional optimizations. Enable with `"compile_backend": "torch-simple"` in the configuration.
-- **torch-opt:** Uses `torch.compile` along with CUDA Graph capture to enhance inference performance. Enable with `"compile_backend": "torch-opt"` in the configuration.
+| `"compile_backend"` | Description |
+|--------------------|-------------|
+| `torch-simple`     | Exports the graph without additional optimizations. |
+| `torch-compile`    | Applies `torch.compile` to the graph after all AutoDeploy transformations have been completed. |
+| `torch-cudagraph`  | Performs CUDA graph capture (without torch.compile). |
+| `torch-opt`        | Uses `torch.compile` along with CUDA Graph capture to enhance inference performance. |
 
 ### Attention backends
 
 Optimize attention operations using different attention kernel implementations:
 
-- **Triton:** Custom fused multi-head attention (MHA) with KV Cache kernels for efficient attention processing. Enable with `"attn_backend": "TritonWithFlattenedInputs"`.
-- **FlashInfer:** Uses off-the-shelf optimized attention kernels with KV Cache from the [`flashinfer`](https://github.com/flashinfer-ai/flashinfer.git) library. Enable with `"attn_backend": "FlashInfer"`.
+| `"attn_backend"` | Description |
+|----------------------|-------------|
+| `TritonWithFlattenedInputs` | Custom fused multi-head attention (MHA) with KV Cache kernels for efficient attention processing. |
+| `FlashInfer`         | Uses off-the-shelf optimized attention kernels with KV Cache from the [`flashinfer`](https://github.com/flashinfer-ai/flashinfer.git) library. |
 
 ### Precision Support
 
@@ -125,13 +133,25 @@ To build and run AutoDeploy example, use the following command with the [`build_
 
 In the below example:
 
-- `model` is the HF model card or path to a HF checkpoint folder.
-- `world_size` is the number of GPUs for Tensor Parallel, default is `0` .
-- `runtime` specify which type of Engine to use during runtime, default is `demollm` .
-- `compile_backend` specify how to compile the graph from `torch.export`, default is `torch-opt` .
-- `attn_backend` specify kernel implementation for attention, default is `TritonWithFlattenedInputs`.
-- `mla_backend` specify implementation for multi-head latent attention, default is `MultiHeadLatentAttention`.
-- `benchmark` indicates whether to run the built-in benchmark for token generation, default is `False`.
+| Configuration Key | Description |
+|-------------------|-------------|
+| `"model"` | The HF model card or path to a HF checkpoint folder |
+| `"model_factory"` | Choose model factory implementation (`"hf"` or `"llama4"`) |
+| `"skip_loading_weights"` | Only load the architecture, not the weights |
+| `"customize_tokenizer"` | Use tokenizer from model factory (true) or from LLM API (false) |
+| `"model_kwargs"` | Extra kwargs for the model config class to customize the model config |
+| `"tokenizer_kwargs"` | Extra kwargs for the tokenizer class to customize the tokenizer |
+| `"world_size"` | The number of GPUs for Tensor Parallel |
+| `"runtime"` | Specifies which type of Engine to use during runtime |
+| `"compile_backend"` | Specifies how to compile the graph at the end |
+| `"attn_backend"` | Specifies kernel implementation for attention |
+| `"mla_backend"` | Specifies implementation for multi-head latent attention |
+| `"max_seq_len"` | Maximum sequence length for inference/cache |
+| `"max_batch_size"` | Maximum dimension for statically allocated KV cache |
+| `"page_size"` | Page size for attention |
+| `"benchmark"` | Indicates whether to run the built-in benchmark for token generation |
+
+For default values and additional configuration options, refer to the [simple_config.py](./simple_config.py) file.
 
 ```bash
 cd examples/auto_deploy
@@ -250,7 +270,7 @@ llm = LLM(
 
 </details>
 
-For more examples on TRT-LLM LLM API, visit [`this page`](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/).
+For more examples on TRT-LLM LLM API, visit [`this page`](https://nvidia.github.io/TensorRT-LLM/examples/llm_api_examples.html).
 
 ______________________________________________________________________
 

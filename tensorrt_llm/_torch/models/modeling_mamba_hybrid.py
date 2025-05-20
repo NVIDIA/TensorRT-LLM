@@ -10,6 +10,7 @@ from tensorrt_llm.logger import logger
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
+from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.mamba import Mamba2, MambaCacheManager, MambaCacheParams
 from ..modules.mlp import MLP
@@ -93,7 +94,7 @@ class TransformerLayer(Attention):
                                attn_metadata=attn_metadata)
 
 
-class MambaHybridLayer(nn.Module):
+class MambaHybridLayer(DecoderLayer):
 
     def __init__(
         self,
@@ -138,8 +139,10 @@ class MambaHybridLayer(nn.Module):
 
     def forward(
         self,
+        position_ids: torch.LongTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        *,
         mamba_cache_params: MambaCacheParams,
         residual: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -240,8 +243,13 @@ class MambaHybridModel(DecoderModel):
         hidden_states = inputs_embeds
         residual = None
         for layer in self.layers:
-            hidden_states, residual = layer(hidden_states, attn_metadata,
-                                            mamba_cache_params, residual)
+            hidden_states, residual = layer(
+                position_ids,
+                hidden_states,
+                attn_metadata,
+                mamba_cache_params=mamba_cache_params,
+                residual=residual,
+            )
 
         hidden_states, _ = self.norm_f(hidden_states, residual)
 

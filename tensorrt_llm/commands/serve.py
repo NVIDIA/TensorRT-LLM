@@ -50,8 +50,7 @@ def get_llm_args(model: str,
     kv_cache_config = KvCacheConfig(
         free_gpu_memory_fraction=free_gpu_memory_fraction)
 
-    pytorch_backend_config = PyTorchConfig(
-        enable_overlap_scheduler=True) if backend == "pytorch" else None
+    pytorch_backend_config = PyTorchConfig() if backend == "pytorch" else None
     dynamic_batch_config = DynamicBatchConfig(
         enable_batch_size_tuning=True,
         enable_max_num_tokens_tuning=False,
@@ -268,8 +267,8 @@ def disaggregated(config_file: Optional[str], server_start_timeout: int,
                                 gen_servers=gen_server_urls,
                                 req_timeout_secs=request_timeout,
                                 server_start_timeout_secs=server_start_timeout,
-                                ctx_router_type=disagg_cfg.ctx_router_type,
-                                gen_router_type=disagg_cfg.gen_router_type)
+                                ctx_router_config=disagg_cfg.ctx_router_config,
+                                gen_router_config=disagg_cfg.gen_router_config)
 
     asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
 

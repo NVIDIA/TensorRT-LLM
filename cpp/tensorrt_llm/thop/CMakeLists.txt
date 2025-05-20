@@ -36,6 +36,7 @@ target_link_libraries(th_utils PUBLIC ${TORCH_LIBRARIES} ${CUBLAS_LIB}
 
 add_library(
   th_common SHARED
+  mlaPreprocessOp.cpp
   allgatherOp.cpp
   allreduceOp.cpp
   attentionOp.cpp
@@ -61,6 +62,7 @@ add_library(
   mambaConv1dOp.cpp
   moeOp.cpp
   moeCommOp.cpp
+  moeLoadBalanceOp.cpp
   fp8BlockScaleMoe.cpp
   fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp

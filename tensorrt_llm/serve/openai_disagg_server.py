@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
+from tensorrt_llm.llmapi.disagg_utils import RouterConfig
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
                                                 CompletionRequest,
@@ -38,15 +39,13 @@ class OpenAIDisaggServer:
                  gen_servers: List[str] = None,
                  req_timeout_secs: int = 180,
                  server_start_timeout_secs: int = 180,
-                 ctx_router_type: str = "round_robin",
-                 gen_router_type: str = "round_robin"):
+                 ctx_router_config: Optional[RouterConfig] = None,
+                 gen_router_config: Optional[RouterConfig] = None):
 
         self.ctx_servers = ctx_servers
         self.gen_servers = gen_servers
-        self.ctx_server_idx = 0
-        self.gen_server_idx = 0
-        self.ctx_router = create_router(ctx_router_type, ctx_servers)
-        self.gen_router = create_router(gen_router_type, gen_servers)
+        self.ctx_router = create_router(ctx_router_config, ctx_servers)
+        self.gen_router = create_router(gen_router_config, gen_servers)
 
         if (len(self.gen_servers) == 0):
             raise ValueError("At least one generation server must be provided")
@@ -177,7 +176,7 @@ class OpenAIDisaggServer:
             ctx_req.stream = False
             ctx_req.stream_options = None
 
-            ctx_server = await self.ctx_router.get_next_server(ctx_req)
+            ctx_server, _ = await self.ctx_router.get_next_server(ctx_req)
             logging.info("Sending request to ctx server: %s", ctx_server)
 
             if request_type == "chat":
@@ -206,7 +205,7 @@ class OpenAIDisaggServer:
         gen_req.disaggregated_params.request_type = "generation_only"
 
         # Pick a generation server and send request
-        gen_server = await self.gen_router.get_next_server(gen_req)
+        gen_server, _ = await self.gen_router.get_next_server(gen_req)
         logging.info("Sending request to gen server: %s", gen_server)
 
         if not gen_req.stream:
@@ -233,22 +232,6 @@ class OpenAIDisaggServer:
                                 log_level="info",
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
         await uvicorn.Server(config).serve()
-
-    def get_next_server(self, servers: List[str], server_type: str) -> str:
-        """Round-robin selection of next available server"""
-        if not servers:
-            raise ValueError(f"No {server_type} servers available")
-
-        # Pick context and gen servers in round-robin fashion
-        # TODO: In future, use endpoint to monitor load and pick the least loaded server
-        if server_type == "context":
-            server = servers[self.ctx_server_idx]
-            self.ctx_server_idx = (self.ctx_server_idx + 1) % len(servers)
-        else:
-            server = servers[self.gen_server_idx]
-            self.gen_server_idx = (self.gen_server_idx + 1) % len(servers)
-
-        return server
 
     async def create_generator(self, url: str, request: Union[CompletionRequest, ChatCompletionRequest], end_point: str):
         async with self.session.post(url + end_point, json=request.model_dump(exclude_unset=True)) as response:

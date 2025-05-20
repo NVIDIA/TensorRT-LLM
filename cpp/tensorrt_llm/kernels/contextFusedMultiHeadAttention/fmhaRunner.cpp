@@ -116,9 +116,19 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     mKernelParams.b = runnerParams.b;
     mKernelParams.s = runnerParams.qSeqLen;
     mKernelParams.sliding_window_size = runnerParams.slidingWindowSize;
+    // Set the log chunked attention size if the chunked attention is used.
+    if (mLaunchParams.attention_mask_type == ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL
+        && runnerParams.kvSeqLen > runnerParams.chunkedAttentionSize)
+    {
+        TLLM_CHECK_WITH_INFO((runnerParams.chunkedAttentionSize & (runnerParams.chunkedAttentionSize - 1)) == 0,
+            "Chunked attention size should be a power of 2.");
+        mKernelParams.log2_chunked_attention_size = std::log2(runnerParams.chunkedAttentionSize);
+    }
     // Set the head size and number of heads.
     mKernelParams.d = mFixedParams.headSize;
     mKernelParams.dv = mFixedParams.headSizeV;
+    // The number of grouped heads (only used by generation-phase MLA kernels) currently.
+    mKernelParams.num_grouped_heads = runnerParams.numGroupedHeads;
     TLLM_CHECK_WITH_INFO(mFixedParams.numQHeads % mFixedParams.numKvHeads == 0,
         "number of Query heads should be multiple of KV heads !");
     mKernelParams.h = mFixedParams.numQHeads;
@@ -297,11 +307,17 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     bool const isSm100 = (mSM == kSM_100);
     bool const isSm120 = (mSM == kSM_120);
 
-    // Sliding_window_causal mask.
-    if (runnerParams.kvSeqLen > runnerParams.slidingWindowSize
+    // Sliding_or_chunked_causal mask.
+    if ((runnerParams.kvSeqLen > runnerParams.slidingWindowSize
+            || runnerParams.kvSeqLen > runnerParams.chunkedAttentionSize)
         && mLaunchParams.attention_mask_type == ContextAttentionMaskType::CAUSAL)
     {
-        mLaunchParams.attention_mask_type = ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL;
+        TLLM_CHECK_WITH_INFO(!(runnerParams.kvSeqLen > runnerParams.chunkedAttentionSize
+                                 && runnerParams.kvSeqLen > runnerParams.slidingWindowSize),
+            "Chunked attention size and sliding window size should not be used together.");
+        TLLM_CHECK_WITH_INFO(isSm90 || runnerParams.kvSeqLen <= runnerParams.chunkedAttentionSize,
+            "Chunked attention is only supported on Sm90.");
+        mLaunchParams.attention_mask_type = ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL;
     }
 
     // Is the input layout separate q + kv input ?
@@ -394,11 +410,14 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         mLaunchParams.force_unroll = true;
         mLaunchParams.kernel_s = 0;
 
-        // Now we have SM90 generation MLA kernels. These treatments are only for context MLA and non SM90 generation
-        // MLA.
-        bool isFP8GenerationMLAOnHopper = mFixedParams.dataType == DATA_TYPE_E4M3
-            && (mFixedParams.headSize == 576 && mFixedParams.headSizeV == 512) && isSm90;
-        if (!isFP8GenerationMLAOnHopper)
+        // Now we have SM90 FP8 generation and BF16 context MLA kernels
+        bool isHopperFP8GenerationMLA
+            = isSm90 && mFixedParams.dataType == DATA_TYPE_E4M3 && mFixedParams.headSizeV == 512;
+        bool isHopperBF16ContextMLA
+            = isSm90 && mFixedParams.dataType == DATA_TYPE_BF16 && mFixedParams.headSizeV == 128;
+
+        // These treatments are only for other MLA cases
+        if (!isHopperFP8GenerationMLA && !isHopperBF16ContextMLA)
         {
             mLaunchParams.granular_tiling = true;
             // Even on SM90, we use ampere-style kernel, will be optimized later
@@ -476,7 +495,7 @@ void FusedMHARunnerV2::setPackedQkvTmaDescriptors(MHARunnerParams runnerParams)
     uint64_t tensor_stride_qkv[3];
     tensor_stride_qkv[0] = get_size_in_bytes(tensor_size_qkv[0], mFixedParams.dataType); // d
     tensor_stride_qkv[1] = tensor_size_qkv[1] * tensor_stride_qkv[0];                    // d*h
-    tensor_stride_qkv[2] = tensor_size_qkv[2] * tensor_stride_qkv[1];                    // d*h*3
+    tensor_stride_qkv[2] = mKernelParams.qkv_stride_in_bytes;
 
     uint64_t tensor_stride_o[3];
     tensor_stride_o[0] = get_size_in_bytes(tensor_size_o[0], mFixedParams.dataTypeOut); // d
@@ -525,11 +544,29 @@ void FusedMHARunnerV2::setPackedQkvTmaDescriptors(MHARunnerParams runnerParams)
         swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qkv, tensor_stride_qkv,
         traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_kv);
 
+    // Separate TMA descriptor for V when d != dv in packed qkv input layout, e.g. MLA + 192/128 dims
+    if (mKernelParams.d != mKernelParams.dv)
+    {
+        // view V as [total_seq_len, 1, h, dv]
+        tensor_size_qkv[0] = mKernelParams.dv;
+        tensor_size_qkv[1] = mKernelParams.h;
+        tensor_size_qkv[2] = 1;
+
+        tensor_stride_qkv[0] = get_size_in_bytes(tensor_size_qkv[0], mFixedParams.dataType);
+        tensor_stride_qkv[1] = 0; // not used
+
+        size_t v_offset = 2 * mKernelParams.h * mKernelParams.d * get_size_in_bytes(mFixedParams.dataType);
+        qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr + v_offset, desc_format,
+            cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED,
+            tensor_size_qkv, tensor_stride_qkv, traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32,
+            &mKernelParams.tma_desc_v);
+    }
+
     // O: 16
     // Note: sliding window causal kernel currently has reg spill when TMA store is enabled
     box_size[3] = 16;
     if ((get_size_in_bytes(mFixedParams.dataTypeOut) == 1)
-        && mLaunchParams.attention_mask_type != ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL)
+        && mLaunchParams.attention_mask_type != ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL)
     {
         qkv_tma_descriptor.set_tma_desctriptor(o_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
             swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_o, tensor_stride_o, traversal_stride_o,
@@ -611,7 +648,7 @@ void FusedMHARunnerV2::setSeparateQKvTmaDescriptors(MHARunnerParams runnerParams
     // O: 16. Reuse
     box_size_qo[3] = 16;
     if ((get_size_in_bytes(mFixedParams.dataTypeOut) == 1)
-        && mLaunchParams.attention_mask_type != ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL)
+        && mLaunchParams.attention_mask_type != ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL)
     {
         qo_tma_descriptor.set_tma_desctriptor(o_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
             swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qo, tensor_stride_qo, traversal_stride,
@@ -707,14 +744,17 @@ void FusedMHARunnerV2::run(MHARunnerParams runnerParams)
     }
     // Check if the sliding window size is valid or not.
     if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_PAGED_KV
-        && mLaunchParams.attention_mask_type == ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL)
+        && mLaunchParams.attention_mask_type == ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL)
     {
         uint32_t q_step = 0, kv_step = 0;
         xmmaKernel->getStepSize(q_step, kv_step, mKernelParams, mLaunchParams);
         // The sliding window size needs to be multiple of kv_step, so that the paged context fmha can read the cyclic
         // kv cache correctly.
-        TLLM_CHECK_WITH_INFO(mKernelParams.sliding_window_size % kv_step == 0,
-            "The sliding window size doesn't work with paged context fmha kv_step_size = %d.", kv_step);
+        if (runnerParams.kvSeqLen > runnerParams.slidingWindowSize)
+        {
+            TLLM_CHECK_WITH_INFO(mKernelParams.sliding_window_size % kv_step == 0,
+                "The sliding window size doesn't work with paged context fmha kv_step_size = %d.", kv_step);
+        }
     }
 
     // Select the kernel and run it.

@@ -1,4 +1,5 @@
 import itertools
+import json
 import math
 from typing import List, Optional
 
@@ -82,6 +83,18 @@ class GuidedDecoder:
                             grammar = xgrammar.Grammar.from_ebnf(guide)
                             compiled_grammar = self.xgrammar_compiler.compile_grammar(
                                 grammar)
+                        case GuidedDecodingParams.GuideType.STRUCTURAL_TAG:
+                            structural_tag_parameters = json.loads(guide)
+                            structures = structural_tag_parameters["structures"]
+                            structures = [
+                                xgrammar.StructuralTagItem(
+                                    begin=s["begin"],
+                                    schema=json.dumps(s["schema"]),
+                                    end=s["end"]) for s in structures
+                            ]
+                            triggers = structural_tag_parameters["triggers"]
+                            compiled_grammar = self.xgrammar_compiler.compile_structural_tag(
+                                structures, triggers)
                         case _:
                             raise ValueError(
                                 f"Unrecognized guide type: {guide_type}.")

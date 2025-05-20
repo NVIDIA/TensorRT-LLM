@@ -4,6 +4,8 @@ import torch
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
+from ..._utils import get_sm_version
+
 
 def _register_fake():
 
@@ -61,8 +63,11 @@ def _register_fake():
         return [norm_out, residual_out]
 
     @torch.library.register_fake("trtllm::allgather")
-    def _(input, group):
-        output_shape = (len(group), *input.shape)
+    def _(input, sizes, group):
+        if sizes is None:
+            output_shape = (len(group) * input.shape[0], *input.shape[1:])
+        else:
+            output_shape = (sum(sizes), *input.shape[1:])
         return input.new_empty(output_shape)
 
     @torch.library.register_fake("trtllm::cublas_scaled_mm")
@@ -120,7 +125,7 @@ def _register_fake():
     def _(a, b, a_scale, b_scale):
         m = a.shape[0]
         n = b.shape[0]
-        return a.new_empty((m, n))
+        return a.new_empty((m, n), dtype=torch.bfloat16)
 
     @torch.library.register_fake(
         "tensorrt_llm::static_quantize_e4m3_per_tensor")
@@ -218,9 +223,30 @@ def _register_fake():
     def _(max_sm_count: int):
         pass
 
-    @torch.library.custom_op("trtllm::group_rms_norm",
+    @torch.library.register_fake("trtllm::moe_load_balance_wait_gpu_stage")
+    def _(single_layer_load_balancer_ptr: int):
+        return torch.empty((1, ),
+                           dtype=torch.int32,
+                           device=torch.device("cuda"))
+
+    @torch.library.register_fake("trtllm::moe_load_balance_set_cpu_stage")
+    def _(single_layer_load_balancer_ptr: int):
+        pass
+
+    @torch.library.register_fake("trtllm::moe_load_balance_statistic")
+    def _(single_layer_load_balancer_ptr: int,
+          gathered_raw_expert_ids: torch.Tensor, enabled: torch.Tensor,
+          is_first_stage: bool, is_last_stage: bool):
+        pass
+
+    @torch.library.register_fake("trtllm::moe_load_balance_routing")
+    def _(single_layer_load_balancer_ptr: int,
+          token_selected_experts: torch.Tensor):
+        return torch.empty_like(token_selected_experts)
+
+    @torch.library.custom_op("trtllm::group_rms_norm_base",
                              mutates_args=("outputs", ))
-    def group_rms_norm(
+    def group_rms_norm_base(
         inputs: List[torch.Tensor],
         outputs: List[torch.Tensor],
         weights: List[torch.Tensor],
@@ -229,7 +255,7 @@ def _register_fake():
     ) -> None:
         pass
 
-    @group_rms_norm.register_fake
+    @group_rms_norm_base.register_fake
     def _(
         inputs: List[torch.Tensor],
         outputs: List[torch.Tensor],
@@ -259,3 +285,46 @@ def _register_fake():
         weight_bias: float,
     ) -> List[torch.Tensor]:
         return outputs
+
+    # Use groupRMSNormHeuristic which automatically selects between regular and large batch kernels
+    @torch.library.custom_op("trtllm::group_rms_norm_heuristic",
+                             mutates_args=("outputs", ))
+    def group_rms_norm_heuristic(
+        inputs: List[torch.Tensor],
+        outputs: List[torch.Tensor],
+        weights: List[torch.Tensor],
+        eps: float,
+        weight_bias: float,
+    ) -> None:
+        pass
+
+    @group_rms_norm_heuristic.register_fake
+    def _(
+        inputs: List[torch.Tensor],
+        outputs: List[torch.Tensor],
+        weights: List[torch.Tensor],
+        eps: float,
+        weight_bias: float,
+    ) -> List[torch.Tensor]:
+        return outputs
+
+    @torch.library.register_fake(
+        "trtllm::mtp_sampling_and_accepted_draft_tokens_op")
+    def _(logits: torch.Tensor, draft_tokens: torch.Tensor,
+          target_tokens: torch.Tensor, num_mtp_modules: int, batch_size: int,
+          num_context_request: int, vocab_size: int):
+        return logits.new_empty((batch_size, num_mtp_modules + 1),
+                                dtype=torch.int32), logits.new_empty(
+                                    (batch_size, ), dtype=torch.int32)
+
+    @torch.library.register_fake("trtllm::fp8_quantize_1x128")
+    def _(input: torch.Tensor):
+        pad_m = fp4_utils.pad_up(input.shape[0], 4)
+        blocked_n = (input.shape[1] + 127) // 128
+        if get_sm_version() >= 100:
+            sz = (blocked_n, input.shape[0])
+        else:
+            sz = (fp4_utils.pad_up(pad_m * blocked_n * 4, 128) // 4, )
+        return torch.empty_like(input,
+                                dtype=torch.float8_e4m3fn), input.new_empty(
+                                    sz, dtype=torch.float)

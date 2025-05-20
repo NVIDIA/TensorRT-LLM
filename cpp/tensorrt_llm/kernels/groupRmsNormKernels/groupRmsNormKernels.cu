@@ -25,9 +25,66 @@
 
 namespace tensorrt_llm::kernels::group_rms_norm
 {
+// Helper function to calculate the number of warps to launch for GroupRMSNormBase
+template <typename DType, int n>
+uint32_t calculateNumWarpsBase(GroupRMSParams<n> const& params)
+{
+    constexpr uint32_t kPackedSize = sizeof(float4) / sizeof(DType);
+    uint32_t input_chunk_per_warp = 32 * kPackedSize;
+
+    // Calculate rounded input dimensions and total input length
+    int rounded_input_dims[n];
+    for (uint32_t i = 0; i < params.num_inputs; i++)
+    {
+        // Make rounded_input_dims[i] a multiple of 32 * kPackedSize
+        rounded_input_dims[i]
+            = (params.input_last_dims[i] + input_chunk_per_warp - 1) / input_chunk_per_warp * input_chunk_per_warp;
+    }
+
+    // Calculate total warps needed
+    uint32_t total_input_length = std::accumulate(rounded_input_dims, rounded_input_dims + params.num_inputs, 0);
+    uint32_t total_warps_needed = total_input_length / input_chunk_per_warp;
+    return std::min<uint32_t>(32, total_warps_needed);
+}
+
+template <typename DType, int n>
+struct LargeBatchWarpsInfo
+{
+    uint32_t num_warps_to_launch;   // Total warps to launch
+    uint32_t num_warps_to_launch_0; // Warps for first input
+    uint32_t num_warps_to_launch_1; // Warps for second input
+    uint32_t rounds_0;              // Rounds for first input
+    uint32_t rounds_1;              // Rounds for second input
+};
+
+// Helper function to calculate the number of warps to launch for GroupRMSNormKernelLargeBatch
+template <typename DType, int n>
+LargeBatchWarpsInfo<DType, n> calculateNumWarpsLargeBatch(GroupRMSParams<n> const& params)
+{
+    constexpr uint32_t kPackedSize = sizeof(float4) / sizeof(DType);
+    uint32_t input_chunk_per_warp = 32 * kPackedSize;
+
+    // Calculate warps needed for each input
+    uint32_t warps_needed_0 = (params.input_last_dims[0] + input_chunk_per_warp - 1) / input_chunk_per_warp;
+    uint32_t warps_needed_1 = (params.input_last_dims[1] + input_chunk_per_warp - 1) / input_chunk_per_warp;
+
+    LargeBatchWarpsInfo<DType, n> info;
+    info.num_warps_to_launch_0 = std::min((uint32_t) 32, warps_needed_0);
+    info.num_warps_to_launch_1 = std::min((uint32_t) 32, warps_needed_1);
+
+    // Use the maximum of the two for the final warps to launch
+    info.num_warps_to_launch = std::max(info.num_warps_to_launch_0, info.num_warps_to_launch_1);
+
+    // Calculate rounds needed for each input
+    info.rounds_0 = (warps_needed_0 + info.num_warps_to_launch_0 - 1) / info.num_warps_to_launch_0;
+    info.rounds_1 = (warps_needed_1 + info.num_warps_to_launch_1 - 1) / info.num_warps_to_launch_1;
+
+    return info;
+}
+
 // Allocate more warps to deal with the second input
 template <typename DType, typename PackedType, int n, bool EnableWeights, bool MultiRounds>
-__global__ void GroupRMSNormKernel(GroupRMSParams<n> params, int rounds)
+__global__ void GroupRMSNormBaseKernel(GroupRMSParams<n> params, int rounds)
 {
     const uint32_t batch_idx = blockIdx.x; // Maps to batch size
     constexpr uint32_t warp_size = 32;
@@ -510,7 +567,7 @@ __global__ void GroupRMSNormKernelLargeBatch(
 }
 
 template <typename DType, int n, bool EnableWeights>
-void GroupRMSNormKernel(GroupRMSParams<n> params)
+void GroupRMSNormBaseKernel(GroupRMSParams<n>& params)
 {
     // Kernel assertions
     constexpr uint32_t kPackedSize = sizeof(float4) / sizeof(DType);
@@ -535,7 +592,7 @@ void GroupRMSNormKernel(GroupRMSParams<n> params)
     // Calculate total warps to launch and rounds needed
     uint32_t total_input_length = std::accumulate(rounded_input_dims, rounded_input_dims + params.num_inputs, 0);
     uint32_t total_warps_needed = total_input_length / input_chunk_per_warp;
-    uint32_t num_warps_to_launch = std::min<uint32_t>(32, total_warps_needed);
+    uint32_t num_warps_to_launch = calculateNumWarpsBase<DType, n>(params);
     uint32_t rounds = (total_warps_needed + num_warps_to_launch - 1) / num_warps_to_launch; // ceil_div
 
     // Calculate warp_prefix_sum
@@ -571,26 +628,26 @@ void GroupRMSNormKernel(GroupRMSParams<n> params)
     if (rounds > 1)
     {
         TLLM_CUDA_CHECK(
-            cudaLaunchKernelEx(&cfg, GroupRMSNormKernel<DType, float4, n, EnableWeights, true>, params, rounds));
+            cudaLaunchKernelEx(&cfg, GroupRMSNormBaseKernel<DType, float4, n, EnableWeights, true>, params, rounds));
     }
     else
     {
         TLLM_CUDA_CHECK(
-            cudaLaunchKernelEx(&cfg, GroupRMSNormKernel<DType, float4, n, EnableWeights, false>, params, rounds));
+            cudaLaunchKernelEx(&cfg, GroupRMSNormBaseKernel<DType, float4, n, EnableWeights, false>, params, rounds));
     }
 }
 
 template <int n>
-void GroupRMSNormKernelLauncher(GroupRMSParams<n> params)
+void GroupRMSNormBaseKernelLauncher(GroupRMSParams<n>& params)
 {
 #define GROUP_RMS_NORM_DISPATCH(DTYPE)                                                                                 \
     if (params.enable_weights)                                                                                         \
     {                                                                                                                  \
-        return GroupRMSNormKernel<DTYPE, n, true>(params);                                                             \
+        return GroupRMSNormBaseKernel<DTYPE, n, true>(params);                                                         \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-        return GroupRMSNormKernel<DTYPE, n, false>(params);                                                            \
+        return GroupRMSNormBaseKernel<DTYPE, n, false>(params);                                                        \
     }
 
     switch (params.dtype)
@@ -604,13 +661,13 @@ void GroupRMSNormKernelLauncher(GroupRMSParams<n> params)
 #undef GROUP_RMS_NORM_DISPATCH
 }
 
-#define INSTANTIATE_GROUP_RMS_NORM(n) template void GroupRMSNormKernelLauncher<n>(GroupRMSParams<n> params);
+#define INSTANTIATE_GROUP_RMS_NORM_BASE(n) template void GroupRMSNormBaseKernelLauncher<n>(GroupRMSParams<n> & params);
 
-INSTANTIATE_GROUP_RMS_NORM(1)
-INSTANTIATE_GROUP_RMS_NORM(2)
+INSTANTIATE_GROUP_RMS_NORM_BASE(1)
+INSTANTIATE_GROUP_RMS_NORM_BASE(2)
 
 template <typename DType, int n, bool EnableWeights>
-void GroupRMSNormKernelLargeBatch(GroupRMSParams<n> params)
+void GroupRMSNormKernelLargeBatch(GroupRMSParams<n>& params)
 {
     // Kernel assertions
     constexpr uint32_t kPackedSize = sizeof(float4) / sizeof(DType);
@@ -626,18 +683,11 @@ void GroupRMSNormKernelLargeBatch(GroupRMSParams<n> params)
             i, params.input_last_dims[i], kPackedSize);
     }
 
-    // Calculate warps needed for each input
-    uint32_t input_chunk_per_warp = 32 * kPackedSize;
-    uint32_t warps_needed_0 = (params.input_last_dims[0] + input_chunk_per_warp - 1) / input_chunk_per_warp;
-    uint32_t warps_needed_1 = (params.input_last_dims[1] + input_chunk_per_warp - 1) / input_chunk_per_warp;
-    uint32_t num_warps_to_launch_0 = std::min((uint32_t) 32, warps_needed_0);
-    uint32_t num_warps_to_launch_1 = std::min((uint32_t) 32, warps_needed_1);
-
-    // Calculate rounds needed for each input based on the number of warps we'll launch
-    uint32_t rounds_0 = (warps_needed_0 + num_warps_to_launch_0 - 1) / num_warps_to_launch_0;
-    uint32_t rounds_1 = (warps_needed_1 + num_warps_to_launch_1 - 1) / num_warps_to_launch_1;
-
-    uint32_t num_warps_to_launch = std::max(num_warps_to_launch_0, num_warps_to_launch_1);
+    // Calculate warps information
+    auto warpInfo = calculateNumWarpsLargeBatch<DType, n>(params);
+    uint32_t num_warps_to_launch = warpInfo.num_warps_to_launch;
+    uint32_t rounds_0 = warpInfo.rounds_0;
+    uint32_t rounds_1 = warpInfo.rounds_1;
 
     dim3 grid_dim(params.batch_size);
     dim3 block_dim(32, num_warps_to_launch);
@@ -660,30 +710,30 @@ void GroupRMSNormKernelLargeBatch(GroupRMSParams<n> params)
     {
         TLLM_CUDA_CHECK(
             cudaLaunchKernelEx(&cfg, GroupRMSNormKernelLargeBatch<DType, float4, n, EnableWeights, true, true>, params,
-                rounds_0, rounds_1, num_warps_to_launch_0, num_warps_to_launch_1));
+                rounds_0, rounds_1, warpInfo.num_warps_to_launch_0, warpInfo.num_warps_to_launch_1));
     }
     else if (MultiRounds_0 && !MultiRounds_1)
     {
         TLLM_CUDA_CHECK(
             cudaLaunchKernelEx(&cfg, GroupRMSNormKernelLargeBatch<DType, float4, n, EnableWeights, true, false>, params,
-                rounds_0, rounds_1, num_warps_to_launch_0, num_warps_to_launch_1));
+                rounds_0, rounds_1, warpInfo.num_warps_to_launch_0, warpInfo.num_warps_to_launch_1));
     }
     else if (!MultiRounds_0 && MultiRounds_1)
     {
         TLLM_CUDA_CHECK(
             cudaLaunchKernelEx(&cfg, GroupRMSNormKernelLargeBatch<DType, float4, n, EnableWeights, false, true>, params,
-                rounds_0, rounds_1, num_warps_to_launch_0, num_warps_to_launch_1));
+                rounds_0, rounds_1, warpInfo.num_warps_to_launch_0, warpInfo.num_warps_to_launch_1));
     }
     else
     {
         TLLM_CUDA_CHECK(
             cudaLaunchKernelEx(&cfg, GroupRMSNormKernelLargeBatch<DType, float4, n, EnableWeights, false, false>,
-                params, rounds_0, rounds_1, num_warps_to_launch_0, num_warps_to_launch_1));
+                params, rounds_0, rounds_1, warpInfo.num_warps_to_launch_0, warpInfo.num_warps_to_launch_1));
     }
 }
 
 template <int n>
-void GroupRMSNormKernelLargeBatchLauncher(GroupRMSParams<n> params)
+void GroupRMSNormKernelLargeBatchLauncher(GroupRMSParams<n>& params)
 {
 #define GROUP_RMS_NORM_LARGE_BATCH_DISPATCH(DTYPE)                                                                     \
     if (params.enable_weights)                                                                                         \
@@ -707,8 +757,123 @@ void GroupRMSNormKernelLargeBatchLauncher(GroupRMSParams<n> params)
 }
 
 #define INSTANTIATE_GROUP_RMS_NORM_LARGE_BATCH(n)                                                                      \
-    template void GroupRMSNormKernelLargeBatchLauncher<n>(GroupRMSParams<n> params);
+    template void GroupRMSNormKernelLargeBatchLauncher<n>(GroupRMSParams<n> & params);
 
 INSTANTIATE_GROUP_RMS_NORM_LARGE_BATCH(2)
+
+int getComputeCapabilityMajor()
+{
+    int device;
+    TLLM_CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp prop;
+    TLLM_CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+    return prop.major;
+}
+
+bool prefer_base_kernel(int batch, int base_warps, float scheduling_efficiency_ratio)
+{
+    int sm_major = getComputeCapabilityMajor();
+    bool found_match = false;
+    for (auto const& [known_model, model] : gpu_models)
+    {
+        if (sm_major == known_model)
+        {
+            float p = model.batch_size * batch + model.base_warps * base_warps
+                + model.scheduling_efficiency_ratio * scheduling_efficiency_ratio + model.intercept;
+            p = 1.0f / (1.0f + std::exp(-p));
+            found_match = true;
+            return p > 0.5f;
+        }
+    }
+    if (!found_match)
+    {
+        TLLM_LOG_INFO(
+            "GroupRMSNorm: Failed to find heuristic for GPU compute capability %d. Falling back to the base kernel.",
+            sm_major);
+    }
+    return true;
+}
+
+template <int n>
+void GroupRMSNormKernelLauncherWithHeuristic(GroupRMSParams<n>& params)
+{
+    if (params.num_inputs == 1)
+    {
+        GroupRMSNormBaseKernelLauncher<n>(params);
+    }
+    else if (params.num_inputs == 2)
+    {
+        int num_warps_per_sm = 64;
+        uint32_t base_warps;
+        uint32_t large_batch_warps;
+
+        // Choose the appropriate DType
+        switch (params.dtype)
+        {
+        case nvinfer1::DataType::kHALF:
+            base_warps = calculateNumWarpsBase<half, n>(params);
+            large_batch_warps = calculateNumWarpsLargeBatch<half, n>(params).num_warps_to_launch;
+            break;
+        case nvinfer1::DataType::kBF16:
+            base_warps = calculateNumWarpsBase<__nv_bfloat16, n>(params);
+            large_batch_warps = calculateNumWarpsLargeBatch<__nv_bfloat16, n>(params).num_warps_to_launch;
+            break;
+        case nvinfer1::DataType::kFLOAT:
+            base_warps = calculateNumWarpsBase<float, n>(params);
+            large_batch_warps = calculateNumWarpsLargeBatch<float, n>(params).num_warps_to_launch;
+            break;
+        default: TLLM_CHECK_WITH_INFO(false, "Unsupported data type for GroupRMSNorm"); return;
+        }
+
+        int concurrent_block_per_sm_base = std::floor(num_warps_per_sm / base_warps);
+        int concurrent_block_per_sm_large_batch = std::floor(num_warps_per_sm / large_batch_warps);
+
+        /*
+         * Kernel Selection Logic:
+         * We use trained Logistic Regression models to determine which kernel variant to use based on performance
+         * characteristics:
+         *
+         * - base_warps: Proportional to the sum of last dimensions of inputs
+         * - large_batch_warps: Proportional to the max of last dimensions of inputs
+         *
+         * Trade-offs:
+         * - With equal concurrent blocks per SM, base_warps achieves better compute efficiency
+         * - However, large_batch_warps allows more concurrent blocks to be scheduled:
+         *   - concurrent_block_per_sm_base: Maximum blocks of base kernel schedulable per SM
+         *   - concurrent_block_per_sm_large_batch: Maximum blocks of large batch kernel schedulable per SM
+         *
+         * The large batch kernel is preferred when the scheduling efficiency advantage outweighs
+         * the compute efficiency advantage of the base kernel, particularly at larger batch sizes.
+         */
+        if (concurrent_block_per_sm_large_batch > concurrent_block_per_sm_base)
+        {
+            float scheduling_efficiency_ratio
+                = float(concurrent_block_per_sm_large_batch) / float(concurrent_block_per_sm_base);
+            if (prefer_base_kernel(params.batch_size, base_warps, scheduling_efficiency_ratio))
+            {
+                GroupRMSNormBaseKernelLauncher<n>(params);
+            }
+            else
+            {
+                GroupRMSNormKernelLargeBatchLauncher<n>(params);
+            }
+        }
+        else
+        {
+            GroupRMSNormBaseKernelLauncher<n>(params);
+        }
+    }
+    else
+    {
+        // Unsupported number of inputs
+        TLLM_CHECK_WITH_INFO(false, "Unsupported number of inputs for GroupRMSNorm");
+    }
+}
+
+#define INSTANTIATE_GROUP_RMS_NORM_WITH_HEURISTIC(n)                                                                   \
+    template void GroupRMSNormKernelLauncherWithHeuristic<n>(GroupRMSParams<n> & params);
+
+INSTANTIATE_GROUP_RMS_NORM_WITH_HEURISTIC(1)
+INSTANTIATE_GROUP_RMS_NORM_WITH_HEURISTIC(2)
 
 } // namespace tensorrt_llm::kernels::group_rms_norm

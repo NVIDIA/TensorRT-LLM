@@ -17,6 +17,7 @@
 #include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <map>
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -44,10 +45,32 @@ struct GroupRMSParams
     cudaStream_t stream;
 };
 
-template <int n>
-void GroupRMSNormKernelLauncher(GroupRMSParams<n> params);
+// Logistic regression model for predicting when the large batch kernel is faster
+struct Model
+{
+    float batch_size;
+    // Number of warps to launch for the base kernel
+    float base_warps;
+    // Ratio of the concurrent_block_per_sm for the large batch kernel vs the base kernel
+    float scheduling_efficiency_ratio;
+    // Intercept of the logistic regression model
+    float intercept;
+};
+
+// Trained parameters for the logistic regression model
+// For each major version of the Compute Capability
+inline std::map<int, Model> gpu_models = {
+    {10, {-0.004011f, -0.180179f, -0.396733f, 6.714080f}},
+    {9, {-0.006522f, -0.178540f, -0.558174f, 8.210834f}},
+};
 
 template <int n>
-void GroupRMSNormKernelLargeBatchLauncher(GroupRMSParams<n> params);
+void GroupRMSNormBaseKernelLauncher(GroupRMSParams<n>& params);
+
+template <int n>
+void GroupRMSNormKernelLargeBatchLauncher(GroupRMSParams<n>& params);
+
+template <int n>
+void GroupRMSNormKernelLauncherWithHeuristic(GroupRMSParams<n>& params);
 
 } // namespace tensorrt_llm::kernels::group_rms_norm

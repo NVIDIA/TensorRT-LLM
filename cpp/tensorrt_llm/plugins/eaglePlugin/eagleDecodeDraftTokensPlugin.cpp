@@ -628,7 +628,7 @@ void EagleDecodeDraftTokensPlugin::doTopKSampling(nvinfer1::PluginTensorDesc con
         // pluginOutputAllLayersDraftTokenIdsPredecessor,
         //    which will be used to reconstruct the final output tree at the last layer
         invokeCopyScoresAndDraftTokenIds(mLayerIdx, mNumEagleLayers, maxDecodingDraftTokens, batchSize,
-            dynamicTreeMaxTopK, topKOffset,
+            dynamicTreeMaxTopK,
             pluginInputCurrentExpandIndices, // The indices of the nodes that expand in this layer (i.e., the input
                                              // logits). The index is related to the final tree.
             pluginInputAllLayersScores, pluginInputAllLayersDraftTokenIds, pluginInputAllLayersDraftTokenIdsPredecessor,
@@ -695,8 +695,8 @@ void EagleDecodeDraftTokensPlugin::doTopKSampling(nvinfer1::PluginTensorDesc con
             // When reach the last EagleNet, we need to do the third sampling, which take all layers' draft tokens and
             // scores as input, and then select top-maxDecodingDraftTokens draft tokens among them. We need to
             // reconstruct the path/tree after the third topK sampling.
-            invokeAssembleThridTopKSamplingInputs(batchSize, dynamicTreeMaxTopK, maxDecodingDraftTokens,
-                mNumEagleLayers, maxNodesOnFinalTree, thirdTopKs, pluginOutputAllLayersScores, thirdTopKInputScoresPtrs,
+            invokeAssembleThridTopKSamplingInputs(batchSize, maxDecodingDraftTokens, mNumEagleLayers,
+                maxNodesOnFinalTree, thirdTopKs, pluginOutputAllLayersScores, thirdTopKInputScoresPtrs,
                 thirdTopKOutputIds, thirdTopKOutputIdsPtrs, stream);
             sync_check_cuda_error(stream);
 
@@ -725,9 +725,9 @@ void EagleDecodeDraftTokensPlugin::doTopKSampling(nvinfer1::PluginTensorDesc con
             sync_check_cuda_error(stream);
 
             // 3) Copy this layer's outputIds to outputDraftTokenIds
-            invokeCopyFinalDraftTokens(batchSize, dynamicTreeMaxTopK, maxDecodingDraftTokens, mNumEagleLayers,
-                maxNodesOnFinalTree, thirdTopKOutputIdsPtrs, pluginOutputAllLayersDraftTokenIds,
-                pluginOutputDraftTokenIds, pluginOutputDraftLens, stream);
+            invokeCopyFinalDraftTokens(batchSize, maxDecodingDraftTokens, mNumEagleLayers, maxNodesOnFinalTree,
+                thirdTopKOutputIdsPtrs, pluginOutputAllLayersDraftTokenIds, pluginOutputDraftTokenIds,
+                pluginOutputDraftLens, stream);
             sync_check_cuda_error(stream);
         }
     }

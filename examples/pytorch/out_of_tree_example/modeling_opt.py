@@ -89,6 +89,7 @@ class OPTDecoderLayer(DecoderLayer):
 
     def forward(
         self,
+        position_ids: torch.LongTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         **kwargs,
@@ -146,10 +147,13 @@ class OPTModel(DecoderModel):
             config.word_embed_proj_dim,
             dtype=config.torch_dtype,
             mapping=model_config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN)
-        self.embed_positions = nn.Embedding(config.max_position_embeddings + 2,
-                                            config.hidden_size,
-                                            dtype=config.torch_dtype)
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+        )
+        self.embed_positions = Embedding(
+            config.max_position_embeddings + 2,
+            config.hidden_size,
+            dtype=config.torch_dtype,
+        )
 
         if config.word_embed_proj_dim != config.hidden_size:
             self.project_out = nn.Linear(config.hidden_size,
@@ -208,8 +212,11 @@ class OPTModel(DecoderModel):
 
         # residual = None
         for decoder_layer in self.layers:
-            hidden_states = decoder_layer(hidden_states=hidden_states,
-                                          attn_metadata=attn_metadata)
+            hidden_states = decoder_layer(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+            )
 
         if self.final_layer_norm is not None:
             hidden_states = self.final_layer_norm(hidden_states)

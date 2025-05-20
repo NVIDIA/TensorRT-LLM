@@ -36,9 +36,9 @@ class GenerationTask(Task):
     input_str: Optional[str] = None
     skip_tokenizer: bool = False
     skip_detokenizer: bool = False
+
     # sampling params
-    # custom_sampling_params: Optional[dict] = None
-    max_tokens: Optional[int] = None
+    max_tokens: Optional[int] = 2048
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None

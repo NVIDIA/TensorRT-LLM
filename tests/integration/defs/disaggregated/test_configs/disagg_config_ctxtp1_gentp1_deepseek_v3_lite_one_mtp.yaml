@@ -5,7 +5,7 @@ free_gpu_memory_fraction: 0.1
 backend: "pytorch"
 pytorch_backend_config:
   use_cuda_graph: False
-  enable_overlap_scheduler: False
+  disable_overlap_scheduler: True
 speculative_config:
   decoding_type: MTP
   num_nextn_predict_layers: 1

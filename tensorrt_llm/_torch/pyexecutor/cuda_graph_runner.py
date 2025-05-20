@@ -4,7 +4,6 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import torch
 
 from ..attention_backend.interface import AttentionMetadata
-from ..pipeline_interface import PipelineInterface
 from ..speculative.interface import SpecMetadata
 from ..utils import make_weak_ref, set_piecewise_cuda_graph_flag
 
@@ -29,8 +28,6 @@ class DecodingCUDAGraphRunner:
         device: str,
         attn_metadata: AttentionMetadata,
         spec_metadata: Optional[SpecMetadata] = None,
-        pipeline_interface: Optional[PipelineInterface] = None,
-        has_pp: bool = False,
     ) -> None:
         """
         Stores a CUDA graph and its associated input buffers.
@@ -63,8 +60,6 @@ class DecodingCUDAGraphRunner:
         self.extra_model_inputs = {}
         self.attn_metadata = attn_metadata
         self.spec_metadata = spec_metadata
-        self.pipeline_interface = pipeline_interface
-        self.has_pp = has_pp
         self._output = None
         self._graph = None
 
@@ -104,9 +99,6 @@ class DecodingCUDAGraphRunner:
                 new_tensor = tensor.clone()
                 inputs[key] = new_tensor
                 self.extra_model_inputs[key] = new_tensor
-
-        if self.has_pp:
-            inputs["pipeline_interface"] = self.pipeline_interface
 
         # We have to do warm up runs to initialize PyTorch's
         # internal states according to the docs:
@@ -152,12 +144,6 @@ class DecodingCUDAGraphRunner:
         seqlen = input_ids.shape[0]
         self.input_ids[:seqlen].copy_(input_ids)
         self.position_ids[:, :seqlen].copy_(position_ids)
-
-        if self.pipeline_interface is not None:
-            assert "pipeline_interface" in inputs
-            pipeline_interface = inputs["pipeline_interface"]
-            for key in ["hidden_states", "residual"]:
-                self.pipeline_interface[key].copy_(pipeline_interface[key])
 
         if self.extra_model_inputs:
             assert extra_model_inputs is not None, "Model was captured with extra model inputs, so extra_model_inputs must be provided to run()"

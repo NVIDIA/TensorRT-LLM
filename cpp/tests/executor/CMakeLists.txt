@@ -16,3 +16,8 @@ add_gtest(encDecTest encDecTest.cpp)
 target_link_libraries(encDecTest PRIVATE testingUtils)
 add_gtest(disaggExecutorTest disaggExecutorTest.cpp)
 target_link_libraries(disaggExecutorTest PRIVATE testingUtils)
+
+if(NIXL_ROOT)
+  add_gtest(transferAgentTest cache_transmission/transferAgentTest.cpp)
+  target_link_libraries(transferAgentTest PRIVATE tensorrt_llm_nixl_wrapper)
+endif()

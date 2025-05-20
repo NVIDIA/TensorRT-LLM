@@ -18,6 +18,7 @@
 #include "envUtils.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/stringUtils.h"
 #include <cstddef>
 #include <cstdlib>
 #include <mutex>
@@ -98,11 +99,7 @@ size_t parseMemorySize(std::string const& input)
         throw std::invalid_argument("Invalid number format in memory size: " + input);
     }
 
-    for (char& c : unitPart)
-    {
-        c = std::tolower(c);
-    }
-
+    toLower(unitPart);
     size_t multiplier = 1;
     if (unitPart == "b")
     {

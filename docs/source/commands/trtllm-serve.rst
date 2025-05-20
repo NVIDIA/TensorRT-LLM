@@ -78,6 +78,7 @@ First, create a configuration file:
    cat >./extra-llm-api-config.yml<<EOF
    kv_cache_config:
        enable_block_reuse: false
+       free_gpu_memory_fraction: 0.6
    EOF
 
 Then, start the server with the configuration file:

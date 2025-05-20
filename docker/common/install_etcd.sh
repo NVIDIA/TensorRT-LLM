@@ -17,13 +17,15 @@ elif [ "$ARCH" = "x86_64" ]; then
     ARCH="amd64"
 fi
 
-rm -f /tmp/etcd-${ETCD_VER}-linux-${ARCH}.tar.gz
-rm -rf /tmp/etcd-download-test && mkdir -p /tmp/etcd-download-test
+# Use a temporary location for downloading files
+TMP_DIR=$(mktemp -d)
+ETCD_TAR=${TMP_DIR}/etcd-${ETCD_VER}-linux-${ARCH}.tar.gz
 
-curl -L ${DOWNLOAD_URL}/${ETCD_VER}/etcd-${ETCD_VER}-linux-${ARCH}.tar.gz -o /tmp/etcd-${ETCD_VER}-linux-${ARCH}.tar.gz
-tar xzvf /tmp/etcd-${ETCD_VER}-linux-${ARCH}.tar.gz -C /tmp/etcd-download-test --strip-components=1
-rm -f /tmp/etcd-${ETCD_VER}-linux-${ARCH}.tar.gz
+# Download etcd binaries
+curl -L ${DOWNLOAD_URL}/${ETCD_VER}/etcd-${ETCD_VER}-linux-${ARCH}.tar.gz -o ${ETCD_TAR}
 
-mv /tmp/etcd-download-test/* /usr/local/bin/
+# Extract binaries to /usr/local/bin directly to avoid unnecessary copying
+tar xzvf ${ETCD_TAR} -C /usr/local/bin --strip-components=1
 
-rm -rf /tmp/etcd-download-test
+# Cleanup temporary files and directories
+rm -rf ${TMP_DIR}

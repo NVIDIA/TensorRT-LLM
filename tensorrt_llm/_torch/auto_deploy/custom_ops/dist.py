@@ -1,5 +1,7 @@
 """Custom ops required for implementing tensor parallelism."""
 
+from typing import List, Optional
+
 import torch
 
 from ..distributed import common as dist
@@ -7,10 +9,12 @@ from ..distributed import trtllm as trtllm_dist
 
 
 @torch.library.custom_op("dist::all_gather", mutates_args=(), device_types="cuda")
-def all_gather(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+def all_gather(
+    tensor: torch.Tensor, dim: int = 0, sizes: Optional[List[int]] = None
+) -> torch.Tensor:
     """All gather followed by concat in dim = 0. This is the default nccl behavior."""
     if trtllm_dist.is_trtllm_op_available():
-        return trtllm_dist.trtllm_allgather(tensor, dim=dim)
+        return trtllm_dist.trtllm_allgather(tensor, dim=dim, sizes=sizes)
     tl = [torch.zeros_like(tensor) for _ in range(dist.get_world_size())]
     dist.all_gather(tl, tensor)
     return torch.cat(tl, dim=dim)

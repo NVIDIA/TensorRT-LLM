@@ -155,6 +155,103 @@ class TunableRunner(ABC):
         """
         raise NotImplementedError
 
+    @lru_cache(maxsize=1000)
+    def find_nearest_profile(
+            self, shapes: Tuple[torch.Size],
+            dynamic_tensors: Tuple[Tuple[int, int, Tuple[Union[Tuple[int],
+                                                               Callable],
+                                                         Callable]]],
+            constraints: Tuple[Tuple[int, int, Callable]]) -> Tuple:
+        """Find the nearest optimization profile for given inputs
+        User can define their own nearest profile generation method to reduce the host overhead.
+
+        Args:
+            shapes: Tuple of input tensor shapes
+            dynamic_tensors: Tuple of dynamic tensor dimensions
+            constraints: Tuple of constraints
+
+        Return:
+            Tuple: A tuple containing:
+                - attributes: Tuple of runner attributes, sorted.
+                - profile: Tuple of input tensor shapes
+        """
+        base_profile = OptimizationProfile([[StaticDim(x) for x in s]
+                                            for s in shapes])
+
+        for input_idx, dim_idx, (_, shape_round_rule) in dynamic_tensors:
+            dim_val = base_profile.shapes[input_idx][dim_idx].val
+            nearest_opt_shape = shape_round_rule(dim_val)
+            base_profile.shapes[input_idx][dim_idx] = StaticDim(
+                nearest_opt_shape)
+
+        # Adjust the profile to satisfy the constraints
+        for input_idx, dim_idx, constraint in constraints:
+            min_value = 0
+            max_value = base_profile.shapes[input_idx][dim_idx].val
+            base_profile.shapes[input_idx][dim_idx] = DynamicDim(
+                min_value, constraint(base_profile.get_opt_shapes()), max_value)
+
+        return base_profile.get_opt_shapes()
+
+    def get_cache_key(
+        self,
+        custom_op: str,
+        input_shapes: Tuple[torch.Size],
+        tuning_config: TuningConfig,
+    ) -> Tuple:
+        """Generate a cache key for the given custom operation, runner, inputs, and profile.
+
+        Args:
+            custom_op (str): Name of the custom operation
+            runner (TunableRunner): Runner implementation
+            profile (OptimizationProfile): Optimization profile
+
+        Returns:
+            Tuple[str, str, Tuple, Tuple]: A tuple containing:
+                - custom_op: Operation name
+                - runner_key: Runner class name
+                - attribute_key: Tuple of runner attributes
+                - profile_key: Profile hash key
+        """
+        nearest_profile = self.find_nearest_profile(
+            shapes=input_shapes,
+            dynamic_tensors=tuning_config.dynamic_tensors,
+            constraints=tuning_config.constraints)
+        return (self.get_cache_key_general(custom_op),
+                self.get_cache_key_specifc(nearest_profile))
+
+    def get_cache_key_general(self, custom_op: str) -> Tuple:
+        """Generate the general part of cache key.
+        Args:
+            custom_op: Operation name
+
+        Return:
+            Tuple: A tuple containing:
+                - custom_op: Operation name
+                - runner_key: Runner class name
+        """
+        return custom_op, self.__class__.__name__
+
+    def get_cache_key_specifc(self, profile: Tuple) -> Tuple:
+        """Generate the specific part of cache key.
+        User can define their own cache key assembly method to reduce the host overhead.
+        Args:
+            profile: Tuple of input tensor shapes
+
+        Return:
+            Tuple: A tuple containing:
+                - attributes: Tuple of runner attributes, sorted.
+                - profile: Tuple of input tensor shapes
+        """
+        attributes = {
+            k: v
+            for k, v in self.__dict__.items()
+            if not callable(v) and not k.startswith("_")
+        }
+        attribute_key = tuple(attributes[key]
+                              for key in sorted(attributes.keys()))
+        return attribute_key, profile
+
 
 @contextlib.contextmanager
 def autotune(tune_mode: bool = True):
@@ -251,7 +348,7 @@ class AutoTuner:
 
     @classmethod
     def get(cls):
-        if cls._instance == None:
+        if cls._instance is None:
             cls._instance = AutoTuner()
         return cls._instance
 
@@ -259,7 +356,8 @@ class AutoTuner:
         self,
         custom_op: str,
         runners: List[TunableRunner],
-        profile: OptimizationProfile,
+        input_shapes: Tuple[torch.Size],
+        tuning_config: TuningConfig,
     ) -> Tuple[bool, int, int, OptimizationProfile]:
         """Search for cached profiling results matching the current configuration.
 
@@ -273,7 +371,7 @@ class AutoTuner:
             [is_cache_hit, runner_id, tactic, stored_profile]
         """
         for r in runners:
-            cache_key = self.get_cache_key(custom_op, r, profile)
+            cache_key = r.get_cache_key(custom_op, input_shapes, tuning_config)
 
             if cache_key in self.profiling_cache:
                 return True, *self.profiling_cache[cache_key]
@@ -304,15 +402,12 @@ class AutoTuner:
             Although runners[0] with tactic=-1 is always treated as the fallback runner.
             Runner authors are suggested to provide a fallback implementation for each runner to avoid potential issues.
         """
-
-        profile = self._find_nearest_profile(tuning_config.dynamic_tensors,
-                                             tuning_config.constraints,
-                                             tuple(t.shape for t in inputs))
+        input_shapes = tuple(t.shape for t in inputs)
 
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:
             is_cache_hit, runner_id, tactic, stored_profile = self.search_cache(
-                custom_op, runners, profile)
+                custom_op, runners, input_shapes, tuning_config)
             runner = runners[runner_id]
             # TODO: check the stored runner and tactic can implement this shape here
             # Should not directly try (runner, tactic) here, or it will hurt a lot of inference perf.
@@ -324,9 +419,11 @@ class AutoTuner:
                 if custom_op not in self.stats.cache_miss_config_collection:
                     self.stats.cache_miss_config_collection[custom_op] = set()
                 self.stats.cache_miss_config_collection[custom_op].add(
-                    profile.get_hash_key())
+                    input_shapes)
 
-                logger.debug(f"[AutoTunner]: Using fallback tactic")
+                logger.debug(
+                    f"[AutoTunner]: Using fallback tactic for {custom_op} with input shapes {input_shapes}"
+                )
                 assert runner == runners[0] \
                     and tactic == -1, f"Should use fallback runner {runners[0]} and tactic {-1}, but got runner {runner} and tactic {tactic}"
             return runner, tactic
@@ -344,7 +441,7 @@ class AutoTuner:
         for p in profiles:
             tensors = self._prepare_input_tensors(p, inputs)
             is_cache_hit, runner, tactic, _ = self.search_cache(
-                custom_op, runners, p)
+                custom_op, runners, p.get_opt_shapes(), tuning_config)
             if not is_cache_hit:
                 min_time = float('inf')
                 # Initialize runner and tactic as None in case of no valid tactic or runners are found
@@ -374,7 +471,8 @@ class AutoTuner:
                                 self.stats.failed_profiling_count[
                                     custom_op] = set()
                             self.stats.failed_profiling_count[custom_op].add(
-                                self.get_cache_key(custom_op, r, p))
+                                r.get_cache_key(custom_op, p.get_opt_shapes(),
+                                                tuning_config))
 
                             # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
                             # or some runtime error occurs during profiling.
@@ -384,7 +482,10 @@ class AutoTuner:
                             runner, tactic = r, tac
                 if runner is not None:
                     # At least one valid (runner, tactic) pair is found
-                    cache_key = self.get_cache_key(custom_op, runner, p)
+                    cache_key = runner.get_cache_key(custom_op,
+                                                     p.get_opt_shapes(),
+                                                     tuning_config)
+                    # inspect call stack
                     self.profiling_cache[cache_key] = (runner_id, tactic, p)
                     self.stats.tuned_op_successful_configs[
                         custom_op] = self.stats.tuned_op_successful_configs.get(
@@ -395,7 +496,8 @@ class AutoTuner:
 
         # Get the best runner and tactic from cache
         # If no valid tactic is found, the fallback runner and tactic will be used
-        _, runner_id, tactic, _ = self.search_cache(custom_op, runners, profile)
+        _, runner_id, tactic, _ = self.search_cache(custom_op, runners,
+                                                    input_shapes, tuning_config)
 
         return runners[runner_id], tactic
 
@@ -442,43 +544,6 @@ class AutoTuner:
         )
 
         return avg_time
-
-    @lru_cache(maxsize=1000)
-    def _find_nearest_profile(self, dynamic_tensors: Tuple[Tuple[
-        int, int, Tuple[Union[Tuple[int], Callable], Callable]]],
-                              constraints: Tuple[Tuple[int, int, Callable]],
-                              shapes: Tuple[torch.Size]) -> OptimizationProfile:
-        """Find the nearest optimization profile for given inputs.
-
-        Args:
-            dynamic_tensors (Tuple[Tuple[int, int, Tuple[Union[Tuple[int], Callable], Callable]]]): Tuple specifying which dimensions to tune
-            constraints (Tuple[Tuple[int, int, Callable]]): Tuple specifying constraints on the dimensions
-            inputs (List[torch.Tensor]): List of input tensors
-
-        Returns:
-            OptimizationProfile: Profile with dimensions rounded to nearest valid values
-
-        Note:
-            This method uses the rounding rules specified in dynamic_tensors to
-            find valid dimensions closest to the actual input dimensions.
-        """
-        base_profile = OptimizationProfile([[StaticDim(x) for x in s]
-                                            for s in shapes])
-
-        for input_idx, dim_idx, (_, shape_round_rule) in dynamic_tensors:
-            dim_val = base_profile.shapes[input_idx][dim_idx].val
-            nearest_opt_shape = shape_round_rule(dim_val)
-            base_profile.shapes[input_idx][dim_idx] = StaticDim(
-                nearest_opt_shape)
-
-        # Adjust the profile to satisfy the constraints
-        for input_idx, dim_idx, constraint in constraints:
-            min_value = 0
-            max_value = base_profile.shapes[input_idx][dim_idx].val
-            base_profile.shapes[input_idx][dim_idx] = DynamicDim(
-                min_value, constraint(base_profile.get_opt_shapes()), max_value)
-
-        return base_profile
 
     def _optimization_profiles(
             self, dynamic_tensors: Tuple[Tuple[int, int, Tuple[Union[Tuple[int],
@@ -583,33 +648,6 @@ class AutoTuner:
                 tensor = inputs[i]
             tensors.append(tensor)
         return tensors
-
-    def get_cache_key(self, custom_op: str, runner: TunableRunner,
-                      profile: OptimizationProfile) -> Tuple:
-        """Generate a unique cache key for the given custom operation, runner, inputs, and profile.
-
-        Args:
-            custom_op (str): Name of the custom operation
-            runner (TunableRunner): Runner implementation
-            profile (OptimizationProfile): Optimization profile
-
-        Returns:
-            Tuple[str, str, Tuple, Tuple]: A tuple containing:
-                - custom_op: Operation name
-                - runner_key: Runner class name
-                - attribute_key: Tuple of runner attributes
-                - profile_key: Profile hash key
-        """
-        attributes = {
-            k: v
-            for k, v in runner.__dict__.items()
-            if not callable(v) and not k.startswith("_")
-        }
-        attribute_key = tuple(attributes[key]
-                              for key in sorted(attributes.keys()))
-        profile_key = profile.get_hash_key()
-        runner_key = runner.__class__.__name__
-        return (custom_op, runner_key, attribute_key, profile_key)
 
     def clear_cache(self) -> None:
         """Clear the profiling cache."""

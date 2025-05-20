@@ -148,6 +148,11 @@ add_subdirectory(batch_manager)
 set(EXECUTOR_TARGET tensorrt_llm_executor_static)
 set(EXECUTOR_TARGET_ARCH ${TARGET_ARCH})
 set(UCX_WRAPPER_TARGET tensorrt_llm_ucx_wrapper)
+
+if(NIXL_ROOT)
+  set(NIXL_WRAPPER_TARGET tensorrt_llm_nixl_wrapper)
+endif()
+
 add_subdirectory(executor)
 
 find_package(Threads REQUIRED)
@@ -170,8 +175,8 @@ set(TRTLLM_LINK_LIBS
     trtllm_gen_blockscale_gemm
     trtllm_gen_fp8_block_scale_moe
     trtllm_gen_gemm
-    trtllm_gen_fp8_batched_gemm
     trtllm_gen_gemm_gated_act
+    trtllm_gen_batched_gemm
     selective_scan_src
     ws_layernorm_src
     fpA_intB_gemm_src
@@ -231,6 +236,11 @@ target_link_libraries(${EXECUTOR_TARGET} INTERFACE ${SHARED_TARGET})
 if(TARGET ${UCX_WRAPPER_TARGET})
   target_link_libraries(${UCX_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
   add_dependencies(${SHARED_TARGET} ${UCX_WRAPPER_TARGET})
+endif()
+
+if(TARGET ${NIXL_WRAPPER_TARGET})
+  target_link_libraries(${NIXL_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
+  add_dependencies(${SHARED_TARGET} ${NIXL_WRAPPER_TARGET})
 endif()
 
 if(NOT WIN32)

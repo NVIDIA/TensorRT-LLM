@@ -62,11 +62,16 @@ def run_single_gpu_tests(build_dir: _pl.Path,
         run_spec_dec_tests(build_dir=build_dir)
 
 
-def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
-                   build_dir: _pl.Path, resources_dir: _pl.Path,
-                   model_cache: str, test_gpt_session_benchmark: bool,
-                   batching_types: list[str], api_types: list[str]):
-
+def run_benchmarks(
+    model_name: str,
+    python_exe: str,
+    root_dir: _pl.Path,
+    build_dir: _pl.Path,
+    resources_dir: _pl.Path,
+    model_cache: str,
+    batching_types: list[str],
+    api_types: list[str],
+):
     benchmark_exe_dir = build_dir / "benchmarks"
     if model_name == "gpt":
         model_engine_dir = resources_dir / "models" / "rt_engine" / "gpt2"
@@ -86,33 +91,6 @@ def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
             f"run_benchmark test does not support {model_name}. Skipping benchmarks"
         )
         return NotImplementedError
-
-    if test_gpt_session_benchmark:
-        if model_name == "gpt":
-            pass
-
-            # WAR: Currently importing the bindings here causes a segfault in pybind 11 during shutdown
-            # As this just builds a path we hard-code for now to obviate the need for import of bindings
-
-            # model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
-            # model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
-            # model_spec_obj.use_gpt_plugin()
-            # model_engine_path = model_engine_dir / model_spec_obj.get_model_path(
-            # ) / "tp1-pp1-cp1-gpu"
-
-            model_engine_path = model_engine_dir / "fp16_plugin_continuous" / "tp1-pp1-cp1-gpu"
-        else:
-            _logger.info(
-                f"gptSessionBenchmark test does not support {model_name}. Skipping benchmarks"
-            )
-            return NotImplementedError
-
-        benchmark = [
-            str(benchmark_exe_dir / "gptSessionBenchmark"), "--engine_dir",
-            str(model_engine_path), "--batch_size", "8", "--input_output_len",
-            "10,20", "--duration", "10"
-        ]
-        _cpp.run_command(benchmark, cwd=root_dir, timeout=600)
 
     prompt_datasets_args = [{
         '--dataset-name': "cnn_dailymail",
@@ -245,7 +223,6 @@ def run_model_benchmarks(root_dir, build_dir, cpp_resources_dir, python_exe,
 
     def _run(
         model_name: str,
-        test_gpt_session_benchmark: bool,
         batching_types: List[str],
         api_types: List[str],
     ):
@@ -257,7 +234,6 @@ def run_model_benchmarks(root_dir, build_dir, cpp_resources_dir, python_exe,
             build_dir=build_dir,
             resources_dir=cpp_resources_dir,
             model_cache=model_cache,
-            test_gpt_session_benchmark=test_gpt_session_benchmark,
             batching_types=batching_types,
             api_types=api_types,
         )
@@ -269,8 +245,8 @@ def run_model_benchmarks(root_dir, build_dir, cpp_resources_dir, python_exe,
                          indirect=True)
 @pytest.mark.parametrize("model", [
     "bart", "chatglm", "eagle", "encoder", "enc_dec_language_adapter", "gpt",
-    "gpt_executor", "gpt_session", "gpt_tests", "llama", "mamba", "medusa",
-    "recurrentgemma", "redrafter", "t5"
+    "gpt_executor", "gpt_tests", "llama", "mamba", "medusa", "recurrentgemma",
+    "redrafter", "t5"
 ])
 @pytest.mark.parametrize("run_fp8", [False, True], ids=["", "fp8"])
 def test_model(build_google_tests, model, prepare_model, run_model_tests,
@@ -294,13 +270,11 @@ def test_benchmarks(build_benchmarks, model, prepare_model,
 
     prepare_model(model)
 
-    test_gpt_session_benchmark = True if model == "gpt" else False
-    batching_types = ["IFB", "V1"] if model == "gpt" else ["IFB"]
+    batching_types = ["IFB"]
     api_types = ["executor"]
 
     run_model_benchmarks(
         model_name=model,
-        test_gpt_session_benchmark=test_gpt_session_benchmark,
         batching_types=batching_types,
         api_types=api_types,
     )

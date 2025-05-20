@@ -1,3 +1,5 @@
+google/gemma-3-1b-it:
+  - accuracy: 22.988
 gpt2:
   - accuracy: 18.408
   - quant_algo: W8A16
@@ -15,6 +17,9 @@ gpt2:
   - extra_acc_spec: beam_width=256
     num_samples: 32
     accuracy: 29.422
+  - extra_acc_spec: beam_width=8;beam_width_array=[2,3,4,5]
+    num_samples: 32
+    accuracy: 26.994
 gpt2-medium:
   - accuracy: 22.730
   - quant_algo: FP8
@@ -246,6 +251,8 @@ Qwen/Qwen2-0.5B-Instruct:
     accuracy: 30.930
   - quant_algo: FP8
     accuracy: 31.140
+Qwen/Qwen2-1.5B:
+  - accuracy: 32.58
 Qwen/Qwen2-7B-Instruct:
   - accuracy: 36.148
   - quant_algo: W8A16
@@ -269,6 +276,9 @@ Qwen/Qwen2.5-1.5B-Instruct:
 Qwen/Qwen2.5-7B-Instruct:
   - accuracy: 33.014
   - quant_algo: FP8
+    accuracy: 33.248
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
     accuracy: 33.248
 nvidia/Nemotron-Mini-4B-Instruct:
   - quant_algo: FP8

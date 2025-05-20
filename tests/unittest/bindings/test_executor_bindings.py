@@ -838,7 +838,7 @@ def test_output_config():
     assert config.exclude_input_from_output == False
     assert config.return_encoder_output == False
     assert config.return_perf_metrics == False
-    assert config.additional_model_outputs == None
+    assert config.additional_model_outputs is None
 
     config = trtllm.OutputConfig(
         True, False, True, False, True, False,
@@ -1160,22 +1160,22 @@ def test_scheduler_config():
     capacity_scheduler_policy = trtllm.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
     config = trtllm.SchedulerConfig()
     assert config.capacity_scheduler_policy == capacity_scheduler_policy
-    assert config.context_chunking_policy == None
+    assert config.context_chunking_policy is None
 
     capacity_scheduler_policy = trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION
     config = trtllm.SchedulerConfig(capacity_scheduler_policy)
     assert config.capacity_scheduler_policy == capacity_scheduler_policy
-    assert config.context_chunking_policy == None
+    assert config.context_chunking_policy is None
 
     capacity_scheduler_policy = trtllm.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
     config = trtllm.SchedulerConfig(capacity_scheduler_policy)
     assert config.capacity_scheduler_policy == capacity_scheduler_policy
-    assert config.context_chunking_policy == None
+    assert config.context_chunking_policy is None
 
     capacity_scheduler_policy = trtllm.CapacitySchedulerPolicy.STATIC_BATCH
     config = trtllm.SchedulerConfig(capacity_scheduler_policy)
     assert config.capacity_scheduler_policy == capacity_scheduler_policy
-    assert config.context_chunking_policy == None
+    assert config.context_chunking_policy is None
 
     context_chunking_policy = trtllm.ContextChunkingPolicy.FIRST_COME_FIRST_SERVED
     config = trtllm.SchedulerConfig(capacity_scheduler_policy,
@@ -1204,7 +1204,7 @@ def test_kv_cache_config():
     assert config.cross_kv_cache_fraction is None
     assert config.host_cache_size is None
     assert config.onboard_blocks == True
-    assert config.secondary_offload_min_priority == None
+    assert config.secondary_offload_min_priority is None
     assert config.event_buffer_max_size == 0
 
     config.enable_block_reuse = False
@@ -1368,24 +1368,24 @@ def test_eagle_config():
     assert config.greedy_sampling == False
     assert config.posterior_threshold == 0.5
     assert config.use_dynamic_tree == False
-    assert config.dynamic_tree_max_topK == None
+    assert config.dynamic_tree_max_topK is None
 
     config = trtllm.EagleConfig([[0, 0], [0, 1, 0]], True)
     assert config.eagle_choices == [[0, 0], [0, 1, 0]]
     assert config.greedy_sampling == True
-    assert config.posterior_threshold == None
+    assert config.posterior_threshold is None
     assert config.use_dynamic_tree == False
-    assert config.dynamic_tree_max_topK == None
+    assert config.dynamic_tree_max_topK is None
 
     config = trtllm.EagleConfig(None, True, 0.5)
-    assert config.eagle_choices == None
+    assert config.eagle_choices is None
     assert config.greedy_sampling == True
     assert config.posterior_threshold == 0.5
     assert config.use_dynamic_tree == False
-    assert config.dynamic_tree_max_topK == None
+    assert config.dynamic_tree_max_topK is None
 
     config = trtllm.EagleConfig(None, False, 0.5, True, 3)
-    assert config.eagle_choices == None
+    assert config.eagle_choices is None
     assert config.greedy_sampling == False
     assert config.posterior_threshold == 0.5
     assert config.use_dynamic_tree == True
@@ -1463,8 +1463,8 @@ def test_speculative_decoding_config():
     config = trtllm.DecodingConfig()
     config.decoding_mode = trtllm.DecodingMode.TopKTopP()
     assert config.decoding_mode.isTopKandTopP()
-    assert config.lookahead_decoding_config == None
-    assert config.medusa_choices == None
+    assert config.lookahead_decoding_config is None
+    assert config.medusa_choices is None
     assert config.eagle_config is None
 
     config = trtllm.DecodingConfig()
@@ -1475,14 +1475,14 @@ def test_speculative_decoding_config():
     assert config.lookahead_decoding_config.max_ngram_size == la_decoding_config.max_ngram_size
     assert config.lookahead_decoding_config.max_window_size == la_decoding_config.max_window_size
     assert config.lookahead_decoding_config.max_verification_set_size == la_decoding_config.max_verification_set_size
-    assert config.medusa_choices == None
+    assert config.medusa_choices is None
     assert config.eagle_config is None
 
     config = trtllm.DecodingConfig()
     config.medusa_choices = [[0, 0], [0, 1]]
 
     assert config.decoding_mode.isMedusa()
-    assert config.lookahead_decoding_config == None
+    assert config.lookahead_decoding_config is None
     assert config.medusa_choices == [[0, 0], [0, 1]]
     assert config.eagle_config is None
 
@@ -1490,16 +1490,16 @@ def test_speculative_decoding_config():
     config.eagle_config = trtllm.EagleConfig([[0, 0], [0, 1]])
 
     assert config.decoding_mode.isEagle()
-    assert config.lookahead_decoding_config == None
-    assert config.medusa_choices == None
+    assert config.lookahead_decoding_config is None
+    assert config.medusa_choices is None
     assert config.eagle_config is not None
     assert config.eagle_config.eagle_choices == [[0, 0], [0, 1]]
 
 
 def test_logits_post_processor_config():
     config = trtllm.LogitsPostProcessorConfig()
-    assert config.processor_map == None
-    assert config.processor_batched == None
+    assert config.processor_map is None
+    assert config.processor_batched is None
     assert config.replicate == True
 
     kwargs = {
@@ -1551,7 +1551,6 @@ def test_executor_config():
     assert config.guided_decoding_config is None
     assert config.additional_model_outputs is None
     assert config.gather_generation_logits is False
-    assert config.use_variable_beam_width_search is False
     assert config.use_gpu_direct_storage is False
     assert config.mm_embedding_offloading is False
     assert config.enable_trt_overlap is False
@@ -1603,8 +1602,6 @@ def test_executor_config():
         [trtllm.AdditionalModelOutput("topKLogits")],
         "gather_generation_logits":
         True,
-        "use_variable_beam_width_search":
-        True,
         "use_gpu_direct_storage":
         True,
         "mm_embedding_offloading":
@@ -1633,7 +1630,6 @@ def test_executor_config():
     assert config.additional_model_outputs[0].name == "topKLogits"
     assert config.additional_model_outputs[0].gather_context is False
     assert config.gather_generation_logits is True
-    assert config.use_variable_beam_width_search is True
     assert config.use_gpu_direct_storage is True
     assert config.mm_embedding_offloading is True
     assert config.enable_trt_overlap is True
@@ -2378,8 +2374,6 @@ def test_executor_config_pickle():
         [trtllm.AdditionalModelOutput("topKLogits")],
         "gather_generation_logits":
         True,
-        "use_variable_beam_width_search":
-        False,
         "mm_embedding_offloading":
         True,
         "enable_trt_overlap":
@@ -2425,7 +2419,6 @@ def test_executor_config_pickle():
         0].gather_context == config_copy.additional_model_outputs[
             0].gather_context
     assert config.gather_generation_logits == config_copy.gather_generation_logits
-    assert config.use_variable_beam_width_search == config_copy.use_variable_beam_width_search
     assert config.mm_embedding_offloading == config_copy.mm_embedding_offloading
     assert config.enable_trt_overlap == config_copy.enable_trt_overlap
 
@@ -2497,7 +2490,7 @@ def test_runtime_defaults():
 
     default_runtime_defaults = trtllm.RuntimeDefaults()
     for key in all_field_names:
-        assert getattr(default_runtime_defaults, key) == None
+        assert getattr(default_runtime_defaults, key) is None
 
 
 def test_request_pickle():

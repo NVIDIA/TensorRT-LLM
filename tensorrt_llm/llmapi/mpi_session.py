@@ -179,9 +179,6 @@ class MpiPoolSession(MpiSession):
 class MpiCommSession(MpiSession):
 
     def __init__(self, comm=None, n_workers: int = 1):
-        if not external_mpi_comm_available(n_workers):
-            raise RuntimeError('The LLM instance should be launched by mpirun.')
-
         self.comm = comm
         self.n_workers = n_workers
         self.thread_pool: Optional[ThreadPoolExecutor] = None
@@ -328,6 +325,9 @@ class RemoteMpiCommSessionClient(MpiSession):
             return self.queue.get()  # should get a True if success
         return False
 
+    def abort(self):
+        self.shutdown()
+
     def shutdown(self, wait=True):
         if self._is_shutdown:
             return
@@ -344,7 +344,7 @@ class RemoteMpiCommSessionClient(MpiSession):
         finally:
             self._is_shutdown = True
 
-    def abort(self):
+    def shutdown_abort(self, grace: float = 60, reason=None):
         self.shutdown()
 
 
@@ -411,7 +411,7 @@ class RemoteMpiCommSessionServer():
                 print_colored_debug(
                     f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received shutdown signal\n",
                     "green")
-                self.session.shutdown()
+                self.session.shutdown_abort()
                 break
             else:
                 print_colored_debug(

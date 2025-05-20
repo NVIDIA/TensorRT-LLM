@@ -45,7 +45,7 @@ void copyLastContextLogits(TensorPtr const& contextLogits, LlmRequest& llmReq, B
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const numLogits = contextLogits->getShape().d[0];
-    for (int beam = 0; beam < llmReq.mSamplingConfig.beamWidth; beam++)
+    for (int beam = 0; beam < llmReq.getBeamWidthByIter(); beam++)
     {
         // [beamWidth, mMaxNewTokens, vocabSizePadded] -> [numLogits, vocabSizePadded]
         auto beamHostTensorPtr = ITensor::slice(llmReq.getGenerationLogitsHost(), {beam, 0}, numLogits);
@@ -80,7 +80,6 @@ SizeType32 HandleContextLogits::operator()(RequestVector const& contextRequests,
     // Copy logits into decoderBuffers.logits
     for (auto const& llmReq : contextRequests)
     {
-        auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
         auto const numContextLogits = numContextLogitsVec.at(batchIndex);
         auto const draftLength = llmReq->isLastContextChunk() ? llmReq->getNumDraftTokens() : 0;
 
@@ -137,6 +136,7 @@ SizeType32 HandleContextLogits::operator()(RequestVector const& contextRequests,
         TLLM_CHECK_DEBUG_WITH_INFO(tru::tensorHasInvalid<float>(*logitsView, manager, "logits") == false,
             "Found invalid number (NaN or Inf) in logits");
         // Scatter the output logits to the decoderLogits
+        auto const reqBeamWidth = llmReq->getBeamWidthByIter();
         if (reqBeamWidth > 1)
         {
             // Tile logits of context requests

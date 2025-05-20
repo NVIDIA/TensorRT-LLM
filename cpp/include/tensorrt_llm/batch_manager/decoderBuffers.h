@@ -40,14 +40,13 @@ public:
         SizeType32 maxBatchSize, SizeType32 maxDecoderSteps, runtime::BufferManager const& manager);
 
     // buffers for setup
-    TensorPtr setupBatchSlots;
     TensorPtr inputsIds;
-
-    // buffers for forward
-    TensorPtr forwardBatchSlotsRequestOrder;
-    TensorPtr forwardBatchSlotsRequestOrderDevice;
+    TensorPtr setupBatchSlots;
+    TensorPtr setupBatchSlotsDevice;
     TensorPtr fillValues;
     TensorPtr fillValuesDevice;
+
+    // buffers for forward
     std::vector<TensorPtr> forwardBatchSlots;
 };
 

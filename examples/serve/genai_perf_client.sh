@@ -3,7 +3,6 @@
 genai-perf profile \
     -m TinyLlama-1.1B-Chat-v1.0 \
     --tokenizer TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-    --service-kind openai \
     --endpoint-type chat \
     --random-seed 123 \
     --synthetic-input-tokens-mean 128 \

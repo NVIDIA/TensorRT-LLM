@@ -8,10 +8,10 @@ from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..model_config import ModelConfig
 from ..models.modeling_utils import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
+from ..modules.embedding import Embedding
 from ..modules.fused_moe import FusedMoE, RenormalizeMoeRoutingMethod
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
@@ -59,14 +59,20 @@ class MixtralMoE(nn.Module):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        use_dp_padding = False
         if self.enable_attention_dp and len(all_rank_num_tokens) > 1:
+            # Use padding here to keep the behavior unchanged
+            use_dp_padding = True
             max_num_token = max(all_rank_num_tokens)
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
                 (0, 0, 0, max_num_token - hidden_states.shape[0]))
         router_logits = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states, router_logits,
-                                           all_rank_num_tokens)
+        final_hidden_states = self.experts(
+            hidden_states,
+            router_logits,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding)
         return final_hidden_states
 
 
@@ -153,10 +159,11 @@ class MixtralModel(DecoderModel):
         self.vocab_size = config.vocab_size
         self.aux_stream = torch.cuda.Stream()
 
-        self.embed_tokens = nn.Embedding(config.vocab_size,
-                                         config.hidden_size,
-                                         config.pad_token_id,
-                                         dtype=config.torch_dtype)
+        self.embed_tokens = Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            dtype=config.torch_dtype,
+        )
 
         self.layers = nn.ModuleList([
             MixtralDecoderLayer(model_config, layer_idx, self.aux_stream)

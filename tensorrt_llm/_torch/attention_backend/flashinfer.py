@@ -6,6 +6,7 @@ from typing import Dict, Literal, Optional
 import flashinfer
 import torch
 from flashinfer.jit.core import check_cuda_arch
+from typing_extensions import Self
 
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -163,6 +164,19 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                                  device='cuda',
                                                  dtype=torch.int)
 
+    def create_cuda_graph_metadata(self,
+                                   max_batch_size: int,
+                                   sub_cross_metadata: bool = False,
+                                   max_draft_tokens: int = 0) -> Self:
+        metadata = super().create_cuda_graph_metadata(max_batch_size,
+                                                      sub_cross_metadata,
+                                                      max_draft_tokens)
+        metadata.max_num_requests = max_batch_size
+        metadata.max_num_tokens = max_batch_size * (1 + max_draft_tokens)
+        # Post init again to make sure all tensors are allocated
+        metadata.__post_init__()
+        return metadata
+
     @property
     def page_size(self) -> int:
         """
@@ -172,9 +186,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
     def prepare(self) -> None:
         extra_attrs = get_model_extra_attrs()
-        if extra_attrs is not None:
-            extra_attrs["attention_metadata"] = weakref.ref(self)
-        else:
+        if extra_attrs is None:
             get_global_attrs().attention_metadata = weakref.ref(self)
         # start and end indices of each sequence in the ragged query
         torch.cumsum(self.seq_lens_cuda,
@@ -186,11 +198,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         assert self.request_ids is not None
         block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
             self.request_ids)
-        paged_kv_indices = torch.tensor(
-            [x for block_ids in block_ids_per_seq for x in block_ids],
-            dtype=torch.int32)
-        self._paged_kv_indices[:paged_kv_indices.size(0)].copy_(
-            paged_kv_indices, non_blocking=True)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -212,13 +219,26 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                              1])
 
         # number of cache blocks used by each sequence in the cache
-        self.num_blocks = [len(block_ids) for block_ids in block_ids_per_seq]
+        # NOTE: do not use len(block_ids) - that will give you a number
+        # that can be too big if using chunked prefill/kv cache reuse
+        # since we allocate all blocks ahead of time.
+        num_blocks = ((kv_lens + self.page_size - 1) // self.page_size)
+        self.num_blocks = num_blocks.tolist()
         self.num_context_blocks = sum(self.num_blocks[:self.num_contexts])
         self.num_generation_blocks = sum(self.num_blocks[self.num_contexts:])
 
+        paged_kv_indices_list = []
+        for i, block_ids in enumerate(block_ids_per_seq):
+            paged_kv_indices_list.extend(block_ids[:self.num_blocks[i]])
+
+        paged_kv_indices = torch.tensor(paged_kv_indices_list,
+                                        dtype=torch.int32)
+
+        self._paged_kv_indices[:paged_kv_indices.size(0)].copy_(
+            paged_kv_indices, non_blocking=True)
+
         # number of tokens in the last cache block used by each sequence
-        paged_kv_last_page_len = kv_lens - (torch.Tensor(
-            self.num_blocks).int().cuda(non_blocking=True) - 1) * self.page_size
+        paged_kv_last_page_len = kv_lens - (num_blocks - 1) * self.page_size
         self._paged_kv_last_page_len[:paged_kv_last_page_len.size(0)].copy_(
             paged_kv_last_page_len, non_blocking=True)
 

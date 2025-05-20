@@ -1,5 +1,5 @@
-from .eagle3 import Eagle3Decoder, Eagle3SpecMetadata
-from .mtp import MTPDecoder, MTPHiddenStatesManager, MTPSpecMetadata
+from .eagle3 import Eagle3Sampler, Eagle3SpecMetadata
+from .mtp import MTPHiddenStatesManager, MTPSampler, MTPSpecMetadata
 
 
 def get_spec_metadata(spec_config,
@@ -40,9 +40,9 @@ def get_spec_resource_manager(spec_config, model_config, max_num_requests):
 
 def get_spec_decoder(max_seq_len, spec_config):
     if spec_config.spec_dec_mode.is_mtp():
-        return MTPDecoder(max_seq_len, spec_config)
+        return MTPSampler(max_seq_len, spec_config)
     if spec_config.spec_dec_mode.is_eagle3():
-        return Eagle3Decoder(max_seq_len)
+        return Eagle3Sampler(max_seq_len)
     else:
         return None
 

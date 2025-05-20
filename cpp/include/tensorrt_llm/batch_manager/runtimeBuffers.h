@@ -180,8 +180,8 @@ public:
     //! Eagle decoding
     std::optional<runtime::EagleBuffers> eagleBuffers;
 
-    //! Language adapter routing information if language adapter is presented.
-    TensorPtr languageAdapterRoutings; // [numTokens, numLanguages]
+    //! Language adapter routing information if language adapter is presented, [numTokens, numLanguages]
+    TensorPtr languageAdapterRoutings;
 
     TensorPtr cacheIndirDecoderIOBatchedCopySrcOffsets;
     TensorPtr cacheIndirDecoderIOBatchedCopyDstOffsets;

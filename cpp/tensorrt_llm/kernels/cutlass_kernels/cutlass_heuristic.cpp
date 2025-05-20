@@ -225,9 +225,19 @@ std::vector<CutlassTileConfigSM90> get_candidate_tiles_sm90(CutlassGemmConfig::C
 #else
     if (config & CutlassGemmConfig::GROUPED_GEMM)
     {
-        return {CutlassTileConfigSM90::CtaShape128x16x128B, CutlassTileConfigSM90::CtaShape128x32x128B,
-            CutlassTileConfigSM90::CtaShape128x64x128B, CutlassTileConfigSM90::CtaShape128x128x128B,
-            CutlassTileConfigSM90::CtaShape128x256x128B, CutlassTileConfigSM90::CtaShape256x128x128B};
+        if (config & CutlassGemmConfig::WEIGHT_ONLY)
+        {
+            return {CutlassTileConfigSM90::CtaShape64x16x128B, CutlassTileConfigSM90::CtaShape64x32x128B,
+                CutlassTileConfigSM90::CtaShape64x64x128B, CutlassTileConfigSM90::CtaShape64x128x128B,
+                CutlassTileConfigSM90::CtaShape128x16x128B, CutlassTileConfigSM90::CtaShape128x32x128B,
+                CutlassTileConfigSM90::CtaShape128x64x128B, CutlassTileConfigSM90::CtaShape128x128x128B};
+        }
+        else
+        {
+            return {CutlassTileConfigSM90::CtaShape128x16x128B, CutlassTileConfigSM90::CtaShape128x32x128B,
+                CutlassTileConfigSM90::CtaShape128x64x128B, CutlassTileConfigSM90::CtaShape128x128x128B,
+                CutlassTileConfigSM90::CtaShape128x256x128B, CutlassTileConfigSM90::CtaShape256x128x128B};
+        }
     }
     else
     {
@@ -237,6 +247,19 @@ std::vector<CutlassTileConfigSM90> get_candidate_tiles_sm90(CutlassGemmConfig::C
             CutlassTileConfigSM90::CtaShape128x32x128B, CutlassTileConfigSM90::CtaShape128x64x128B,
             CutlassTileConfigSM90::CtaShape128x128x128B, CutlassTileConfigSM90::CtaShape128x256x128B};
     }
+#endif
+}
+
+bool sm90_supports_coop(CutlassTileConfigSM90 const tile)
+{
+#ifdef FAST_BUILD
+    return false;
+#else
+    std::set<CutlassTileConfigSM90> valid_tiles{CutlassTileConfigSM90::CtaShape128x16x128B,
+        CutlassTileConfigSM90::CtaShape128x32x128B, CutlassTileConfigSM90::CtaShape128x64x128B,
+        CutlassTileConfigSM90::CtaShape128x128x128B, CutlassTileConfigSM90::CtaShape128x256x128B,
+        CutlassTileConfigSM90::CtaShape256x128x128B, CutlassTileConfigSM90::CtaShape256x256x128B};
+    return valid_tiles.count(tile) == 1;
 #endif
 }
 
@@ -275,37 +298,65 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm90(CutlassGemmConfig::Can
     std::vector<CutlassGemmConfig> candidate_configs;
     for (auto const& tile_config : tiles)
     {
-        CutlassGemmConfig config(
-            tile_config, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1);
-        candidate_configs.push_back(config);
-
         bool const has_m_mcast = sm90_supports_mcast_along_m(tile_config);
         bool const has_n_mcast = sm90_supports_mcast_along_n(tile_config);
-        if (has_m_mcast)
+        bool const has_w4afp8 = (config & CutlassGemmConfig::WEIGHT_ONLY) && (config & CutlassGemmConfig::GROUPED_GEMM);
+        if (has_w4afp8)
         {
-            CutlassGemmConfig config(
-                tile_config, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_2x1x1);
-            candidate_configs.push_back(config);
+            bool const has_coop_supported = sm90_supports_coop(tile_config);
+            std::set<MainloopScheduleType> mainloop_schedules{MainloopScheduleType::PINGPONG};
+            if (has_coop_supported)
+            {
+                mainloop_schedules.insert(MainloopScheduleType::COOPERATIVE);
+            }
+            auto const epilogue_schedule = EpilogueScheduleType::AUTO;
+            for (auto const& mainloop_schedule : mainloop_schedules)
+            {
+                CutlassGemmConfig candidate(
+                    tile_config, mainloop_schedule, epilogue_schedule, ClusterShape::ClusterShape_1x1x1);
+                candidate_configs.push_back(candidate);
+                candidate = CutlassGemmConfig(
+                    tile_config, mainloop_schedule, epilogue_schedule, ClusterShape::ClusterShape_2x1x1);
+                candidate_configs.push_back(candidate);
+                candidate = CutlassGemmConfig(
+                    tile_config, mainloop_schedule, epilogue_schedule, ClusterShape::ClusterShape_1x2x1);
+                candidate_configs.push_back(candidate);
+                candidate = CutlassGemmConfig(
+                    tile_config, mainloop_schedule, epilogue_schedule, ClusterShape::ClusterShape_2x2x1);
+                candidate_configs.push_back(candidate);
+            }
         }
-
-        if (has_n_mcast)
+        else
         {
-            CutlassGemmConfig config(
-                tile_config, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x2x1);
-            candidate_configs.push_back(config);
-        }
+            CutlassGemmConfig candidate(
+                tile_config, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1);
+            candidate_configs.push_back(candidate);
+            if (has_m_mcast)
+            {
+                CutlassGemmConfig candidate(tile_config, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
+                    ClusterShape::ClusterShape_2x1x1);
+                candidate_configs.push_back(candidate);
+            }
 
-        if (has_m_mcast && has_n_mcast)
-        {
-            CutlassGemmConfig config(
-                tile_config, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_2x2x1);
-            candidate_configs.push_back(config);
+            if (has_n_mcast)
+            {
+                CutlassGemmConfig candidate(tile_config, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
+                    ClusterShape::ClusterShape_1x2x1);
+                candidate_configs.push_back(candidate);
+            }
+
+            if (has_m_mcast && has_n_mcast)
+            {
+                CutlassGemmConfig candidate(tile_config, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
+                    ClusterShape::ClusterShape_2x2x1);
+                candidate_configs.push_back(candidate);
+            }
         }
     }
     // add cuda kernel profiler to tactics for weight-only plugins
     if (config & CutlassGemmConfig::WEIGHT_ONLY)
     {
-        if (tiles.size() > 0)
+        if (tiles.size() > 0 && !(config & CutlassGemmConfig::GROUPED_GEMM))
         {
             CutlassGemmConfig CudaKernelConfig(
                 tiles[0], MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1);
