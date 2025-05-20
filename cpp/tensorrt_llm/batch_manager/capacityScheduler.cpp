@@ -220,7 +220,6 @@ std::tuple<RequestVector, RequestVector> PrefillFirstScheduler::operator()(
             = prefillWithChunkedContextsAlreadyExecuting(activeRequests, kvCacheManager, crossKvCacheManager);
     }
 
-    std::cout << "activeRequests: " << activeRequests.size() << std::endl;
     for (auto const& req : activeRequests)
     {
         // if request cannot be scheduled yet or request should no longer be scheduled, skip
@@ -243,7 +242,6 @@ std::tuple<RequestVector, RequestVector> PrefillFirstScheduler::operator()(
 
             if (enoughBlocks && enoughCrossBlocks)
             {
-                std::cout << "context request scheduled: ID " << req->mRequestId << std::endl;
                 scheduledRequests.emplace_back(req);
                 reservedBlocks.decrementReservedBlocks(*req);
                 if (reservedCrossBlocks)
@@ -257,59 +255,51 @@ std::tuple<RequestVector, RequestVector> PrefillFirstScheduler::operator()(
         }
     }
 
-    std::cout << "return scheduledRequests: " << scheduledRequests.size() << std::endl;
     if (scheduledRequests.size() > 0)
     {
         // If we have scheduled context requests, return them
         return {std::move(scheduledRequests), RequestVector{}};
     }
 
-    for (auto const& requests : {activeRequests})
+    for (auto const& req : activeRequests)
     {
-        for (auto const& req : requests)
+        if (skippingIsRelevant && !req->isDisaggGenerationInitState()
+            && beneficialToSkip(req, kvCacheManager, crossKvCacheManager, newlyContributedContextBlocks,
+                newlyContributedCrossContextBlocks))
         {
-            if (skippingIsRelevant && !req->isDisaggGenerationInitState()
-                && beneficialToSkip(req, kvCacheManager, crossKvCacheManager, newlyContributedContextBlocks,
-                    newlyContributedCrossContextBlocks))
-            {
-                continue;
-            }
+            continue;
+        }
 
-            if (scheduledRequests.size() >= static_cast<std::size_t>(mMaxNumRequests))
+        if (scheduledRequests.size() >= static_cast<std::size_t>(mMaxNumRequests))
+        {
+            break;
+        }
+        else if (req->isGenerationInProgressState())
+        {
+            scheduledRequests.emplace_back(req);
+            reservedBlocks.decrementReservedBlocks(*req);
+            if (reservedCrossBlocks)
+                reservedCrossBlocks->decrementReservedBlocks(*req);
+        }
+        else if (req->isDisaggGenerationInitState())
+        {
+            bool enoughBlocks = reservedBlocks.enoughAvailableBlocks(*req);
+            bool enoughCrossBlocks = reservedCrossBlocks ? reservedCrossBlocks->enoughAvailableBlocks(*req) : true;
+
+            if (enoughBlocks && enoughCrossBlocks)
             {
-                break;
-            }
-            else if (req->isGenerationInProgressState())
-            {
-                std::cout << "isGenerationInProgressState request scheduled: ID " << req->mRequestId << std::endl;
                 scheduledRequests.emplace_back(req);
                 reservedBlocks.decrementReservedBlocks(*req);
                 if (reservedCrossBlocks)
                     reservedCrossBlocks->decrementReservedBlocks(*req);
             }
-            else if (req->isDisaggGenerationInitState())
+            else if (!enoughBlocks || !enoughCrossBlocks)
             {
-                bool enoughBlocks = reservedBlocks.enoughAvailableBlocks(*req);
-                bool enoughCrossBlocks = reservedCrossBlocks ? reservedCrossBlocks->enoughAvailableBlocks(*req) : true;
-
-                if (enoughBlocks && enoughCrossBlocks)
-                {
-                    std::cout << "isDisaggGenerationInitState request scheduled: ID " << req->mRequestId << std::endl;
-                    scheduledRequests.emplace_back(req);
-                    reservedBlocks.decrementReservedBlocks(*req);
-                    if (reservedCrossBlocks)
-                        reservedCrossBlocks->decrementReservedBlocks(*req);
-                }
-                else if (!enoughBlocks || !enoughCrossBlocks)
-                {
-                    // If one requests fails to be scheduled, break
-                    break;
-                }
+                // If one requests fails to be scheduled, break
+                break;
             }
         }
     }
-    // }
-    std::cout << "return scheduledRequests: " << scheduledRequests.size() << std::endl;
 
     return {std::move(scheduledRequests), RequestVector{}};
 }
