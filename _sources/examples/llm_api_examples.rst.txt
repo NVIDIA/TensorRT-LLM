@@ -5,19 +5,19 @@ LLM Examples
    :maxdepth: 2
    :caption: Scripts
 
-   llm_inference_async
-   llm_inference_kv_events
-   llm_inference_customize
-   llm_lookahead_decoding
    llm_medusa_decoding
-   llm_guided_decoding
-   llm_logits_processor
-   llm_quantization
-   llm_inference
    llm_multilora
-   llm_inference_async_streaming
-   llm_inference_distributed
    llm_eagle_decoding
+   llm_inference_async
+   llm_inference_distributed
+   llm_logits_processor
+   llm_inference_kv_events
+   llm_lookahead_decoding
+   llm_quantization
+   llm_inference_async_streaming
+   llm_guided_decoding
+   llm_inference
+   llm_inference_customize
    llm_auto_parallel
    llm_mgmn_llm_distributed
    llm_mgmn_trtllm_bench
