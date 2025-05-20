@@ -1,17 +1,18 @@
+import asyncio
 import copy
-import pytest
 import threading
 import time
-import asyncio
 from unittest import mock
 
+import pytest
+
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
+from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest,
                                                 DisaggregatedParams)
 from tensorrt_llm.serve.router import (KvCacheAwareRouter, LoadBalancingRouter,
                                        RoundRobinRouter, create_router)
-from tensorrt_llm.logger import logger
 
 
 # Mock class for metadata server

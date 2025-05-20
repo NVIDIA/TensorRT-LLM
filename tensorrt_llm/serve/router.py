@@ -1,7 +1,7 @@
 import asyncio
 import heapq
 from abc import ABC, abstractmethod
-from typing import Iterable, Optional, Union, Dict, List,
+from typing import Dict, Iterable, List, Optional, Union
 
 import aiohttp
 from transformers import AutoTokenizer
@@ -15,8 +15,6 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest)
 
 OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest]
-
-logger = logging.getLogger(__name__)
 
 
 def get_request_num_tokens(request: OpenAIRequest) -> int:
@@ -427,8 +425,7 @@ class RoundRobinRouter(Router):
             # Safety check: ensure index is always within bounds
             self._server_idx = 0
 
-    async def get_next_server(
-            self, request: OpenAIRequest) -> str:
+    async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
         if not self._servers:
             if self._metadata_server:
                 raise ValueError(
@@ -444,7 +441,7 @@ class RoundRobinRouter(Router):
 
             server = self._servers[self._server_idx]
             self._server_idx = (self._server_idx + 1) % len(self._servers)
-        return server
+        return server, {}
 
     async def finish_request(self, request: OpenAIRequest):
         pass
@@ -494,8 +491,7 @@ class LoadBalancingRouter(Router):
             heapq.heappush(self._server_load_heap,
                            (self._get_server_load(server), server))
 
-    async def get_next_server(
-            self, request: OpenAIRequest) -> str:
+    async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
         if not self._servers:
             if self._metadata_server:
                 raise ValueError(
@@ -537,18 +533,20 @@ def block_key_hasher(token_ids: list[int],
 class KvCacheAwareRouter(Router):
 
     def __init__(self,
+                 server_role: ServerRole,
                  servers: list[str] = None,
+                 metadata_server: JsonDictionary = None,
                  use_tokens: bool = False,
                  max_batch_size: int = 64,
                  tokens_per_block: int = 32,
                  **kwargs):
-        super().__init__(servers)
+        super().__init__(server_role, servers, metadata_server)
         self._lock = asyncio.Lock()
 
         # Load map between servers and their number of tokens processed
         self._server_state: dict[str, KvCacheAwareServerState] = {
             server: KvCacheAwareServerState(server, use_tokens)
-            for server in servers
+            for server in servers or []
         }
 
         # Routing table to map requests to servers
@@ -649,7 +647,8 @@ def create_router(router_config: Optional[RouterConfig],
         ValueError: If an unsupported router type is provided
     """
     if router_config is None:
-        return RoundRobinRouter(servers)
+        # Create a default router without server_role
+        return RoundRobinRouter(None, servers)
 
     router_map = {
         "round_robin": RoundRobinRouter,
@@ -663,4 +662,6 @@ def create_router(router_config: Optional[RouterConfig],
         raise ValueError(f"Unsupported router type: {router_type}. "
                          f"Supported types are: {list(router_map.keys())}")
 
-    return router_class(servers, metadata_server, **router_config.args)
+    # Pass server_role as the first argument
+    return router_class(router_config.server_role, servers, metadata_server,
+                        **router_config.args)
