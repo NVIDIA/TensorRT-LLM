@@ -155,6 +155,10 @@ def row_linear_residual_norm_fusion_forward(
     ids=["fusion", "no_fusion"],
 )
 def test_row_linear_residual_norm_fusion(seq_len, hidden_size, fusion):
+
+    if not fusion:
+        pytest.skip("skip no fusion test")
+
     torch.manual_seed(42)
     dtype = torch.bfloat16
     tensor_parallel_size = 2
