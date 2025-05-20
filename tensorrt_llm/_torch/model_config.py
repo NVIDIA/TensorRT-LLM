@@ -32,6 +32,8 @@ class ModelConfig(Generic[TConfig]):
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
 
+    extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
+
     def __post_init__(self):
         if self.pretrained_config and hasattr(self.pretrained_config,
                                               "architectures"):
