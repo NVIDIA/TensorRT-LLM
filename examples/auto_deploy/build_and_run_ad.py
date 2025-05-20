@@ -39,14 +39,17 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
 
     # setup AD config
     ad_config = AutoDeployConfig(
-        use_cuda_graph=config.compile_backend == "torch-opt",
-        torch_compile_enabled=config.compile_backend == "torch-opt",
+        # Both torch-opt and torch-cudagraph invoke cudagraphs
+        use_cuda_graph=config.compile_backend in ["torch-opt", "torch-cudagraph"],
+        # Both torch-opt and torch-compile invoke torch.compile
+        torch_compile_enabled=config.compile_backend in ["torch-opt", "torch-compile"],
         model_factory=config.model_factory,
         model_kwargs=config.model_kwargs,
         attn_backend=config.attn_backend,
         mla_backend=config.mla_backend,
         skip_loading_weights=config.skip_loading_weights,
         cuda_graph_max_batch_size=config.max_batch_size,
+        free_mem_ratio=config.free_mem_ratio,
     )
     ad_logger.info(f"AutoDeploy Config: {ad_config}")
 

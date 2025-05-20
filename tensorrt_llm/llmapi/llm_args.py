@@ -12,7 +12,8 @@ from pydantic import BaseModel, Field, validator
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.lora_manager import (LoraConfig,
+                                       get_default_trtllm_modules_to_hf_modules)
 
 from .._utils import mpi_rank
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
@@ -787,13 +788,22 @@ class LlmArgs(BaseModel):
     # LoRA arguments
     enable_lora: bool = Field(default=False, description="Enable LoRA.")
 
-    max_lora_rank: Optional[int] = Field(default=None,
-                                         description="The maximum LoRA rank.")
+    max_lora_rank: Optional[int] = Field(
+        default=None,
+        description="The maximum LoRA rank.",
+        deprecated="Use lora_config.max_lora_rank instead.")
 
-    max_loras: int = Field(default=4, description="The maximum number of LoRA.")
+    max_loras: int = Field(default=4,
+                           description="The maximum number of LoRA.",
+                           deprecated="Use lora_config.max_loras instead.")
 
-    max_cpu_loras: int = Field(default=4,
-                               description="The maximum number of LoRA on CPU.")
+    max_cpu_loras: int = Field(
+        default=4,
+        description="The maximum number of LoRA on CPU.",
+        deprecated="Use lora_config.max_cpu_loras instead.")
+
+    lora_config: Optional[LoraConfig] = Field(
+        default=None, description="LoRA configuration for the model.")
 
     # Prompt adapter arguments
     enable_prompt_adapter: bool = Field(default=False,
@@ -905,10 +915,6 @@ class LlmArgs(BaseModel):
     backend: Optional[str] = Field(default=None,
                                    description="The backend to use.",
                                    exclude=True)
-
-    # TODO smor- this is an experimental feature and is probably subject to change before 1.0 release
-    lora_config: Optional[LoraConfig] = Field(
-        default=None, description="LoRA configuration for the model.")
 
     # private fields those are unstable and just for internal use
     num_postprocess_workers: int = Field(
@@ -1149,7 +1155,9 @@ class LlmArgs(BaseModel):
         if self.parallel_config._world_size == 1:
             self.build_config.plugin_config.nccl_plugin = None
 
-        if self.enable_lora:
+        self._ensure_lora_config_consistency()
+
+        if self.enable_lora and self.lora_config is None and self.backend != 'pytorch':
             self.build_config.plugin_config.lora_plugin = 'auto'
             if self.max_lora_rank is not None:
                 self.build_config.lora_config.max_lora_rank = self.max_lora_rank
@@ -1219,10 +1227,40 @@ class LlmArgs(BaseModel):
         else:
             self.decoding_config = None
 
+    def _ensure_lora_config_consistency(self):
         if self.lora_config:
+            if self.max_lora_rank is not None:
+                logger.warning(
+                    "max_lora_rank is ignored when lora_config is provided.")
+            if self.max_loras != self.lora_config.max_loras:
+                logger.warning(
+                    "max_loras is ignored when lora_config is provided.")
+            if self.max_cpu_loras != self.lora_config.max_cpu_loras:
+                logger.warning(
+                    "max_cpu_loras is ignored when lora_config is provided.")
+
+            if len(self.lora_config.lora_dir) == 0:
+                # TODO [TRTLLM-5173]
+                logger.warning(
+                    "lora_dir is empty, so custom embedding or lm head will not be applied."
+                )
+
+        if self.enable_lora and self.lora_config is not None and self.backend == 'pytorch':
             logger.warning(
-                "Lora is an experimental feature and is probably subject to change before 1.0 release"
+                "enable_lora is ignored when lora_config is provided for pytorch backend."
             )
+
+        if self.lora_config is not None:
+            if len(self.lora_config.lora_dir) == 0 and len(
+                    self.lora_config.lora_target_modules) == 0:
+                logger.warning(
+                    "Both lora_dir and lora_target_modules are empty, so all LoRA modules will be expected. "
+                    "This will lead to serious memory consumption. Please provide either lora_dir or lora_target_modules if this behavior is not what you expect."
+                )
+                default_trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules(
+                )
+                self.lora_config.lora_target_modules = list(
+                    default_trtllm_modules_to_hf_modules.keys())
 
     @property
     def _build_config_mutable(self) -> bool:

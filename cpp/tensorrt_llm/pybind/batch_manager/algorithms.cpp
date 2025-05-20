@@ -141,25 +141,25 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
             [](GenerateRequestOptions& self, tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
                 executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
                 tr::BufferManager const& bufferManager, nvinfer1::DataType logitsType,
-                DecoderInputBuffers const& inputBuffers, OptionalRef<RuntimeBuffers const> buffers = std::nullopt)
+                DecoderInputBuffers& inputBuffers, tr::decoder::DecoderState& decoderState, tr::SizeType32 beamWidth,
+                tr::CudaStream const& stream, OptionalRef<RuntimeBuffers const> buffers = std::nullopt)
             {
                 auto [batchSlots, decoderRequests, samplingConfigs] = self(modelConfig, worldConfig, decodingConfig,
-                    contextRequests, bufferManager, logitsType, inputBuffers, buffers);
+                    contextRequests, bufferManager, logitsType, inputBuffers, decoderState, beamWidth, stream, buffers);
 
                 return std::tuple{
                     runtime::Torch::tensor(batchSlots), std::move(decoderRequests), std::move(samplingConfigs)};
             },
             py::arg("model_config"), py::arg("world_config"), py::arg("decoding_config"), py::arg("context_requests"),
             py::arg("buffer_manager"), py::arg("logits_type"), py::arg("decoder_input_buffers"),
-            py::arg("buffers") = std::nullopt)
+            py::arg("decoder_state"), py::arg("beam_width"), py::arg("stream"), py::arg("buffers") = std::nullopt)
         .def("name", [](GenerateRequestOptions const&) { return GenerateRequestOptions::name; });
 
     py::class_<MakeDecodingBatchInputOutput>(m, MakeDecodingBatchInputOutput::name)
         .def(py::init())
         .def("__call__", &MakeDecodingBatchInputOutput::operator(), py::arg("context_requests"),
             py::arg("generation_requests"), py::arg("decoder_buffers"), py::arg("decoder_input_buffers"),
-            py::arg("decoder_state"), py::arg("model_config"), py::arg("max_num_sequences"), py::arg("beam_width"),
-            py::arg("is_trt_overlap"), py::arg("buffer_manager"), py::arg("stream"),
+            py::arg("decoder_state"), py::arg("model_config"), py::arg("max_num_sequences"),
             py::arg("fused_runtime_buffers") = std::nullopt)
         .def("name", [](MakeDecodingBatchInputOutput const&) { return MakeDecodingBatchInputOutput::name; });
 

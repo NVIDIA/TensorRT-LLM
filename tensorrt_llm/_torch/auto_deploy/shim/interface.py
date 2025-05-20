@@ -88,7 +88,7 @@ GetInferenceModel = Callable[[CachedSequenceInterface], nn.Module]
 @dataclass
 class AutoDeployConfig(PyTorchConfig):
     # model factory to choose from
-    model_factory: str = "hf"  # only 'hf' supported for "trtllm" runtime
+    model_factory: str = "AutoModelForCausalLM"
 
     ### MODEL EXTRA KWARGS ###
     # Extra kwargs for the model config class to customize the model config. Those arguments will
@@ -112,6 +112,9 @@ class AutoDeployConfig(PyTorchConfig):
     # check if we should skip loading weights
     skip_loading_weights: bool = False
 
+    # specifies the fraction of available memory to occupy for cache
+    free_mem_ratio: float = 0.8
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -120,3 +123,6 @@ class AutoDeployConfig(PyTorchConfig):
         # gets replaced by the user provided one. We don't want that though.
         f_default = self.__dataclass_fields__["model_kwargs"].default_factory()
         setattr(self, "model_kwargs", {**f_default, **getattr(self, "model_kwargs")})
+
+        # TODO (https://github.com/NVIDIA/TensorRT-LLM/issues/4364) support overlap scheduler
+        self.disable_overlap_scheduler = True

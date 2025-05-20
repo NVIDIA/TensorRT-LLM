@@ -47,15 +47,9 @@ methods:
       enable_lora:
         annotation: bool
         default: false
-      max_lora_rank:
-        annotation: Optional[int]
+      lora_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.LoraConfig]
         default: null
-      max_loras:
-        annotation: int
-        default: 4
-      max_cpu_loras:
-        annotation: int
-        default: 4
       # Prompt tuning
       enable_prompt_adapter:
         annotation: bool

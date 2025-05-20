@@ -59,4 +59,7 @@ from utils.llm_data import llm_models_root
 def test_build_ad(world_size: Optional[int], config: Dict):
     simple_config = SimpleConfig(**config)
     simple_config.world_size = world_size
+    simple_config.skip_loading_weights = True
+    simple_config.free_mem_ratio = 0.01  # we don't need the cache and it may cause OOM issues
+    print(f"Simple Config: {simple_config}")
     main(simple_config)

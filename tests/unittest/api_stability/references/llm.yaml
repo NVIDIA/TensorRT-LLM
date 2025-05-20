@@ -71,9 +71,16 @@ methods:
       workspace:
         annotation: Optional[str]
         default: null
-      lora_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.LoraConfig]
+      # LoRA
+      max_lora_rank:
+        annotation: Optional[int]
         default: null
+      max_loras:
+        annotation: int
+        default: 4
+      max_cpu_loras:
+        annotation: int
+        default: 4
       kwargs:
         annotation: Any
         default: inspect._empty
