@@ -597,7 +597,6 @@ def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
                     compare_length = 2 if (
                         return_context_logits
                         or return_generation_logits) else len(predicted_tokens)
-                    compare_length = min(compare_length, len(predicted_tokens))
 
                     for i in range(compare_length):
                         if expected_tokens[i] == end_id:
