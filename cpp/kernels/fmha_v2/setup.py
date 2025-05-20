@@ -2878,6 +2878,7 @@ def get_kernel_traits_code(specs_names):
                                   {loop_step},
                                   {kv_loop_step},
                                   {head_size},
+                                  {head_size_v},
                                   {q_tile_buffers},
                                   {kv_tile_buffers},
                                   NUM_COMPUTE_GROUPS,

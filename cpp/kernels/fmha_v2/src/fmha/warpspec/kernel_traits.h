@@ -128,7 +128,7 @@ struct Kernel_traits
 
     enum
     {
-        DV = fmha::Div_up<VALID_DV, D_ALIGN>::VALUE * D_ALIGN
+        DV = Next_power_of_two<VALID_DV>::VALUE
     };
 
     // The number of smem buffers for Q tiles.
