@@ -74,7 +74,7 @@ class TRTLLMEvalBase(TemplateLM):
         self.moe_expert_parallel_size = moe_expert_parallel_size
         self.moe_backend = moe_backend
         trt_kv_cache_config = TRT_KvCacheConfig(enable_block_reuse=False)
-        trt_kv_cache_config.free_gpu_memory_fraction = free_gpu_memory_fraction
+        trt_kv_cache_config.free_gpu_memory_fraction = 0.5
         if max_tokens_kv_cache is not None:
             trt_kv_cache_config.max_tokens = max_tokens_kv_cache
 
@@ -109,7 +109,8 @@ class TRTLLMEvalBase(TemplateLM):
                 model=model,
                 tensor_parallel_size=tp,
                 trust_remote_code=trust_remote_code,
-                enable_chunked_prefill=False,
+                enable_chunked_prefill=True,
+                max_num_tokens=2048,
                 pytorch_backend_config=pytorch_config,
                 tokenizer=self.tokenizer,
                 kv_cache_config=trt_kv_cache_config,
@@ -292,11 +293,11 @@ class TRTLLMEvalBase(TemplateLM):
             # process the output of the request i
             r_out: RequestOutput = futures.pop(i).result()
             stop_words = future_stop_words.pop(i)
-            for word in stop_words:
-                txt = r_out.outputs[0].text
-                word_index = txt.find(word)
-                if word_index >= 0:
-                    txt = txt[:word_index]
+            txt = r_out.outputs[0].text
+            # for word in stop_words:
+            #     word_index = txt.find(word)
+            #     if word_index >= 0:
+            #         txt = txt[:word_index]
             results.append(txt)
 
         return results
