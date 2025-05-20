@@ -209,8 +209,7 @@ class InferenceOptimizer:
         # initialize cache on correct device
         cm.initialize_caches()
 
-        # Free memory ratio is hardcoded to 0.8 for now to ensure we have enough memory for graph
-        # capture.
+        # resize kv cache to occupy the available GPU memory up to free_mem_ratio
         resize_kv_cache(egm, cm, free_mem_ratio=self.ad_config.free_mem_ratio)
 
         ############################################################################################
