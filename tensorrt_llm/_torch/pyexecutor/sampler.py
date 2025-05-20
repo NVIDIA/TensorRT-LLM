@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import torch
@@ -578,7 +579,7 @@ class TRTLLMSampler(Sampler):
                 decoder_requests)
 
     @staticmethod
-    def beam_width(scheduled_requests) -> int:
+    def beam_width(scheduled_requests: Iterable[LlmRequest]) -> int:
         for req in scheduled_requests:
             return req.sampling_config.beam_width
         return 0
