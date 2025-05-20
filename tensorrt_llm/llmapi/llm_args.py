@@ -902,15 +902,14 @@ class LlmArgs(BaseModel):
         default=None, description="Cache transceiver config.")
 
     # Speculative decoding parameters
-    speculative_config: (
-        None
-        | LookaheadDecodingConfig
-        | MedusaDecodingConfig
-        | EagleDecodingConfig
-        | MTPDecodingConfig
-        | NGramDecodingConfig
-        ) = Field(
-        default=None, description="Speculative decoding config.")
+    speculative_config: (None
+                         | LookaheadDecodingConfig
+                         | MedusaDecodingConfig
+                         | EagleDecodingConfig
+                         | MTPDecodingConfig
+                         | NGramDecodingConfig) = Field(
+                             default=None,
+                             description="Speculative decoding config.")
 
     batching_type: Optional[BatchingType] = Field(default=None,
                                                   description="Batching type.")
