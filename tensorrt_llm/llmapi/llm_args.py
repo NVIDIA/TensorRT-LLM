@@ -4,8 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
 from enum import Enum, EnumMeta
 from pathlib import Path
-from typing import (Any, ClassVar, Dict, List, Literal, Optional, TypeAlias,
-                    Union)
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
 
 import torch
 import yaml
@@ -914,15 +913,10 @@ class LlmArgs(BaseModel):
         default=None, description="Cache transceiver config.")
 
     # Speculative decoding parameters
-    SpeculativeConfig: TypeAlias = Optional[Union[
-        LookaheadDecodingConfig,
-        MedusaDecodingConfig,
-        EagleDecodingConfig,
-        MTPDecodingConfig,
-        NGramDecodingConfig,
-    ]]
-    speculative_config: SpeculativeConfig = Field(
-        default=None, description="Speculative decoding config.")
+    speculative_config: Optional[Union[
+        LookaheadDecodingConfig, MedusaDecodingConfig, EagleDecodingConfig,
+        MTPDecodingConfig, NGramDecodingConfig]] = Field(
+            default=None, description="Speculative decoding config.")
 
     batching_type: Optional[BatchingType] = Field(default=None,
                                                   description="Batching type.")
