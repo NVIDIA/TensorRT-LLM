@@ -10,7 +10,6 @@ from .kvcache import *
 from .quantization import *
 from .rope import *
 from .sharding import *
-from .unfuse_weight import *
 
 try:
     from .visualization import visualize_namespace
