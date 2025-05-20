@@ -3,11 +3,6 @@ from typing import Dict, Optional
 import torch
 from torch import nn
 from torch.nn import functional as F
-
-try:
-    from transformer_engine.pytorch import RMSNorm
-except ImportError:
-    RMSNorm = None
 from transformers import AutoConfig, PretrainedConfig
 
 from ..attention_backend import AttentionMetadata
@@ -16,6 +11,7 @@ from ..modules.attention import Attention
 from ..modules.embedding import Embedding
 from ..modules.mamba.mixer import MambaMixer
 from ..modules.mlp import MLP
+from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
@@ -111,10 +107,8 @@ class NemotronHLayer(nn.Module):
         self.layer_idx = layer_idx
         self.layer_type = layer_type
 
-        assert RMSNorm is not None, "RMSNorm from transformer_engine is not installed, install it with `pip3 install transformer_engine[pytorch]`"
-
         self.norm = RMSNorm(
-            normalized_shape=config.hidden_size,
+            hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype,
         )
@@ -187,11 +181,9 @@ class NemotronHModel(DecoderModel):
             layers.append(NemotronHLayer(model_config, layer_idx, layer_type))
         self.layers = nn.ModuleList(layers)
 
-        assert RMSNorm is not None, "RMSNorm from transformer_engine is not installed, install it with `pip3 install transformer_engine[pytorch]`"
-
         # final norm
         self.norm_f = RMSNorm(
-            normalized_shape=config.hidden_size,
+            hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype,
         )
