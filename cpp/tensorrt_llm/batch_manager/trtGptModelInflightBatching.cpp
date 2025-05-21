@@ -953,11 +953,6 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
             = (*mMicroBatchScheduler)(fittingRequests, mInflightReqIds, mMaxBatchSizeRuntime, mMaxNumTokensRuntime);
         TLLM_CHECK(currRequests.size() <= static_cast<size_t>(getMaxBatchSize()));
 
-        // Move context requests that reached the last context chunk to the end of the vector.
-        // This order is required for moveFinishedContextRequestsToGeneration.
-        std::partition(currRequests.contextRequests.begin(), currRequests.contextRequests.end(),
-            [](auto const& llmReq) { return !llmReq->isLastContextChunk(); });
-
         (*mPauseRequests)(requestsToPause, mInflightReqIds, mReqIdsToPause, false, *mSeqSlotManager, mKvCacheManager,
             mCrossKvCacheManager, mPeftCacheManager);
 
@@ -1717,7 +1712,8 @@ void TrtGptModelInflightBatching::executeStep(
         // TODO: support layer-wise cross kv cache in encoder-decoder models
         if (!layerWiseRequests.empty() && !mModelConfig.useCrossAttention())
         {
-            int const numLayers = mModelConfig.getNbAttentionLayers(mWorldConfig.getPipelineParallelism());
+            int const numLayers = mModelConfig.getNbAttentionLayers(
+                mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank());
             progress = std::make_shared<ContextProgress>(numLayers);
         }
         bufferCast<void*>(*mBuffers[bufferId]->transformerBuffers->contextProgressHost)[0] = progress.get();
