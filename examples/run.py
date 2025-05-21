@@ -454,7 +454,8 @@ def main(args):
             lora_ckpt_source=args.lora_ckpt_source,
             gpu_weights_percent=args.gpu_weights_percent,
             max_output_len=args.max_output_len,
-            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
+            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc,
+        )
         if args.medusa_choices is not None:
             args.medusa_choices = ast.literal_eval(args.medusa_choices)
             assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
