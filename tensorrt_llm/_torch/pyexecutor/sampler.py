@@ -4,13 +4,15 @@ from dataclasses import dataclass
 
 import torch
 
+from tensorrt_llm._torch.pyexecutor.handle_context_logits import \
+    HandleContextLogits
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
                                    WorldConfig, make_sampling_config)
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import (
-    CreateNewDecoderRequests, HandleContextLogits, HandleGenerationLogits,
+    CreateNewDecoderRequests, HandleGenerationLogits,
     MakeDecodingBatchInputOutput)
 from tensorrt_llm.bindings.internal.batch_manager import (DecoderBuffers,
                                                           DecoderInputBuffers)
@@ -601,10 +603,9 @@ class TRTLLMSampler(Sampler):
         #       numContextLogits.at(batchIdx) = modelConfig.computeContextLogits() ? contextChunkSize : 1;
         # Revisit this when we support chunked context.
         num_context_logits = [1] * batch_size
-        logits_index = self.algs.handle_context_logits(
-            scheduled_requests.context_requests, num_context_logits, logits,
-            self.store["decoder_buffers"], self.model_config,
-            self.store["buffer_manager"], self.store["cuda_stream"])
+        logits_index = self.algs.handle_context_logits(scheduled_requests.context_requests,
+                                           num_context_logits, logits,
+                                           self.store["decoder_buffers"])
 
         self.algs.handle_generation_logits(
             logits_index, scheduled_requests.generation_requests,
@@ -682,7 +683,6 @@ class TRTLLMSampler(Sampler):
             seq_slot = request.seq_slot
             num_generated_tokens = request.num_draft_tokens + 1
             current_num_of_tokens = request.max_beam_num_tokens
-
             num_new_tokens = [0] * beam_width
 
             for beam in range(beam_width):
