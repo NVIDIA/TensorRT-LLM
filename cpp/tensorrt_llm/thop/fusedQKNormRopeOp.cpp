@@ -34,6 +34,7 @@ void fused_qk_norm_rope(
     int64_t num_heads_k,         // Number of key heads
     int64_t num_heads_v,         // Number of value heads
     int64_t head_dim,            // Dimension per head
+    bool is_neox,                // Whether RoPE is applied in Neox style
     double eps,                  // Epsilon for RMS normalization
     double base)                 // Base for RoPE computation
 {
@@ -53,11 +54,13 @@ void fused_qk_norm_rope(
 
     auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
 
+    bool interleave = !is_neox;
+
     // Call the CUDA kernel
     tensorrt_llm::kernels::launchFusedQKNormRope(reinterpret_cast<__nv_bfloat16*>(qkv.data_ptr()),
         reinterpret_cast<int const*>(position_ids.data_ptr()), static_cast<int>(num_tokens),
         static_cast<int>(num_heads_q), static_cast<int>(num_heads_k), static_cast<int>(num_heads_v),
-        static_cast<int>(head_dim), static_cast<float>(eps), static_cast<float>(base), stream);
+        static_cast<int>(head_dim), interleave, static_cast<float>(eps), static_cast<float>(base), stream);
 }
 
 // Register the PyTorch operators
@@ -65,7 +68,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "fused_qk_norm_rope(Tensor qkv, Tensor position_ids, int num_heads_q, int num_heads_k, int num_heads_v, int "
-        "head_dim, float eps, float base) -> ()",
+        "head_dim, bool is_neox, float eps, float base) -> ()",
         &fused_qk_norm_rope);
 }
 

@@ -35,6 +35,7 @@ void launchFusedQKNormRope(
     int const num_heads_k,          // Number of key heads
     int const num_heads_v,          // Number of value heads
     int const head_dim,             // Dimension per head
+    bool const interleave,          // Whether RoPE is applied in interleave mode (non-Neox style)
     float const eps = 1e-5f,        // Epsilon for RMS normalization
     float const base = 10000.0f,    // Base for RoPE computation
     cudaStream_t stream = nullptr); // CUDA stream

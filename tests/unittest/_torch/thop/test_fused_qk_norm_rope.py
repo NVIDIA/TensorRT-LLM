@@ -12,6 +12,7 @@ def torch_ref_rms_norm_rope(qkv,
                             num_heads_k,
                             num_heads_v,
                             head_dim,
+                            is_neox,
                             eps=1e-5,
                             base=10000.0):
     """
@@ -69,12 +70,12 @@ def torch_ref_rms_norm_rope(qkv,
     rope_params = RopeParams(
         dim=head_dim,  # Set the rotary dimension to match the head dimension
         theta=base,  # Base value for RoPE calculations
-        max_positions=8192  # Large enough for any reasonable sequence length
+        max_positions=8192  # Large enough for any reasonable hidden size
     )
     # TODO: support is_neox=True
     rotary_emb = RotaryEmbedding(rope_params=rope_params,
                                  head_dim=head_dim,
-                                 is_neox=False).to(qkv.device)
+                                 is_neox=is_neox).to(qkv.device)
 
     # Apply RoPE to the normalized Q and K
     [q_rope, k_rope] = rotary_emb(position_ids, [q_normalized, k_normalized])
@@ -98,10 +99,12 @@ dtypes = [torch.bfloat16]  # TODO: support float16
 
 
 @pytest.mark.parametrize("head_dim", head_dims)
+@pytest.mark.parametrize("is_neox", [False])
 @pytest.mark.parametrize("num_heads_group", num_heads_groups)
 @pytest.mark.parametrize("num_tokens", num_tokens_list)
 @pytest.mark.parametrize("dtype", dtypes)
-def test_fused_qk_norm_rope(head_dim, num_heads_group, num_tokens, dtype):
+def test_fused_qk_norm_rope(head_dim, is_neox, num_heads_group, num_tokens,
+                            dtype):
     """
     Test the fused QK RMSNorm + RoPE operation with various configurations.
 
@@ -139,9 +142,16 @@ def test_fused_qk_norm_rope(head_dim, num_heads_group, num_tokens, dtype):
     base = 10000.0
 
     # Run the custom fusedQKNormRope operation
-    torch.ops.trtllm.fused_qk_norm_rope(qkv, position_ids, num_heads_q,
-                                        num_heads_k, num_heads_v, head_dim, eps,
-                                        base)
+    torch.ops.trtllm.fused_qk_norm_rope(
+        qkv,
+        position_ids,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        is_neox,  # interleave
+        eps,
+        base)
     # Check for CUDA errors
     torch.cuda.synchronize()
     output = qkv  # This op is inplace
@@ -149,7 +159,7 @@ def test_fused_qk_norm_rope(head_dim, num_heads_group, num_tokens, dtype):
     # Compute reference output using TensorRT-LLM modules
     ref_output = torch_ref_rms_norm_rope(qkv_copy, position_ids, num_heads_q,
                                          num_heads_k, num_heads_v, head_dim,
-                                         eps, base)
+                                         is_neox, eps, base)
 
     # Set tolerance based on dtype - bfloat16 needs higher tolerance
     atol = 1e-2 if dtype == torch.float16 else 1e-1  # Higher tolerance for bfloat16

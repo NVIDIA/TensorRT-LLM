@@ -1,5 +1,6 @@
 #include "fusedQKNormRopeKernel.h"
 #include "tensorrt_llm/common/mathUtils.h"
+#include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include <cmath>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -20,7 +21,9 @@ __host__ __device__ void applyRoPE(float& x, float& y, float cosTheta, float sin
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Perform per-head QK Norm and RoPE in a single kernel.
-template <int head_dim>
+// head_dim: the dimension of each head
+// interleave: interleave=!is_neox.
+template <int head_dim, bool interleave>
 __global__ void fusedQKNormRopeKernel(
     __nv_bfloat16* qkv,         // Combined QKV tensor [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]
     int const* position_ids,    // Position IDs for RoPE [num_tokens]
@@ -54,7 +57,9 @@ __global__ void fusedQKNormRopeKernel(
     int const headIdx = isQ ? localHeadIdx : localHeadIdx - num_heads_q;
 
     int const num_heads = num_heads_q + num_heads_k + num_heads_v;
-    static_assert(head_dim % 32 == 0, "head_dim must be divisible by 32 (each warp processes one head)");
+    static_assert(head_dim % (32 * 2) == 0,
+        "head_dim must be divisible by 64 (each warp processes one head, and each thread gets even number of "
+        "elements)");
     constexpr int numElemsPerThread = head_dim / 32;
     constexpr int numVecPerThread = numElemsPerThread / 4;
     float elements[numElemsPerThread];
@@ -106,11 +111,8 @@ __global__ void fusedQKNormRopeKernel(
         sumOfSquares += elements[i] * elements[i];
     }
 
-    // Reduce sum across warp
-    for (int mask = 16; mask > 0; mask /= 2)
-    {
-        sumOfSquares += __shfl_xor_sync(0xffffffff, sumOfSquares, mask);
-    }
+    // Reduce sum across warp using the utility function
+    sumOfSquares = tensorrt_llm::common::warpReduceSum(sumOfSquares);
 
     // Compute RMS normalization factor
     float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
@@ -169,10 +171,24 @@ namespace tensorrt_llm
 namespace kernels
 {
 
+// Borrowed from
+// https://github.com/flashinfer-ai/flashinfer/blob/8125d079a43e9a0ba463a4ed1b639cefd084cec9/include/flashinfer/pos_enc.cuh#L568
+#define DISPATCH_INTERLEAVE(interleave, INTERLEAVE, ...)                                                               \
+    if (interleave)                                                                                                    \
+    {                                                                                                                  \
+        const bool INTERLEAVE = true;                                                                                  \
+        __VA_ARGS__                                                                                                    \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        const bool INTERLEAVE = false;                                                                                 \
+        __VA_ARGS__                                                                                                    \
+    }
+
 // Launch wrapper for the fusedQKNormRope kernel with different head dimensions
 void launchFusedQKNormRope(void* qkv, int const* position_ids, int const num_tokens, int const num_heads_q,
-    int const num_heads_k, int const num_heads_v, int const head_dim, float const eps, float const base,
-    cudaStream_t stream)
+    int const num_heads_k, int const num_heads_v, int const head_dim, bool const interleave, float const eps,
+    float const base, cudaStream_t stream)
 {
     constexpr int blockSize = 256;
 
@@ -184,23 +200,28 @@ void launchFusedQKNormRope(void* qkv, int const* position_ids, int const num_tok
     dim3 gridDim(gridSize);
     dim3 blockDim(blockSize);
 
-    // Head dimensions should be a multiple of 32
+    // Head dimensions should be a multiple of 64
     // Add more cases as needed
     switch (head_dim)
     {
     case 64:
-        fusedQKNormRopeKernel<64><<<gridDim, blockDim, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv), position_ids,
-            num_tokens, num_heads_q, num_heads_k, num_heads_v, eps, base);
+        DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+            fusedQKNormRopeKernel<64, INTERLEAVE>
+                <<<gridDim, blockDim, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv), position_ids, num_tokens,
+                    num_heads_q, num_heads_k, num_heads_v, eps, base);
+        });
         break;
     case 128:
-        fusedQKNormRopeKernel<128><<<gridDim, blockDim, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv),
-            position_ids, num_tokens, num_heads_q, num_heads_k, num_heads_v, eps, base);
+        DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+            fusedQKNormRopeKernel<128, INTERLEAVE>
+                <<<gridDim, blockDim, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv), position_ids, num_tokens,
+                    num_heads_q, num_heads_k, num_heads_v, eps, base);
+        });
         break;
     default:
         // Unsupported head dimension
         TLLM_THROW("Unsupported head dimension for fusedQKNormRope: %d", head_dim);
     }
 }
-
 } // namespace kernels
 } // namespace tensorrt_llm
