@@ -255,7 +255,8 @@ TEST_F(TransferAgentTest, SyncMessage)
         checked = nixlAgent0->checkRemoteDescs(agent1, regMem3.getDescs());
     } while (!checked);
     auto syncMessage = std::string("agent_sync_message");
-    TransferRequest writeReq{TransferOp::kWRITE, regMem0.getDescs(), regMem3.getDescs(), agent1, syncMessage};
+    nixlAgent0->notifySyncMessage(agent1, syncMessage);
+    TransferRequest writeReq{TransferOp::kWRITE, regMem0.getDescs(), regMem3.getDescs(), agent1};
     auto status = nixlAgent0->submitTransferRequests(writeReq);
     status->wait();
 
@@ -302,7 +303,8 @@ TEST_F(TransferAgentTest, SyncMessage)
     } while (!checked2);
 
     std::string syncMessage4 = "four_agent_sync_message";
-    TransferRequest writeReq1{TransferOp::kWRITE, regMem2.getDescs(), regMem1.getDescs(), agent0, syncMessage4};
+    nixlAgent1->notifySyncMessage(agent0, syncMessage4);
+    TransferRequest writeReq1{TransferOp::kWRITE, regMem2.getDescs(), regMem1.getDescs(), agent0};
     auto status1 = nixlAgent1->submitTransferRequests(writeReq1);
     status1->wait();
     auto notif4 = nixlAgent0->getNotifiedSyncMessages();
