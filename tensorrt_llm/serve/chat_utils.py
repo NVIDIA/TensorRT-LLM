@@ -171,6 +171,8 @@ def parse_chat_messages_coroutines(
     mm_placeholder_counts = mm_data_tracker.mm_data_counts()
     if mm_placeholder_counts:
         parsed_msg["content"] = add_multimodal_placeholders(
-            parsed_msg["content"], mm_placeholder_counts)
+            model_config.model_type, parsed_msg["content"],
+            mm_placeholder_counts)
 
-    return conversation, mm_data_tracker.retrieve_all_mm_data_async()
+    return conversation, mm_data_tracker.retrieve_all_mm_data_async(
+    ), mm_placeholder_counts

@@ -182,7 +182,7 @@ class OpenAIServer:
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
 
-            conversation, mm_coroutines = parse_chat_messages_coroutines(request.messages, self.model_config)
+            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config)
 
             prompt: str = apply_chat_template(
                 model_type=self.model_config.model_type,
@@ -190,6 +190,7 @@ class OpenAIServer:
                 processor=self.processor,
                 conversation=conversation,
                 add_generation_prompt=request.add_generation_prompt,
+                mm_placeholder_counts=mm_placeholder_counts,
                 tools=tool_dicts,
                 documents=request.documents,
                 chat_template=request.chat_template,

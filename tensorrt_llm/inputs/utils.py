@@ -176,20 +176,22 @@ NOTE:
 """
 
 SUPPORTED_QWEN_MODEL_GROUP = ["qwen2_vl", "qwen2_5_vl"]
-SUPPORTED_LLAMA_MODEL_GROUP = ["mllama", "llama4", "llava_next"]
-SUPPORTED_VILA_MODEL_GROUP = ["llava_llama"]
+SUPPORTED_LLAMA_MODEL_GROUP = ["mllama", "llama4"]
+SUPPORTED_LLAVA_IMAGE_MODEL_GROUP = ["llava_llama", "llava_next"]
+SUPPORTED_LLAVA_VIDEO_MODEL_GROUP = ["llava_llama"]
 
 ALL_SUPPORTED_IMAGE_MODELS = SUPPORTED_QWEN_MODEL_GROUP \
     + SUPPORTED_LLAMA_MODEL_GROUP \
-    + SUPPORTED_VILA_MODEL_GROUP
+    + SUPPORTED_LLAVA_IMAGE_MODEL_GROUP
 
 ALL_SUPPORTED_VIDEO_MODELS = SUPPORTED_QWEN_MODEL_GROUP \
-    + SUPPORTED_VILA_MODEL_GROUP
+    + SUPPORTED_LLAVA_VIDEO_MODEL_GROUP
 
 ALL_SUPPORTED_MULTIMODAL_MODELS = list(set(ALL_SUPPORTED_IMAGE_MODELS) \
     | set(ALL_SUPPORTED_VIDEO_MODELS))
 
 HF_CHAT_TEMPLATE_EXCEPTIONS = ["llava_llama"]
+PLACEHOLDER_EXCEPTIONS = ["llava_next"]
 
 
 def retrieve_multimodal_placeholder(model_type: str, modality: str,
@@ -209,7 +211,7 @@ def retrieve_multimodal_placeholder(model_type: str, modality: str,
             return "<|vision_start|><|image_pad|><|vision_end|>"
         elif model_type in SUPPORTED_LLAMA_MODEL_GROUP:
             return "<|image|>"
-        elif model_type in SUPPORTED_VILA_MODEL_GROUP:
+        elif model_type in SUPPORTED_LLAVA_IMAGE_MODEL_GROUP:
             return "<image>"
         raise TypeError(
             f"For image modality, only {ALL_SUPPORTED_IMAGE_MODELS} are supported but got {model_type}"
@@ -217,7 +219,7 @@ def retrieve_multimodal_placeholder(model_type: str, modality: str,
     elif modality == "video":
         if model_type in SUPPORTED_QWEN_MODEL_GROUP:
             return "<|vision_start|><|video_pad|><|vision_end|>"
-        elif model_type in SUPPORTED_VILA_MODEL_GROUP:
+        elif model_type in SUPPORTED_LLAVA_VIDEO_MODEL_GROUP:
             return "<vila/video>"
         raise TypeError(
             f"For video modality, only {ALL_SUPPORTED_VIDEO_MODELS} are supported but got {model_type}"
@@ -281,9 +283,12 @@ class MultimodalDataTracker:
         return dict(self.mm_placeholder_counts)
 
 
-def add_multimodal_placeholders(text_prompt: str,
+def add_multimodal_placeholders(model_type: str, text_prompt: str,
                                 mm_placeholder_counts: dict[str, int]) -> str:
     """Add multimodal placeholders to the text prompt."""
+    if model_type in PLACEHOLDER_EXCEPTIONS:
+        # no need to add placeholders, it is handled differently
+        return text_prompt
     placeholders = []
     for placeholder in mm_placeholder_counts:
         placeholders.extend([placeholder] * mm_placeholder_counts[placeholder])
@@ -315,6 +320,19 @@ def resolve_hf_chat_template(
     return None
 
 
+def handle_placeholder_exceptions(model_type: str,
+                                  conversation: list[ConversationMessage],
+                                  mm_placeholder_counts: dict[str, int]):
+    if model_type == "llava_next":
+        # we need to convert the flattened content back to conversation format
+        for conv in conversation:
+            conv["content"] = [{"type": "text", "text": conv["content"]}, \
+                *[{"type": "image"} for _ in mm_placeholder_counts]]
+    else:
+        raise ValueError(f"This path should not be reached for: {model_type}")
+    return conversation
+
+
 def apply_chat_template(
     *,
     model_type: str,
@@ -322,6 +340,7 @@ def apply_chat_template(
     processor: ProcessorMixin,
     conversation: list[ConversationMessage],
     add_generation_prompt: bool,
+    mm_placeholder_counts: dict[str, int],
     tools: Optional[list[dict[str, Any]]] = None,
     documents: Optional[list[dict[str, str]]] = None,
     chat_template: Optional[str] = None,
@@ -338,6 +357,10 @@ def apply_chat_template(
     if hf_chat_template is None:
         raise ValueError(
             "No chat template found for the given tokenizer and tools.")
+    if model_type in PLACEHOLDER_EXCEPTIONS:
+        # flattened content do not work for these models, so go back to other formats as needed
+        conversation = handle_placeholder_exceptions(model_type, conversation,
+                                                     mm_placeholder_counts)
 
     return tokenizer.apply_chat_template(
         conversation=conversation,
@@ -409,12 +432,14 @@ def default_multimodal_input_loader(
         prompt = conv["content"]
         if mm_placeholder_counts:
             conv["content"] = add_multimodal_placeholders(
-                conv["content"], mm_placeholder_counts)
-            prompt = apply_chat_template(model_type=model_type,
-                                         tokenizer=tokenizer,
-                                         processor=processor,
-                                         conversation=[conv],
-                                         add_generation_prompt=True)
+                model_type, conv["content"], mm_placeholder_counts)
+            prompt = apply_chat_template(
+                model_type=model_type,
+                tokenizer=tokenizer,
+                processor=processor,
+                conversation=[conv],
+                add_generation_prompt=True,
+                mm_placeholder_counts=mm_placeholder_counts)
         inputs.append({
             "prompt":
             prompt,
