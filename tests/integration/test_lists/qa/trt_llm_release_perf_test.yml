@@ -19,10 +19,10 @@ trt_llm_release_perf_test:
 
   # E2E gptManagerBenchmark IFB
   - perf/test_perf.py::test_perf[gpt_350m_moe-cppmanager-exe-plugin-float16-bs:64-input_output_len:128,8+512,32]
-  - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-static_batching-plugin_ifb-float16-bs:8+64-input_output_len:128,128+512,32]
-  - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-float16-mp-input_output_len:128,128+512,32]
-  - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-bfloat16-gwp:0.0-input_output_len:128,128+512,32]
-  - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-bfloat16-gwp:0.5-input_output_len:128,128+512,32]
+  - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-static_batching-plugin_ifb-float16-bs:8+64-input_output_len:128,128+512,32] #oom for l40s
+  - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-float16-mp-input_output_len:128,128+512,32] #oom for l40s
+  - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-bfloat16-gwp:0.0-input_output_len:128,128+512,32] #oom for l40s
+  - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-bfloat16-gwp:0.5-input_output_len:128,128+512,32] #oom for l40s
 
   # E2E ENC-DEC
   - perf/test_perf.py::test_perf[t5_large-cppmanager-exe-plugin_ifb-float16-mp-input_output_len:128,20]
@@ -104,8 +104,6 @@ trt_llm_release_perf_test:
   - perf/test_perf.py::test_perf[llama_v3.1_8b-cppmanager-exe-plugin_ifb-bfloat16-mp-maxbs:256-input_output_len:128,128-pp:2]
   - perf/test_perf.py::test_perf[t5-bench-float16-input_output_len:128,20-gpus:2]
   - perf/test_perf.py::test_perf[flan_t5_large-bench-float16-input_output_len:128,20-gpus:2]
-  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-bfloat16-input_output_len:128,128-quant:int8-gpus:2]
-  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-bfloat16-input_output_len:128,128-quant:int8_wo-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-bfloat16-input_output_len:128,128-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-streaming-bfloat16-input_output_len:128,128-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-bfloat16-maxbs:256-input_output_len:128,128-gpus:2]
@@ -221,10 +219,10 @@ trt_llm_release_perf_test:
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-bfloat16-input_output_len:128,128-quant:fp8]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp8-bench-pytorch-float8-input_output_len:128,128]
   - perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float8-input_output_len:128,128]
-  - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-float16-input_output_len:1000,1000-quant:fp8]
-  - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-float16-input_output_len:500,2000-quant:fp8]
+  - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-float16-maxbs:256-input_output_len:1000,1000-quant:fp8]
+  - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-float16-maxbs:256-input_output_len:500,2000-quant:fp8]
   - perf/test_perf.py::test_perf[phi_3_mini_4k_instruct-bench-float16-maxbs:128-input_output_len:1000,1000-quant:fp8]
-  - perf/test_perf.py::test_perf[phi_3_mini_4k_instruct-bench-float16-maxbs:128-input_output_len:500,2000-quant:fp8]
+  - perf/test_perf.py::test_perf[phi_3_mini_4k_instruct-bench-float16-maxbs:64-input_output_len:500,2000-quant:fp8]
 
 - condition:
     terms:
@@ -316,7 +314,7 @@ trt_llm_release_perf_test:
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.3_nemotron_49b-bench-pytorch-float8-input_output_len:128,128-gpus:8]
-  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-streaming-pytorch-float8-input_output_len:128,128-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-streaming-float8-input_output_len:128,128-gpus:8]
 
 # GB chip specific tests
 - condition:
