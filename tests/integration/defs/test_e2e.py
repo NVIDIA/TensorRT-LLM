@@ -1855,8 +1855,7 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
     tllm_logits = []
     for output in outputs:
         prompt = output.prompt
-        tllm_logit = output.context_logits.cpu(
-        )[:, 0]  # drop vocab_size dimension.
+        tllm_logit = output.context_logits.cpu()[0, :]
         print(f"Prompt: {prompt!r}, Context logits: {tllm_logit}")
         tllm_logits += [tllm_logit]
     # Stack the output

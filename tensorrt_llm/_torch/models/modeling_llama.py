@@ -508,6 +508,11 @@ class LlamaDecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
 
+        self.attention_mask = PredefinedAttentionMask.CAUSAL
+        # If the model is being used as an encoder model (prefill only) we use a full attention mask
+        if not model_config.is_generation:
+            self.attention_mask = PredefinedAttentionMask.FULL
+
     def forward(
         self,
         position_ids: torch.LongTensor,
@@ -529,6 +534,7 @@ class LlamaDecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            attention_mask=self.attention_mask,
             **kwargs,
         )
 
@@ -757,10 +763,8 @@ class LlamaModel(DecoderModel):
                 self.embed_tokens.weight.data.copy_(x)
 
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(
-                model_config,
-                layer_idx,
-            ) for layer_idx in range(config.num_hidden_layers)
+            LlamaDecoderLayer(model_config, layer_idx)
+            for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
