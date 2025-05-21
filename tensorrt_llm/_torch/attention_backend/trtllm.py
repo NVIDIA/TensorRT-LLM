@@ -859,11 +859,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert out_dtype in [torch.float16, torch.bfloat16, torch.float32]
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
-
-        if metadata.max_ctx_kv_len == 0:
-            return torch.empty((0, metadata.kv_cache_manager.head_dim),
-                               dtype=out_dtype,
-                               device=metadata.ctx_cached_token_indptr.device)
+        assert metadata.max_ctx_kv_len > 0
 
         sink_token_length = 0
         beam_width = 1

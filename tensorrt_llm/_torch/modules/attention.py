@@ -832,6 +832,7 @@ class MLA(nn.Module):
         q_nope, q_pe = q.view([
             -1, self.num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim
         ]).split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
         # apply rope to current q_pe and k_pe
         assert position_ids is not None
         assert position_ids.dim() == 1 or (position_ids.dim() == 2
@@ -843,7 +844,6 @@ class MLA(nn.Module):
                                       self.num_heads * self.qk_rope_head_dim)
         q_pe, k_pe = self.rotary_emb(
             position_ids[..., :attn_metadata.num_ctx_tokens], [q_pe, k_pe])
-
         k_pe = k_pe.contiguous()
 
         # build q for attention op
@@ -858,7 +858,6 @@ class MLA(nn.Module):
         assert q.is_contiguous()
 
         # append paged kv cache for mla
-        # we may finish it inside the attention op by passing latent_cache
         trtllm_attention.append_paged_kv_cache_for_mla(
             compressed_kv,
             k_pe,
@@ -925,6 +924,12 @@ class MLA(nn.Module):
             mla_context_kv_cache_block_offsets,
         )
 
+        full_compressed_kv = None
+        full_k_pe = None
+        full_k_nope = None
+        full_v = None
+        full_kv = None
+        paged_full_kv = None
         return attn_output
 
     def forward_context(
