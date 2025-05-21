@@ -134,11 +134,11 @@ void CubinObj::serialize(void* buffer_, size_t buffer_size) const noexcept
 void CubinObj::launch(dim3 gridDim, dim3 blockDim, CUstream hStream, void** kernelParams) const
 {
     TLLM_CHECK(mInitialized);
-    CUlaunchAttribute fdlAttr;
-    fdlAttr.id = CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
-    fdlAttr.value.programmaticStreamSerializationAllowed = (tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0);
+    CUlaunchAttribute pdlAttr;
+    pdlAttr.id = CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+    pdlAttr.value.programmaticStreamSerializationAllowed = (tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0);
     CUlaunchConfig const cfg{
-        gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, mSharedMemBytes, hStream, &fdlAttr, 1};
+        gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, mSharedMemBytes, hStream, &pdlAttr, 1};
 
     TLLM_CU_CHECK(mDriver->cuLaunchKernelEx(&cfg, mFunction, kernelParams, /*extra=*/nullptr));
 }
