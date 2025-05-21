@@ -69,7 +69,7 @@ class ModelConfig(Generic[TConfig]):
             return True
         return model_architectures[0] not in [
             "BertForSequenceClassification", "Qwen2ForProcessRewardModel",
-            "Qwen2ForRewardModel"
+            "Qwen2ForRewardModel", "LlamaForTextEmbedding"
         ]
         # TODO: should be 'not model_type == ModelType.ENCODER_ONLY'
         # once ModelType is used in pytorch flow.
