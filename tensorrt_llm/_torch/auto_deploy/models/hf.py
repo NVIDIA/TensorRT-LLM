@@ -21,33 +21,6 @@ from .factory import ModelFactory, ModelFactoryRegistry
 
 
 @contextmanager
-def load_state_dict_with_assign():
-    """
-    Context manager that temporarily patches torch.nn.Module.load_state_dict
-    to use assign=True, which directly replaces parameters in the model with those
-    from the loaded state_dict, maintaining their data type and device placement.
-    """
-    # Save the original load_state_dict method
-    original_load_state_dict = torch.nn.Module.load_state_dict
-
-    # Define and apply the patched version
-    def load_state_dict_with_assign(
-        self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False
-    ):
-        return original_load_state_dict(self, state_dict, strict=strict, assign=True)
-
-    # Apply the patch
-    torch.nn.Module.load_state_dict = load_state_dict_with_assign
-
-    try:
-        # Allow the context body to execute
-        yield
-    finally:
-        # Restore the original method, even if an exception occurred
-        torch.nn.Module.load_state_dict = original_load_state_dict
-
-
-@contextmanager
 def hf_load_state_dict_with_device(device: DeviceLikeType):
     """Patch HF load_state_dict to use provided device."""
     # save the original load_state_dict method
@@ -225,7 +198,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
         self.prefetch_checkpoint()
 
         # reuse the load checkpoint utility from accelerate
-        with load_state_dict_with_assign(), hf_load_state_dict_with_device(device):
+        with hf_load_state_dict_with_device(device):
             load_checkpoint_and_dispatch(model, checkpoint=self.model)
 
     def _load_quantization_config(self):
