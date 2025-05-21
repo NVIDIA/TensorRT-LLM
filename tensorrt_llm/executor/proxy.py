@@ -18,7 +18,7 @@ from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             print_colored, print_colored_debug)
 from .executor import GenerationExecutor
-from .ipc import FusedIpcQueue, IpcQueue
+from .ipc import IpcQueue
 from .postproc_worker import PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
@@ -114,22 +114,16 @@ class ExecutorBindingsProxy(GenerationExecutor):
                                       name="proxy_request_queue")
         self.request_error_queue = IpcQueue(is_server=True,
                                             name="proxy_request_error_queue")
-        # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
         # Use PULL mode when enable_postprocess_parallel as there are
         # multiple senders from multiple processes.
-        self.result_queue = FusedIpcQueue(
+        self.result_queue = IpcQueue(
             is_server=True,
-            fuse_message=False,
             socket_type=zmq.PULL
             if self.enable_postprocess_parallel else zmq.PAIR,
             name="proxy_result_queue")
-        self.mp_stats_queue = FusedIpcQueue(is_server=True,
-                                            fuse_message=False,
-                                            name="proxy_stats_queue")
-        self.kv_cache_events_queue = FusedIpcQueue(
-            is_server=True,
-            fuse_message=False,
-            name="proxy_kv_cache_events_queue")
+        self.mp_stats_queue = IpcQueue(is_server=True, name="proxy_stats_queue")
+        self.kv_cache_events_queue = IpcQueue(
+            is_server=True, name="proxy_kv_cache_events_queue")
         return WorkerCommIpcAddrs(
             request_queue_addr=self.request_queue.address,
             request_error_queue_addr=self.request_error_queue.address,
@@ -187,8 +181,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
         if async_queues:
             _SyncQueue.notify_many(event_loop, async_queues)
 
-    def _iteration_result_task(self, queue: Union[FusedIpcQueue,
-                                                  IntraProcessQueue],
+    def _iteration_result_task(self, queue: Union[IpcQueue, IntraProcessQueue],
                                result_singleton: IterationResult) -> None:
         # iteration result is not urgent, so we can sleep a bit
         time.sleep(0.2)

@@ -30,16 +30,15 @@ from ..runtime import ModelConfig
 from ..runtime.model_runner import _engine_config_to_model_config
 from ..sampling_params import BatchedLogitsProcessor, SamplingParams
 from .executor import GenerationExecutor, IterationResultQueue
-from .ipc import FusedIpcQueue, IpcQueue
+from .ipc import IpcQueue
 from .postproc_worker import (PostprocParams, PostprocWorker,
                               PostprocWorkerConfig, postproc_worker_main)
 from .request import (CancellingRequest, GenerationRequest, LoRARequest,
                       PromptAdapterRequest)
 from .result import (GenerationResult, IterationResult, LogProbsResult,
                      ResponseWrapper, compute_logprobs)
-from .utils import (PERIODICAL_RESP_IN_AWAIT, ErrorResponse, IntraProcessQueue,
-                    RequestError, WorkerCommIpcAddrs, has_event_loop,
-                    is_llm_response)
+from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
+                    WorkerCommIpcAddrs, has_event_loop, is_llm_response)
 
 __all__ = [
     "ExecutorBindingsWorker",
@@ -190,7 +189,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 it_result_queue.aqueue = None
 
     def _set_iteration_result_queue(self, it_result_queue: IterationResultQueue,
-                                    queue: Union[Queue, FusedIpcQueue,
+                                    queue: Union[Queue, IpcQueue,
                                                  IntraProcessQueue]):
         assert not it_result_queue.is_initialized, "Iteration result queue should not already be initialized."
         it_result_queue.is_initialized = True
@@ -616,32 +615,27 @@ def worker_main(
         request_error_queue = IpcQueue(worker_queues.request_error_queue_addr,
                                        is_server=False,
                                        name="worker_request_error_queue")
-        mp_stats_queue = FusedIpcQueue(worker_queues.stats_queue_addr,
-                                       is_server=False,
-                                       fuse_message=True,
-                                       name="worker_stats_queue")
-        kv_cache_events_queue = FusedIpcQueue(
+        mp_stats_queue = IpcQueue(worker_queues.stats_queue_addr,
+                                  is_server=False,
+                                  name="worker_stats_queue")
+        kv_cache_events_queue = IpcQueue(
             worker_queues.kv_cache_events_queue_addr,
             is_server=False,
-            fuse_message=False,
             name="worker_kv_cache_events_queue")
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel
             # processes, each one is a PAIR zmq socket
             result_queues = [
-                FusedIpcQueue(is_server=True,
-                              fuse_message=PERIODICAL_RESP_IN_AWAIT,
-                              name=f"postprocess_{i}_feedin_queue")
+                IpcQueue(is_server=True, name=f"postprocess_{i}_feedin_queue")
                 for i in range(postproc_worker_config.num_postprocess_workers)
             ]
         else:
             # IPC queue for sending results back to the proxy, and let the
             # Proxy process to handle the postprocess
-            result_queue = FusedIpcQueue(worker_queues.result_queue_addr,
-                                         is_server=False,
-                                         fuse_message=PERIODICAL_RESP_IN_AWAIT,
-                                         name="worker_result_queue")
+            result_queue = IpcQueue(worker_queues.result_queue_addr,
+                                    is_server=False,
+                                    name="worker_result_queue")
 
     def notify_proxy_threads_to_quit():
         # Signal the dispatcher thread in the proxy to quit
@@ -756,8 +750,7 @@ class AwaitResponseHelper:
     class HandlerKind(enum.Enum):
         unknown = 0
         single_process_worker = 1
-        ipc_periodically = 2
-        ipc_batched = 3
+        ipc_batched = 2
 
     def __init__(self, worker: "ExecutorBindingsWorker"):
         # TODO: make worker weakref
@@ -781,10 +774,7 @@ class AwaitResponseHelper:
                 # The ExecutorBindingProxy is used
                 print_colored_debug(f"creating await_response helper for IPC\n",
                                     color="yellow")
-                if PERIODICAL_RESP_IN_AWAIT:
-                    self.handler_kind = HandlerKind.ipc_periodically
-                else:
-                    self.handler_kind = HandlerKind.ipc_batched
+                self.handler_kind = HandlerKind.ipc_batched
             else:
                 raise NotImplementedError
 
@@ -793,8 +783,6 @@ class AwaitResponseHelper:
                 return self.handle_for_worker(responses)
             case HandlerKind.ipc_batched:
                 return self.handle_for_ipc_batched(responses)
-            case HandlerKind.ipc_periodically:
-                return self.handle_for_ipc_periodically(responses)
             case _:
                 raise NotImplementedError
 
@@ -843,34 +831,6 @@ class AwaitResponseHelper:
         # Notify the events in bulk for performance.
         if async_queues:
             _SyncQueue.notify_many(event_loop, async_queues)
-
-    def handle_for_ipc_periodically(self,
-                                    responses: List[tllm.Response]) -> None:
-        ''' Return the responses to Proxy via IPC. This will put Rsp to a Queue
-        in a FusedIpcQueue, and a background thread will batch them and invoke
-        IPC periodically. '''
-
-        with nvtx_range_debug(f"handle_for_ipc_periodically-{len(responses)}",
-                              color="red",
-                              category="Worker"):
-
-            for response in responses:
-
-                if self.worker._has_background_error():
-                    response = self.worker._create_error_response(response)
-                elif response.has_error():
-                    response = ErrorResponse(response.client_id,
-                                             response.error_msg,
-                                             response.request_id)
-                else:
-                    logprobs_result = _get_logprobs(
-                        self.worker, response, self.worker._is_pytorch_backend)
-                    if logprobs_result:
-                        response = ResponseWrapper(response, logprobs_result)
-
-                # TODO: To verify the performance of using ZMQ instead of SharedMemory
-                # to send the logits tensor back to the Proxy process.
-                _send_rsp(self.worker, response)
 
     def handle_for_ipc_batched(self, responses: List[tllm.Response]) -> None:
         ''' Perform the IPC in batch explicitly. '''
