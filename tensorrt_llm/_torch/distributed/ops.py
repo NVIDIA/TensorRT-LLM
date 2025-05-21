@@ -74,7 +74,7 @@ def filter_valid_input(
 
 def restore_full_output(output_list: List[torch.Tensor],
                         valid_list: List[bool]) -> List[torch.Tensor]:
-    index_list = list(accumulate(map(lambda x: int(x), valid_list)))
+    index_list = list(accumulate(map(int, valid_list)))
     output_list = list(
         map(lambda valid, index: output_list[index - 1]
             if valid else None, valid_list, index_list))
