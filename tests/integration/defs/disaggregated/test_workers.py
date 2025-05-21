@@ -356,8 +356,10 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
                  tokens_per_block: int = 32):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs)
-        self.ctx_router = KvCacheAwareRouter(ctx_servers, tokens_per_block)
-        self.gen_router = KvCacheAwareRouter(gen_servers, tokens_per_block)
+        self.ctx_router = KvCacheAwareRouter(ctx_servers,
+                                             tokens_per_block=tokens_per_block)
+        self.gen_router = KvCacheAwareRouter(gen_servers,
+                                             tokens_per_block=tokens_per_block)
         self.model_name = model_name
 
     async def multi_round_request(self,
