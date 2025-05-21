@@ -9,6 +9,7 @@ from utils.torch_ref import mamba_conv1d_ref
 from utils.util import unittest_name_func
 
 import tensorrt_llm
+from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 
 
 class TestFunctional(unittest.TestCase):
@@ -107,6 +108,7 @@ class TestFunctional(unittest.TestCase):
                 cache_indices,
                 has_initial_state,
                 apply_silu,
+                PAD_SLOT_ID,
             )
             outputs = (x_in_out, conv_state_in_out)
 
@@ -122,6 +124,7 @@ class TestFunctional(unittest.TestCase):
                 apply_silu,
                 cache_seqlens,
                 conv_state_indices,
+                PAD_SLOT_ID,
             )
             outputs = (x_in_out, conv_state_in_out)
 
