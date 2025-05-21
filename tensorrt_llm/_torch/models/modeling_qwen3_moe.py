@@ -20,7 +20,7 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
 
-class Qwen3Gate(RenormalizeMoeRoutingMethod):
+class Qwen3Gate(nn.Module):
 
     def __init__(
         self,
@@ -31,12 +31,11 @@ class Qwen3Gate(RenormalizeMoeRoutingMethod):
         apply_routing: bool = False,
         moe_backend: str = "CUTLASS",
     ):
-        super().__init__(top_k=top_k)
-
+        super().__init__()
+        self.top_k = top_k
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
                                                dtype=dtype),
                                    requires_grad=False)
-        self.moe_backend = moe_backend
         # FIXME: out_dtype=float32 does not work
         # self.out_dtype = torch.float32 if moe_backend == "TRTLLM" else dtype
         self.out_dtype = dtype
@@ -54,8 +53,9 @@ class Qwen3Gate(RenormalizeMoeRoutingMethod):
         self.weight.copy_(weights[0]["weight"][:])
 
     @property
-    def routing_method(self) -> RenormalizeMoeRoutingMethod:
-        return self
+    def routing_method(self):
+        # TODO: allow switching between Qwen3 routing method and fast Renormalize routing method
+        return RenormalizeMoeRoutingMethod(top_k=self.top_k)
 
 
 class Qwen3MoE(nn.Module):
@@ -89,7 +89,7 @@ class Qwen3MoE(nn.Module):
 
         self.experts = FusedMoE(
             num_experts=self.num_experts,
-            routing_method=RenormalizeMoeRoutingMethod(top_k=self.top_k),
+            routing_method=self.gate.routing_method,
             hidden_size=self.hidden_dim,
             intermediate_size=self.moe_intermediate_size,
             aux_stream=aux_stream,

@@ -29,7 +29,7 @@ FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE = torch.int32
 
 
 # The type of method in top-K routing, for use in torch custom op
-# Please keep sync with in cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h
+# Please keep this in sync with the counterpart defined in cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h
 class RoutingMethodType(IntEnum):
     # Default: Softmax -> TopK
     Default = 0,

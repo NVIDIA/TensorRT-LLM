@@ -84,11 +84,11 @@ torch::Tensor fp4_block_scale_moe_runner(torch::Tensor const& routing_logits,
     // * 2 to compensate for the fact that sizeof(hidden_states.dtype) is 1 because we pack 2 e2m1 into 1 byte.
     args.hidden_size = hidden_states.sizes()[1] * 2;
     args.top_k = top_k;
-    args.n_group = n_group.has_value() ? n_group.value() : 1;
-    args.topk_group = topk_group.has_value() ? topk_group.value() : top_k;
+    args.n_group = n_group.value_or(1);
+    args.topk_group = topk_group.value_or(top_k);
     args.local_expert_offset = local_expert_offset;
     args.local_num_experts = local_num_experts;
-    args.routed_scaling_factor = routed_scaling_factor.has_value() ? routed_scaling_factor.value() : 1.0;
+    args.routed_scaling_factor = routed_scaling_factor.value_or(1.0);
     args.intermediate_size = intermediate_size;
 
     // allocate workspace for routing kernel

@@ -35,25 +35,32 @@ namespace Routing
 {
 
 // The type of method in top-K routing, for use in torch custom op
-// Please keep sync with in tensorrt_llm/_torch/modules/fused_moe.py
+// Please keep this in sync with the counterpart defined in tensorrt_llm/_torch/modules/fused_moe.py
 enum class RoutingMethodType : int64_t
 {
+    // Default: Softmax -> TopK
     Default = 0,
+    // Renormalize: TopK -> Softmax
     Renormalize = 1,
+    // DeepSeekV3: Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts from the Top4 groups
     DeepSeekV3 = 2,
+    // Llama4: Top1 -> Sigmoid
     Llama4 = 3,
+    // Qwen3: Softmax -> TopK -> Renormalize
     Qwen3 = 4,
+    // Unspecified
+    Unspecified = 5,
 };
 
-inline std::string serializeMoeRoutingMethodType(RoutingMethodType routing_method_type)
+inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethodType)
 {
-    switch (static_cast<int>(routing_method_type))
+    switch (routingMethodType)
     {
-    case 0: return "Default";
-    case 1: return "Renormalize";
-    case 2: return "DeepSeekV3";
-    case 3: return "Llama4";
-    case 4: return "Qwen3";
+    case RoutingMethodType::Default: return "Default";
+    case RoutingMethodType::Renormalize: return "Renormalize";
+    case RoutingMethodType::DeepSeekV3: return "DeepSeekV3";
+    case RoutingMethodType::Llama4: return "Llama4";
+    case RoutingMethodType::Qwen3: return "Qwen3";
     default: TLLM_CHECK_WITH_INFO(false, "Invalid routing method"); return "";
     };
 }
