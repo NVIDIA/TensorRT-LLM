@@ -93,7 +93,7 @@ torch::Tensor fp8_block_scaling_gemm_ada(torch::Tensor const& mat1, torch::Tenso
     auto const n = mat2.sizes()[0];
     auto const k = mat1.sizes()[1];
     TORCH_CHECK(k % 128 == 0, "K must be a multiple of 128, (K=", k, ")");
-    // TORCH_CHECK(n % 16 == 0, "N must be a multiple of 16, (N=", n, ")");
+    TORCH_CHECK(n % 16 == 0, "N must be a multiple of 16, (N=", n, ")");
 
     at::Tensor out = at::detail::empty_cuda({m, n}, at::ScalarType::BFloat16, mat1.device(), std::nullopt);
 

@@ -117,25 +117,4 @@ struct DefaultGemm_TensorOp_MMA<cute::float_e4m3_t, cutlass::arch::Sm89>
     using TiledMma = cute::TiledMMA<MMA_Atom_Arch, ThreadLayoutMNK, ValLayoutMNK>;
 };
 
-// kTileM = 16
-// template <>
-// struct DefaultGemm_TensorOp_MMA<cute::bfloat16_t, cutlass::arch::Sm80>
-// {
-//     using ArchTag = cutlass::arch::Sm80;
-//     using MMA_Atom_Arch = cute::MMA_Atom<cute::SM80_16x8x16_F32BF16BF16F32_TN>;
-//     using ThreadLayoutMNK = cute::Layout<cute::Shape<cute::_2, cute::_4, cute::_1>>;
-//     using ValLayoutMNK = cute::Tile<cute::_16, cute::_64, cute::_16>;
-//     using TiledMma = cute::TiledMMA<MMA_Atom_Arch, ThreadLayoutMNK, ValLayoutMNK>;
-// };
-
-// template <>
-// struct DefaultGemm_TensorOp_MMA<cute::float_e4m3_t, cutlass::arch::Sm89>
-// {
-//     using ArchTag = cutlass::arch::Sm89;
-//     using MMA_Atom_Arch = cute::MMA_Atom<cute::SM89_16x8x32_F32F8F8F32_TN>;
-//     using ThreadLayoutMNK = cute::Layout<cute::Shape<cute::_2, cute::_4, cute::_1>>;
-//     using ValLayoutMNK = cute::Tile<cute::_16, cute::_64, cute::_32>;
-//     using TiledMma = cute::TiledMMA<MMA_Atom_Arch, ThreadLayoutMNK, ValLayoutMNK>;
-// };
-
 } // namespace ada_blockwise_gemm
