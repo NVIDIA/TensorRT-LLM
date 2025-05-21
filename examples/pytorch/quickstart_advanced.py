@@ -162,7 +162,7 @@ def setup_llm(args):
             max_matching_ngram_size=args.max_matching_ngram_size,
             is_keep_all=True,
             is_use_oldest=True,
-            is_public_pool=True,
+            is_public_pool=False,
         )
     else:
         spec_config = None
