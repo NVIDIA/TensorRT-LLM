@@ -672,7 +672,7 @@ class PyExecutor:
                         self.new_active_requests_queue_latency_ms)
 
                 if not got_finish_signal:
-                    self._pad_attention_dp_dummy_request()
+                    num_dummy_request = self._pad_attention_dp_dummy_request()
 
                 scheduled_batch, _, _ = self._schedule()
 
@@ -811,7 +811,7 @@ class PyExecutor:
                     self._check_disagg_gen_transfer_status()
 
                 if not got_finish_signal:
-                    self._pad_attention_dp_dummy_request()
+                    num_dummy_request = self._pad_attention_dp_dummy_request()
 
                 if self.draft_model_engine is not None:
                     self._prepare_draft_requests()
@@ -866,6 +866,9 @@ class PyExecutor:
                     ) if self.kv_cache_transceiver else []
 
                     self._update_requests(sample_state)
+
+                    if num_dummy_request > 0:
+                        self._finish_dummy_request(scheduled_batch)
 
                     if self.kv_cache_transceiver:
                         # For context only req in transmission, we reset the state since decoder might have changed it
@@ -944,7 +947,7 @@ class PyExecutor:
                         self.new_active_requests_queue_latency_ms)
 
                 if not got_finish_signal:
-                    self._pad_attention_dp_dummy_request()
+                    num_dummy_request = self._pad_attention_dp_dummy_request()
 
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
                 )
@@ -1479,7 +1482,7 @@ class PyExecutor:
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
         if not self.enable_attention_dp:
-            return
+            return 0
 
         assert self.expected_num_active_requests >= len(self.active_requests)
         if self.kv_cache_transceiver is None:
@@ -1492,19 +1495,18 @@ class PyExecutor:
             ])
 
         num_dummy_request = self.expected_num_active_requests - num_active_request
-        if num_dummy_request <= 0:
-            return
-
-        llm_request_list = self.kv_cache_manager.add_dummy_requests(
-            request_ids=list(range(num_dummy_request)),
-            is_gen=not self.has_context_request,
-            prepare_resource=not self.has_context_request,
-            max_num_draft_tokens=0
-            if self.has_context_request else self.max_draft_tokens,
-        )
-        for llm_request in llm_request_list:
-            llm_request.is_attention_dp_dummy = True
-        self.active_requests += llm_request_list
+        if num_dummy_request > 0:
+            llm_request_list = self.kv_cache_manager.add_dummy_requests(
+                request_ids=list(range(num_dummy_request)),
+                is_gen=not self.has_context_request,
+                prepare_resource=not self.has_context_request,
+                max_num_draft_tokens=0
+                if self.has_context_request else self.max_draft_tokens,
+            )
+            for llm_request in llm_request_list:
+                llm_request.is_attention_dp_dummy = True
+            self.active_requests += llm_request_list
+        return num_dummy_request
 
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
