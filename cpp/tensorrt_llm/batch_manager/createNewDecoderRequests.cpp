@@ -145,7 +145,8 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
         bufferManager, runtimeStream);
 
     auto decoderRequests = createDecoderRequests(finishedContextRequests, inputBuffers.inputsIds, decodingConfig,
-        bufferManager, logitsType, modelConfig, worldConfig, buffers);
+        decoderState, bufferManager, logitsType, modelConfig, worldConfig, runtimeStream, *decoderStream,
+        maxSequenceLength, buffers);
 
     auto const batchSize = finishedContextRequests.size();
 
@@ -157,14 +158,6 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
     }
 
     TensorPtr batchSlotsView = runtime::ITensor::slice(inputBuffers.setupBatchSlots, 0, batchSize);
-
-    auto batchSlotsRange = BufferRange<SizeType32>(*batchSlotsView);
-    auto const localBatchSize = batchSlotsView->getSize();
-    for (size_t bi = 0; bi < localBatchSize; ++bi)
-    {
-        newRequest(batchSlotsRange[bi], decoderRequests[bi], samplingConfigs[bi], modelConfig, decoderState,
-            runtimeStream, *decoderStream, maxSequenceLength);
-    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return {std::move(batchSlotsView), std::move(decoderRequests), std::move(samplingConfigs)};
@@ -570,8 +563,10 @@ void CreateNewDecoderRequests::newRequestEagle(SizeType32 batchIdx, runtime::dec
 
 [[nodiscard]] std::vector<runtime::decoder_batch::Request> CreateNewDecoderRequests::createDecoderRequests(
     RequestVector const& finishedContextRequests, TensorPtr const& inputIds,
-    executor::DecodingConfig const& decodingConfig, BufferManager const& bufferManager, nvinfer1::DataType logitsType,
-    runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
+    executor::DecodingConfig const& decodingConfig, runtime::decoder::DecoderState& decoderState,
+    BufferManager const& bufferManager, nvinfer1::DataType logitsType, runtime::ModelConfig const& modelConfig,
+    runtime::WorldConfig const& worldConfig, runtime::CudaStream const& runtimeStream,
+    runtime::CudaStream const& decoderStream, SizeType32 maxSequenceLength,
     OptionalRef<RuntimeBuffers const> buffers) const
 {
     unsigned decoderInputSize{0};
@@ -661,6 +656,10 @@ void CreateNewDecoderRequests::newRequestEagle(SizeType32 batchIdx, runtime::dec
                 = bufferManager.copyFrom(*llmReq->getStopWordsList().value(), MemoryType::kGPU);
             decoderRequest.stopWordsList->squeeze(0);
         }
+
+        newRequest(llmReq->mSeqSlot.value(), decoderRequest, llmReq->mSamplingConfig, modelConfig, decoderState,
+            runtimeStream, decoderStream, maxSequenceLength);
+
         decoderRequests.push_back(decoderRequest);
 
         inputOffset += promptLen;

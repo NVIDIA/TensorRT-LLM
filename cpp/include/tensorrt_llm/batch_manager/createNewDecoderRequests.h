@@ -115,9 +115,11 @@ private:
 
     [[nodiscard]] std::vector<runtime::decoder_batch::Request> createDecoderRequests(
         RequestVector const& finishedContextRequests, TensorPtr const& inputIds,
-        executor::DecodingConfig const& decodingConfig, runtime::BufferManager const& bufferManager,
-        nvinfer1::DataType logitsType, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
-        OptionalRef<RuntimeBuffers const> buffers) const;
+        executor::DecodingConfig const& decodingConfig, runtime::decoder::DecoderState& decoderState,
+        runtime::BufferManager const& bufferManager, nvinfer1::DataType logitsType,
+        runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
+        runtime::CudaStream const& runtimeStream, runtime::CudaStream const& decoderStream,
+        SizeType32 maxSequenceLength, OptionalRef<RuntimeBuffers const> buffers) const;
 
     [[nodiscard]] std::shared_ptr<runtime::ITensor> retrieveDraftLogits(runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, std::shared_ptr<runtime::ITensor> const& tensor,
