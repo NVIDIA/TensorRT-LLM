@@ -187,10 +187,11 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5292517")
     @skip_pre_hopper
-    def test_fp8_llm_decoder(self):
+    def test_fp8_llm_sampler(self):
         model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
-        pytorch_config = PyTorchConfig(enable_trtllm_decoder=True)
+        pytorch_config = PyTorchConfig(enable_trtllm_sampler=True)
         llm = LLM(model_path, pytorch_backend_config=pytorch_config)
         assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
 
