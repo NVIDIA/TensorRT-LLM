@@ -3,7 +3,9 @@ This script is used to start the MPICommSession in the rank0 and wait for the
 MPI Proxy process to connect and get the MPI task to run.
 '''
 from tensorrt_llm._utils import mpi_world_size
-from tensorrt_llm.executor.utils import get_spawn_proxy_process_ipc_addr_env
+from tensorrt_llm.executor.utils import (
+    get_spawn_proxy_process_ipc_addr_env,
+    get_spawn_proxy_process_ipc_hmac_key_env)
 from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
 from tensorrt_llm.llmapi.utils import print_colored_debug
 
@@ -17,6 +19,7 @@ def launch_server_main(sub_comm=None):
         comm=sub_comm,
         n_workers=num_ranks,
         addr=get_spawn_proxy_process_ipc_addr_env(),
+        hmac_key=get_spawn_proxy_process_ipc_hmac_key_env(),
         is_comm=True)
     print_colored_debug(
         f"MPI Comm Server started at {get_spawn_proxy_process_ipc_addr_env()}")

@@ -77,11 +77,15 @@ add_gtest(gptDecoderTest runtime/gptDecoderTest.cpp)
 add_gtest(gptDecoderBatchedTest runtime/gptDecoderBatchedTest.cpp)
 add_gtest(medusaModuleTest runtime/medusaModuleTest.cpp)
 
+add_gtest(moeLoadBalancerTest runtime/moeLoadBalancerTest.cpp)
+
 add_gtest(sanitizerTest runtime/sanitizerTest.cpp)
 
 add_gtest(eaglePackDataTest kernels/eaglePackDataTest.cpp)
 
 add_gtest(medusaDecodeLayerTest layers/medusaDecodeLayerTest.cpp)
+
+add_gtest(moeLoadBalanceKernelTest kernels/moeLoadBalanceKernelTest.cpp)
 
 add_gtest(eagleLayerTest layers/eagleLayerTest.cpp)
 

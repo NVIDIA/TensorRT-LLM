@@ -28,12 +28,8 @@ PUSH_TO_STAGING    ?= 1
 DOCKER_BUILD_OPTS  ?= --pull --load
 DOCKER_BUILD_ARGS  ?=
 DOCKER_PROGRESS    ?= auto
-CUDA_ARCHS         ?=
 PLATFORM           ?= $(shell uname -m | grep -q 'aarch64' && echo "arm64" || echo "amd64")
-ifeq ($(PLATFORM), arm64)
-  CUDA_ARCHS = '90-real;100-real;120-real'
-endif
-
+CUDA_ARCHS         ?= $(if $(filter arm64,$(PLATFORM)),'90-real;100-real;120-real',)
 BUILD_WHEEL_OPTS   ?=
 BUILD_WHEEL_ARGS   ?= $(shell grep 'ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))
 TORCH_INSTALL_TYPE ?= skip
@@ -47,6 +43,8 @@ TRT_LLM_VERSION    ?= $(shell grep '^__version__' ../tensorrt_llm/version.py | g
 GITHUB_MIRROR      ?=
 PYTHON_VERSION     ?=
 NGC_STAGING_REPO   ?= nvcr.io/nvstaging/tensorrt-llm
+NGC_REPO           ?= nvcr.io/nvidia/tensorrt-llm
+NGC_USE_STAGING    ?= 0
 
 define add_local_user
 	docker build \
@@ -201,22 +199,29 @@ ngc-devel_%: IMAGE_TAG = $(TRT_LLM_VERSION)
 ngc-devel_push: DOCKER_BUILD_ARGS = --push
 ngc-devel_push: ngc-devel_build ;
 
+ngc-devel_run: IMAGE_NAME = $(if $(filter 1,$(NGC_USE_STAGING)),$(NGC_STAGING_REPO),$(NGC_REPO))
+
 ngc-release_%: STAGE = release
 ngc-release_%: DOCKER_BUILD_OPTS = --pull --load --platform linux/$(PLATFORM)
 ngc-release_%: DEVEL_IMAGE = $(NGC_STAGING_REPO)/devel:$(TRT_LLM_VERSION)
-ngc-release_%: IMAGE_NAME = nvcr.io/nvstaging/tensorrt-llm
+ngc-release_%: IMAGE_NAME = $(NGC_STAGING_REPO)
 ngc-release_%: IMAGE_TAG = $(TRT_LLM_VERSION)-$(PLATFORM)
+
+ngc-release_run: IMAGE_NAME = $(if $(filter 1,$(NGC_USE_STAGING)),$(NGC_STAGING_REPO),$(NGC_REPO))
+ngc-release_run: WORK_DIR = /app/tensorrt_llm
 
 ngc-manifest_%: STAGE = release
 ngc-manifest_%: IMAGE_NAME = $(NGC_STAGING_REPO)
 ngc-manifest_%: IMAGE_TAG = $(TRT_LLM_VERSION)
 
 ngc-manifest_create:
+	docker pull $(IMAGE_WITH_TAG)-amd64
+	docker pull $(IMAGE_WITH_TAG)-arm64
 	docker manifest create $(IMAGE_WITH_TAG) \
   		--amend $(IMAGE_WITH_TAG)-amd64 \
   		--amend $(IMAGE_WITH_TAG)-arm64
 
-ngc-manifest_push:
+ngc-manifest_push: ngc-manifest_create
 	docker manifest push $(IMAGE_WITH_TAG)
 
 build: devel_build ;

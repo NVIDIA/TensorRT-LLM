@@ -160,6 +160,7 @@ def build_google_tests(request, build_dir):
         use_ccache=True,
         clean=True,
         trt_root="/usr/local/tensorrt",
+        nixl_root="/opt/nvidia/nvda_nixl",
     )
 
     make_google_tests = [
