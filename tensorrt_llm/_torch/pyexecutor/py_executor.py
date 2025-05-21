@@ -663,6 +663,15 @@ class PyExecutor:
                 return True
         return False
 
+    def _need_return_log_probs(self, scheduled_requests: ScheduledRequests):
+        for req in scheduled_requests.context_requests:
+            if req.py_return_log_probs:
+                return True
+        for req in scheduled_requests.generation_requests:
+            if req.py_return_log_probs:
+                return True
+        return False
+
     def _executor_loop_pp(self):
         torch.cuda.set_device(self.device_id)
         got_finish_signal = False
@@ -785,9 +794,12 @@ class PyExecutor:
                         self.send_handles[
                             prev_microbatch_id] = self.dist.isend_object(
                                 (
-                                    sample_state.logits_host.numpy()
-                                    if sample_state.logits_host is not None else
-                                    None,
+                                    sample_state.logits_host.numpy() if
+                                    self._need_return_logits(scheduled_batch) or
+                                    (self._need_return_log_probs(
+                                        scheduled_batch)
+                                     and sample_state.log_probs is not None)
+                                    else None,
                                     sample_state.log_probs,
                                     sample_state.new_tensors_host,
                                 ),
