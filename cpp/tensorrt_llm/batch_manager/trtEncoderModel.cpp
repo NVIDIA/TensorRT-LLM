@@ -75,8 +75,8 @@ TrtEncoderModel::TrtEncoderModel(runtime::ModelConfig const& modelConfig, WorldC
     // handling of maximizing utilization or pause/evict
     // TODO: finer control on encoder requests scheduling
     mCapacityScheduler = std::make_unique<tensorrt_llm::batch_manager::CapacityScheduler>(
-        getMaxBatchSize() * mNumMicroBatches, optionalParams.schedulerConfig.getCapacitySchedulerPolicy(), false,
-        std::nullopt, LlmRequestState::kENCODER_INIT, LlmRequestState::kCONTEXT_INIT);
+        getMaxBatchSize() * mNumMicroBatches, optionalParams.schedulerConfig.getCapacitySchedulerPolicy(), false, false,
+        LlmRequestState::kENCODER_INIT, LlmRequestState::kCONTEXT_INIT);
 
     mMicroBatchScheduler = std::make_unique<tensorrt_llm::batch_manager::MicroBatchScheduler>(
         std::nullopt, mModelConfig.getMaxInputLen(), LlmRequestState::kENCODER_INIT, LlmRequestState::kCONTEXT_INIT);
