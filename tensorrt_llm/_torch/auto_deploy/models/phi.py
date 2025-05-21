@@ -1,3 +1,19 @@
+"""
+Patch RotaryEmbedding implementations in Phi3/Phi4 models for torch.export compatibility.
+
+This module fixes two issues that break model export and state dict reloading:
+
+1. Phi3RotaryEmbedding:
+   Registers `inv_freq` as an empty buffer, leading to missing keys when loading the state dict.
+
+2. Phi3LongRoPEScaledRotaryEmbedding:
+   Dynamically initializes `short_factor` and `long_factor` during forward passes, which is incompatible
+   with torch.export.
+
+These patches move the initialization of `inv_freq` and `short_factor` into the class constructor and simplify LongRoPE
+to always use the `short_factor` path (removing dynamic updates).
+"""
+
 import math
 import re
 import types
