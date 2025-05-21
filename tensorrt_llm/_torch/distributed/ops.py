@@ -1,6 +1,7 @@
 import math
 import os
 import threading
+from itertools import accumulate
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -62,6 +63,24 @@ def get_output_info(input: torch.Tensor, dim: int) -> List[int]:
     return {'output_shape': output_shape, 'numel_base': numel_base}
 
 
+def filter_valid_input(
+        input_list: List[torch.Tensor]
+) -> Tuple[List[torch.Tensor], List[bool]]:
+    func_valid = lambda x: x is not None
+    valid_list = list(map(func_valid, input_list))
+    input_list = list(filter(func_valid, input_list))
+    return input_list, valid_list
+
+
+def restore_full_output(output_list: List[torch.Tensor],
+                        valid_list: List[bool]) -> List[torch.Tensor]:
+    index_list = list(accumulate(map(lambda x: int(x), valid_list)))
+    output_list = list(
+        map(lambda valid, index: output_list[index - 1]
+            if valid else None, valid_list, index_list))
+    return output_list
+
+
 def allgather(
     input: Union[torch.Tensor, List[torch.Tensor]],
     mapping: Mapping,
@@ -116,6 +135,7 @@ def allgather(
         output_info = get_output_info(input, dim)
         input = input.contiguous().view(-1, output_info['numel_base'])
     else:
+        input, valid = filter_valid_input(input)
         torch_op = torch.ops.trtllm.allgather_list
         output_info = [get_output_info(val, dim) for val in input]
         input = [
@@ -148,6 +168,7 @@ def allgather(
             convert_output(val, val_info)
             for val, val_info in zip(output, output_info)
         ]
+        output = restore_full_output(output, valid)
     return output
 
 
@@ -191,6 +212,7 @@ def reducescatter(
         output_info = get_output_info(input, dim)
         input = convert_input(input, output_info)
     else:
+        input, valid = filter_valid_input(input)
         torch_op = torch.ops.trtllm.reducescatter_list
         output_info = [get_output_info(val, dim) for val in input]
         input = [
@@ -211,6 +233,7 @@ def reducescatter(
             val.view(val_info['output_shape'])
             for val, val_info in zip(output, output_info)
         ]
+        output = restore_full_output(output, valid)
     return output
 
 

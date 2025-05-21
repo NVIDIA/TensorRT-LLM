@@ -821,25 +821,11 @@ class FusedMoE(nn.Module):
 
         if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
         ) and not self.enable_alltoall:
-            var_dict = {
-                'x': x,
-                'x_sf': x_sf,
-                'token_selected_experts': token_selected_experts,
-                'token_final_scales': token_final_scales,
-            }
-            key_list = [key for key, val in var_dict.items() if val is not None]
-            var_list = [var_dict[key] for key in key_list]
-            var_list = allgather(
-                var_list,
+            x, x_sf, token_selected_experts, token_final_scales = allgather(
+                [x, x_sf, token_selected_experts, token_final_scales],
                 self.mapping,
                 dim=0,
                 sizes=None if use_dp_padding else all_rank_num_tokens)
-            for idx, key in enumerate(key_list):
-                var_dict[key] = var_list[idx]
-            x = var_dict['x']
-            x_sf = var_dict['x_sf']
-            token_selected_experts = var_dict['token_selected_experts']
-            token_final_scales = var_dict['token_final_scales']
             # Fp4 gemm has extra scaling factor
             if x_sf is not None:
                 x_sf = reswizzle_sf(x_sf, x_row, x_col,
