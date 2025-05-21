@@ -74,6 +74,10 @@ RUN pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-d
 
 # WAR against https://github.com/advisories/GHSA-vqfr-h8mv-ghfj
 RUN pip3 install --upgrade h11>=0.16 --no-cache-dir
+# WAR against https://github.com/advisories/GHSA-7cx3-6m66-7c5m
+RUN pip3 install --upgrade tornado>=6.5.0 --no-cache-dir
+# WAR against https://github.com/advisories/GHSA-5rjg-fvgr-3xxf
+RUN pip3 install --upgrade setuptools>=78.1.1 --no-cache-dir
 
 
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
