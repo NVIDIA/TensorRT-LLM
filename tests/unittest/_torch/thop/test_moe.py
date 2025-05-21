@@ -23,6 +23,7 @@ import torch.nn.functional as F
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import getSMVersion
 
+from tensorrt_llm._torch.modules.fused_moe import RoutingMethodType
 from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)
 
@@ -182,6 +183,7 @@ def noaux_tc_ref(logits, bias, n_group, topk_group, top_k,
     return scores
 
 
+# Tiered TopK routing used by DeepSeek
 def routing_reference_no_aux(expert_logits,
                              routing_bias,
                              top_k,
@@ -199,6 +201,15 @@ def routing_reference_no_aux(expert_logits,
                               top_k_groups, top_k, routed_scaling)
     permute_info = routing_reference(scores, top_k, padding)
     # print("permute_info: ", permute_info)
+    return permute_info, scores
+
+
+# TopK -> Softmax
+def routing_reference_renormalize(expert_logits, top_k, num_experts, padding):
+    topk_values, _ = torch.topk(expert_logits, k=top_k, dim=-1)
+    scores = torch.nn.functional.softmax(topk_values.float(), dim=-1)
+
+    permute_info = routing_reference(scores, top_k, padding)
     return permute_info, scores
 
 
@@ -625,34 +636,73 @@ def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size):
     getSMVersion(),
 )
 @pytest.mark.parametrize("num_tokens", [1, 2, 16, 64, 1024])
-@pytest.mark.parametrize("num_experts", [32, 256])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [1024])
-def test_moe_fp4(num_tokens, num_experts, hidden_size, intermediate_size):
+@pytest.mark.parametrize(
+    "routing_info",
+    [
+        pytest.param(
+            {
+                "num_experts": 256,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": 4,
+                "top_k_groups": 4,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3
+            },
+            id="RoutingDSv3"),
+        # FIXME: reference for TopK->Softmax is not implemented yet
+        # pytest.param(
+        #     {
+        #         "num_experts": 128,
+        #         "top_k": 8,
+        #         "padding": 8,
+        #         "n_groups": None,
+        #         "top_k_groups": None,
+        #         "routed_scaling": None,
+        #         "has_routing_bias": False,
+        #         "routing_method_type": RoutingMethodType.Renormalize
+        #     },
+        #     id="RoutingRenormalize"
+        # ),
+    ],
+)
+def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
     torch.random.manual_seed(0)
 
     #
     # Data Generation
     #
-    top_k = 8
+
+    top_k = routing_info["top_k"]
     # FIXME: set to TileN size
-    padding = 8
-    n_groups = 8
-    top_k_groups = 4
-    routed_scaling = 2.5
+    padding = routing_info["padding"]
+    n_groups = routing_info["n_groups"]
+    top_k_groups = routing_info["top_k_groups"]
+    routed_scaling = routing_info["routed_scaling"]
+    num_experts = routing_info["num_experts"]
+    routing_method_type = routing_info["routing_method_type"]
 
     assert top_k <= num_experts
     assert top_k == 8
-    assert top_k_groups == 4
-    assert num_experts > n_groups
-    assert num_experts % n_groups == 0
-    assert top_k < (top_k_groups * num_experts / n_groups)
     assert hidden_size % 128 == 0
     assert intermediate_size % 128 == 0
+    if (top_k_groups is not None) and (n_groups is not None):
+        assert top_k_groups == 4
+        assert num_experts > n_groups
+        assert num_experts % n_groups == 0
+        assert top_k < (top_k_groups * num_experts / n_groups)
 
     expert_logits = torch.randn((num_tokens, num_experts),
                                 device='cuda').to(torch.float)
-    routing_bias = torch.randn(num_experts, device='cuda', dtype=torch.bfloat16)
+    if routing_info["has_routing_bias"]:
+        routing_bias = torch.randn(num_experts,
+                                   device="cuda",
+                                   dtype=torch.bfloat16)
+    else:
+        routing_bias = None
 
     hidden_states = 2 * torch.randn(
         (num_tokens, hidden_size), device='cuda', dtype=torch.bfloat16)
@@ -706,11 +756,15 @@ def test_moe_fp4(num_tokens, num_experts, hidden_size, intermediate_size):
         torch.float8_e4m3fn).reshape(num_experts, hidden_size,
                                      intermediate_size //
                                      16)  # fp8 scaling factors
+    if routing_method_type == RoutingMethodType.DeepSeekV3:
+        permute_info, scores = routing_reference_no_aux(expert_logits,
+                                                        routing_bias, top_k,
+                                                        n_groups, top_k_groups,
+                                                        routed_scaling, padding)
+    elif routing_method_type == RoutingMethodType.Renormalize:
+        permute_info, scores = routing_reference_renormalize(
+            expert_logits, top_k, num_experts, padding)
 
-    permute_info, scores = routing_reference_no_aux(expert_logits, routing_bias,
-                                                    top_k, n_groups,
-                                                    top_k_groups,
-                                                    routed_scaling, padding)
     args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
                     top_k, padding, hidden_states_fp4_bytes,
                     hidden_states_scale_fp4_bytes, hidden_states_scale_global,

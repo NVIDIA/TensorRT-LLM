@@ -57,13 +57,15 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx,
     void* expertWeights, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
     int32_t* numNonExitingCtas, tg::Dtype dtypeElt, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
-    cudaStream_t stream)
+    RoutingMethodType routingMethodType, cudaStream_t stream)
 {
-    if (topK == 8)
-    {
-        // FIXME: hardcoded for now
-        int32_t tileN = 8;
+    // Some restriction to be lifted by https://github.com/NVIDIA/TensorRT-LLM/pull/4063
+    TLLM_CHECK_WITH_INFO(topK == 1 || topK == 8, "top_k can only be 1 or 8.");
+    // FIXME: hardcoded for now
+    int32_t tileN = 8;
 
+    if (routingMethodType == RoutingMethodType::DeepSeekV3)
+    {
         moe::dev::routing::Data routingData;
         routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
         routingData.mDtypeExpW = tg::Dtype::Bfloat16;
@@ -103,11 +105,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mUseRoutingSoftmax = false;
         moe::dev::routing::run(routingData, stream);
     }
-    else if (topK == 1)
+    else if (routingMethodType == RoutingMethodType::Llama4)
     {
-        // FIXME: hardcoded for now
-        int32_t tileN = 8;
-
         moe::dev::routingLlama4::Data routingData;
         // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
         routingData.mDtypeExpW = tg::Dtype::Bfloat16;
@@ -147,9 +146,65 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         // routingData.mUseRoutingSoftmax = false;
         moe::dev::routingLlama4::run(routingData, stream);
     }
+    else if (routingMethodType == RoutingMethodType::Renormalize /* default */
+        || routingMethodType == RoutingMethodType::Qwen3 /* Softmax -> TopK */)
+    {
+        moe::dev::routingQwen3::Data routingData;
+
+        //
+        // Config
+        //
+        // (mDtypeElt=bf16, mDtypeExpW=bf16): OK
+        // (mDtypeElt=bf16, mDtypeExpW=fp32): OK
+        // (mDtypeElt=fp32, mDtypeExpW=fp32): Crash but considered lower prio
+        //
+        // TODO: clean up
+        // The Qwen3 routing kernel overloads the meaning of mDtypeExpW as the internal compute type.
+        // It's original meaning is routingLogits dtype
+        routingData.mDtypeExpW = tg::Dtype::Fp32;
+        // TODO: clean up
+        // The Qwen3 routing kernel overloads the meaning of mDtypeElt as the dtype of routingLogits.
+        // It's original meaning is hidden_state dtype. This should be a no-op as hidden_state is no longer an input.
+        routingData.mDtypeElt = tg::Dtype::Bfloat16;
+        routingData.mUsePdl = true;
+        routingData.mNormTopkProb = routingMethodType == RoutingMethodType::Renormalize;
+        routingData.mPtrScores = routingLogits;
+
+        //
+        // Outputs
+        //
+        routingData.mPtrExpertIdx = routingExpertIndexes;
+        routingData.mPtrExpertCounts = expertCountHistogram;
+        routingData.mPtrPermutedIdxSize = permutedIdxSize;
+        routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+        routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
+        routingData.mPtrExpertWeights = expertWeights;
+
+        //
+        // Grouped Gemm Launch Config Buffers
+        //
+        routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
+        routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
+        routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+
+        //
+        // Inputs
+        //
+        routingData.mNumTokens = numTokens;
+        routingData.mNumExperts = numExperts;
+        routingData.mTopK = topK;
+        routingData.mPaddingLog2 = computeLog2(tileN);
+        routingData.mLocalExpertsStartIdx = localExpertOffset;
+        routingData.mLocalExpertsStrideLog2 = 0;
+        routingData.mNumLocalExperts = localNumExperts;
+
+        // TODO: expose Qwen3 routing flow "RoutingMethodType::Qwen3" in routingQwen3::run()
+        moe::dev::routingQwen3::run(routingData, stream);
+    }
     else
     {
-        TLLM_CHECK_WITH_INFO(false, "top_k can only be 1 or 8.");
+        TLLM_CHECK_WITH_INFO(false, "Unimplemented routing method %s of enum %d",
+            serializeMoeRoutingMethodType(routingMethodType).c_str(), (int) routingMethodType);
     }
 }
 } // namespace Routing

@@ -33,6 +33,31 @@ namespace trtllmGenFp8BlockScaleMoe
 
 namespace Routing
 {
+
+// The type of method in top-K routing, for use in torch custom op
+// Please keep sync with in tensorrt_llm/_torch/modules/fused_moe.py
+enum class RoutingMethodType : int64_t
+{
+    Default = 0,
+    Renormalize = 1,
+    DeepSeekV3 = 2,
+    Llama4 = 3,
+    Qwen3 = 4,
+};
+
+inline std::string serializeMoeRoutingMethodType(RoutingMethodType routing_method_type)
+{
+    switch (static_cast<int>(routing_method_type))
+    {
+    case 0: return "Default";
+    case 1: return "Renormalize";
+    case 2: return "DeepSeekV3";
+    case 3: return "Llama4";
+    case 4: return "Qwen3";
+    default: TLLM_CHECK_WITH_INFO(false, "Invalid routing method"); return "";
+    };
+}
+
 inline int32_t getMaxPermutedPaddedCount(
     int32_t numTokens, int32_t expertsPerToken, int32_t numExperts, int32_t padding)
 {
@@ -74,7 +99,7 @@ public:
         int32_t* permutedIdxSize, int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx,
         int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx,
         int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas, trtllm::gen::Dtype dtypeElt,
-        bool useRoutingScalesOnInput, bool useDeepSeekFp8, cudaStream_t stream);
+        bool useRoutingScalesOnInput, bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream);
 };
 } // namespace Routing
 
