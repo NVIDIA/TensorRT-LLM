@@ -465,10 +465,13 @@ private:
 
         // The mask type.
         TrtllmGenAttentionMaskType maskType = params.mMaskType;
-        // Enable sliding window causal if the max kv sequence length exceeds attention window size.
-        if (params.mAttentionWindowSize < params.mMaxSeqLenKv && maskType == TrtllmGenAttentionMaskType::Causal)
+        // Enable sliding window or chunked causal if the max kv sequence length exceeds attention window size or
+        // chunked attention size.
+        if (maskType == TrtllmGenAttentionMaskType::Causal
+            && (params.mMaxSeqLenKv > params.mAttentionWindowSize
+                || params.mMaxSeqLenKv > params.mChunkedAttentionSize))
         {
-            maskType = TrtllmGenAttentionMaskType::SlidingWindowCausal;
+            maskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
         }
         // NumTokensPerPage is set to 0 when not selecting pagedKv-layout kernels.
         int numTokensPerPage = (!isPagedKv(params.mQkvLayout)) ? 0 : params.mNumTokensPerPage;

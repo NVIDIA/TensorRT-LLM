@@ -202,6 +202,7 @@ def main(*,
          extra_make_targets: str = "",
          trt_root: str = '/usr/local/tensorrt',
          nccl_root: str = None,
+         nixl_root: str = None,
          internal_cutlass_kernels_root: str = None,
          clean: bool = False,
          clean_wheel: bool = False,
@@ -297,6 +298,9 @@ def main(*,
 
     if nccl_root is not None:
         cmake_def_args.append(f"-DNCCL_ROOT={nccl_root}")
+
+    if nixl_root is not None:
+        cmake_def_args.append(f"-DNIXL_ROOT={nixl_root}")
 
     build_dir = get_build_dir(build_dir, build_type)
     first_build = not Path(build_dir, "CMakeFiles").exists()
@@ -646,6 +650,8 @@ def add_arguments(parser: ArgumentParser):
                         help="Directory to find TensorRT headers/libs")
     parser.add_argument("--nccl_root",
                         help="Directory to find NCCL headers/libs")
+    parser.add_argument("--nixl_root",
+                        help="Directory to find NIXL headers/libs")
     parser.add_argument(
         "--internal-cutlass-kernels-root",
         default="",

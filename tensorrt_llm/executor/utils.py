@@ -23,6 +23,12 @@ def get_spawn_proxy_process_ipc_addr_env() -> str | None:
     return os.getenv("TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR")
 
 
+def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes | None:
+    ''' Get the HMAC key for the spawn proxy process dynamically. '''
+    if key := os.getenv("TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"):
+        return bytes.fromhex(key)
+
+
 def get_spawn_proxy_process_env() -> bool:
     ''' Get the environment variable for the spawn proxy process dynamically. '''
     return os.getenv("TLLM_SPAWN_PROXY_PROCESS") == "1"
@@ -42,10 +48,7 @@ def create_mpi_comm_session(
         print_colored_debug(
             f"Using RemoteMpiPoolSessionClient to bind to external MPI processes at {get_spawn_proxy_process_ipc_addr_env()}\n",
             "yellow")
-        hmac_key = os.getenv("TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY")
-        # Convert the hex string to bytes
-        if hmac_key is not None:
-            hmac_key = bytes.fromhex(hmac_key)
+        hmac_key = get_spawn_proxy_process_ipc_hmac_key_env()
         return RemoteMpiCommSessionClient(
             addr=get_spawn_proxy_process_ipc_addr_env(), hmac_key=hmac_key)
     else:
