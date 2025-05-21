@@ -305,7 +305,6 @@ def add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module):
 
     # Register the hook
     gm._register_load_state_dict_pre_hook(aliasing_load_pre_hook)
-    return gm
 
 
 @torch.inference_mode()
