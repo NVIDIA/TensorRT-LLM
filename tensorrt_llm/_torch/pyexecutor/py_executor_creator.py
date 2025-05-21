@@ -12,7 +12,7 @@ from tensorrt_llm.quantization import KV_CACHE_QUANT_ALGO_LIST
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist
-from ..speculative import Eagle3Config, get_spec_resource_manager
+from ..speculative import Eagle3Config, NGramConfig, get_spec_resource_manager
 from ._util import (create_kv_cache_manager, create_py_executor_instance,
                     estimate_max_kv_cache_tokens, get_token_num_for_estimation,
                     instantiate_sampler, is_mla)
@@ -63,11 +63,13 @@ def create_py_executor(executor_config: ExecutorConfig,
 
     spec_config = executor_config.speculative_config
     has_draft_model_engine = isinstance(spec_config, Eagle3Config)
+    has_ngram_drafter = isinstance(spec_config, NGramConfig)
 
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=executor_config.enable_chunked_context,
         cache_reuse=executor_config.kv_cache_config.enable_block_reuse,
-        has_speculative_draft_tokens=has_draft_model_engine,
+        has_speculative_draft_tokens=has_draft_model_engine
+        or has_ngram_drafter,
     )
 
     model_engine = PyTorchModelEngine(
