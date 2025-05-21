@@ -187,7 +187,7 @@ private:
     struct SenderState
     {
         MemoryDesc mReceiverBufferDesc{nullptr, 0, 0};
-        int valideSegmentIdx{0};
+        int validSegmentIdx{0};
         SenderState() = default;
     };
 

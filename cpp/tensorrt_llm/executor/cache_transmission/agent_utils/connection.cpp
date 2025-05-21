@@ -82,9 +82,9 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
         reinterpret_cast<uintptr_t>(data), size, static_cast<uint32_t>(mAgentConnectionManager->getDeviceId())};
     MemoryDescs srcDescs{MemoryType::kVRAM, {srcDesc}};
     auto dstBaseDesc = mSenderState.mReceiverBufferDesc;
-    MemoryDesc dstDesc{dstBaseDesc.getAddr() + (mSenderState.valideSegmentIdx * size), size, dstBaseDesc.getDeviceId()};
+    MemoryDesc dstDesc{dstBaseDesc.getAddr() + (mSenderState.validSegmentIdx * size), size, dstBaseDesc.getDeviceId()};
     TLLM_LOG_DEBUG(
-        "send dstDesc: %p, size: %ld ,validSegmentIdx: %ld", dstDesc.getAddr(), size, mSenderState.valideSegmentIdx);
+        "send dstDesc: %p, size: %ld ,validSegmentIdx: %ld", dstDesc.getAddr(), size, mSenderState.validSegmentIdx);
     MemoryDescs dstDescs{MemoryType::kVRAM, {dstDesc}};
     TransferRequest request{TransferOp::kWRITE, srcDescs, dstDescs, mRemoteAgentName};
     auto status = mAgentConnectionManager->getAgent()->submitTransferRequests(request);
@@ -137,10 +137,10 @@ void AgentConnection::sendRequestAndBufferInfo(
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
 }
 
-void AgentConnection::setSenderState(MemoryDesc mReceiverBufferDesc, int valideSegmentIdx)
+void AgentConnection::setSenderState(MemoryDesc mReceiverBufferDesc, int validSegmentIdx)
 {
     mSenderState.mReceiverBufferDesc = mReceiverBufferDesc;
-    mSenderState.valideSegmentIdx = valideSegmentIdx;
+    mSenderState.validSegmentIdx = validSegmentIdx;
 }
 
 void AgentConnection::setHasLoadRemoteAgent(bool hasLoadRemoteAgent)

@@ -37,4 +37,3 @@ if(NIXL_ROOT)
   add_gtest(agentCommTest agentCommTest.cpp)
   target_link_libraries(transferAgentTest PRIVATE tensorrt_llm_nixl_wrapper)
 endif()
-
