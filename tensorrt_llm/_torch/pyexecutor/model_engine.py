@@ -349,12 +349,16 @@ class PyTorchModelEngine(ModelEngine):
                                                 self.model.vocab_size_padded)
 
         self._torch_compile_backend = None
+        print(
+            f"torch_compile_enabled: {pytorch_backend_config.torch_compile_enabled}",
+            flush=True)
 
         try:
             if pytorch_backend_config.torch_compile_enabled:
                 set_torch_compiling(True)
                 use_ub = pytorch_backend_config.torch_compile_enable_userbuffers and self._init_userbuffers(
                     self.model.config.hidden_size)
+                print(f"use_ub: {use_ub}", flush=True)
                 self._torch_compile_backend = Backend(
                     pytorch_backend_config.torch_compile_inductor_enabled,
                     enable_userbuffers=use_ub,

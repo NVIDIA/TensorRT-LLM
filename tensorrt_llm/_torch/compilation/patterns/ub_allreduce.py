@@ -180,8 +180,61 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 extra_check=extra_check_fp4_quant_pattern,
             )
 
+        def register_no_quant_pattern(custom_pass: PatternMatcherPass):
+            input_node = KeywordArg('input')
+            fusion = KeywordArg('fusion_op')
+            trtllm_allreduce_default = CallFunction(
+                torch.ops.trtllm.allreduce.default, input_node,
+                KeywordArg('residual_in'), KeywordArg('gamma'), Ignored(),
+                Ignored(), Ignored(), mapping.tp_group, strategy, fusion,
+                KeywordArg('eps'))
+            no_quant_pattern = MultiOutputPattern([trtllm_allreduce_default])
+
+            def empty_no_quant_pattern(
+                input: torch.Tensor,
+                residual_in: torch.Tensor,
+                gamma: torch.Tensor,
+                eps: float,
+            ):
+                return
+
+            def target_no_quant_pattern(
+                input: torch.Tensor,
+                residual_in: torch.Tensor,
+                gamma: torch.Tensor,
+                eps: float,
+            ):
+                input = torch.ops.trtllm.copy_to_userbuffers(input)
+                all_reduce_output = torch.ops.trtllm.allreduce(
+                    input, residual_in, gamma, None, None, None,
+                    mapping.tp_group, int(AllReduceStrategy.UB), fusion, eps)
+                finalize_output = torch.ops.trtllm.userbuffers_allreduce_finalize(
+                    all_reduce_output[-1], False)
+                return all_reduce_output[0], finalize_output
+
+            def extra_check_no_quant_pattern(match: Match) -> bool:
+                input = match.ctx.pattern_to_node[input_node]
+                if not isinstance(input, torch.fx.graph.Node):
+                    return False
+                dtype = input.meta["tensor_meta"].dtype
+                # UB only supports FP16/BF16 input
+                if dtype != torch.float16 and dtype != torch.bfloat16:
+                    return False
+                return True
+
+            register_replacement(
+                empty_no_quant_pattern,
+                target_no_quant_pattern,
+                [],
+                fwd_only,
+                custom_pass,
+                search_fn_pattern=no_quant_pattern,
+                extra_check=extra_check_no_quant_pattern,
+            )
+
         register_fp8_quant_pattern(custom_pass)
         register_fp4_quant_pattern(custom_pass)
+        # register_no_quant_pattern(custom_pass)
 
     def register_convert_supported_ar_to_ub(custom_pass: PatternMatcherPass):
         strategy = int(AllReduceStrategy.AUTO)

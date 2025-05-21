@@ -161,8 +161,10 @@ public:
         size_t size = input.numel();
         size_t seq_len = input.size(0);
 
-        // If strategy is set to UB, UB must be used as UB impl output is special and cannot be used
-        // by others.
+        if (std::getenv("TLLM_USE_NCCL_UB") && mStrategy == AllReduceStrategyType::UB)
+        {
+            return runNCCLAllReduceUB(input, residual, norm_weight, scale, bias);
+        }
         AllReduceStrategyType runtime_strategy = getRuntimeStrategy(seq_len, size);
 
         // Log runtime strategy
@@ -297,6 +299,30 @@ private:
 
         // Treat any other patterns as fallback cases.
         return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, reduce_output);
+    }
+
+    std::vector<torch::Tensor> runNCCLAllReduceUB(torch::Tensor const& input,
+        torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
+        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias) noexcept
+    {
+
+        auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+        int size = input.numel();
+        auto& ub_manager = tensorrt_llm::runtime::ub::UserBuffersManager::get_instance();
+        auto ub_buffer0 = ub_manager.search_buffer(input.data_ptr());
+        TLLM_CHECK(!ub_buffer0.invalid());
+        auto [norm_out, ub_buffer1] = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
+
+        NCCLCHECK(ncclAllReduce(
+            input.data_ptr(), norm_out.mutable_data_ptr(), size, (*getDtypeMap())[mType], ncclSum, *mNcclComm, stream));
+
+        if (mOp == AllReduceFusionOp::NONE)
+        {
+            return {norm_out};
+        }
+
+        // Treat any other patterns as fallback cases.
+        return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, norm_out);
     }
 
     std::vector<torch::Tensor> runLowPrecisionAllReduce(torch::Tensor const& input,

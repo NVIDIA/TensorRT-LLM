@@ -64,6 +64,7 @@ class Backend:
                 register_ar_residual_norm(cls._custom_pass_instances[0])
                 if enable_userbuffers and tensorrt_llm.bindings.internal.userbuffers.ub_supported(
                 ):
+                    print("Registering UB patterns", flush=True)
                     register_ub_patterns(cls._custom_pass_instances)
             else:
                 register_add_norm(cls._custom_pass_instances[0])

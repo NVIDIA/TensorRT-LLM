@@ -36,7 +36,7 @@ void ub_initialize(int tp_size)
 
 bool ub_is_initialized()
 {
-    return UserBufferAllocator::Instance().is_initialized();
+    return UserBufferAllocator::Instance().isInitialized();
 }
 
 UBBuffer ub_allocate(size_t bytes)
