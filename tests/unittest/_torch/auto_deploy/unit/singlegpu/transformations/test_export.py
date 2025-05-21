@@ -233,8 +233,9 @@ def test_deduplicate_during_export(model_cls: Type[nn.Module], device_export: st
         if device_export != "meta":
             assert torch.equal(gm.fc1.weight, sd_og[expected_param])
 
-    # Test loading fc3.weight into fc1.weight
+    # fc3.weight is aliased to fc1.weight
+    # Test loading fc3.weight into gm.fc1.weight. State dict does not contain fc1.weight
     check_parameter_loading("fc1.weight", "fc3.weight")
 
-    # Test loading fc1.weight into fc1.weight
+    # Test loading fc1.weight into gm.fc1.weight. State dict does not contain fc3.weight
     check_parameter_loading("fc3.weight", "fc1.weight")
