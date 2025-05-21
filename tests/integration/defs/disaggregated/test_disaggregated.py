@@ -397,6 +397,7 @@ def test_disaggregated_conditional(disaggregated_test_root, llm_venv,
 
 
 @skip_no_hopper
+@pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8(disaggregated_test_root,
@@ -460,6 +461,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
 
 
 @skip_no_hopper
+@pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
@@ -509,6 +511,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
 
 
 @skip_no_hopper
+@pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp(
@@ -531,6 +534,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp(
 
 
 @skip_no_hopper
+@pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
@@ -552,6 +556,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
 
 
 @skip_no_hopper
+@pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph(
@@ -575,6 +580,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph(
 
 
 @skip_no_hopper
+@pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_overlap_cuda_graph(
@@ -597,6 +603,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_overlap_cuda_graph(
 
 
 @skip_no_hopper
+@pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one(
@@ -619,6 +626,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one(
 
 
 @skip_no_hopper
+@pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp(
@@ -641,6 +649,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp(
 
 
 @skip_no_hopper
+@pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp(
