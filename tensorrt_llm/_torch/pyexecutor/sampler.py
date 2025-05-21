@@ -37,6 +37,7 @@ class SampleState:
     scheduled_requests: ScheduledRequests
 
     logits: torch.Tensor = None
+    logits_host: torch.Tensor = None
 
     # Set when decode_async() has evaluated these to avoid computing again in update_requests()
     # log_probs[request_idx][token_idx]
@@ -81,13 +82,14 @@ class EarlyStopSampler(Sampler):
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
-            logits = state.logits[idx]
-            if logits.ndim == 1:
-                # For BERT: Add axis to be compatible with LogitsStorage
-                # (LogitsStorage will interpret this dim as the prompt_len which
-                # is not relevant for outputting logits of encoder only model).
-                logits = logits.unsqueeze(0)
-            request.py_result.append_context_logits(logits)
+            if request.py_return_context_logits:
+                logits = state.logits[idx]
+                if logits.ndim == 1:
+                    # For BERT: Add axis to be compatible with LogitsStorage
+                    # (LogitsStorage will interpret this dim as the prompt_len which
+                    # is not relevant for outputting logits of encoder only model).
+                    logits = logits.unsqueeze(0)
+                request.py_result.append_context_logits(logits)
 
 
 def top_k_sampling_batch(logits, top_k=50):
@@ -409,7 +411,8 @@ class TorchStarAttentionSampler(TorchSampler):
         num_tokens = request.add_new_token(new_token, beam_idx)
 
         current_logits = logits[output_token_idx].unsqueeze(0)
-        request.py_result.append_generation_logits(current_logits)
+        if request.py_return_generation_logits:
+            request.py_result.append_generation_logits(current_logits)
         if request.py_return_log_probs:
             _, log_probs = greedy_search_sampling_batch(current_logits)
             request.py_result.append_log_probs([[{
