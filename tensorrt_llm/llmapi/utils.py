@@ -239,6 +239,9 @@ class ManagedThread(threading.Thread):
         **kwargs: The arguments to pass to the task
     """
 
+    class StopEvent(Exception):
+        pass
+
     def __init__(self,
                  task: Callable[..., bool],
                  error_queue: Queue,
@@ -264,8 +267,10 @@ class ManagedThread(threading.Thread):
                     break
 
             try:
-                if not task(**self.kwargs):
-                    break
+                task(**self.kwargs)
+            except ManagedThread.StopEvent:
+                print_colored_debug(f"Thread {self.name} stopped.\n", "green")
+                break
             except Exception as e:
                 logger.error(
                     f"Error in thread {self.name}: {e}\n{traceback.format_exc()}"

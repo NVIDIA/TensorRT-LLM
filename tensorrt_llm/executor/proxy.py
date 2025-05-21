@@ -149,11 +149,11 @@ class ExecutorBindingsProxy(GenerationExecutor):
         # send back a finished result.
         self.request_queue.put(CancellingRequest(request_id))
 
-    def dispatch_result_task(self) -> bool:
+    def dispatch_result_task(self) -> None:
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context
         if (res := self.result_queue.get()) is None:
-            return False  # shutdown the thread
+            raise ManagedThread.StopEvent()
 
         async_queues = []
         event_loop = None
@@ -181,17 +181,15 @@ class ExecutorBindingsProxy(GenerationExecutor):
         for i in res:
             global_tracer().log_instant("IPC.get")
             if i is None:
-                return False
+                raise ManagedThread.StopEvent()
             process_res(i)
 
         if async_queues:
             _SyncQueue.notify_many(event_loop, async_queues)
 
-        return True  # success
-
     def _iteration_result_task(self, queue: Union[FusedIpcQueue,
                                                   IntraProcessQueue],
-                               result_singleton: IterationResult) -> bool:
+                               result_singleton: IterationResult) -> None:
         # iteration result is not urgent, so we can sleep a bit
         time.sleep(0.2)
 
@@ -200,11 +198,11 @@ class ExecutorBindingsProxy(GenerationExecutor):
         except:
             logger.debug(
                 "proxy.py: Error in _iteration_result_task: queue.get()")
-            return False
+            raise ManagedThread.StopEvent()
 
         if data is None:
             logger.debug("proxy.py: _iteration_result_task: data is None")
-            return False  # shutdown the thread
+            raise ManagedThread.StopEvent()
 
         data = data if isinstance(data, list) else [data]
         queue = result_singleton.queue
@@ -217,7 +215,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
             for d in data:
                 if d is None:
                     logger.debug("proxy.py: _iteration_result_task: d is None")
-                    return False
+                    raise ManagedThread.StopEvent()
 
                 if isinstance(queue, _SyncQueue):
                     queue.put_nowait(d)
@@ -237,15 +235,13 @@ class ExecutorBindingsProxy(GenerationExecutor):
             logger.debug(f"proxy.py: Error in _iteration_result_task: {e}")
             raise e
 
-        return True  # success
+    def dispatch_stats_task(self) -> None:
+        self._iteration_result_task(self.mp_stats_queue,
+                                    self._iter_stats_result)
 
-    def dispatch_stats_task(self) -> bool:
-        return self._iteration_result_task(self.mp_stats_queue,
-                                           self._iter_stats_result)
-
-    def dispatch_kv_cache_events_task(self) -> bool:
-        return self._iteration_result_task(self.kv_cache_events_queue,
-                                           self._iter_kv_events_result)
+    def dispatch_kv_cache_events_task(self) -> None:
+        self._iteration_result_task(self.kv_cache_events_queue,
+                                    self._iter_kv_events_result)
 
     def _start_dispatch_threads(self):
         if self.dispatch_result_thread is None:

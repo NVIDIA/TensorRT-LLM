@@ -239,7 +239,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
     def _iteration_result_task(self, it_result_queue: IterationResultQueue,
                                engine_get_result_api: Callable,
                                result_singleton: IterationResult,
-                               result_serializer: Callable):
+                               result_serializer: Callable) -> None:
         time.sleep(0.2)
         async_queues = []
         queue = result_singleton.queue if self._is_llm_executor and result_singleton else it_result_queue.queue
@@ -268,8 +268,6 @@ class ExecutorBindingsWorker(GenerationExecutor):
         except Exception as e:
             logger.error(f"worker.py: Error in _iteration_result_task: {e}")
             raise e
-
-        return True  # success
 
     def dispatch_stats_task(self) -> bool:
 
@@ -301,7 +299,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
                                            self._iter_stats_result,
                                            stats_serializer)
 
-    def dispatch_kv_cache_events_task(self) -> bool:
+    def dispatch_kv_cache_events_task(self) -> None:
         if isinstance(self.engine, tllm.Executor):
             # Check if the engine has a kv cache event manager
             # If not, return an empty list for the events which will cause the thread to exit early.
@@ -800,7 +798,7 @@ class AwaitResponseHelper:
             case _:
                 raise NotImplementedError
 
-    def __call__(self) -> bool:
+    def __call__(self) -> None:
         ''' This method should be called by a ManagedThread. '''
         responses = self.worker.engine.await_responses(
             timeout=datetime.timedelta(milliseconds=100))
@@ -814,7 +812,6 @@ class AwaitResponseHelper:
                               color="red",
                               category="Worker"):
             self.responses_handler(responses)
-        return True
 
     def handle_for_worker(self, responses: List[tllm.Response]) -> None:
         ''' Return the responses to asyncio.event_loop. '''
