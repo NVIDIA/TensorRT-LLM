@@ -150,6 +150,7 @@ devel_%: STAGE = devel
 tritondevel_%: STAGE = tritondevel
 tritonrelease_%: STAGE = tritonrelease
 tritonrelease_%: DEVEL_IMAGE = tritondevel
+tritonrelease_run: WORK_DIR = /app/tensorrt_llm
 
 wheel_%: STAGE = wheel
 wheel_run: WORK_DIR = /src/tensorrt_llm
