@@ -283,7 +283,7 @@ def torch_export_to_gm(
     torch.autocast = lambda *args, **kwargs: nullcontext()
     torch.nn.attention.sdpa_kernel = lambda *args, **kwargs: nullcontext()
 
-    with lift_to_meta(model, strict_missing=False) as state_dict:
+    with lift_to_meta(model) as state_dict:
         # clean up args, kwargs and move to correct device
         args, kwargs = tree_to((args, kwargs or {}), device="meta")
 
