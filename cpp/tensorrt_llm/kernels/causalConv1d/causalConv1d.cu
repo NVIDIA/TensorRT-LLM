@@ -18,14 +18,6 @@
 // adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/csrc/causal_conv1d_fwd.cu
 // and https://github.com/Dao-AILab/causal-conv1d/blob/main/csrc/causal_conv1d_update.cu
 
-#include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-
-#include <c10/util/BFloat16.h>
-#include <c10/util/Half.h>
-#include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
-
 #include <cub/block/block_load.cuh>
 #include <cub/block/block_store.cuh>
 
@@ -253,12 +245,11 @@ void causal_conv1d_fwd_launch(ConvParamsBase &params, cudaStream_t stream) {
         auto kernel = &causal_conv1d_fwd_kernel<Ktraits>;
 
         if (kSmemSize >= 48 * 1024) {
-            C10_CUDA_CHECK(cudaFuncSetAttribute(
+            TLLM_CUDA_CHECK(cudaFuncSetAttribute(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
         }
         kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
-
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        TLLM_CUDA_KERNEL_LAUNCH_CHECK();
     });
 }
 
@@ -275,8 +266,8 @@ void causal_conv1d_fwd_cuda(ConvParamsBase &params, cudaStream_t stream) {
 
 
 template void causal_conv1d_fwd_cuda<float, float>(ConvParamsBase &params, cudaStream_t stream);
-template void causal_conv1d_fwd_cuda<at::Half, at::Half>(ConvParamsBase &params, cudaStream_t stream);
-template void causal_conv1d_fwd_cuda<at::BFloat16, at::BFloat16>(ConvParamsBase &params, cudaStream_t stream);
+template void causal_conv1d_fwd_cuda<half, half>(ConvParamsBase &params, cudaStream_t stream);
+template void causal_conv1d_fwd_cuda<nv_bfloat16, nv_bfloat16>(ConvParamsBase &params, cudaStream_t stream);
 
 
 
@@ -388,7 +379,7 @@ void causal_conv1d_update_launch(ConvParamsBase &params, cudaStream_t stream) {
         ? &causal_conv1d_update_kernel<Ktraits, false>
         : &causal_conv1d_update_kernel<Ktraits, true>;
     kernel<<<grid, Ktraits::kNThreads, 0, stream>>>(params);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    TLLM_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template<typename input_t, typename weight_t>
@@ -403,7 +394,7 @@ void causal_conv1d_update_cuda(ConvParamsBase &params, cudaStream_t stream) {
 }
 
 template void causal_conv1d_update_cuda<float, float>(ConvParamsBase &params, cudaStream_t stream);
-template void causal_conv1d_update_cuda<at::Half, at::Half>(ConvParamsBase &params, cudaStream_t stream);
-template void causal_conv1d_update_cuda<at::BFloat16, at::BFloat16>(ConvParamsBase &params, cudaStream_t stream);
+template void causal_conv1d_update_cuda<half, half>(ConvParamsBase &params, cudaStream_t stream);
+template void causal_conv1d_update_cuda<nv_bfloat16, nv_bfloat16>(ConvParamsBase &params, cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels::causal_conv1d

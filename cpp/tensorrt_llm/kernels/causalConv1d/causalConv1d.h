@@ -27,6 +27,8 @@
 namespace tensorrt_llm::kernels::causal_conv1d
 {
 
+#define TLLM_CUDA_KERNEL_LAUNCH_CHECK() TLLM_CUDA_CHECK(cudaGetLastError())
+
 /// @param COND       - a boolean expression to switch by
 /// @param CONST_NAME - a name given for the constexpr bool variable.
 /// @param ...       - code to execute for true and false

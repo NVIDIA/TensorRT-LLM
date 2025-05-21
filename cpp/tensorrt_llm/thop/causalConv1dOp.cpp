@@ -32,14 +32,14 @@ namespace torch_ext
 #define DISPATCH_WTYPE_ITYPE_FLOAT_AND_HALF_AND_BF16(ITYPE, NAME, ...)                                                 \
     if (ITYPE == at::ScalarType::Half)                                                                                 \
     {                                                                                                                  \
-        using input_t = at::Half;                                                                                      \
-        using weight_t = at::Half;                                                                                     \
+        using input_t = half;                                                                                          \
+        using weight_t = half;                                                                                         \
         __VA_ARGS__();                                                                                                 \
     }                                                                                                                  \
     else if (ITYPE == at::ScalarType::BFloat16)                                                                        \
     {                                                                                                                  \
-        using input_t = at::BFloat16;                                                                                  \
-        using weight_t = at::BFloat16;                                                                                 \
+        using input_t = nv_bfloat16;                                                                                   \
+        using weight_t = nv_bfloat16;                                                                                  \
         __VA_ARGS__();                                                                                                 \
     }                                                                                                                  \
     else if (ITYPE == at::ScalarType::Float)                                                                           \
