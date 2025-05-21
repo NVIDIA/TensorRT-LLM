@@ -848,14 +848,14 @@ class PyExecutor:
                 finished_requests = []
 
                 if scheduled_batch.batch_size > 0:
-                    self.resource_manager.prepare_resources(scheduled_batch)
-                    if self.draft_model_engine is not None:
-                        self._prepare_draft_tokens(scheduled_batch)
-
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
+
+                    self.resource_manager.prepare_resources(scheduled_batch)
+                    if self.draft_model_engine is not None:
+                        self._prepare_draft_tokens(scheduled_batch)
 
                     batch_outputs = self._forward_step(scheduled_batch)
 
@@ -980,6 +980,11 @@ class PyExecutor:
                 self._pause_requests(scheduled_batch.paused_requests)
 
                 if scheduled_batch.batch_size > 0:
+                    if self.kv_cache_transceiver:
+                        # For generation requests which have completed KV cache transfer
+                        self._prepare_disagg_gen_transmission_complete(
+                            scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     generation_requests = scheduled_batch.generation_requests
@@ -998,11 +1003,6 @@ class PyExecutor:
                         if req.py_batch_idx is not None:
                             new_generation_requests.append(req)
                     scheduled_batch.generation_requests = new_generation_requests
-
-                    if self.kv_cache_transceiver:
-                        # For generation requests which have completed KV cache transfer
-                        self._prepare_disagg_gen_transmission_complete(
-                            scheduled_batch)
 
                     previous_tensors_device = self.previous_batch and self.previous_batch.sample_state.device
 
