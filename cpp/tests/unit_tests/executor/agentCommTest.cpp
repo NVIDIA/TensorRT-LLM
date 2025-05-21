@@ -84,10 +84,8 @@ protected:
 
         mCacheManager->allocatePools(false);
 
-        // TLLM_LOG_INFO("kvCacheManager created");
         size_t maxNumTokens = 1024;
         mTransBufferManager = std::make_unique<CacheTransBufferManager>(mCacheManager.get(), maxNumTokens);
-        // TLLM_LOG_INFO("CacheTransBufferManager created");
         mCacheState = std::make_unique<CacheState>(numLayers, numHeads, sizePerHead, tokensPerBlock, 1, 1, dataType);
     }
 
@@ -125,8 +123,7 @@ TEST_F(AgentCommTest, AgentConnectionManagerConnect)
     ASSERT_TRUE(!agentName0.empty());
     ASSERT_TRUE(!agentName1.empty());
     ASSERT_TRUE(agentName0 != agentName1);
-    // TLLM_LOG_INFO("AgentConnectionManagerConnect: agentName0: %s, agentName1: %s", agentName0.c_str(),
-    // agentName1.c_str());
+
     auto commState0 = connectionManager0->getCommState();
     auto commState1 = connectionManager1->getCommState();
     ASSERT_TRUE(commState0.isAgentState());
@@ -148,13 +145,10 @@ TEST_F(AgentCommTest, AgentConnectionManagerConnect)
     auto agentConnection0 = const_cast<tensorrt_llm::executor::kv_cache::AgentConnection*>(
         dynamic_cast<tensorrt_llm::executor::kv_cache::AgentConnection const*>(connection0));
     agentConnection0->sendRequestAndBufferInfo(sendRequestInfo, cacheBufferId, validConnectionIdx);
-    // TLLM_LOG_INFO("after sendRequestAndBufferInfo");
 
     tensorrt_llm::batch_manager::RequestInfo recvRequestInfo;
     auto connection1 = connectionManager1->recvConnectionAndRequestInfo(recvRequestInfo);
-    // TLLM_LOG_INFO("after recvRequestAndBufferInfo");
     ASSERT_EQ(recvRequestInfo.getRequestId(), requestId);
-    // TLLM_LOG_INFO("finish");
 
     auto sendBuffer = mTransBufferManager->getSendBuffer(cacheBufferId);
     auto sendSize = 1024;
@@ -169,16 +163,13 @@ TEST_F(AgentCommTest, AgentConnectionManagerConnect)
             TLLM_CUDA_CHECK(cudaSetDevice(0));
             connection1->send(dataContext, sendBuffer->data(), sendSize);
         });
-    // TLLM_LOG_INFO("after async send");
     connection0->recv(dataContext, nullptr, 0);
 
-    // TLLM_LOG_INFO("after recv");
     future.wait();
 
     auto recvBuffer = mTransBufferManager->getRecvBuffer(cacheBufferId);
     std::vector<char> recvData(sendSize);
     TLLM_CUDA_CHECK(cudaMemcpy(recvData.data(), recvBuffer->data(), sendSize, cudaMemcpyDeviceToHost));
-    // TLLM_LOG_INFO("after cudaMemcpy");
     for (size_t i = 0; i < sendSize; i++)
     {
         ASSERT_EQ(recvData[i], 'a');

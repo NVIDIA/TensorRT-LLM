@@ -297,7 +297,8 @@ void AgentConnectionManager::updateUnhandledNotifications()
     for (auto const& [agent, notifs] : notif_map)
     {
         auto& existing_notifs = mUnhandledNotifications[agent];
-        existing_notifs.insert(existing_notifs.end(), notifs.begin(), notifs.end());
+        existing_notifs.insert(
+            existing_notifs.end(), std::make_move_iterator(notifs.begin()), std::make_move_iterator(notifs.end()));
     }
 }
 
@@ -461,15 +462,7 @@ std::string const& AgentConnectionManager::getAgentName() const
 
 AgentConnectionManager::~AgentConnectionManager()
 {
-
+    // TODO: invalideRemoteAgent
     m_Agent->deregisterMemory(mRegMemDescs);
-
-    // for (auto& [agent, connection] : mConnections)
-    // {
-    //     if (connection->hasLoadRemoteAgent())
-    //     {
-    //         m_Agent->invalidateRemoteAgent(agent);
-    //     }
-    // }
 }
 } // namespace tensorrt_llm::executor::kv_cache
