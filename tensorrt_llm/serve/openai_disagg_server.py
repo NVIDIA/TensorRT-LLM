@@ -110,7 +110,7 @@ class OpenAIDisaggServer:
                                         gen_req: Union[CompletionRequest, ChatCompletionRequest]):
         try:
 
-            if len(ctx_response.choices) != 1:
+            if ctx_response is not None and len(ctx_response.choices) != 1:
                 raise ValueError("Context server did not return a single choice. This is not expected")
 
             # First yield the context response if it's not None
@@ -122,7 +122,9 @@ class OpenAIDisaggServer:
                 yield f"data: {data}\n\n".encode('utf-8')
 
             # Only send request to gen server if request is not finished
-            if ctx_response.choices[0].finish_reason == "not_finished":
+            if ctx_response is not None and ctx_response.choices[0].finish_reason != "not_finished":
+                yield f"data: [DONE]\n\n".encode('utf-8')
+            else:
                 # Then yield the generation responses
                 if isinstance(gen_req, CompletionRequest):
                     gen_response = await self.send_completion_request(gen_server, gen_req)
@@ -133,8 +135,6 @@ class OpenAIDisaggServer:
 
                 async for chunk in gen_response.body_iterator:
                     yield chunk
-            else:
-                yield f"data: [DONE]\n\n".encode('utf-8')
 
         finally:
             await self.gen_router.finish_request(gen_req)
@@ -234,7 +234,7 @@ class OpenAIDisaggServer:
                 # TODO: add ctx_server info into generation request for pre-registration
                 ctx_response = await self._send_context_request(ctx_server, ctx_req)
 
-                if len(ctx_response.choices) != 1:
+                if ctx_response is not None and len(ctx_response.choices) != 1:
                     raise ValueError("Context server did not return a single choice. This is not expected")
 
                 # Append disaggregates parameters to generation request
@@ -249,22 +249,22 @@ class OpenAIDisaggServer:
             logging.info("Sending request to gen server: %s", gen_server)
 
             if not req.stream:
-               try: 
-                   if ctx_response is not None and ctx_response.choices[0].finish_reason != "not_finished":
-                       #If request finished after first token, return right away and skip gen
-                       del ctx_response.choices[0].disaggregated_params
-                       return ctx_response
-                   else:
-                       if isinstance(req, CompletionRequest):
-                           gen_response = await self.send_completion_request(gen_server, req)
-                       else:
-                           assert isinstance(req, ChatCompletionRequest)
-                           gen_response = await self.send_chat_request(gen_server, req)
-                       return gen_response
+                try:
+                    if ctx_response is not None and ctx_response.choices[0].finish_reason != "not_finished":
+                        #If request finished after first token, return right away and skip gen
+                        del ctx_response.choices[0].disaggregated_params
+                        return ctx_response
+                    else:
+                        if isinstance(req, CompletionRequest):
+                            gen_response = await self.send_completion_request(gen_server, req)
+                        else:
+                            assert isinstance(req, ChatCompletionRequest)
+                            gen_response = await self.send_chat_request(gen_server, req)
+                        return gen_response
                 finally:
                     if gen_server is not None:
                         await self.gen_router.finish_request(req)
-                    
+
             else:
                 # Return a streaming response that combines both context and generation responses
                 return StreamingResponse(
