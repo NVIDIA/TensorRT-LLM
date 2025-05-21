@@ -178,5 +178,9 @@ RUN bash ./triton_backend/inflight_batcher_llm/scripts/build.sh
 FROM release AS tritonrelease
 
 WORKDIR /app/tensorrt_llm
-COPY ./triton_backend/ ./triton_backend/
+COPY ./triton_backend/all_models ./triton_backend/all_models
+COPY ./triton_backend/scripts ./triton_backend/scripts
+COPY ./triton_backend/tools ./triton_backend/tools
+COPY ./triton_backend/inflight_batcher_llm/scripts ./triton_backend/inflight_batcher_llm/scripts
+COPY ./triton_backend/inflight_batcher_llm/client ./triton_backend/inflight_batcher_llm/client
 COPY --from=tritonbuild /opt/tritonserver/backends/tensorrtllm /opt/tritonserver/backends/tensorrtllm
