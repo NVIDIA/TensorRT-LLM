@@ -894,6 +894,11 @@ class PyExecutor:
                 finished_requests = []
 
                 if scheduled_batch.batch_size > 0:
+                    if self.kv_cache_transceiver:
+                        # For generation requests which have completed KV cache transfer
+                        self._prepare_disagg_gen_transmission_complete(
+                            scheduled_batch)
+
                     has_ngram_iter_stats = is_ngram and self.model_engine.spec_config.spec_dec_mode.is_ngram(
                     ) and iter_stats is not None
                     if has_ngram_iter_stats:
@@ -908,11 +913,6 @@ class PyExecutor:
                                                       iter_stats)
                         iter_stats.specdec_stats.iter_latency_ms = (
                             time.time() - before) * 1e3
-
-                    if self.kv_cache_transceiver:
-                        # For generation requests which have completed KV cache transfer
-                        self._prepare_disagg_gen_transmission_complete(
-                            scheduled_batch)
 
                     batch_outputs = self._forward_step(scheduled_batch)
 
@@ -1029,6 +1029,11 @@ class PyExecutor:
                 self._pause_requests(scheduled_batch.paused_requests)
 
                 if scheduled_batch.batch_size > 0:
+                    if self.kv_cache_transceiver:
+                        # For generation requests which have completed KV cache transfer
+                        self._prepare_disagg_gen_transmission_complete(
+                            scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     # The generation requests that are do not have batch_idx,
@@ -1040,11 +1045,6 @@ class PyExecutor:
                         scheduled_batch.generation_requests,
                         key=lambda req: int(req.py_batch_idx is not None),
                     )
-
-                    if self.kv_cache_transceiver:
-                        # For generation requests which have completed KV cache transfer
-                        self._prepare_disagg_gen_transmission_complete(
-                            scheduled_batch)
 
                     previous_tensors_device = self.previous_batch and self.previous_batch.sample_state.device
 
