@@ -45,14 +45,9 @@ class HandleContextLogits:
             num_context_logits = num_context_logits_vec[batch_index]
             draft_length = llm_req.num_draft_tokens if llm_req.is_last_context_chunk() else 0
 
-            print("Is last context chunk: ", llm_req.is_last_context_chunk(), "py_return_context_logits: ", llm_req.py_return_context_logits)
-
             if llm_req.py_return_context_logits:
-                print("py_return_context_logits: ", llm_req.py_return_context_logits)
                 if llm_req.prepopulated_prompt_len > 0:
                     print(f"Warning: Because of KV cache reuse, not all context logits could be produced for request {llm_req.request_id}.")
-                
-                print("logits shape: ", logits.shape)
 
                 context_logits_device_view = logits[logits_index:logits_index + num_context_logits]
                 llm_req.py_result.append_context_logits(context_logits_device_view)
