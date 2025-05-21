@@ -161,3 +161,21 @@ ARG GIT_COMMIT
 ARG TRT_LLM_VER
 ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
     TRT_LLM_VERSION=${TRT_LLM_VER}
+
+FROM wheel AS tritonbuild
+
+WORKDIR /src/tensorrt_llm
+RUN pip install /src/tensorrt_llm/build/tensorrt_llm*.whl
+COPY ./triton_backend/ ./triton_backend/
+RUN bash ./triton_backend/inflight_batcher_llm/scripts/build.sh
+
+
+FROM release AS tritonrelease
+
+WORKDIR /app/tensorrt_llm
+COPY ./triton_backend/all_models ./triton_backend/all_models
+COPY ./triton_backend/scripts ./triton_backend/scripts
+COPY ./triton_backend/tools ./triton_backend/tools
+COPY ./triton_backend/inflight_batcher_llm/scripts ./triton_backend/inflight_batcher_llm/scripts
+COPY ./triton_backend/inflight_batcher_llm/client ./triton_backend/inflight_batcher_llm/client
+COPY --from=tritonbuild /opt/tritonserver/backends/tensorrtllm /opt/tritonserver/backends/tensorrtllm
