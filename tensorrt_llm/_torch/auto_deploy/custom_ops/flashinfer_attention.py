@@ -71,8 +71,7 @@ class _FlashInferPlanner:
 
         self.workspace_buffer = workspace_buffer
         # NOTE (lucaslie): flashinfer fa3 backend has accuracy issue + illegal memory access issues
-        # on H100 PCIe, see https://github.com/NVIDIA/TensorRT-LLM/pull/3686 and
-        # https://github.com/flashinfer-ai/flashinfer/issues/924
+        # on H100 PCIe, see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
         self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             self.workspace_buffer,
             "NHD",

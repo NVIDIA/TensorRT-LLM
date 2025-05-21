@@ -132,6 +132,10 @@ def resize_kv_cache(
         f"Current cache size: {current_cache_size}, Current num pages: {current_num_pages}"
     )
 
+    if free_mem_ratio == 0.0:
+        ad_logger.info(f"Skipping cache resize for {free_mem_ratio=}")
+        return
+
     try:
         # Let's run a forward pass to get the memory usage
         cm.info._set_max_num_tokens_sample()
