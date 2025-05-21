@@ -17,12 +17,11 @@ from transformers import AutoConfig, AutoProcessor
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
+from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import LLM
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.chat_utils import (ConversationMessage,
-                                           apply_chat_template,
-                                           parse_chat_messages_coroutines)
+from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
                                                 CompletionRequest,
@@ -186,6 +185,7 @@ class OpenAIServer:
             conversation, mm_coroutines = parse_chat_messages_coroutines(request.messages, self.model_config)
 
             prompt: str = apply_chat_template(
+                model_type=self.model_config.model_type,
                 tokenizer=self.tokenizer,
                 processor=self.processor,
                 conversation=conversation,

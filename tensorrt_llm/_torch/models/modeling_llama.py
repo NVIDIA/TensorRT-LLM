@@ -918,7 +918,7 @@ class Llama4InputProcessor(InputProcessor):
 
 
 @register_auto_model("Llama4ForConditionalGeneration")
-@register_input_processor(Llama4InputProcessor)
+@register_input_processor(Llama4InputProcessor, model_type="llama4")
 class Llama4ForConditionalGeneration(Llama4ForCausalLM):
 
     @torch.inference_mode()
