@@ -104,6 +104,7 @@ Welcome to TensorRT-LLM's Documentation!
    advanced/inference-request.md
    advanced/lora.md
    advanced/expert-parallelism.md
+   advanced/kv-cache-management.md
    advanced/kv-cache-reuse.md
    advanced/speculative-decoding.md
    advanced/disaggregated-service.md
