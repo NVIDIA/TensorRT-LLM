@@ -142,11 +142,6 @@ class LLaMAConfig(PretrainedConfig):
                 hf_config = Mistral3Config.from_pretrained(
                     hf_config_dir).text_config
                 hf_config.architectures = ["MistralForCausalLM"]
-            if hf_config.model_type == 'llama4':
-                from transformers import Llama4Config
-                hf_config = Llama4Config.from_pretrained(
-                    hf_config_dir).text_config
-                hf_config.architectures = ["Llama4ForConditionalGeneration"]
 
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)

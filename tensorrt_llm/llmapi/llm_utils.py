@@ -426,19 +426,6 @@ class ModelLoader:
                             "weight_block_size"):
                     quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                     quant_config.exclude_modules = ["*eh_proj"]
-                elif hf_quant_config.get(
-                        "quant_method") == "compressed-tensors":
-                    config_groups = hf_quant_config.get("config_groups", {})
-                    if "group_0" in config_groups:
-                        group = config_groups["group_0"]
-                        weights_config = group.get("weights", {})
-                        activations_config = group.get("input_activations", {})
-
-                        if (weights_config.get("strategy") == "channel" and
-                                activations_config.get("strategy") == "token"
-                                and weights_config.get("type") == "float"
-                                and weights_config.get("num_bits") == 8):
-                            quant_config.quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
                 else:
                     raise NotImplementedError(
                         f"Unsupported quantization_config: {hf_quant_config}.")
