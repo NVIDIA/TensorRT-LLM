@@ -93,11 +93,17 @@ class SequenceInfo:
     def __post_init__(self):
         if self.page_size < 1:
             self.page_size = self.max_seq_len
+
+        # NOTE (lucaslie): WAR to address issue when using FlashInfer attention with
+        # (max_batch_size, max_seq_len) input in trtllm runtime.
+        # see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
+        max_seq_len_adjusted = self.max_seq_len + 1
+
         if self.max_num_tokens < 1:
-            self.max_num_tokens = self.max_batch_size * self.max_seq_len
+            self.max_num_tokens = self.max_batch_size * max_seq_len_adjusted
         # if the provided max_num_tokens is less than the max_batch_size * max_seq_len,
         # we use the provided max_num_tokens to calculate the number of pages
-        total_tokens = min(self.max_num_tokens, self.max_batch_size * self.max_seq_len)
+        total_tokens = min(self.max_num_tokens, self.max_batch_size * max_seq_len_adjusted)
         self._num_pages = (total_tokens) // self.page_size + (total_tokens % self.page_size > 0)
         self.input_ids = torch.ones(self.max_batch_size, 1, dtype=torch.int)
         self.position_ids = torch.zeros(self.max_batch_size, 1, dtype=torch.int)
