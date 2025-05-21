@@ -445,10 +445,10 @@ class PyTorchModelEngine(ModelEngine):
             self.previous_kv_lens_offsets_cuda = torch.zeros((batch_size, ),
                                                              dtype=torch.int,
                                                              device='cuda')
-            self.is_mtp = self.spec_config.spec_dec_mode.is_mtp()
+            self.without_logits = self.spec_config.spec_dec_mode.without_logits()
             self.max_draft_len = spec_config.max_draft_tokens
         else:
-            self.is_mtp = False
+            self.without_logits = False
             self.max_draft_len = 0
         self.iter_counter = 0
 
@@ -1086,7 +1086,7 @@ class PyTorchModelEngine(ModelEngine):
         if new_tensors_device is not None:
             # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
             new_tokens_device = new_tensors_device.new_tokens
-            if self.is_mtp:
+            if self.without_logits:
                 assert isinstance(new_tensors_device, SampleStateTensorsMTP)
                 new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
                 next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
@@ -1939,7 +1939,7 @@ class PyTorchModelEngine(ModelEngine):
     def _forward_step(self, inputs: Dict[str, Any],
                       gather_ids: Optional[torch.Tensor]) -> Dict[str, Any]:
         inputs = self._preprocess_inputs(inputs)
-        if self.is_mtp:
+        if self.without_logits:
             outputs = self.model_forward(**inputs)
             return outputs
 

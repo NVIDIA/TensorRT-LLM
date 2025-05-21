@@ -66,7 +66,18 @@ torch::Tensor llama4_fp8_bf16_gemm(torch::Tensor const& inputA, torch::Tensor co
     CHECK_INPUT(inputA, c10::ScalarType::Float8_e4m3fn);
     CHECK_INPUT(inputB, c10::ScalarType::Float8_e4m3fn);
     CHECK_INPUT(scaling_factor, c10::ScalarType::Float);
-    CHECK_OPTIONAL_INPUT(position_ids, c10::ScalarType::Long);
+
+    bool const has_position_ids = position_ids.has_value();
+    if (has_position_ids) {
+        CHECK_TH_CUDA(position_ids.value());
+        CHECK_CONTIGUOUS(position_ids.value());
+        if (position_ids.value().scalar_type() != c10::ScalarType::Long
+            && position_ids.value().scalar_type() != c10::ScalarType::Int) {
+            TORCH_CHECK(false, "position_ids must be a Long or Int tensor.");
+        }
+    }
+
+    bool const position_ids_int64 = has_position_ids && position_ids.value().dtype() == c10::ScalarType::Long;
 
     TORCH_CHECK(inputA.dim() == 2, "inputA must be 2D.");
     TORCH_CHECK(inputB.dim() == 2, "inputB must be 2D.");
@@ -84,8 +95,8 @@ torch::Tensor llama4_fp8_bf16_gemm(torch::Tensor const& inputA, torch::Tensor co
 
     tensorrt_llm::kernels::llama4_min_latency::llama4_fp8_bf16_gemm::llama4_fp8_bf16_gemm_op(inputA.data_ptr(),
         inputB.data_ptr(), output.data_ptr(), scaling_factor.data_ptr(),
-        position_ids.has_value() ? position_ids.value().data_ptr() : nullptr, num_tokens, hidden_in, hidden_out,
-        stream);
+        has_position_ids ? position_ids.value().data_ptr() : nullptr, position_ids_int64, num_tokens, hidden_in,
+        hidden_out, stream);
 
     return output;
 }

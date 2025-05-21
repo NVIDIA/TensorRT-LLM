@@ -297,60 +297,6 @@ class AllReduce(nn.Module):
         return output if len(output) > 1 else output[0]
 
 
-def allreduce_argmax(
-    input: torch.Tensor,
-    all_reduce: AllReduce,
-    padding: int = 0,
-    dim: int = -1,
-    keepdim: bool = False,
-) -> torch.Tensor:
-
-    assert dim == -1 or dim == input.dim(
-    ) - 1, "Only supports allreduce_argmax along last dimension."
-
-    tp_size = all_reduce.mapping.tp_size
-    tp_rank = all_reduce.mapping.tp_rank
-
-    # If TP1, call argmax directly.
-    if tp_size == 1:
-        return torch.argmax(input, dim, keepdim=keepdim)
-
-    # Get per-rank number of elements.
-    per_rank_elements = input.shape[dim]
-
-    # For last rank, we need to remove the padding.
-    if tp_rank == tp_size - 1 and padding > 0:
-        input = input[..., :-padding]
-
-    # First, take argmax locally.
-    local_argmax = torch.argmax(input, dim, keepdim=True)
-    local_max = input.gather(dim=dim, index=local_argmax).float()
-    local_argmax = local_argmax.squeeze(dim)
-    local_max = local_max.squeeze(dim)
-
-    # Create a tensor to store both local argmax and local max, and then use allreduce to communicate across ranks.
-    # To reduce the number of transfers, we pack int32 as float32, hoping that adding 0.0f results in identical result.
-    # Since the vocab size is almost always <2^30, there should be no NaNs or infs that will mess up the argmax.
-    expanded_max = torch.zeros(2,
-                               *local_argmax.shape,
-                               tp_size,
-                               device=input.device,
-                               dtype=torch.float)
-    expanded_max[0, ..., tp_rank] = local_argmax.int().view(dtype=torch.float)
-    expanded_max[1, ..., tp_rank] = local_max
-    expanded_max = all_reduce(expanded_max)
-
-    # Finally, take argmax again to get the global argmax.
-    argmax_rank = torch.argmax(expanded_max[1], dim=-1, keepdim=True)
-    output = expanded_max[0].gather(dim=-1, index=argmax_rank).view(
-        dtype=torch.int32).long() + argmax_rank * per_rank_elements
-
-    if not keepdim:
-        output = output.squeeze(dim)
-
-    return output
-
-
 class MoEAllReduce(nn.Module):
 
     def __init__(self, mapping: Mapping):

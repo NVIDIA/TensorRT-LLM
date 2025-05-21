@@ -297,14 +297,12 @@ class Linear(nn.Module):
             self.register_parameter("bias", None)
         self._weights_created = True
 
-    def apply_linear(
-        self,
-        input,
-        weight,
-        bias,
-        lora_params: Optional[dict] | None = None,
-        layer_idx: Optional[int] | None = None,
-    ) -> torch.Tensor:
+    def apply_linear(self,
+                     input,
+                     weight,
+                     bias,
+                     lora_params: Optional[dict] | None = None,
+                     layer_idx: Optional[int] | None = None):
         if self.has_any_quant:
             qc = self.quant_config
             if self.has_fp8_qdq:
@@ -330,7 +328,6 @@ class Linear(nn.Module):
                     bias=None,
                     out_dtype=self.dtype or input.dtype,
                 )
-
                 if bias is not None:
                     output = output + bias
             elif self.has_fp8_block_scales:
