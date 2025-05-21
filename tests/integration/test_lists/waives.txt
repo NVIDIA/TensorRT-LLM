@@ -390,7 +390,6 @@ examples/test_multimodal.py::test_llm_multimodal_general[VILA1.5-3b-pp:1-tp:1-fl
 examples/test_multimodal.py::test_llm_multimodal_general[neva-22b-pp:1-tp:1-bfloat16-bs:8-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5220761)
 examples/test_multimodal.py::test_llm_multimodal_general[neva-22b-pp:1-tp:1-bfloat16-bs:8-cpp_e2e:True-nb:1] SKIP (https://nvbugs/5220761)
 examples/test_cli_flow.py::TestSantacoder::test_auto_dtype SKIP (https://nvbugs/5219531)
-test_e2e.py::test_trtllm_bench_mgmn SKIP (https://nvbugs/5220766)
 examples/test_medusa.py::test_llama_medusa_1gpu[llama-3.1-8b] SKIP (https://nvbugs/5219535)
 examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-4-mini-instruct-fp8-bfloat16] SKIP (https://nvbugspro.nvidia.com/bug/5226339)
 examples/test_multimodal.py::test_llm_multimodal_general[neva-22b-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:True-nb:1] SKIP (https://nvbugs/5227342)
