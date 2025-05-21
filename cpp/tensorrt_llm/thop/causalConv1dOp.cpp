@@ -182,8 +182,8 @@ void causalConv1dFwd(at::Tensor const& x, at::Tensor const& weight, std::optiona
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char) x.get_device()};
+    // Static cast to signed char (AKA c10::DeviceIndex - the input to CUDAGuard) to avoid compiler warning about narrowing
+    at::cuda::CUDAGuard device_guard{static_cast<signed char>(x.get_device())};
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     DISPATCH_WTYPE_ITYPE_FLOAT_AND_HALF_AND_BF16(x.scalar_type(), "causal_conv1d_fwd",
         [&] { tensorrt_llm::kernels::causal_conv1d::causal_conv1d_fwd_cuda<input_t, weight_t>(params, stream); });
@@ -277,8 +277,8 @@ void causalConv1dUpdate(at::Tensor const& x, at::Tensor const& conv_state, at::T
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char) x.get_device()};
+    // Static cast to signed char (AKA c10::DeviceIndex - the input to CUDAGuard) to avoid compiler warning about narrowing
+    at::cuda::CUDAGuard device_guard{static_cast<signed char>(x.get_device())};
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     DISPATCH_WTYPE_ITYPE_FLOAT_AND_HALF_AND_BF16(x.scalar_type(), "causal_conv1d_update",
         [&] { tensorrt_llm::kernels::causal_conv1d::causal_conv1d_update_cuda<input_t, weight_t>(params, stream); });
