@@ -298,3 +298,5 @@ l0_dgx_h100:
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float16-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:2-pp:2-nb:1-disable_fp8]
   - examples/test_gpt.py::test_llm_gpt2_next_prompt_tuning[use_py_session-tp2]
   - unittest/llmapi/apps/_test_openai_multi_gpu.py -m "part0"
+  - test_e2e.py::test_trtllm_bench_llmapi_launch[pytorch_backend-llama-v3-llama3-8b]
+  - test_e2e.py::test_trtllm_bench_llmapi_launch[trt_backend-llama-v3-llama3-8b]
