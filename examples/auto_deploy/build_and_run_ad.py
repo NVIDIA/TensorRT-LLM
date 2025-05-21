@@ -96,6 +96,7 @@ def main(config: Optional[SimpleConfig] = None):
     llm = build_llm_from_config(config)
 
     # prompt the model and print its output
+    ad_logger.info("Running example prompts...")
     outs = llm.generate(
         config.prompt,
         sampling_params=SamplingParams(
@@ -108,6 +109,7 @@ def main(config: Optional[SimpleConfig] = None):
 
     # run a benchmark for the model with batch_size == config.benchmark_bs
     if config.benchmark:
+        ad_logger.info("Running benchmark...")
         keys = [
             "compile_backend",
             "attn_backend",
