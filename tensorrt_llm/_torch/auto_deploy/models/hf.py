@@ -4,7 +4,7 @@ import json
 import os
 import types
 from contextlib import contextmanager, nullcontext
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
