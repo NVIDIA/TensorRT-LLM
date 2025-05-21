@@ -603,9 +603,9 @@ class TRTLLMSampler(Sampler):
         #       numContextLogits.at(batchIdx) = modelConfig.computeContextLogits() ? contextChunkSize : 1;
         # Revisit this when we support chunked context.
         num_context_logits = [1] * batch_size
-        logits_index = self.algs.handle_context_logits(scheduled_requests.context_requests,
-                                           num_context_logits, logits,
-                                           self.store["decoder_buffers"])
+        logits_index = self.algs.handle_context_logits(
+            scheduled_requests.context_requests, num_context_logits, logits,
+            self.store["decoder_buffers"])
 
         self.algs.handle_generation_logits(
             logits_index, scheduled_requests.generation_requests,
