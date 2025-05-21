@@ -78,22 +78,26 @@ INPUT_PROCESSOR_REGISTRY = InputProcessorRegistry()
 
 
 def register_input_processor(processor_cls: Type[InputProcessor],
-                             model_type: str):
+                             model_type: str,
+                             out_of_tree: bool = False):
     """
     Register an input processor to a model class.
     NOTE:
-        Since this API is only used for multimodal models, we are checking
-        the model type only for that.
-        If this is used for other models in the future, this logic needs to be
-        updated e.g. adding another version of this API without the model_type.
+        1. Since this API is only used for multimodal models, we are checking
+           the model type only for that.
+        2. If this is used for other models in the future, this logic needs to be
+           updated e.g. adding another version of this API without the model_type.
+        3. If the model is not in the tree, user needs to set out_of_tree to True
+           to bypass the model type check and provide their own input preparation.
     """
 
     def wrapper(model_cls: N) -> N:
         INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type[
             model_cls] = processor_cls
-        assert model_type in ALL_SUPPORTED_MULTIMODAL_MODELS, \
-            f"Model type {model_type} not in {ALL_SUPPORTED_MULTIMODAL_MODELS}.\n" \
-            "Please see the inputs/utils.py file for more information."
+        if not out_of_tree:
+            assert model_type in ALL_SUPPORTED_MULTIMODAL_MODELS, \
+                f"Model type {model_type} not in {ALL_SUPPORTED_MULTIMODAL_MODELS}.\n" \
+                "Please see the inputs/utils.py file for more information."
 
         return model_cls
 
