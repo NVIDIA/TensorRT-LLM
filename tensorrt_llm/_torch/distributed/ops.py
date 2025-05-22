@@ -120,8 +120,10 @@ def allgather(
         if isinstance(input, torch.Tensor):
             assert input.shape[dim] == sizes[mapping.tp_rank]
         else:
-            assert all(
-                [val.shape[dim] == sizes[mapping.tp_rank] for val in input])
+            assert all([
+                val.shape[dim] == sizes[mapping.tp_rank] for val in input
+                if val is not None
+            ])
         # 'sizes' is not needed if all inputs in the same TP group have the same shape
         for split_size in sizes[1:]:
             if split_size != sizes[0]:
@@ -187,7 +189,10 @@ def reducescatter(
         if isinstance(input, torch.Tensor):
             assert input.shape[dim] == sum_split_size
         else:
-            assert all([val.shape[dim] == sum_split_size for val in input])
+            assert all([
+                val.shape[dim] == sum_split_size for val in input
+                if val is not None
+            ])
         # 'sizes' is not needed if all outputs in the same TP group have the same shape
         for split_size in sizes[1:]:
             if split_size != sizes[0]:
