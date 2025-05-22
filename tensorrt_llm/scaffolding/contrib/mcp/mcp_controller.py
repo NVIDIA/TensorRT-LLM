@@ -1,6 +1,6 @@
 import copy
 from enum import Enum
-from typing import Any, List
+from typing import List
 
 from tensorrt_llm.scaffolding import Controller, Task
 
@@ -69,10 +69,7 @@ class MCPController(Controller):
         yield mcp_call_tasks
         mcp_result = mcp_call_tasks[0].output_str
         print(f"\nmcp_result is {mcp_result}\n")
-        messages.append({
-            "role": "assistant",
-            "content": chattask.output_str
-        })
+        messages.append({"role": "assistant", "content": chattask.output_str})
         finalchattask = ChatTask.create_from_prompt(messages, mcp_result,
                                                     available_tools)
         finalchattask.worker_tag = self.WorkerTag.GENERATION

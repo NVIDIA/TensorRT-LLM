@@ -1,16 +1,11 @@
+import asyncio
 import json
+from typing import List
 
 from tensorrt_llm.scaffolding import TaskStatus, Worker
 
 from .mcp_task import MCPCallTask, MCPListTask
 from .mcp_utils import MCPClient
-<<<<<<< HEAD
-
-=======
-import json
-import asyncio
-from typing import List
->>>>>>> 70a51136 (support sandbox, websearch)
 
 class MCPWorker(Worker):
 
@@ -30,15 +25,6 @@ class MCPWorker(Worker):
         return cls(clients)
 
     async def call_handler(self, task: MCPCallTask) -> TaskStatus:
-<<<<<<< HEAD
-        tool_name = task.tool_name
-        args = json.loads(task.args)
-        response = await self.mcp_client.call_tool(tool_name, args)
-        print(f"mcp call tool response {response}")
-        task.output_str = response.content[0].text
-        return TaskStatus.SUCCESS
-
-=======
         for mcp_client in self.mcp_clients:
             response = await mcp_client.list_tools()
             for tool in response.tools:
@@ -50,8 +36,7 @@ class MCPWorker(Worker):
                 response = await mcp_client.call_tool(tool_name, args)
                 task.output_str = response.content[0].text
                 return TaskStatus.SUCCESS
-    
->>>>>>> 70a51136 (support sandbox, websearch)
+            
     async def list_handler(self, task: MCPListTask) -> TaskStatus:
         result_tools = []
         for mcp_client in self.mcp_clients:

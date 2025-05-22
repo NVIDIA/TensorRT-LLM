@@ -1,10 +1,6 @@
 import asyncio
 from contextlib import AsyncExitStack
-<<<<<<< HEAD
 from typing import Optional
-=======
-from typing import Any, Optional
->>>>>>> 70a51136 (support sandbox, websearch)
 
 from dotenv import load_dotenv
 from mcp import ClientSession
@@ -34,22 +30,12 @@ class MCPClient:
         streams = await self.exit_stack.enter_async_context(streams_context)
 
         session_context = ClientSession(*streams)
-        self.session = await self.exit_stack.enter_async_context(session_context)
+        self.session = await self.exit_stack.enter_async_context(session_context
+                                                                 )
 
         # Initialize session
         await self.session.initialize()
 
-<<<<<<< HEAD
-        # List available tools to verify connection
-        print("Initialized SSE client...")
-        print("Listing tools...")
-        response = await self.list_tools()
-        tools = response.tools
-        print("\nConnected to server with tools:",
-              [tool.name for tool in tools])
-
-=======
->>>>>>> 70a51136 (support sandbox, websearch)
     async def cleanup(self):
         """Properly clean up all registered async resources."""
         await self.exit_stack.aclose()

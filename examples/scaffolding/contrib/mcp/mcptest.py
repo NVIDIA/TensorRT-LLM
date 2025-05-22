@@ -1,7 +1,5 @@
 import argparse
 import asyncio
-import os
-from typing import Any
 
 from openai import AsyncOpenAI
 
@@ -42,10 +40,10 @@ async def main():
         'What was the score of the NBA playoffs game 7 between the Thunder and the Nuggets in 2025?'
     ]
     API_KEY = args.API_KEY
-    urls = ["http://0.0.0.0:8080/sse",
-            "http://0.0.0.0:8081/sse",
-            "http://0.0.0.0:8082/sse"
-            ]
+    urls = [
+        "http://0.0.0.0:8080/sse", "http://0.0.0.0:8081/sse",
+        "http://0.0.0.0:8082/sse"
+    ]
     print(f"API_KEY {API_KEY}")
     client = AsyncOpenAI(api_key=API_KEY, base_url=args.base_url)
     qwen_worker = OpenaiWorker(client, args.model)

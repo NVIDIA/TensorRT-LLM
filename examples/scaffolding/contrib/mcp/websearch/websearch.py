@@ -1,15 +1,14 @@
-from typing import Any
-from starlette.applications import Starlette
-from mcp.server.sse import SseServerTransport
-from starlette.requests import Request
-from starlette.routing import Mount, Route
+import os
+
 import uvicorn
+from brave import Brave
+from dotenv import load_dotenv
 from mcp.server import Server
 from mcp.server.fastmcp import FastMCP
-
-from dotenv import load_dotenv
-import os
-from brave import Brave
+from mcp.server.sse import SseServerTransport
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.routing import Mount, Route
 
 # Initialize FastMCP server for Weather tools (SSE)
 mcp = FastMCP("websearch")
@@ -17,20 +16,23 @@ mcp = FastMCP("websearch")
 # Load environment variables
 load_dotenv()
 
+
 @mcp.tool()
 async def websearch(query: str) -> str:
     """Web search, fetch information from the internet
     Args:
-        query:  string of what you want to search 
+        query:  string of what you want to search
     """
     BRAVE_API_KEY = os.getenv("BRAVE_API_KEY")
     brave = Brave(BRAVE_API_KEY)
     print(f"brave apikey {BRAVE_API_KEY }")
-    num_results = 10
     search_results = brave.search(q=query, raw=True)
     return f"{search_results}"
 
-def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlette:
+
+def create_starlette_app(mcp_server: Server,
+                         *,
+                         debug: bool = False) -> Starlette:
     """Create a Starlette application that can server the provied mcp server with SSE."""
     sse = SseServerTransport("/messages/")
 
@@ -59,10 +61,13 @@ if __name__ == "__main__":
     mcp_server = mcp._mcp_server  # noqa: WPS437
 
     import argparse
-    
+
     parser = argparse.ArgumentParser(description='Run MCP SSE-based server')
     parser.add_argument('--host', default='0.0.0.0', help='Host to bind to')
-    parser.add_argument('--port', type=int, default=8082, help='Port to listen on')
+    parser.add_argument('--port',
+                        type=int,
+                        default=8082,
+                        help='Port to listen on')
     args = parser.parse_args()
 
     # Bind SSE request handling to MCP server

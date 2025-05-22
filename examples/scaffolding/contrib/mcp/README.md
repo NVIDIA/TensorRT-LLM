@@ -2,9 +2,9 @@
 
 ## Step1: Run Servers
 
-### Terminal1: 
+### Terminal1:
 
-`cd weather` 
+`cd weather`
 
 `pip install uv`
 

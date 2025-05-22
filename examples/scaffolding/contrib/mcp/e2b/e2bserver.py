@@ -1,19 +1,15 @@
-
 import logging
-from typing import Any
-from starlette.applications import Starlette
-from mcp.server.sse import SseServerTransport
-from starlette.requests import Request
-from starlette.routing import Mount, Route
+
 import uvicorn
+from dotenv import load_dotenv
+from e2b_code_interpreter import Sandbox
 from mcp.server import Server
 from mcp.server.fastmcp import FastMCP
-
-from dotenv import load_dotenv
-
-
-from pydantic import BaseModel, ValidationError
-from e2b_code_interpreter import Sandbox
+from mcp.server.sse import SseServerTransport
+from pydantic import BaseModel
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.routing import Mount, Route
 
 # Initialize FastMCP server for Weather tools (SSE)
 mcp = FastMCP("sandbox")
@@ -23,6 +19,7 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("e2b-mcp-server")
+
 
 # Tool schema
 class ToolSchema(BaseModel):
@@ -48,7 +45,10 @@ async def run_code(code: str) -> str:
 
     return f"{result}"
 
-def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlette:
+
+def create_starlette_app(mcp_server: Server,
+                         *,
+                         debug: bool = False) -> Starlette:
     """Create a Starlette application that can server the provied mcp server with SSE."""
     sse = SseServerTransport("/messages/")
 
@@ -77,10 +77,13 @@ if __name__ == "__main__":
     mcp_server = mcp._mcp_server  # noqa: WPS437
 
     import argparse
-    
+
     parser = argparse.ArgumentParser(description='Run MCP SSE-based server')
     parser.add_argument('--host', default='0.0.0.0', help='Host to bind to')
-    parser.add_argument('--port', type=int, default=8081, help='Port to listen on')
+    parser.add_argument('--port',
+                        type=int,
+                        default=8081,
+                        help='Port to listen on')
     args = parser.parse_args()
 
     # Bind SSE request handling to MCP server

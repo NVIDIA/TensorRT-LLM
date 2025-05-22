@@ -68,6 +68,7 @@ class GenerationTask(Task):
         output.output_str = self.output_str
         return output
 
+
 @dataclass
 class RewardTask(Task):
     # input field
