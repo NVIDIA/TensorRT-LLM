@@ -540,24 +540,26 @@ class PyTorchModelEngine(ModelEngine):
 
             available_blocks = kv_cache_manager.get_num_free_blocks()
 
-            # We create multiple requests with the possible maximum sequence length
-            # which should be num_tokens_per_request computed with the constraints.
-            request_num_pre = self.max_num_tokens // num_tokens_per_request
-            request_len_remainder = self.max_num_tokens % num_tokens_per_request
+            # Calculate number of full-length requests and remaining tokens
+            # Each request has num_tokens_per_request tokens, except possibly the last one
+            full_len_request_num = self.max_num_tokens // num_tokens_per_request
+            remaining_tokens = self.max_num_tokens % num_tokens_per_request
 
-            if request_num_pre + 1 > available_blocks:
+            request_num = full_len_request_num if remaining_tokens == 0 else full_len_request_num + 1
+
+            if request_num > available_blocks:
                 return None, None
 
             requests = kv_cache_manager.add_dummy_requests(
-                request_ids=list(range(request_num_pre)),
-                token_nums=[num_tokens_per_request] * request_num_pre,
+                request_ids=list(range(full_len_request_num)),
+                token_nums=[num_tokens_per_request] * full_len_request_num,
                 is_gen=False,
                 max_num_draft_tokens=self.max_draft_len)
 
-            if request_len_remainder > 0:
+            if remaining_tokens > 0:
                 final_request = kv_cache_manager.add_dummy_requests(
-                    request_ids=[request_num_pre],
-                    token_nums=[request_len_remainder],
+                    request_ids=[full_len_request_num],
+                    token_nums=[remaining_tokens],
                     is_gen=False,
                     max_num_draft_tokens=self.max_draft_len)
 
@@ -565,7 +567,7 @@ class PyTorchModelEngine(ModelEngine):
 
             if spec_resource_manager is not None:
                 spec_resource_manager.add_dummy_requests(
-                    request_ids=list(range(request_num_pre + 1)))
+                    request_ids=list(range(request_num)))
 
             result = ScheduledRequests()
             result.context_requests = requests
