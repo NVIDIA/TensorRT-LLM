@@ -705,6 +705,7 @@ def worker_main(
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())
+        print_colored_debug(f"error: {traceback.format_exc()}", "red")
         if is_leader:
             request_error_queue.put(e)
         return
