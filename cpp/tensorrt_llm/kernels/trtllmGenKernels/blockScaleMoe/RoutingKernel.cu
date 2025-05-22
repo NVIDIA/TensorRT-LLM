@@ -2961,6 +2961,7 @@ __device__ TypeElt calcSoftmax(
 }
 
 template <typename KernelParams, bool IsOriFlow = false>
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(NumThreads)
     routingIndicesClusterKernel(KernelParams params)
 {
@@ -3244,6 +3245,12 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
         }
     }
 }
+#else
+__global__ void __launch_bounds__(NumThreads) routingIndicesClusterKernel(KernelParams /* params */)
+{
+    assert(false && "routingIndicesClusterKernel is only supported on SM90+ architectures");
+}
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -3271,8 +3278,10 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
     // Wait on primary grid and trigger secondary kernel.
     if constexpr (KernelParams::UsePdl)
     {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaGridDependencySynchronize();
         cudaTriggerProgrammaticLaunchCompletion();
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     }
     // in this case, each warp represents a token, and we use a grid-stride loop
     // over all warps/tokens
@@ -3369,8 +3378,10 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramKernel(
     // Wait on primary grid and trigger secondary kernel.
     if constexpr (KernelParams::UsePdl)
     {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaGridDependencySynchronize();
         cudaTriggerProgrammaticLaunchCompletion();
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     }
 
     uint32_t const expandedIdxSize = params.mNumTokens * NumTopExperts;
@@ -3462,7 +3473,9 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
     // Wait on primary grid.
     if constexpr (KernelParams::UsePdl)
     {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaGridDependencySynchronize();
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     }
 
     // The expert offsets are common to all tiles of all blocks.
@@ -3685,7 +3698,9 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
 #if !defined(FDL_PROFILE) || FDL_PROFILE == 0
     if constexpr (KernelParams::UsePdl)
     {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaTriggerProgrammaticLaunchCompletion();
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     }
 #endif
 }
