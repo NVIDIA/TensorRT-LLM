@@ -80,6 +80,15 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
     uint32_t input_offset = buffer_flags[0] * buffer_size;
     uint32_t clear_offset = buffer_flags[1] * buffer_size;
 
+    if (wait_for_results)
+    {
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+            atomicAdd(offset_access_ptr, 1);
+        }
+    }
+
     if (elt < token_dim)
     {
         // Scatter token
