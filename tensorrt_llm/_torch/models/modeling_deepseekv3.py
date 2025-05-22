@@ -613,7 +613,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
         self.layer_idx = layer_idx
-        self.allreduce = AllReduce(self.mapping)
+        self.allreduce = AllReduce(self.mapping, dtype=config.torch_dtype)
         self.moe_allreduce = MoEAllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
 
@@ -651,7 +651,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
     def _enable_min_latency_mode(self, num_tokens: int):
         return (num_tokens <= 128 and self.fusion_config.POST_MOE_FUSION
                 and self.is_nvfp4 and self.model_config.moe_backend == 'CUTLASS'
-                and not self.mapping.is_multi_node())
+                and not self.mapping.is_multi_node()
+                and self.allreduce.mnnvl_allreduce is None)
 
     def forward(
         self,
@@ -664,14 +665,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-
         # Self Attention
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
-                enable_allreduce=not self.disable_attn_allreduce),
+                enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
 
@@ -793,10 +793,12 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     norm_weight=self.post_attention_layernorm.weight,
                     scale=self.mlp.gate_up_proj.input_scale,
                     eps=self.post_attention_layernorm.variance_epsilon,
-                ))
+                ),
+            )
             hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
         else:
             # No fusion
+            # We need to add twoshot allreduce here to avoid modifying MLA logic
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
@@ -814,7 +816,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     residual=residual,
                     norm_weight=self.next_layer_layernorm.weight,
                     eps=self.next_layer_layernorm.variance_epsilon,
-                ))
+                ),
+            )
         else:
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
@@ -867,7 +870,6 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        # deepseek allreduce kernel is better when m < 512
         inputs_embeds = self.enorm(embed_tokens(input_ids))
         hidden_states = self.hnorm(hidden_states)
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
@@ -883,7 +885,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
-                enable_allreduce=not self.disable_attn_allreduce),
+                enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
 
@@ -896,7 +898,8 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                     residual=residual,
                     norm_weight=self.post_attention_layernorm.weight,
                     eps=self.post_attention_layernorm.variance_epsilon,
-                ))
+                ),
+            )
         else:
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
@@ -918,7 +921,8 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                     residual=residual,
                     norm_weight=self.shared_head.norm.weight,
                     eps=self.shared_head.norm.variance_epsilon,
-                ))
+                ),
+            )
         else:
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
 
