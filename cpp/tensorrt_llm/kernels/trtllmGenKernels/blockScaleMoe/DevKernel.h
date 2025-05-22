@@ -176,7 +176,7 @@ namespace moe::dev
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-        TLLM_LOG_ERROR("Unsupported dtypeExpW: ", tg::dtypeToString(data.mDtypeExpW));                                 \
+        TLLM_LOG_ERROR("Unsupported dtypeExpW: ");                                                                     \
     }
 
 #define LAUNCH_EXPW_ONLY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream)                            \
