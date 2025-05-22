@@ -37,10 +37,10 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_mtp()
 
     def support_overlap_scheduler(self):
-        return self.is_mtp()
+        return self.is_mtp() or self.is_ngram()
 
     def has_spec_decoder(self):
-        return self.is_mtp() or self.is_eagle3()
+        return self.is_mtp() or self.is_eagle3() or self.is_ngram()
 
     def extend_ctx(self, attention_backend: AttentionBackend):
         """
