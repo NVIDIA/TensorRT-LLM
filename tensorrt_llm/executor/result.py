@@ -179,9 +179,10 @@ class GenerationResultBase:
         # Skip output the first generated token in generation response
         # TODO: We should have a better way to handle this when enable
         # beam search with PD.
-        if not self.sampling_params.use_beam_search and \
-            len(response_tensors.output_token_ids[src_idx]) == 2:
-            output._last_token_ids_len = 1
+        # Remove, breaks specdec
+        # if not self.sampling_params.use_beam_search and \
+        #     len(response_tensors.output_token_ids[src_idx]) == 2:
+        #     output._last_token_ids_len = 1
 
         if response_tensors.cum_log_probs is not None:
             output.cumulative_logprob = response_tensors.cum_log_probs[src_idx]
