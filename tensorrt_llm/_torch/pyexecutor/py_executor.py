@@ -656,7 +656,7 @@ class PyExecutor:
 
     def _need_return_logits(self, scheduled_requests: ScheduledRequests):
         for req in scheduled_requests.context_requests:
-            if req.py_return_generation_logits:
+            if req.py_return_context_logits:
                 return True
         for req in scheduled_requests.generation_requests:
             if req.py_return_generation_logits:
