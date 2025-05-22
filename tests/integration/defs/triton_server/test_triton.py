@@ -487,8 +487,7 @@ def test_triton_extensive(tritonserver_test_root, test_name, llm_root):
     backend_path = os.path.join(llm_root, "triton_backend")
     run_shell_command(
         f"cd {backend_path}/ci/L0_backend_trtllm && "
-        f"PYTHONPATH={backend_path}:$PYTHONPATH BACKEND_ROOT={backend_path} bash -ex test.sh",
-        llm_root)
+        f"BACKEND_ROOT={backend_path} bash -ex test.sh", llm_root)
 
 
 @pytest.mark.parametrize("test_name", ["llmapi-unit-tests"], indirect=True)

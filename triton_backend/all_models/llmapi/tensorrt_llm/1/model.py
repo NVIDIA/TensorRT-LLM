@@ -35,7 +35,6 @@ from contextlib import asynccontextmanager
 import numpy as np
 import triton_python_backend_utils as pb_utils
 import yaml
-# PYTHONPATH needs to include the root directory of all_models to import all_models.helper.helpers properly
 from helpers import (get_input_tensor_by_name, get_output_config_from_request,
                      get_sampling_params_from_request,
                      get_streaming_from_request)
