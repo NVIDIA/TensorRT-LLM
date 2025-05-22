@@ -1119,7 +1119,7 @@ class PyTorchModelEngine(ModelEngine):
                 num_draft_tokens = len(request.py_draft_tokens)
                 past_seen_token_num = request.max_beam_num_tokens - 1
                 draft_lens.append(num_draft_tokens)
-                prompt_lengths.append(1 + num_draft_tokens)
+                prompt_lengths.append(request.py_prompt_len)
                 sequence_lengths.append(1 + num_draft_tokens)
                 gather_ids.extend(
                     list(
