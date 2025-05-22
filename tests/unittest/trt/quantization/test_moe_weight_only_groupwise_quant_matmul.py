@@ -182,14 +182,10 @@ class TestMoEWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                              k,
                              dtype=activation_dtype,
                              device="cuda") * 0.01
-        alpha_1 = torch.randn(num_experts,
-                              1,
-                              dtype=torch.float32,
-                              device="cuda") * 0.1
-        alpha_2 = torch.randn(num_experts,
-                              1,
-                              dtype=torch.float32,
-                              device="cuda") * 0.1
+        alpha_1 = torch.randn(
+            num_experts, 1, dtype=torch.float32, device="cuda") * 0.1
+        alpha_2 = torch.randn(
+            num_experts, 1, dtype=torch.float32, device="cuda") * 0.1
 
         preprocessor = tensorrt_llm.quantization.functional.preprocess_weights_for_mixed_gemm
         unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
