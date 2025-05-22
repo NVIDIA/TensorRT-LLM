@@ -421,6 +421,7 @@ def attention(
     mrope_position_deltas: Optional[torch.Tensor],
     mla_context_paged_kv: Optional[torch.Tensor],
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
+    attention_chunk_size: Optional[int],
 ) -> torch.Tensor:
     num_tokens = q.size(0)
     attention_input_type = (AttentionInputType(attention_input_type)
@@ -450,7 +451,8 @@ def attention(
         use_paged_context_fmha, attention_input_type, is_mla_enable,
         q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim,
         v_head_dim, mrope_rotary_cos_sin, mrope_position_deltas,
-        mla_context_paged_kv, mla_context_kv_cache_block_offsets)
+        mla_context_paged_kv, mla_context_kv_cache_block_offsets,
+        attention_chunk_size)
     return output
 
 
@@ -516,6 +518,7 @@ def _(
     mrope_position_deltas: Optional[torch.Tensor],
     mla_context_paged_kv: Optional[torch.Tensor],
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
+    attention_chunk_size: Optional[int],
 ) -> torch.Tensor:
     num_tokens = q.size(0)
     attention_input_type = (AttentionInputType(attention_input_type)

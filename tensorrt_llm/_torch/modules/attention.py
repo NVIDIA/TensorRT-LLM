@@ -49,6 +49,7 @@ class Attention(nn.Module):
         config: Optional[ModelConfig] = None,
         qk_norm_type: QkNormType = QkNormType.none,
         q_scaling: float = 1.0,
+        attention_chunk_size: Optional[int] = None,
     ):
         """
         Initialize the Attention module.
@@ -66,6 +67,7 @@ class Attention(nn.Module):
             config (ModelConfig): The model configuration.
             qk_norm_type (QkNormType): The type of QK normalization.
             q_scaling (float): The scaling factor for the qk_scale. The definition is $O = softmax(QK^T * qk_scale) * V, qk_scale = 1 / (sqrt(head_dim) * q_scaling)$. The default value is 1.0.
+            attention_chunk_size (int): See [Chunked Attention] below.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -82,6 +84,22 @@ class Attention(nn.Module):
         self.qk_norm_type = qk_norm_type
         self.dense_bias = dense_bias
         self.q_scaling = q_scaling
+
+        # [Chunked Attention]
+        # Chunked attention is applied to context requests only. Chunked attention will be
+        # applied when this field is specified and mMaskType == CAUSAL.
+        #
+        # In chunked attention, we break context requests into chunks of a specified size. Tokens can only
+        # attend to tokens in the same chunk. So, for example, if the chunk size is 3, we might have a mask
+        # that looks like this:
+        #
+        # 1 0 0 0 0 0
+        # 1 1 0 0 0 0
+        # 1 1 1 0 0 0
+        # 0 0 0 1 0 0
+        # 0 0 0 1 1 0
+        # 0 0 0 1 1 1
+        self.attention_chunk_size = attention_chunk_size
 
         if dense_bias is None:
             self.dense_bias = bias
@@ -165,6 +183,7 @@ class Attention(nn.Module):
             quant_config=self.quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             q_scaling=self.q_scaling,
+            attention_chunk_size=self.attention_chunk_size,
         )
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
