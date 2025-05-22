@@ -154,15 +154,11 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         //
         // Config
         //
-        // (mDtypeElt=bf16, mDtypeExpW=bf16): OK
-        // (mDtypeElt=bf16, mDtypeExpW=fp32): OK
-        // (mDtypeElt=fp32, mDtypeExpW=fp32): Crash but considered lower prio
-        //
 
         routingData.mDtypeExpW = tg::Dtype::Bfloat16;
         // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
         routingData.mUsePdl = true;
-        routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::Renormalize ? true : false;
+        routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::Qwen3;
         routingData.mNormTopkProb = routingMethodType == RoutingMethodType::Renormalize;
         routingData.mPtrScores = routingLogits;
 
@@ -194,7 +190,6 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mLocalExpertsStrideLog2 = 0;
         routingData.mNumLocalExperts = localNumExperts;
 
-        // TODO: expose Qwen3 routing flow "RoutingMethodType::Qwen3" in routingQwen3::run()
         moe::dev::routingQwen3::run(routingData, stream);
     }
     else

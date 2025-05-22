@@ -265,12 +265,11 @@ class LoadBalancedMoeRoutingMethod(BaseMoeRoutingMethod):
         return balanced_indices, balanced_values
 
 
-class Qwen3MoeRoutingMethod(RenormalizeMoeRoutingMethod):
+class Qwen3MoeRoutingMethod(BaseMoeRoutingMethod):
 
     def __init__(self, top_k: int):
         super().__init__()
         self.top_k = top_k
-        self.routing_method_type = RoutingMethodType.Qwen3
 
     def apply(self,
               router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
@@ -283,6 +282,10 @@ class Qwen3MoeRoutingMethod(RenormalizeMoeRoutingMethod):
                                                dim=-1)
         topk_values /= topk_values.sum(dim=-1, keepdim=True)
         return topk_indices.to(torch.int32), topk_values
+
+    @property
+    def routing_method_type(self) -> RoutingMethodType:
+        return RoutingMethodType.Qwen3
 
 
 class MoEWeightLoadingMode(Enum):

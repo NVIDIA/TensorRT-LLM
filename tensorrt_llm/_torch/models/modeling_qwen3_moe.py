@@ -11,7 +11,9 @@ from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import FusedMoE, RenormalizeMoeRoutingMethod
+from ..modules.fused_moe import (BaseMoeRoutingMethod, FusedMoE,
+                                 Qwen3MoeRoutingMethod,
+                                 RenormalizeMoeRoutingMethod, RoutingMethodType)
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from .modeling_qwen3 import Qwen3Attention
@@ -29,6 +31,7 @@ class Qwen3Gate(nn.Module):
         top_k: int,
         dtype: Optional[torch.dtype] = None,
         apply_routing: bool = False,
+        routing_method_type: RoutingMethodType = RoutingMethodType.Renormalize,
         moe_backend: str = "CUTLASS",
     ):
         super().__init__()
@@ -36,6 +39,7 @@ class Qwen3Gate(nn.Module):
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
                                                dtype=dtype),
                                    requires_grad=False)
+        self.routing_method_type = routing_method_type
         # FIXME: out_dtype=float32 does not work
         # self.out_dtype = torch.float32 if moe_backend == "TRTLLM" else dtype
         self.out_dtype = dtype
@@ -53,9 +57,14 @@ class Qwen3Gate(nn.Module):
         self.weight.copy_(weights[0]["weight"][:])
 
     @property
-    def routing_method(self):
-        # TODO: allow switching between Qwen3 routing method and fast Renormalize routing method
-        return RenormalizeMoeRoutingMethod(top_k=self.top_k)
+    def routing_method(self) -> BaseMoeRoutingMethod:
+        if self.routing_method_type == RoutingMethodType.Qwen3:
+            return Qwen3MoeRoutingMethod(top_k=self.top_k)
+        elif self.routing_method_type == RoutingMethodType.Renormalize:
+            return RenormalizeMoeRoutingMethod(top_k=self.top_k)
+        else:
+            raise ValueError(
+                f"Unsupported routing method: {self.routing_method_type}")
 
 
 class Qwen3MoE(nn.Module):
@@ -84,6 +93,7 @@ class Qwen3MoE(nn.Module):
             top_k=self.top_k,
             dtype=config.torch_dtype,
             apply_routing=False,
+            routing_method_type=RoutingMethodType.Renormalize,
             moe_backend=model_config.moe_backend,
         )
 
