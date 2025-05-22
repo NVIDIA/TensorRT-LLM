@@ -2,7 +2,22 @@ import argparse
 import os
 import subprocess
 
-kVALID_TEST_LIST_MARKERS = ["XFAIL", "SKIP", "UNSTABLE"]
+kVALID_TEST_LIST_MARKERS = ["SKIP"]
+"""
+This script is used to verify test lists for L0, QA, and waives file.
+
+Usage:
+When in a development or container environment, run the following command:
+    python $LLM_ROOT/scripts/check_test_list.py --l0 --qa --waive
+
+Options:
+--l0:    Check only the L0 tests located in $LLM_ROOT/tests/integration/test_list/test_db/*.yml.
+--qa:    Check only the QA tests under $LLM_ROOT/tests/integration/test_list/*.txt.
+--waive: Check only the tests in $LLM_ROOT/tests/integration/test_list/waives.txt.
+
+Note:
+All the perf tests will be excluded since they are generated dynamically.
+"""
 
 
 def install_python_dependencies(llm_src):
