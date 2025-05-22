@@ -1,4 +1,5 @@
 #include "fusedQKNormRopeKernel.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/mathUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include <cmath>
@@ -6,6 +7,31 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+
+namespace tensorrt_llm::common
+{
+// Specialization for packed_as used in this kernel.
+template <>
+struct packed_as<uint, 1>
+{
+    using type = uint;
+};
+
+template <>
+struct packed_as<uint, 2>
+{
+    using type = uint2;
+};
+
+template <>
+struct packed_as<uint, 4>
+{
+    using type = uint4;
+};
+} // namespace tensorrt_llm::common
+
+namespace tensorrt_llm::kernels
+{
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -57,12 +83,16 @@ __global__ void fusedQKNormRopeKernel(
     int const headIdx = isQ ? localHeadIdx : localHeadIdx - num_heads_q;
 
     int const num_heads = num_heads_q + num_heads_k + num_heads_v;
+
     static_assert(head_dim % (32 * 2) == 0,
         "head_dim must be divisible by 64 (each warp processes one head, and each thread gets even number of "
         "elements)");
     constexpr int numElemsPerThread = head_dim / 32;
-    constexpr int numVecPerThread = numElemsPerThread / 4;
     float elements[numElemsPerThread];
+    constexpr int elemSizeBytes = numElemsPerThread * sizeof(__nv_bfloat16);
+    static_assert(elemSizeBytes % 4 == 0, "numSizeBytes must be a multiple of 4");
+    constexpr int vecSize = elemSizeBytes / 4; // Use packed_as<uint, vecSize> to perform loading/saving.
+    using vec_T = typename tensorrt_llm::common::packed_as<uint, vecSize>::type;
 
     int offsetWarp; // Offset for the warp
     if (isQ)
@@ -80,35 +110,18 @@ __global__ void fusedQKNormRopeKernel(
     // Sum of squares for RMSNorm
     float sumOfSquares = 0.0f;
 
-    // Load elements and compute sum of squares
-    int i = 0;
-
-    // Load vectorized elements
-    for (; i < numVecPerThread * 4; i += 4)
+    // Load.
     {
-        uint2 data;
-        data = *reinterpret_cast<uint2 const*>(&qkv[offsetThread + i]);
+        vec_T vec = *reinterpret_cast<vec_T const*>(&qkv[offsetThread]);
+        for (int i = 0; i < vecSize; i++)
+        {
+            float2 vals = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<uint*>(&vec) + i));
+            sumOfSquares += vals.x * vals.x;
+            sumOfSquares += vals.y * vals.y;
 
-        // Convert bfloat16 to float
-        auto vals0 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162 const&>(data.x));
-        auto vals1 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162 const&>(data.y));
-
-        // Store and compute sum of squares
-        elements[i] = vals0.x;
-        elements[i + 1] = vals0.y;
-        elements[i + 2] = vals1.x;
-        elements[i + 3] = vals1.y;
-
-        sumOfSquares += elements[i] * elements[i];
-        sumOfSquares += elements[i + 1] * elements[i + 1];
-        sumOfSquares += elements[i + 2] * elements[i + 2];
-        sumOfSquares += elements[i + 3] * elements[i + 3];
-    }
-    // Load remaining elements
-    for (; i < numElemsPerThread; i++)
-    {
-        elements[i] = __bfloat162float(qkv[offsetThread + i]);
-        sumOfSquares += elements[i] * elements[i];
+            elements[2 * i] = vals.x;
+            elements[2 * i + 1] = vals.y;
+        }
     }
 
     // Reduce sum across warp using the utility function
@@ -118,7 +131,7 @@ __global__ void fusedQKNormRopeKernel(
     float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
 
     // Normalize elements
-    for (i = 0; i < numElemsPerThread; i++)
+    for (int i = 0; i < numElemsPerThread; i++)
     {
         elements[i] *= rms_rcp;
     }
@@ -126,7 +139,7 @@ __global__ void fusedQKNormRopeKernel(
     // Apply RoPE to normalized elements
     int pos_id = position_ids[tokenIdx];
 
-    for (i = 0; i < numElemsPerThread; i += 2)
+    for (int i = 0; i < numElemsPerThread; i += 2)
     {
         // Calculate the actual dimension index in the head
         int dim_idx = laneId * numElemsPerThread + i;
@@ -143,33 +156,18 @@ __global__ void fusedQKNormRopeKernel(
         applyRoPE(elements[i], elements[i + 1], cosTheta, sinTheta);
     }
 
-    // Store vectorized elements
-    for (i = 0; i < numVecPerThread * 4; i += 4)
+    // Store.
     {
-        // Convert back to bfloat16 format
-        __nv_bfloat162 vals0 = __float22bfloat162_rn(make_float2(elements[i], elements[i + 1]));
-        __nv_bfloat162 vals1 = __float22bfloat162_rn(make_float2(elements[i + 2], elements[i + 3]));
-
-        uint2 data;
-        data.x = *reinterpret_cast<uint32_t*>(&vals0);
-        data.y = *reinterpret_cast<uint32_t*>(&vals1);
-
-        // Calculate the correct offset for writing back
-        int writeOffset = offsetThread + i;
-        uint2* outputPtr = reinterpret_cast<uint2*>(&qkv[writeOffset]);
-        *outputPtr = data;
-    }
-    // Store remaining elements
-    for (; i < numElemsPerThread; i++)
-    {
-        qkv[offsetThread + i] = __float2bfloat16_rn(elements[i]);
+        vec_T vec;
+        for (int i = 0; i < vecSize; i++)
+        {
+            __nv_bfloat162 vals = __float22bfloat162_rn(make_float2(elements[2 * i], elements[2 * i + 1]));
+            reinterpret_cast<__nv_bfloat162&>(*(reinterpret_cast<uint*>(&vec) + i)) = vals;
+        }
+        vec_T* outputPtr = reinterpret_cast<vec_T*>(&qkv[offsetThread]);
+        *outputPtr = vec;
     }
 }
-
-namespace tensorrt_llm
-{
-namespace kernels
-{
 
 // Borrowed from
 // https://github.com/flashinfer-ai/flashinfer/blob/8125d079a43e9a0ba463a4ed1b639cefd084cec9/include/flashinfer/pos_enc.cuh#L568
@@ -223,5 +221,4 @@ void launchFusedQKNormRope(void* qkv, int const* position_ids, int const num_tok
         TLLM_THROW("Unsupported head dimension for fusedQKNormRope: %d", head_dim);
     }
 }
-} // namespace kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels
