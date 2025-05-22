@@ -371,10 +371,11 @@ public:
         return mAllProfiles.size();
     }
 
-    void runGemmProfile(torch::Tensor const& input, torch::Tensor const& fc2_expert_weights, int64_t const top_k,
-        int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
-        int64_t const cluster_size, int64_t const cluster_rank, bool const min_latency_mode, int64_t const gemm_idx,
-        int64_t const profile_id, bool const do_preparation)
+    void runGemmProfile(torch::Tensor const& input, torch::Tensor const& expert_weights,
+        torch::Tensor const& fc2_expert_weights, int64_t const top_k, int64_t const tp_size, int64_t const tp_rank,
+        int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
+        bool const min_latency_mode, bool const use_fp8_block_scaling, int64_t const gemm_idx, int64_t const profile_id,
+        bool const do_preparation)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -418,18 +419,18 @@ public:
                 tensorrt_llm::runtime::TorchUtils::dataType(mWeightDtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
                 hidden_size, inter_size, group_size, tensorrt_llm::ActivationType::Swiglu, USE_BIAS, USE_LORA,
-                min_latency_mode, parallelism_config);
+                min_latency_mode, use_fp8_block_scaling, parallelism_config);
 
             freeProfileWorkspace();
-            size_t profile_workspace_size = mProfiler->getWorkspaceSize(num_rows);
+            size_t profile_workspace_size = mProfiler->getWorkspaceSize(num_rows, /*need_weights*/ false);
             auto const cu_malloc_status = cudaMalloc(&mProfileWorkspace, profile_workspace_size);
             TORCH_CHECK(cu_malloc_status == cudaSuccess, "Can't allocate profile workspace for MoE GEMM profile.");
 
-            mProfiler->prepare(num_rows, mProfileWorkspace, stream);
+            mProfiler->prepare(num_rows, mProfileWorkspace, expert_weights.const_data_ptr(), stream);
         }
 
         // Profile specific tactic. Assuming at least one preparation phase has been executed already.
-        mProfiler->runProfiler(num_rows, profile, mProfileWorkspace, stream);
+        mProfiler->runProfiler(num_rows, profile, mProfileWorkspace, expert_weights.const_data_ptr(), stream);
     }
 
 private:
