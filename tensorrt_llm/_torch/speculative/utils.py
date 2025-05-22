@@ -51,8 +51,6 @@ def get_spec_decoder(max_seq_len, spec_config):
         return MTPSampler(max_seq_len, spec_config)
     if spec_config.spec_dec_mode.is_eagle3():
         return Eagle3Sampler(max_seq_len)
-    elif spec_config.spec_dec_mode.is_draft_target():
-        return DraftTargetSampler(max_seq_len)
     else:
         return None
 
