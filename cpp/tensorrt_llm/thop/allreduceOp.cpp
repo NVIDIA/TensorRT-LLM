@@ -1071,8 +1071,9 @@ at::Tensor mnnvlTwoShotAllReduce(
     return output;
 }
 
-void twoShotRMSNorm(torch::Tensor& prenorm_output, torch::Tensor& normed_output, torch::Tensor const& input,
-    torch::Tensor const& gamma, double epsilon, torch::Tensor const& residual, torch::Tensor& buffer_flags)
+std::vector<torch::Tensor> twoShotRMSNorm(torch::Tensor& prenorm_output, torch::Tensor& normed_output,
+    torch::Tensor const& input, torch::Tensor const& gamma, double epsilon, torch::Tensor const& residual,
+    torch::Tensor& buffer_flags)
 {
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
     auto rmsnorm_params = tensorrt_llm::kernels::mnnvl::RMSNormParams();
@@ -1089,6 +1090,8 @@ void twoShotRMSNorm(torch::Tensor& prenorm_output, torch::Tensor& normed_output,
     rmsnorm_params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
     tensorrt_llm::kernels::mnnvl::twoshot_rmsnorm_op(rmsnorm_params);
+
+    return {normed_output, prenorm_output};
 }
 } // namespace torch_ext
 
@@ -1099,7 +1102,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor(buffer_flags!) buffer_flags, bool wait_for_result) -> Tensor");
     m.def(
         "mnnvl_twoshot_rmsnorm(Tensor prenorm_output, Tensor normed_output, Tensor input, Tensor gamma, "
-        "float epsilon, Tensor residual, Tensor buffer_flags) -> ()");
+        "float epsilon, Tensor residual, Tensor buffer_flags) -> (Tensor, Tensor)");
     m.def(
         "allreduce("
         "Tensor input,"
