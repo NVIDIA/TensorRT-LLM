@@ -132,3 +132,5 @@ nvidia/Llama-3.1-Nemotron-Nano-8B-v1:
   - accuracy: 57.97
 nvidia/Nemotron-H-8B-Base-8K:
   - accuracy: 69.590
+microsoft/Phi-4-mini-instruct:
+  - accuracy: 68.98
