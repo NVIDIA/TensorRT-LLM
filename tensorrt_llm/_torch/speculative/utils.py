@@ -39,7 +39,7 @@ def get_spec_resource_manager(spec_config, model_config, max_num_requests):
                                       model_config.hidden_size,
                                       max_num_requests)
     elif spec_config.spec_dec_mode.is_ngram():
-        return NGramHiddenStatesManager()
+        return NGramHiddenStatesManager(spec_config)
     else:
         return None
 

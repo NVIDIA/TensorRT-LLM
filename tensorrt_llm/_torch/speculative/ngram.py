@@ -43,17 +43,18 @@ class NGramConfig(SpecConfig):
 
 class NGramHiddenStatesManager(BaseResourceManager):
 
-    def __init__(self):
-        pass
+    def __init__(self, spec_config: SpecConfig):
+        self.max_num_draft_tokens = spec_config.max_draft_tokens
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        for req in chain(scheduled_batch.context_requests,
-                         scheduled_batch.generation_requests):
-            if req.state != LlmRequestState.GENERATION_IN_PROGRESS:
+        for request in chain(scheduled_batch.context_requests,
+                             scheduled_batch.generation_requests):
+            if request.state != LlmRequestState.GENERATION_IN_PROGRESS:
                 continue
-            if req.py_next_draft_tokens is not None:
-                req.py_draft_tokens = req.py_next_draft_tokens
-                req.py_next_draft_tokens = None
+            request.py_draft_pages_allocated = self.max_num_draft_tokens
+            if request.py_next_draft_tokens is not None:
+                request.py_draft_tokens = request.py_next_draft_tokens
+                request.py_next_draft_tokens = None
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
         pass
@@ -158,18 +159,14 @@ class NGramSampler(TorchSampler):
 
         base_sample_state = super().sample_async(scheduled_requests,
                                                  model_outputs)
-        new_tokens = base_sample_state.host.new_tokens.tolist()
+        # TODO: move the pool onto GPU to avoid memory copy below
+        new_tokens = base_sample_state.device.new_tokens.cpu().tolist()
         index = 0  # Index for each request to get corresponding tokens from `new_tokens`.
-
         sorted_requests = sorted(chain(scheduled_requests.context_requests,
                                        scheduled_requests.generation_requests),
                                  key=lambda x: x.py_batch_idx)
         for py_batch_idx, request in enumerate(sorted_requests):
-            # TODO: remove this check
-            assert request.py_batch_idx == py_batch_idx
-            # TODO: move this to `NGramHiddenStatesManager.prepare_resources()`
-            request.py_draft_pages_allocated = self.max_num_draft_tokens
-            request.py_next_draft_tokens = None
+            assert request.py_batch_idx == py_batch_idx  # TODO: remove this check
             # Add new token to a copy of the generated tokens to find new daft tokens
             prefix = list(request.get_tokens()[0])  # Get a copy
             if request.py_draft_tokens is not None:
@@ -214,7 +211,7 @@ class NGramSampler(TorchSampler):
                 logger.debug(f"Request {request_id}, size={len(request_map)}")
                 self._print_line(request_map, 4)
 
-    def _print_line(self, local_map, indentation=0):  # For debug
+    def _print_line(self, local_map, indentation=0):
         for pattern, matches in local_map.items():
             output = " " * indentation + str(pattern) + "->"
             for match in matches:
