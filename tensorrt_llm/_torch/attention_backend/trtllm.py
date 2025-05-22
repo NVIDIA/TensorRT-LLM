@@ -61,6 +61,7 @@ class TrtllmAttentionWrapper:
     qk_rope_head_dim: Optional[int]
     qk_nope_head_dim: Optional[int]
     v_head_dim: Optional[int]
+    attention_chunk_size: Optional[int]
     kwargs: dict
 
     def __init__(
@@ -71,6 +72,7 @@ class TrtllmAttentionWrapper:
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
         q_scaling: Optional[float] = None,
         mla_params: Optional[MLAParams] = None,
+        attention_chunk_size: Optional[int] = None,
         **kwargs,
     ):
         """
@@ -90,6 +92,7 @@ class TrtllmAttentionWrapper:
         self.is_mla_enable = mla_params is not None
         self.q_scaling = q_scaling or 1.0
         self.predicted_tokens_per_seq = 1
+        self.attention_chunk_size = attention_chunk_size
 
         if self.is_mla_enable:
             self.q_lora_rank = mla_params.q_lora_rank
@@ -390,6 +393,7 @@ class TrtllmAttentionWrapper:
             self.mrope_position_deltas,
             self.mla_context_paged_kv,
             self.mla_context_kv_cache_block_offsets,
+            self.attention_chunk_size,
         )
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
@@ -669,6 +673,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
         mla_params: Optional[MLAParams] = None,
         skip_create_weights_in_init: bool = False,
+        attention_chunk_size: Optional[int] = None,
         **kwargs,
     ):
         """
@@ -702,6 +707,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             pos_embd_params=pos_embd_params,
             q_scaling=q_scaling,
             mla_params=mla_params,
+            attention_chunk_size=attention_chunk_size,
         )
 
         self.is_mla_enable = mla_params is not None
