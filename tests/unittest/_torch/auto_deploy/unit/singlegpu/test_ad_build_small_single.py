@@ -68,28 +68,18 @@ from utils.llm_data import llm_models_root
                 "model_kwargs": {"num_hidden_layers": 2},
             },
         ),
-        # small deepseekv3 model with world_size 1 (processes are spawned)
+        # small Phi3-mini-4k model with world_size 1
         (
             1,
             {
                 "model": _hf_model_dir_or_hub_id(
-                    f"{llm_models_root()}/DeepSeek-V3",
-                    "deepseek-ai/DeepSeek-V3",
+                    f"{llm_models_root()}/Phi-3/Phi-3-mini-4k-instruct",
+                    "microsoft/Phi-3-mini-4k-instruct",
                 ),
                 "runtime": "demollm",
                 "attn_backend": "TritonWithFlattenedInputs",
                 "compile_backend": "torch-simple",
-                "model_kwargs": {
-                    "num_hidden_layers": 6,
-                    "hidden_size": 32,
-                    "max_position_embeddings": 2048,
-                    "intermediate_size": 16,
-                    "moe_intermediate_size": 16,
-                    "n_routed_experts": 16,
-                    "num_attention_heads": 8,
-                    "num_key_value_heads": 4,
-                },
-                "skip_loading_weights": "True",
+                "model_kwargs": {"num_hidden_layers": 2},
             },
         ),
     ],

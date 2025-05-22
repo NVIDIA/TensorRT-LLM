@@ -78,7 +78,7 @@ class SequenceInfo:
     ## [UPDATE WITH CARE] TENSOR FIELDS THAT WILL BE PASSED TO PREPARE_METADATA OP #################
     # input_ids MUST ALWAYS BE THE FIRST FIELD
     input_ids: torch.Tensor = field(default_factory=lambda: torch.zeros(1, 1, dtype=torch.int))
-    position_ids: torch.Tensor = field(default_factory=lambda: torch.zeros(1, 1, dtype=torch.int))
+    position_ids: torch.Tensor = field(default_factory=lambda: torch.zeros(1, 1, dtype=torch.long))
 
     seq_len: torch.Tensor = field(default_factory=lambda: torch.ones(1, dtype=torch.int))
     input_pos: torch.Tensor = field(default_factory=lambda: torch.zeros(1, dtype=torch.int))
@@ -106,7 +106,7 @@ class SequenceInfo:
         total_tokens = min(self.max_num_tokens, self.max_batch_size * max_seq_len_adjusted)
         self._num_pages = (total_tokens) // self.page_size + (total_tokens % self.page_size > 0)
         self.input_ids = torch.ones(self.max_batch_size, 1, dtype=torch.int)
-        self.position_ids = torch.zeros(self.max_batch_size, 1, dtype=torch.int)
+        self.position_ids = torch.zeros(self.max_batch_size, 1, dtype=torch.long)
         self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int)
         self.input_pos = torch.empty_like(self.seq_len)
         self.cache_loc = torch.empty(self.num_pages, dtype=torch.int)
@@ -341,7 +341,7 @@ class SequenceInfo:
     def _update_position_ids(self) -> None:
         # set new position_ids as new tensor from input_pos and seq_len via torch.arange
         position_ids_list = [
-            torch.arange(in_pos, in_pos + seq_len, dtype=torch.int)
+            torch.arange(in_pos, in_pos + seq_len, dtype=torch.long)
             for in_pos, seq_len in zip(self.input_positions, self.sequence_lengths)
         ]
         self.position_ids = torch.cat(position_ids_list, dim=0).to(self.device)
