@@ -484,7 +484,6 @@ def test_get_num_responses_ready(streaming: bool,
     assert executor.get_num_responses_ready() == num_expected_responses
 
 
-#@pytest.mark.skip("https://nvbugs/5028235")
 @pytest.mark.parametrize("batching_type", [trtllm.BatchingType.INFLIGHT])
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("beam_width", [1])
@@ -592,8 +591,9 @@ def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
                     expected_tokens = test_data["expected_output_ids"][
                         batch_id * beam_width + beam][input_length:]
 
-                    # Through experiments find out when set return_context_logits
+                    # From experiments find out when set return_context_logits
                     # or return_generation_logits, the predicted_tokens cannot match with expected_tokens
+                    # Fixed by comparing partial output tokens like in c++ test
                     compare_length = 2 if (
                         return_context_logits
                         or return_generation_logits) else len(predicted_tokens)
