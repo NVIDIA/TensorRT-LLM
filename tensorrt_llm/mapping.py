@@ -243,8 +243,10 @@ class Mapping(object):
         for i in range(pp_size):
             for j in range(moe_tp_size):
                 ranks = range(
-                    i * moe_tp_cluster_ep_size + j * moe_cluster_size,
-                    i * moe_tp_cluster_ep_size + (j + 1) * moe_cluster_size)
+                    i * moe_tp_cluster_ep_size +
+                    j * moe_cluster_size * moe_ep_size,
+                    i * moe_tp_cluster_ep_size +
+                    (j + 1) * moe_cluster_size * moe_ep_size)
                 self.moe_cluster_groups.append(list(ranks))
 
         # init moe ep group
@@ -353,16 +355,14 @@ class Mapping(object):
 
     @property
     def moe_cluster_group(self):
-        return self.moe_cluster_groups[self.pp_rank * self.moe_tp_size *
-                                       self.moe_ep_size +
-                                       self.moe_tp_rank * self.moe_ep_size +
-                                       self.moe_ep_rank]
+        return self.moe_cluster_groups[self.pp_rank * self.moe_tp_size +
+                                       self.moe_tp_rank]
 
     @property
     def moe_ep_group(self):
-        return self.moe_ep_groups[self.pp_rank * self.moe_cluster_size *
-                                  self.moe_tp_size +
-                                  self.tp_rank * self.moe_cluster_size +
+        return self.moe_ep_groups[self.pp_rank * self.moe_tp_size *
+                                  self.moe_cluster_size +
+                                  self.moe_tp_rank * self.moe_cluster_size +
                                   self.moe_cluster_rank]
 
     @property
