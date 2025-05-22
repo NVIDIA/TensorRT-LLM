@@ -126,7 +126,7 @@ __global__ void fusedQKNormRopeKernel(
     }
 
     // Apply RoPE to normalized elements
-    float elements2[numElemsPerThread];  // Additional buffer required for RoPE.
+    float elements2[numElemsPerThread]; // Additional buffer required for RoPE.
     float cos_vals[numElemsPerThread];
     float sin_vals[numElemsPerThread];
 
@@ -138,13 +138,13 @@ __global__ void fusedQKNormRopeKernel(
         // Perform interleaving. Fill cos_vals and sin_vals.
         for (int i = 0; i < numElemsPerThread; i++)
         {
-            if(i % 2 == 0)
+            if (i % 2 == 0)
             {
-                elements2[i] = -elements[i+1];
+                elements2[i] = -elements[i + 1];
             }
-            else    
+            else
             {
-                elements2[i] = elements[i-1];
+                elements2[i] = elements[i - 1];
             }
 
             int dim_idx = laneId * numElemsPerThread + i;
@@ -162,14 +162,13 @@ __global__ void fusedQKNormRopeKernel(
         for (int i = 0; i < numElemsPerThread; i++)
         {
             elements2[i] = __shfl_xor_sync(0xffffffff, elements[i], 16);
-            if(laneId < 16)
+            if (laneId < 16)
             {
                 elements2[i] = -elements2[i];
             }
 
-            int laneIdForDim = laneId ^ ((((laneId >> 4) ^ (i & 1)) & 1) << 4);
-
-            int dim_idx = laneIdForDim * numElemsPerThread + i;
+            int dim_idx = laneId * numElemsPerThread + i;
+            dim_idx = (dim_idx * 2) % head_dim;
             int half_dim = dim_idx / 2;
             float freq = powf(base, -2.0f * half_dim / static_cast<float>(head_dim));
             float theta = pos_id * freq;

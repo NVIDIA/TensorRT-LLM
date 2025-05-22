@@ -6,6 +6,7 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 
 
+@torch.inference_mode()
 def torch_ref_rms_norm_rope(qkv,
                             position_ids,
                             num_heads_q,
@@ -72,7 +73,6 @@ def torch_ref_rms_norm_rope(qkv,
         theta=base,  # Base value for RoPE calculations
         max_positions=8192  # Large enough for any reasonable hidden size
     )
-    # TODO: support is_neox=True
     rotary_emb = RotaryEmbedding(rope_params=rope_params,
                                  head_dim=head_dim,
                                  is_neox=is_neox).to(qkv.device)
@@ -94,12 +94,12 @@ num_heads_groups = [
     (40, 8, 8),  # Qwen3-14B
     (64, 8, 8)  # Qwen3-32B, Qwen3-235B-A22B
 ]
-num_tokens_list = [3, 8, 32, 256]
+num_tokens_list = [1, 3, 8, 32, 256]
 dtypes = [torch.bfloat16]  # TODO: support float16
 
 
 @pytest.mark.parametrize("head_dim", head_dims)
-@pytest.mark.parametrize("is_neox", [False])
+@pytest.mark.parametrize("is_neox", [False, True])
 @pytest.mark.parametrize("num_heads_group", num_heads_groups)
 @pytest.mark.parametrize("num_tokens", num_tokens_list)
 @pytest.mark.parametrize("dtype", dtypes)
@@ -152,8 +152,6 @@ def test_fused_qk_norm_rope(head_dim, is_neox, num_heads_group, num_tokens,
         is_neox,  # interleave
         eps,
         base)
-    # Check for CUDA errors
-    torch.cuda.synchronize()
     output = qkv  # This op is inplace
 
     # Compute reference output using TensorRT-LLM modules
