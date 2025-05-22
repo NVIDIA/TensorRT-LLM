@@ -82,6 +82,7 @@ public:
 
     RequestInfo(LlmRequest::RequestIdType requestId, std::vector<size_t> blockHashes,
         executor::DataTransceiverState transState);
+    RequestInfo() = default;
 
     /// @brief Equality comparison operator.
     /// @param rhs The right operand of the operator.

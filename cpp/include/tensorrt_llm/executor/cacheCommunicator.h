@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include <cstddef>
+#include "tensorrt_llm/executor/serialization.h"
 #include <vector>
 
 namespace tensorrt_llm::executor::kv_cache
