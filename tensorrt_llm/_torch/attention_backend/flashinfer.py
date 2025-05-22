@@ -14,6 +14,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ..utils import get_global_attrs, get_model_extra_attrs
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
                         PredefinedAttentionMask)
+from .utils import create_context_chunk_mask
 
 try:
     check_cuda_arch()
@@ -156,6 +157,22 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._positions = torch.empty((self.max_num_tokens, ),
                                       dtype=torch.int,
                                       device='cuda')
+
+        #TODO: Only allocate this if attention_chunk_size is not None
+        max_mask_elements = self.max_num_tokens * self.kv_cache_manager.max_seq_len
+        self._attention_mask_data_buffer = torch.empty(max_mask_elements,
+                                                       dtype=torch.bool,
+                                                       device="cuda")
+
+        self.prompt_lens_cpu = torch.empty((self.max_num_requests, ),
+                                           device='cpu',
+                                           pin_memory=True,
+                                           dtype=torch.int32)
+        self.kv_lens_cpu = torch.empty((self.max_num_requests, ),
+                                       device='cpu',
+                                       pin_memory=True,
+                                       dtype=torch.int32)
+
         self._plan_params_to_wrappers = {}
 
         if self.kv_cache_manager is not None:
@@ -205,8 +222,17 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._cached_token_lens[:cached_token_lens.size(0)].copy_(
             cached_token_lens, non_blocking=True)
 
-        # number of tokens needed in the kv cache for each sequence after the next pass
         kv_lens = self.cached_token_lens + self.seq_lens_kv_cuda
+        prompt_lens = torch.tensor(
+            self.prompt_lens,
+            dtype=torch.int32,
+            device='cpu',
+        )
+        self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
+        # number of tokens needed in the kv cache for each sequence after the next pass
+        kv_lens_host = cached_token_lens + self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv  ## see if there is difference between cached_token_lens and self.cached_token_lens
+        self.kv_lens_cpu[:self.num_seqs].copy_(
+            kv_lens_host + self.kv_cache_params.num_extra_kv_tokens)
 
         # start and end indices of each sequence in the ragged key and value
         # for self attention it's the same as qo_indptr so avoid computing twice.
@@ -365,7 +391,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 causal=is_causal,
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
-            )
+                custom_mask=plan_params.attention_mask_data)
 
         if plan_params in self._plan_params_to_wrappers:
             decode_wrapper = self._plan_params_to_wrappers[
@@ -453,8 +479,30 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 metadata: FlashInferAttentionMetadata,
                 *,
                 attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+                attention_chunk_size: Optional[int] = None,
                 **kwargs) -> torch.Tensor:
-        if attention_mask == PredefinedAttentionMask.CAUSAL:
+        if attention_chunk_size is not None and metadata.num_contexts > 0:
+            attention_mask_type = int(AttentionMaskType.custom_mask)
+            host_context_lengths = metadata.prompt_lens_cpu[:metadata.
+                                                            num_contexts]
+            host_past_key_value_lengths = metadata.kv_lens_cpu[:metadata.
+                                                               num_contexts]
+            token_offset = 0
+            for ctx_len, kv_len in zip(host_context_lengths,
+                                       host_past_key_value_lengths):
+                current_mask_size = ctx_len * kv_len
+                attention_mask = create_context_chunk_mask(
+                    kv_len, ctx_len, attention_chunk_size)
+                flattened_attention_mask = attention_mask.flatten()
+                metadata._attention_mask_data_buffer[
+                    token_offset:token_offset +
+                    current_mask_size].copy_(flattened_attention_mask)
+                token_offset += current_mask_size
+            assert token_offset == torch.sum(host_context_lengths *
+                                             host_past_key_value_lengths)
+            attention_mask_data = metadata._attention_mask_data_buffer[:
+                                                                       token_offset]
+        elif attention_mask == PredefinedAttentionMask.CAUSAL:
             attention_mask_type = int(AttentionMaskType.causal)
             attention_mask_data = None
         elif attention_mask == PredefinedAttentionMask.FULL:
