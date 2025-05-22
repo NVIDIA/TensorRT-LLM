@@ -155,7 +155,12 @@ def get_model_from_config_patched(model_config, trust_remote_code):
         return model
     # handling: microsoft/Phi-3-mini-128k-instruct, microsoft/Phi-3-medium-128k-instruct
     # microsoft/Phi-3-mini-4k-instruct, microsoft/Phi-3-medium-4k-instruct
-    if not re.search(r"Phi-3-(?:mini|medium)", model_config._name_or_path):
+    # microsoft/Phi-3.5-mini-instruct
+    pattern = (
+        r"Phi-(?:3|3\.5)-"
+        r"(?:mini|medium)"
+    )
+    if not re.search(pattern, model_config._name_or_path):
         return model
     for _, module in model.named_modules():
         name = type(module).__name__
