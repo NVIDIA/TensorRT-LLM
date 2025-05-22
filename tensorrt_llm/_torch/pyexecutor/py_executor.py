@@ -274,12 +274,20 @@ class PyExecutor:
         if start_worker:
             self.start_worker()
 
+    def _event_loop_wrapper(self):
+        try:
+            self.event_loop()
+        except Exception as e:
+            logger.error(f"Error in event loop: {e}")
+            logger.error(traceback.format_exc())
+            raise e
+
     def start_worker(self):
         self.worker_lock.acquire()
         try:
             if self.worker_started == False:
-                self.worker_thread = threading.Thread(target=self.event_loop,
-                                                      daemon=True)
+                self.worker_thread = threading.Thread(
+                    target=self._event_loop_wrapper, daemon=True)
                 self.worker_thread.start()
                 self.worker_started = True
         finally:
