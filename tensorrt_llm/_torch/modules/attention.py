@@ -303,19 +303,34 @@ def extract_extra_attrs(layer_idx: str):
     return metadata, mla_layer
 
 
+@torch.library.custom_op("trtllm::mla_custom_op_inplace",
+                         mutates_args=("out", ))
+def mla_custom_op_inplace(
+    hidden_states: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    layer_idx: str,
+    out: torch.Tensor,
+) -> None:
+    metadata, mla_layer = extract_extra_attrs(layer_idx)
+    mla_layer.forward_impl(position_ids, hidden_states, metadata, out=out)
+
+
 @torch.library.custom_op("trtllm::mla_custom_op", mutates_args=())
 def mla_custom_op(
-    position_ids: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
     layer_idx: str,
 ) -> torch.Tensor:
     metadata, mla_layer = extract_extra_attrs(layer_idx)
-
-    return mla_layer.forward_impl(position_ids, hidden_states, metadata)
+    out = mla_layer.forward_impl_fake(hidden_states)
+    return mla_layer.forward_impl(position_ids,
+                                  hidden_states,
+                                  metadata,
+                                  out=out)
 
 
 @mla_custom_op.register_fake
-def _(position_ids, hidden_states, layer_idx):
+def _(hidden_states, position_ids, layer_idx):
     _, mla_layer = extract_extra_attrs(layer_idx)
     return mla_layer.forward_impl_fake(hidden_states)
 
@@ -642,12 +657,11 @@ class MLA(nn.Module):
         return hidden_states.new_empty([num_tokens, hidden_size],
                                        dtype=hidden_states.dtype)
 
-    def forward_impl(
-        self,
-        position_ids: Optional[torch.Tensor],
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
+    def forward_impl(self,
+                     position_ids: Optional[torch.Tensor],
+                     hidden_states: torch.Tensor,
+                     attn_metadata: AttentionMetadata,
+                     out: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass for the MLA module.
 
@@ -703,11 +717,14 @@ class MLA(nn.Module):
             if self.apply_rotary_emb:
                 assert position_ids is not None
                 k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
-
-            attn_output_context = self.forward_context(q_ctx, compressed_kv_ctx,
-                                                       k_pe_ctx, attn_metadata,
-                                                       latent_cache_ctx,
-                                                       position_ids)
+            attn_output_context = self.forward_context(
+                q_ctx,
+                compressed_kv_ctx,
+                k_pe_ctx,
+                attn_metadata,
+                latent_cache_ctx,
+                position_ids,
+                out=out if num_generations == 0 else None)
         else:
             attn_output_context = None
 
@@ -720,9 +737,15 @@ class MLA(nn.Module):
                 assert position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
 
-            attn_output_gen = self.forward_generation(q_gen, compressed_kv_gen,
-                                                      k_pe_gen, attn_metadata,
-                                                      latent_cache_gen)
+            attn_output_gen = self.forward_generation(
+                q_gen,
+                compressed_kv_gen,
+                k_pe_gen,
+                attn_metadata,
+                latent_cache_gen,
+                out=out if num_contexts == 0 else None)
+            if num_contexts == 0:
+                return attn_output_gen
         else:
             attn_output_gen = None
 
@@ -731,25 +754,22 @@ class MLA(nn.Module):
         compressed_kv = None
         k_pe = None
 
-        # merge context and gen batches
-        if attn_output_context is not None and attn_output_gen is not None:
-            assert (
-                len(attn_output_context.shape) == 2
-            ), f"attn_output_context must be rank 2, not {len(attn_output_context.shape)}"
-            assert (
-                len(attn_output_gen.shape) == 2
-            ), f"attn_output_gen must be rank 2, not {len(attn_output_gen.shape)}"
-            attn_output = torch.cat([attn_output_context, attn_output_gen],
-                                    dim=0)
-            # release pytorch activation memory
-            attn_output_context = None
-            attn_output_gen = None
-        elif attn_output_gen is None:
-            attn_output = attn_output_context
-        else:
-            attn_output = attn_output_gen
-
-        return attn_output
+        assert attn_output_context is not None and attn_output_gen is not None
+        assert (
+            len(attn_output_context.shape) == 2
+        ), f"attn_output_context must be rank 2, not {len(attn_output_context.shape)}"
+        assert (
+            len(attn_output_gen.shape) == 2
+        ), f"attn_output_gen must be rank 2, not {len(attn_output_gen.shape)}"
+        out = out if out is not None else torch.empty(
+            (num_tokens, attn_output_context.shape[1]),
+            dtype=attn_output_context.dtype,
+            device=attn_output_context.device)
+        out[:attn_output_context.shape[0], :] = attn_output_context
+        out[attn_output_context.shape[0]:, :] = attn_output_gen
+        attn_output_context = None
+        attn_output_gen = None
+        return out
 
     def _maybe_concat_qkv(self, q, k, v):
         if k is not None and v is not None and self.support_fused_qkv:
@@ -758,13 +778,13 @@ class MLA(nn.Module):
         return q, k, v
 
     def forward_context_default(
-        self,
-        q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        latent_cache: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+            self,
+            q: torch.Tensor,
+            compressed_kv: torch.Tensor,
+            k_pe: torch.Tensor,
+            attn_metadata: AttentionMetadata,
+            latent_cache: Optional[torch.Tensor] = None,
+            out: Optional[torch.Tensor] = None) -> torch.Tensor:
         kv = self.kv_b_proj(compressed_kv)
         k_nope, v = kv.split(
             [
@@ -796,18 +816,19 @@ class MLA(nn.Module):
             attention_input_type=AttentionInputType.context_only,
             latent_cache=latent_cache,
             out_scale=out_scale,
+            out=out,
         )
 
         return attn_output
 
     def forward_context_with_cached_kv(
-        self,
-        q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        position_ids: Optional[torch.LongTensor] = None,
-    ) -> torch.Tensor:
+            self,
+            q: torch.Tensor,
+            compressed_kv: torch.Tensor,
+            k_pe: torch.Tensor,
+            attn_metadata: AttentionMetadata,
+            position_ids: Optional[torch.LongTensor] = None,
+            out: Optional[torch.Tensor] = None) -> torch.Tensor:
         trtllm_attention = cast(TrtllmAttention, self.mha)
         # copy past_compressed_kv and past_k_pe from paged kv cache
         past_latent_cache = trtllm_attention.load_paged_kv_cache_for_mla(
@@ -919,6 +940,7 @@ class MLA(nn.Module):
             mla_context_paged_kv=full_kv,
             mla_context_kv_cache_block_offsets=
             mla_context_kv_cache_block_offsets,
+            out=out,
         )
         return attn_output
 
@@ -930,24 +952,24 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         latent_cache: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
             if trtllm_attention.has_cached_kv_for_mla_context(attn_metadata):
                 return self.forward_context_with_cached_kv(
-                    q, compressed_kv, k_pe, attn_metadata, position_ids)
+                    q, compressed_kv, k_pe, attn_metadata, position_ids, out)
         return self.forward_context_default(q, compressed_kv, k_pe,
-                                            attn_metadata, latent_cache)
+                                            attn_metadata, latent_cache, out)
 
-    def forward_generation(
-        self,
-        q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        latent_cache: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def forward_generation(self,
+                           q: torch.Tensor,
+                           compressed_kv: torch.Tensor,
+                           k_pe: torch.Tensor,
+                           attn_metadata: AttentionMetadata,
+                           latent_cache: Optional[torch.Tensor] = None,
+                           out: Optional[torch.Tensor] = None) -> torch.Tensor:
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -1018,9 +1040,13 @@ class MLA(nn.Module):
         attn_out_latent = attn_out_latent.view(
             [-1, self.num_heads, self.kv_lora_rank])
 
-        attn_output = torch.empty([num_tokens, self.num_heads, self.v_head_dim],
-                                  dtype=attn_out_latent.dtype,
-                                  device=attn_out_latent.device)
+        # [seq, num_heads * v_head_dim]
+        out = out if out is not None else torch.empty(
+            [num_tokens, self.num_heads * self.v_head_dim],
+            dtype=attn_out_latent.dtype,
+            device=attn_out_latent.device)
+
+        attn_output = out.view([num_tokens, self.num_heads, self.v_head_dim])
 
         if self.v_b_proj.dtype == torch.bfloat16:
             # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
@@ -1040,8 +1066,7 @@ class MLA(nn.Module):
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
 
-        # [seq, num_heads * v_head_dim]
-        return attn_output.flatten(1, 2)
+        return out
 
     def forward(
         self,
@@ -1052,7 +1077,7 @@ class MLA(nn.Module):
     ) -> torch.Tensor:
         if self.register_to_config:
             attn_output = torch.ops.trtllm.mla_custom_op(
-                position_ids, hidden_states, self.layer_idx_str)
+                hidden_states, position_ids, self.layer_idx_str)
         else:
             attn_output = self.forward_impl(position_ids, hidden_states,
                                             attn_metadata)

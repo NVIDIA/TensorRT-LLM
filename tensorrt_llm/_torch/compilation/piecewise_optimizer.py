@@ -263,6 +263,35 @@ def piecewise_optimizer(
 
             nodes_to_remove.append(node)
 
+        elif is_call_function(node, torch.ops.trtllm.mla_custom_op.default):
+            hidden_states = get_arg(node, 0, "hidden_states")
+            fake_mode = detect_fake_mode()
+            with fake_mode:
+                new_output_tensor = torch.ops.trtllm.mla_custom_op.default(
+                    *[
+                        i.meta["val"] if hasattr(i, "meta") else i
+                        for i in node.args
+                    ],
+                    **node.kwargs,
+                )
+            with graph.inserting_before(node):
+                output = graph.call_function(
+                    torch.ops.aten.new_empty.default,
+                    (hidden_states, [
+                        symint_node[str(i)]
+                        if isinstance(i, torch.SymInt) else i
+                        for i in new_output_tensor.shape
+                    ]),
+                    {"dtype": new_output_tensor.dtype},
+                )
+                args = node.args + tuple((output, ))
+                new_mla_custom_op = graph.call_function(
+                    torch.ops.trtllm.mla_custom_op_inplace.default, args,
+                    node.kwargs)
+                node.replace_all_uses_with(output)
+                output.meta["val"] = new_mla_custom_op
+            nodes_to_remove.append(node)
+
     for node in nodes_to_remove:
         graph.erase_node(node)
 
@@ -278,13 +307,14 @@ def piecewise_optimizer(
             continue
         if (not stop_partition and is_call_function(node, [
                 torch.ops.trtllm.attention_inplace.default,
+                torch.ops.trtllm.mla_custom_op_inplace.default,
                 torch.ops.aten.index.Tensor,
                 torch.ops.aten.cumsum.default,
         ])):
             idx += 1
             node_to_graph_id[node] = idx
             exclude_modules_id.append(idx)
-            if node.target != torch.ops.trtllm.attention_inplace.default:
+            if node.target != torch.ops.trtllm.attention_inplace.default and node.target != torch.ops.trtllm.mla_custom_op_inplace.default:
                 # We only know it is safe to continue splitting after attention
                 # since attention_inplace will not produce any new tensor
                 stop_partition = True
