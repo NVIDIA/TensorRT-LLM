@@ -60,6 +60,8 @@ class TRTLLMEvalBase(TemplateLM):
         max_context_length: Optional[int] = None,
         moe_expert_parallel_size: Optional[int] = None,
         moe_backend: Optional[str] = "TRTLLM",
+        enable_chunked_prefill: bool = False,
+        max_num_tokens: Optional[int] = None,
         **kwargs,
     ):
         # initialize TemplateLM, copied from TemplateAPI
@@ -109,7 +111,8 @@ class TRTLLMEvalBase(TemplateLM):
                 model=model,
                 tensor_parallel_size=tp,
                 trust_remote_code=trust_remote_code,
-                enable_chunked_prefill=False,
+                enable_chunked_prefill=enable_chunked_prefill,
+                max_num_tokens=max_num_tokens,
                 pytorch_backend_config=pytorch_config,
                 tokenizer=self.tokenizer,
                 kv_cache_config=trt_kv_cache_config,
@@ -292,11 +295,12 @@ class TRTLLMEvalBase(TemplateLM):
             # process the output of the request i
             r_out: RequestOutput = futures.pop(i).result()
             stop_words = future_stop_words.pop(i)
-            for word in stop_words:
-                txt = r_out.outputs[0].text
-                word_index = txt.find(word)
-                if word_index >= 0:
-                    txt = txt[:word_index]
+            txt = r_out.outputs[0].text
+            if stop_words:
+                for word in stop_words:
+                    word_index = txt.find(word)
+                    if word_index >= 0:
+                        txt = txt[:word_index]
             results.append(txt)
 
         return results
