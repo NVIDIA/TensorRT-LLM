@@ -1,6 +1,10 @@
 import asyncio
 from contextlib import AsyncExitStack
+<<<<<<< HEAD
 from typing import Optional
+=======
+from typing import Any, Optional
+>>>>>>> 70a51136 (support sandbox, websearch)
 
 from dotenv import load_dotenv
 from mcp import ClientSession
@@ -18,8 +22,6 @@ class MCPClient:
 
     async def list_tools(self):
         response = await self.session.list_tools()
-        tools = response.tools
-        print("\nlist_tools ", [tool.name for tool in tools])
         return response
 
     async def call_tool(self, tool_name, tool_args):
@@ -28,16 +30,16 @@ class MCPClient:
 
     async def connect_to_sse_server(self, server_url: str):
         """Connect to an MCP server running with SSE transport"""
-        # Store the context managers so they stay alive
-        self._streams_context = sse_client(url=server_url)
-        streams = await self._streams_context.__aenter__()
+        streams_context = sse_client(url=server_url)
+        streams = await self.exit_stack.enter_async_context(streams_context)
 
-        self._session_context = ClientSession(*streams)
-        self.session: ClientSession = await self._session_context.__aenter__()
+        session_context = ClientSession(*streams)
+        self.session = await self.exit_stack.enter_async_context(session_context)
 
-        # Initialize
+        # Initialize session
         await self.session.initialize()
 
+<<<<<<< HEAD
         # List available tools to verify connection
         print("Initialized SSE client...")
         print("Listing tools...")
@@ -46,12 +48,12 @@ class MCPClient:
         print("\nConnected to server with tools:",
               [tool.name for tool in tools])
 
+=======
+>>>>>>> 70a51136 (support sandbox, websearch)
     async def cleanup(self):
-        """Properly clean up the session and streams"""
-        if self._session_context:
-            await self._session_context.__aexit__(None, None, None)
-        if self._streams_context:
-            await self._streams_context.__aexit__(None, None, None)
+        """Properly clean up all registered async resources."""
+        await self.exit_stack.aclose()
+
 
 
 async def main():

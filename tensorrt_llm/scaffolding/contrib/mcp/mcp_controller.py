@@ -1,16 +1,18 @@
 import copy
 from enum import Enum
 from typing import Any, List
-from tensorrt_llm.scaffolding import (Task,  Controller)
-from .mcp_task import (MCPCallTask, MCPListTask)
-from .chat_task import (ChatTask)
+
+from tensorrt_llm.scaffolding import Controller, Task
+
+from .chat_task import ChatTask
+from .mcp_task import MCPCallTask, MCPListTask
+
 
 class MCPController(Controller):
 
     class WorkerTag(Enum):
         GENERATION = "generation"
-        MCPLIST = "mcp"
-        MCPCALL = "mcp"
+        MCP = "mcp"
 
     def __init__(self, custom_sampling_params: dict = None):
         super().__init__()
@@ -19,14 +21,8 @@ class MCPController(Controller):
 
     def process(self, tasks: List[Task], **kwargs):
         list_task = MCPListTask.create_mcptask()
-        list_task.worker_tag = MCPController.WorkerTag.MCPLIST
+        list_task.worker_tag = MCPController.WorkerTag.MCP
         yield [list_task]
-        available_tools = [{
-            "name": tool.name,
-            "description": tool.description,
-            "input_schema": tool.inputSchema
-        } for tool in list_task.result_tools]
-
         available_tools = [{
             "type": "function",
             "function": {
@@ -36,7 +32,7 @@ class MCPController(Controller):
             }
         } for tool in list_task.result_tools]
 
-        print(f"available_tools {available_tools}")
+        print(f"\navailable_tools {available_tools}\n")
         # return
         assert (len(tasks) == 1)
         system_message = (
@@ -58,22 +54,24 @@ class MCPController(Controller):
                 if hasattr(tasks[0], key) and getattr(tasks[0], key) is None:
                     setattr(tasks[0], key, value)
         yield [chattask]
-        if chattask.choice.finish_reason != 'tool_calls':
+        if chattask.finish_reason != 'tool_calls':
             result_task.output_str = chattask.output_str
             return
-        tool_calls = chattask.choice.message.tool_calls
+        tool_calls = chattask.tool_calls
         mcp_call_tasks = [
             MCPCallTask.create_mcptask(tool_call.function.name,
                                        tool_call.function.arguments)
             for tool_call in tool_calls
         ]
         for task in mcp_call_tasks:
-            task.worker_tag = MCPController.WorkerTag.MCPCALL
+            task.worker_tag = MCPController.WorkerTag.MCP
+        print(f"\nmcp_call_tasks is {mcp_call_tasks}\n")
         yield mcp_call_tasks
         mcp_result = mcp_call_tasks[0].output_str
+        print(f"\nmcp_result is {mcp_result}\n")
         messages.append({
             "role": "assistant",
-            "content": chattask.choice.message.content
+            "content": chattask.output_str
         })
         finalchattask = ChatTask.create_from_prompt(messages, mcp_result,
                                                     available_tools)

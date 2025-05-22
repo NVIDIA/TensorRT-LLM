@@ -1,5 +1,6 @@
 from abc import ABC
-from typing import Callable
+from copy import deepcopy
+from typing import Callable, List, Optional, Union
 
 import openai
 from transformers import AutoTokenizer
@@ -98,25 +99,6 @@ class OpenaiWorker(Worker):
             # Handle errors
             print('Openai client get exception: ' + str(e))
             return TaskStatus.WORKER_EXECEPTION
-<<<<<<< HEAD
-
-    async def chat_handler(self, task: ChatTask) -> TaskStatus:
-        params = self.convert_task_params(task)
-        params["messages"] = task.messages
-
-        # Make the API call
-        try:
-            response = await self.async_client.chat.completions.create(**params)
-            self.fill_generation_task_with_response(task, response)
-            task.choice = response.choices[0]
-            return TaskStatus.SUCCESS
-
-        except Exception as e:
-            # Handle errors
-            print('Openai chat client get exception: ' + str(e))
-            return TaskStatus.WORKER_EXECEPTION
-=======
->>>>>>> 40fc64c3 (move all into contrib/mcp)
 
     def shutdown(self):
         # OpenAI client doesn't require explicit cleanup
