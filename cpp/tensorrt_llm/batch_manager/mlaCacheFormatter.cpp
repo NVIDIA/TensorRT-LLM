@@ -24,6 +24,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+#include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheConcatenate.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -159,6 +160,13 @@ void MLACacheFormatter::formatOutput(LlmRequest const& llmRequest,
         cacheBufferId, pPDomainSize, targetBufferSize, bufferManager);
     auto& outputSplitCaches = std::get<0>(result);
     auto& bufferCoverTargetNum = std::get<1>(result);
+    auto& onlyUseDynamicBuffer = std::get<2>(result);
+    auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
+    if (agentConnnecion != nullptr)
+    {
+        TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == pPDomainSize, "Agent need all buffer pre-allocated");
+        TLLM_CHECK(onlyUseDynamicBuffer == false);
+    }
     // diff end
 
     // The size of outputSplitCaches should be equal to pPDomainSize
@@ -318,7 +326,16 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
     }
     else
     {
-        cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
+        auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
+        if (agentConnnecion != nullptr)
+        {
+            cacheBufferId = agentConnnecion->getCacheBufferId();
+            TLLM_CHECK(cacheBufferId.has_value());
+        }
+        else
+        {
+            cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
+        }
 
         auto cacheBlockSize = outputBuffers.at(0)->getSize();
 
@@ -330,7 +347,12 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
         auto& recvSplitCaches = std::get<0>(result);
         auto& bufferCoverTargetNum = std::get<1>(result);
         size_t remainNoCoverTargetNum = targetNum > bufferCoverTargetNum ? targetNum - bufferCoverTargetNum : 0;
-
+        auto& onlyUseDynamicBuffer = std::get<2>(result);
+        if (agentConnnecion != nullptr)
+        {
+            TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == targetNum, "Agent need buffer pre-allocated");
+            TLLM_CHECK(onlyUseDynamicBuffer == false);
+        }
         bufferManager.getStream().synchronize();
 
         auto preAllocRecvBuffer = mCacheTransBufferManager->getRecvBuffer(cacheBufferId);

@@ -29,9 +29,7 @@ if(NIXL_ROOT)
 
   # Add the NIXL wrapper target
   add_library(${NIXL_WRAPPER_TARGET} SHARED transferAgent.cpp)
-  target_compile_options(
-    ${NIXL_WRAPPER_TARGET} PRIVATE -U_GLIBCXX_USE_CXX11_ABI
-                                   -D_GLIBCXX_USE_CXX11_ABI=1 -Wno-error)
+  target_compile_options(${NIXL_WRAPPER_TARGET} PRIVATE -Wno-error)
 
   # Add include directories
   target_include_directories(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
@@ -39,9 +37,4 @@ if(NIXL_ROOT)
   # Link against all NIXL libraries
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
 
-  add_custom_command(
-    TARGET ${NIXL_WRAPPER_TARGET}
-    POST_BUILD
-    COMMAND nm -C $<TARGET_FILE:${NIXL_WRAPPER_TARGET}> | grep -E
-            'tensorrt_llm.*__cxx11|__cxx11.*tensorrt_llm' && exit 1 || exit 0)
 endif()
