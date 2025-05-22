@@ -200,15 +200,43 @@ def routing_reference_no_aux(expert_logits,
         scores = noaux_tc_ref(routing_logits, routing_bias, n_groups,
                               top_k_groups, top_k, routed_scaling)
     permute_info = routing_reference(scores, top_k, padding)
-    # print("permute_info: ", permute_info)
     return permute_info, scores
 
 
 # TopK -> Softmax
 def routing_reference_renormalize(expert_logits, top_k, num_experts, padding):
-    topk_values, _ = torch.topk(expert_logits, k=top_k, dim=-1)
-    scores = torch.nn.functional.softmax(topk_values.float(), dim=-1)
+    topk_values, topk_idx = torch.topk(expert_logits, k=top_k, dim=-1)
+    topk_values = torch.nn.functional.softmax(topk_values.float(), dim=-1)
 
+    new_mask = torch.zeros_like(expert_logits)
+    new_mask.scatter_(-1, topk_idx, 1)
+    scores = expert_logits * new_mask
+
+    for i in range(topk_idx.shape[0]):
+        for j in range(topk_idx.shape[1]):
+            scores[i, topk_idx[i, j]] = topk_values[i, j]
+    permute_info = routing_reference(scores, top_k, padding)
+    return permute_info, scores
+
+
+# Softmax->TopK -> Normalize
+def routing_reference_qwen3(expert_logits, top_k, num_experts, padding):
+    norm_topk_prob = True
+    scores = torch.nn.functional.softmax(expert_logits.float(), dim=-1)
+    topk_values, topk_idx = torch.topk(scores, k=top_k, dim=-1)
+
+    if norm_topk_prob:  # only diff with mixtral sparse moe block!
+        topk_values /= topk_values.sum(dim=-1, keepdim=True)
+    topk_values = topk_values.to(expert_logits.dtype)
+    scores = scores.to(expert_logits.dtype)
+
+    new_mask = torch.zeros_like(expert_logits)
+    new_mask.scatter_(-1, topk_idx, 1)
+    scores = expert_logits * new_mask
+
+    for i in range(topk_idx.shape[0]):
+        for j in range(topk_idx.shape[1]):
+            scores[i, topk_idx[i, j]] = topk_values[i, j]
     permute_info = routing_reference(scores, top_k, padding)
     return permute_info, scores
 
@@ -646,27 +674,37 @@ def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size):
                 "num_experts": 256,
                 "top_k": 8,
                 "padding": 8,
-                "n_groups": 4,
+                "n_groups": 8,
                 "top_k_groups": 4,
                 "routed_scaling": 2.5,
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.DeepSeekV3
             },
             id="RoutingDSv3"),
-        # FIXME: reference for TopK->Softmax is not implemented yet
-        # pytest.param(
-        #     {
-        #         "num_experts": 128,
-        #         "top_k": 8,
-        #         "padding": 8,
-        #         "n_groups": None,
-        #         "top_k_groups": None,
-        #         "routed_scaling": None,
-        #         "has_routing_bias": False,
-        #         "routing_method_type": RoutingMethodType.Renormalize
-        #     },
-        #     id="RoutingRenormalize"
-        # ),
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize
+            },
+            id="RoutingRenormalize"),
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Qwen3
+            },
+            id="Qwen3"),
     ],
 )
 def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
@@ -695,8 +733,13 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
         assert num_experts % n_groups == 0
         assert top_k < (top_k_groups * num_experts / n_groups)
 
-    expert_logits = torch.randn((num_tokens, num_experts),
-                                device='cuda').to(torch.float)
+    if routing_method_type == RoutingMethodType.DeepSeekV3:
+        expert_logits = torch.randn((num_tokens, num_experts),
+                                    device='cuda').to(torch.float)
+    elif routing_method_type == RoutingMethodType.Qwen3 or routing_method_type == RoutingMethodType.Renormalize:
+        expert_logits = torch.randn((num_tokens, num_experts),
+                                    device='cuda').to(torch.bfloat16)
+
     if routing_info["has_routing_bias"]:
         routing_bias = torch.randn(num_experts,
                                    device="cuda",
@@ -764,6 +807,9 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
     elif routing_method_type == RoutingMethodType.Renormalize:
         permute_info, scores = routing_reference_renormalize(
             expert_logits, top_k, num_experts, padding)
+    elif routing_method_type == RoutingMethodType.Qwen3:
+        permute_info, scores = routing_reference_qwen3(expert_logits, top_k,
+                                                       num_experts, padding)
 
     args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
                     top_k, padding, hidden_states_fp4_bytes,
@@ -851,26 +897,12 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
                                                       args.gemm2_scales_global)
 
     output = torch.ops.trtllm.fp4_block_scale_moe_runner(
-        expert_logits,
-        routing_bias,
-        hidden_states_fp4,
-        hidden_states_scale_linear_fp4,
-        gemm1_weights_fp4_shuffled,
-        gemm1_scales_fp4_shuffled,
-        gemm2_weights_fp4_shuffled,
-        gemm2_scales_fp4_shuffled,
-        scale_c_fc1,
-        scale_gate_fc1,
-        scale_c_fc2,
-        num_experts,
-        top_k,
-        n_groups,
-        top_k_groups,
-        intermediate_size,
-        0,
-        num_experts,
-        routed_scaling,
-    )
+        expert_logits, routing_bias, hidden_states_fp4,
+        hidden_states_scale_linear_fp4, gemm1_weights_fp4_shuffled,
+        gemm1_scales_fp4_shuffled, gemm2_weights_fp4_shuffled,
+        gemm2_scales_fp4_shuffled, scale_c_fc1, scale_gate_fc1, scale_c_fc2,
+        num_experts, top_k, n_groups, top_k_groups, intermediate_size, 0,
+        num_experts, routed_scaling, routing_method_type)
 
     output_dequant_actual = output.to(torch.float)
 
