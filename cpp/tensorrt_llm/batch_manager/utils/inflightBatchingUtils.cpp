@@ -60,8 +60,9 @@ void moveFinishedContextRequestsToGeneration(ScheduledRequests& scheduledRequest
 
     auto& contextRequests = scheduledRequests.contextRequests;
     auto& generationRequests = scheduledRequests.generationRequests;
-    auto firstFinished = std::find_if(
-        contextRequests.begin(), contextRequests.end(), [](auto const& llmReq) { return llmReq->isContextFinished(); });
+
+    auto firstFinished = std::partition(contextRequests.begin(), contextRequests.end(),
+        [](auto const& llmReq) { return !llmReq->isContextFinished(); });
     TLLM_LOG_DEBUG(
         "Moving %ld finished context requests to generation.", std::distance(firstFinished, contextRequests.end()));
     generationRequests.insert(generationRequests.begin(), std::make_move_iterator(firstFinished),
