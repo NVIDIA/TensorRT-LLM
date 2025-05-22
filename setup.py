@@ -14,11 +14,13 @@
 # limitations under the License.
 import os
 import platform
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
 
 from setuptools import find_packages, setup
 from setuptools.dist import Distribution
+from setuptools_scm.git import GitWorkdir
 
 
 def parse_requirements(filename: os.PathLike):
@@ -71,6 +73,12 @@ def get_version():
 
     if version is None:
         raise RuntimeError(f"Could not set version from {version_file}")
+
+    if os.environ.get("TRTLLM_NIGHTLY_BUILD") == "1":
+        # Set as local version, e.g. '0.20.0rc2+nightly20250507.gb6cfe08'
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d")
+        git_hash = GitWorkdir.from_potential_worktree(".").node()
+        return f"{version}+nightly{ts}.g{git_hash}"
 
     return version
 
