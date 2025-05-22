@@ -62,7 +62,7 @@ def test_single_completion(client: openai.OpenAI, model_name):
     assert completion.id is not None
     assert completion.choices is not None and len(completion.choices) == 1
     completion_tokens = 5
-    prompt_tokens = 6
+    prompt_tokens = 5
     assert completion.usage == openai.types.CompletionUsage(
         completion_tokens=completion_tokens,
         prompt_tokens=prompt_tokens,
