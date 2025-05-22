@@ -359,6 +359,70 @@ def _(
                              dtype=output_dtype)
 
 
+class W4A16GemmRunner(TunableRunner):
+    _runner_dict: Dict[str, torch.classes.trtllm.W4A16GemmRunner] = dict()
+
+    def __init__(self, activation_dtype: torch.dtype, quant_mode: int):
+        instance_key = (activation_dtype, quant_mode)
+        if instance_key not in W4A16GemmRunner._runner_dict:
+            W4A16GemmRunner._runner_dict[
+                instance_key] = torch.classes.trtllm.W4A16GemmRunner(
+                    activation_dtype, quant_mode)
+        self._w4a16_gemm_runner = W4A16GemmRunner._runner_dict[instance_key]
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+    ) -> List[int]:
+        return list(range(self._w4a16_gemm_runner.get_num_configs()))
+
+    def forward(self,
+                inputs: List[torch.Tensor],
+                tactic: int = -1,
+                do_preparation: bool = False,
+                **kwargs) -> torch.Tensor:
+        activation, weights_packed, scales, bias = inputs
+
+        return self._w4a16_gemm_runner.run_gemm(
+            activation,
+            weights_packed,
+            scales,
+            bias,
+            kwargs["group_size"],
+            tactic,
+            kwargs[
+                "zeros"],  # NOTE if qunant_mode is 0 (FINEGRAINED_SCALE_ONLY), zeros is not used --> needs to be None
+        )
+
+
+@torch.library.custom_op("trtllm::w4a16_gemm", mutates_args=())
+def w4a16_gemm(input: torch.Tensor,
+               weight: torch.Tensor,
+               scales: torch.Tensor,
+               bias: torch.Tensor,
+               group_size: int,
+               quant_mode: int,
+               zeros: Optional[torch.Tensor] = None) -> torch.Tensor:
+
+    tuner = AutoTuner.get()
+    tuner.is_tuning_mode = True
+
+    tuning_config = TuningConfig(dynamic_tensors=(
+        # For tensor index 0 (input A), tune dimension 0 (M dimension)
+        (0, 0, ((8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1),
+                next_positive_power_of_2)), ))
+
+    w4a16_gemm_runner = W4A16GemmRunner(input.dtype, quant_mode)
+    kwargs = {"group_size": group_size, "zeros": zeros}
+    _, best_tactic = tuner.choose_one("trtllm::w4a16_gemm::gemm",
+                                      [w4a16_gemm_runner], tuning_config,
+                                      [input, weight, scales, bias], **kwargs)
+
+    return w4a16_gemm_runner(inputs=[input, weight, scales, bias],
+                             tactic=best_tactic,
+                             **kwargs)
+
+
 @torch.library.custom_op("trtllm::attention", mutates_args=())
 def attention(
     q: torch.Tensor,
