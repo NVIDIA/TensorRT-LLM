@@ -28,7 +28,6 @@
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 
-#ifndef _WIN32
 #ifdef ENABLE_CUFILE
 #include <cufile.h>
 #endif
@@ -36,7 +35,6 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-#endif
 
 #include <cstring>
 #include <string>
@@ -50,10 +48,6 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 
 static bool gpuToFilePosix(tr::ITensor::SharedPtr const& srcPtr, std::string const& filename)
 {
-#ifdef _WIN32
-    TLLM_LOG_ERROR("POSIX fallback not supported on Windows");
-    return false;
-#else
     int fd = ::open(filename.c_str(), O_CREAT | O_WRONLY, 0664);
     TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '%s' for writing (POSIX fallback)", filename.c_str());
 
@@ -70,15 +64,10 @@ static bool gpuToFilePosix(tr::ITensor::SharedPtr const& srcPtr, std::string con
 
     ::close(fd);
     return true;
-#endif
 }
 
 static bool fileToGpuPosix(tr::ITensor::SharedPtr const& dstPtr, std::string const& filename)
 {
-#ifdef _WIN32
-    TLLM_LOG_ERROR("POSIX fallback not supported on Windows");
-    return false;
-#else
     int fd = ::open(filename.c_str(), O_RDONLY);
     TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '%s' for reading (POSIX fallback)", filename.c_str());
 
@@ -95,7 +84,6 @@ static bool fileToGpuPosix(tr::ITensor::SharedPtr const& dstPtr, std::string con
 
     ::close(fd);
     return true;
-#endif
 }
 
 KVCacheTransferManager::KVCacheTransferManager(tr::BufferManager const& bufferManager)
@@ -125,7 +113,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 
     if (mode == executor::KvCacheTransferMode::DRAM)
     {
-        TLLM_LOG_INFO("Using DRAM-based copy (GPU <-> CPU) for this block.");
+        TLLM_LOG_DEBUG("Using DRAM-based copy (GPU <-> CPU) for this block.");
 
         // Iterate over all pools, partial-copy logic
         for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
@@ -170,7 +158,6 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
         return;
     }
 
-#ifndef _WIN32
     for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
     {
         auto srcPtr = computeBlockPointer(src, pools, poolIdx);
@@ -208,9 +195,13 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
                 "Failed to open '%s' for %s; fallback POSIX", filename.c_str(), (isOffload ? "writing" : "reading"));
 
             if (isOffload)
+            {
                 gpuToFilePosix(srcPtr, filename);
+            }
             else
+            {
                 fileToGpuPosix(dstPtr, filename);
+            }
             continue;
         }
 
@@ -267,15 +258,15 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
         TLLM_LOG_DEBUG("ENABLE_CUFILE=OFF, so fallback to POSIX for %s", filename.c_str());
         ::close(fd); // close the file opened for GDS
         if (isOffload)
+        {
             gpuToFilePosix(srcPtr, filename);
+        }
         else
+        {
             fileToGpuPosix(dstPtr, filename);
+        }
 #endif
     }
-#else
-    // On Windows, we cannot do GDS or POSIX fallback
-    TLLM_LOG_WARN("No GDS or POSIX fallback on Windows in this build.");
-#endif
 }
 
 void KVCacheTransferManager::onboard(BlockPtr const& offloadBlock, BlockPtr const& block,
