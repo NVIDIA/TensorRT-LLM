@@ -24,7 +24,7 @@
 cmake_minimum_required(VERSION 3.17)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules/set_ifndef.cmake)
 
-set_ifndef(TRTLLM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../tensorrt_llm)
+set_ifndef(TRTLLM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../)
 
 include_directories(${TRTLLM_DIR} ${TRTLLM_DIR}/cpp/include)
 

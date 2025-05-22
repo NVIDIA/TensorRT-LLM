@@ -393,8 +393,6 @@ examples/test_cli_flow.py::TestSantacoder::test_auto_dtype SKIP (https://nvbugs/
 examples/test_medusa.py::test_llama_medusa_1gpu[llama-3.1-8b] SKIP (https://nvbugs/5219535)
 examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-4-mini-instruct-fp8-bfloat16] SKIP (https://nvbugspro.nvidia.com/bug/5226339)
 examples/test_multimodal.py::test_llm_multimodal_general[neva-22b-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:True-nb:1] SKIP (https://nvbugs/5227342)
-perf/test_perf.py::test_perf[gpt_350m-cppmanager-plugin-float16-bs:32-input_output_len:60,20] SKIP (https://nvbugs/5228840)
-perf/test_perf.py::test_perf[gpt_350m-cppmanager-static_batching-plugin-float16-bs:32-input_output_len:60,20] SKIP (https://nvbugs/5228840)
 perf/test_perf.py::test_perf[t5-bench-float16-input_output_len:128,20] SKIP # https://nvbugspro.nvidia.com/bug/5207477
 perf/test_perf.py::test_perf[flan_t5_base-bench-float16-input_output_len:128,20] SKIP
 perf/test_perf.py::test_perf[flan_t5_large-bench-float16-input_output_len:128,20] SKIP

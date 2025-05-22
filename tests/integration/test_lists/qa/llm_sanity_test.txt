@@ -95,6 +95,7 @@ accuracy/test_cli_flow.py::TestPhi3Mini128kInstruct::test_auto_dtype
 accuracy/test_cli_flow.py::TestPhi3Small8kInstruct::test_auto_dtype
 accuracy/test_cli_flow.py::TestPhi3Small128kInstruct::test_auto_dtype
 accuracy/test_cli_flow.py::TestPhi3_5MiniInstruct::test_auto_dtype
+accuracy/test_cli_flow.py::TestPhi4MiniInstruct::test_auto_dtype
 accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_fp8
 accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[disable_norm_quant_fusion-disable_fused_quant]
 accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[enable_norm_quant_fusion-enable_fused_quant]
