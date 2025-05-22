@@ -17,10 +17,9 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
-from tensorrt_llm.llmapi.disagg_utils import (RouterConfig, 
+from tensorrt_llm.llmapi.disagg_utils import (ConditionalDisaggConfig,
                                               MetadataServerConfig,
-                                              ConditionalDisaggConfig, 
-                                              ServerRole)
+                                              RouterConfig)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
