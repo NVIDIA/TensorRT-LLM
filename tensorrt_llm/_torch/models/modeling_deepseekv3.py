@@ -273,7 +273,7 @@ class DeepseekV3Gate(DeepSeekV3MoeRoutingMethod):
         apply_routing: bool = False,
         moe_backend: str = 'CUTLASS',
     ):
-        super().__init__()
+        super().__init__(top_k=top_k)
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
                                                dtype=dtype),
                                    requires_grad=False)
