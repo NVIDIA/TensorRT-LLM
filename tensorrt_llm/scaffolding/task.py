@@ -70,6 +70,26 @@ class GenerationTask(Task):
 
 
 @dataclass
+class ChatTask(GenerationTask):
+    messages: list = None
+    tools = None
+    choice = None
+
+    @staticmethod
+    def create_from_prompt(messages: list, prompt: str, tools) -> "ChatTask":
+        task = ChatTask()
+        messages.append({"role": "user", "content": prompt})
+        task.messages = messages
+        task.tools = tools
+        return task
+
+    def create_scaffolding_output(self) -> "ScaffoldingOutput":
+        output = ScaffoldingOutput()
+        output.output_str = self.output_str
+        return output
+
+
+@dataclass
 class RewardTask(Task):
     # input field
     input_tokens: Optional[List[int]] = field(default=None)

@@ -10,7 +10,7 @@ from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
-from .task import GenerationTask, Task, TaskStatus
+from .task import ChatTask, GenerationTask, Task, TaskStatus
 
 ExecutorCls = GenerationExecutor
 
@@ -99,11 +99,27 @@ class OpenaiWorker(Worker):
             print('Openai client get exception: ' + str(e))
             return TaskStatus.WORKER_EXECEPTION
 
+    async def chat_handler(self, task: ChatTask) -> TaskStatus:
+        params = self.convert_task_params(task)
+        params["messages"] = task.messages
+
+        # Make the API call
+        try:
+            response = await self.async_client.chat.completions.create(**params)
+            self.fill_generation_task_with_response(task, response)
+            task.choice = response.choices[0]
+            return TaskStatus.SUCCESS
+
+        except Exception as e:
+            # Handle errors
+            print('Openai chat client get exception: ' + str(e))
+            return TaskStatus.WORKER_EXECEPTION
+
     def shutdown(self):
         # OpenAI client doesn't require explicit cleanup
         pass
 
-    task_handlers = {GenerationTask: generation_handler}
+    task_handlers = {GenerationTask: generation_handler, ChatTask: chat_handler}
 
 
 # worker inherit from OpenaiWorker
