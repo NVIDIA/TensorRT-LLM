@@ -8,7 +8,8 @@ from .llm_args import (BatchingType, CacheTransceiverConfig, CalibConfig,
                        DynamicBatchConfig, EagleDecodingConfig,
                        ExtendedRuntimePerfKnobConfig, KvCacheConfig,
                        LookaheadDecodingConfig, MedusaDecodingConfig,
-                       MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig)
+                       MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
+                       DraftTargetDecodingConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mpi_session import MpiCommSession
@@ -41,4 +42,5 @@ __all__ = [
     'DynamicBatchConfig',
     'CacheTransceiverConfig',
     'NGramDecodingConfig',
+    'DraftTargetDecodingConfig',
 ]

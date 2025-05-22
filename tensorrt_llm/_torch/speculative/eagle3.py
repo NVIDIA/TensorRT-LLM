@@ -11,12 +11,12 @@ from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 @dataclass
 class Eagle3Config(SpecConfig):
     spec_dec_name: str = "EAGLE3"
-    eagle_weights_path: Optional[str] = None
+    pytorch_weights_path: Optional[str] = None
     num_layers: int = 0
     hidden_size: int = 0
 
     def __post_init__(self):
-        if self.eagle_weights_path is None:
+        if self.pytorch_weights_path is None:
             raise ValueError("Path to EAGLE3 weights must be specified.")
 
         self.spec_dec_mode = SpeculativeDecodingMode.from_string(

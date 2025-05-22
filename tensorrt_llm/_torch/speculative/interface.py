@@ -16,6 +16,7 @@ class SpeculativeDecodingMode(IntEnum):
     MTP_EAGLE = auto()
     EAGLE3 = auto()
     NGRAM = auto()
+    DRAFT_TARGET = auto()
     NONE = auto()
 
     def is_mtp(self):
@@ -32,6 +33,9 @@ class SpeculativeDecodingMode(IntEnum):
 
     def is_none(self):
         return self == SpeculativeDecodingMode.NONE
+    
+    def is_draft_target(self):
+        return self == SpeculativeDecodingMode.DRAFT_TARGET
 
     def needs_kv_cache_rewind(self):
         return self.is_mtp()
@@ -41,6 +45,9 @@ class SpeculativeDecodingMode(IntEnum):
 
     def has_spec_decoder(self):
         return self.is_mtp() or self.is_eagle3()
+
+    def has_pytorch_model(self):
+        return self.is_eagle3() or self.is_draft_target()
 
     def extend_ctx(self, attention_backend: AttentionBackend):
         """
@@ -52,7 +59,7 @@ class SpeculativeDecodingMode(IntEnum):
         # Fixme: only trtllm attention backend supports eagle3 generation-phase kernels on blackwell.
         return (self.is_eagle3()
                 and not (isinstance(attention_backend, TrtllmAttention)
-                         and get_sm_version() == 100)) or self.is_ngram()
+                         and get_sm_version() == 100)) or self.is_ngram() or self.is_draft_target()
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":

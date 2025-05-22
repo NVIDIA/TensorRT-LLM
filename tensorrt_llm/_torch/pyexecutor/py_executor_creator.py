@@ -62,7 +62,7 @@ def create_py_executor(executor_config: ExecutorConfig,
     dist = MPIDist(mapping=mapping)
 
     spec_config = executor_config.speculative_config
-    has_draft_model_engine = isinstance(spec_config, Eagle3Config)
+    has_draft_model_engine = spec_config.spec_dec_mode.has_pytorch_model()
     has_ngram_drafter = isinstance(spec_config, NGramConfig)
 
     attn_runtime_features = AttentionRuntimeFeatures(
@@ -93,7 +93,7 @@ def create_py_executor(executor_config: ExecutorConfig,
         draft_spec_config.max_draft_tokens = 0
 
         draft_model_engine = PyTorchModelEngine(
-            spec_config.eagle_weights_path,
+            spec_config.pytorch_weights_path,
             pytorch_backend_config,
             batch_size=executor_config.max_batch_size,
             max_num_tokens=executor_config.max_num_tokens,

@@ -1,3 +1,4 @@
+from .draft_target import DraftTargetSampler, DraftTargetSpecMetadata
 from .eagle3 import Eagle3Sampler, Eagle3SpecMetadata
 from .mtp import MTPHiddenStatesManager, MTPSampler, MTPSpecMetadata
 from .ngram import NGramPoolManager
@@ -19,6 +20,10 @@ def get_spec_metadata(spec_config,
                                   max_num_requests=max_num_requests,
                                   num_layers=spec_config.num_layers,
                                   hidden_size=spec_config.hidden_size)
+    elif spec_config.spec_dec_mode.is_draft_target():
+        return DraftTargetSpecMetadata(max_draft_tokens=spec_config.max_draft_tokens,
+                                      spec_dec_mode=spec_config.spec_dec_mode,
+                                      max_num_requests=max_num_requests)
     else:
         return None
 
@@ -46,6 +51,8 @@ def get_spec_decoder(max_seq_len, spec_config):
         return MTPSampler(max_seq_len, spec_config)
     if spec_config.spec_dec_mode.is_eagle3():
         return Eagle3Sampler(max_seq_len)
+    elif spec_config.spec_dec_mode.is_draft_target():
+        return DraftTargetSampler(max_seq_len)
     else:
         return None
 

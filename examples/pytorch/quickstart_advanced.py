@@ -4,7 +4,7 @@ from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
-                                 MTPDecodingConfig, NGramDecodingConfig)
+                                 MTPDecodingConfig, NGramDecodingConfig, DraftTargetDecodingConfig)
 
 example_prompts = [
     "Hello, my name is",
@@ -12,7 +12,7 @@ example_prompts = [
     "The capital of France is",
     "The future of AI is",
 ]
-
+# python3 quickstart_advanced.py --model_dir /base/evian-70b/evian3-3b-instruct-final-hf_vv1/ --max_batch_size 1 --disable_kv_cache_reuse --disable_overlap_scheduler --spec_decode_algo draft_target --spec_decode_nextn 5 --eagle_model_dir /base/evian-70b/evian2-8b-instruct_vhf-8c22764-b/
 
 def add_llm_args(parser):
     parser.add_argument('--model_dir',
@@ -155,7 +155,11 @@ def setup_llm(args):
     elif spec_decode_algo == "EAGLE3":
         spec_config = EagleDecodingConfig(
             max_draft_len=args.spec_decode_nextn,
-            pytorch_eagle_weights_path=args.eagle_model_dir)
+            pytorch_weights_path=args.eagle_model_dir)
+    elif spec_decode_algo == "DRAFT_TARGET":
+        spec_config = DraftTargetDecodingConfig(
+            max_draft_len=args.spec_decode_nextn,
+            pytorch_weights_path=args.eagle_model_dir)
     elif spec_decode_algo == "NGRAM":
         spec_config = NGramDecodingConfig(
             prompt_lookup_num_tokens=args.spec_decode_nextn,
