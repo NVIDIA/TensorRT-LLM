@@ -7,6 +7,7 @@ from tensorrt_llm.scaffolding import TaskStatus, Worker
 from .mcp_task import MCPCallTask, MCPListTask
 from .mcp_utils import MCPClient
 
+
 class MCPWorker(Worker):
 
     def __init__(
@@ -36,7 +37,7 @@ class MCPWorker(Worker):
                 response = await mcp_client.call_tool(tool_name, args)
                 task.output_str = response.content[0].text
                 return TaskStatus.SUCCESS
-            
+
     async def list_handler(self, task: MCPListTask) -> TaskStatus:
         result_tools = []
         for mcp_client in self.mcp_clients:

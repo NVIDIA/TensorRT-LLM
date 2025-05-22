@@ -41,7 +41,6 @@ class MCPClient:
         await self.exit_stack.aclose()
 
 
-
 async def main():
     if len(sys.argv) < 2:
         print(
