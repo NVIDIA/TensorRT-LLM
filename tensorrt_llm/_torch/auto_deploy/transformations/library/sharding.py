@@ -31,6 +31,7 @@ from ...utils.node_utils import (
     identify_regions_between_residuals,
     is_linear_op,
     is_op,
+    num_users_of_weight_node,
 )
 from ...utils.quantization_utils import QuantizationImpl
 from .._graph import canonicalize_graph
@@ -86,6 +87,12 @@ def _insert_sharded_matmul(
     ) -> torch.Tensor:
         return torch.tensor_split(t, ws, dim=d)[r]
 
+    num_users = num_users_of_weight_node(node)
+    if num_users > 1:
+        ad_logger.warning(
+            f"Weight node {node} has {num_users} users. This is not supported for sharding. Skipping."
+        )
+        return
     # get weight and bias key
     weight_key, bias_key = extract_param_names_from_lin_node(node)
 
