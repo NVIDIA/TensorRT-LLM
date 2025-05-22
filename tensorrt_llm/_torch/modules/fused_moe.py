@@ -1521,6 +1521,7 @@ class FusedMoE(nn.Module):
             use_fp8_block_scaling=use_fp8_block_scaling,
             use_w4a8_group_scaling=use_w4a8_group_scaling,
             min_latency_mode=cutlass_min_latency_mode,
+            tune_max_num_tokens=self.tune_max_num_tokens,
         )
 
         if cutlass_min_latency_mode:

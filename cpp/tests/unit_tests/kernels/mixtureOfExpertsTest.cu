@@ -1869,7 +1869,8 @@ TYPED_TEST(LargeMixtureOfExpertsTest, RunProfiler)
             this->FP8 ? nvinfer1::DataType::kFP8 : nvinfer1::DataType::kHALF,
             this->FP8 ? nvinfer1::DataType::kFP8 : nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k,
             this->DEFAULT_HIDDEN_SIZE, this->DEFAULT_HIDDEN_SIZE * 4, this->mGroupSize,
-            tensorrt_llm::ActivationType::Geglu, false, this->mUseLora, false, MOEParallelismConfig{});
+            tensorrt_llm::ActivationType::Geglu, false, this->mUseLora, /*min_latency_mode=*/false,
+            /*need_weights=*/true, MOEParallelismConfig{});
 
         auto ws_size = backend.getWorkspaceSize(128);
 
@@ -1877,12 +1878,12 @@ TYPED_TEST(LargeMixtureOfExpertsTest, RunProfiler)
 
         for (int64_t num_tokens : {1, 128})
         {
-            backend.prepare(num_tokens, workspace, this->mStream->get());
+            backend.prepare(num_tokens, workspace, /*expert_weights=*/nullptr, this->mStream->get());
             for (auto const& tactic : this->getAllTileConfigsToTest())
             {
                 backend.runProfiler(num_tokens,
                     gemm_to_profile == GemmProfilerBackend::GemmToProfile::GEMM_1 ? tactic.first : tactic.second,
-                    workspace, this->mStream->get());
+                    workspace, /*expert_weights=*/nullptr, this->mStream->get());
             }
         }
         ASSERT_EQ(cudaStreamSynchronize(this->mStream->get()), cudaSuccess);
@@ -1910,13 +1911,13 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
         {
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
                 nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, mGroupSize, {}, false,
-                mUseLora, false, MOEParallelismConfig{1, 0, ep, ep - 1});
+                mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, MOEParallelismConfig{1, 0, ep, ep - 1});
 
             auto ws_size = backend.getWorkspaceSize(num_tokens);
             auto workspace = this->allocBuffer<char>(ws_size);
             int64_t num_experts_per_node = num_experts / ep;
 
-            backend.prepare(num_tokens, workspace, mStream->get());
+            backend.prepare(num_tokens, workspace, /*expert_weights=*/nullptr, mStream->get());
 
             auto workspaces = backend.getProfilerWorkspaces(num_tokens, getSMVersion() >= 90 && getSMVersion() < 120);
 #define GET_WS_PTR(type, name) auto* name = reinterpret_cast<type>(workspace + workspaces.at(#name).second)

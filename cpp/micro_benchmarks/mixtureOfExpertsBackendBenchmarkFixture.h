@@ -625,11 +625,12 @@ public:
         GemmProfilerBackend profiler;
         profiler.init(mMoERunner, gemm_to_profile, typeToDtypeID<DataType>(), typeToDtypeID<WeightType>(),
             typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mInterSize, mGroupSize, mActType, mUseBias,
-            mUseLora, /*min_latency_mode=*/false, parallelism_config);
+            mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, parallelism_config);
         auto workspace_size = profiler.getWorkspaceSize(mTotalTokens);
         auto workspace = bufferManager->gpu(workspace_size);
 
-        profiler.prepare(mTotalTokens, static_cast<char*>(workspace->data()), streamPtr->get());
+        profiler.prepare(
+            mTotalTokens, static_cast<char*>(workspace->data()), /*expert_weights=*/nullptr, streamPtr->get());
 
         float best_time = INFINITY;
         int best_idx = -1;
@@ -645,7 +646,8 @@ public:
                 {
                     ::nvtx3::scoped_range nvtx(tensorrt_llm::common::nvtx::nextColor(), "Tactic Profiling Warm-Up");
                     // Warm-Up run
-                    profiler.runProfiler(mTotalTokens, t, static_cast<char*>(workspace->data()), streamPtr->get());
+                    profiler.runProfiler(mTotalTokens, t, static_cast<char*>(workspace->data()),
+                        /*expert_weights=*/nullptr, streamPtr->get());
                     check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
                 }
 
@@ -662,7 +664,8 @@ public:
                             "Tactic Profiling Iteration " + std::to_string(iter));
 
                         check_cuda_error(cudaEventRecord(mStartEvent, streamPtr->get()));
-                        profiler.runProfiler(mTotalTokens, t, static_cast<char*>(workspace->data()), streamPtr->get());
+                        profiler.runProfiler(mTotalTokens, t, static_cast<char*>(workspace->data()),
+                            /*expert_weights=*/nullptr, streamPtr->get());
                         check_cuda_error(cudaEventRecord(mEndEvent, streamPtr->get()));
                         check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
                     }
