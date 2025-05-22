@@ -255,6 +255,19 @@ def initialize_dummy_weights(
         elif torch.is_floating_point(param):
             param.uniform_(low, high, generator=generator)
 
+    def _set_next_layer_layernorm(model):
+        if not hasattr(model, 'layers'):
+            return
+
+        for idx, layer in enumerate(model.layers):
+            if idx == len(model.layers) - 1:
+                layer.next_layer_layernorm = model.norm
+            else:
+                layer.next_layer_layernorm = model.layers[idx +
+                                                          1].input_layernorm
+
+    _set_next_layer_layernorm(model.model)
+
 
 KV_CACHE_MANAGER_KEY = 'kv_cache_manager'
 DRAFT_KV_CACHE_MANAGER_KEY = 'draft_kv_cache_manager'
@@ -434,10 +447,10 @@ class PyTorchModelEngine(ModelEngine):
             self.previous_kv_lens_offsets_cuda = torch.zeros((batch_size, ),
                                                              dtype=torch.int,
                                                              device='cuda')
-            self.is_mtp = self.spec_config.spec_dec_mode.is_mtp()
+            self.without_logits = self.spec_config.spec_dec_mode.without_logits()
             self.max_draft_len = spec_config.max_draft_tokens
         else:
-            self.is_mtp = False
+            self.without_logits = False
             self.max_draft_len = 0
         self.iter_counter = 0
 
@@ -733,6 +746,7 @@ class PyTorchModelEngine(ModelEngine):
             return get_spec_metadata(
                 self.spec_config,
                 self.batch_size,
+                max_num_tokens=self.max_num_tokens,
                 spec_resource_manager=spec_resource_manager)
 
         if self.spec_metadata is not None:
@@ -740,6 +754,7 @@ class PyTorchModelEngine(ModelEngine):
         self.spec_metadata = get_spec_metadata(
             self.spec_config,
             self.batch_size,
+            max_num_tokens=self.max_num_tokens,
             spec_resource_manager=spec_resource_manager)
         return self.spec_metadata
 
@@ -937,6 +952,12 @@ class PyTorchModelEngine(ModelEngine):
 
                 model.load_weights(weights)
 
+                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
+                ):
+                    weights = load_weights(self.spec_config.draft_model_path,
+                                           self.mapping)
+                    model.load_draft_weights(weights)
+
             elif load_format == LoadFormat.DUMMY:
                 initialize_dummy_weights(model)
 
@@ -1071,7 +1092,7 @@ class PyTorchModelEngine(ModelEngine):
         if new_tensors_device is not None:
             # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
             new_tokens_device = new_tensors_device.new_tokens
-            if self.is_mtp:
+            if self.without_logits:
                 assert isinstance(new_tensors_device, SampleStateTensorsMTP)
                 new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
                 next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
@@ -1929,7 +1950,7 @@ class PyTorchModelEngine(ModelEngine):
     def _forward_step(self, inputs: Dict[str, Any],
                       gather_ids: Optional[torch.Tensor]) -> Dict[str, Any]:
         inputs = self._preprocess_inputs(inputs)
-        if self.is_mtp:
+        if self.without_logits:
             outputs = self.model_forward(**inputs)
             return outputs
 

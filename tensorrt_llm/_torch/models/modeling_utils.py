@@ -21,6 +21,7 @@ from ..attention_backend import AttentionMetadata
 from ..distributed.communicator import pp_recv, pp_send
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
+from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding, LMHead
 from ..modules.fused_moe import FusedMoE
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
@@ -215,6 +216,63 @@ def forward_before_send(forward_fn):
 
     forward_before_send_fn.__wrapped_by_forward_before_send__ = True
     return forward_before_send_fn
+
+
+class MissingLayer(torch.nn.Identity):
+    """Signature of missing layers in pipeline parallel setup."""
+
+    def __init__(self):
+        super().__init__()
+
+
+class MissingDecoderLayer(MissingLayer, DecoderLayer):
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return hidden_states, residual
+
+    def is_missing(self) -> bool:
+        return True
+
+
+def missing_layer_parameter(name: str, model: torch.nn.Module) -> bool:
+    """ Check if a layer parameter is missing if when pp is enabled.
+        A layer parameter is missing if either:
+            1. The model itself is a MissingLayer, or
+            2. It has a submodule that is a MissingLayer.
+    """
+    if isinstance(model, MissingLayer):
+        return True
+
+    return any(
+        name.startswith(missing_layer_name)
+        for missing_layer_name in _get_missing_layer_names(model))
+
+
+# Static cache to store missing layer names for each model instance
+_model_to_missing_layer_names: Dict[int, List[str]] = {}
+
+
+def _get_missing_layer_names(model: torch.nn.Module) -> List[str]:
+    """ Get the missing layer names of a given model when pp is enabled.
+    """
+    model_id = id(model)
+    if model_id in _model_to_missing_layer_names:
+        return _model_to_missing_layer_names[model_id]
+
+    missing_layer_names = []
+    for name, module in model.named_modules():
+        if isinstance(module, MissingLayer):
+            # Add trailing dot to ensure exact prefix matching
+            missing_layer_names.append(name + '.')
+
+    # Cache the result
+    _model_to_missing_layer_names[model_id] = missing_layer_names
+    return missing_layer_names
 
 
 class PPInitCaller(type):
@@ -528,8 +586,8 @@ class DecoderModelForCausalLM(nn.Module,
             return_context_logits,
         )
 
-    def load_weights(self, weights: Dict):
-        _load_weights_impl(self, weights)
+    def load_weights(self, weights: Dict, skip_modules: List[str] = []):
+        _load_weights_impl(self, weights, skip_modules)
 
     def infer_max_seq_len(self) -> int:
         # Modified from tensorrt_llm/builder.py _init_max_seq_len
@@ -633,6 +691,7 @@ def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
 
 def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        weights: Dict,
+                       skip_modules: List[str] = [],
                        params_map: Optional[Dict[str, str]] = None):
     if not hasattr(model, 'model_config') or not isinstance(
             model.model_config, ModelConfig):
@@ -665,6 +724,10 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
     for name, module in tqdm(list(model.named_modules()),
                              desc="Loading weights"):
         if len(module._parameters) > 0:
+            # skip load weights if module is in skip_modules
+            if any(skip_module in name for skip_module in skip_modules):
+                continue
+
             # skip load weights if tie word embeddings is enabled and layer is lm_head
             if model.config.tie_word_embeddings and name.startswith("lm_head"):
                 continue

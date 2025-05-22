@@ -41,8 +41,8 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
 {
     CUtensorMap desc{};
     // The data type.
-    CUtensorMapDataType tmaDataFormat;
-    if (dtype == tg::Dtype::E4m3)
+    CUtensorMapDataType tmaDataFormat{CU_TENSOR_MAP_DATA_TYPE_FLOAT32};
+    if (dtype == tg::Dtype::E4m3 || dtype == tg::Dtype::MxE4m3)
     {
         tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_UINT8;
     }
@@ -64,7 +64,7 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
     }
     else
     {
-        std::cerr << "Unexpected dtype " << static_cast<int32_t>(dtype) << std::endl;
+        std::cerr << "buildNdTmaDescriptor: unexpected dtype " << static_cast<int32_t>(dtype) << std::endl;
         assert(false);
     }
 
@@ -87,7 +87,7 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
         }
         else
         {
-            std::cerr << "Unexpected tileKSizeInBytes " << tileKSizeInBytes << std::endl;
+            std::cerr << "buildNdTmaDescriptor: unexpected tileKSizeInBytes " << tileKSizeInBytes << std::endl;
             assert(false);
         }
     }
@@ -187,13 +187,13 @@ inline CUtensorMap buildSfTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
 {
     CUtensorMap desc{};
     CUtensorMapDataType tmaDataFormat;
-    if (dtype == tg::Dtype::E4m3)
+    if (dtype == tg::Dtype::E4m3 || dtype == tg::Dtype::UE8m0)
     {
         tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_UINT8;
     }
     else
     {
-        std::cerr << "Unexpected dtype " << static_cast<int32_t>(dtype) << std::endl;
+        std::cerr << "buildSfTmaDescriptor: unexpected dtype " << static_cast<int32_t>(dtype) << std::endl;
         assert(false);
     }
 

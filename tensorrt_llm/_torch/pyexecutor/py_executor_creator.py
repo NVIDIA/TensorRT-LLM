@@ -12,7 +12,7 @@ from tensorrt_llm.quantization import KV_CACHE_QUANT_ALGO_LIST
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist
-from ..speculative import Eagle3Config, NGramConfig, get_spec_resource_manager
+from ..speculative import NGramConfig, get_spec_resource_manager
 from ._util import (create_kv_cache_manager, create_py_executor_instance,
                     estimate_max_kv_cache_tokens, get_token_num_for_estimation,
                     instantiate_sampler, is_mla)
@@ -62,7 +62,9 @@ def create_py_executor(executor_config: ExecutorConfig,
     dist = MPIDist(mapping=mapping)
 
     spec_config = executor_config.speculative_config
-    has_draft_model_engine = isinstance(spec_config, Eagle3Config)
+    has_draft_model_engine = False
+    if spec_config is not None:
+        has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
     has_ngram_drafter = isinstance(spec_config, NGramConfig)
 
     attn_runtime_features = AttentionRuntimeFeatures(
@@ -71,6 +73,7 @@ def create_py_executor(executor_config: ExecutorConfig,
         has_speculative_draft_tokens=has_draft_model_engine
         or has_ngram_drafter,
     )
+    print("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
     model_engine = PyTorchModelEngine(
         checkpoint_dir,
@@ -93,7 +96,7 @@ def create_py_executor(executor_config: ExecutorConfig,
         draft_spec_config.max_draft_tokens = 0
 
         draft_model_engine = PyTorchModelEngine(
-            spec_config.eagle_weights_path,
+            spec_config.draft_model_path,
             pytorch_backend_config,
             batch_size=executor_config.max_batch_size,
             max_num_tokens=executor_config.max_num_tokens,
