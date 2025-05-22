@@ -1107,18 +1107,14 @@ class PyTorchModelEngine(ModelEngine):
         # will contain previous batch incices of generation requests
         previous_batch_indices = []
         previous_pos_indices = []
+        request_ids_with_previous_batch = []
+        num_extend_reqs_wo_previous_batch = 0
         for request in extend_requests:
             if next_draft_tokens_device is None or request.py_batch_idx is None:
                 # get token ids, including input token ids and draft token ids
-                if next_draft_tokens_device is None:
-                    # skip dummy generation requests
-                    # if next_draft_tokens_device is not None, but the batch index is None,
-                    # it means the generation requests are dummy requests. For such cases,
-                    # we do not update the input_ids and draft_tokens and just use the tokens
-                    # from the previous batch.
-                    input_ids.append(request.get_last_tokens(0))
-                    input_ids.extend(request.py_draft_tokens)
-                    draft_tokens.extend(request.py_draft_tokens)
+                input_ids.append(request.get_last_tokens(0))
+                input_ids.extend(request.py_draft_tokens)
+                draft_tokens.extend(request.py_draft_tokens)
                 # get other ids and lengths
                 num_draft_tokens = len(request.py_draft_tokens)
                 past_seen_token_num = request.max_beam_num_tokens - 1
@@ -1134,10 +1130,13 @@ class PyTorchModelEngine(ModelEngine):
                         range(past_seen_token_num,
                               past_seen_token_num + 1 + num_draft_tokens)))
                 num_cached_tokens_per_seq.append(past_seen_token_num)
+                request_ids.append(request.py_request_id)
+                # update batch index
                 request.py_batch_idx = batch_idx
                 batch_idx += 1
+                num_extend_reqs_wo_previous_batch += 1
             else:
-                # batch index
+                # update batch index
                 previous_batch_idx = request.py_batch_idx
                 request.py_batch_idx = batch_idx
                 batch_idx += 1
@@ -1162,8 +1161,10 @@ class PyTorchModelEngine(ModelEngine):
                 num_cached_tokens_per_seq.append(past_seen_token_num +
                                                  self.max_draft_len + 1)
                 prompt_lengths.append(request.py_prompt_len)
+                request_ids_with_previous_batch.append(request.py_request_id)
 
-            request_ids.append(request.py_request_id)
+        # move requests with previous batch to the end of the list
+        request_ids.extend(request_ids_with_previous_batch)
 
         sequence_lengths.extend([1] * len(generation_requests))
         gather_ids.extend(
@@ -1196,12 +1197,20 @@ class PyTorchModelEngine(ModelEngine):
             batch_idx += 1
 
         num_tokens = len(input_ids)
+        num_draft_tokens = len(draft_tokens)
         previous_batchs = len(previous_batch_indices)
+        # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
             input_ids = torch.tensor(input_ids,
                                      dtype=torch.int,
                                      pin_memory=True)
             self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
+        if num_draft_tokens > 0:
+            draft_tokens = torch.tensor(draft_tokens,
+                                        dtype=torch.int,
+                                        pin_memory=True)
+            self.draft_tokens_cuda[:len(draft_tokens)].copy_(draft_tokens,
+                                                             non_blocking=True)
         if next_draft_tokens_device is not None:
             if len(previous_batch_indices) > 0:
                 previous_batch_indices = torch.tensor(previous_batch_indices,
@@ -1220,26 +1229,39 @@ class PyTorchModelEngine(ModelEngine):
                                                  non_blocking=True)
                 # previous draft tokens
                 previous_batch_draft_tokens = previous_batchs * self.max_draft_len
-                self.draft_tokens_cuda[:previous_batch_draft_tokens].copy_(
-                    next_draft_tokens_device[
+                self.draft_tokens_cuda[
+                    num_draft_tokens:num_draft_tokens +
+                    previous_batch_draft_tokens].copy_(next_draft_tokens_device[
                         self.previous_batch_indices_cuda[:previous_batchs], :].
-                    flatten(),
-                    non_blocking=True)
+                                                       flatten(),
+                                                       non_blocking=True)
                 # prepare data for the preprocess inputs
                 kv_len_offsets_device = new_tokens_lens_device - self.max_draft_len - 1
+                pre_tokens_start_idx = num_extend_reqs_wo_previous_batch * (
+                    1 + self.max_draft_len)
+                pre_tokens_end_idx = pre_tokens_start_idx + previous_batch_tokens
+                pre_batch_start_idx = num_extend_reqs_wo_previous_batch
+                pre_batch_end_idx = pre_batch_start_idx + previous_batchs
                 previous_pos_indices = torch.tensor(previous_pos_indices,
                                                     dtype=torch.int,
                                                     pin_memory=True)
-                self.previous_pos_indices_cuda[:previous_batch_tokens].copy_(
-                    previous_pos_indices, non_blocking=True)
-                self.previous_pos_id_offsets_cuda[:previous_batch_tokens].copy_(
-                    new_tokens_lens_device[
-                        self.previous_pos_indices_cuda[:previous_batch_tokens]],
-                    non_blocking=True)
-                self.previous_kv_lens_offsets_cuda[:previous_batchs].copy_(
-                    kv_len_offsets_device[
-                        self.previous_batch_indices_cuda[:previous_batchs]],
-                    non_blocking=True)
+                self.previous_pos_indices_cuda[
+                    pre_tokens_start_idx:pre_tokens_end_idx].copy_(
+                        previous_pos_indices, non_blocking=True)
+                self.previous_pos_id_offsets_cuda[
+                    pre_tokens_start_idx:pre_tokens_end_idx].copy_(
+                        new_tokens_lens_device[self.previous_pos_indices_cuda[
+                            pre_tokens_start_idx:pre_tokens_end_idx]],
+                        non_blocking=True)
+                self.previous_kv_lens_offsets_cuda[
+                    pre_batch_start_idx:pre_batch_end_idx].copy_(
+                        kv_len_offsets_device[
+                            self.previous_batch_indices_cuda[:previous_batchs]],
+                        non_blocking=True)
+                # for the requests that do not have previous batch, set the previous_pos_id_offsets and
+                # previous_kv_lens_offsets to zeros to skip the value changes in _preprocess_inputs
+                self.previous_pos_id_offsets_cuda[:pre_tokens_start_idx] *= 0
+                self.previous_kv_lens_offsets_cuda[:pre_batch_start_idx] *= 0
             else:
                 # change the data to zeros to skip the value changes in _preprocess_inputs
                 self.previous_pos_id_offsets_cuda *= 0
@@ -1310,12 +1332,6 @@ class PyTorchModelEngine(ModelEngine):
 
         if spec_metadata is not None:
             total_draft_lens = sum(draft_lens)
-            if len(draft_tokens) > 0:
-                draft_tokens = torch.tensor(draft_tokens,
-                                            dtype=torch.int,
-                                            pin_memory=True)
-                self.draft_tokens_cuda[:len(draft_tokens)].copy_(
-                    draft_tokens, non_blocking=True)
             spec_metadata.draft_tokens = self.draft_tokens_cuda[:
                                                                 total_draft_lens]
             spec_metadata.request_ids = request_ids
