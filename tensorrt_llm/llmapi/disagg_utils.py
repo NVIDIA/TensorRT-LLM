@@ -102,7 +102,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
     gen_router_config = extract_router_config(generation_servers)
     ctx_router_config.server_role = ServerRole.CONTEXT
     gen_router_config.server_role = ServerRole.GENERATION
-    
+
     conditional_disagg_config = ConditionalDisaggConfig(
         **conditional_disagg_config) if conditional_disagg_config else None
 
