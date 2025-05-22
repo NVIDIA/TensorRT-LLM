@@ -314,7 +314,7 @@ class TorchSampler(Sampler):
                     num_accepted += 1
                     new_token = new_tokens_list[token_idx + num_accepted]
                     num_tokens = request.add_new_token(new_token, beam_idx)
-                    new_tokens.append(num_tokens)
+                    new_tokens.append(num_tokens)  # `num_tokens`->`new_token`
 
                     if self._handle_stop_criteria(request, new_token,
                                                   num_tokens, beam_idx):

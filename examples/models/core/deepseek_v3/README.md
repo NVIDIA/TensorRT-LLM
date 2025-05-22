@@ -1,7 +1,7 @@
 # DeepSeek‑V3 and DeepSeek-R1
 
 This guide walks you through the examples to run the DeepSeek‑V3/DeepSeek-R1 models using NVIDIA's TensorRT-LLM framework with the PyTorch backend.
-**DeepSeek-R1 and DeepSeek-V3 share exact same model architecture other than weights differences, and share same code path in TensorRT-LLM, for brevity we only provide one model example, the example command to be used interchangeablely by only replacing the model name to the other one**.
+**DeepSeek-R1 and DeepSeek-V3 share exact same model architecture other than weights differences, and share same code path in TensorRT-LLM, for brevity we only provide one model example, the example command to be used interchangeably by only replacing the model name to the other one**.
 
 To benchmark the model with best configurations, refer to [DeepSeek R1 benchmarking blog](../../../../docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md).
 
@@ -508,6 +508,25 @@ DeepGEMM-related behavior can be controlled by the following environment variabl
 | `TRTLLM_DG_JIT_DEBUG` | When set to `1`, enable JIT debugging. |
 | `TRTLLM_DG_JIT_USE_NVCC` | When set to `1`, use NVCC instead of NVRTC to compile the kernel, which has slightly better performance but requires CUDA Toolkit (>=12.3) and longer compilation time.|
 | `TRTLLM_DG_JIT_DUMP_CUBIN` | When set to `1`, dump the cubin file. This is only effective with NVRTC since NVCC will always dump the cubin file. NVRTC-based JIT will store the generated kernels in memory by default. If you want to persist the kernels across multiple runs, you can either use this variable or use NVCC. |
+
+#### MOE GEMM Optimization
+
+For Mixture of Experts (MOE) GEMM operations, TensorRT-LLM's DeepGEMM includes the optimized `fp8_gemm_kernel_swapAB` kernel. This kernel is automatically selected based on the input dimensions and GPU type:
+
+- On H20 GPUs (SM count = 78): Uses `fp8_gemm_kernel_swapAB` when the expected m_per_expert is less than 64
+- On H100/H200 GPUs: Uses `fp8_gemm_kernel_swapAB` when the expected m_per_expert is less than 32
+- Otherwise, uses the original `fp8_gemm_kernel`
+
+This automatic selection provides better performance for different workload sizes across various Hopper GPUs. In our test cases, the `fp8_gemm_kernel_swapAB` kernel achieves up to 1.8x speedup for individual kernels on H20 GPUs and up to 1.3x speedup on H100 GPUs.
+
+#### Dense GEMM Optimization
+
+The same optimization has been extended to Dense GEMM operations. For regular dense matrix multiplications:
+
+- On all Hopper GPUs (H20, H100, H200): Uses `fp8_gemm_kernel_swapAB` when the m is less than 32
+- Otherwise, uses the original `fp8_gemm_kernel`
+
+This optimization delivers significant performance improvements for small batch sizes. Our benchmarks show that the `fp8_gemm_kernel_swapAB` kernel achieves up to 1.7x speedup on H20 GPUs and up to 1.8x speedup on H100 GPUs for certain matrix dimensions.
 
 ```bash
 #single-node

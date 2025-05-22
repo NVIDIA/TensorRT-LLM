@@ -132,6 +132,15 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("micro_batch_id", &tle::InflightBatchingStats::microBatchId)
         .def_readwrite("avg_num_decoded_tokens_per_iter", &tle::InflightBatchingStats::avgNumDecodedTokensPerIter);
 
+    py::class_<tle::SpecDecodingStats>(m, "SpecDecodingStats")
+        .def(py::init<>())
+        .def_readwrite("num_draft_tokens", &tle::SpecDecodingStats::numDraftTokens)
+        .def_readwrite("num_accepted_tokens", &tle::SpecDecodingStats::numAcceptedTokens)
+        .def_readwrite("num_requests_with_draft_tokens", &tle::SpecDecodingStats::numRequestsWithDraftTokens)
+        .def_readwrite("acceptance_length", &tle::SpecDecodingStats::acceptanceLength)
+        .def_readwrite("iter_latency_ms", &tle::SpecDecodingStats::iterLatencyMS)
+        .def_readwrite("draft_overhead", &tle::SpecDecodingStats::draftOverhead);
+
     py::class_<tle::IterationStats>(m, "IterationStats")
         .def(py::init<>())
         .def_readwrite("timestamp", &tle::IterationStats::timestamp)
@@ -150,6 +159,7 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("cross_kv_cache_stats", &tle::IterationStats::crossKvCacheStats)
         .def_readwrite("static_batching_stats", &tle::IterationStats::staticBatchingStats)
         .def_readwrite("inflight_batching_stats", &tle::IterationStats::inflightBatchingStats)
+        .def_readwrite("specdec_stats", &tle::IterationStats::specDecStats)
         .def("to_json_str",
             [](tle::IterationStats const& iterationStats)
             { return tle::JsonSerialization::toJsonStr(iterationStats); });

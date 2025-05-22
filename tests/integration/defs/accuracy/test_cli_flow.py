@@ -260,6 +260,15 @@ class TestPhi3_5MiniInstruct(CliFlowAccuracyTestHarness):
         self.run(dtype='auto')
 
 
+class TestPhi4MiniInstruct(CliFlowAccuracyTestHarness):
+    MODEL_NAME = "microsoft/Phi-4-mini-instruct"
+    MODEL_PATH = f"{llm_models_root()}/Phi-4-mini-instruct"
+    EXAMPLE_FOLDER = "models/core/phi"
+
+    def test_auto_dtype(self):
+        self.run(tasks=[MMLU(self.MODEL_NAME)], dtype='auto')
+
+
 # Long sequence length test:
 # Model FP16 7B + 32K tokens in KV cache = 14 * 1024 MB + 32K * 0.5 MB = 30720 MB + scratch memory
 @pytest.mark.skip_less_device_memory(40000)

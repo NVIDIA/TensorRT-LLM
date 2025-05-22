@@ -491,10 +491,34 @@ def main(args):
             f"Using {'Python' if args.use_py_session else 'C++'} session")
 
         runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
-        runner_kwargs = dict(engine_dir=args.engine_dir,
-                             rank=runtime_rank,
-                             debug_mode=args.debug_mode,
-                             gpu_weights_percent=args.gpu_weights_percent)
+        runner_kwargs = dict(
+            engine_dir=args.engine_dir,
+            rank=runtime_rank,
+            debug_mode=args.debug_mode,
+            gpu_weights_percent=args.gpu_weights_percent,
+            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc,
+        )
+        if not args.use_py_session:
+            runner_kwargs.update(
+                lora_dir=args.lora_dir,
+                lora_ckpt_source=args.lora_ckpt_source,
+                max_batch_size=max_batch_size,
+                max_input_len=test_token_num,
+                max_output_len=output_len,
+                max_beam_width=num_beams,
+                max_attention_window_size=max_attention_window_size,
+                sink_token_length=sink_token_length,
+                max_tokens_in_paged_kv_cache=args.max_tokens_in_paged_kv_cache,
+                kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
+                kv_cache_free_gpu_memory_fraction=args.
+                kv_cache_free_gpu_memory_fraction,
+                enable_chunked_context=args.enable_chunked_context,
+                multi_block_mode=args.multi_block_mode,
+                cuda_graph_mode=args.cuda_graph_mode,
+                gather_generation_logits=args.eval_ppl,
+                use_gpu_direct_storage=args.use_gpu_direct_storage,
+            )
+
         if args.medusa_choices is not None:
             args.medusa_choices = ast.literal_eval(args.medusa_choices)
             assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
@@ -523,38 +547,16 @@ def main(args):
         if args.prompt_lookup_config is not None:
             assert args.kv_cache_enable_block_reuse, "`--kv_cache_enable_block_reuse` must be specified in speculative decoding."
             assert not args.use_py_session, "`--use_py_session` is not supported in Speculative decoding."
+            assert not is_enc_dec, "Encoder-Decoder model is not supported in Speculative decoding."
             assert args.num_beams == 1, "`--num_beams>1` is not supported in Speculative decoding."
             prompt_lookup_num_tokens, _, target_device_list = ast.literal_eval(
                 args.prompt_lookup_config)
             args.max_output_len = output_len  # Specialization for PLD
             runner_kwargs.update(is_orchestrator_mode=True,
-                                 device_ids=target_device_list)
-
-        if not args.use_py_session:
-            runner_kwargs.update(
-                lora_dir=args.lora_dir,
-                lora_ckpt_source=args.lora_ckpt_source,
-                max_batch_size=max_batch_size,
-                max_input_len=test_token_num,
-                max_output_len=output_len,
-                max_beam_width=num_beams,
-                max_attention_window_size=max_attention_window_size,
-                sink_token_length=sink_token_length,
-                max_tokens_in_paged_kv_cache=args.max_tokens_in_paged_kv_cache,
-                kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
-                kv_cache_free_gpu_memory_fraction=args.
-                kv_cache_free_gpu_memory_fraction,
-                enable_chunked_context=args.enable_chunked_context,
-                multi_block_mode=args.multi_block_mode,
-                cuda_graph_mode=args.cuda_graph_mode,
-                gather_generation_logits=args.eval_ppl,
-                use_gpu_direct_storage=args.use_gpu_direct_storage)
-        runner_kwargs.update(
-            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
-        if args.prompt_lookup_config is not None:
-            # Specialization for PLD since many call of `generate()` is needed
-            runner_kwargs.update(max_input_len=test_token_num +
+                                 device_ids=target_device_list,
+                                 max_input_len=test_token_num +
                                  prompt_lookup_num_tokens + output_len)
+
         runner = runner_cls.from_dir(**runner_kwargs)
         assert not (args.eval_ppl and not runner.gather_context_logits), \
             "PPL evaluation requires engine built with gather_context_logits enabled"

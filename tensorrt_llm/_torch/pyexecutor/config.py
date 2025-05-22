@@ -168,9 +168,9 @@ def update_executor_config(
 
     logger.info(f"{executor_config.pytorch_backend_config}")
 
-    if build_config is not None:
-        # TODO: move to pure-Python KvCacheConfig, and remove dependency on build_config.
-        executor_config.tokens_per_block = executor_config.tokens_per_block or build_config.plugin_config.tokens_per_block
+    build_config = build_config or BuildConfig()
+    # TODO: move to pure-Python KvCacheConfig, and remove dependency on build_config.
+    executor_config.tokens_per_block = executor_config.tokens_per_block or build_config.plugin_config.tokens_per_block
 
     executor_config.hf_model_dir = hf_model_dir
     executor_config.trt_engine_dir = trt_engine_dir

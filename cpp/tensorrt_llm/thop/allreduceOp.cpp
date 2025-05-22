@@ -18,14 +18,17 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
+#include "tensorrt_llm/kernels/communicationKernels/mnnvlTwoShotAllreduceKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp4_gemm.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
+#include "tensorrt_llm/runtime/mcastDeviceMemory.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/thop/fp4Quantize.h"
@@ -1045,10 +1048,63 @@ std::vector<torch::Tensor> moe_allreduce(torch::Tensor const& residual, torch::T
     return {norm_out, residual_out};
 }
 
+at::Tensor mnnvlTwoShotAllReduce(
+    at::Tensor& output, at::Tensor& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, bool wait_for_results)
+{
+    auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
+    TORCH_CHECK(mcast_mem != nullptr, "two_shot_all_reduce: comm_buffer must be obtained from a mcastBuffer instance.");
+
+    auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+
+    auto allreduce_params = tensorrt_llm::kernels::mnnvl::AllReduceParams();
+    allreduce_params.dtype = dtype;
+    allreduce_params.output = output.data_ptr();
+    allreduce_params.input = input.data_ptr();
+    allreduce_params.buffer_flags = buffer_flags.data_ptr();
+    allreduce_params.wait_for_results = wait_for_results;
+    allreduce_params.stream = at::cuda::getCurrentCUDAStream(output.get_device());
+    allreduce_params.nranks = mcast_mem->getWorldSize();
+    allreduce_params.rank = mcast_mem->getRank();
+    allreduce_params.buffer_M = comm_buffer.size(2);
+    allreduce_params.num_tokens = input.size(0);
+    allreduce_params.token_dim = input.size(1);
+    allreduce_params.buffer_ptrs_dev = reinterpret_cast<void**>(mcast_mem->getBufferPtrsDev());
+    allreduce_params.multicast_ptr = mcast_mem->getMulticastPtr();
+
+    tensorrt_llm::kernels::mnnvl::twoshot_allreduce_op(allreduce_params);
+
+    return output;
+}
+
+void twoShotRMSNorm(torch::Tensor& prenorm_output, torch::Tensor& normed_output, torch::Tensor const& input,
+    torch::Tensor const& gamma, double epsilon, torch::Tensor const& residual, torch::Tensor& buffer_flags)
+{
+    auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+    auto rmsnorm_params = tensorrt_llm::kernels::mnnvl::RMSNormParams();
+    rmsnorm_params.dtype = dtype;
+    rmsnorm_params.residual_output = prenorm_output.data_ptr();
+    rmsnorm_params.output = normed_output.data_ptr();
+    rmsnorm_params.input = input.data_ptr();
+    rmsnorm_params.gamma = gamma.data_ptr();
+    rmsnorm_params.epsilon = epsilon;
+    rmsnorm_params.residual = residual.data_ptr();
+    rmsnorm_params.buffer_flags = reinterpret_cast<uint32_t*>(buffer_flags.data_ptr());
+    rmsnorm_params.batch = normed_output.size(0);
+    rmsnorm_params.hidden_dim = normed_output.size(1);
+    rmsnorm_params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+    tensorrt_llm::kernels::mnnvl::twoshot_rmsnorm_op(rmsnorm_params);
+}
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.def(
+        "mnnvl_twoshot_allreduce(Tensor(output!) output, Tensor(input!) input, Tensor(comm_buf!) comm_buffer, "
+        "Tensor(buffer_flags!) buffer_flags, bool wait_for_result) -> Tensor");
+    m.def(
+        "mnnvl_twoshot_rmsnorm(Tensor prenorm_output, Tensor normed_output, Tensor input, Tensor gamma, "
+        "float epsilon, Tensor residual, Tensor buffer_flags) -> ()");
     m.def(
         "allreduce("
         "Tensor input,"
@@ -1078,6 +1134,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
+    m.impl("mnnvl_twoshot_allreduce", &torch_ext::mnnvlTwoShotAllReduce);
+    m.impl("mnnvl_twoshot_rmsnorm", &torch_ext::twoShotRMSNorm);
     m.impl("allreduce", &torch_ext::allreduce);
     m.impl("moe_allreduce", &torch_ext::moe_allreduce);
 }

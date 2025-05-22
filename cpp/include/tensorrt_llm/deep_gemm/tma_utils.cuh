@@ -32,6 +32,7 @@
 #include <cuda/barrier>
 #include <cudaTypedefs.h>
 #include <cuda_runtime.h>
+#include <stdexcept>
 #endif
 
 #include "utils.cuh"

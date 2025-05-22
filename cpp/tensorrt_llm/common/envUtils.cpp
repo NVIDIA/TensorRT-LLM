@@ -261,6 +261,12 @@ bool getEnvUseMPIKvCache()
     return useMPIKVCache;
 }
 
+bool getEnvUseNixlKvCache()
+{
+    static bool const useNixlKvCache = getBoolEnv("TRTLLM_USE_NIXL_KVCACHE");
+    return useNixlKvCache;
+}
+
 std::string getEnvUCXInterface()
 {
     static std::once_flag flag;
@@ -392,6 +398,12 @@ size_t getEnvMemSizeForKVCacheTransferBuffer()
         });
 
     return memSizeForKVCacheTransferBuffer;
+}
+
+uint16_t getEnvNixlPort()
+{
+    static uint16_t const nixlPort = getUInt64Env("TRTLLM_NIXL_PORT").value_or(0);
+    return nixlPort;
 }
 
 } // namespace tensorrt_llm::common

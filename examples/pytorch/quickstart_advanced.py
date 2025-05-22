@@ -4,7 +4,7 @@ from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
-                                 MTPDecodingConfig)
+                                 MTPDecodingConfig, NGramDecodingConfig)
 
 example_prompts = [
     "Hello, my name is",
@@ -103,6 +103,7 @@ def add_llm_args(parser):
     parser.add_argument('--spec_decode_algo', type=str, default=None)
     parser.add_argument('--spec_decode_nextn', type=int, default=1)
     parser.add_argument('--eagle_model_dir', type=str, default=None)
+    parser.add_argument('--max_matching_ngram_size', type=int, default=5)
 
     # Relaxed acceptance
     parser.add_argument('--use_relaxed_acceptance_for_thinking',
@@ -130,6 +131,7 @@ def setup_llm(args):
         use_cuda_graph=args.use_cuda_graph,
         load_format=args.load_format,
         print_iter_log=args.print_iter_log,
+        enable_iter_perf_stats=args.print_iter_log,
         torch_compile_enabled=args.use_torch_compile,
         torch_compile_piecewise_cuda_graph=args.use_piecewise_cuda_graph,
         moe_backend=args.moe_backend,
@@ -154,6 +156,14 @@ def setup_llm(args):
         spec_config = EagleDecodingConfig(
             max_draft_len=args.spec_decode_nextn,
             pytorch_eagle_weights_path=args.eagle_model_dir)
+    elif spec_decode_algo == "NGRAM":
+        spec_config = NGramDecodingConfig(
+            prompt_lookup_num_tokens=args.spec_decode_nextn,
+            max_matching_ngram_size=args.max_matching_ngram_size,
+            is_keep_all=True,
+            is_use_oldest=True,
+            is_public_pool=True,
+        )
     else:
         spec_config = None
 

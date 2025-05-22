@@ -1004,11 +1004,8 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mScaleQ = mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim))
             / sqrtf((float) (mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim));
 
-        // The kv cache should be based on the maximum headDim of K and V due to paddings.
-        int maxHeadDimKv = std::max(tllmRunnerParams.mHeadDimQk, tllmRunnerParams.mHeadDimV);
-        tllmRunnerParams.mNumPagesInMemPool = mTllmGenFMHARunner->getTotalDeviceMemory()
-            / (tllmRunnerParams.mNumHeadsKv * tllmRunnerParams.mNumTokensPerPage * maxHeadDimKv * elemSize);
-
+        // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds access.
+        tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
         tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
         tllmRunnerParams.stream = stream;
         tllmRunnerParams.mSfStartTokenIdx = generation_params.start_token_idx_sf;

@@ -183,19 +183,14 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.mMaxSeqLenQ = runnerParams.qSeqLen;
         tllmRunnerParams.mMaxSeqLenKv = runnerParams.kvSeqLen;
         tllmRunnerParams.mAttentionWindowSize = runnerParams.slidingWindowSize;
+        tllmRunnerParams.mChunkedAttentionSize = runnerParams.chunkedAttentionSize;
         tllmRunnerParams.mSumOfSeqLensQ = runnerParams.totalQSeqLen;
         tllmRunnerParams.mSumOfSeqLensKv = runnerParams.totalKvSeqLen;
         tllmRunnerParams.mMaxNumPagesPerSeqKv = maxBlocksPerSeq;
         tllmRunnerParams.mNumTokensPerPage = numTokensPerBlock;
         tllmRunnerParams.mScaleQ = mFixedParams.qScaling;
-        if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_PAGED_KV)
-        {
-            // The kv cache should be based on the maximum headDim of K and V due to paddings.
-            int maxHeadDimKv = std::max(tllmRunnerParams.mHeadDimQk, tllmRunnerParams.mHeadDimV);
-            tllmRunnerParams.mNumPagesInMemPool = mTllmGenFMHARunner->getTotalDeviceMemory()
-                / (tllmRunnerParams.mNumHeadsKv * tllmRunnerParams.mNumTokensPerPage * maxHeadDimKv
-                    * get_size_in_bytes(mFixedParams.dataType));
-        }
+        // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds access.
+        tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
         tllmRunnerParams.mSfStartTokenIdx = 0;
         tllmRunnerParams.stream = runnerParams.stream;
         mTllmGenFMHARunner->run(tllmRunnerParams);

@@ -27,7 +27,7 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
                                        print_warning)
 
 from ..conftest import get_llm_root, llm_models_root, trt_environment
-from .model_yaml_config import get_model_yaml_config
+from .pytorch_model_config import get_model_yaml_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
                     PerfMetricType, PerfScriptTestCmds, generate_test_nodes)
 

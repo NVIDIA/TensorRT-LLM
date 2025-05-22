@@ -96,6 +96,7 @@ class SpeculativeDecodingMode(IntFlag):
     LOOKAHEAD_DECODING = auto()
     EXPLICIT_DRAFT_TOKENS = auto()
     EAGLE = auto()
+    NGRAM = auto()
 
     @staticmethod
     def from_arguments(args: argparse.Namespace):
@@ -111,6 +112,8 @@ class SpeculativeDecodingMode(IntFlag):
             return SpeculativeDecodingMode.EXPLICIT_DRAFT_TOKENS
         elif args.speculative_decoding_mode == "eagle":
             return SpeculativeDecodingMode.EAGLE
+        elif args.speculative_decoding_mode == "ngram":
+            return SpeculativeDecodingMode.NGRAM
         else:
             assert False, "Unknown speculative_decoding_mode " + args.speculative_decoding_mode
 
