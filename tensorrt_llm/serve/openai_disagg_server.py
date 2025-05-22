@@ -121,8 +121,8 @@ class OpenAIDisaggServer:
                 data = json.dumps(data)
                 yield f"data: {data}\n\n".encode('utf-8')
 
-            # Only send request to gen server if request is not finished
-            if ctx_response is not None and ctx_response.choices[0].finish_reason != "not_finished":
+            #If request finished after first token not due to length, return right away and skip gen
+            if ctx_response is not None and ctx_response.choices[0].finish_reason not in ["length", "not_finished"]:
                 yield f"data: [DONE]\n\n".encode('utf-8')
             else:
                 # Then yield the generation responses
@@ -171,12 +171,6 @@ class OpenAIDisaggServer:
             raise HTTPException(status_code=500, detail=f"Internal server error {str(exception)}")
 
     async def _send_context_request(self, ctx_server: str, ctx_req: Union[CompletionRequest, ChatCompletionRequest]):
-        # Here we set 2 output tokens to prevent stop reason to be set to "length"
-        # and we don't set the max_tokens to prevent over-allocation of KV cache
-        if isinstance(ctx_req, ChatCompletionRequest):
-            ctx_req.max_completion_tokens = 2
-        elif isinstance(ctx_req, CompletionRequest):
-            ctx_req.max_tokens = 2
 
         ctx_req.disaggregated_params = DisaggregatedParams(request_type="context_only")
         ctx_req.stream = False
@@ -250,8 +244,8 @@ class OpenAIDisaggServer:
 
             if not req.stream:
                 try:
-                    if ctx_response is not None and ctx_response.choices[0].finish_reason != "not_finished":
-                        #If request finished after first token, return right away and skip gen
+                    #If request finished after first token for reason other than length, return right away and skip gen
+                    if ctx_response is not None and ctx_response.choices[0].finish_reason not in ["length","not_finished"]:
                         del ctx_response.choices[0].disaggregated_params
                         return ctx_response
                     else:
@@ -275,6 +269,7 @@ class OpenAIDisaggServer:
             if gen_server is not None:
                 await self.gen_router.finish_request(req)
             raise
+
 
     async def __call__(self, host, port):
         config = uvicorn.Config(self.app,

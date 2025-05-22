@@ -279,7 +279,7 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
             # Send 256 requests to make sure the context worker is saturated
             for _ in range(256):
                 requests.append(
-                    (prompt, SamplingParams(max_tokens=2, ignore_eos=True),
+                    (prompt, SamplingParams(max_tokens=1, ignore_eos=True),
                      DisaggregatedParams(request_type="context_only")))
 
             intercomm.send(requests, dest=0, tag=MPI_REQUEST)

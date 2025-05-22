@@ -1597,7 +1597,8 @@ class PyExecutor:
         if (scheduled_ctx_requests is None or len(scheduled_ctx_requests) == 0):
             return []
         for req in scheduled_ctx_requests:
-            if req.is_context_only_request and req.is_context_finished:
+            if req.is_context_only_request and (req.is_context_finished or
+                                                req.is_finished_due_to_length):
                 self.kv_cache_transceiver.respond_and_send_async(req)
                 self.resource_manager.resource_managers[
                     "seq_slot_manager"].free_resources(req)
