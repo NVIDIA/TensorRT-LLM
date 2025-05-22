@@ -30,19 +30,6 @@ namespace tensorrt_llm::runtime
 
 namespace
 {
-#define CUCHECK(cmd)                                                                                                   \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        CUresult retval = cmd;                                                                                         \
-        if (retval != CUDA_SUCCESS)                                                                                    \
-        {                                                                                                              \
-            const char* error_string;                                                                                  \
-            cuGetErrorString(retval, &error_string);                                                                   \
-            printf("Failed: Cuda error %s:%d '%s'\n", __FILE__, __LINE__, error_string);                               \
-            exit(EXIT_FAILURE);                                                                                        \
-        }                                                                                                              \
-    } while (0)
-
 // An efficient implementation assuming gran is a power of 2
 inline size_t roundUp(size_t val, size_t gran)
 {
@@ -66,7 +53,7 @@ McastDeviceMemory::McastDeviceMemory(
     cudaSetDevice(mDeviceIdx);
     // Check if the device support multicasting
     int multicast_supported{0};
-    CUCHECK(cuDeviceGetAttribute(&multicast_supported, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, mDeviceIdx));
+    TLLM_CU_CHECK(cuDeviceGetAttribute(&multicast_supported, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, mDeviceIdx));
     if (multicast_supported == 0)
     {
         TLLM_THROW("[McastDeviceMemory] Device does not support multicasting.");
@@ -83,7 +70,7 @@ McastDeviceMemory::McastDeviceMemory(
     {
         // For multi-node, we also need to check if fabric handle is supported
         int fabric_handle_supported{0};
-        CUCHECK(cuDeviceGetAttribute(
+        TLLM_CU_CHECK(cuDeviceGetAttribute(
             &fabric_handle_supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, mDeviceIdx));
         if (fabric_handle_supported == 0)
         {
