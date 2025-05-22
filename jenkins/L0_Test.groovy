@@ -854,7 +854,7 @@ def getSSHConnectionPorts(portConfigFile, stageName)
     return [userPort, monitorPort]
 }
 
-def rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout) {
+def rerunFailedTests(stageName, llmSrc, testCmdLine) {
     if (!fileExists("${WORKSPACE}/${stageName}/results.xml")) {
         error "There is not results.xml file, skip the rerun step"
     }
@@ -904,20 +904,16 @@ def rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout) {
         }
         sh "cat ${rerunTestList}"
         xmlFile = "${WORKSPACE}/${stageName}/rerun_results_${times}.xml"
-        testCmdLine = [
-            "LLM_ROOT=${llmSrc}",
-            "LLM_MODELS_ROOT=${MODEL_CACHE_DIR}",
-            extraInternalEnv,
-            "pytest",
-            "-v",
-            "--timeout=${pytestTestTimeout}",
-            "--rootdir ${llmSrc}/tests/integration/defs",
-            "--test-prefix=${stageName}",
+        // change the testCmdLine for rerun
+        noNeedLine = ["--splitting-algorithm", "--splits", "--group", "--waives-file", "--cov"]
+        needToChangeLine = ["--test-list", "--csv", "--junit-xml"]
+        testCmdLine = testCmdLine.findAll { cmd ->
+            !noNeedLine.any { line -> cmd.contains(line) } && !needToChangeLine.any { line -> cmd.contains(line) }
+        }
+        testCmdLine += [
             "--test-list=${rerunTestList}",
-            "--output-dir=${WORKSPACE}/${stageName}/",
             "--csv=${WORKSPACE}/${stageName}/rerun_report_${times}.csv",
             "--junit-xml ${xmlFile}",
-            "-o junit_logging=out-err",
             "--reruns ${times - 1}"
         ]
         try {
@@ -1200,7 +1196,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 } catch (InterruptedException e) {
                     throw e
                 } catch (Exception e) {
-                    isRerunFailed = rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout)
+                    isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine)
                     if (isRerunFailed) {
                         echo "The tests still failed after rerun attempt."
                         throw e

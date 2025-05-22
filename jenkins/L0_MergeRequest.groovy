@@ -738,7 +738,8 @@ def collectTestResults(pipeline, testFilter)
             """
             trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
             echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
-            if (env.alternativeTRT || testFilter[(IS_POST_MERGE)]) {
+            def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+            if (env.alternativeTRT || isOfficialPostMergeJob) {
                 catchError(
                     buildResult: 'FAILURE',
                     stageResult: 'FAILURE') {
