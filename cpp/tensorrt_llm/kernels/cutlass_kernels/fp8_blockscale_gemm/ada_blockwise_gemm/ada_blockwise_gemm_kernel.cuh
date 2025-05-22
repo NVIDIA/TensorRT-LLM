@@ -224,6 +224,14 @@ struct AdaBlockwiseGemmKernel
             tBpB(n, 0) = cute::get<0>(tBcB(0, n, 0)) < residue_n; // blk_n coord < residue_n
         }
 
+        cute::Tensor tApSFA = cute::make_tensor<bool>(
+            cute::make_shape(cute::size<1>(tAsScaleA), cute::size<2>(tAsScaleA)), cute::Stride<cute::_1, cute::_0>{});
+        cute::Tensor tAcSFA = gmem_thr_copy_ScaleA.partition_S(cA); // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
+        CUTLASS_PRAGMA_UNROLL
+        for (int m = 0; m < cute::size<0>(tApSFA); ++m)
+        {
+            tApSFA(m, 0) = cute::get<0>(tAcSFA(0, m, 0)) < residue_m; // blk_m coord < residue_m
+        }
         // (1.2) prefetch gmem -> smem
         cute::clear(tAsA); // we don't need to clear tBsB..
         cute::clear(tBsB);
@@ -240,15 +248,16 @@ struct AdaBlockwiseGemmKernel
             {
                 cute::clear(tApA);
                 cute::clear(tBpB);
+                cute::clear(tApSFA);
             }
             cute::copy_if(gmem_tiled_copy_A, tApA, tAgA(cute::_, cute::_, cute::_, *k_tile_iter),
                 tAsA(cute::_, cute::_, cute::_, k_pipe));
             cute::copy_if(gmem_tiled_copy_B, tBpB, tBgB(cute::_, cute::_, cute::_, *k_tile_iter),
                 tBsB(cute::_, cute::_, cute::_, k_pipe));
 
-            cute::copy_if(gmem_tiled_copy_ScaleA, tApA, tAgScaleA(cute::_, cute::_, cute::_, *k_tile_iter),
+            cute::copy_if(gmem_tiled_copy_ScaleA, tApSFA, tAgScaleA(cute::_, cute::_, cute::_, *k_tile_iter),
                 tAsScaleA(cute::_, cute::_, cute::_, k_pipe));
-            cute::copy_if(gmem_tiled_copy_ScaleB, tBpB, tBgScaleB(cute::_, cute::_, cute::_, *k_tile_iter),
+            cute::copy(gmem_tiled_copy_ScaleB, tBgScaleB(cute::_, cute::_, cute::_, *k_tile_iter),
                 tBsScaleB(cute::_, cute::_, cute::_, k_pipe));
 
             cute::cp_async_fence();
@@ -355,19 +364,15 @@ struct AdaBlockwiseGemmKernel
                     // Copy gmem -> smem before computing gemm on each k-pipe
                     if (k_block == 0)
                     {
-                        if (k_tile_count <= 0)
-                        {
-                            cute::clear(tApA);
-                            cute::clear(tBpB);
-                        }
                         cute::copy_if(gmem_tiled_copy_A, tApA, tAgA(cute::_, cute::_, cute::_, *k_tile_iter),
                             tAsA(cute::_, cute::_, cute::_, smem_pipe_write));
                         cute::copy_if(gmem_tiled_copy_B, tBpB, tBgB(cute::_, cute::_, cute::_, *k_tile_iter),
                             tBsB(cute::_, cute::_, cute::_, smem_pipe_write));
 
-                        cute::copy_if(gmem_tiled_copy_ScaleA, tApA, tAgScaleA(cute::_, cute::_, cute::_, *k_tile_iter),
+                        cute::copy_if(gmem_tiled_copy_ScaleA, tApSFA,
+                            tAgScaleA(cute::_, cute::_, cute::_, *k_tile_iter),
                             tAsScaleA(cute::_, cute::_, cute::_, smem_pipe_write));
-                        cute::copy_if(gmem_tiled_copy_ScaleB, tBpB, tBgScaleB(cute::_, cute::_, cute::_, *k_tile_iter),
+                        cute::copy(gmem_tiled_copy_ScaleB, tBgScaleB(cute::_, cute::_, cute::_, *k_tile_iter),
                             tBsScaleB(cute::_, cute::_, cute::_, smem_pipe_write));
 
                         cute::cp_async_fence();
