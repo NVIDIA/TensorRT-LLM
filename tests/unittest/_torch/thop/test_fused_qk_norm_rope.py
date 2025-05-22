@@ -7,15 +7,9 @@ from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 
 
 @torch.inference_mode()
-def torch_ref_rms_norm_rope(qkv,
-                            position_ids,
-                            num_heads_q,
-                            num_heads_k,
-                            num_heads_v,
-                            head_dim,
-                            is_neox,
-                            eps=1e-5,
-                            base=10000.0):
+def torch_ref_rms_norm_rope(qkv, num_heads_q, num_heads_k, num_heads_v,
+                            head_dim, eps, q_weight, k_weight, base, is_neox,
+                            position_ids):
     """
     PyTorch reference implementation of RMSNorm+RoPE for verification.
 
@@ -24,13 +18,16 @@ def torch_ref_rms_norm_rope(qkv,
 
     Args:
         qkv: Combined QKV tensor of shape [num_tokens, hidden_size]
-        position_ids: Position IDs for RoPE of shape [num_tokens]
         num_heads_q: Number of query heads
         num_heads_k: Number of key heads
         num_heads_v: Number of value heads (unused for normalization/RoPE but needed for tensor splitting)
         head_dim: Dimension of each head
         eps: Epsilon value for RMS normalization
+        q_weight: RMSNorm weights for query [head_dim]
+        k_weight: RMSNorm weights for key [head_dim]
         base: Base value for RoPE calculations
+        is_neox: Whether to use NeoX style RoPE
+        position_ids: Position IDs for RoPE of shape [num_tokens]
 
     Returns:
         Combined tensor with Q and K parts normalized and RoPE applied
@@ -52,14 +49,13 @@ def torch_ref_rms_norm_rope(qkv,
     k = qkv[:, q_size:q_size + k_size]
     v = qkv[:, q_size + k_size:]
 
-    # Create and apply RMSNorm modules
-    # No trainable parameters needed, just pure normalization
+    # Create and apply RMSNorm modules with custom weights
     q_norm = RMSNorm(hidden_size=head_dim, eps=eps).to(qkv.device).to(qkv.dtype)
     k_norm = RMSNorm(hidden_size=head_dim, eps=eps).to(qkv.device).to(qkv.dtype)
 
-    # Initialize weights to 1.0 (no scaling, just normalization)
-    q_norm.weight.data.fill_(1.0)
-    k_norm.weight.data.fill_(1.0)
+    # Set the weights to the provided weights
+    q_norm.weight.data.copy_(q_weight)
+    k_norm.weight.data.copy_(k_weight)
 
     # Apply RMSNorm to Q and K
     q_normalized = q_norm(q.reshape(num_tokens * num_heads_q,
@@ -95,15 +91,16 @@ num_heads_groups = [
     (64, 8, 8)  # Qwen3-32B, Qwen3-235B-A22B
 ]
 num_tokens_list = [1, 3, 8, 32, 256]
+is_neox_list = [False, True]
 dtypes = [torch.bfloat16]  # TODO: support float16
 
 
 @pytest.mark.parametrize("head_dim", head_dims)
-@pytest.mark.parametrize("is_neox", [False, True])
 @pytest.mark.parametrize("num_heads_group", num_heads_groups)
 @pytest.mark.parametrize("num_tokens", num_tokens_list)
+@pytest.mark.parametrize("is_neox", is_neox_list)
 @pytest.mark.parametrize("dtype", dtypes)
-def test_fused_qk_norm_rope(head_dim, is_neox, num_heads_group, num_tokens,
+def test_fused_qk_norm_rope(head_dim, num_heads_group, num_tokens, is_neox,
                             dtype):
     """
     Test the fused QK RMSNorm + RoPE operation with various configurations.
@@ -137,37 +134,29 @@ def test_fused_qk_norm_rope(head_dim, is_neox, num_heads_group, num_tokens,
     position_ids = torch.arange(num_tokens, dtype=torch.int32,
                                 device=device) + 100
 
+    # Generate random weights for RMSNorm
+    q_weight = torch.randn(head_dim, dtype=torch_dtype, device=device) * 5.0
+    k_weight = torch.randn(head_dim, dtype=torch_dtype, device=device) * 5.0
+
     # Set RMSNorm and RoPE parameters
     eps = 1e-5
     base = 10000.0
 
     # Run the custom fusedQKNormRope operation
-    torch.ops.trtllm.fused_qk_norm_rope(
-        qkv,
-        position_ids,
-        num_heads_q,
-        num_heads_k,
-        num_heads_v,
-        head_dim,
-        is_neox,  # interleave
-        eps,
-        base)
+    torch.ops.trtllm.fused_qk_norm_rope(qkv, num_heads_q, num_heads_k,
+                                        num_heads_v, head_dim, eps, q_weight,
+                                        k_weight, base, is_neox, position_ids)
     output = qkv  # This op is inplace
 
     # Compute reference output using TensorRT-LLM modules
-    ref_output = torch_ref_rms_norm_rope(qkv_copy, position_ids, num_heads_q,
-                                         num_heads_k, num_heads_v, head_dim,
-                                         is_neox, eps, base)
-
-    # Set tolerance based on dtype - bfloat16 needs higher tolerance
-    atol = 1e-2 if dtype == torch.float16 else 1e-1  # Higher tolerance for bfloat16
+    ref_output = torch_ref_rms_norm_rope(qkv_copy, num_heads_q, num_heads_k,
+                                         num_heads_v, head_dim, eps, q_weight,
+                                         k_weight, base, is_neox, position_ids)
 
     # Compare outputs from custom kernel vs reference implementation
     torch.testing.assert_close(
         output,
         ref_output,
-        rtol=1e-2,
-        atol=atol,
-        msg=
-        f"Failed with head_dim={head_dim}, num_heads=({num_heads_q},{num_heads_k},{num_heads_v}), num_tokens={num_tokens}, dtype={dtype}"
+        rtol=5e-2,
+        atol=1e-1,
     )

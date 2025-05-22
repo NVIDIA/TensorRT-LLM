@@ -1,3 +1,19 @@
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "fusedQKNormRopeKernel.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/mathUtils.h"
@@ -40,14 +56,16 @@ namespace tensorrt_llm::kernels
 // interleave: interleave=!is_neox.
 template <int head_dim, bool interleave>
 __global__ void fusedQKNormRopeKernel(
-    __nv_bfloat16* qkv,         // Combined QKV tensor [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]
-    int const* position_ids,    // Position IDs for RoPE [num_tokens]
-    int const num_tokens,       // Number of tokens
-    int const num_heads_q,      // Number of query heads
-    int const num_heads_k,      // Number of key heads
-    int const num_heads_v,      // Number of value heads
-    float const eps = 1e-5f,    // Epsilon for RMS normalization
-    float const base = 10000.0f // Base for RoPE computation
+    __nv_bfloat16* qkv,            // Combined QKV tensor [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]
+    int const num_heads_q,         // Number of query heads
+    int const num_heads_k,         // Number of key heads
+    int const num_heads_v,         // Number of value heads
+    float const eps,               // Epsilon for RMS normalization
+    __nv_bfloat16 const* q_weight, // RMSNorm weights for query
+    __nv_bfloat16 const* k_weight, // RMSNorm weights for key
+    float const base,              // Base for RoPE computation
+    int const* position_ids,       // Position IDs for RoPE
+    int const num_tokens           // Number of tokens
 )
 {
     int const warpsPerBlock = blockDim.x / 32;
@@ -122,7 +140,9 @@ __global__ void fusedQKNormRopeKernel(
     // Normalize elements
     for (int i = 0; i < numElemsPerThread; i++)
     {
-        elements[i] *= rms_rcp;
+        int dim = laneId * numElemsPerThread + i;
+        float weight = isQ ? __bfloat162float(q_weight[dim]) : __bfloat162float(k_weight[dim]);
+        elements[i] *= rms_rcp * weight;
     }
 
     // Apply RoPE to normalized elements
@@ -210,10 +230,9 @@ __global__ void fusedQKNormRopeKernel(
         __VA_ARGS__                                                                                                    \
     }
 
-// Launch wrapper for the fusedQKNormRope kernel with different head dimensions
-void launchFusedQKNormRope(void* qkv, int const* position_ids, int const num_tokens, int const num_heads_q,
-    int const num_heads_k, int const num_heads_v, int const head_dim, bool const interleave, float const eps,
-    float const base, cudaStream_t stream)
+void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_q, int const num_heads_k,
+    int const num_heads_v, int const head_dim, float const eps, void const* q_weight, void const* k_weight,
+    float const base, bool const interleave, int const* position_ids, cudaStream_t stream)
 {
     constexpr int blockSize = 256;
 
@@ -232,20 +251,20 @@ void launchFusedQKNormRope(void* qkv, int const* position_ids, int const num_tok
     case 64:
         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
             fusedQKNormRopeKernel<64, INTERLEAVE>
-                <<<gridDim, blockDim, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv), position_ids, num_tokens,
-                    num_heads_q, num_heads_k, num_heads_v, eps, base);
+                <<<gridDim, blockDim, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k,
+                    num_heads_v, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),
+                    reinterpret_cast<__nv_bfloat16 const*>(k_weight), base, position_ids, num_tokens);
         });
         break;
     case 128:
         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
             fusedQKNormRopeKernel<128, INTERLEAVE>
-                <<<gridDim, blockDim, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv), position_ids, num_tokens,
-                    num_heads_q, num_heads_k, num_heads_v, eps, base);
+                <<<gridDim, blockDim, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k,
+                    num_heads_v, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),
+                    reinterpret_cast<__nv_bfloat16 const*>(k_weight), base, position_ids, num_tokens);
         });
         break;
-    default:
-        // Unsupported head dimension
-        TLLM_THROW("Unsupported head dimension for fusedQKNormRope: %d", head_dim);
+    default: TLLM_THROW("Unsupported head dimension for fusedQKNormRope: %d", head_dim);
     }
 }
 } // namespace tensorrt_llm::kernels
