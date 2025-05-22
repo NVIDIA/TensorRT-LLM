@@ -37,21 +37,3 @@ class DraftTargetSpecMetadata(SpecMetadata):
 
     def prepare(self):
         pass
-
-
-
-class DraftTargetSampler(TorchSampler):
-
-    def _batch_sample(self, scheduled_requests, model_outputs) -> SampleState:
-        logits = model_outputs["logits"]
-        new_tokens_device = torch.argmax(logits, dim=-1)
-        device = SampleStateTensors(new_tokens=new_tokens_device)
-        host = SampleStateTensors(
-            new_tokens=new_tokens_device.to('cpu', non_blocking=True))
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
-        return SampleState(scheduled_requests=scheduled_requests,
-                           logits=logits,
-                           device=device,
-                           host=host,
-                           sampler_event=sampler_event)
