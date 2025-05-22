@@ -2093,7 +2093,7 @@ def all_pytest_items():
 
 
 @pytest.fixture(scope="session")
-def turtle_root():
+def test_root():
     return os.path.dirname(os.path.dirname(__file__))
 
 
