@@ -331,7 +331,7 @@ struct Data
     tg::Dtype mDtypeExpW{tg::Dtype::Fp32};
     tg::Dtype mDtypeElt{tg::Dtype::Bfloat16};
     bool mUsePdl{false};
-
+    bool mDoSoftmaxBeforeTopK{false};
     bool mNormTopkProb{true}; // Default value is true for Qwen3 model
     // optional: if `nullptr`, `mPtrExpertIdx` must be provided.
     // If it is given, it represents the scores without sigmoid activation for
@@ -378,15 +378,15 @@ struct Data
     int32_t mNumLocalExperts;
 };
 
-template <typename TypeElt_, typename TypeExpW_, bool UsePdl_>
+template <typename Type_, typename TypeExpW_, bool UsePdl_>
 struct KernelParams
 {
+    using Type = Type_;
     using TypeExpW = TypeExpW_;
-    using TypeElt = TypeElt_;
     static constexpr bool UsePdl = UsePdl_;
     bool mNormTopkProb = true;
-    PackedScoreIdx<TypeElt>* mPtrExpertIdx;
-    TypeElt const* mPtrScores;
+    PackedScoreIdx<TypeExpW>* mPtrExpertIdx;
+    TypeExpW const* mPtrScores;
     int32_t* mPtrExpertCounts;
     int32_t* mPtrPermutedIdxSize;
     int32_t* mPtrExpandedIdxToPermutedIdx;
@@ -394,7 +394,7 @@ struct KernelParams
     int32_t* mPtrCtaIdxXyToBatchIdx;
     int32_t* mPtrCtaIdxXyToMnLimit;
     int32_t* mPtrNumNonExitingCtas;
-    TypeElt* mPtrExpertWeights;
+    TypeExpW* mPtrExpertWeights;
 
     int32_t mNumTokens;
     int32_t mNumExperts;
@@ -407,8 +407,8 @@ struct KernelParams
     {
         KernelParams params;
         params.mNormTopkProb = data.mNormTopkProb;
-        params.mPtrExpertIdx = (PackedScoreIdx<TypeElt>*) data.mPtrExpertIdx;
-        params.mPtrScores = (TypeElt const*) data.mPtrScores;
+        params.mPtrExpertIdx = (PackedScoreIdx<TypeExpW>*) data.mPtrExpertIdx;
+        params.mPtrScores = (TypeExpW const*) data.mPtrScores;
         params.mPtrExpertCounts = data.mPtrExpertCounts;
         params.mPtrPermutedIdxSize = data.mPtrPermutedIdxSize;
         params.mPtrExpandedIdxToPermutedIdx = data.mPtrExpandedIdxToPermutedIdx;
@@ -416,7 +416,7 @@ struct KernelParams
         params.mPtrCtaIdxXyToBatchIdx = data.mPtrCtaIdxXyToBatchIdx;
         params.mPtrCtaIdxXyToMnLimit = data.mPtrCtaIdxXyToMnLimit;
         params.mPtrNumNonExitingCtas = data.mPtrNumNonExitingCtas;
-        params.mPtrExpertWeights = (TypeElt*) data.mPtrExpertWeights;
+        params.mPtrExpertWeights = (TypeExpW*) data.mPtrExpertWeights;
 
         params.mNumTokens = data.mNumTokens;
         params.mNumExperts = data.mNumExperts;

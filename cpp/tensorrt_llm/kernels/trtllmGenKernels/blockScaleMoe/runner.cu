@@ -158,15 +158,11 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         // (mDtypeElt=bf16, mDtypeExpW=fp32): OK
         // (mDtypeElt=fp32, mDtypeExpW=fp32): Crash but considered lower prio
         //
-        // TODO: clean up
-        // The Qwen3 routing kernel overloads the meaning of mDtypeExpW as the internal compute type.
-        // It's original meaning is routingLogits dtype
-        routingData.mDtypeExpW = tg::Dtype::Fp32;
-        // TODO: clean up
-        // The Qwen3 routing kernel overloads the meaning of mDtypeElt as the dtype of routingLogits.
-        // It's original meaning is hidden_state dtype. This should be a no-op as hidden_state is no longer an input.
-        routingData.mDtypeElt = tg::Dtype::Bfloat16;
+
+        routingData.mDtypeExpW = tg::Dtype::Bfloat16;
+        // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
         routingData.mUsePdl = true;
+        routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::Renormalize ? true : false;
         routingData.mNormTopkProb = routingMethodType == RoutingMethodType::Renormalize;
         routingData.mPtrScores = routingLogits;
 

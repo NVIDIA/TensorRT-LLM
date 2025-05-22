@@ -2793,7 +2793,10 @@ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const& warp, Type (&o
     RedType topK[N];
 #pragma unroll
     for (int nn = 0; nn < N; ++nn)
+    {
         topK[nn] = RedType{value[nn], idx[nn]};
+    }
+
     if constexpr (!IsSorted)
     {
         TOPK_SWAP(0, 2);
@@ -2868,37 +2871,6 @@ __host__ __device__ constexpr void setBits(int32_t& value, int32_t newBits, int 
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-template <typename TypeExpW, int VecSize, int K>
-__device__ void calSoftmaxAndTopk(cg::thread_block_tile<WarpSize> const& warp, TypeExpW (&scores)[VecSize],
-    int32_t (&indices)[VecSize], TypeExpW (&topKScores)[K], int32_t (&topKIndices)[K], TypeExpW maxScore)
-{
-    TypeExpW minScore = TypeExpW{-INFINITY};
-    TypeExpW sumScore = TypeExpW{0.f};
-
-    // Get the max score for each token
-    for (int i = 0; i < VecSize; ++i)
-    {
-        maxScore = scores[i] >= maxScore ? scores[i] : maxScore;
-    }
-    maxScore = cg::reduce(warp, maxScore, cg::greater<TypeExpW>());
-
-    // Get the summation of scores for each token
-#pragma unroll
-    for (int i = 0; i < VecSize; ++i)
-    {
-        scores[i] = static_cast<TypeExpW>(exp(scores[i] - maxScore));
-        sumScore += scores[i];
-    }
-
-    sumScore = cg::reduce(warp, sumScore, cg::plus<TypeExpW>());
-
-    // Normalize the scores
-#pragma unroll
-    for (int i = 0; i < VecSize; ++i)
-    {
-        scores[i] = static_cast<TypeExpW>(scores[i] / sumScore);
-    }
-}
 
 template <typename TypeExpW, int VecSize>
 __device__ void calcSoftmax(cg::thread_block_tile<WarpSize> const& warp, TypeExpW (&scores)[VecSize])
@@ -2930,16 +2902,18 @@ __device__ void calcSoftmax(cg::thread_block_tile<WarpSize> const& warp, TypeExp
     }
 }
 
-template <typename TypeElt>
-__device__ TypeElt calcSoftmax(
-    cg::thread_block_tile<WarpSize> const& warp, TypeElt score, int32_t laneIdx, int32_t NumTopExperts)
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename TypeExpW>
+__device__ TypeExpW calcSoftmax(
+    cg::thread_block_tile<WarpSize> const& warp, TypeExpW score, int32_t laneIdx, int32_t NumTopExperts)
 {
-    TypeElt maxScore = TypeElt{-INFINITY};
+    TypeExpW maxScore = TypeExpW{-INFINITY};
     if (laneIdx < NumTopExperts)
     {
         maxScore = score >= maxScore ? score : maxScore;
     }
-    maxScore = cg::reduce(warp, maxScore, cg::greater<TypeElt>());
+    maxScore = cg::reduce(warp, maxScore, cg::greater<TypeExpW>());
 
     float sumScore = float{0.f};
     float newScore;
@@ -2954,24 +2928,26 @@ __device__ TypeElt calcSoftmax(
 
     if (laneIdx < NumTopExperts)
     {
-        score = static_cast<TypeElt>(newScore / sumScore);
+        score = static_cast<TypeExpW>(newScore / sumScore);
     }
 
     return score;
 }
 
-template <typename KernelParams, bool IsOriFlow = false>
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename KernelParams, bool DoSoftmaxBeforeTopK = false>
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(NumThreads)
     routingIndicesClusterKernel(KernelParams params)
 {
     // number of experts is bounded by number of threads
-    __shared__ int32_t __attribute((aligned(128))) smemExpertCount[NumThreads]; //@todo: check this expert count
+    __shared__ int32_t __attribute((aligned(128))) smemExpertCount[NumThreads];
     __shared__ int32_t __attribute((aligned(128))) smemExpertOffset[NumThreads];
     // number of tokens/expanded idx is bounded by total number of warps
     using TypeExpW = typename KernelParams::TypeExpW;
-    using TypeElt = typename KernelParams::TypeElt;
-    using BaseType = std::conditional_t<IsOriFlow, TypeExpW, TypeElt>;
+
+    using BaseType = std::conditional_t<DoSoftmaxBeforeTopK, float, TypeExpW>;
     using TypePacked = PackedScoreIdx<BaseType>;
 
     __shared__ TypePacked __attribute((aligned(128))) smemPackedScoreIdx[NumWarps * NumTopExperts];
@@ -3015,8 +2991,6 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
     if (params.mPtrScores != nullptr)
     {
         // in this case, each warp represents a token
-        // we then exchange all token max scores, s.t. afterwards, each thread
-        // represents a token
         BaseType score[MaxNumExperts / WarpSize];
         int32_t idx[MaxNumExperts / WarpSize];
 
@@ -3036,7 +3010,7 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
                 idx[i] = expertIdx;
             }
 
-            if constexpr (IsOriFlow)
+            if constexpr (DoSoftmaxBeforeTopK)
             {
                 calcSoftmax(warp, score);
             }
@@ -3045,13 +3019,13 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
             reduceTopK(warp, warpTopKScore, warpTopKExpertIdx, score, idx, minScore);
 
             // Normalize the scores
-            if constexpr (IsOriFlow)
+            if constexpr (DoSoftmaxBeforeTopK)
             {
-                TypeExpW sum = TypeExpW{1.f};
+                float sum = float{1.f};
                 if (params.mNormTopkProb)
                 {
-                    sum = static_cast<TypeExpW>(laneIdx < NumTopExperts ? warpTopKScore[laneIdx] : 0);
-                    sum = cg::reduce(warp, sum, cg::plus<TypeExpW>());
+                    sum = static_cast<float>(laneIdx < NumTopExperts ? warpTopKScore[laneIdx] : 0);
+                    sum = cg::reduce(warp, sum, cg::plus<float>());
                 }
                 if (laneIdx < NumTopExperts)
                 {
@@ -3113,7 +3087,7 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
         expertOffsets[ii] = isLocalExpert ? atomicAdd(smemExpertCount + scoreIdx.idx, 1) : 0;
         if (params.mPtrExpertWeights != nullptr)
         {
-            params.mPtrExpertWeights[expandedIdx] = static_cast<TypeElt>(scoreIdx.score);
+            params.mPtrExpertWeights[expandedIdx] = static_cast<TypeExpW>(scoreIdx.score);
         }
     };
 
@@ -3251,17 +3225,15 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesClusterKernel(Kernel
     assert(false && "routingIndicesClusterKernel is only supported on SM90+ architectures");
 }
 #endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // this kernel is needed in case we have scores as input for the histogram kernel
-template <typename KernelParams, bool IsOriFlow = false>
+template <typename KernelParams, bool DoSoftmaxBeforeTopK = true>
 __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresKernel(KernelParams params)
 {
     using TypeExpW = typename KernelParams::TypeExpW;
-    using TypeElt = typename KernelParams::TypeElt;
 
-    using BaseType = std::conditional_t<IsOriFlow, TypeExpW, TypeElt>;
+    using BaseType = std::conditional_t<DoSoftmaxBeforeTopK, float, TypeExpW>;
 
     static constexpr int VecSize = MaxNumExperts / WarpSize;
     // we assume that #experts is a multiple of 4, so VecSize must be 4.
@@ -3293,9 +3265,8 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
         BaseType warpTopKScore[NumTopExperts];
         int32_t warpTopKExpertIdx[NumTopExperts];
 
-//@TODO：optimize this part with vectorized loading
-// auto* ptrAllScores = reinterpret_cast<TypeExpWVec const*>(params.mPtrScores);
-//*reinterpret_cast<TypeExpWVec*>(allScores) = params.mPtrScores[scoreOffset];
+        //@TODO：optimize this part with vectorized loading
+
 #pragma unroll
         for (int i = 0; i < VecSize; ++i)
         {
@@ -3307,23 +3278,23 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
             allExpertIdx[i] = expertIdx;
         }
 
-        if constexpr (IsOriFlow)
+        if constexpr (DoSoftmaxBeforeTopK)
         {
             calcSoftmax(warp, allScores);
         }
 
         // Get the top-k scores and their corresponding expert indices
         reduceTopK(warp, warpTopKScore, warpTopKExpertIdx, allScores, allExpertIdx, minScore);
-        __syncthreads(); //@TODO: check the synchronization
+        __syncwarp(); //@TODO: check the synchronization
 
         // Normalize the scores
-        if constexpr (IsOriFlow)
+        if constexpr (DoSoftmaxBeforeTopK)
         {
-            TypeExpW sum = TypeExpW{1.f};
+            float sum = float{1.f};
             if (params.mNormTopkProb)
             {
-                sum = static_cast<TypeExpW>(laneIdx < NumTopExperts ? warpTopKScore[laneIdx] : 0);
-                sum = cg::reduce(warp, sum, cg::plus<TypeExpW>());
+                sum = static_cast<float>(laneIdx < NumTopExperts ? warpTopKScore[laneIdx] : 0);
+                sum = cg::reduce(warp, sum, cg::plus<float>());
             }
             if (laneIdx < NumTopExperts)
             {
@@ -3341,8 +3312,8 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
         }
         for (int i = laneIdx; i < NumTopExperts; i += WarpSize)
         {
-            PackedScoreIdx<TypeElt> packedScore{
-                static_cast<TypeElt>(warpTopKScore[i]), static_cast<int16_t>(warpTopKExpertIdx[i])};
+            PackedScoreIdx<TypeExpW> packedScore{
+                static_cast<TypeExpW>(warpTopKScore[i]), static_cast<int16_t>(warpTopKExpertIdx[i])};
             params.mPtrExpertIdx[tokenIdx * NumTopExperts + i] = packedScore;
         }
     }
@@ -3360,8 +3331,8 @@ template <typename KernelParams>
 __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramKernel(KernelParams params)
 {
     using TypeExpW = typename KernelParams::TypeExpW;
-    using TypeElt = typename KernelParams::TypeElt;
-    using TypePacked = PackedScoreIdx<TypeExpW>;
+
+    using TypePacked = PackedScoreIdx<float>;
     // number of experts is bounded by number of threads
     __shared__ int32_t __attribute((aligned(128))) smemExpertCount[NumThreadsHist];
 
@@ -3393,7 +3364,7 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramKernel(
     // Define a lambda to avoid code duplication in branches.
     auto loopBody = [&](int expandedIdx)
     {
-        PackedScoreIdx<TypeElt> scoreIdx = params.mPtrExpertIdx[expandedIdx];
+        PackedScoreIdx<TypeExpW> scoreIdx = params.mPtrExpertIdx[expandedIdx];
         // check whether this expert is local to our GPU at all and ignore if not
         auto localExpertIdx = scoreIdx.idx - params.mLocalExpertsStartIdx;
         auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent
@@ -3402,10 +3373,10 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramKernel(
         {
             atomicAdd(&smemExpertCount[scoreIdx.idx], 1);
         }
-        // auto finalScore = TypeExpW{sigmoid_accurate(float{scoreIdx.score})};
+
         if (params.mPtrExpertWeights != nullptr)
         {
-            params.mPtrExpertWeights[expandedIdx] = static_cast<TypeElt>(scoreIdx.score);
+            params.mPtrExpertWeights[expandedIdx] = static_cast<TypeExpW>(scoreIdx.score);
         }
     };
 
@@ -3453,7 +3424,6 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
 {
     using TypeExpW = typename KernelParams::TypeExpW;
     using TypePacked = PackedScoreIdx<TypeExpW>;
-    using TypeElt = typename KernelParams::TypeElt;
 
     // number of experts is bounded by number of threads
     __shared__ int32_t __attribute((aligned(128))) smemExpertOffset[NumThreadsHist];
@@ -3561,7 +3531,7 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
         // Define a lambda to avoid code duplication in branches.
         auto loopBody = [&](int ii, int expandedIdx)
         {
-            PackedScoreIdx<TypeElt> scoreIdx = params.mPtrExpertIdx[expandedIdx];
+            PackedScoreIdx<TypeExpW> scoreIdx = params.mPtrExpertIdx[expandedIdx];
             expertIndexes[ii] = scoreIdx.idx;
             // check whether this expert is local to our GPU at all and ignore if not
             auto localExpertIdx = scoreIdx.idx - params.mLocalExpertsStartIdx;
@@ -3750,7 +3720,7 @@ void run(Data const& data, void* stream)
 
     if (useSingleCluster)
     {
-        LAUNCH_EXPW_QWEN3(data, routingIndicesClusterKernel, NumBlocksPerCluster, NumThreads,
+        LAUNCH_EXPW_QWEN3(data, false, routingIndicesClusterKernel, NumBlocksPerCluster, NumThreads,
             /*smemSize=*/0, // No dynamic smem
             stream);
     }
@@ -3771,14 +3741,14 @@ void run(Data const& data, void* stream)
 
         if (data.mPtrScores != nullptr)
         {
-            LAUNCH_EXPW_QWEN3(data, routingIndicesHistogramScoresKernel, maxNumBlocks, NumThreadsHist,
+            LAUNCH_EXPW_QWEN3(data, false, routingIndicesHistogramScoresKernel, maxNumBlocks, NumThreadsHist,
                 /*smemSize=*/0, // No dynamic smem
                 stream);
         }
-        LAUNCH_EXPW_QWEN3(data, routingIndicesHistogramKernel, numBlocksHistogram, NumThreadsHist,
+        LAUNCH_EXPW_ONLY(data, false, routingIndicesHistogramKernel, numBlocksHistogram, NumThreadsHist,
             /*smemSize=*/0, // No dynamic smem
             stream);
-        LAUNCH_EXPW_QWEN3(data, routingIndicesOffsetsKernel, numBlocksOffsets, NumThreadsHist,
+        LAUNCH_EXPW_ONLY(data, false, routingIndicesOffsetsKernel, numBlocksOffsets, NumThreadsHist,
             /*smemSize=*/0, // No dynamic smem
             stream);
     }
