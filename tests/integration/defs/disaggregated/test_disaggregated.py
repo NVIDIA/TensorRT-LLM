@@ -489,6 +489,31 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
+                                                 disaggregated_example_root,
+                                                 llm_venv,
+                                                 deepseek_v3_model_root):
+
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    env = llm_venv._new_env.copy()
+    env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
+    env["UCX_TLS"] = "^ib"
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_fp8",
+                           env=env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@skip_no_hopper
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         deepseek_v3_model_root):

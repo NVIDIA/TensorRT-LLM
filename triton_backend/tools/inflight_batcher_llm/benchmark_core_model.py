@@ -13,8 +13,6 @@ from datetime import datetime
 from functools import partial
 
 import numpy as np
-from end_to_end_test import \
-    test_performance as test_performance_with_text_prompts
 from transformers import AutoTokenizer
 from utils import utils
 
@@ -75,17 +73,28 @@ def test_performance(client,
         model_name = FLAGS.tensorrt_llm_model_name[i % len(
             FLAGS.tensorrt_llm_model_name)]
         output0_len = np.ones_like([[1]]).astype(np.int32) * 100
-        inputs = [
-            utils.prepare_tensor("input_ids", input_start_ids[0],
-                                 FLAGS.protocol),
-            utils.prepare_tensor("input_lengths", input_lens[0],
-                                 FLAGS.protocol),
-            utils.prepare_tensor("request_output_len", output0_len,
-                                 FLAGS.protocol),
-        ]
+        if FLAGS.test_llmapi:
+            input_data = np.array(
+                [input_start_ids[0]], dtype=object
+            )  ## TODO: [JIRA-4496] support batching in llmapi backend and add tests here.
+            inputs = [
+                utils.prepare_tensor("text_input", input_data, FLAGS.protocol),
+                utils.prepare_tensor("sampling_param_max_tokens",
+                                     np.array([output_lens[0]], dtype=np.int32),
+                                     FLAGS.protocol),
+            ]
+        else:
+            inputs = [
+                utils.prepare_tensor("input_ids", input_start_ids[0],
+                                     FLAGS.protocol),
+                utils.prepare_tensor("input_lengths", input_lens[0],
+                                     FLAGS.protocol),
+                utils.prepare_tensor("request_output_len", output0_len,
+                                     FLAGS.protocol),
+            ]
+            append_pad_id_to_tensors(pad_id, inputs)
+            append_end_id_to_tensors(end_id, inputs)
 
-        append_pad_id_to_tensors(pad_id, inputs)
-        append_end_id_to_tensors(end_id, inputs)
         if FLAGS.decoupled:
             client.async_stream_infer(model_name, inputs, request_id=str(i))
         else:
@@ -106,16 +115,27 @@ def test_performance(client,
         model_name = FLAGS.tensorrt_llm_model_name[i % len(
             FLAGS.tensorrt_llm_model_name)]
         output0_len = np.ones_like([[1]]).astype(np.int32) * output_lens[i]
-        inputs = [
-            utils.prepare_tensor("input_ids", ids, FLAGS.protocol),
-            utils.prepare_tensor("input_lengths", input_lens[i],
-                                 FLAGS.protocol),
-            utils.prepare_tensor("request_output_len", output0_len,
-                                 FLAGS.protocol),
-        ]
+        if FLAGS.test_llmapi:
+            input_data = np.array(
+                [ids], dtype=object
+            )  ## TODO: [JIRA-4496] support batching in llmapi backend and add tests here.
+            inputs = [
+                utils.prepare_tensor("text_input", input_data, FLAGS.protocol),
+                utils.prepare_tensor("sampling_param_max_tokens",
+                                     np.array([output_lens[i]], dtype=np.int32),
+                                     FLAGS.protocol),
+            ]
+        else:
+            inputs = [
+                utils.prepare_tensor("input_ids", ids, FLAGS.protocol),
+                utils.prepare_tensor("input_lengths", input_lens[i],
+                                     FLAGS.protocol),
+                utils.prepare_tensor("request_output_len", output0_len,
+                                     FLAGS.protocol),
+            ]
 
-        append_pad_id_to_tensors(pad_id, inputs)
-        append_end_id_to_tensors(end_id, inputs)
+            append_pad_id_to_tensors(pad_id, inputs)
+            append_end_id_to_tensors(end_id, inputs)
 
         time.sleep(delays[i])
 
@@ -148,8 +168,9 @@ def test_performance(client,
         print(f"[INFO] Total Latency: {latency} ms")
 
         # TODO(kaiyu): support `extract_print_stats` for http
+        # TODO(achartier): support `extract_print_stats` for LLMAPI
         data_dict = None
-        if FLAGS.protocol == "grpc":
+        if FLAGS.protocol == "grpc" and not FLAGS.test_llmapi:
             request_latencies = 0.0
             for latency in user_data._latencies:
                 request_latencies += latency
@@ -403,29 +424,6 @@ if __name__ == '__main__':
     ratio = []
 
     print(FLAGS.workload)
-    if FLAGS.test_llmapi:
-        assert FLAGS.workload == "dataset", "LLMAPI only supports dataset workload with text prompts"
-        FLAGS.streaming = FLAGS.decoupled
-        FLAGS.model_name = "tensorrt_llm"
-        prompts = []
-        output_lens = []
-        with open(FLAGS.dataset, 'r') as f:
-            data_dict = json.load(f)
-            for req in data_dict:
-                prompt = req['input'] + ' ' + req['instruction']
-                output = req['output']
-                # 1.3 is a magic number that converts number of words to number of tokens
-                if int(len(prompt.split(' ')) / 1.3) > FLAGS.max_input_len:
-                    continue
-                prompts.append(prompt)
-                # 1.3 is a magic number that converts number of words to number of tokens
-                output_lens.append(int(len(output.split(' ')) * 1.3))
-        test_performance_with_text_prompts(client,
-                                           prompts,
-                                           output_lens,
-                                           FLAGS,
-                                           use_llmapi=True)
-        exit(0)
     if FLAGS.workload == "dataset":
         tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer_dir,
                                                   legacy=False,
@@ -453,7 +451,10 @@ if __name__ == '__main__':
                 if prompt_cnt > FLAGS.num_requests:
                     break
 
-                input_start_ids.append(np.array([line], np.int32))
+                if FLAGS.test_llmapi:
+                    input_start_ids.append(prompt)
+                else:
+                    input_start_ids.append(np.array([line], np.int32))
                 input_lens.append(np.array([[len(line)]], np.int32))
                 output_lens.append(
                     int(len(output.split(' ')) * FLAGS.op_tokens_per_word))
@@ -469,6 +470,7 @@ if __name__ == '__main__':
                          delays, FLAGS, pad_id, end_id)
 
     elif FLAGS.workload == "token-norm-dist":
+        assert not FLAGS.test_llmapi, "LLMAPI does not support token-norm-dist workload yet"
         input_lens = utils.get_norm_dist_tokens(FLAGS.input_mean,
                                                 FLAGS.input_stdev,
                                                 FLAGS.num_requests)
@@ -489,6 +491,7 @@ if __name__ == '__main__':
                          delays, FLAGS)
 
     elif FLAGS.workload == "token-from-histogram":
+        assert not FLAGS.test_llmapi, "LLMAPI does not support token-from-histogram workload yet"
         input_lens_orig = utils.get_token_list_from_histogram(
             FLAGS.histogram_key + "_ip")
         output_lens_orig = utils.get_token_list_from_histogram(

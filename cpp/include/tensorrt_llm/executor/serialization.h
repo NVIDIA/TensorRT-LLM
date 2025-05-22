@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
@@ -89,6 +90,11 @@ public:
     [[nodiscard]] static kv_cache::SocketState deserializeSocketState(std::istream& is);
     static void serialize(kv_cache::SocketState const& state, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(kv_cache::SocketState const& state);
+
+    // AgentState
+    [[nodiscard]] static kv_cache::AgentState deserializeAgentState(std::istream& is);
+    static void serialize(kv_cache::AgentState const& state, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(kv_cache::AgentState const& state);
 
     // CacheState
     [[nodiscard]] static kv_cache::CacheState deserializeCacheState(std::istream& is);

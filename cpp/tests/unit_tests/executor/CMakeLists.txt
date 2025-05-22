@@ -34,5 +34,6 @@ add_gtest(ucxCommTest ucxCommTest.cpp)
 
 if(NIXL_ROOT)
   add_gtest(transferAgentTest transferAgentTest.cpp)
+  add_gtest(agentCommTest agentCommTest.cpp)
   target_link_libraries(transferAgentTest PRIVATE tensorrt_llm_nixl_wrapper)
 endif()
