@@ -1,11 +1,9 @@
 import copy
 from enum import Enum
-from typing import List
-
-from tensorrt_llm.scaffolding import ChatTask, Controller, Task
-
-from .mcp_task import MCPCallTask, MCPListTask
-
+from typing import Any, List
+from tensorrt_llm.scaffolding import (Task,  Controller)
+from .mcp_task import (MCPCallTask, MCPListTask)
+from .chat_task import (ChatTask)
 
 class MCPController(Controller):
 
