@@ -19,6 +19,7 @@
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <ATen/cuda/EmptyTensor.h>
+#include <ATen/ops/index_select.h>
 
 namespace torch_ext
 {
@@ -256,6 +257,12 @@ torch::Tensor fp4_block_scale_moe_runner(torch::Tensor const& routing_logits,
     moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream);
     return output;
 }
+
+torch::Tensor shuffleMatrix(torch::Tensor matrix, torch::Tensor permuteIndices)
+{
+    return torch::index_select(matrix, 0, permuteIndices);
+}
+
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -284,7 +291,11 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int routing_method_type) -> Tensor");
 }
 
+// Accepts CUDA tensor only
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("fp4_block_scale_moe_runner", &torch_ext::fp4_block_scale_moe_runner);
 }
+
+// Accepts both CPU and CUDA tensors
+static auto shuffle_matrix = torch::RegisterOperators("trtllm::shuffle_matrix", &torch_ext::shuffleMatrix);
