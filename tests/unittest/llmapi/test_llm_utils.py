@@ -9,12 +9,12 @@ from tensorrt_llm.llmapi.llm_utils import *
 from .test_llm import llama_model_path
 # isort: on
 
-from tensorrt_llm.llmapi.llm_utils import *
+from tensorrt_llm.llmapi.llm_args import *
 
 
 def test_ModelLoader():
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
-    args = LlmArgs(model=llama_model_path, kv_cache_config=kv_cache_config)
+    args = TrtLlmArgs(model=llama_model_path, kv_cache_config=kv_cache_config)
     args._setup()
 
     # Test with HF model

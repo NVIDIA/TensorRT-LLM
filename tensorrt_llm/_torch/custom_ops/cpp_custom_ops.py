@@ -223,6 +223,27 @@ def _register_fake():
     def _(max_sm_count: int):
         pass
 
+    @torch.library.register_fake("trtllm::moe_load_balance_wait_gpu_stage")
+    def _(single_layer_load_balancer_ptr: int):
+        return torch.empty((1, ),
+                           dtype=torch.int32,
+                           device=torch.device("cuda"))
+
+    @torch.library.register_fake("trtllm::moe_load_balance_set_cpu_stage")
+    def _(single_layer_load_balancer_ptr: int):
+        pass
+
+    @torch.library.register_fake("trtllm::moe_load_balance_statistic")
+    def _(single_layer_load_balancer_ptr: int,
+          gathered_raw_expert_ids: torch.Tensor, enabled: torch.Tensor,
+          is_first_stage: bool, is_last_stage: bool):
+        pass
+
+    @torch.library.register_fake("trtllm::moe_load_balance_routing")
+    def _(single_layer_load_balancer_ptr: int,
+          token_selected_experts: torch.Tensor):
+        return torch.empty_like(token_selected_experts)
+
     @torch.library.custom_op("trtllm::group_rms_norm_base",
                              mutates_args=("outputs", ))
     def group_rms_norm_base(

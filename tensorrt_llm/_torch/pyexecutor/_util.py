@@ -463,7 +463,8 @@ def instantiate_sampler(model_engine: PyTorchModelEngine,
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         sampler = TorchStarAttentionSampler(
             max_seq_len=model_engine.max_seq_len)
-    elif model_engine.spec_config is not None:
+    elif model_engine.spec_config is not None and model_engine.spec_config.spec_dec_mode.has_spec_decoder(
+    ):
         sampler = get_spec_decoder(max_seq_len=model_engine.max_seq_len,
                                    spec_config=model_engine.spec_config)
     elif pytorch_backend_config.enable_trtllm_sampler:

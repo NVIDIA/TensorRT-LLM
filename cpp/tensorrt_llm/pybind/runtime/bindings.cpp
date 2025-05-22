@@ -16,6 +16,7 @@
  */
 
 #include "bindings.h"
+#include "moeBindings.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
@@ -34,6 +35,7 @@
 #include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
 #include "tensorrt_llm/runtime/loraCache.h"
+#include "tensorrt_llm/runtime/mcastGPUBuffer.h"
 #include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
@@ -399,6 +401,11 @@ void initBindings(pybind11::module_& m)
         [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
         "Calculate the maximum workspace size needed for low precision all-reduce operations");
 
+    py::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
+        .def(py::init<size_t, uint32_t, uint32_t, at::Device, bool>())
+        .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer)
+        .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer);
+
     py::enum_<tensorrt_llm::kernels::AllReduceFusionOp>(m, "AllReduceFusionOp")
         .value("NONE", tensorrt_llm::kernels::AllReduceFusionOp::NONE)
         .value("RESIDUAL_RMS_NORM", tensorrt_llm::kernels::AllReduceFusionOp::RESIDUAL_RMS_NORM)
@@ -418,6 +425,9 @@ void initBindings(pybind11::module_& m)
         .value("UB", tensorrt_llm::kernels::AllReduceStrategyType::UB)
         .value("ONESHOT", tensorrt_llm::kernels::AllReduceStrategyType::ONESHOT)
         .value("TWOSHOT", tensorrt_llm::kernels::AllReduceStrategyType::TWOSHOT);
+
+    // Initialize MoeLoadBalancer bindings
+    initMoeBindings(m);
 }
 
 } // namespace tensorrt_llm::pybind::runtime
