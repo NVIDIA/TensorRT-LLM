@@ -609,7 +609,7 @@ class LLM:
         if self._on_trt_backend and self.args.extended_runtime_perf_knob_config is not None:
             executor_config.extended_runtime_perf_knob_config = PybindMirror.maybe_to_pybind(
                 self.args.extended_runtime_perf_knob_config)
-        if self._on_trt_backend and self.args.cache_transceiver_config is not None:
+        if self.args.cache_transceiver_config is not None:
             executor_config.cache_transceiver_config = PybindMirror.maybe_to_pybind(
                 self.args.cache_transceiver_config)
         from tensorrt_llm._torch.pyexecutor.config import update_executor_config
