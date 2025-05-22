@@ -104,6 +104,7 @@ class CompletionResponse(OpenAIBaseModel):
     model: str
     choices: List[CompletionResponseChoice]
     usage: UsageInfo
+    prompt_token_ids: Optional[List[List[int]]] = None
 
 
 class CompletionResponseStreamChoice(OpenAIBaseModel):

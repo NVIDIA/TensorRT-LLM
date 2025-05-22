@@ -315,6 +315,7 @@ class OpenAIServer:
         async def create_completion_response(
                 generator: AsyncIterator[Tuple[RequestOutput, Optional[PostprocParams]]]) -> CompletionResponse:
             all_choices: List[CompletionResponseChoice] = []
+            all_prompt_token_ids: List[List[int]] = []
             num_prompt_tokens = num_gen_tokens = 0
             async for request_output, postproc_params in generator:
                 pp_result: CompletionResponse
@@ -328,6 +329,7 @@ class OpenAIServer:
                 all_choices.extend(choices)
                 num_prompt_tokens += usage.prompt_tokens
                 num_gen_tokens += usage.completion_tokens
+                all_prompt_token_ids.append(request_output.prompt_token_ids)
 
             usage_info = UsageInfo(
                 prompt_tokens=num_prompt_tokens,
@@ -338,6 +340,7 @@ class OpenAIServer:
                 model=self.model,
                 choices=all_choices,
                 usage=usage_info,
+                prompt_token_ids=all_prompt_token_ids,
             )
             return response
 
