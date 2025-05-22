@@ -103,6 +103,7 @@ def add_llm_args(parser):
     parser.add_argument('--spec_decode_algo', type=str, default=None)
     parser.add_argument('--spec_decode_nextn', type=int, default=1)
     parser.add_argument('--eagle_model_dir', type=str, default=None)
+    parser.add_argument('--draft_model_dir', type=str, default=None)
     parser.add_argument('--max_matching_ngram_size', type=int, default=5)
 
     # Relaxed acceptance
@@ -159,7 +160,7 @@ def setup_llm(args):
     elif spec_decode_algo == "DRAFT_TARGET":
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=args.spec_decode_nextn,
-            pytorch_weights_path=args.eagle_model_dir)
+            pytorch_weights_path=args.draft_model_dir)
     elif spec_decode_algo == "NGRAM":
         spec_config = NGramDecodingConfig(
             prompt_lookup_num_tokens=args.spec_decode_nextn,
