@@ -766,6 +766,17 @@ void WindowBlockManager::claimLeafBlock(BlockPtr const& block, std::optional<exe
     block->freeLeafBlock();
 }
 
+void WindowBlockManager::freeChildren(BlockPtr const& block, executor::RetentionPriority priority, std::optional<std::chrono::milliseconds> durationMs)
+{
+    auto nextBlocks = block->getNextBlocks();
+    for (auto iter = nextBlocks.begin(); iter != nextBlocks.end(); ++iter)
+    {
+        auto childBlock = iter->second;
+        freeChildren(childBlock, priority, durationMs);
+    }
+    claimLeafBlock(block, priority, durationMs);
+}
+
 BlockPtr WindowBlockManager::getFreeBlock(
     executor::RetentionPriority priority, std::optional<std::chrono::milliseconds> durationMs)
 {
@@ -800,7 +811,12 @@ BlockPtr WindowBlockManager::getFreeBlock(
         mEventManager->enqueueRemovedEvent(block);
     }
 
-    claimLeafBlock(block, priority, durationMs);
+    // Ensure that returned block is a leaf block by freeing all it's children.
+    // Most blocks returned by mEvictionPolicy->getFreeBlock will be leaf blocks,
+    // but there are situations where they are not. One example is when a primary
+    // block has children in secondary memory and offloading is not possible
+    // because there are no free secondary blocks.
+    freeChildren(block, priority, durationMs);
 
     return block;
 }
