@@ -27,6 +27,7 @@ def temp_extra_llm_api_options_file(request):
                 "enable_block_reuse": False,
                 "free_gpu_memory_fraction": 0.6,
             },
+            "max_num_tokens": 16384,  # for pytorch backend
             # NOTE: This is for video support.
             "build_config": {
                 "max_num_tokens": 16384,
