@@ -35,17 +35,6 @@ namespace tensorrt_llm::kernels
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Helper function to compute RoPE rotation
-__host__ __device__ void applyRoPE(float& x, float& y, float cosTheta, float sinTheta)
-{
-    float xNew = x * cosTheta - y * sinTheta;
-    float yNew = x * sinTheta + y * cosTheta;
-    x = xNew;
-    y = yNew;
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 // Perform per-head QK Norm and RoPE in a single kernel.
 // head_dim: the dimension of each head
 // interleave: interleave=!is_neox.
@@ -137,23 +126,62 @@ __global__ void fusedQKNormRopeKernel(
     }
 
     // Apply RoPE to normalized elements
-    int pos_id = position_ids[tokenIdx];
+    float elements2[numElemsPerThread];  // Additional buffer required for RoPE.
+    float cos_vals[numElemsPerThread];
+    float sin_vals[numElemsPerThread];
 
-    for (int i = 0; i < numElemsPerThread; i += 2)
+    float pos_id = static_cast<float>(position_ids[tokenIdx]);
+
+    // TODO: cos sin calculation could be halved.
+    if constexpr (interleave)
     {
-        // Calculate the actual dimension index in the head
-        int dim_idx = laneId * numElemsPerThread + i;
+        // Perform interleaving. Fill cos_vals and sin_vals.
+        for (int i = 0; i < numElemsPerThread; i++)
+        {
+            if(i % 2 == 0)
+            {
+                elements2[i] = -elements[i+1];
+            }
+            else    
+            {
+                elements2[i] = elements[i-1];
+            }
 
-        // Proper RoPE frequency calculation
-        int half_dim = dim_idx / 2;
-        float freq = powf(base, -2.0f * half_dim / static_cast<float>(head_dim));
-        float theta = pos_id * freq;
+            int dim_idx = laneId * numElemsPerThread + i;
+            int half_dim = dim_idx / 2;
+            float freq = powf(base, -2.0f * half_dim / static_cast<float>(head_dim));
+            float theta = pos_id * freq;
+            __sincosf(theta, &sin_vals[i], &cos_vals[i]);
+        }
+    }
+    else
+    {
+        // Before data exchange with in warp, we need to sync.
+        __syncwarp();
+        // Get the data from the other half of the warp. Fill cos_vals and sin_vals.
+        for (int i = 0; i < numElemsPerThread; i++)
+        {
+            elements2[i] = __shfl_xor_sync(0xffffffff, elements[i], 16);
+            if(laneId < 16)
+            {
+                elements2[i] = -elements2[i];
+            }
 
-        float cosTheta = cosf(theta);
-        float sinTheta = sinf(theta);
+            int laneIdForDim = laneId ^ ((((laneId >> 4) ^ (i & 1)) & 1) << 4);
 
-        // Apply rotation
-        applyRoPE(elements[i], elements[i + 1], cosTheta, sinTheta);
+            int dim_idx = laneIdForDim * numElemsPerThread + i;
+            int half_dim = dim_idx / 2;
+            float freq = powf(base, -2.0f * half_dim / static_cast<float>(head_dim));
+            float theta = pos_id * freq;
+            __sincosf(theta, &sin_vals[i], &cos_vals[i]);
+        }
+        // __shfl_xor_sync does not provide memfence. Need to sync again.
+        __syncwarp();
+    }
+
+    for (int i = 0; i < numElemsPerThread; i++)
+    {
+        elements[i] = elements[i] * cos_vals[i] + elements2[i] * sin_vals[i];
     }
 
     // Store.
