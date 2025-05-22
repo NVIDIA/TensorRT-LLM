@@ -66,6 +66,12 @@ def test_health(server: RemoteOpenAIServer):
     assert response.status_code == 200
 
 
+def test_health_generate(server: RemoteOpenAIServer):
+    health_generate_url = server.url_for("health_generate")
+    response = requests.get(health_generate_url)
+    assert response.status_code == 200
+
+
 def test_model(client: openai.OpenAI, model_name: str):
     model = client.models.list().data[0]
     assert model.id == model_name.split('/')[-1]
