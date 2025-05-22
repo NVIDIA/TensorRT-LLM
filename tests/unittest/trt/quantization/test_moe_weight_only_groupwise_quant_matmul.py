@@ -154,14 +154,14 @@ class TestMoEWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
             2**31, (num_experts, n, k // num_weights_in_32_bits),
             dtype=torch.int32,
             device="cuda")
-        pre_quant_scale_1 = torch.ones(1,
-                                       k,
-                                       dtype=activation_dtype,
-                                       device="cuda")
-        pre_quant_scale_2 = torch.ones(1,
-                                       n,
-                                       dtype=activation_dtype,
-                                       device="cuda")
+        pre_quant_scale_1 = torch.randn(1,
+                                        k,
+                                        dtype=activation_dtype,
+                                        device="cuda")
+        pre_quant_scale_2 = torch.randn(1,
+                                        n,
+                                        dtype=activation_dtype,
+                                        device="cuda")
         scale_1 = torch.randn(num_experts,
                               k // group_size,
                               n * 2,
@@ -182,8 +182,14 @@ class TestMoEWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                              k,
                              dtype=activation_dtype,
                              device="cuda") * 0.01
-        alpha_1 = 1 / pre_quant_scale_1.float()
-        alpha_2 = 1 / pre_quant_scale_2.float()
+        alpha_1 = torch.randn(num_experts,
+                              1,
+                              dtype=torch.float32,
+                              device="cuda") * 0.1
+        alpha_2 = torch.randn(num_experts,
+                              1,
+                              dtype=torch.float32,
+                              device="cuda") * 0.1
 
         preprocessor = tensorrt_llm.quantization.functional.preprocess_weights_for_mixed_gemm
         unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
