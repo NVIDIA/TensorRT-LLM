@@ -241,7 +241,7 @@ class SamplingParams:
     # Tokenizer-related configs
     ignore_eos: bool = False
     detokenize: bool = True
-    add_special_tokens: bool = True
+    add_special_tokens: bool = False
     truncate_prompt_tokens: Optional[int] = None
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
