@@ -32,7 +32,7 @@ class SampleStateTensors:
         return vars(self).values()
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(kw_only=True)
 class SampleState:
     scheduled_requests: ScheduledRequests
 
