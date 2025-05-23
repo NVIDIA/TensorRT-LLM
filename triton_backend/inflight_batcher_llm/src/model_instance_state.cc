@@ -61,11 +61,7 @@ executor::BatchingType ModelInstanceState::getBatchingTypeFromParams()
     executor::BatchingType batchingType;
     auto gpt_model_type = model_state_->GetParameter<std::string>("gpt_model_type");
 
-    if (gpt_model_type == "V1" || gpt_model_type == "v1")
-    {
-        batchingType = executor::BatchingType::kSTATIC;
-    }
-    else if (gpt_model_type == "inflight_batching" || gpt_model_type == "inflight_fused_batching")
+    if (gpt_model_type == "inflight_batching" || gpt_model_type == "inflight_fused_batching")
     {
         batchingType = executor::BatchingType::kINFLIGHT;
     }
@@ -73,7 +69,7 @@ executor::BatchingType ModelInstanceState::getBatchingTypeFromParams()
     {
         throw std::runtime_error(
             "Invalid gpt_model_type. Must be "
-            "v1/inflight_batching/inflight_fused_batching.");
+            "inflight_batching/inflight_fused_batching.");
     }
     return batchingType;
 }
@@ -365,6 +361,10 @@ executor::SchedulerConfig ModelInstanceState::getSchedulerConfigFromParams(bool 
         else if (schedulerPolicyStr == "guaranteed_no_evict")
         {
             schedulerPolicy = CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT;
+        }
+        else if (schedulerPolicyStr == "static_batch")
+        {
+            schedulerPolicy = CapacitySchedulerPolicy::kSTATIC_BATCH;
         }
         else
         {
