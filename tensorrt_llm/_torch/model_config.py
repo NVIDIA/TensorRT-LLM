@@ -21,25 +21,48 @@ class MoeLoadBalancerConfig:
     initial_global_assignments: Optional[Dict[int, List[int]]] = None
     layer_updates_per_iter: int = 0
 
-    def get_initial_local_expert_ids(self, num_experts: int, ep_rank: int,
-                                     ep_size: int, layer_idx: int) -> List[int]:
-        num_slots = num_experts if self.num_slots is None else self.num_slots
-        assert num_slots >= num_experts
-        assert num_slots % ep_size == 0
-        num_local_slots = num_slots // ep_size
+    num_experts: Optional[int] = field(default=None, init=False)
+    ep_rank: Optional[int] = field(default=None, init=False)
+    ep_size: Optional[int] = field(default=None, init=False)
 
+    def setup(self, num_experts: int, ep_rank: int, ep_size: int) -> None:
+        self.num_experts = num_experts
+        self.ep_rank = ep_rank
+        self.ep_size = ep_size
+        if self.num_slots is None:
+            self.num_slots = self.num_experts
+        assert self.num_slots >= self.num_experts
+        assert self.num_slots % self.ep_size == 0
+
+    @property
+    def num_local_slots(self) -> int:
+        return self.num_slots // self.ep_size
+
+    @property
+    def slot_start(self) -> int:
+        return self.ep_rank * self.num_local_slots
+
+    @property
+    def slot_end(self) -> int:
+        return self.slot_start + self.num_local_slots
+
+    def get_layer_initial_global_assignments(self, layer_idx: int) -> List[int]:
         if self.initial_global_assignments is None:
-            return [(ep_rank * num_experts // ep_size + i) % num_experts
-                    for i in range(num_local_slots)]
+            return [(ep_rank * self.num_experts // self.ep_size + i) %
+                    self.num_experts for ep_rank in range(self.ep_size)
+                    for i in range(self.num_local_slots)]
         else:
             assert layer_idx in self.initial_global_assignments
-            assert len(self.initial_global_assignments[layer_idx]) == num_slots
+            assert len(
+                self.initial_global_assignments[layer_idx]) == self.num_slots
             assert set(self.initial_global_assignments[layer_idx]) == set(
-                range(num_experts))
-            slot_start = ep_rank * num_local_slots
-            slot_end = slot_start + num_local_slots
-            return self.initial_global_assignments[layer_idx][
-                slot_start:slot_end]
+                range(self.num_experts))
+            return self.initial_global_assignments[layer_idx]
+
+    def get_layer_initial_local_expert_ids(self, layer_idx: int) -> List[int]:
+        layer_initial_global_assignments = self.get_layer_initial_global_assignments(
+            layer_idx)
+        return layer_initial_global_assignments[self.slot_start:self.slot_end]
 
 
 @dataclass(kw_only=True)
