@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import json
 import tempfile
 import threading
@@ -9,6 +10,7 @@ import pytest
 import torch
 import zmq
 
+import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm._utils import mpi_world_size
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
@@ -356,6 +358,60 @@ def test_ZeroMqQueue_sync_async():
     push_pipe.close()
 
 
+def _ZeroMqQueue_serialization_complicated_dataclass(addr: str,
+                                                     iterations: int):
+    pull_pipe = ZeroMqQueue(address=addr, is_server=False, is_async=True)
+
+    total = 0
+
+    async def task():
+        print(f"running task")
+        for i in range(iterations):
+            print(f"waiting for msg")
+            msg = await pull_pipe.get_async()
+            # print(f"received: {msg}")
+            nonlocal total
+            try:
+                total += msg.prompt_token_ids[0]
+            except Exception as e:
+                print(f"error: {e}")
+
+    print(f"to run task")
+    asyncio.run(task())
+
+    return total
+
+
+def test_ZeroMqQueue_serialization_complicated_dataclass():
+    # sync send message, async recv message
+    push_pipe = ZeroMqQueue(is_async=False, is_server=True)
+    iterations = 2
+
+    pool = ProcessPoolExecutor(max_workers=1)
+    res = pool.submit(_ZeroMqQueue_serialization_complicated_dataclass,
+                      push_pipe.address, iterations)
+
+    TokenRangeRetentionConfig = tllm.KvCacheRetentionConfig.TokenRangeRetentionConfig
+    kvcache_config = tllm.KvCacheRetentionConfig(
+        [TokenRangeRetentionConfig(0, 2, 30, datetime.timedelta(seconds=30))],
+        80)
+
+    sampling_params = SamplingParams(max_tokens=4,
+                                     embedding_bias=torch.randn(2, 2))
+
+    for i in range(iterations):
+        request = GenerationRequest(prompt_token_ids=[i],
+                                    sampling_params=sampling_params,
+                                    kv_cache_retention_config=kvcache_config)
+        # print(f"put with msg: {request}")
+        push_pipe.put(request)
+
+    print(res.result())
+    assert res.result() == iterations * (iterations - 1) / 2
+    pool.shutdown()
+    push_pipe.close()
+
+
 Input = PostprocWorker.Input
 Output = PostprocWorker.Output
 
@@ -374,7 +430,8 @@ def ResponsePostprocessWorker_worker_task(pull_pipe_addr, push_pipe_addr,
         pull_pipe_addr=pull_pipe_addr,
         push_pipe_addr=push_pipe_addr,
         tokenizer_dir=tokenizer_dir,
-        record_creator=ResponsePostprocessWorker_record_creator)
+        record_creator=ResponsePostprocessWorker_record_creator,
+        BASE_ZMQ_CLASSES=serialization.BASE_ZMQ_CLASSES)
     worker.start()
 
 

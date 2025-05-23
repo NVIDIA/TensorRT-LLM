@@ -6,14 +6,18 @@ from torch import nn
 from tqdm import tqdm
 from transformers import Qwen3MoeConfig
 
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
+
 from ..attention_backend import AttentionMetadata
-from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
+from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
+                           allgather)
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import FusedMoE, RenormalizeMoeRoutingMethod
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
+from ..utils import disable_fp4_allgather
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, duplicate_kv_weight,
@@ -32,12 +36,15 @@ class Qwen3MoE(nn.Module):
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size
         self.moe_intermediate_size = config.moe_intermediate_size
-        # self.shared_expert_intermediate_size = config.shared_expert_intermediate_size # not used in qwen3
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.mapping = model_config.mapping
         self.allreduce = AllReduce(self.mapping)
+        self.enable_alltoall = Qwen3MoE.should_enable_alltoall(
+            model_config, self.top_k)
+        if self.enable_alltoall:
+            MnnvlMemory.initialize()
 
         # moe gate (linear layer) only runs in half/full precision for now
         self.gate = Linear(self.hidden_dim,
@@ -57,6 +64,25 @@ class Qwen3MoE(nn.Module):
             model_config=model_config,
         )
 
+    @staticmethod
+    def should_enable_alltoall(model_config: ModelConfig, top_k: int) -> bool:
+        if not model_config.mapping.enable_attention_dp:
+            return False
+
+        if model_config.mapping.tp_size == 1:
+            return False
+
+        if not MnnvlMemory.supports_mnnvl():
+            return False
+
+        if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
+            return False
+
+        if model_config.mapping.moe_ep_size <= top_k:
+            return False
+
+        return True
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -66,14 +92,32 @@ class Qwen3MoE(nn.Module):
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
-
+        use_dp_padding = False
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+
+        if self.enable_attention_dp and self.mapping.tp_size > 1:
+            # FP4 all_gather moves this bf16 allgather in to after topk and fp4 quantization
+            # to reduce allreduce BW
+            if disable_fp4_allgather() and not self.enable_alltoall:
+                hidden_states = allgather(hidden_states,
+                                          self.mapping,
+                                          dim=0,
+                                          sizes=all_rank_num_tokens)
+            elif not self.experts.is_cutlass() or (not self.experts.has_fp8_qdq
+                                                   and self.experts.has_nvfp4):
+                # Use padding when not using the cutlass path or when x_sf in self.experts is not None
+                use_dp_padding = True
+                max_num_token = max(all_rank_num_tokens)
+                hidden_states = torch.nn.functional.pad(
+                    hidden_states,
+                    (0, 0, 0, max_num_token - hidden_states.shape[0]))
+
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states,
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
-            use_dp_padding=False)
+            use_dp_padding=use_dp_padding)
 
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
             final_hidden_states = self.allreduce(

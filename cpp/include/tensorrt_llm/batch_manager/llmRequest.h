@@ -1620,6 +1620,13 @@ public:
         return isGenerationCompleteState() || mState == LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS;
     }
 
+    /// Returns true if finished_reason is length for all beams
+    [[nodiscard]] bool isFinishedDueToLength() const noexcept
+    {
+        return std::all_of(mFinishReasons.begin(), mFinishReasons.end(),
+            [](auto reason) { return reason == executor::FinishReason::kLENGTH; });
+    }
+
     [[nodiscard]] bool isTimedOut() const
     {
         if (!mAllottedTimeMs.has_value())
