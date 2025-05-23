@@ -294,6 +294,14 @@ class LLM:
         """
         sampling_params = self._prepare_sampling_params(sampling_params)
 
+        # With pytorch backend, py_executor has logic to handle max_tokens of 1,
+        # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
+        # TODO: Also support for trt backend
+        if (disaggregated_params is not None
+                and disaggregated_params.request_type == "context_only"
+                and not self._on_trt_backend):
+            sampling_params.max_tokens = 1
+
         max_batch_size = self.args.max_batch_size
         max_batch_size = max_batch_size or self.args.build_config.max_batch_size
 
@@ -609,7 +617,7 @@ class LLM:
         if self._on_trt_backend and self.args.extended_runtime_perf_knob_config is not None:
             executor_config.extended_runtime_perf_knob_config = PybindMirror.maybe_to_pybind(
                 self.args.extended_runtime_perf_knob_config)
-        if self._on_trt_backend and self.args.cache_transceiver_config is not None:
+        if self.args.cache_transceiver_config is not None:
             executor_config.cache_transceiver_config = PybindMirror.maybe_to_pybind(
                 self.args.cache_transceiver_config)
         from tensorrt_llm._torch.pyexecutor.config import update_executor_config

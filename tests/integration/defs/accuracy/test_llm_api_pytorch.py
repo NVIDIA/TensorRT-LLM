@@ -57,7 +57,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     def test_chunked_prefill(self, attn_backend):
-        pytest.skip("https://nvbugspro.nvidia.com/bug/5285881")
         pytorch_config = PyTorchConfig(attn_backend=attn_backend, )
         llm = LLM(self.MODEL_PATH,
                   enable_chunked_prefill=True,
@@ -890,6 +889,7 @@ class TestNemotronNas(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@pytest.mark.skip_less_device_memory(80000)
 class TestNemotronSuper(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Llama-3_3-Nemotron-Super-49B-v1"
     MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1"

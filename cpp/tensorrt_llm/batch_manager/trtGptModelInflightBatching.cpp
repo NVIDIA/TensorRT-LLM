@@ -1484,6 +1484,16 @@ void TrtGptModelInflightBatching::prepareDisaggGenInitRequests(
     // Initiate KV cache transfer
     auto timeStart = std::chrono::steady_clock::now();
 
+    if (tc::getEnvDisaggBenchmarkGenOnly())
+    {
+        TLLM_LOG_DEBUG("Disaggregated generation only benchmark mode is enabled");
+        for (auto& req : newGenReqs)
+        {
+            req->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
+        }
+        return;
+    }
+
     auto const genInitReqNum = std::count_if(activeRequests.begin(), activeRequests.end(),
         [](auto const& req) { return req->isDisaggGenerationInitState(); });
 
