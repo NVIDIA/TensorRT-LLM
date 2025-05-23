@@ -49,8 +49,6 @@
 #include <torch/extension.h>
 
 namespace tr = tensorrt_llm::runtime;
-namespace tle = tensorrt_llm::executor;
-using CudaStreamPtr = std::shared_ptr<tr::CudaStream>;
 
 class PyITensor : public tensorrt_llm::runtime::ITensor
 {
@@ -369,7 +367,10 @@ void initBindings(pybind11::module_& m)
             py::arg("world_config"))
         .def("forward_async", &tr::GptDecoderBatched::forwardAsync, py::arg("output"), py::arg("input"))
         .def("underlying_decoder", &tr::GptDecoderBatched::getUnderlyingDecoder, py::return_value_policy::reference)
-        .def_property_readonly("stream_ptr", &tr::GptDecoderBatched::getDecoderStream)
+        .def_property_readonly(
+            "decoder_stream",
+            [](tr::GptDecoderBatched& self) -> tr::CudaStream const& { return *self.getDecoderStream(); },
+            py::return_value_policy::reference)
         .def_property_readonly(
             "decoder_state", py::overload_cast<>(&tr::GptDecoderBatched::getDecoderState, py::const_));
 
