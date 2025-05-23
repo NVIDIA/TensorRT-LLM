@@ -96,14 +96,16 @@ def test_llm_eagle_1gpu(batch_size, data_type, use_dynamic_tree,
 # TODO: remove skip_post_blackwell after Speculative decoding is supported.
 @skip_post_blackwell
 @skip_pre_ada
+@pytest.mark.parametrize("use_dynamic_tree", [False, True],
+                         ids=['eagle1', 'eagle2'])
 @pytest.mark.parametrize("batch_size", [8], ids=['bs8'])
 @pytest.mark.parametrize("data_type", ['float16'])
 @pytest.mark.parametrize("eagle_model_roots", ["llama3.1-eagle-8b-hf_v0.5"],
                          indirect=True)
-def test_llm_eagle_1gpu_modelopt_ckpt(batch_size, data_type, eagle_model_roots,
-                                      eagle_example_root, llm_datasets_root,
-                                      llm_rouge_root, llm_venv, cmodel_dir,
-                                      engine_dir):
+def test_llm_eagle_1gpu_modelopt_ckpt(batch_size, data_type, use_dynamic_tree,
+                                      eagle_model_roots, eagle_example_root,
+                                      llm_datasets_root, llm_rouge_root,
+                                      llm_venv, cmodel_dir, engine_dir):
     print("Build engines...")
     model_name = "eagle"
 
@@ -140,6 +142,22 @@ def test_llm_eagle_1gpu_modelopt_ckpt(batch_size, data_type, eagle_model_roots,
     ]
 
     venv_check_call(llm_venv, run_cmd)
+
+    print("Run summarize...")
+    summary_cmd = [
+        f"{eagle_example_root}/../summarize.py", "--test_trt_llm",
+        "--hf_model_dir", f"{eagle_model_roots}", "--tokenizer_dir",
+        f"{eagle_model_roots}", f"--engine_dir={engine_dir}",
+        "--check_accuracy", "--tensorrt_llm_rouge1_threshold=24",
+        "--eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]",
+        f"--max_ite=40", f"--batch_size={batch_size}",
+        f"--dataset_dir={llm_datasets_root}", f"--rouge_dir={llm_rouge_root}"
+    ]
+    if use_dynamic_tree:
+        summary_cmd.extend(
+            [f"--eagle_dynamic_tree_max_top_k={3}", "--eagle_use_dynamic_tree"])
+
+    venv_check_call(llm_venv, summary_cmd)
 
 
 def test_with_dummy_eagle(hf_model_root,
