@@ -102,7 +102,6 @@ class BasicWorkerTester:
         ctx_request = copy.deepcopy(request)
         gen_request = copy.deepcopy(request)
 
-        ctx_request["max_tokens"] = 1
         ctx_request["disaggregated_params"] = {"request_type": "context_only"}
         ctx_response = await self.send_request(session, ctx_url, ctx_request)
         assert len(ctx_response["choices"]) == 1
@@ -195,6 +194,7 @@ class ConditionalWorkerTester(BasicWorkerTester):
             "model": MODEL_NAME,
             "prompt": init_prompt,
             "max_tokens": 10,
+            "ignore_eos": True,
             "temperature": 0.0,
         }
         prev_prompt_len = 0
@@ -268,6 +268,7 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
             "model": MODEL_NAME,
             "prompt": init_prompt,
             "max_tokens": 64,
+            "ignore_eos": True,
             "temperature": 0.0,
         }
         tokens_per_block = 32  # TODO: read from config
@@ -360,6 +361,7 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             "model": MODEL_NAME,
             "prompt": init_prompt,
             "max_tokens": 64,
+            "ignore_eos": True,
             "temperature": 0.0,
         }
         ctx_server_prev = None
@@ -423,6 +425,7 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
                 "model": MODEL_NAME,
                 "prompt": [3] * 100,
                 "max_tokens": 1,
+                "ignore_eos": True,
                 "temperature": 0.0,
             }
             assert len(self.gen_servers) == 1
