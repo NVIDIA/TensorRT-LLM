@@ -135,7 +135,8 @@ class ModelFactory(ABC):
         shard needs is reserved and/or allocated.
         """
         model._apply(
-            lambda t: torch.normal(0.0, 1.0, size=t.shape, device=device, dtype=t.dtype)
+            # NOTE (lucaslie): torch.normal is not support for all dtypes
+            lambda t: torch.normal(0.0, 1.0, size=t.shape, device=device).to(t.dtype)
             if t.device == torch.device("meta")
             else t.to(device)
         )
