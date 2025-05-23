@@ -20,7 +20,7 @@ class SampleStateTensorsMTP(SampleStateTensors):
     next_draft_tokens: torch.Tensor
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(kw_only=True)
 class SampleStateMTP(SampleState):
     device: SampleStateTensorsMTP
     host: SampleStateTensorsMTP
