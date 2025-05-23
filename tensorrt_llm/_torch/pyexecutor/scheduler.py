@@ -30,7 +30,8 @@ class ScheduledRequests:
 
     @property
     def can_run_cuda_graph(self) -> bool:
-        return (not self.context_requests)
+        # return (not self.context_requests)
+        return False
 
     @property
     def batch_size(self) -> int:

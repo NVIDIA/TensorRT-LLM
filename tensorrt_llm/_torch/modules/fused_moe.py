@@ -8,7 +8,7 @@ from typing import Dict, List, NamedTuple, Optional, Union
 import torch
 from torch import nn
 
-from tensorrt_llm._mnnvl_utils import MnnvlMoe, MoEAlltoallInfo
+from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 from tensorrt_llm._utils import get_sm_version, logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils import fp4_utils
@@ -25,6 +25,7 @@ from ..utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
 from .gated_mlp import GatedMLP
 from .linear import TensorParallelMode, load_weight_shard
 from .moe_load_balancer import MoeLoadBalancer
+from . import deep_ep_utils
 
 # The declarations aligns with moe_kernels.h
 # pack inputs into int64, e.g. 4 x bf16 input values
@@ -1013,8 +1014,10 @@ class FusedMoE(nn.Module):
             self.use_postquant_alltoall = (os.environ.get(
                 "TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1")
                                            == "1") and qm.has_nvfp4()
-        self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
-            model_config.mapping) if enable_alltoall else None
+        self.deep_ep_buffer = deep_ep_utils.get_buffer(
+            MnnvlMemory.get_comm(model_config.mapping),
+            deep_ep_utils.get_hidden_bytes(torch.empty(1, hidden_size, dtype=dtype))
+        )
 
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
@@ -1433,11 +1436,10 @@ class FusedMoE(nn.Module):
         alltoall_info = None
 
         if self.enable_alltoall:
-            x, token_selected_slots, token_final_scales, alltoall_info = \
-                self.alltoall_prepare_maybe_dispatch(all_rank_num_tokens,
-                                                     x,
-                                                     token_selected_slots,
-                                                     token_final_scales)
+            if not self.use_postquant_alltoall:
+                x, recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deepep_handle, event = \
+                    deep_ep_utils.dispatch_forward(x, token_selected_slots.to(torch.int64), token_final_scales, self.num_slots)
+                event.current_stream_wait()
 
         x_sf = None
         if self.has_any_quant:
@@ -1503,8 +1505,30 @@ class FusedMoE(nn.Module):
             quant_scales = self.quant_scales
 
         if self.use_postquant_alltoall:
-            x, x_sf = self.alltoall_postquant_dispatch(x, x_sf, x_row, x_col,
-                                                       alltoall_info)
+            if x_sf is not None:
+                if self.has_nvfp4:
+                    x_sf = unswizzle_sf(x_sf, x_row, x_col,
+                                        self.scaling_vector_size)
+                x_sf_dtype = x_sf.dtype
+                x_sf = x_sf.view(torch.float32)  # TODO: add dtype support to DeepEP
+            (x, x_sf), recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deepep_handle, event = \
+                deep_ep_utils.dispatch_forward((x, x_sf), token_selected_slots.to(torch.int64), token_final_scales, self.num_slots)
+            event.current_stream_wait()
+            if x_sf is not None:
+                x_sf = x_sf.view(x_sf_dtype)
+                if self.has_nvfp4:
+                    x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
+                                      self.scaling_vector_size)
+
+        token_selected_slots = recv_topk_idx.to(torch.int32)
+        mask = token_selected_slots == -1
+        token_selected_slots += self.num_slots // self.mapping.world_size * self.mapping.rank
+        token_selected_slots[mask] = self.num_slots
+        num_recv_token_is_zero = x.shape[0] == 0
+        if x.shape[0] == 0:
+            x = torch.zeros((1, x.shape[1]), dtype=x.dtype, device=x.device)
+            token_selected_slots = torch.full((1, token_selected_slots.shape[1]), self.num_slots, dtype=token_selected_slots.dtype, device=token_selected_slots.device)
+            token_final_scales = torch.ones((1, token_final_scales.shape[1]), dtype=token_final_scales.dtype, device=token_final_scales.device)
 
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
@@ -1539,8 +1563,11 @@ class FusedMoE(nn.Module):
         if not self.enable_alltoall:
             return final_hidden_states
         else:
-            return self.alltoall_combine(final_hidden_states, alltoall_info,
-                                         token_count)
+            if num_recv_token_is_zero:
+                final_hidden_states = final_hidden_states[:0]
+            combined_x, event = deep_ep_utils.combine_forward(final_hidden_states, deepep_handle)
+            event.current_stream_wait()
+            return combined_x
 
     def forward(
         self,
