@@ -313,18 +313,6 @@ void TransformerBuffers::getBuffers(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void TransformerBuffers::reshapePositionIds(std::vector<SizeType32> const& positionIdsHost, bool isChatGlm)
-{
-    if (isChatGlm)
-    {
-        positionIds->reshape(ITensor::makeShape({2, static_cast<int>(positionIdsHost.size()) / 2}));
-    }
-    else
-    {
-        positionIds->reshape(ITensor::makeShape({static_cast<int>(positionIdsHost.size())}));
-    }
-}
-
 void TransformerBuffers::copyPositionIds(runtime::TllmRuntime const& runtime,
     std::vector<SizeType32> const& positionIdsHost, bool isChatGlm, TensorPtr const& decoderPositionIds)
 {
