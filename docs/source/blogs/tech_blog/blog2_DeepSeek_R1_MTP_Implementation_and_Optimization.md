@@ -33,7 +33,7 @@ Speculative decoding is a popular technique for faster and cost-effective LLM in
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog2_verify_and_accept.png" alt="tech_blog2_verify_and_accept" width="1280" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog2_verify_and_accept.png" alt="tech_blog2_verify_and_accept" width="1280" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1. Verification example</em></sub></p>
@@ -45,7 +45,7 @@ For the draft stage in MTP, there are two different MTP methods, MTP vanilla and
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog2_mtp_vanilla.png" alt="tech_blog2_mtp_vanilla" width="640" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog2_mtp_vanilla.png" alt="tech_blog2_mtp_vanilla" width="640" height="auto">
 </figure>
 </div>
 <p align="left"><sub><em>Figure 2. MTP Vanilla, where t<sub>i</sub> is the input token, d<sub>i</sub> is the predicted draft token, K is the number of MTP modules, and h<sub>i</sub><sup>n</sup> is the hidden state of the n-th MTP module. Note that h<sub>0</sub> means the hidden states of the main model.  (Disclaimer: the figures adapted from the original DeepSeek V3 tech report)</em></sub></p>
@@ -61,7 +61,7 @@ In the generation phase, there will be a little difference. The predicted token 
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog2_mtp_eagle.png" alt="tech_blog2_mtp_eagle" width="640" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog2_mtp_eagle.png" alt="tech_blog2_mtp_eagle" width="640" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. MTP Eagle, using the same notation as Figure 2</em></sub></p>
@@ -78,7 +78,7 @@ TensorRT-LLM has two different paths for MTP, one for [MTP Vanilla](https://gith
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog2_overall_workflow.png" alt="tech_blog2_overall_workflow" width="800" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog2_overall_workflow.png" alt="tech_blog2_overall_workflow" width="800" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4. MTP workflow in TensorRT-LLM</em></sub></p>
@@ -93,7 +93,7 @@ Except for the Rewind KV Cache, all of those processes are inside the model engi
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog2_mtp_modules.png" alt="tech_blog2_mtp_modules" width="640" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog2_mtp_modules.png" alt="tech_blog2_mtp_modules" width="640" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5. MTP model architecture</em></sub></p>
@@ -150,7 +150,7 @@ DeepSeek-R1 is a reasoning model that first outputs some thinking tokens, after 
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog2_relaxed_acceptance.png" alt="tech_blog2_relaxed_acceptance" width="1024" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog2_relaxed_acceptance.png" alt="tech_blog2_relaxed_acceptance" width="1024" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 6. Relaxed Acceptance example. Use MTP nextn=4 and top-3 in this example.</em></sub></p>
@@ -207,7 +207,7 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog2_perf_and_ar.png" alt="tech_blog2_perf_and_ar" width="1280" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog2_perf_and_ar.png" alt="tech_blog2_perf_and_ar" width="1280" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 7. DeepSeek-R1-FP4 671B min-latency performance with different MTP next-n</em></sub></p>
@@ -218,7 +218,7 @@ We tested the min-latency (batch size = 1) performance of the DeepSeek-R1-FP4 mo
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog2_acc_relaxed_acceptance.png" alt="tech_blog2_acc_relaxed_acceptance" width="800" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog2_acc_relaxed_acceptance.png" alt="tech_blog2_acc_relaxed_acceptance" width="800" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 8. Ablation results for the Relaxed Acceptance. Using MTP nextn=3, top-10, and delta=0.6.</em></sub></p>
@@ -230,7 +230,7 @@ We validated the Relaxed Acceptance on different datasets. In Figure 8, we show 
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog2_tree_spec_decoding.png" alt="tech_blog2_tree_spec_decoding" width="800" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog2_tree_spec_decoding.png" alt="tech_blog2_tree_spec_decoding" width="800" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 9. Comparison between the chain-based and tree-based speculative decoding</em></sub></p>
