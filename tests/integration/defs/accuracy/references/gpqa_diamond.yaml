@@ -16,3 +16,5 @@ deepseek-ai/DeepSeek-R1:
     accuracy: 70.45
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 44.95
+  - quant_algo: FP8
+    accuracy: 49.49
