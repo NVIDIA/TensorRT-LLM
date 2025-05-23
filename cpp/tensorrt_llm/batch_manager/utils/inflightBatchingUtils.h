@@ -40,7 +40,8 @@ TensorPtr collectRequestIds(RequestVector const& contextRequests, RequestVector 
 //!          Sort requests by lora task id for performance.
 //! @param contextRequests The context requests.
 //! @param generationRequests The generation requests.
-void sortRequests(RequestVector& contextRequests, RequestVector& generationRequests);
+//! @param chunksPresent Whether context chunks are present.
+void sortRequests(RequestVector& contextRequests, RequestVector& generationRequests, bool chunksPresent);
 
 //! @brief Move finished context requests to generation requests.
 //! @details This function assumes that the context requests are sorted so that requests with isLastContextChunk() are
