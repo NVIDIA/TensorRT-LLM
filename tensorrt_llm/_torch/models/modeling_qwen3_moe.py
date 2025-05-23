@@ -1,5 +1,5 @@
 import os
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 from torch import nn
@@ -14,8 +14,10 @@ from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import FusedMoE, RenormalizeMoeRoutingMethod
-from ..modules.linear import Linear, TensorParallelMode
+from ..modules.fused_moe import (BaseMoeRoutingMethod, FusedMoE,
+                                 Qwen3MoeRoutingMethod,
+                                 RenormalizeMoeRoutingMethod, RoutingMethodType)
+from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..utils import disable_fp4_allgather
 from .modeling_qwen3 import Qwen3Attention
@@ -24,12 +26,58 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
 
+class Qwen3Gate(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int,
+        top_k: int,
+        dtype: Optional[torch.dtype] = None,
+        apply_routing: bool = False,
+        routing_method_type: RoutingMethodType = RoutingMethodType.Renormalize,
+        moe_backend: str = "CUTLASS",
+    ):
+        super().__init__()
+        self.top_k = top_k
+        self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
+                                               dtype=dtype),
+                                   requires_grad=False)
+        self.routing_method_type = routing_method_type
+        # FIXME: out_dtype=float32 does not work
+        # self.out_dtype = torch.float32 if moe_backend == "TRTLLM" else dtype
+        self.out_dtype = dtype
+
+        assert not apply_routing, "Qwen3Gate routing is called inside MoE"
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        logits: torch.Tensor = torch.ops.trtllm.cublas_mm(
+            hidden_states, self.weight.t(), bias=None, out_dtype=self.out_dtype)
+        return logits
+
+    def load_weights(self, weights: List[Dict]):
+        assert len(weights) == 1
+
+        self.weight.copy_(weights[0]["weight"][:])
+
+    @property
+    def routing_method(self) -> BaseMoeRoutingMethod:
+        if self.routing_method_type == RoutingMethodType.Qwen3:
+            return Qwen3MoeRoutingMethod(top_k=self.top_k)
+        elif self.routing_method_type == RoutingMethodType.Renormalize:
+            return RenormalizeMoeRoutingMethod(top_k=self.top_k)
+        else:
+            raise ValueError(
+                f"Unsupported routing method: {self.routing_method_type}")
+
+
 class Qwen3MoE(nn.Module):
 
     def __init__(
         self,
         model_config: ModelConfig[Qwen3MoeConfig],
         aux_stream: torch.cuda.Stream,
+        layer_idx: int,
     ):
         super().__init__()
         config = model_config.pretrained_config
@@ -46,16 +94,19 @@ class Qwen3MoE(nn.Module):
         if self.enable_alltoall:
             MnnvlMemory.initialize()
 
-        # moe gate (linear layer) only runs in half/full precision for now
-        self.gate = Linear(self.hidden_dim,
-                           self.num_experts,
-                           bias=False,
-                           dtype=config.torch_dtype,
-                           quant_config=None)
+        self.gate = Qwen3Gate(
+            hidden_size=self.hidden_dim,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            dtype=config.torch_dtype,
+            apply_routing=False,
+            routing_method_type=RoutingMethodType.Renormalize,
+            moe_backend=model_config.moe_backend,
+        )
 
         self.experts = FusedMoE(
             num_experts=self.num_experts,
-            routing_method=RenormalizeMoeRoutingMethod(top_k=self.top_k),
+            routing_method=self.gate.routing_method,
             hidden_size=self.hidden_dim,
             intermediate_size=self.moe_intermediate_size,
             aux_stream=aux_stream,
@@ -139,7 +190,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         self.mapping = model_config.mapping
         self.enable_attention_dp = self.mapping.enable_attention_dp
 
-        self.mlp = Qwen3MoE(model_config, aux_stream)
+        self.mlp = Qwen3MoE(model_config, aux_stream, layer_idx=layer_idx)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,

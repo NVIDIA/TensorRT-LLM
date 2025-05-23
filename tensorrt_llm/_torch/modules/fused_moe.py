@@ -1,7 +1,7 @@
 import math
 import os
 import threading
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Dict, List, NamedTuple, Optional, Union
 
 import torch
@@ -10,7 +10,9 @@ from torch import nn
 from tensorrt_llm._mnnvl_utils import MnnvlMoe, MoEAlltoallInfo
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.quantization.utils.fp4_utils import (
-    reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)
+    get_reorder_rows_for_gated_act_gemm_row_indices,
+    get_shuffle_matrix_a_row_indices, get_shuffle_matrix_sf_a_row_indices,
+    shuffle_matrix_a, shuffle_matrix_sf_a)
 
 from ...quantization.utils.fp4_utils import float4_sf_dtype
 from ..distributed import allgather, reducescatter
@@ -26,6 +28,23 @@ FUSED_MOE_NVFP4_INPUT_DTYPE = torch.int64
 FUSED_MOE_NVFP4_WEIGHT_DTYPE = torch.int64
 # pack weight block scales into int32, e.g. 4 x fp8 weight values
 FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE = torch.int32
+
+
+# The type of method in top-K routing, for use in torch custom op
+# Please keep this in sync with the counterpart defined in cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h
+class RoutingMethodType(IntEnum):
+    # Default: Softmax -> TopK
+    Default = 0,
+    # Renormalize: TopK -> Softmax
+    Renormalize = 1,
+    # DeepSeekV3: Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts from the Top4 groups
+    DeepSeekV3 = 2,
+    # Llama4: Top1 -> Sigmoid
+    Llama4 = 3,
+    # Qwen3: Softmax -> TopK -> Renormalize
+    Qwen3 = 4,
+    # Unspecified
+    Unspecified = 5.
 
 
 class BaseMoeRoutingMethod(nn.Module):
@@ -49,6 +68,10 @@ class BaseMoeRoutingMethod(nn.Module):
     def experts_per_token(self):
         return self.get_experts_per_token()
 
+    @property
+    def routing_method_type(self):
+        return RoutingMethodType.Unspecified
+
 
 class DefaultMoeRoutingMethod(BaseMoeRoutingMethod):
 
@@ -64,10 +87,30 @@ class DefaultMoeRoutingMethod(BaseMoeRoutingMethod):
                                                dim=-1)
         return topk_indices.to(torch.int32), topk_values
 
+    @property
+    def routing_method_type(self):
+        return RoutingMethodType.Default
+
+
+class DeepSeekV3MoeRoutingMethod(BaseMoeRoutingMethod):
+
+    # Intentionally leave apply() unimplemented.
+    # See comments in DeepseekV3Gate on why routing is done by DeepseekV3Gate.
+    def __init__(self, top_k: int):
+        super().__init__()
+        self.top_k = top_k
+
+    @property
+    def routing_method_type(self):
+        return RoutingMethodType.DeepSeekV3
+
 
 class RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
 
-    def __init__(self, top_k: int):
+    def __init__(
+        self,
+        top_k: int,
+    ):
         super().__init__()
         self.top_k = top_k
 
@@ -78,6 +121,10 @@ class RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
                                                dim=-1)
         return topk_indices.to(torch.int32), torch.nn.functional.softmax(
             topk_values.float(), dim=-1)
+
+    @property
+    def routing_method_type(self):
+        return RoutingMethodType.Renormalize
 
 
 class Llama4RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
@@ -92,6 +139,10 @@ class Llama4RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
                                                k=self.top_k,
                                                dim=-1)
         return topk_indices.to(torch.int32), torch.sigmoid(topk_values.float())
+
+    @property
+    def routing_method_type(self):
+        return RoutingMethodType.Llama4
 
 
 # TODO: re-enable this once the custom op is working.
@@ -212,6 +263,29 @@ class LoadBalancedMoeRoutingMethod(BaseMoeRoutingMethod):
                                         self.top_k).contiguous()
 
         return balanced_indices, balanced_values
+
+
+class Qwen3MoeRoutingMethod(BaseMoeRoutingMethod):
+
+    def __init__(self, top_k: int):
+        super().__init__()
+        self.top_k = top_k
+
+    def apply(self,
+              router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+
+        routing_weights = torch.nn.functional.softmax(router_logits,
+                                                      dim=1,
+                                                      dtype=torch.float)
+        topk_values, topk_indices = torch.topk(routing_weights,
+                                               k=self.top_k,
+                                               dim=-1)
+        topk_values /= topk_values.sum(dim=-1, keepdim=True)
+        return topk_indices.to(torch.int32), topk_values
+
+    @property
+    def routing_method_type(self) -> RoutingMethodType:
+        return RoutingMethodType.Qwen3
 
 
 class MoEWeightLoadingMode(Enum):
@@ -1078,14 +1152,22 @@ class FusedMoE(nn.Module):
         assert self.is_trtllm()
         assert x.dtype == torch.bfloat16
 
+        # DeepSeekV3 style routing
+        if isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod):
+            top_k = self.routing_method.routing_impl.top_k
+            routing_bias = self.routing_method.e_score_correction_bias
+            n_group = self.routing_method.routing_impl.n_group
+            topk_group = self.routing_method.routing_impl.topk_group
+            routed_scaling_factor = self.routing_method.routing_impl.routed_scaling_factor
+        else:
+            top_k = self.routing_method.top_k
+            routing_bias = None
+            n_group = None
+            topk_group = None
+            routed_scaling_factor = None
+
         # TODO: since routing kernel is integrated into moe_runner for fp8,
         #       here we just route the I/Os for moe_runner
-        routing_bias = self.routing_method.e_score_correction_bias
-        top_k = self.routing_method.routing_impl.top_k
-        n_group = self.routing_method.routing_impl.n_group
-        topk_group = self.routing_method.routing_impl.topk_group
-        routed_scaling_factor = self.routing_method.routing_impl.routed_scaling_factor
-
         if self.quant_config and self.quant_config.quant_mode.has_fp8_block_scales(
         ):
             x_val, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x)
@@ -1108,6 +1190,7 @@ class FusedMoE(nn.Module):
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
                 routed_scaling_factor,
+                self.routing_method.routing_method_type,
             )
         elif self.quant_config and self.quant_config.quant_mode.has_nvfp4():
             scale_factor_use_ue8m0 = False
@@ -1137,6 +1220,7 @@ class FusedMoE(nn.Module):
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
                 routed_scaling_factor,
+                self.routing_method.routing_method_type,
             )
         else:
             raise NotImplementedError(
@@ -1242,16 +1326,40 @@ class FusedMoE(nn.Module):
                                                 self.tp_rank,
                                                 TensorParallelMode.COLUMN)
 
-            w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard],
-                                         dim=0)
-
             if is_trtllm:
                 # FIXME: this depends on the kernel internals
                 epilogue_tile_m = 128
-                w31_weight_shard = reorder_rows_for_gated_act_gemm(
-                    w31_weight_shard)
-                w31_weight_shard = shuffle_matrix_a(w31_weight_shard,
-                                                    epilogue_tile_m)
+
+                # Keep weights in device buffer
+                dst_w3_weight = dst_w3_w1_weight.narrow(
+                    dim=0, start=0, length=self.intermediate_size_per_partition)
+                dst_w1_weight = dst_w3_w1_weight.narrow(
+                    dim=0,
+                    start=self.intermediate_size_per_partition,
+                    length=self.intermediate_size_per_partition)
+                dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
+                dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
+
+                # Get permute indices and chain them together
+                permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(
+                    dst_w3_w1_weight)
+                permute1 = get_shuffle_matrix_a_row_indices(
+                    dst_w3_w1_weight, epilogue_tile_m)
+                permute = permute0[permute1]
+
+                # Shuffle the weight according to permute indices
+                processed_w31_weight_shard = torch.ops.trtllm.shuffle_matrix(
+                    dst_w3_w1_weight, permute.to(dst_w3_w1_weight.device))
+                # Copy the result into device buffer
+                dst_w3_w1_weight.copy_(processed_w31_weight_shard.view(
+                    dst_w3_w1_weight.dtype),
+                                       non_blocking=True)
+                # We are done here so do not continue
+                return
+
+            w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard],
+                                         dim=0)
+
             if self.has_w4afp8 and self.sm_version == 89:
                 import tensorrt_llm.quantization.functional
                 preprocessor = tensorrt_llm.quantization.functional.preprocess_weights_for_mixed_gemm
@@ -1264,9 +1372,9 @@ class FusedMoE(nn.Module):
                                                 torch.quint4x2,
                                                 torch.float8_e4m3fn,
                                                 89).view(dst_w3_w1_weight.shape)
-
             dst_w3_w1_weight.copy_(w31_weight_shard.view(
-                dst_w3_w1_weight.dtype))
+                dst_w3_w1_weight.dtype),
+                                   non_blocking=True)
 
         def load_expert_w2_weight(w2_weight,
                                   dst_w2_weight: torch.Tensor,
@@ -1277,8 +1385,19 @@ class FusedMoE(nn.Module):
             if is_trtllm:
                 # FIXME: this depends on the kernel internals
                 epilogue_tile_m = 128
-                w2_weight_shard = shuffle_matrix_a(w2_weight_shard,
-                                                   epilogue_tile_m)
+
+                # Keep weights in device buffer
+                dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
+                                    non_blocking=True)
+                # Get permuted result
+                processed_w2_weight = shuffle_matrix_a(dst_w2_weight,
+                                                       epilogue_tile_m)
+                # Copy the result into device buffer
+                dst_w2_weight.copy_(processed_w2_weight.view(
+                    dst_w2_weight.dtype),
+                                    non_blocking=True)
+                # We are done here so do not continue
+                return
 
             if self.has_w4afp8 and self.sm_version == 89:
                 import tensorrt_llm.quantization.functional
@@ -1292,7 +1411,8 @@ class FusedMoE(nn.Module):
                                                torch.float8_e4m3fn,
                                                89).view(dst_w2_weight.shape)
 
-            dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype))
+            dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
+                                non_blocking=True)
 
         # Use multi-threading to load expert weights in parallel.
         # Even though CPython has global interpreter lock (GIL),
@@ -1564,6 +1684,7 @@ class FusedMoE(nn.Module):
             w3_weight_scale = load_weight_shard(w3_weight_scale, self.tp_size,
                                                 self.tp_rank,
                                                 TensorParallelMode.COLUMN)
+            # Keep weights in device buffer
             # w3
             dst_w3_weight_scale = dst_w3_w1_weight_scale.narrow(
                 dim=0, start=0, length=self.intermediate_size_per_partition)
@@ -1583,12 +1704,29 @@ class FusedMoE(nn.Module):
             if is_trtllm:
                 # FIXME
                 epilogue_tile_m = 128
+
+                # Get permute indices and chain them together
+                permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(
+                    dst_w3_w1_weight_scale)
+                permute1 = get_shuffle_matrix_sf_a_row_indices(
+                    dst_w3_w1_weight_scale.view(float4_sf_dtype),
+                    epilogue_tile_m, 16)
+                permute = permute0[permute1]
+
+                # Shuffle the weight according to permute indices
+                w3_w1_weight_scale = torch.ops.trtllm.shuffle_matrix(
+                    dst_w3_w1_weight_scale.view(float4_sf_dtype),
+                    permute.cuda())
+                # Assert should only be removed during debugging
+                assert w3_w1_weight_scale.is_cuda, "w3_w1_weight_scale.is_cuda should be true or suffer from slow speed"
+                # Interleave the weight.
+                processed_w3_w1_weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+                    w3_w1_weight_scale.view(float4_sf_dtype).reshape(
+                        orig_shape))
+                # Copy the result into device buffer
                 dst_w3_w1_weight_scale.copy_(
-                    shuffle_matrix_sf_a(
-                        reorder_rows_for_gated_act_gemm(
-                            dst_w3_w1_weight_scale.view(float4_sf_dtype)),
-                        epilogue_tile_m,
-                        16).view(block_scales_dtype).reshape(orig_shape))
+                    processed_w3_w1_weight_scale.view(
+                        block_scales_dtype).reshape(orig_shape))
             else:
                 dst_w3_w1_weight_scale.copy_(
                     torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
@@ -1601,12 +1739,16 @@ class FusedMoE(nn.Module):
             w2_weight_scale = load_weight_shard(w2_weight_scale, self.tp_size,
                                                 self.tp_rank,
                                                 TensorParallelMode.ROW)
+            # Keep weights in device buffer
             dst_w2_weight_scale.copy_(
                 w2_weight_scale.view(dst_w2_weight_scale.dtype))
 
             orig_shape = dst_w2_weight_scale.shape
             if is_trtllm:
                 epilogue_tile_m = 128  # FIXME: read from kernel
+                # Assert should only be removed during debugging
+                assert dst_w2_weight_scale.is_cuda, "dst_w2_weight_scale.is_cuda should be true or suffer from slow speed"
+                # Interleave the weight and copy
                 dst_w2_weight_scale.copy_(
                     shuffle_matrix_sf_a(
                         dst_w2_weight_scale.view(float4_sf_dtype),
@@ -1679,7 +1821,8 @@ class FusedMoE(nn.Module):
                                         self.fc2_alpha.data[expert_idx])
         if self.is_trtllm():
             self.fc31_scale_c.data.copy_(self.fc2_input_scale.data *
-                                         self.fc31_alpha.data)
+                                         self.fc31_alpha.data,
+                                         non_blocking=True)
 
     def _load_int4_groupwise_scales(self, weights: Dict):
         # fc31 scales
