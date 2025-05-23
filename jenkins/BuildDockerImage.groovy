@@ -39,10 +39,23 @@ def globalVars = [
     (ACTION_INFO): null,
 ]
 
-def createKubernetesPodConfig(type, arch = "amd64")
+def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 {
     def targetCould = "kubernetes-cpu"
     def containerConfig = ""
+    def selectors = """
+                  nvidia.com/node_type: builder
+                  kubernetes.io/os: linux
+                  kubernetes.io/arch: ${arch}"""
+
+    if (build_wheel && arch == "arm64") {
+        // For aarch64, we need to use lws to fix the ucxx issue when building wheels
+        selectors = """
+                  nvidia.com/node_type: builder
+                  kubernetes.io/os: linux
+                  nvidia.com/lws: true
+                  kubernetes.io/arch: ${arch}"""
+    }
 
     switch(type)
     {
@@ -113,10 +126,7 @@ def createKubernetesPodConfig(type, arch = "amd64")
             kind: Pod
             spec:
                 qosClass: Guaranteed
-                nodeSelector:
-                  nvidia.com/node_type: builder
-                  kubernetes.io/os: linux
-                  kubernetes.io/arch: ${arch}
+                nodeSelector: ${selectors}
                 containers:
                   ${containerConfig}
                   - name: jnlp
@@ -270,6 +280,7 @@ def launchBuildJobs(pipeline) {
         args: "",
         torchInstallType: "skip",
         arch: "amd64",
+        build_wheel: false,
         dependOtherTarget: "",
     ]
     def release_action = env.JOB_NAME ==~ /.*PostMerge.*/ ? "push" : params.action
@@ -278,11 +289,13 @@ def launchBuildJobs(pipeline) {
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG,
+            build_wheel: true,
         ],
         "Build trtllm release(SBSA)": [
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-sbsa",
+            build_wheel: true,
             arch: "arm64"
         ],
         "Build CI image(x86_64)": [:],
@@ -303,6 +316,7 @@ def launchBuildJobs(pipeline) {
             target: "ngc_release",
             action: release_action,
             customTag: "ngc-" + LLM_BRANCH_TAG + "-x86_64",
+            build_wheel: true,
             dependOtherTarget: "devel",
         ],
         "Build NGC devel and release(SBSA)": [
@@ -310,6 +324,7 @@ def launchBuildJobs(pipeline) {
             action: release_action,
             customTag: "ngc-" + LLM_BRANCH_TAG + "-sbsa",
             arch: "arm64",
+            build_wheel: true,
             dependOtherTarget: "devel",
         ],
     ]
@@ -320,7 +335,7 @@ def launchBuildJobs(pipeline) {
                 config[defaultKey] = defaultValue
             }
         }
-        config.podConfig = createKubernetesPodConfig("build", config.arch)
+        config.podConfig = createKubernetesPodConfig("build", config.arch, config.lws)
     }
     echo "Build configs:"
     println buildConfigs
