@@ -2,7 +2,6 @@ import json
 import math
 import os
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Dict, List, Optional, Union
 
 import yaml
@@ -10,17 +9,12 @@ import yaml
 from tensorrt_llm.bindings.executor import ExecutorConfig
 
 from ...builder import BuildConfig
+from ...llmapi.llm_args import LoadFormat
 from ...logger import logger
 from ...mapping import Mapping
 from ..model_config import MoeLoadBalancerConfig
 from ..speculative import SpecConfig
 from .resource_manager import BaseResourceManager
-
-
-class LoadFormat(Enum):
-    AUTO = 0
-    # Initialize all weights randomly.
-    DUMMY = 1
 
 
 @dataclass

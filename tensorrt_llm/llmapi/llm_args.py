@@ -4,7 +4,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
 from enum import Enum, EnumMeta
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
+from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
+                    Union)
 
 import torch
 import yaml
@@ -17,6 +18,9 @@ from tensorrt_llm.lora_manager import (LoraConfig,
 
 from .._utils import mpi_rank
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 
 # yapf: disable
 # isort: off
@@ -37,15 +41,6 @@ from ..bindings.executor import (
                                  SchedulerConfig as _SchedulerConfig) # isort: skip
 # isort: on
 from transformers import PreTrainedTokenizerBase
-
-from tensorrt_llm._torch.pyexecutor.config import LoadFormat
-from tensorrt_llm._torch.pyexecutor.resource_manager import BaseResourceManager
-from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm.llmapi.llm_utils import get_type_repr
-from tensorrt_llm.llmapi.tokenizer import TokenizerBase
-from tensorrt_llm.llmapi.utils import print_traceback_on_error
-from tensorrt_llm.models.modeling_utils import (PretrainedConfig, QuantAlgo,
-                                                QuantConfig)
 
 # yapf: enable
 from ..builder import BuildConfig, EngineConfig
@@ -1455,6 +1450,12 @@ LLMARGS_EXPLICIT_DOCSTRING = generate_api_docs_as_docstring(LlmArgs,
                                                             indent=' ' * 4)
 
 
+class LoadFormat(Enum):
+    AUTO = 0
+    # Initialize all weights randomly.
+    DUMMY = 1
+
+
 class TorchLlmArgs(BaseLlmArgs):
 
     # Just a dummy BuildConfig to allow code reuse with the TrtLlmArgs
@@ -1465,10 +1466,11 @@ class TorchLlmArgs(BaseLlmArgs):
         json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
 
     # PyTorch backend specific configurations
-    extra_resource_managers: Dict[str, BaseResourceManager] = Field(
+    extra_resource_managers: Dict[str, object] = Field(
         default_factory=dict,
         description=
-        "Extra resource managers to use in addition to the KV cache manager. Each manager's prepare_resources method is called before the forward pass, and update_resources() is called after the pass finishes. free_resources() is called when a request finishes. The KV cache manager is guaranteed to be invoked after all of these extra managers in all stages."
+        "Extra resource managers to use in addition to the KV cache manager. Each manager's prepare_resources method is called before the forward pass, and update_resources() is called after the pass finishes. free_resources() is called when a request finishes. The KV cache manager is guaranteed to be invoked after all of these extra managers in all stages.",
+        exclude=True,
     )
 
     use_cuda_graph: bool = Field(
@@ -1561,6 +1563,12 @@ class TorchLlmArgs(BaseLlmArgs):
     enable_layerwise_nvtx_marker: bool = Field(
         default=False, description="If true, enable layerwise nvtx marker.")
 
+    auto_deploy_config: Optional[object] = Field(
+        default=None,
+        description="Auto deploy config.",
+        exclude_from_json=True,
+        json_schema_extra={"type": f"Optional[AutoDeployConfig]"})
+
     load_format: Union[str, LoadFormat] = Field(
         default='auto',
         description=
@@ -1609,6 +1617,44 @@ class TorchLlmArgs(BaseLlmArgs):
                     -1]:
                 self.cuda_graph_batch_sizes.append(
                     self.cuda_graph_max_batch_size)
+
+    # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
+    @property
+    def get_pytorch_backend_config(self) -> "PyTorchConfig":
+        from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+
+        # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
+        # Just a WAR to support the auto_deploy
+        if self.auto_deploy_config is not None:
+            return self.auto_deploy_config
+
+        return PyTorchConfig(
+            extra_resource_managers=self.extra_resource_managers,
+            use_cuda_graph=self.use_cuda_graph,
+            cuda_graph_batch_sizes=self.cuda_graph_batch_sizes,
+            cuda_graph_max_batch_size=self.cuda_graph_max_batch_size,
+            cuda_graph_padding_enabled=self.cuda_graph_padding_enabled,
+            disable_overlap_scheduler=self.disable_overlap_scheduler,
+            moe_max_num_tokens=self.moe_max_num_tokens,
+            attn_backend=self.attn_backend,
+            moe_backend=self.moe_backend,
+            mixed_sampler=self.mixed_sampler,
+            enable_trtllm_sampler=self.enable_trtllm_sampler,
+            kv_cache_dtype=self.kv_cache_dtype,
+            use_kv_cache=self.use_kv_cache,
+            enable_iter_perf_stats=self.enable_iter_perf_stats,
+            enable_iter_req_stats=self.enable_iter_req_stats,
+            print_iter_log=self.print_iter_log,
+            torch_compile_enabled=self.torch_compile_enabled,
+            torch_compile_fullgraph=self.torch_compile_fullgraph,
+            torch_compile_inductor_enabled=self.torch_compile_inductor_enabled,
+            torch_compile_piecewise_cuda_graph=self.
+            torch_compile_piecewise_cuda_graph,
+            torch_compile_enable_userbuffers=self.
+            torch_compile_enable_userbuffers,
+            autotuner_enabled=self.autotuner_enabled,
+            enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
+            load_format=self.load_format)
 
 
 def update_llm_args_with_extra_dict(

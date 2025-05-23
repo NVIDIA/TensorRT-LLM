@@ -622,7 +622,8 @@ class LLM:
         update_executor_config(
             executor_config,
             backend=self.args.backend,
-            pytorch_backend_config=self.pytorch_backend_config,
+            pytorch_backend_config=self.args.get_pytorch_backend_config()
+            if self.args.backend == "pytorch" else None,
             mapping=self.args.parallel_config.to_mapping(),
             build_config=self.args.build_config
             if self._on_trt_backend else None,
