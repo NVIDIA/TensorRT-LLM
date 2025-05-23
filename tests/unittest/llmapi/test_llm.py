@@ -1906,10 +1906,12 @@ def llm_get_stats_test_harness(tp_size: int = 1,
     else:
         LLM_CLASS = LLM
 
+    if not pytorch_backend:
+        llm_args_extra["fast_build"] = True
+
     llm = LLM_CLASS(model=llama_model_path,
                     kv_cache_config=global_kvcache_config,
                     tensor_parallel_size=tp_size,
-                    fast_build=True,
                     **llm_args_extra)
 
     max_tokens = 5

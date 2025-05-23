@@ -1417,8 +1417,10 @@ class TrtLlmArgs(BaseLlmArgs):
 
     # BuildConfig is introduced to give users a familiar interface to configure the model building.
     build_config: Optional[object] = Field(
-        default=None,
+        default_factory=lambda: BuildConfig(),
         description="Build config.",
+        exclude_from_json=True,
+        frozen=True,
         json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
 
     workspace: Optional[str] = Field(default=None,
@@ -1517,6 +1519,7 @@ class TorchLlmArgs(BaseLlmArgs):
         default_factory=lambda: BuildConfig(),
         description="Build config.",
         exclude_from_json=True,
+        frozen=True,
         json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
 
     # PyTorch backend specific configurations
