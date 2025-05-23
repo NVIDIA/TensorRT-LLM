@@ -55,6 +55,7 @@ add_library(
   fp4BatchedQuantize.cpp
   fp8BlockScalingGemm.cpp
   fp8Quantize.cpp
+  dsv3FusedAGemmOp.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
   groupRmsNormOp.cpp
@@ -72,6 +73,7 @@ add_library(
   redrafterCurandOp.cpp
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
+  dsv3RouterGemmOp.cpp
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
