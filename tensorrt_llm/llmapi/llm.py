@@ -118,7 +118,9 @@ class LLM:
             # check the kwargs and raise ValueError directly
             for key in kwargs:
                 if key not in llm_args_cls.model_fields:
-                    raise ValueError(f"Invalid argument: {key}")
+                    raise ValueError(
+                        f"{self.__class__.__name__} got invalid argument: {key}"
+                    )
 
             self.args = llm_args_cls.from_kwargs(
                 model=model,
