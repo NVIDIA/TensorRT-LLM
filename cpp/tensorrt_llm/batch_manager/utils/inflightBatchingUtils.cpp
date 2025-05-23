@@ -39,17 +39,26 @@ TensorPtr collectRequestIds(RequestVector const& contextRequests, RequestVector 
     return requestIds;
 }
 
-void sortByLoraId(ScheduledRequests& scheduledRequests)
+void sortRequests(ScheduledRequests& scheduledRequests)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto sortRequests = [](RequestVector& requests)
+    // Move context requests that reached the last context chunk to the end of the vector.
+    // This order is required for moveFinishedContextRequestsToGeneration.
+    auto firstFinished = std::partition(scheduledRequests.contextRequests.begin(),
+        scheduledRequests.contextRequests.end(), [](auto const& llmReq) { return !llmReq->isLastContextChunk(); });
+
+    auto sortByLoraId = [](RequestVector::iterator begin, RequestVector::iterator end)
     {
-        std::sort(requests.begin(), requests.end(),
-            [](auto const& lhs, auto const& rhs) { return lhs->getLoraTaskId() < rhs->getLoraTaskId(); });
+        std::sort(
+            begin, end, [](auto const& lhs, auto const& rhs) { return lhs->getLoraTaskId() < rhs->getLoraTaskId(); });
     };
-    sortRequests(scheduledRequests.contextRequests);
-    sortRequests(scheduledRequests.generationRequests);
+
+    // Sort context requests by lora task id, but keep finished requests separate.
+    sortByLoraId(scheduledRequests.contextRequests.begin(), firstFinished);
+    sortByLoraId(firstFinished, scheduledRequests.contextRequests.end());
+    // Sort generation requests by lora task id.
+    sortByLoraId(scheduledRequests.generationRequests.begin(), scheduledRequests.generationRequests.end());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -60,11 +69,12 @@ void moveFinishedContextRequestsToGeneration(ScheduledRequests& scheduledRequest
 
     auto& contextRequests = scheduledRequests.contextRequests;
     auto& generationRequests = scheduledRequests.generationRequests;
-
-    auto firstFinished = std::partition(contextRequests.begin(), contextRequests.end(),
-        [](auto const& llmReq) { return !llmReq->isContextFinished(); });
+    auto firstFinished = std::find_if(
+        contextRequests.begin(), contextRequests.end(), [](auto const& llmReq) { return llmReq->isContextFinished(); });
     TLLM_LOG_DEBUG(
-        "Moving %ld finished context requests to generation.", std::distance(firstFinished, contextRequests.end()));
+        "Found %ld unfinished chunked context requests. Found %ld finished context requests, moving them to "
+        "generation.",
+        std::distance(contextRequests.begin(), firstFinished), std::distance(firstFinished, contextRequests.end()));
     generationRequests.insert(generationRequests.begin(), std::make_move_iterator(firstFinished),
         std::make_move_iterator(contextRequests.end()));
     contextRequests.erase(firstFinished, contextRequests.end());
