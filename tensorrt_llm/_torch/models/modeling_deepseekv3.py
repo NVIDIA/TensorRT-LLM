@@ -51,7 +51,7 @@ from ..models.modeling_utils import ModelConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import DeepSeekV3MoeRoutingMethod, FusedMoE
+from ..modules.fused_moe import DeepSeekV3MoeRoutingMethod, get_fusedMoe_cls
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -361,7 +361,7 @@ class Deepseekv3MoE(nn.Module):
             fuse_routing_kernel=True,
             apply_routing=False,
             moe_backend=model_config.moe_backend)
-        self.experts = FusedMoE(
+        self.experts = get_fusedMoe_cls(model_config)(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,
             hidden_size=hidden_size,

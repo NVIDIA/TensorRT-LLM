@@ -428,7 +428,7 @@ class DecoderModelForCausalLM(nn.Module,
         quant_config_dict = self.model_config.quant_config_dict
         if quant_config_dict is not None:
             for name, module in self.named_modules():
-                if isinstance(module, FusedMoE):
+                if issubclass(type(module), FusedMoE):
                     for n, q in quant_config_dict.items():
                         # all linear layers inside FusedMoE share the same quant config
                         if name in n:

@@ -26,8 +26,8 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention, QkNormType
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (FusedMoE, Llama4RenormalizeMoeRoutingMethod,
-                                 MoEWeightLoadingMode)
+from ..modules.fused_moe import (Llama4RenormalizeMoeRoutingMethod,
+                                 MoEWeightLoadingMode, get_fusedMoe_cls)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
@@ -233,7 +233,7 @@ class Llama4MoE(nn.Module):
         config = model_config.pretrained_config
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.top_k = top_k
-        self.experts = FusedMoE(
+        self.experts = get_fusedMoe_cls(model_config)(
             routing_method=Llama4RenormalizeMoeRoutingMethod(top_k),
             num_experts=num_experts,
             hidden_size=hidden_size,

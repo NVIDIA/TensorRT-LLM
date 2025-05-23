@@ -11,8 +11,8 @@ from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
                                                    DefaultMoeRoutingMethod,
-                                                   FusedMoE,
-                                                   RenormalizeMoeRoutingMethod)
+                                                   RenormalizeMoeRoutingMethod,
+                                                   get_fusedMoe_cls)
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -44,13 +44,15 @@ def test_fused_moe(dtype, experts, RoutingMethodCls):
         weights[f"{expert_id}.w1.weight"] = w1_weight
         weights[f"{expert_id}.w2.weight"] = w2_weight
         weights[f"{expert_id}.w3.weight"] = w3_weight
-    fused_moe = FusedMoE(num_experts=NUM_EXPERTS,
-                         routing_method=routing_method,
-                         hidden_size=HIDDEN_SIZE,
-                         intermediate_size=INTERMEDIATE_SIZE,
-                         dtype=dtype,
-                         reduce_results=False,
-                         model_config=ModelConfig())
+    model_config = ModelConfig()
+    fused_moe = get_fusedMoe_cls(model_config)(
+        num_experts=NUM_EXPERTS,
+        routing_method=routing_method,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+        dtype=dtype,
+        reduce_results=False,
+        model_config=model_config)
     fused_moe.load_weights([weights])
     fused_moe.cuda()
 
@@ -135,13 +137,16 @@ def test_fused_moe_fp8(dtype):
         weights[f"{expert_id}.w3.input_scale"] = w3_input_scale
 
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
-    fused_moe = FusedMoE(num_experts=NUM_EXPERTS,
-                         routing_method=routing_method,
-                         hidden_size=HIDDEN_SIZE,
-                         intermediate_size=INTERMEDIATE_SIZE,
-                         dtype=dtype,
-                         reduce_results=False,
-                         model_config=ModelConfig(quant_config=quant_config))
+
+    model_config = ModelConfig(quant_config=quant_config)
+    fused_moe = get_fusedMoe_cls(model_config)(
+        num_experts=NUM_EXPERTS,
+        routing_method=routing_method,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+        dtype=dtype,
+        reduce_results=False,
+        model_config=model_config)
     fused_moe.cuda()
     fused_moe.load_weights([weights])
 
@@ -238,13 +243,17 @@ def test_fused_moe_nvfp4(dtype):
         weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global
 
     quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
-    fused_moe = FusedMoE(num_experts=NUM_EXPERTS,
-                         routing_method=routing_method,
-                         hidden_size=HIDDEN_SIZE,
-                         intermediate_size=INTERMEDIATE_SIZE,
-                         dtype=dtype,
-                         reduce_results=False,
-                         model_config=ModelConfig(quant_config=quant_config))
+
+    model_config = ModelConfig(quant_config=quant_config)
+    fused_moe = get_fusedMoe_cls(model_config)(
+        num_experts=NUM_EXPERTS,
+        routing_method=routing_method,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+        dtype=dtype,
+        reduce_results=False,
+        model_config=model_config)
+
     fused_moe.load_weights([weights])
     fused_moe.cuda()
 
@@ -327,13 +336,15 @@ def test_fused_moe_w4afp8(dtype):
         weights[f"{expert_id}.w3.input_scale"] = w3_input
 
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_AWQ)
-    fused_moe = FusedMoE(num_experts=NUM_EXPERTS,
-                         routing_method=routing_method,
-                         hidden_size=HIDDEN_SIZE,
-                         intermediate_size=INTERMEDIATE_SIZE,
-                         dtype=dtype,
-                         reduce_results=False,
-                         model_config=ModelConfig(quant_config=quant_config))
+    model_config = ModelConfig(quant_config=quant_config)
+    fused_moe = get_fusedMoe_cls(model_config)(
+        num_experts=NUM_EXPERTS,
+        routing_method=routing_method,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+        dtype=dtype,
+        reduce_results=False,
+        model_config=model_config)
     fused_moe.load_weights([weights])
     fused_moe.cuda()
 

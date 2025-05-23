@@ -14,7 +14,8 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import DefaultMoeRoutingMethod, FusedMoE
+from ..modules.fused_moe import (DefaultMoeRoutingMethod, FusedMoE,
+                                 get_fusedMoe_cls)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
@@ -48,7 +49,7 @@ class QwenMoE(nn.Module):
 
         reduce_results = True
 
-        self.experts = FusedMoE(
+        self.experts = get_fusedMoe_cls(model_config)(
             num_experts=self.num_experts,
             routing_method=DefaultMoeRoutingMethod(top_k=self.top_k),
             hidden_size=self.hidden_dim,
@@ -296,7 +297,7 @@ class Qwen2MoeForCausalLM(DecoderModelForCausalLM[QwenMoeModel,
                     module.load_weights(weights=module_weights)
                 else:
                     module_weights = filter_weights(name, weights)
-                    if isinstance(module, FusedMoE):
+                    if issubclass(type(module), FusedMoE):
                         updated_module_weights = {}
                         for weight_name, weight_value in module_weights.items():
                             new_weight_name = weight_name.replace(
