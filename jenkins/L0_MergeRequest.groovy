@@ -399,7 +399,11 @@ def launchReleaseCheck(pipeline)
                 try {
                     sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f) 2>&1 | tee scan.log"
                 } catch (Exception e) {
-                    echo "Scan failed. Error: ${e.message}"
+                    catchError(
+                        buildResult: 'SUCCESS',
+                        stageResult: 'FAILURE') {
+                        error "Scan failed. Error: ${e.message}"
+                    }
                 }
                 sh "cd ${LLM_ROOT} && cat scan.log"
                 trtllm_utils.uploadArtifacts("${LLM_ROOT}/scan.log", "${UPLOAD_PATH}/scan-results/")
