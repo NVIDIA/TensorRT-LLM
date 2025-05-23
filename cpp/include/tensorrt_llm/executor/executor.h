@@ -579,8 +579,7 @@ public:
     {
         return mTokenRangeRetentionConfigs == other.mTokenRangeRetentionConfigs
             && mDecodeRetentionPriority == other.mDecodeRetentionPriority
-            && mDecodeDurationMs == other.mDecodeDurationMs
-            && mTransferMode == other.mTransferMode
+            && mDecodeDurationMs == other.mDecodeDurationMs && mTransferMode == other.mTransferMode
             && mDirectory == other.mDirectory;
     }
 

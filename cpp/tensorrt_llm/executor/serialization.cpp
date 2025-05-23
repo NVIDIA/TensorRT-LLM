@@ -1542,7 +1542,8 @@ KvCacheRetentionConfig Serialization::deserializeKvCacheRetentionConfig(std::ist
     auto transferMode = su::deserialize<executor::KvCacheTransferMode>(is);
     auto directory = su::deserialize<std::optional<std::string>>(is);
 
-    return KvCacheRetentionConfig{tokenRangeRetentionPriorities, decodePriority, decodeDurationMs, transferMode, directory};
+    return KvCacheRetentionConfig{
+        tokenRangeRetentionPriorities, decodePriority, decodeDurationMs, transferMode, directory};
 }
 
 void Serialization::serialize(KvCacheRetentionConfig const& kvCacheRetentionConfig, std::ostream& os)

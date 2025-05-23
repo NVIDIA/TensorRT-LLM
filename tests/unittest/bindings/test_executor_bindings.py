@@ -1291,7 +1291,7 @@ def test_kv_cache_retention_config():
     test_dir = "test_dir"
     config = trtllm.KvCacheRetentionConfig(
         [TokenRangeRetentionConfig(0, 2, 30, datetime.timedelta(seconds=30))],
-        80, trtllm.KvCacheTransferMode.GDS, "test_dir")
+        80, None, trtllm.KvCacheTransferMode.GDS, "test_dir")
     assert len(config.token_range_retention_configs) == 1
     assert config.token_range_retention_configs[0].token_start == 0
     assert config.token_range_retention_configs[0].token_end == 2
@@ -1303,10 +1303,12 @@ def test_kv_cache_retention_config():
     assert config.transfer_mode == trtllm.KvCacheTransferMode.GDS
     assert config.directory == test_dir
 
-    config = trtllm.KvCacheRetentionConfig([
-        TokenRangeRetentionConfig(0, 64, 80),
-        TokenRangeRetentionConfig(64, 100, 10)
-    ], 10, datetime.timedelta(milliseconds=30000), trtllm.KvCacheTransferMode.POSIX_DEBUG_FALLBACK, test_dir)
+    config = trtllm.KvCacheRetentionConfig(
+        [
+            TokenRangeRetentionConfig(0, 64, 80),
+            TokenRangeRetentionConfig(64, 100, 10)
+        ], 10, datetime.timedelta(milliseconds=30000),
+        trtllm.KvCacheTransferMode.POSIX_DEBUG_FALLBACK, test_dir)
 
     assert len(config.token_range_retention_configs) == 2
     assert config.token_range_retention_configs[0].token_start == 0
@@ -2250,7 +2252,7 @@ def test_kv_cache_retention_config_pickle():
     config = trtllm.KvCacheRetentionConfig([
         trtllm.KvCacheRetentionConfig.TokenRangeRetentionConfig(
             0, 2, 30, datetime.timedelta(seconds=30))
-    ], 80, trtllm.KvCacheTransferMode.GDS, "test_dir")
+    ], 80, None, trtllm.KvCacheTransferMode.GDS, "test_dir")
     config_copy = pickle.loads(pickle.dumps(config))
     assert config == config_copy
 
