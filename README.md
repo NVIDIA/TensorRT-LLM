@@ -17,6 +17,13 @@ TensorRT-LLM
 ---
 <div align="left">
 
+## Tech Blogs
+* [05/23] DeepSeek R1 MTP Implementation and Optimization
+✨ [➡️ link](./docs/source/blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.md)
+
+* [05/16] Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs
+✨ [➡️ link](./docs/source/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md)
+
 ## Latest News
 * [04/10] TensorRT-LLM DeepSeek R1 performance benchmarking best practices now published.
 ✨ [➡️ link](./docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md)
