@@ -38,7 +38,7 @@ def get_rcca_path():
 @pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
 @pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
 @pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY", ["guaranteed_no_evict"])
+@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY", ["static_batch"])
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
@@ -80,8 +80,6 @@ def test_rcca_bug_4323566(
     gpt_tokenizer_model_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -148,11 +146,12 @@ def test_rcca_bug_4323566(
 @pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
 @pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
 @pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY", ["guaranteed_no_evict"])
+@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
+                         ["guaranteed_no_evict", "static_batch"])
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["False"],
                          ids=["disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -192,8 +191,6 @@ def test_rcca_bug_4342666(
     total_gpu_memory_mib,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -301,11 +298,12 @@ In this conversation, the customer support representative was able to resolve th
 @pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
 @pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
 @pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", ["4096"])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY", ["max_utilization"])
+@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
+                         ["max_utilization", "static_batch"])
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True"], ids=["enableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
 @pytest.mark.parametrize("MAX_QUEUE_DELAY_MICROSECONDS", ["0"])
@@ -343,8 +341,6 @@ def test_rcca_bug_4895566(
     mistral_v1_tokenizer_model_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -468,8 +464,6 @@ def test_rcca_bug_4934893(
     tensorrt_llm_llama_example_root,
     llama3_v1_8b_model_root,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -623,8 +617,6 @@ def test_rcca_bug_4714193(
     mixtral_8x7b_v0_1_model_root,
     llm_backend_root,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -769,8 +761,6 @@ def test_mistral_beam_search(
     tensorrt_llm_llama_example_root,
     mistral_v1_tokenizer_model_root,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")

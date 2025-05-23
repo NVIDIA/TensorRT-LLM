@@ -727,6 +727,8 @@ def test_convert_scheduler_policy():
     assert convert_scheduler_policy(
         "guaranteed_no_evict"
     ) == trtllm.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+    assert convert_scheduler_policy(
+        "static_batch") == trtllm.CapacitySchedulerPolicy.STATIC_BATCH
     with pytest.raises(
             Exception,
             match="batch_scheduler_policy value of 'other' is not supported"):
@@ -738,7 +740,6 @@ def test_convert_batching_type():
         "inflight_fused_batching") == trtllm.BatchingType.INFLIGHT
     assert convert_batching_type(
         "inflight_batching") == trtllm.BatchingType.INFLIGHT
-    assert convert_batching_type("v1") == trtllm.BatchingType.STATIC
     with pytest.raises(
             Exception,
             match="gpt_model_type value of 'other' is not supported"):
