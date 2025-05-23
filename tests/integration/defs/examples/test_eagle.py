@@ -303,6 +303,7 @@ def test_mistral_eagle_1gpu(llm_mistral_model_root,
                           llm_rouge_root=llm_rouge_root)
 
 
+@skip_post_blackwell
 @skip_pre_ada
 @pytest.mark.parametrize("use_dynamic_tree", [False, True],
                          ids=['eagle1', 'eagle2'])
