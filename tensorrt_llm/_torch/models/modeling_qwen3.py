@@ -29,7 +29,7 @@ class Qwen3Attention(Attention):
     ):
         config = model_config.pretrained_config
 
-        self.fuse_qk_norm_rope = False  # TODO: Make this configurable?
+        self.fuse_qk_norm_rope = True  # TODO: Make this configurable?
 
         if getattr(config, "rope_scaling", None) is not None:
             pos_embd_params = PositionalEmbeddingParams(
