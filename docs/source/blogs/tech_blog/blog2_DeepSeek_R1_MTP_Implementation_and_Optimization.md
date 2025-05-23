@@ -1,13 +1,3 @@
-<style>
-figcaption {
-    font-size: 14px;
-    text-align: center;
-    color: #666;
-    font-style: italic;
-    margin-top: 8px;
-}
-</style>
-
 # DeepSeek R1 MTP Implementation and Optimization
 by NVIDIA TensorRT-LLM team
 
@@ -21,8 +11,8 @@ Speculative decoding is a popular technique for faster and cost-effective LLM in
 
 <figure>
   <img src="../media/tech_blog2_verify_and_accept.png" alt="tech_blog2_verify_and_accept" width="1280" height="auto">
-  <figcaption>Figure 1. Verification example</figcaption>
 </figure>
+<p align="center"><small><em>Figure 1. Verification example</em></small></p>
 
 Figure 1 shows an example of how to verify and accept those draft tokens. Assuming there are a total of 5 draft tokens “ABCDE”, we will extend them to the input token “G”, and input a total of 6 tokens to the main model. After sampling, we can get six different expected tokens, then compare the expected tokens with the draft tokens and accept the longest prefix matched tokens. In this example, the tokens “ABC” are matched. Because “H” is predicted by the main model and the corresponding input token “C” is already accepted, “H” will also be accepted. In this way, we can accept four tokens in a single iteration. MTP also uses this method to verify and accept draft tokens.
 For the draft stage in MTP, there are two different MTP methods, MTP vanilla and MTP eagle. They can be used for different inference cases.
@@ -31,8 +21,9 @@ For the draft stage in MTP, there are two different MTP methods, MTP vanilla and
 
 <figure>
   <img src="../media/tech_blog2_mtp_vanilla.png" alt="tech_blog2_mtp_vanilla" width="800" height="auto">
-  <figcaption style="font-size: 14px; color: #333; text-align: left;">Figure 2. MTP Vanilla, where t<sub>i</sub> is the input token, d<sub>i</sub> is the predicted draft token, K is the number of MTP modules, and h<sub>i</sub><sup>n</sup> is the hidden state of the n-th MTP module. Note that h<sub>0</sub> means the hidden states of the main model.  (Disclaimer: the figures adapted from the original DeepSeek V3 tech report)</figcaption>
 </figure>
+<p align="left"><small><em>Figure 2. MTP Vanilla, where t<sub>i</sub> is the input token, d<sub>i</sub> is the predicted draft token, K is the number of MTP modules, and h<sub>i</sub><sup>n</sup> is the hidden state of the n-th MTP module. Note that h<sub>0</sub> means the hidden states of the main model.  (Disclaimer: the figures adapted from the original DeepSeek V3 tech report)</em></small></p>
+
 
 MTP Vanilla method is more similar to the MTP training, and it sequentially uses different MTP modules to predict multiple draft tokens. This method can support model checkpoints with weights of multiple different MTP modules. And each MTP module will have its own KV cache.
 
@@ -44,8 +35,8 @@ In the generation phase, there will be a little difference. The predicted token 
 
 <figure>
   <img src="../media/tech_blog2_mtp_eagle.png" alt="tech_blog2_mtp_eagle" width="800" height="auto">
-  <figcaption>Figure 3. MTP Eagle, using the same notation as Figure 2.</figcaption>
 </figure>
+<p align="center"><small><em>Figure 3. MTP Eagle, using the same notation as Figure 2</em></small></p>
 
 MTP Eagle can be viewed as a variant of Eagle speculative decoding method<sup>[2]</sup>, but only supports chain decoding now. It reuses the same MTP module and repeats multiple times to predict draft tokens. MTP Eagle supports the model checkpoint with only one MTP module. The official DeepSeek-V3 and DeepSeek-R1 have only one MTP module in their checkpoints. Another difference with MTP vanilla is the KV cache. In the MTP Eagle method, the MTP module reuses the same KV cache when predicting multiple draft tokens.
 
@@ -59,8 +50,8 @@ TensorRT-LLM has two different paths for MTP, one for MTP Vanilla and another fo
 
 <figure>
   <img src="../media/tech_blog2_overall_workflow.png" alt="tech_blog2_overall_workflow" width="1280" height="auto">
-  <figcaption>Figure 4. MTP workflow in TensorRT-LLM.</figcaption>
 </figure>
+<p align="center"><small><em>Figure 4. MTP workflow in TensorRT-LLM</em></small></p>
 
 Figure 4 shows the overall workflow of MTP in TensorRT-LLM. Both paths share the runtime workflow, and the differences are in the MTP modules forward. In the context phase, there is no draft token in the inputs. TensorRT-LLM model engine fetches the input IDs from the requests and inputs to the model engine forward to get the next token and the hidden state. Then we prepare the MTP module inputs, and the MTP modules forward the inputs to predict the draft tokens.
 
@@ -72,8 +63,8 @@ Except for the Rewind KV Cache, all of those processes are inside the model engi
 
 <figure>
   <img src="../media/tech_blog2_mtp_modules.png" alt="tech_blog2_mtp_modules" width="760" height="auto">
-  <figcaption>Figure 5. MTP model architecture.</figcaption>
 </figure>
+<p align="center"><small><em>Figure 5. MTP model architecture</em></small></p>
 
 Figure 5 introduces the basic model architecture of [MTP Vanilla](https://github.com/NVIDIA/TensorRT-LLM/blob/338744fba6a91147b739b7f02d19b37bc19aa17a/tensorrt_llm/_torch/speculative/mtp.py#L326), [MTP Eagle](https://github.com/NVIDIA/TensorRT-LLM/blob/338744fba6a91147b739b7f02d19b37bc19aa17a/tensorrt_llm/_torch/speculative/mtp.py#L1047), and the basic [MTP module](https://github.com/NVIDIA/TensorRT-LLM/blob/338744fba6a91147b739b7f02d19b37bc19aa17a/tensorrt_llm/_torch/models/modeling_deepseekv3.py#L829) design. Because MTP vanilla needs $K$ input tokens, if the number of accepted tokens is less than the number of input tokens, i.e. $j<K$, we need to use the old token IDs and hidden states as the input of the first MTP module. To avoid bringing much additional computation overhead, we add two tensors for each request to save the past $K$ input IDs and the hidden states of past $K$ tokens, and update them by using the accepted tokens and corresponding hidden states each iteration. In this way, we can read these tensors when preparing inputs for the first MTP module. MTP Eagle implementation is much easier and straightforward, just call the same MTP module forward $K$ times to get $K$ new draft tokens.
 
@@ -127,8 +118,8 @@ DeepSeek-R1 is a reasoning model that first outputs some thinking tokens, after 
 
 <figure>
   <img src="../media/tech_blog2_relaxed_acceptance.png" alt="tech_blog2_relaxed_acceptance" width="1280" height="auto">
-  <figcaption>Figure 6. Relaxed Acceptance example. Use MTP nextn=4 and top-3 in this example.</figcaption>
 </figure>
+<p align="center"><small><em>Figure 6. Relaxed Acceptance example. Use MTP nextn=4 and top-3 in this example.</em></small></p>
 
 In previous verification and acceptance, we will use a top-1 to sample from the logits the main model to get the “expected” tokens as shown in Figure 1. There will be only one choice to compare with the draft tokens, which we call “Strict Acceptance”.
 
@@ -182,8 +173,8 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
 
 <figure>
   <img src="../media/tech_blog2_perf_and_ar.png" alt="tech_blog2_perf_and_ar" width="1280" height="auto">
-  <figcaption>Figure 7. DeepSeek-R1 671B min-latency performance with different MTP next-n.</figcaption>
 </figure>
+<p align="center"><small><em>Figure 7. DeepSeek-R1-FP4 671B min-latency performance with different MTP next-n</em></small></p>
 
 We tested the min-latency (batch size = 1) performance of the DeepSeek-R1-FP4 model with different MTP next-n on a B200 node. The MLA runs with TP=8, and the MoE runs with EP=4. And there are ten different requests with ISL/OSL=1K/2K. From Figure 7, we can see that MTP=3 can help get the best min-latency performance on 8 B200 GPUs, which can bring 2.25x speedup compared with nextn=0. We also evaluated the CUDA graph and overlap scheduler benefits. For such a min-latency case, CUDA graph can achieve a 4.98x average speedup, while the overlap scheduler can achieve 1.03x average latency.
 
@@ -191,8 +182,8 @@ We tested the min-latency (batch size = 1) performance of the DeepSeek-R1-FP4 mo
 
 <figure>
   <img src="../media/tech_blog2_acc_relaxed_acceptance.png" alt="tech_blog2_acc_relaxed_acceptance" width="800" height="auto">
-  <figcaption>Figure 8. Ablation results for the Relaxed Acceptance. Using MTP nextn=3, top-10, and delta=0.6.</figcaption>
 </figure>
+<p align="center"><small><em>Figure 8. Ablation results for the Relaxed Acceptance. Using MTP nextn=3, top-10, and delta=0.6.</em></small></p>
 
 We validated the Relaxed Acceptance on different datasets. In Figure 8, we show the ablation results for Relaxed Acceptance by using the DeepSeek-R1-FP4 model. Compared with Strict Acceptance, the impact of Relaxed Acceptance on output quality is limited, resulting in only a slight accuracy drop.
 
@@ -200,8 +191,8 @@ We validated the Relaxed Acceptance on different datasets. In Figure 8, we show 
 ### Tree-based speculative decoding support
 <figure>
   <img src="../media/tech_blog2_tree_spec_decoding.png" alt="tech_blog2_tree_spec_decoding" width="800" height="auto">
-  <figcaption>Figure 9. Comparison between the chain-based and tree-based speculative decoding.</figcaption>
 </figure>
+<p align="center"><small><em>Figure 9. Comparison between the chain-based and tree-based speculative decoding</em></small></p>
 
 TensorRT-LLM PyTorch backend can only support chain-based speculative decoding now, both MTP Vanilla and MTP Eagle. However, the tree-based speculative decoding technique is widely used in previous advanced methods, such as Ealge2 and Eagle3, to increase the acceptance rate. MTPs in TensorRT-LLM can also be extended to support the tree-based technique. Figure 9 compares the chain-based method with the tree-based method. Both full tree and dynamic tree methods can help expand the candidate combinations, so that we can have more choices for the draft tokens.
 
