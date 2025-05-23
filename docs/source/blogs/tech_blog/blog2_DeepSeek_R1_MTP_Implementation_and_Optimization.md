@@ -9,7 +9,7 @@ Inspired by a previous research work <sup>[1]</sup>, MTP is designed to help the
 ### Background
 Speculative decoding is a popular technique for faster and cost-effective LLM inference. It’s based on the premise that generating multiple future tokens(especially for decode phase which is less compute bound) is more efficient than processing a single token. Speculative decoding techniques usually divide the process into a low-cost draft stage and a parallelized verification stage. The draft stage predicts draft tokens by using a small model or a subset of layers in the main model. And the verification stage uses the main model to determine how many of these draft tokens to accept, which is far more efficient than generating one token per iteration.
 
-<figure>
+<figure align="center">
   <img src="../media/tech_blog2_verify_and_accept.png" alt="tech_blog2_verify_and_accept" width="1280" height="auto">
 </figure>
 <p align="center"><small><em>Figure 1. Verification example</em></small></p>
@@ -19,7 +19,7 @@ For the draft stage in MTP, there are two different MTP methods, MTP vanilla and
 
 ### MTP Vanilla
 
-<figure>
+<figure align="center">
   <img src="../media/tech_blog2_mtp_vanilla.png" alt="tech_blog2_mtp_vanilla" width="640" height="auto">
 </figure>
 <p align="left"><small><em>Figure 2. MTP Vanilla, where t<sub>i</sub> is the input token, d<sub>i</sub> is the predicted draft token, K is the number of MTP modules, and h<sub>i</sub><sup>n</sup> is the hidden state of the n-th MTP module. Note that h<sub>0</sub> means the hidden states of the main model.  (Disclaimer: the figures adapted from the original DeepSeek V3 tech report)</em></small></p>
@@ -33,7 +33,7 @@ In the generation phase, there will be a little difference. The predicted token 
 
 ### MTP Eagle
 
-<figure>
+<figure align="center">
   <img src="../media/tech_blog2_mtp_eagle.png" alt="tech_blog2_mtp_eagle" width="640" height="auto">
 </figure>
 <p align="center"><small><em>Figure 3. MTP Eagle, using the same notation as Figure 2</em></small></p>
@@ -48,7 +48,7 @@ In the generation phase, the verification stage is the same as MTP Vanilla. Afte
 ### Basic Implementation
 TensorRT-LLM has two different paths for MTP, one for MTP Vanilla and another for MTP Eagle. MTP Eagle is the default path for DeepSeek-V3 and DeepSeek-R1 models.
 
-<figure>
+<figure align="center">
   <img src="../media/tech_blog2_overall_workflow.png" alt="tech_blog2_overall_workflow" width="1024" height="auto">
 </figure>
 <p align="center"><small><em>Figure 4. MTP workflow in TensorRT-LLM</em></small></p>
@@ -61,7 +61,7 @@ Except for the Rewind KV Cache, all of those processes are inside the model engi
 
 ### MTP Modules
 
-<figure>
+<figure align="center">
   <img src="../media/tech_blog2_mtp_modules.png" alt="tech_blog2_mtp_modules" width="640" height="auto">
 </figure>
 <p align="center"><small><em>Figure 5. MTP model architecture</em></small></p>
@@ -116,7 +116,7 @@ DeepSeek-R1 is a reasoning model that first outputs some thinking tokens, after 
 
 ### Relaxed Acceptance
 
-<figure>
+<figure align="center">
   <img src="../media/tech_blog2_relaxed_acceptance.png" alt="tech_blog2_relaxed_acceptance" width="1024" height="auto">
 </figure>
 <p align="center"><small><em>Figure 6. Relaxed Acceptance example. Use MTP nextn=4 and top-3 in this example.</em></small></p>
@@ -171,7 +171,7 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
 ## Evaluation
 ### Achieving speedup with MTP speculative decoding
 
-<figure>
+<figure align="center">
   <img src="../media/tech_blog2_perf_and_ar.png" alt="tech_blog2_perf_and_ar" width="1280" height="auto">
 </figure>
 <p align="center"><small><em>Figure 7. DeepSeek-R1-FP4 671B min-latency performance with different MTP next-n</em></small></p>
@@ -180,7 +180,7 @@ We tested the min-latency (batch size = 1) performance of the DeepSeek-R1-FP4 mo
 
 ### Accuracy Studies for Relaxed Acceptance
 
-<figure>
+<figure align="center">
   <img src="../media/tech_blog2_acc_relaxed_acceptance.png" alt="tech_blog2_acc_relaxed_acceptance" width="800" height="auto">
 </figure>
 <p align="center"><small><em>Figure 8. Ablation results for the Relaxed Acceptance. Using MTP nextn=3, top-10, and delta=0.6.</em></small></p>
@@ -189,7 +189,7 @@ We validated the Relaxed Acceptance on different datasets. In Figure 8, we show 
 
 ## Future Works
 ### Tree-based speculative decoding support
-<figure>
+<figure align="center">
   <img src="../media/tech_blog2_tree_spec_decoding.png" alt="tech_blog2_tree_spec_decoding" width="800" height="auto">
 </figure>
 <p align="center"><small><em>Figure 9. Comparison between the chain-based and tree-based speculative decoding</em></small></p>
