@@ -773,7 +773,7 @@ class PyExecutor:
                         (
                             logits,
                             sample_state.log_probs,
-                            sample_state.new_tensors_host,
+                            sample_state.host,
                         ) = self.dist.recv_object(
                             src=self.dist.prev_pp_rank,
                             tag=prev_microbatch_id,
@@ -801,7 +801,7 @@ class PyExecutor:
                                      and sample_state.log_probs is not None)
                                     else None,
                                     sample_state.log_probs,
-                                    sample_state.new_tensors_host,
+                                    sample_state.host,
                                 ),
                                 dest=self.dist.next_pp_rank,
                                 tag=prev_microbatch_id)
