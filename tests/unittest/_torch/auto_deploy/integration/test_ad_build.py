@@ -131,6 +131,19 @@ from utils.llm_data import llm_models_root
                 "compile_backend": "torch-opt",
             },
         ),
+        # Llama4 Scout Instruct
+        param_with_device_count(
+            4,
+            {
+                "model": _hf_model_dir_or_hub_id(
+                    f"{llm_models_root()}/Llama-4-Scout-17B-16E-Instruct",
+                    "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+                ),
+                "model_factory": "AutoModelForImageTextToText",
+                "compile_backend": "torch-opt",
+                "attn_backend": "FlashInfer",
+            },
+        ),
     ],
 )
 def test_build_ad(world_size: Optional[int], config: Dict):
