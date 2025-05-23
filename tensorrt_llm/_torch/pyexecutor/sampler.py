@@ -51,6 +51,8 @@ class SampleState:
 
 class Sampler(ABC):
 
+    SampleState = SampleState
+
     def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
         pass
 
@@ -463,6 +465,7 @@ class SampleStateTRTLLM(SampleState):
 
 class TRTLLMSampler(Sampler):
     MAX_DECODING_TOKENS = 1  # It must be 1 when not in speculative decoding
+    SampleState = SampleStateTRTLLM
 
     def __init__(
         self,

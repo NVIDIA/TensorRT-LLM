@@ -221,6 +221,8 @@ class MTPSampler(TorchSampler):
     MTP sampler.
     """
 
+    SampleState = SampleStateMTP
+
     def __init__(self, max_seq_len: int, config: MTPConfig):
         super().__init__(max_seq_len, False)
         self.mapping = None

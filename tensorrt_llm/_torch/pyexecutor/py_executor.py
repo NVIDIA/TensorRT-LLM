@@ -1145,7 +1145,7 @@ class PyExecutor:
         sampler_event.record()
         self._update_request_states(scheduled_batch)
         sampler_event.synchronize()
-        return SampleState(
+        return self.sampler.SampleState(
             scheduled_requests=scheduled_batch,
             sampler_event=sampler_event,
         )
