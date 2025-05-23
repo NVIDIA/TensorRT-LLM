@@ -237,6 +237,10 @@ private:
     //! These blocks become reusable from next step.
     void storeContextBlocks(std::shared_ptr<LlmRequest> const& req);
 
+    //! @brief Store newest kv cache block for reuse.
+    //! The block become reusable from next step.
+    void storeNewBlock(std::shared_ptr<LlmRequest> const& req);
+
     //! @brief Set LayerProfiler to collect performance per layer.
     void setLayerProfiler() override;
 
