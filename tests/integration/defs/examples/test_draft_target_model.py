@@ -285,7 +285,6 @@ def test_llm_draft_target_llama_fp8_2gpu(llama_example_root, llm_venv,
         "--use_paged_context_fmha=enable",
         "--gemm_plugin=auto",
         "--workers=2",
-        "--tp_size=2",
         "--gather_generation_logits",
     ]
 
