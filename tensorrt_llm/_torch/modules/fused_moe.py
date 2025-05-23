@@ -593,13 +593,17 @@ class FusedMoE(nn.Module):
                                    self.hidden_size,
                                    self.intermediate_size_per_partition // 2)
 
-                fc31_act_scale = nn.Parameter(torch.empty(
-                    self.expert_size_per_partition, 1, dtype=self.dtype),
+                fc31_act_scale = nn.Parameter(torch.empty(1,
+                                                          self.hidden_size,
+                                                          dtype=self.dtype),
                                               requires_grad=False)
                 self.register_parameter("fc31_act_scale", fc31_act_scale)
 
                 fc2_act_scale = nn.Parameter(torch.empty(
-                    self.expert_size_per_partition, 1, dtype=self.dtype),
+                    1,
+                    self.intermediate_size_per_partition,
+                    1,
+                    dtype=self.dtype),
                                              requires_grad=False)
                 self.register_parameter("fc2_act_scale", fc2_act_scale)
 
@@ -1670,12 +1674,14 @@ class FusedMoE(nn.Module):
             load_weight_shard(weights[f"{expert_id}.w1.input_scale"])
             for expert_id in range(self.expert_start, self.expert_end)
         ]
-        all_w3_w1_input_scales = torch.max(torch.stack(all_w3_input_scales),
-                                           torch.stack(all_w1_input_scales))
-        all_w3_w1_input_scales = torch.ones_like(
-            all_w3_w1_input_scales) * all_w3_w1_input_scales.max()
-        self.fc31_act_scale.data.copy_(1 / all_w3_w1_input_scales)
-        self.fc31_alpha.data.copy_(all_w3_w1_input_scales.float())
+        all_w3_w1_input_scales_max = torch.max(
+            torch.stack(all_w3_input_scales),
+            torch.stack(all_w1_input_scales)).max()
+        self.fc31_act_scale.data.copy_(
+            torch.ones_like(self.fc31_act_scale) *
+            (1 / all_w3_w1_input_scales_max))
+        self.fc31_alpha.data.copy_((torch.ones_like(self.fc31_alpha) *
+                                    all_w3_w1_input_scales_max).float())
 
         all_w3_scales = [
             load_weight_shard(weights[f"{expert_id}.w3.weight_scale_inv"],
@@ -1711,11 +1717,12 @@ class FusedMoE(nn.Module):
             load_weight_shard(weights[f"{expert_id}.w2.input_scale"])
             for expert_id in range(self.expert_start, self.expert_end)
         ]
-        all_w2_input_scales = torch.stack(all_w2_input_scales).to(self.dtype)
-        all_w2_input_scales = torch.ones_like(
-            all_w2_input_scales) * all_w2_input_scales.max()
-        self.fc2_act_scale.data.copy_(1 / all_w2_input_scales)
-        self.fc2_alpha.data.copy_(all_w2_input_scales.float())
+        all_w2_input_scales_max = torch.stack(all_w2_input_scales).to(
+            self.dtype).max()
+        self.fc2_act_scale.data.copy_(
+            torch.ones_like(self.fc2_act_scale) * (1 / all_w2_input_scales_max))
+        self.fc2_alpha.data.copy_(
+            (torch.ones_like(self.fc2_alpha) * all_w2_input_scales_max).float())
 
         all_w2_scales = [
             load_weight_shard(weights[f"{expert_id}.w2.weight_scale_inv"],
