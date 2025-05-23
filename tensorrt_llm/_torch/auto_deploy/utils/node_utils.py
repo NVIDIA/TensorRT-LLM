@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import torch
-import torch.nn as nn
 from torch._ops import OpOverload, OpOverloadPacket
 from torch.fx import Graph, GraphModule, Node
 
@@ -306,7 +305,7 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     # sanity check: we expect at most two users for any residual node
     res_nodes_more_users = [n for n in boundary_nodes[2:] if len(n.users) > 2]
     if res_nodes_more_users:
-        ad_logger.warning(f"Unexpected # of users for residuals: {res_nodes_more_users}")
+        ad_logger.debug(f"Unexpected # of users for residuals: {res_nodes_more_users}")
 
     # add output node to boundary nodes
     boundary_nodes.append(output_node)
@@ -353,43 +352,41 @@ def extract_output_tuple(node: Node, count: int = 2):
     return results
 
 
-def is_chunk_or_slice_op(node: Node) -> bool:
-    """Check if the node is a chunk or slice op."""
-    target_ops = {
-        torch.ops.aten.slice,
-        torch.ops.aten.chunk,
-    }
-    return is_op(node, target_ops)
-
-
-def add_new_attribute_to_submodule(
-    gm: GraphModule,
-    new_submodule_name: str,
-    new_attr_name: str,
-    new_attr: torch.Tensor,
-    is_buffer: bool = False,
-) -> str:
+def extract_op_args(node: Node, *arg_names):
     """
-    Adds a new parameter or buffer to a submodule within gm.
-    If the submodule identified by new_submodule_name does not exist,
-    it will be created. Then the new parameter or buffer is added to the submodule
-    under the attribute new_attr_name.
-    Returns:
-        A string representing the full parameter/buffer name in the format "new_submodule_name.new_attr_name".
+    Given a call_function node for torch custom op,
+    returns a tuple of values for each name in arg_names, trying in order:
+    1. node.kwargs[name]
+    2. node.args[position_in_schema]
+    3. the schema default
     """
-    try:
-        submodule = gm.get_submodule(new_submodule_name)
-        ad_logger.debug(f"Found existing submodule '{new_submodule_name}'.")
-    except AttributeError:
-        result = gm.add_submodule(new_submodule_name, nn.Module())
-        ad_logger.debug(f"Added submodule '{new_submodule_name}' with result: {result}.")
-        submodule = gm.get_submodule(new_submodule_name)
+    if node.op != "call_function":
+        raise ValueError(f"extract_op_args only supports call_function nodes, got {node.op}")
 
-    if is_buffer:
-        submodule.register_buffer(new_attr_name, new_attr)
-        ad_logger.debug(f"Set new buffer '{new_attr_name}' in submodule '{new_submodule_name}'.")
+    op = node.target
+    if hasattr(op, "_schemas"):
+        schema = next(iter(op._schemas.values()))
+    elif hasattr(op, "_schema"):
+        schema = op._schema
     else:
-        submodule.register_parameter(new_attr_name, new_attr)
-        ad_logger.debug(f"Set new parameter '{new_attr_name}' in submodule '{new_submodule_name}'.")
+        raise RuntimeError(f"No schema found on op {op}")
+    args_meta = schema.arguments
 
-    return f"{new_submodule_name}.{new_attr_name}"
+    # name→index in signature, and name→default_value
+    pos = {a.name: i for i, a in enumerate(args_meta)}
+    defs = {a.name: a.default_value for a in args_meta if a.has_default_value}
+
+    args = list(node.args)
+    kwargs = node.kwargs or {}
+
+    def _get(name):
+        if name in kwargs:
+            return kwargs[name]
+        i = pos.get(name)
+        if i is not None and i < len(args):
+            return args[i]
+        if name in defs:
+            return defs[name]
+        raise RuntimeError(f"Could not find a value for '{name}' on op {op}")
+
+    return [_get(n) for n in arg_names]

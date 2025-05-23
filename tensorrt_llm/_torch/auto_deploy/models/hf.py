@@ -13,7 +13,13 @@ from accelerate.utils import modeling
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import HFValidationError, filter_repo_objects, validate_repo_id
 from torch._prims_common import DeviceLikeType
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, PretrainedConfig
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoTokenizer,
+    PretrainedConfig,
+)
 from transformers.utils import (
     SAFE_WEIGHTS_INDEX_NAME,
     SAFE_WEIGHTS_NAME,
@@ -311,3 +317,21 @@ class AutoModelForCausalLMFactory(ModelFactory):
                 # We do not quantize lm_head.
                 if "exclude_modules" not in self._quant_config:
                     self._quant_config["exclude_modules"] = ["lm_head"]
+
+
+@ModelFactoryRegistry.register("AutoModelForImageTextToText")
+class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # additional heuristic to disable use_cache
+        self.model_kwargs["text_config"] = self.model_kwargs.get("text_config", {})
+        self.model_kwargs["text_config"]["use_cache"] = False
+
+        self.model_kwargs["text_config"]["max_position_embeddings"] = self.model_kwargs[
+            "max_position_embeddings"
+        ]
+
+    @property
+    def automodel_from_config(self):
+        return AutoModelForImageTextToText.from_config

@@ -194,10 +194,12 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
         if not is_op(node, rope_ops):
             continue
 
+        # TODO (fridah-nv): check this and use correctly utility
         rope_op = next(op for op in rope_ops if is_op(node, op))
         if is_op(node, torch.ops.rope.torch_apply_rope_with_complex_freqs):
             q_node, k_node, freqs_node, *rest = node.args
             unsq = rest[0] if rest else _get_default_unsqueeze_dim(rope_op)
+
         else:
             q_node, k_node, cos_node, sin_node, *rest = node.args
             unsq = rest[0] if rest else _get_default_unsqueeze_dim(rope_op)

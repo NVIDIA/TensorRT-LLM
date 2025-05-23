@@ -11,10 +11,9 @@ from ..distributed import common as dist_ad
 from ..models.factory import ModelFactory
 from ..shim.interface import AutoDeployConfig, CachedSequenceInterface
 from ..utils.logger import ad_logger
-from ._graph import canonicalize_graph, move_to_device
+from ._graph import canonicalize_graph, lift_to_meta, move_to_device
 from .export import torch_export_to_gm
 from .library import (
-    check_in_out_nodes,
     column_row_shard,
     dp_bmm_shard,
     eliminate_redundant_transposes,
@@ -36,6 +35,7 @@ from .library import (
     optimize_rope,
     quantize,
     resize_kv_cache,
+    update_in_out_nodes,
 )
 
 
@@ -91,10 +91,8 @@ class InferenceOptimizer:
         # EXPORT MODEL TO GRAPH MODULE
         ############################################################################################
 
-        cm.info._set_example_sequence()
-        egm = torch_export_to_gm(
-            model, args=cm.args_original, dynamic_shapes=cm.original_dynamic_shapes
-        )
+        cm.info.set_example_sequence()
+        egm = torch_export_to_gm(model, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
         del model
         ad_logger.debug("original graph: " + str(egm))
         local_rank, world_size = dist_ad.get_rank_world_size()
@@ -151,8 +149,9 @@ class InferenceOptimizer:
         egm = dp_bmm_shard(egm, local_rank, world_size)
 
         # let's run a shape propagation pass to update the graph with correct meta values for
-        # subsequent optimization passes
-        egm = canonicalize_graph(egm, shape_prop=True)
+        # subsequent optimization passes. Lift state_dict to meta as shape propagation involves device check
+        with lift_to_meta(egm):
+            egm = canonicalize_graph(egm, shape_prop=True)
 
         ############################################################################################
         # MOVE MODEL AND LOAD WEIGHTS
@@ -195,16 +194,14 @@ class InferenceOptimizer:
                 pass
 
         ############################################################################################
-        # HANDLE CACHES
+        # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
         ############################################################################################
 
-        input_nodes = check_in_out_nodes(egm)
+        egm = update_in_out_nodes(egm, cm)
 
         # detect attention op and replace with cache-aware op
         for attn_descriptor in [self.attention_op, self.mla_op]:
-            egm = insert_cached_attention(
-                egm, cm, attn_descriptor, self.factory.get_cache_config(), input_nodes
-            )
+            egm = insert_cached_attention(egm, cm, attn_descriptor, self.factory.get_cache_config())
 
         # initialize cache on correct device
         cm.initialize_caches()
@@ -216,7 +213,7 @@ class InferenceOptimizer:
         # COMPILE MODEL
         ############################################################################################
 
-        cm.info._set_generate_only_batch()
+        cm.info.set_generate_only_batch()
         compiler_kwargs = {
             "cuda_graph_batch_sizes": self.ad_config.cuda_graph_batch_sizes,
             "num_batched_inputs": 2,  # TODO (lucaslie): improve once we have a config system...
