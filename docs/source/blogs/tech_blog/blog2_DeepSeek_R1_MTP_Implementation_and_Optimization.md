@@ -1,3 +1,13 @@
+<style>
+figcaption {
+    font-size: 14px;
+    text-align: center;
+    color: #666;
+    font-style: italic;
+    margin-top: 8px;
+}
+</style>
+
 # DeepSeek R1 MTP Implementation and Optimization
 by NVIDIA TensorRT-LLM team
 
@@ -21,7 +31,7 @@ For the draft stage in MTP, there are two different MTP methods, MTP vanilla and
 
 <figure>
   <img src="../media/tech_blog2_mtp_vanilla.png" alt="tech_blog2_mtp_vanilla" width="800" height="auto">
-  <figcaption>Figure 2. MTP Vanilla, where $t_i$ is the input token, $d_i$ is the predicted draft token, $K$ is the number of MTP modules, and $h_i^n$ is the hidden state of the $n-th$ MTP module. Note that $h_0$ means the hidden states of the main model.  (Disclaimer: the figures adapted from the original DeepSeek V3 tech report)</figcaption>
+  <figcaption style="font-size: 14px; color: #333; text-align: left;">Figure 2. MTP Vanilla, where t<sub>i</sub> is the input token, d<sub>i</sub> is the predicted draft token, K is the number of MTP modules, and h<sub>i</sub><sup>n</sup> is the hidden state of the n-th MTP module. Note that h<sub>0</sub> means the hidden states of the main model.  (Disclaimer: the figures adapted from the original DeepSeek V3 tech report)</figcaption>
 </figure>
 
 MTP Vanilla method is more similar to the MTP training, and it sequentially uses different MTP modules to predict multiple draft tokens. This method can support model checkpoints with weights of multiple different MTP modules. And each MTP module will have its own KV cache.
@@ -65,7 +75,7 @@ Except for the Rewind KV Cache, all of those processes are inside the model engi
   <figcaption>Figure 5. MTP model architecture.</figcaption>
 </figure>
 
-Figure 5 introduces the basic model architecture of MTP Vanilla, MTP Eagle, and the basic MTP module design. Because MTP vanilla needs $K$ input tokens, if the number of accepted tokens is less than the number of input tokens, i.e. $j<K$, we need to use the old token IDs and hidden states as the input of the first MTP module. To avoid bringing much additional computation overhead, we add two tensors for each request to save the past $K$ input IDs and the hidden states of past $K$ tokens, and update them by using the accepted tokens and corresponding hidden states each iteration. In this way, we can read these tensors when preparing inputs for the first MTP module. MTP Eagle implementation is much easier and straightforward, just call the same MTP module forward $K$ times to get $K$ new draft tokens.
+Figure 5 introduces the basic model architecture of [MTP Vanilla](https://github.com/NVIDIA/TensorRT-LLM/blob/338744fba6a91147b739b7f02d19b37bc19aa17a/tensorrt_llm/_torch/speculative/mtp.py#L326), [MTP Eagle](https://github.com/NVIDIA/TensorRT-LLM/blob/338744fba6a91147b739b7f02d19b37bc19aa17a/tensorrt_llm/_torch/speculative/mtp.py#L1047), and the basic [MTP module](https://github.com/NVIDIA/TensorRT-LLM/blob/338744fba6a91147b739b7f02d19b37bc19aa17a/tensorrt_llm/_torch/models/modeling_deepseekv3.py#L829) design. Because MTP vanilla needs $K$ input tokens, if the number of accepted tokens is less than the number of input tokens, i.e. $j<K$, we need to use the old token IDs and hidden states as the input of the first MTP module. To avoid bringing much additional computation overhead, we add two tensors for each request to save the past $K$ input IDs and the hidden states of past $K$ tokens, and update them by using the accepted tokens and corresponding hidden states each iteration. In this way, we can read these tensors when preparing inputs for the first MTP module. MTP Eagle implementation is much easier and straightforward, just call the same MTP module forward $K$ times to get $K$ new draft tokens.
 
 The MTP module follows the design in DeepSeek-V3. The embedding layer and output head in MTP modules are shared with the main model, which can save GPU memory consumption.
 
@@ -111,7 +121,7 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
 ```
 
 ## MTP optimization - Relaxed Acceptance
-DeepSeek-R1 is a reasoning model that first outputs some thinking tokens, after which the user can get the actual outputs. The thinking process usually takes up a lot of tokens, and the quality of the outputs of the thinking process may have a limited impact on the final answer. So we want to use a more aggressive acceptance strategy, called relaxed acceptance, for the thinking process to speed up the thinking decoding phase. This will be a tradeoff between speedup and output quality. From the experimental results, the impact of relaxed acceptance on output quality is limited.
+DeepSeek-R1 is a reasoning model that first outputs some thinking tokens, after which the user can get the actual outputs. The thinking process usually takes up a lot of tokens, and the quality of the outputs of the thinking process may have a limited impact on the final answer. So we want to use a more aggressive acceptance strategy, called [relaxed acceptance](https://github.com/NVIDIA/TensorRT-LLM/pull/3865), for the thinking process to speed up the thinking decoding phase. This will be a tradeoff between speedup and output quality. From the experimental results, the impact of relaxed acceptance on output quality is limited.
 
 ### Relaxed Acceptance
 
@@ -197,7 +207,7 @@ TensorRT-LLM PyTorch backend can only support chain-based speculative decoding n
 
 ### Eagle3 support
 
-Another important method is Eagle3. From the Eagle3 paper [3], the promising results show that it can help greatly increase the acceptance rate by leveraging different levels’ hidden states to predict draft tokens. Since TensorRT-LLM already has Eagle-3 support now, in the future, we also want to train an Eagle3 head to support DeepSeek-V3/R1+Eagle3 to achieve better speedup.
+Another important method is Eagle3. From the Eagle3 paper<sup>[3]</sup>, the promising results show that it can help greatly increase the acceptance rate by leveraging different levels’ hidden states to predict draft tokens. Since TensorRT-LLM already has [Eagle-3 support](https://github.com/NVIDIA/TensorRT-LLM/pull/3035) now, in the future, we also want to train an Eagle3 head to support DeepSeek-V3/R1+Eagle3 to achieve better speedup.
 
 ### Fix known issues
 
