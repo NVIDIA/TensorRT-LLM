@@ -20,7 +20,7 @@ For the draft stage in MTP, there are two different MTP methods, MTP vanilla and
 ### MTP Vanilla
 
 <figure>
-  <img src="../media/tech_blog2_mtp_vanilla.png" alt="tech_blog2_mtp_vanilla" width="800" height="auto">
+  <img src="../media/tech_blog2_mtp_vanilla.png" alt="tech_blog2_mtp_vanilla" width="640" height="auto">
 </figure>
 <p align="left"><small><em>Figure 2. MTP Vanilla, where t<sub>i</sub> is the input token, d<sub>i</sub> is the predicted draft token, K is the number of MTP modules, and h<sub>i</sub><sup>n</sup> is the hidden state of the n-th MTP module. Note that h<sub>0</sub> means the hidden states of the main model.  (Disclaimer: the figures adapted from the original DeepSeek V3 tech report)</em></small></p>
 
@@ -34,7 +34,7 @@ In the generation phase, there will be a little difference. The predicted token 
 ### MTP Eagle
 
 <figure>
-  <img src="../media/tech_blog2_mtp_eagle.png" alt="tech_blog2_mtp_eagle" width="800" height="auto">
+  <img src="../media/tech_blog2_mtp_eagle.png" alt="tech_blog2_mtp_eagle" width="640" height="auto">
 </figure>
 <p align="center"><small><em>Figure 3. MTP Eagle, using the same notation as Figure 2</em></small></p>
 
@@ -49,7 +49,7 @@ In the generation phase, the verification stage is the same as MTP Vanilla. Afte
 TensorRT-LLM has two different paths for MTP, one for MTP Vanilla and another for MTP Eagle. MTP Eagle is the default path for DeepSeek-V3 and DeepSeek-R1 models.
 
 <figure>
-  <img src="../media/tech_blog2_overall_workflow.png" alt="tech_blog2_overall_workflow" width="1280" height="auto">
+  <img src="../media/tech_blog2_overall_workflow.png" alt="tech_blog2_overall_workflow" width="1024" height="auto">
 </figure>
 <p align="center"><small><em>Figure 4. MTP workflow in TensorRT-LLM</em></small></p>
 
@@ -62,7 +62,7 @@ Except for the Rewind KV Cache, all of those processes are inside the model engi
 ### MTP Modules
 
 <figure>
-  <img src="../media/tech_blog2_mtp_modules.png" alt="tech_blog2_mtp_modules" width="760" height="auto">
+  <img src="../media/tech_blog2_mtp_modules.png" alt="tech_blog2_mtp_modules" width="640" height="auto">
 </figure>
 <p align="center"><small><em>Figure 5. MTP model architecture</em></small></p>
 
@@ -117,7 +117,7 @@ DeepSeek-R1 is a reasoning model that first outputs some thinking tokens, after 
 ### Relaxed Acceptance
 
 <figure>
-  <img src="../media/tech_blog2_relaxed_acceptance.png" alt="tech_blog2_relaxed_acceptance" width="1280" height="auto">
+  <img src="../media/tech_blog2_relaxed_acceptance.png" alt="tech_blog2_relaxed_acceptance" width="1024" height="auto">
 </figure>
 <p align="center"><small><em>Figure 6. Relaxed Acceptance example. Use MTP nextn=4 and top-3 in this example.</em></small></p>
 
@@ -176,7 +176,7 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
 </figure>
 <p align="center"><small><em>Figure 7. DeepSeek-R1-FP4 671B min-latency performance with different MTP next-n</em></small></p>
 
-We tested the min-latency (batch size = 1) performance of the DeepSeek-R1-FP4 model with different MTP next-n on a B200 node. The MLA runs with TP=8, and the MoE runs with EP=4. And there are ten different requests with ISL/OSL=1K/2K. From Figure 7, we can see that MTP=3 can help get the best min-latency performance on 8 B200 GPUs, which can bring 2.25x speedup compared with nextn=0. We also evaluated the CUDA graph and overlap scheduler benefits. For such a min-latency case, CUDA graph can achieve a 4.98x average speedup, while the overlap scheduler can achieve 1.03x average latency.
+We tested the min-latency (batch size = 1) performance of the DeepSeek-R1-FP4 model with different MTP next-n on a B200 node. The MLA runs with TP=8, and the MoE runs with EP=2. And there are ten different requests with ISL/OSL=1K/2K. From Figure 7, we can see that MTP=3 can help get the best min-latency performance on 8 B200 GPUs, which can bring 2.16x speedup compared with the baseline nextn=0. And with the help of the relaxed acceptance, the min-latency performance can be further improved to achieve a 2.33x speedup. We also evaluated the CUDA graph and overlap scheduler benefits. For such a min-latency case, CUDA graph can achieve a 7.22x average speedup, while the overlap scheduler can achieve 1.03x average latency.
 
 ### Accuracy Studies for Relaxed Acceptance
 
