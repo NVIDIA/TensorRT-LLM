@@ -177,7 +177,11 @@ std::string ar_info(AllReduceStrategyType runtime_strategy, AllReduceStrategyCon
     {
         info += "TWOSHOT ";
     }
-    if (config == AllReduceStrategyConfig::PUSH_MODE)
+    if (config == AllReduceStrategyConfig::USE_MEMCPY)
+    {
+        info += "USE_MEMCPY";
+    }
+    else if (config == AllReduceStrategyConfig::PUSH_MODE)
     {
         info += "PUSH_MODE";
     }

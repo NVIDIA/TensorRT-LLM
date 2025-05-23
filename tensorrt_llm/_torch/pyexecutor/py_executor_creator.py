@@ -73,7 +73,7 @@ def create_py_executor(executor_config: ExecutorConfig,
         has_speculative_draft_tokens=has_draft_model_engine
         or has_ngram_drafter,
     )
-    print("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
+    logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
     model_engine = PyTorchModelEngine(
         checkpoint_dir,

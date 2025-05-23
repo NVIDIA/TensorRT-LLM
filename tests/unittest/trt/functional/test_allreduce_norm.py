@@ -52,7 +52,7 @@ class TestCommunicationPlugin(unittest.TestCase):
         cudart.cudaSetDevice(self.rank)
         self.reference_tensors = [
             torch.full([10000000], i + 1, dtype=torch.float32, device="cuda")
-            for i in range(self.world_size * 2)
+            for i in range(self.world_size)
         ]
         self.mapping = Mapping(self.world_size,
                                self.rank,
@@ -73,15 +73,11 @@ class TestCommunicationPlugin(unittest.TestCase):
         workspace = None
         torch_dtype = tllm._utils.str_dtype_to_torch(dtype)
         dtype_size = torch.finfo(torch_dtype).bits // 8
-        allreduce_ref_0 = torch.zeros(self.reference_tensors[0][:size].shape,
-                                      dtype=torch_dtype,
-                                      device="cuda").reshape(
-                                          token_num, hidden_size)
-        allreduce_ref_1 = torch.zeros(self.reference_tensors[0][:size].shape,
-                                      dtype=torch_dtype,
-                                      device="cuda").reshape(
-                                          token_num, hidden_size)
-        residual = torch.rand(allreduce_ref_0.shape,
+        allreduce_ref = torch.zeros(self.reference_tensors[0][:size].shape,
+                                    dtype=torch_dtype,
+                                    device="cuda").reshape(
+                                        token_num, hidden_size)
+        residual = torch.rand(allreduce_ref.shape,
                               dtype=torch_dtype,
                               device="cuda")
         weight = torch.rand((1, hidden_size), dtype=torch_dtype, device="cuda")
@@ -89,15 +85,10 @@ class TestCommunicationPlugin(unittest.TestCase):
         eps = 1e-6
 
         for i in range(self.world_size):
-            allreduce_ref_0 = allreduce_ref_0 + self.reference_tensors[
-                i][:size].to(torch_dtype).reshape(token_num, hidden_size)
-            allreduce_ref_1 = allreduce_ref_1 + self.reference_tensors[
-                i + self.world_size][:size].to(torch_dtype).reshape(
-                    token_num, hidden_size)
-        allreduce_ref_0 = allreduce_ref_0 + bias + residual
-        allreduce_ref_1 = allreduce_ref_1 + bias + residual
-        allreduce_ref_0 = rms_norm(allreduce_ref_0, weight, eps)
-        allreduce_ref_1 = rms_norm(allreduce_ref_1, weight, eps)
+            allreduce_ref = allreduce_ref + self.reference_tensors[i][:size].to(
+                torch_dtype).reshape(token_num, hidden_size)
+        allreduce_ref = allreduce_ref + bias + residual
+        allreduce_ref = rms_norm(allreduce_ref, weight, eps)
 
         builder = tllm.Builder()
         net = builder.create_network()
@@ -106,16 +97,14 @@ class TestCommunicationPlugin(unittest.TestCase):
         _, workspace = current_all_reduce_helper().allocate_workspace(
             self.mapping, size * dtype_size)
 
-        input_0 = self.reference_tensors[self.rank][:size].to(
-            torch_dtype).reshape(token_num, hidden_size)
-        input_1 = self.reference_tensors[self.rank + self.world_size][:size].to(
+        input = self.reference_tensors[self.rank][:size].to(
             torch_dtype).reshape(token_num, hidden_size)
 
         with tllm.net_guard(net):
             tllm.default_trtnet()
 
             x = Tensor(name='x',
-                       shape=input_0.shape,
+                       shape=input.shape,
                        dtype=tllm.str_dtype_to_trt(dtype))
             y = Tensor(name='y',
                        shape=bias.shape,
@@ -143,7 +132,7 @@ class TestCommunicationPlugin(unittest.TestCase):
             current.mark_output('output', dtype)
 
         feed_dict = {
-            'x': input_0,
+            'x': input,
             'y': bias,
             'z': residual,
             'w': weight,
@@ -151,27 +140,26 @@ class TestCommunicationPlugin(unittest.TestCase):
         }
 
         session = create_session(builder, net, precision=dtype)
-        outputs_0 = run_session(session, feed_dict)
-        feed_dict['x'] = input_1
-        outputs_1 = run_session(session, feed_dict)
+        outputs = run_session(session, feed_dict)
 
-        def check_close(ref, output):
-            close = torch.isclose(ref, output, rtol=1e-2, atol=1e-3)
-            if not torch.all(close):
-                not_close_a = ref[~close]
-                not_close_b = output[~close]
-                print("rank {}, \n{}\n{}".format(self.rank, ref, output))
-                print("mismatch value:")
-                print("ref:", not_close_a)
-                print("output:", not_close_b)
+        close = torch.isclose(allreduce_ref,
+                              outputs['output'],
+                              rtol=1e-2,
+                              atol=1e-3)
+        if not torch.all(close):
+            not_close_a = allreduce_ref[~close]
+            not_close_b = outputs['output'][~close]
+            print("rank {}, \n{}\n{}".format(self.rank, allreduce_ref,
+                                             outputs['output']))
+            print("mismatch value:")
+            print("ref:", not_close_a)
+            print("output:", not_close_b)
 
-            torch.testing.assert_close(output.cpu(),
-                                       ref.cpu(),
-                                       rtol=1e-2,
-                                       atol=1e-3)
-
-        check_close(allreduce_ref_0, outputs_0['output'])
-        check_close(allreduce_ref_1, outputs_1['output'])
+        self.assertTrue(
+            torch.allclose(outputs['output'].cpu(),
+                           allreduce_ref.cpu(),
+                           rtol=1e-2,
+                           atol=1e-3))
 
 
 if __name__ == "__main__":

@@ -43,6 +43,8 @@ class LMHead(Linear):
         elif tensor_parallel_mode == TensorParallelMode.COLUMN:
             local_out_features = math.ceil(num_embeddings / tp_size)
             self.padding_size = tp_size * local_out_features - num_embeddings
+        else:
+            self.padding_size = 0
 
         super().__init__(
             local_in_features * tp_size,
@@ -126,6 +128,7 @@ def pre_comm_embedding_ops(
     input_: torch.Tensor,
     weight: torch.Tensor,
     tp_size: int,
+    tp_rank: int,
     tp_mode: TensorParallelMode,
     vocab_start_index: int,
     vocab_end_index: int,
@@ -198,7 +201,8 @@ class Embedding(LMHead):
     def forward(self, input):
         # Run the ops before all_reduce/all_gather.
         output = pre_comm_embedding_ops(input, self.weight, self.tp_size,
-                                        self.tp_mode, self.vocab_start_index,
+                                        self.tp_rank, self.tp_mode,
+                                        self.vocab_start_index,
                                         self.vocab_end_index,
                                         self.gather_output, self.padding_size)
 

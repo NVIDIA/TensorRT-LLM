@@ -46,8 +46,7 @@ from ..speculative import SpecMetadata, get_spec_worker
 from ..utils import Fp4QuantizedTensor
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             EagerFusionConfig, MissingLayer,
-                             register_auto_model)
+                             EagerFusionConfig, register_auto_model)
 
 # Perf heuristics thresholds.
 # Use routing gemv kernels when num_tokens <= 8.
@@ -1413,7 +1412,9 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
         self.draft_model = None
-        if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
+        if hasattr(
+                model_config, "spec_config"
+        ) and model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
         ):
             draft_config = ModelConfig.from_pretrained(
                 model_config.spec_config.draft_model_path,
@@ -1430,6 +1431,15 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                 draft_config, model_config.pretrained_config.num_hidden_layers)
             self.spec_worker = get_spec_worker(model_config.spec_config,
                                                model_config.mapping)
+
+            # Set to True to enable delayed all-gather for LM head.
+            # This means LM head will not perform all-gather on the output logits, so each rank will only have
+            # a subset of the logits. The decoding part must be aware of that and apply all gather after top1 reduction.
+            self.enable_lm_head_delayed_all_gather = True
+            if self.enable_lm_head_delayed_all_gather:
+                # Delay all-gather until after top1 reduction.
+                self.lm_head.gather_output = False
+                self.draft_model.lm_head.gather_output = False
 
     def forward(
         self,
@@ -1571,7 +1581,9 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
 
-        self.is_eagle3_one_model = model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
+        self.is_eagle3_one_model = hasattr(
+            model_config, "spec_config"
+        ) and model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
         )
         self.draft_model = None
         if self.is_eagle3_one_model:
@@ -1667,7 +1679,7 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
-            elif not isinstance(self.model.layers[idx + 1], MissingLayer):
+            else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
                 layer.next_attn = self.model.layers[idx + 1].self_attn

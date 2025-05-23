@@ -36,19 +36,19 @@
 namespace torch_ext
 {
 
-torch::Tensor llama4_bf16_bf16_gemm(torch::Tensor inputA, torch::Tensor inputB)
+torch::Tensor llama4_bf16_bf16_gemm(torch::Tensor const& inputA, torch::Tensor const& inputB)
 {
     CHECK_INPUT(inputA, c10::ScalarType::BFloat16);
     CHECK_INPUT(inputB, c10::ScalarType::BFloat16);
 
     TORCH_CHECK(inputA.dim() == 2, "inputA must be 2D.");
     TORCH_CHECK(inputB.dim() == 2, "inputB must be 2D.");
-    TORCH_CHECK(inputA.size(1) == 5120, "inputA.size(1) must be 5120");
-    TORCH_CHECK(inputB.size(0) == 128, "inputB.size(0) must be 128");
-    TORCH_CHECK(inputB.size(1) == 5120, "inputB.size(1) must be 5120");
+    TORCH_CHECK(inputA.sizes()[1] == 5120, "inputA.size(1) must be 5120");
+    TORCH_CHECK(inputB.sizes()[0] == 128, "inputB.size(0) must be 128");
+    TORCH_CHECK(inputB.sizes()[1] == 5120, "inputB.size(1) must be 5120");
 
-    auto const num_tokens = inputA.size(0);
-    auto const hidden_out = inputB.size(0);
+    auto const num_tokens = inputA.sizes()[0];
+    auto const hidden_out = inputB.sizes()[0];
 
     auto stream = at::cuda::getCurrentCUDAStream(inputA.get_device());
     auto output = torch::empty(
@@ -61,7 +61,7 @@ torch::Tensor llama4_bf16_bf16_gemm(torch::Tensor inputA, torch::Tensor inputB)
 }
 
 torch::Tensor llama4_fp8_bf16_gemm(torch::Tensor const& inputA, torch::Tensor const& inputB,
-    torch::Tensor const& scaling_factor, torch::optional<torch::Tensor> position_ids)
+    torch::Tensor const& scaling_factor, torch::optional<torch::Tensor> const& position_ids)
 {
     CHECK_INPUT(inputA, c10::ScalarType::Float8_e4m3fn);
     CHECK_INPUT(inputB, c10::ScalarType::Float8_e4m3fn);
@@ -83,13 +83,13 @@ torch::Tensor llama4_fp8_bf16_gemm(torch::Tensor const& inputA, torch::Tensor co
 
     TORCH_CHECK(inputA.dim() == 2, "inputA must be 2D.");
     TORCH_CHECK(inputB.dim() == 2, "inputB must be 2D.");
-    TORCH_CHECK(inputA.size(1) == 5120, "inputA.size(1) must be 5120");
-    TORCH_CHECK(inputB.size(1) == 5120, "inputB.size(1) must be 5120");
+    TORCH_CHECK(inputA.sizes()[1] == 5120, "inputA.size(1) must be 5120");
+    TORCH_CHECK(inputB.sizes()[1] == 5120, "inputB.size(1) must be 5120");
     TORCH_CHECK(scaling_factor.dim() == 0, "scaling_factor must be a scalar tensor");
 
-    auto const num_tokens = inputA.size(0);
-    auto const hidden_in = inputA.size(1);
-    auto const hidden_out = inputB.size(0);
+    auto const num_tokens = inputA.sizes()[0];
+    auto const hidden_in = inputA.sizes()[1];
+    auto const hidden_out = inputB.sizes()[0];
 
     auto stream = at::cuda::getCurrentCUDAStream(inputA.get_device());
     auto output = torch::empty(
@@ -103,8 +103,8 @@ torch::Tensor llama4_fp8_bf16_gemm(torch::Tensor const& inputA, torch::Tensor co
     return output;
 }
 
-torch::Tensor llama4_fp8_fp8_gemm_swiglu(
-    torch::Tensor inputA, torch::Tensor inputB, torch::Tensor in_scale, torch::Tensor out_scale_inv)
+torch::Tensor llama4_fp8_fp8_gemm_swiglu(torch::Tensor const& inputA, torch::Tensor const& inputB,
+    torch::Tensor const& in_scale, torch::Tensor const& out_scale_inv)
 {
     CHECK_INPUT(inputA, c10::ScalarType::Float8_e4m3fn);
     CHECK_INPUT(inputB, c10::ScalarType::Float8_e4m3fn);
@@ -113,15 +113,15 @@ torch::Tensor llama4_fp8_fp8_gemm_swiglu(
 
     TORCH_CHECK(inputA.dim() == 2, "inputA must be 2D.");
     TORCH_CHECK(inputB.dim() == 2, "inputB must be 2D.");
-    TORCH_CHECK(inputA.size(1) == 5120, "inputA.size(1) must be 5120");
-    TORCH_CHECK(inputB.size(1) == 5120, "inputB.size(0) must be 5120");
+    TORCH_CHECK(inputA.sizes()[1] == 5120, "inputA.size(1) must be 5120");
+    TORCH_CHECK(inputB.sizes()[0] == 5120, "inputB.size(0) must be 5120");
     TORCH_CHECK(in_scale.dim() == 0, "in_scale must be a scalar tensor");
     TORCH_CHECK(out_scale_inv.dim() == 0, "out_scale_inv must be a scalar tensor");
 
     auto stream = at::cuda::getCurrentCUDAStream(inputA.get_device());
-    auto const num_tokens = inputA.size(0);
-    auto const hidden_in = inputA.size(1);
-    auto const hidden_out = inputB.size(0) / 2;
+    auto const num_tokens = inputA.sizes()[0];
+    auto const hidden_in = inputA.sizes()[1];
+    auto const hidden_out = inputB.sizes()[0] / 2;
     auto output = torch::empty(
         {num_tokens, hidden_out}, torch::TensorOptions().dtype(c10::ScalarType::Float8_e4m3fn).device(inputA.device()));
 
@@ -134,7 +134,7 @@ torch::Tensor llama4_fp8_fp8_gemm_swiglu(
 
 torch::Tensor llama4_moe_tp8ep1_min_latency(torch::Tensor const& input, torch::Tensor const& router_logits,
     torch::Tensor const& fc1_expert_weights, torch::Tensor const& fc2_expert_weights,
-    torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales)
+    torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales)
 {
     CHECK_INPUT(input, c10::ScalarType::Float8_e4m3fn)
     CHECK_INPUT(router_logits, c10::ScalarType::BFloat16)
