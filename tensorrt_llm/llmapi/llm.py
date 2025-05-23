@@ -112,9 +112,6 @@ class LLM:
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
 
         try:
-            self.pytorch_backend_config = kwargs.pop('pytorch_backend_config',
-                                                     None)
-
             llm_args_cls = TorchLlmArgs if kwargs.get(
                 'backend', None) == 'pytorch' else TrtLlmArgs
 
