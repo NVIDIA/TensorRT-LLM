@@ -222,6 +222,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             **kwargs):
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
+        self.py_disagg_mm_params = kwargs.pop("disagg_mm_params", None)
+
         super().__init__(
             *args,
             client_id=client_id,
@@ -323,6 +325,7 @@ def executor_request_to_llm_request(
     stop_words_list = convert_wordlist(
         executor_request.stop_words) if executor_request.stop_words else None
 
+    disagg_mm_params = getattr(executor_request, 'disagg_mm_params', None)
     llm_request = LlmRequest(
         request_id=req_id,
         max_new_tokens=executor_request.max_tokens,
@@ -375,6 +378,7 @@ def executor_request_to_llm_request(
         if executor_request.client_id is not None else req_id,
         priority=0.5,
         llm_request_type=llm_request_type,
-        context_phase_params=executor_request.context_phase_params)
+        context_phase_params=executor_request.context_phase_params,
+        disagg_mm_params=disagg_mm_params)
 
     return llm_request

@@ -19,6 +19,7 @@ from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             print_colored, print_colored_debug)
 from .executor import GenerationExecutor
+from .multimodal import MultimodalResult
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
@@ -385,6 +386,27 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         # Process the errors in-case error during shutting down the threads
         self._handle_background_error()
+
+    def submit_mm(self, request):
+        """Submit a multimodal request for processing.
+
+        Args:
+            request: The multimodal request containing items to process
+
+        Returns:
+            MultimodalResponse: The response object that will be populated with results
+        """
+        self._start_dispatch_threads()
+        request.set_id(self._get_next_client_id())
+        result = MultimodalResult(
+            request,
+            background_error_handler=self._handle_background_error,
+            executor=self)
+        self._results[request.id] = result
+        self.request_queue.put(request)
+
+        self._handle_background_error()
+        return result
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """

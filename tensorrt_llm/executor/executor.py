@@ -20,6 +20,7 @@ from .._utils import mpi_world_size
 from ..bindings import executor as tllm
 from ..builder import Engine
 from ..disaggregated_params import DisaggregatedParams
+from ..multimodal_params import MultimodalParams
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
                                   need_spawn_mpi_workers)
@@ -120,7 +121,8 @@ class GenerationExecutor(ABC):
             mrope_config: Optional[dict] = None,
             kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
             disaggregated_params: Optional[DisaggregatedParams] = None,
-            postproc_params: Optional[PostprocParams] = None
+            postproc_params: Optional[PostprocParams] = None,
+            disagg_mm_params: Optional[MultimodalParams] = None,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -145,7 +147,16 @@ class GenerationExecutor(ABC):
                 multimodal_embedding=multimodal_embedding,
                 mrope_config=mrope_config,
                 kv_cache_retention_config=kv_cache_retention_config,
-                disaggregated_params=disaggregated_params))
+                disaggregated_params=disaggregated_params,
+                disagg_mm_params=disagg_mm_params))
+        return result
+
+    def generate_multimodal_async(
+            self,
+            mm_request,
+    ):
+        result = self.submit_mm(
+            mm_request)
         return result
 
     def generate(

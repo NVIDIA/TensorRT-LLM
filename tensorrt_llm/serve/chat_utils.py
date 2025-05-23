@@ -67,7 +67,7 @@ def _parse_chat_message_content_mm_part(
 
 
 def parse_chat_message_content_part(
-    part: ChatCompletionMessageParam, ) -> Optional[Any]:
+    part: ChatCompletionMessageParam, skip_loading: bool = False) -> Optional[Any]:
     """Parse a single part of a chat message."""
     if isinstance(part, str):
         return part
@@ -93,8 +93,10 @@ def parse_chat_message_content_part(
             except Exception as e:
                 logger.error(f"Failed to load image: {str(e)}")
                 return None
+        async def noop_coroutine():
+            return str_content
 
-        return MultimodalData(modality="image", data=load_image_async())
+        return MultimodalData(modality="image", data=load_image_async() if not skip_loading else noop_coroutine())
 
     if part_type == "video_url":
         str_content = cast(str, content)
@@ -105,8 +107,10 @@ def parse_chat_message_content_part(
             except Exception as e:
                 logger.error(f"Failed to load video: {str(e)}")
                 return None
+        async def noop_coroutine():
+            return str_content
 
-        return MultimodalData(modality="video", data=load_video_async())
+        return MultimodalData(modality="video", data=load_video_async() if not skip_loading else noop_coroutine())
 
     raise NotImplementedError(f"Unknown part type: {part_type}")
 
@@ -114,12 +118,13 @@ def parse_chat_message_content_part(
 def parse_chat_message_content_parts(
     role: str,
     parts: Iterable[ChatCompletionMessageParam],
+    skip_loading: bool = False,
 ) -> ConversationMessage:
     """Parse multiple parts of a chat message."""
     text_parts = []
     media_parts = []
     for part in parts:
-        parse_res = parse_chat_message_content_part(part)
+        parse_res = parse_chat_message_content_part(part, skip_loading)
         if parse_res:
             if isinstance(parse_res, str):
                 text_parts.append(parse_res)
@@ -134,7 +139,7 @@ def parse_chat_message_content_parts(
 
 
 def parse_chat_message_content(
-    message: ChatCompletionMessageParam, ) -> ConversationMessage:
+    message: ChatCompletionMessageParam, skip_loading: bool = False) -> ConversationMessage:
     """Parse the content of a chat message."""
     role = message["role"]
     content = message.get("content")
@@ -149,6 +154,7 @@ def parse_chat_message_content(
     result = parse_chat_message_content_parts(
         role,
         content,
+        skip_loading,
     )
     return result
 
@@ -156,6 +162,7 @@ def parse_chat_message_content(
 def parse_chat_messages_coroutines(
     messages: List[ChatCompletionMessageParam],
     model_config: AutoConfig,
+    skip_loading: bool = False,
 ) -> Tuple[List[ConversationMessage], Optional[Coroutine[
         Any, Any, Optional[Dict[str, List[Any]]]]]]:
     """Parse multiple chat messages and return conversation and coroutine."""
@@ -163,7 +170,7 @@ def parse_chat_messages_coroutines(
     mm_data_tracker = MultimodalDataTracker(model_config.model_type)
 
     for msg in messages:
-        parsed_msg = parse_chat_message_content(msg)
+        parsed_msg = parse_chat_message_content(msg, skip_loading)
         conversation.append(parsed_msg)
         if parsed_msg["media"]:
             for mdata in parsed_msg["media"]:

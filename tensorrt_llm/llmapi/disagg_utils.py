@@ -1,7 +1,7 @@
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, List, Literal, Optional, Tuple
+from typing import Any, List, Literal, Optional, Tuple, Union
 
 import yaml
 from mpi4py.MPI import COMM_WORLD, Comm
@@ -29,6 +29,14 @@ class CtxGenServerConfig():
     instance_num_ranks: int = 1
     other_args: dict = field(default_factory=dict)
 
+@dataclass
+class MultimodalServerConfig():
+    type: Literal['mm']
+    hostname: Optional[str] = None
+    port: Optional[int] = None
+    instance_num_ranks: int = 1
+    other_args: dict = field(default_factory=dict)
+
 
 @dataclass
 class RouterConfig():
@@ -41,6 +49,14 @@ class RouterConfig():
 class ConditionalDisaggConfig():
     max_local_prefill_length: int = 0
 
+
+@dataclass
+class MultimodalDisaggServerConfig():
+    server_configs: List[Union[MultimodalServerConfig, CtxGenServerConfig]]
+    hostname: str = "localhost"
+    port: int = 8000
+    #mm_router_config: Optional[RouterConfig] = None
+    #gen_router_config: Optional[RouterConfig] = None
 
 @dataclass
 class DisaggServerConfig():
@@ -70,6 +86,45 @@ def parse_disagg_config_file(yaml_config_file: str):
 
         return disagg_server_config
 
+def parse_mm_disagg_config_file(yaml_config_file: str):
+
+    with open(yaml_config_file, 'r') as file:
+
+        config = yaml.safe_load(file)
+
+        disagg_server_config = extract_mm_disagg_cfg(**config)
+
+        return disagg_server_config
+
+def extract_mm_disagg_cfg(hostname: str = 'localhost',
+                       port: int = 8000,
+                       multimodal_servers: dict = dict(),
+                       generation_servers: dict = dict(),
+                       **kwargs: Any) -> MultimodalDisaggServerConfig:
+
+    # If parameters are specified outside the context_severs and generation_servers sections,
+    # make sure they match
+    # Also inherit the values from the top-level
+    for key, value in kwargs.items():
+        for server_type, servers in [("multimodal_servers", multimodal_servers),
+                                     ("generation_servers", generation_servers)
+                                     ]:
+            if key in servers:
+                if servers[key] != value:
+                    raise ValueError(
+                        f"Parameter {key} is specified both in the top-level and in the {server_type} section, but with different values"
+                    )
+            else:
+                # Inherit the value from the top-level
+                servers[key] = value
+
+    server_configs = extract_multimodal_cfgs(
+        type="mm", **multimodal_servers) + extract_ctx_gen_cfgs(
+            type="gen", **generation_servers)
+
+    # TODO: add router config later for multimodal server
+
+    return MultimodalDisaggServerConfig(server_configs, hostname, port)
 
 def extract_disagg_cfg(hostname: str = 'localhost',
                        port: int = 8000,
@@ -112,6 +167,47 @@ def extract_disagg_cfg(hostname: str = 'localhost',
 
     return config
 
+
+def extract_multimodal_cfgs(type: Literal['mm'],
+                         num_instances: int = 1,
+                         urls: Optional[List[str]] = None,
+                         **kwargs: Any) -> List[MultimodalServerConfig]:
+
+    hostnames = []
+    ports = []
+    if urls:
+        for url in urls:
+            hostname, port_str = url.split(':')
+            port = int(port_str)
+            hostnames.append(hostname)
+            ports.append(port)
+
+        if len(hostnames) != num_instances:
+            raise ValueError(
+                f"Number of hostnames ({len(hostnames)}) should be equal to the number of instances ({num_instances})"
+            )
+
+        if len(ports) != num_instances:
+            raise ValueError(
+                f"Number of ports ({len(ports)}) should be equal to the number of instances ({num_instances})"
+            )
+
+    else:
+        hostnames = [None] * num_instances
+        ports = [None] * num_instances
+
+    # Compute the number of ranks per instance for multimodal server
+    instance_num_ranks = kwargs.get('data_parallel_size', 1)
+
+    cfgs = []
+    for hostname, port in zip(hostnames, ports):
+        cfgs.append(
+            MultimodalServerConfig(type=type,
+                               hostname=hostname,
+                               port=port,
+                               instance_num_ranks=instance_num_ranks,
+                               other_args=kwargs))
+    return cfgs
 
 def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
                          num_instances: int = 1,

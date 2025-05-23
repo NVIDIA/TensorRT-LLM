@@ -15,7 +15,7 @@ from typing_extensions import Annotated, Required, TypedDict
 from tensorrt_llm.executor.serialization import register_approved_ipc_class
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
-
+from tensorrt_llm.multimodal_params import MultimodalParams
 
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does not allow extra fields & allow to initialize by both alias and field name
@@ -506,6 +506,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
     disaggregated_params: Optional[DisaggregatedParams] = Field(
         default=None,
         description=("Parameters for disaggregated serving"),
+    )
+
+    mm_params: Optional[MultimodalParams] = Field(
+        default=None,
+        description=("Parameters for multimodal serving"),
     )
 
     # doc: end-chat-completion-extra-params

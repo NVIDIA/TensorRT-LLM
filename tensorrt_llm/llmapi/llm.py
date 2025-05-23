@@ -39,7 +39,7 @@ from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
                     print_colored_debug)
-
+from ..multimodal_params import MultimodalParams
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
     """The output data of a completion request to the LLM.
@@ -291,6 +291,7 @@ class LLM:
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
         _postproc_params: Optional[PostprocParams] = None,
+        disagg_mm_params: Optional[MultimodalParams] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -343,10 +344,18 @@ class LLM:
             prompt_token_ids = inputs['prompt_token_ids']
             prompt = None
             query_token_ids = inputs.get("query_token_ids", None)
+            extra_processed_inputs = None
         elif "prompt" in inputs:
-            with nvtx_range_debug("input_processor"):
-                prompt_token_ids, extra_processed_inputs = self.input_processor(
-                    inputs, sampling_params)
+
+            if disagg_mm_params is not None:
+                with nvtx_range_debug("mm_postprocess_on_llm"):
+                    prompt_token_ids = self.input_processor.postprocess(inputs, sampling_params, disagg_mm_params)
+                extra_processed_inputs = None
+            else:
+                with nvtx_range_debug("input_processor"):
+                    prompt_token_ids, extra_processed_inputs = self.input_processor(
+                        inputs, sampling_params)
+
             prompt = inputs['prompt']
             if extra_processed_inputs is not None:
                 query_token_ids = extra_processed_inputs.get('query_token_ids')
@@ -365,6 +374,7 @@ class LLM:
         if _postproc_params:
             _postproc_params.postproc_args.num_prompt_tokens = len(
                 prompt_token_ids)
+
         result = self._executor.generate_async(
             prompt_token_ids,
             query_token_ids=query_token_ids,
@@ -377,6 +387,7 @@ class LLM:
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
             postproc_params=_postproc_params,
+            disagg_mm_params=disagg_mm_params,
         )
 
         return RequestOutput._from_generation_result(result, prompt,

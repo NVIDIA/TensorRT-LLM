@@ -44,6 +44,7 @@ from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
 from .auto_parallel import AutoParallelConfig, auto_parallel
 from .builder import BuildConfig, Builder, BuilderConfig, build
 from .disaggregated_params import DisaggregatedParams
+from .multimodal_params import MultimodalParams
 from .functional import Tensor, constant
 from .llmapi import LLM, LlmArgs
 from .logger import logger
@@ -101,6 +102,7 @@ __all__ = [
     'SamplingParams',
     'DisaggregatedParams',
     'KvCacheConfig',
+    'MultimodalParams',
     '__version__',
 ]
 

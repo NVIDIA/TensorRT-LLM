@@ -253,7 +253,8 @@ class OpenAIServer:
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
 
-            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config)
+            skip_loading = True if request.mm_params is not None else False
+            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config, skip_loading=True)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
@@ -291,7 +292,8 @@ class OpenAIServer:
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params if self.postproc_worker_enabled else None,
                 streaming=request.stream,
-                disaggregated_params=disaggregated_params
+                disaggregated_params=disaggregated_params,
+                disagg_mm_params=request.mm_params
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:

@@ -1,6 +1,6 @@
 import os
-from dataclasses import dataclass
-from typing import List, Optional, Union
+from dataclasses import dataclass, field
+from typing import List, Optional, Union, AsyncIterator, Any
 
 import numpy as np
 import torch
@@ -9,13 +9,13 @@ from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..sampling_params import SamplingParams
 from .postproc_worker import PostprocParams
+from ..multimodal_params import MultimodalParams
 
 __all__ = [
     "LoRARequest",
     "PromptAdapterRequest",
     "GenerationRequest",
 ]
-
 
 @dataclass(slots=True)
 class LoRARequest:
@@ -68,7 +68,6 @@ class PromptAdapterRequest:
     def local_path(self):
         return self.prompt_adapter_local_path
 
-
 class GenerationRequest:
 
     def __init__(
@@ -85,6 +84,7 @@ class GenerationRequest:
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
         postproc_params: Optional[PostprocParams] = None,
+        disagg_mm_params: Optional[MultimodalParams] = None,
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
@@ -108,6 +108,7 @@ class GenerationRequest:
         self.kv_cache_retention_config = kv_cache_retention_config
         self.id: Optional[int] = None
         self.disaggregated_params = disaggregated_params
+        self.disagg_mm_params = disagg_mm_params
 
     def set_id(self, id):
         assert self.id is None, f"Request ID is already set: {self.id}"

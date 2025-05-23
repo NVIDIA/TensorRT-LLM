@@ -41,6 +41,22 @@ def load_base64_image(parsed_url: str) -> Image.Image:
     image = _load_and_convert_image(BytesIO(content))
     return image
 
+def _load_and_convert_image(image):
+    image = Image.open(image)
+    image.load()
+    return image.convert("RGB")
+
+def load_base64_image(parsed_url: str) -> Image.Image:
+    data_spec, data = parsed_url.path.split(",", 1)
+    media_type, data_type = data_spec.split(";", 1)
+
+    if data_type != "base64":
+        msg = "Only base64 data URLs are supported for now."
+        raise NotImplementedError(msg)
+
+    content = base64.b64decode(data)
+    image = _load_and_convert_image(BytesIO(content))
+    return image
 
 def load_image(image: str,
                format: str = "pt",

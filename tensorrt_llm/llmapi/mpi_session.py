@@ -165,9 +165,7 @@ class MpiPoolSession(MpiSession):
 
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
-
-        self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
-                                        path=sys.path)
+        self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers, path=sys.path)
 
     def __del__(self):
         self.shutdown_abort()

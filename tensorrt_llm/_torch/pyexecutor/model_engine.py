@@ -39,7 +39,7 @@ from ..attention_backend.vanilla import VanillaAttentionMetadata
 from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
 from ..compilation.utils import set_enable_piecewise_cuda_graph_capture_flag
-from ..distributed import MPIDist
+from ..distributed import MPIDist, MMEmbeddingComm
 from ..distributed.communicator import init_pp_comm
 from ..expert_statistic import ExpertStatistic
 from ..metadata import KVCacheParams
@@ -58,6 +58,9 @@ from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManager)
 from .scheduler import ScheduledRequests
+from tensorrt_llm._torch.multimodal import SharedTensorContainer
+from tensorrt_llm._torch.pyexecutor.multimodal.shared_tensor_handle_pool import get_tensor_pool
+import base64
 
 MAX_UINT64 = (1 << 64) - 1
 
@@ -314,6 +317,7 @@ class PyTorchModelEngine(ModelEngine):
             init_pp_comm(mapping)
         self.dist = dist
         ExpertStatistic.create(self.dist.rank)
+        self.mm_emb_dist = None
         self.pytorch_backend_config = pytorch_backend_config
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
@@ -799,6 +803,11 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager=spec_resource_manager)
         return self.spec_metadata
 
+    def _setup_mm_emb_comm(self):
+        if self.mm_emb_dist is None:
+            self.mm_emb_dist = MMEmbeddingComm(self.mapping)
+        return self.mm_emb_dist
+
     def _get_padded_batch(self, scheduled_requests: ScheduledRequests,
                           kv_cache_manager) -> int:
         can_run_cuda_graph = scheduled_requests.can_run_cuda_graph
@@ -1131,6 +1140,27 @@ class PyTorchModelEngine(ModelEngine):
                 multi_modal_data.append(multimodal_embedding)
 
             mrope_rotary_cos_sin = request.mrope_rotary_cos_sin
+            if request.py_disagg_mm_params is not None and hasattr(request.py_disagg_mm_params, 'embeddings'):
+                assert multimodal_embedding is None, "multimodal_embedding and disagg_mm_params are not supported at the same time"
+                assert self.mm_emb_dist is not None, "mm_emb_dist is not initialized"
+                mm_tensor_handle = request.py_disagg_mm_params.embeddings[0]
+                tensor_shape = mm_tensor_handle['tensor_size']
+                tensor_dtype = mm_tensor_handle['dtype']
+                multimodal_embedding = torch.empty(tensor_shape, dtype=eval(tensor_dtype), device='cuda')
+                if self.mapping.rank == 0:
+                    # Leading rank will rebuild the tensor in local device
+                    shared_tensor = SharedTensorContainer.from_dict(mm_tensor_handle).to_local_view()
+                    # TODO: Add to tensor pool to prevent immediate cuda close ipc handle call, which will introduces cpu overhead
+                    # TODO: Potential issue: in SharedTensorPool, we cannot spawn the new background process to handle the ipc close call
+                    tensor_pool = get_tensor_pool(async_ipc_release=False)
+                    tensor_pool.add_handle(str(request.py_request_id), shared_tensor)
+                    multimodal_embedding.copy_(shared_tensor)
+                    self.mm_emb_dist.broadcast(multimodal_embedding)
+                else:
+                    # Other ranks will broadcast the tensor from leading rank
+                    self.mm_emb_dist.broadcast(multimodal_embedding)
+                multi_modal_data.append(multimodal_embedding)
+
             if mrope_rotary_cos_sin is not None:
                 mrope_config['mrope_rotary_cos_sin'].append(
                     mrope_rotary_cos_sin)
