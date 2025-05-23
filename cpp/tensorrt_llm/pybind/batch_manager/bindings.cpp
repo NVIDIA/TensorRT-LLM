@@ -255,6 +255,7 @@ void initBindings(pybind11::module_& m)
         .def("get_context_remaining_length", py::overload_cast<>(&GenLlmReq::getContextRemainingLength, py::const_))
         .def("set_finished_reason", &GenLlmReq::setFinishedReason, py::arg("finish_reason"), py::arg("beam"))
         .def_property_readonly("is_finished", &GenLlmReq::isFinished)
+        .def_property_readonly("is_finished_due_to_length", &GenLlmReq::isFinishedDueToLength)
         .def_property(
             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
         .def_property_readonly("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)

@@ -252,6 +252,10 @@ class GenerationResultBase:
                 output.finish_reason = 'length'
             elif finish_reasons[src_idx] == tllm.FinishReason.TIMED_OUT:
                 output.finish_reason = 'timeout'
+            # For disaggregated serving, finish reason might be NOT_FINISHED which is ok
+            elif finish_reasons[
+                    src_idx] == tllm.FinishReason.NOT_FINISHED and self.disaggregated_params is not None and self.disaggregated_params.request_type == "context_only":
+                output.finish_reason = 'not_finished'
             elif finish_reasons[src_idx] == tllm.FinishReason.CANCELLED:
                 pass
             else:
