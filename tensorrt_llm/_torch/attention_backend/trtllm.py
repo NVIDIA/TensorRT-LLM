@@ -630,15 +630,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.num_ctx_cached_tokens = cached_token_lens[:self.
                                                            num_contexts].sum(
                                                            ).item()
-            self.max_ctx_cached_token_len = cached_token_lens[:self.
-                                                              num_contexts].max(
-                                                              ).item()
             self.max_ctx_kv_len = kv_lens[:self.num_contexts].max().item()
             self.max_ctx_seq_len = self.seq_lens[:self.num_contexts].max().item(
             )
         else:
             self.num_ctx_cached_tokens = 0
-            self.max_ctx_cached_token_len = 0
             self.max_ctx_kv_len = 0
             self.max_ctx_seq_len = 0
         torch.cumsum(cached_token_lens[:self.num_contexts],

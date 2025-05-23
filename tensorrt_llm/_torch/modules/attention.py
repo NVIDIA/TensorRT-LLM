@@ -924,12 +924,6 @@ class MLA(nn.Module):
             mla_context_kv_cache_block_offsets,
         )
 
-        full_compressed_kv = None
-        full_k_pe = None
-        full_k_nope = None
-        full_v = None
-        full_kv = None
-        paged_full_kv = None
         return attn_output
 
     def forward_context(

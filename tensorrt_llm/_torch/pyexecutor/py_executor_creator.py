@@ -156,8 +156,8 @@ def create_py_executor(executor_config: ExecutorConfig,
 
         kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
         if executor_config.kv_cache_config.enable_block_reuse and not (
-                kv_cache_quant_algo == QuantAlgo.NO_QUANT
-                or kv_cache_quant_algo == QuantAlgo.FP8):
+                kv_cache_quant_algo is None or kv_cache_quant_algo
+                == QuantAlgo.NO_QUANT or kv_cache_quant_algo == QuantAlgo.FP8):
             logger.warning(
                 f"KV cache reuse for MLA can only be enabled without KV cache quantization or with FP8 quantization, "
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
