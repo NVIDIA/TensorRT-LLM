@@ -1,9 +1,11 @@
 import tempfile
 
+import pydantic_core
 import pytest
 import yaml
 
 import tensorrt_llm.bindings.executor as tle
+from tensorrt_llm._torch.llm import LLM as TorchLLM
 from tensorrt_llm.llmapi.llm_args import *
 
 from .test_llm import llama_model_path
@@ -216,3 +218,44 @@ class TestTorchLlmArgsCudaGraphSettings:
         assert args.cuda_graph_batch_sizes == TorchLlmArgs._generate_cuda_graph_batch_sizes(
             128, True)
         assert args.cuda_graph_max_batch_size == 128
+
+
+class TestTrtLlmArgs:
+
+    def test_dynamic_setattr(self):
+        with pytest.raises(pydantic_core._pydantic_core.ValidationError):
+            args = LlmArgs(model=llama_model_path, invalid_arg=1)
+
+        with pytest.raises(ValueError):
+            args = LlmArgs(model=llama_model_path)
+            args.invalid_arg = 1
+
+
+class TestTorchLlmArgs:
+
+    def test_runtime_sizes(self):
+        llm = TorchLLM(
+            llama_model_path,
+            max_beam_width=4,
+            max_num_tokens=256,
+            max_seq_len=128,
+            max_batch_size=8,
+        )
+
+        assert llm.args.max_beam_width == 4
+        assert llm.args.max_num_tokens == 256
+        assert llm.args.max_seq_len == 128
+        assert llm.args.max_batch_size == 8
+
+        assert llm._executor_config.max_beam_width == 4
+        assert llm._executor_config.max_num_tokens == 256
+        assert llm._executor_config.max_seq_len == 128
+        assert llm._executor_config.max_batch_size == 8
+
+    def test_dynamic_setattr(self):
+        with pytest.raises(pydantic_core._pydantic_core.ValidationError):
+            args = TorchLlmArgs(model=llama_model_path, invalid_arg=1)
+
+        with pytest.raises(ValueError):
+            args = TorchLlmArgs(model=llama_model_path)
+            args.invalid_arg = 1

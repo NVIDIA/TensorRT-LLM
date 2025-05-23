@@ -752,7 +752,7 @@ class BaseLlmArgs(BaseModel):
     """
     model_config = {
         "arbitrary_types_allowed": True,
-        "extra": "allow",
+        "extra": "forbid",
     }
 
     # Explicit arguments
@@ -930,18 +930,17 @@ class BaseLlmArgs(BaseModel):
     # private fields those are unstable and just for internal use
     num_postprocess_workers: int = Field(
         default=0,
-        description="The number of postprocess worker processes.",
-        alias="_num_postprocess_workers")
+        description=
+        "The number of processes for generated token postprocessing, such as detokenization and so on."
+    )
 
     postprocess_tokenizer_dir: Optional[str] = Field(
         default=None,
-        description="The postprocess tokenizer directory.",
-        alias="_postprocess_tokenizer_dir")
+        description="The path to the tokenizer directory for postprocessing.")
 
     reasoning_parser: Optional[str] = Field(
         default=None,
-        description="The parser to separate reasoning content from output.",
-        alias="_reasoning_parser")
+        description="The parser to separate reasoning content from output.")
 
     # TODO[Superjomn]: To deprecate this config.
     decoding_config: Optional[object] = Field(
@@ -957,6 +956,28 @@ class BaseLlmArgs(BaseModel):
         json_schema_extra={"type": "Optional[MpiSession]"},
         exclude=True,  # exclude from serialization
         alias="_mpi_session")
+
+    _parallel_config: Optional[object] = PrivateAttr(default=None)
+    _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
+    _speculative_model: Optional[str] = PrivateAttr(default=None)
+    _speculative_model_format: Optional[_ModelFormatKind] = PrivateAttr(
+        default=None)
+
+    @property
+    def parallel_config(self) -> _ParallelConfig:
+        return self._parallel_config
+
+    @property
+    def model_format(self) -> _ModelFormatKind:
+        return self._model_format
+
+    @property
+    def speculative_model(self) -> Optional[_ModelFormatKind]:
+        return self._speculative_model
+
+    @property
+    def speculative_model_format(self) -> _ModelFormatKind:
+        return self._speculative_model_format
 
     @print_traceback_on_error
     def model_post_init(self, __context: Any):
@@ -990,7 +1011,7 @@ class BaseLlmArgs(BaseModel):
         if self.moe_expert_parallel_size is None:
             self.moe_expert_parallel_size = -1
 
-        self.parallel_config = _ParallelConfig(
+        self._parallel_config = _ParallelConfig(
             tp_size=self.tensor_parallel_size,
             pp_size=self.pipeline_parallel_size,
             cp_size=self.context_parallel_size,
@@ -1012,6 +1033,15 @@ class BaseLlmArgs(BaseModel):
             tensorrt_llm.llmapi.llm_utils.BaseLlmArgs: The `BaseLlmArgs` instance.
         """
         kwargs = BaseLlmArgs._maybe_update_config_for_consistency(dict(kwargs))
+        # build_config always prioritize over flattened arguments in kwargs
+        if build_config := kwargs.pop("build_config", None):
+            if kwargs.get("backend") == "pytorch":
+                logger.warning("build_config is deprecated from PyT path.")
+            kwargs["max_batch_size"] = build_config.max_batch_size
+            kwargs["max_num_tokens"] = build_config.max_num_tokens
+            kwargs["max_seq_len"] = build_config.max_seq_len
+            kwargs["max_beam_width"] = build_config.max_beam_width
+
         ret = cls(**kwargs)
         ret._setup()
         return ret
@@ -1080,18 +1110,18 @@ class BaseLlmArgs(BaseModel):
                     f"Invalid build_cache_config: {self.enable_build_cache}")
         model_obj = _ModelWrapper(self.model)
 
-        self.speculative_model = getattr(self.speculative_config,
-                                         "speculative_model", None)
+        self._speculative_model = getattr(self.speculative_config,
+                                          "speculative_model", None)
         speculative_model_obj = _ModelWrapper(
-            self.speculative_model
-        ) if self.speculative_model is not None else None
+            self._speculative_model
+        ) if self._speculative_model is not None else None
         if model_obj.is_local_model and self.backend not in [
                 'pytorch', '_autodeploy'
         ]:
             # Load parallel_config from the engine.
-            self.model_format = get_model_format(self.model)
+            self._model_format = get_model_format(self.model)
 
-            if self.model_format is _ModelFormatKind.TLLM_ENGINE:
+            if self._model_format is _ModelFormatKind.TLLM_ENGINE:
                 if self.build_config is not None:
                     logger.warning(
                         "The build_config is ignored for model format of TLLM_ENGINE."
@@ -1103,13 +1133,13 @@ class BaseLlmArgs(BaseModel):
                         runtime_defaults)
 
             # Load parallel_config from the checkpoint.
-            elif self.model_format is _ModelFormatKind.TLLM_CKPT:
+            elif self._model_format is _ModelFormatKind.TLLM_CKPT:
                 self._load_config_from_ckpt(model_obj.model_dir)
         else:
-            self.model_format = _ModelFormatKind.HF
+            self._model_format = _ModelFormatKind.HF
 
-        if self.speculative_model and speculative_model_obj.is_local_model:
-            self.speculative_model_format = _ModelFormatKind.HF
+        if self._speculative_model and speculative_model_obj.is_local_model:
+            self._speculative_model_format = _ModelFormatKind.HF
 
         self.quant_config = self.quant_config or QuantConfig()
 
@@ -1279,7 +1309,7 @@ class BaseLlmArgs(BaseModel):
 
     @property
     def _build_config_mutable(self) -> bool:
-        return self.model_format is not _ModelFormatKind.TLLM_ENGINE
+        return self._model_format is not _ModelFormatKind.TLLM_ENGINE
 
     def _update_plugin_config(self, key: str, value: Any):
         setattr(self.build_config.plugin_config, key, value)
@@ -1484,7 +1514,7 @@ class TorchLlmArgs(BaseLlmArgs):
 
     # Just a dummy BuildConfig to allow code reuse with the TrtLlmArgs
     build_config: Optional[object] = Field(
-        default=None,
+        default_factory=lambda: BuildConfig(),
         description="Build config.",
         exclude_from_json=True,
         json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
@@ -1616,7 +1646,7 @@ class TorchLlmArgs(BaseLlmArgs):
         from .._torch.model_config import MoeLoadBalancerConfig
 
         super().model_post_init(__context)
-        self.model_format = _ModelFormatKind.HF
+        self._model_format = _ModelFormatKind.HF
 
         if isinstance(self.moe_load_balancer, str):
             if not os.path.exists(self.moe_load_balancer):
