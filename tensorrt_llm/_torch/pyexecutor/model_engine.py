@@ -27,7 +27,6 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, LoraModelConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
-from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ..attention_backend.interface import (AttentionMetadata,
                                            AttentionRuntimeFeatures)
@@ -38,16 +37,14 @@ from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
 from ..compilation.utils import set_enable_piecewise_cuda_graph_capture_flag
 from ..distributed import MPIDist
-from ..distributed.communicator import init_pp_comm
 from ..metadata import KVCacheParams
 from ..model_config import ModelConfig, MoeLoadBalancerConfig
 from ..models import AutoModelForCausalLM
-from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
-                                     timing)
+from ..models.modeling_utils import MetaInitMode, timing
 from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
 from ..utils import (get_model_extra_attrs, set_torch_compiling,
                      with_model_extra_attrs)
-from .config import LoadFormat, PyTorchConfig
+from .config import LoadFormat
 from .config_utils import is_mla
 from .cuda_graph_runner import DecodingCUDAGraphRunner
 from .guided_decoder import GuidedDecoder
@@ -90,29 +87,27 @@ _VALID_KV_CACHE_DTYPES = ("fp8", "auto")
 
 
 def validate_and_set_kv_cache_quant(model_config: ModelConfig,
-                                    pyt_kv_cache_dtype: str) -> QuantAlgo:
+                                    kv_cache_dtype: str) -> QuantAlgo:
     logger.info(
-        f'Validating KV Cache config against kv_cache_dtype="{pyt_kv_cache_dtype}"'
-    )
+        f'Validating KV Cache config against kv_cache_dtype="{kv_cache_dtype}"')
     # Quantization from hf_quant_config.json
     kv_cache_quant = model_config.quant_config.kv_cache_quant_algo
     # PyTorch configuration quantization
-    valid_pyt_quant = bool(pyt_kv_cache_dtype in _VALID_KV_CACHE_DTYPES)
-    mapped_pyt_quant = _KV_CACHE_MAP.get(pyt_kv_cache_dtype, None)
+    valid_pyt_quant = bool(kv_cache_dtype in _VALID_KV_CACHE_DTYPES)
+    mapped_pyt_quant = _KV_CACHE_MAP.get(kv_cache_dtype, None)
 
     # If we're letting the checkpoint dictate the quant with auto, simply
     # return and do not modify the checkpoint.
-    if pyt_kv_cache_dtype == "auto":
-        logger.info(
-            f'KV cache quantization set to "{pyt_kv_cache_dtype}". Using '
-            "checkpoint KV quantization.")
+    if kv_cache_dtype == "auto":
+        logger.info(f'KV cache quantization set to "{kv_cache_dtype}". Using '
+                    "checkpoint KV quantization.")
         return
 
     # If we have an invalid quantization, simply raise an exception.
     if not valid_pyt_quant:
         raise ValueError(
             "Overriding KV cache quantization with an invalid type "
-            f'"PyTorchConfig.kv_cache_dtype="{pyt_kv_cache_dtype}" '
+            f'"kv_cache_dtype="{kv_cache_dtype}" '
             f'Accepted types are "{_VALID_KV_CACHE_DTYPES}".')
 
     # If we get to this point we have a valid quantization setting, but if
@@ -120,8 +115,8 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     if kv_cache_quant is not None and mapped_pyt_quant != kv_cache_quant:
         raise RuntimeError(
             "Attempting to override KV cache quantization "
-            f'"{kv_cache_quant}" with PyTorchConfig.kv_cache_dtype='
-            f'"{pyt_kv_cache_dtype}". You cannot override a checkpoint with a '
+            f'"{kv_cache_quant}" with kv_cache_dtype='
+            f'"{kv_cache_dtype}". You cannot override a checkpoint with a '
             "pre-quantized KV cache that doesn't match.")
 
     # We have an open ended KV cache in the checkpoint
@@ -198,79 +193,35 @@ def load_weights(checkpoint_dir: str, mapping: Mapping):
 
 def initialize_dummy_weights(
     model: torch.nn.Module,
-    low: float = -1e-3,
     high: float = 1e-3,
     seed: int = 0,
 ) -> None:
     """
-    This is similar to this function in SGLang with a few changes:
-    https://github.com/sgl-project/sglang/blob/e074e76b31d4fff13e87a455dbc3acdaa92c537a/python/sglang/srt/model_loader/weight_utils.py#L577
-
-    This method is used to initialize weights with dummy values for testing
-    models without checkpoints. Unquantized (FP16/BF16/etc) values are generated
-    from a uniform distribution over the interval (low, high).
-
-    For some quantized types (FP8/NVFP4), torch has no built-in way to generate random values.
-    We simply generate values uniformly across an interval that has been empirically verified
-    to not generate NaNs/inf for these.
+    Initialize all weights randomly.
     """
 
     def _get_random_min_max(dtype: torch.dtype) -> Tuple[int, int]:
         # These values are not necessarily the largest possible min/max,
         # they need to be small enough to avoid NaNs.
-        if dtype in (torch.float8_e4m3fn, torch.int8):
-            return (-3.0, 3.0)
-
-        elif dtype == float4_e2m1x2:
-            # These correspond to bits of 2 packed FP4 values.
-            # Because we only go up to 64, the high 4 bits will
-            # always be 0. But this is fine - we just need values
-            # that won't generate NaNs.
-            return (0, 64)
-
+        if dtype == torch.float32:
+            return -high, high
+        elif dtype == torch.float16:
+            return -high, high
+        elif dtype == torch.bfloat16:
+            return -high, high
         else:
-            raise NotImplementedError(f"Unknown quantized type: {dtype}.")
+            raise ValueError(f"Unsupported dtype: {dtype}")
 
-    for param in model.state_dict().values():
-        generator = torch.Generator(device=param.data.device)
-        generator.manual_seed(seed)
-        dtype = param.data.dtype
-
-        if param.data.element_size() < 2:
-            # We need to do a cast/round since torch doesn't have uniform_
-            # support for these dtypes.
-            tmp_param = torch.empty(param.data.shape,
-                                    dtype=torch.float16,
-                                    device=param.data.device)
-
-            quant_min, quant_max = _get_random_min_max(dtype)
-            tmp_param = tmp_param.uniform_(quant_min,
-                                           quant_max,
-                                           generator=generator)
-
-            param.data.copy_(tmp_param.to(dtype))
-
-        # Note: no need to to mess with int32 params, these are probably
-        # constants and not weights.
-        elif torch.is_floating_point(param):
-            param.uniform_(low, high, generator=generator)
-
-
-KV_CACHE_MANAGER_KEY = 'kv_cache_manager'
-DRAFT_KV_CACHE_MANAGER_KEY = 'draft_kv_cache_manager'
+    torch.manual_seed(seed)
+    for param in model.parameters():
+        if param.requires_grad:
+            min_val, max_val = _get_random_min_max(param.dtype)
+            param.data.uniform_(min_val, max_val)
 
 
 def get_rank_model_storage(model):
-    total_bytes = 0
-    for _, param in model.named_parameters():
-        if param.device.type == 'cuda' and param.device.index == torch.cuda.current_device(
-        ):
-            total_bytes += param.element_size() * param.nelement()
-    for _, buf in model.named_buffers():
-        if buf.device.type == 'cuda' and buf.device.index == torch.cuda.current_device(
-        ):
-            total_bytes += buf.element_size() * buf.nelement()
-    return total_bytes
+    """Get the storage of the model on the current rank."""
+    return sum(p.numel() * p.element_size() for p in model.parameters())
 
 
 class PyTorchModelEngine(ModelEngine):
@@ -278,7 +229,8 @@ class PyTorchModelEngine(ModelEngine):
     def __init__(
         self,
         model_path: str,
-        pytorch_backend_config: PyTorchConfig,
+        pytorch_backend_config:
+        Any,  # Changed from PyTorchConfig to Any since we're using flattened fields
         batch_size: int = 8,
         max_num_tokens: int = 8192,
         max_seq_len: Optional[int] = None,
@@ -289,24 +241,32 @@ class PyTorchModelEngine(ModelEngine):
         guided_decoding_config: Optional[GuidedDecodingConfig] = None,
         lora_config: Optional[LoraConfig] = None,
     ):
-        self.ub_buffers = None
+        self.model_path = model_path
+        self.pytorch_backend_config = pytorch_backend_config
         self.batch_size = batch_size
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
-
         self.mapping = mapping
-        if mapping.has_pp():
-            init_pp_comm(mapping)
+        self.attn_runtime_features = attn_runtime_features
         self.dist = dist
-        self.pytorch_backend_config = pytorch_backend_config
         self.spec_config = spec_config
-        self.is_spec_decode = spec_config is not None
-        # We keep a reference to the last used spec metadata to
-        # accommodate certain target/draft model use cases. See
-        # py_executor.py for how this is used.
-        self.last_spec_metadata = None
+        self.guided_decoding_config = guided_decoding_config
+        self.lora_config = lora_config
 
-        self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
+        self.model = None
+        self.attn_metadata = None
+        self.spec_metadata = None
+        self.guided_decoder = None
+        self.layerwise_nvtx_marker = None
+        self.cuda_graph_runners = {}
+        self.userbuffers = None
+
+        self._load_model(
+            model_path,
+            self.pytorch_backend_config.load_format,
+            max_num_tokens,
+            self.pytorch_backend_config.moe_max_num_tokens,
+            lora_config,
         )
 
         attn_backend = pytorch_backend_config.attn_backend
@@ -342,111 +302,125 @@ class PyTorchModelEngine(ModelEngine):
         self.dtype = self.model.config.torch_dtype
         self._init_model_capacity()
 
-        self.guided_decoder: Optional[GuidedDecoder] = None
-        if self.mapping.is_last_pp_rank(
-        ) and guided_decoding_config is not None:
-            self.guided_decoder = GuidedDecoder(guided_decoding_config,
-                                                self.batch_size,
-                                                self.model.vocab_size_padded)
+        if self.pytorch_backend_config.enable_layerwise_nvtx_marker:
+            self.layerwise_nvtx_marker = LayerwiseNvtxMarker()
 
-        self._torch_compile_backend = None
+        if self.pytorch_backend_config.torch_compile_enabled:
+            if self.pytorch_backend_config.torch_compile_piecewise_cuda_graph:
+                set_enable_piecewise_cuda_graph_capture_flag(True)
+            set_torch_compiling(True)
+            self.model = torch.compile(
+                self.model,
+                fullgraph=self.pytorch_backend_config.torch_compile_fullgraph,
+                mode="reduce-overhead",
+                enable_userbuffers=self.pytorch_backend_config.
+                torch_compile_enable_userbuffers,
+            )
+            if self.pytorch_backend_config.autotuner_enabled:
+                self.model = autotune(self.model)
 
-        try:
-            if pytorch_backend_config.torch_compile_enabled:
-                set_torch_compiling(True)
-                use_ub = pytorch_backend_config.torch_compile_enable_userbuffers and self._init_userbuffers(
-                    self.model.config.hidden_size)
-                self._torch_compile_backend = Backend(
-                    pytorch_backend_config.torch_compile_inductor_enabled,
-                    enable_userbuffers=use_ub,
-                    enable_piecewise_cuda_graph=pytorch_backend_config.
-                    torch_compile_piecewise_cuda_graph,
-                    cuda_graph_batch_sizes=pytorch_backend_config.
-                    cuda_graph_batch_sizes)
-                if isinstance(self.model, DecoderModelForCausalLM):
-                    self.model.model = torch.compile(
-                        self.model.model,
-                        backend=self._torch_compile_backend,
-                        fullgraph=pytorch_backend_config.torch_compile_fullgraph
-                    )
-                else:
-                    self.model = torch.compile(
-                        self.model,
-                        backend=self._torch_compile_backend,
-                        fullgraph=pytorch_backend_config.torch_compile_fullgraph
-                    )
-                torch._dynamo.config.cache_size_limit = 16
-            else:
-                set_torch_compiling(False)
-        except Exception as e:
-            import traceback
-            traceback.print_exception(Exception, e, e.__traceback__)
-            raise e
-        self._torch_compile_enabled = pytorch_backend_config.torch_compile_enabled
-        self._torch_compile_piecewise_cuda_graph = pytorch_backend_config.torch_compile_piecewise_cuda_graph
+        if self.pytorch_backend_config.use_cuda_graph:
+            self._init_cuda_graphs()
 
-        self.attn_backend = get_attention_backend(attn_backend)
+        if self.pytorch_backend_config.enable_trtllm_sampler:
+            self.model.enable_trtllm_sampler = True
 
-        # This field is initialized lazily on the first forward pass.
-        # This is convenient because:
-        # 1) The attention metadata depends on the KV cache manager.
-        # 2) The KV cache manager depends on the model configuration.
-        # 3) The model configuration is not loaded until the model engine
-        # is initialized.
-        #
-        # NOTE: This can simplified by decoupling the model config loading and
-        # the model engine.
-        self.attn_metadata = None
-        self.iter_states = {}
-        self._cuda_graphs = {}
-        self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
-        self._run_cuda_graphs = pytorch_backend_config.use_cuda_graph
+        if self.pytorch_backend_config.mixed_sampler:
+            self.model.mixed_sampler = True
 
-        self._cuda_graph_padding_enabled = pytorch_backend_config.cuda_graph_padding_enabled
-        self._cuda_graph_batch_sizes = [
-            bs for bs in pytorch_backend_config.cuda_graph_batch_sizes
-            if bs <= self.max_num_tokens and bs <= self.batch_size
-        ]
-        self._max_cuda_graph_batch_size = self._cuda_graph_batch_sizes[-1]
+        if self.pytorch_backend_config.use_kv_cache:
+            validate_and_set_kv_cache_quant(
+                self.model.model_config,
+                self.pytorch_backend_config.kv_cache_dtype,
+            )
 
-        self.previous_batch_indices_cuda = torch.empty((self.max_num_tokens, ),
-                                                       dtype=torch.int,
-                                                       device='cuda')
-        self.input_ids_cuda = torch.empty((self.max_num_tokens, ),
-                                          dtype=torch.int,
-                                          device='cuda')
-        self.position_ids_cuda = torch.empty((self.max_num_tokens, ),
-                                             dtype=torch.int,
-                                             device='cuda')
-        if self.is_spec_decode:
-            self.spec_metadata = None
-            self.spec_config.update_from_model_config(self.model.config)
-            max_num_draft_tokens = self.spec_config.max_draft_tokens * batch_size
-            self.draft_tokens_cuda = torch.empty((max_num_draft_tokens, ),
-                                                 dtype=torch.int,
-                                                 device='cuda')
-            self.gather_ids_cuda = torch.empty((self.max_num_tokens, ),
-                                               dtype=torch.int,
-                                               device='cuda')
-            self.previous_pos_indices_cuda = torch.empty(
-                (self.max_num_tokens, ), dtype=torch.int, device='cuda')
-            self.previous_pos_id_offsets_cuda = torch.zeros(
-                (self.max_num_tokens, ), dtype=torch.int, device='cuda')
-            self.previous_kv_lens_offsets_cuda = torch.zeros((batch_size, ),
-                                                             dtype=torch.int,
-                                                             device='cuda')
-            self.is_mtp = self.spec_config.spec_dec_mode.is_mtp()
-            self.max_draft_len = spec_config.max_draft_tokens
-        else:
-            self.is_mtp = False
-            self.max_draft_len = 0
-        self.iter_counter = 0
+        if self.guided_decoding_config is not None:
+            self.guided_decoder = GuidedDecoder(
+                self.guided_decoding_config,
+                self.model.model_config,
+                self.mapping,
+            )
 
-        # We look up this key in resource_manager during forward to find the
-        # kv cache manager. Can be changed to support multiple model engines
-        # with different KV cache managers.
-        self.kv_cache_manager_key = KV_CACHE_MANAGER_KEY
-        self.lora_model_config: Optional[LoraModelConfig] = None
+        if self.spec_config is not None:
+            self.spec_metadata = get_spec_metadata(
+                self.spec_config,
+                self.model.model_config,
+                self.batch_size * 2,
+            )
+
+        self.attn_backend = get_attention_backend(
+            self.pytorch_backend_config.attn_backend,
+            self.model.model_config,
+            self.attn_runtime_features,
+        )
+
+        if self.attn_backend is not None:
+            self.attn_metadata = self.attn_backend.create_metadata(
+                self.batch_size * 2,
+                self.max_seq_len,
+                self.model.model_config,
+                self.mapping,
+            )
+
+        if self.pytorch_backend_config.enable_layerwise_nvtx_marker:
+            self.layerwise_nvtx_marker = LayerwiseNvtxMarker()
+
+        if self.pytorch_backend_config.torch_compile_enabled:
+            if self.pytorch_backend_config.torch_compile_piecewise_cuda_graph:
+                set_enable_piecewise_cuda_graph_capture_flag(True)
+            set_torch_compiling(True)
+            self.model = torch.compile(
+                self.model,
+                fullgraph=self.pytorch_backend_config.torch_compile_fullgraph,
+                mode="reduce-overhead",
+                enable_userbuffers=self.pytorch_backend_config.
+                torch_compile_enable_userbuffers,
+            )
+            if self.pytorch_backend_config.autotuner_enabled:
+                self.model = autotune(self.model)
+
+        if self.pytorch_backend_config.use_cuda_graph:
+            self._init_cuda_graphs()
+
+        if self.pytorch_backend_config.enable_trtllm_sampler:
+            self.model.enable_trtllm_sampler = True
+
+        if self.pytorch_backend_config.mixed_sampler:
+            self.model.mixed_sampler = True
+
+        if self.pytorch_backend_config.use_kv_cache:
+            validate_and_set_kv_cache_quant(
+                self.model.model_config,
+                self.pytorch_backend_config.kv_cache_dtype,
+            )
+
+        if self.guided_decoding_config is not None:
+            self.guided_decoder = GuidedDecoder(
+                self.guided_decoding_config,
+                self.model.model_config,
+                self.mapping,
+            )
+
+        if self.spec_config is not None:
+            self.spec_metadata = get_spec_metadata(
+                self.spec_config,
+                self.model.model_config,
+                self.batch_size * 2,
+            )
+
+        self.attn_backend = get_attention_backend(
+            self.pytorch_backend_config.attn_backend,
+            self.model.model_config,
+            self.attn_runtime_features,
+        )
+
+        if self.attn_backend is not None:
+            self.attn_metadata = self.attn_backend.create_metadata(
+                self.batch_size * 2,
+                self.max_seq_len,
+                self.model.model_config,
+                self.mapping,
+            )
 
     def set_lora_model_config(self, lora_target_modules: list[str],
                               trtllm_modules_to_hf_modules: dict[str, str]):
