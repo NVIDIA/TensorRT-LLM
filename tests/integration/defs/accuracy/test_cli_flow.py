@@ -856,9 +856,7 @@ class TestLlama3_3_70BInstruct(CliFlowAccuracyTestHarness):
     @pytest.mark.skip_device_not_contain(["B200"])
     def test_nvfp4_prequantized_tp4(self, mocker):
         mocker.patch.object(
-            self.__class__,
-            "MODEL_PATH",
-            model_path=
+            self.__class__, "MODEL_PATH",
             f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4"
         )
         self.run(tasks=[MMLU(self.MODEL_NAME)],
