@@ -1594,14 +1594,14 @@ std::tuple<Executor::Impl::RequestList, double> Executor::Impl::fetchNewRequests
                     }
                 }
 
-                if (newReq->getGuidedDecodingParams() && mModel->getWorldConfig().isLastPipelineParallelRank())
+                if (mModel->getWorldConfig().isLastPipelineParallelRank() && newReq->getGuidedDecodingParams())
                 {
                     TLLM_CHECK_WITH_INFO(mModel->hasGuidedDecoder(),
                         "Request is specified with GuidedDecodingParams, but GuidedDecoder is not setup. Please "
                         "provide a valid GuidedDecodingConfig to setup GuidedDecoder.");
                 }
 
-                if (newReq->hasAdditionalOutputs())
+                if (mModel->getWorldConfig().isLastPipelineParallelRank() && newReq->hasAdditionalOutputs())
                 {
                     newReq->allocAdditionalOutputs([this](std::string const& name)
                         { return mModel->getTensorDataType(name); },
