@@ -1984,17 +1984,20 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(decoderStepAsync);
 
+    auto& seqSlotLogits = mDecoderInputBuffers.at(getFusedBufferId()).logits;
+
     auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
     auto& contextRuntimeBuffers = mBuffers.at(contextBufferId);
-    auto const logitsIndex = (*mHandleContextLogits)(scheduledRequests.contextRequests,
-        contextRuntimeBuffers->numContextLogits, contextRuntimeBuffers->logits, *mDecoderBuffers, mModelConfig,
-        mRuntime->getBufferManager(), mRuntime->getStream(), contextRuntimeBuffers->medusaBuffers);
+    auto const logitsIndex
+        = (*mHandleContextLogits)(scheduledRequests.contextRequests, contextRuntimeBuffers->numContextLogits,
+            contextRuntimeBuffers->logits, seqSlotLogits, mModelConfig, mRuntime->getBufferManager(),
+            mRuntime->getStream(), mDecoderBuffers->draftBuffers, contextRuntimeBuffers->medusaBuffers);
 
     auto const genLogitsIndex = mCtxGenFusion ? logitsIndex : 0;
     auto const genBufferId = mCtxGenFusion ? getFusedBufferId() : getGenerationBufferId();
     auto& genRuntimeBuffers = mBuffers.at(genBufferId);
-    (*mHandleGenerationLogits)(genLogitsIndex, scheduledRequests.generationRequests, *mDecoderBuffers, mModelConfig,
-        mRuntime->getBufferManager(), genRuntimeBuffers->logits, *genRuntimeBuffers);
+    (*mHandleGenerationLogits)(genLogitsIndex, scheduledRequests.generationRequests, seqSlotLogits, mModelConfig,
+        mRuntime->getBufferManager(), genRuntimeBuffers->logits, *genRuntimeBuffers, mDecoderBuffers->draftBuffers);
 
     // Copy indirection output into input
     // TODO: Could we avoid this by modifying batchDecoder to take a vector of tensors instead?
@@ -2002,11 +2005,11 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
 
     mLogitsPostProcessorIsApplied
         = (*mLogitsPostProcessor)(scheduledRequests.contextRequests, scheduledRequests.generationRequests,
-            mReplicateLogitsPostProcessor, *mDecoderBuffers, mWorldConfig, *mRuntime, mLogitsPostProcessorBatched);
+            mReplicateLogitsPostProcessor, seqSlotLogits, mWorldConfig, *mRuntime, mLogitsPostProcessorBatched);
 
     if (mGuidedDecoder)
     {
-        mGuidedDecoder->execute(scheduledRequests, mRuntime->getBufferManager(), mDecoderBuffers->logits);
+        mGuidedDecoder->execute(scheduledRequests, mRuntime->getBufferManager(), seqSlotLogits);
     }
 
     auto const fusedBufferId = getFusedBufferId();
