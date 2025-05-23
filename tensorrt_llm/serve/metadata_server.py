@@ -2,9 +2,13 @@ import json
 from abc import ABC, abstractmethod
 from typing import Optional
 
-import etcd3
-
 from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig
+from tensorrt_llm.logger import logger
+
+try:
+    import etcd3
+except ImportError:
+    logger.warning("etcd3 is not installed correctly")
 
 
 class RemoteDictionary(ABC):
