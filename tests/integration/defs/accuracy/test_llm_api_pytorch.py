@@ -891,13 +891,27 @@ class TestNemotronNas(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestNemotronSuper(LlmapiAccuracyTestHarness):
+class TestLlama3_3NemotronSuper49Bv1(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Llama-3_3-Nemotron-Super-49B-v1"
     MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1"
 
     @pytest.mark.skip_less_device(2)
     def test_auto_dtype_tp2(self):
         with LLM(self.MODEL_PATH, tensor_parallel_size=2) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_device_not_contain(["H100", "B200"])
+    def test_fp8_prequantized_tp2(self):
+        model_path = f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8"
+        with LLM(model_path, tensor_parallel_size=2) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
