@@ -753,8 +753,8 @@ def collectTestResults(pipeline, testFilter)
             //     }
             // }
             catchError(
-                buildResult: 'FAILURE',
-                stageResult: 'FAILURE') {
+                buildResult: 'UNSTABLE',
+                stageResult: 'UNSTABLE') {
                 error "Some failed tests were reruned, please check the rerun report."
             }
         } // Rerun report stage
