@@ -86,7 +86,8 @@ def test_valgrind_llama_v2_13b(
 
     llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
     # Build engine
-    ENGINE_PATH = prepare_llama_v2_13b_engine(tensorrt_llm_llama_example_root,
+    ENGINE_PATH = prepare_llama_v2_13b_engine(tensorrt_llm_example_root,
+                                              tensorrt_llm_llama_example_root,
                                               llama_v2_tokenizer_model_root)
 
     # Prepare model repo
