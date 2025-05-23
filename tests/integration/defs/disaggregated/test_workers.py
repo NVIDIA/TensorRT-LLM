@@ -497,7 +497,7 @@ def load_default_prompts(disaggregated_example_root: str):
 @contextlib.contextmanager
 def background_workers(llm_venv, config_file: str, num_ranks: int = None):
     cwd = llm_venv.get_working_directory()
-    log_file = open(os.path.join(cwd, 'output_workers.log'), 'w')
+    log_file = open(os.path.join(cwd, 'output_workers.log'), 'w+')
     workers_proc, ctx_servers, gen_servers = run_disaggregated_workers(
         config_file=config_file,
         stdout=log_file,
@@ -506,6 +506,11 @@ def background_workers(llm_venv, config_file: str, num_ranks: int = None):
         num_ranks=num_ranks)
     try:
         yield ctx_servers, gen_servers
+    except Exception:
+        log_file.seek(0)
+        logger.error("Worker output:")
+        logger.error(log_file.read())
+        raise
     finally:
         workers_proc.terminate()
         workers_proc.wait()
@@ -558,7 +563,7 @@ def test_workers_kv_cache_aware_router(disaggregated_test_root,
                             4) as (ctx_servers, gen_servers):
         tester = KvCacheAwareRouterTester(ctx_servers, gen_servers)
         prompts = load_default_prompts(disaggregated_example_root)
-        asyncio.run(tester.test_multi_round_request(prompts, 6, 4))
+        asyncio.run(tester.test_multi_round_request(prompts, 16, 4))
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
