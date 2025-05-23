@@ -1034,6 +1034,15 @@ class BaseLlmArgs(BaseModel):
             tensorrt_llm.llmapi.llm_utils.BaseLlmArgs: The `BaseLlmArgs` instance.
         """
         kwargs = BaseLlmArgs._maybe_update_config_for_consistency(dict(kwargs))
+        # build_config always prioritize over flattened arguments in kwargs
+        if build_config := kwargs.pop("build_config", None):
+            if kwargs.get("backend") == "pytorch":
+                logger.warning("build_config is deprecated from PyT path.")
+            kwargs["max_batch_size"] = build_config.max_batch_size
+            kwargs["max_num_tokens"] = build_config.max_num_tokens
+            kwargs["max_seq_len"] = build_config.max_seq_len
+            kwargs["max_beam_width"] = build_config.max_beam_width
+
         ret = cls(**kwargs)
         ret._setup()
         return ret
