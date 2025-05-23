@@ -39,14 +39,9 @@ TensorPtr collectRequestIds(RequestVector const& contextRequests, RequestVector 
     return requestIds;
 }
 
-void sortRequests(RequestVector& contextRequests, RequestVector& generationRequests)
+void sortRequests(RequestVector& contextRequests, RequestVector& generationRequests, bool chunksPresent)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    // Move context requests that reached the last context chunk to the end of the vector.
-    // This order is required for moveFinishedContextRequestsToGeneration.
-    auto firstFinished = std::partition(contextRequests.begin(), contextRequests.end(),
-        [](auto const& llmReq) { return !llmReq->isLastContextChunk(); });
 
     auto sortByLoraId = [](RequestVector::iterator begin, RequestVector::iterator end)
     {
@@ -54,10 +49,21 @@ void sortRequests(RequestVector& contextRequests, RequestVector& generationReque
             begin, end, [](auto const& lhs, auto const& rhs) { return lhs->getLoraTaskId() < rhs->getLoraTaskId(); });
     };
 
-    // Sort context requests by lora task id, but keep finished requests separate.
-    sortByLoraId(contextRequests.begin(), firstFinished);
-    sortByLoraId(firstFinished, contextRequests.end());
-    // Sort generation requests by lora task id.
+    if (chunksPresent)
+    {
+        // Move context requests that reached the last context chunk to the end of the vector.
+        // This order is required for moveFinishedContextRequestsToGeneration.
+        auto firstFinished = std::partition(contextRequests.begin(), contextRequests.end(),
+            [](auto const& llmReq) { return !llmReq->isLastContextChunk(); });
+
+        // Sort context requests by lora task id, but keep finished requests separate.
+        sortByLoraId(contextRequests.begin(), firstFinished);
+        sortByLoraId(firstFinished, contextRequests.end());
+    }
+    else
+    {
+        sortByLoraId(contextRequests.begin(), contextRequests.end());
+    }
     sortByLoraId(generationRequests.begin(), generationRequests.end());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

@@ -309,7 +309,7 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         }
     }
 
-    utils::sortRequests(contextRequests, generationRequests);
+    utils::sortRequests(contextRequests, generationRequests, !allContextRequestsFit);
 
     TLLM_LOG_DEBUG(
         "batchSize (num ctx/enc requests + num gen requests): %u", contextRequests.size() + generationRequests.size());
