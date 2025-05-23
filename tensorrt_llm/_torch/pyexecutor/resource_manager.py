@@ -506,7 +506,7 @@ class MambaCacheManager(BaseResourceManager):
         num_layers: int,
         max_batch_size: int,
         mapping: Mapping,
-        conv1d_state_dtype: torch.dtype,
+        dtype: torch.dtype,
         layer_mask: Optional[List[bool]] = None,
     ) -> None:
 
@@ -546,9 +546,9 @@ class MambaCacheManager(BaseResourceManager):
                 num_local_layers,
                 max_batch_size,
                 conv_dim,
-                d_conv,
+                d_conv - 1,
             ],
-            dtype=conv1d_state_dtype,
+            dtype=dtype,
             device=device,
         )
 
@@ -558,10 +558,10 @@ class MambaCacheManager(BaseResourceManager):
                 num_local_layers,
                 max_batch_size,
                 nheads,
-                d_state,
                 head_dim,
+                d_state,
             ],
-            dtype=torch.float32,
+            dtype=dtype,
             device=device,
         )
 
@@ -632,7 +632,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         mamba_head_dim: int,
         mamba_num_layers: int,
         mamba_layer_mask: List[bool],
-        mamba_conv1d_state_dtype: torch.dtype,
+        mamba_cache_dtype: torch.dtype,
         # kv cache parameters
         kv_cache_config: KvCacheConfigCpp,
         kv_cache_type: CacheTypeCpp,
@@ -666,7 +666,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             mamba_num_layers,
             max_batch_size,
             mapping,
-            mamba_conv1d_state_dtype,
+            mamba_cache_dtype,
             mamba_layer_mask,
         )
 

@@ -3,11 +3,6 @@ from typing import Dict, Optional
 import torch
 from torch import nn
 from torch.nn import functional as F
-
-try:
-    from transformer_engine.pytorch import RMSNorm
-except ImportError:
-    RMSNorm = None
 from transformers import AutoConfig, PretrainedConfig
 
 from ..attention_backend import AttentionMetadata
@@ -15,8 +10,9 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.mamba.mixer import MambaMixer
+from ..modules.mamba.mamba2_mixer import Mamba2Mixer
 from ..modules.mlp import MLP
+from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
@@ -112,8 +108,6 @@ class NemotronHLayer(DecoderLayer):
         self.layer_idx = layer_idx
         self.layer_type = layer_type
 
-        assert RMSNorm is not None, "RMSNorm from transformer_engine is not installed, install it with `pip3 install transformer_engine[pytorch]`"
-
         self.norm = RMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
@@ -121,17 +115,17 @@ class NemotronHLayer(DecoderLayer):
         )
 
         if layer_type == "M":
-            self.mixer = MambaMixer(d_model=config.hidden_size,
-                                    d_state=config.ssm_state_size,
-                                    d_conv=config.conv_kernel,
-                                    expand=config.expand,
-                                    n_groups=config.n_groups,
-                                    head_dim=config.mamba_head_dim,
-                                    chunk_size=config.chunk_size,
-                                    layer_idx=layer_idx,
-                                    rms_norm_eps=config.rms_norm_eps,
-                                    dtype=config.torch_dtype,
-                                    config=model_config)
+            self.mixer = Mamba2Mixer(d_model=config.hidden_size,
+                                     d_state=config.ssm_state_size,
+                                     d_conv=config.conv_kernel,
+                                     expand=config.expand,
+                                     n_groups=config.n_groups,
+                                     head_dim=config.mamba_head_dim,
+                                     chunk_size=config.chunk_size,
+                                     layer_idx=layer_idx,
+                                     rms_norm_eps=config.rms_norm_eps,
+                                     dtype=config.torch_dtype,
+                                     config=model_config)
         elif layer_type == "-":
             self.mixer = MLPLayer(model_config, layer_idx)
         elif layer_type == "*":
@@ -173,8 +167,6 @@ class NemotronHModel(DecoderModel):
         for layer_idx, layer_type in enumerate(config.hybrid_override_pattern):
             layers.append(NemotronHLayer(model_config, layer_idx, layer_type))
         self.layers = nn.ModuleList(layers)
-
-        assert RMSNorm is not None, "RMSNorm from transformer_engine is not installed, install it with `pip3 install transformer_engine[pytorch]`"
 
         # final norm
         self.norm_f = RMSNorm(
