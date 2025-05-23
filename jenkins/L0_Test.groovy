@@ -77,6 +77,10 @@ BUILD_CORES_REQUEST = "8"
 BUILD_CORES_LIMIT = "8"
 BUILD_MEMORY_REQUEST = "48Gi"
 BUILD_MEMORY_LIMIT = "64Gi"
+SLURM_CORES_REQUEST = "1"
+SLURM_CORES_LIMIT = "1"
+SLURM_MEMORY_REQUEST = "8Gi"
+SLURM_MEMORY_LIMIT = "12Gi"
 BUILD_JOBS = "8"
 
 TESTER_CORES = "12"
@@ -142,7 +146,7 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
     }
 }
 
-def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
+def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312")
 {
     SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -193,7 +197,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
 
             if (CloudManager.isNodeOnline(nodeName)) {
                 // TODO: pass in the gpu numbers instead of hard code it to 1
-                def dockerArgs = "--gpus 1 --cap-add=SYS_ADMIN --ipc=host --security-opt seccomp=unconfined  -u root:root -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
+                def dockerArgs = "--gpus ${gpuCount} --cap-add=SYS_ADMIN --ipc=host --security-opt seccomp=unconfined  -u root:root -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
                 slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, false)
                 executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
             } else {
@@ -377,6 +381,24 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                         cpu: '2'
                         memory: 10Gi
                         ephemeral-storage: 25Gi
+                    imagePullPolicy: Always"""
+        nodeLabelPrefix = "cpu"
+        break
+    case "slurm":
+        containerConfig = """
+                  - name: trt-llm
+                    image: ${image}
+                    command: ['sleep', ${POD_TIMEOUT_SECONDS}]
+                    tty: true
+                    resources:
+                      requests:
+                        cpu: ${SLURM_CORES_REQUEST}
+                        memory: ${SLURM_MEMORY_REQUEST}
+                        ephemeral-storage: 100Gi
+                      limits:
+                        cpu: ${SLURM_CORES_LIMIT}
+                        memory: ${SLURM_MEMORY_LIMIT}
+                        ephemeral-storage: 100Gi
                     imagePullPolicy: Always"""
         nodeLabelPrefix = "cpu"
         break
@@ -1454,12 +1476,12 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     fullSet = parallelJobs.keySet()
 
-    turtleSlurmConfigs = [
+    turtleSlurmX86Configs = [
         "RTXPro6000-PyTorch-[Post-Merge]-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
     ]
+    fullSet += turtleSlurmX86Configs.keySet()
 
-    // TODO: use cpu pod to launch slurm job
-    parallelSlurmJobs = turtleSlurmConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10", "amd64", values[4] ?: 1, key.contains("Perf")), {
+    parallelSlurmJobs = turtleSlurmX86Configs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "amd64"), {
     def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -1467,10 +1489,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3])
+        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3], values[4] ?: 1)
     }]]}
 
-    fullSet += parallelSlurmJobs.keySet()
     parallelJobs += parallelSlurmJobs
 
     // Try to match what are being tested on x86 H100_PCIe.
@@ -1482,13 +1503,29 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     ]
 
     fullSet += aarch64Configs.keySet()
+    turtleSlurmAarch64Configs = [
+        "GB200-4_GPUs-PyTorch-DeepSeek-[Post-Merge]-1": ["gb200-4-gpus", "l0_gb200", 1, 1, 4],
+    ]
+    fullSet += turtleSlurmAarch64Configs.keySet()
 
     if (env.targetArch == AARCH64_TRIPLE) {
         parallelJobs = aarch64Configs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), {
             runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3])
         }]]}
-    }
 
+        // Adding SBSA Slurm jobs
+        parallelSlurmJobs = turtleSlurmAarch64Configs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), {
+        def config = LINUX_AARCH64_CONFIG
+            if (key.contains("single-device")) {
+                config = SINGLE_DEVICE_CONFIG
+            }
+            if (key.contains("llvm")) {
+                config = LLVM_CONFIG
+            }
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3], values[4] ?: 1)
+        }]]}
+        parallelJobs += parallelSlurmJobs
+    }
 
     docBuildSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10")
     docBuildConfigs = [
