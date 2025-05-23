@@ -766,7 +766,8 @@ void WindowBlockManager::claimLeafBlock(BlockPtr const& block, std::optional<exe
     block->freeLeafBlock();
 }
 
-void WindowBlockManager::freeChildren(BlockPtr const& block, executor::RetentionPriority priority, std::optional<std::chrono::milliseconds> durationMs)
+void WindowBlockManager::freeChildren(
+    BlockPtr const& block, executor::RetentionPriority priority, std::optional<std::chrono::milliseconds> durationMs)
 {
     auto nextBlocks = block->getNextBlocks();
     for (auto iter = nextBlocks.begin(); iter != nextBlocks.end(); ++iter)
