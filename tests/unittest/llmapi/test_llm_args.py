@@ -1,10 +1,12 @@
 import tempfile
 
+import pydantic_core
+import pytest
 import yaml
 
 import tensorrt_llm.bindings.executor as tle
+from tensorrt_llm._torch.llm import LLM as TorchLLM
 from tensorrt_llm.llmapi.llm_args import *
-from tensorrt_llm.llmapi.llm_utils import *
 
 from .test_llm import llama_model_path
 
@@ -50,7 +52,7 @@ speculative_config:
         f.seek(0)
         dict_content = yaml.safe_load(f)
 
-    llm_args = LlmArgs(llama_model_path)
+    llm_args = LlmArgs(model=llama_model_path)
     llm_args_dict = update_llm_args_with_extra_dict(llm_args.to_dict(),
                                                     dict_content)
     llm_args = LlmArgs(**llm_args_dict)
@@ -173,3 +175,44 @@ def test_PeftCacheConfig_declaration():
     assert pybind_config.device_cache_percent == 0.5
     assert pybind_config.host_cache_size == 1024
     assert pybind_config.lora_prefetch_dir == "."
+
+
+class TestTrtLlmArgs:
+
+    def test_dynamic_setattr(self):
+        with pytest.raises(pydantic_core._pydantic_core.ValidationError):
+            args = LlmArgs(model=llama_model_path, invalid_arg=1)
+
+        with pytest.raises(ValueError):
+            args = LlmArgs(model=llama_model_path)
+            args.invalid_arg = 1
+
+
+class TestTorchLlmArgs:
+
+    def test_runtime_sizes(self):
+        llm = TorchLLM(
+            llama_model_path,
+            max_beam_width=4,
+            max_num_tokens=256,
+            max_seq_len=128,
+            max_batch_size=8,
+        )
+
+        assert llm.args.max_beam_width == 4
+        assert llm.args.max_num_tokens == 256
+        assert llm.args.max_seq_len == 128
+        assert llm.args.max_batch_size == 8
+
+        assert llm._executor_config.max_beam_width == 4
+        assert llm._executor_config.max_num_tokens == 256
+        assert llm._executor_config.max_seq_len == 128
+        assert llm._executor_config.max_batch_size == 8
+
+    def test_dynamic_setattr(self):
+        with pytest.raises(pydantic_core._pydantic_core.ValidationError):
+            args = TorchLlmArgs(model=llama_model_path, invalid_arg=1)
+
+        with pytest.raises(ValueError):
+            args = TorchLlmArgs(model=llama_model_path)
+            args.invalid_arg = 1
