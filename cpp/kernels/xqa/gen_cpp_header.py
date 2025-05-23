@@ -86,7 +86,7 @@ SOURCE_FILES = [
     'cuda_hint.cuh', 'defines.h', 'ldgsts.cuh', 'mha.cu', 'mha_sm90.cu',
     'mha.h', 'mhaUtils.cuh', 'mma.cuh', 'platform.h', 'utils.cuh', 'utils.h',
     'mha_stdheaders.cuh', 'gmma.cuh', 'gmma_impl.cuh', 'barriers.cuh', 'tma.h',
-    'pairedF32Op.cuh', 'specDec.h'
+    'specDec.h'
 ]
 
 CUDA_HEADERS = [
