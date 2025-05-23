@@ -313,7 +313,7 @@ private:
         {
             // The maximum attention window (the maximum number of tokensKv that will be attended to).
             int maxAttentionWindow{params.mMaxSeqLenKv};
-            // Some of the tilesKv will be skipped if the sliding window atteniton or chunked attention is used.
+            // Some of the tilesKv will be skipped if the sliding window attention or chunked attention is used.
             if (isSlidingOrChunkedCausalMask(params.mMaskType))
             {
                 if (params.mMaxSeqLenKv > params.mAttentionWindowSize)
@@ -489,6 +489,9 @@ private:
             && (params.mMaxSeqLenKv > params.mAttentionWindowSize
                 || params.mMaxSeqLenKv > params.mChunkedAttentionSize))
         {
+            TLLM_CHECK_WITH_INFO(params.mMaxSeqLenKv <= params.mAttentionWindowSize
+                    || params.mMaxSeqLenKv <= params.mChunkedAttentionSize,
+                "Sliding window attention and chunked attention should not be used together");
             maskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
         }
         // NumTokensPerPage is set to 0 when not selecting pagedKv-layout kernels.
