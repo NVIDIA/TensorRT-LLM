@@ -1102,7 +1102,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor(buffer_flags!) buffer_flags, bool wait_for_result) -> Tensor");
     m.def(
         "mnnvl_twoshot_rmsnorm(Tensor prenorm_output, Tensor normed_output, Tensor input, Tensor gamma, "
-        "float epsilon, Tensor residual, Tensor buffer_flags) -> (Tensor, Tensor)");
+        "float epsilon, Tensor residual, Tensor buffer_flags) -> Tensor[]");
     m.def(
         "allreduce("
         "Tensor input,"
