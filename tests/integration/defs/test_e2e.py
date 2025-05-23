@@ -1878,6 +1878,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         *accuracy_inputs[modality]["prompt"],
         "--media",
         *accuracy_inputs[modality]["media"],
+        "--disable_kv_cache_reuse",
     ]
     # NOTE
     # Qwen2-VL and Qwen2-5-VL model need larger max_num_tokens.
@@ -1958,6 +1959,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             functionality_inputs[modality]["prompt"],
             "--media",
             *functionality_inputs[modality]["media"],
+            "--disable_kv_cache_reuse",
         ],
                          running_log=running_log)
 
