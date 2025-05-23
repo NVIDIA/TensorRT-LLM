@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._mnnvl_utils import MnnvlMoe, MoEAlltoallInfo
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, logger
 from tensorrt_llm.quantization.utils.fp4_utils import (
     get_reorder_rows_for_gated_act_gemm_row_indices,
     get_shuffle_matrix_a_row_indices, get_shuffle_matrix_sf_a_row_indices,
@@ -439,6 +439,12 @@ class FusedMoE(nn.Module):
             )
             self.balancer_layer.set_initial_weight_assignments(
                 self.initial_global_assignments)
+            logger.info(
+                f"MoE load balancer enabled. num_experts = {num_experts}, num_slots = {self.num_slots}, ep_size = {self.ep_size}"
+            )
+            logger.info(
+                f"initial_global_assignments (layer {layer_idx}) = {self.initial_global_assignments}"
+            )
 
         max_num_tokens = model_config.max_num_tokens
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
