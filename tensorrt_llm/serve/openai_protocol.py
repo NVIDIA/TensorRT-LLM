@@ -104,6 +104,8 @@ class CompletionResponse(OpenAIBaseModel):
     model: str
     choices: List[CompletionResponseChoice]
     usage: UsageInfo
+    # Add prompt_tokens_ids to the response to remove the tokenization
+    # in the generation server in disaggreated serving
     prompt_token_ids: Optional[List[List[int]]] = None
 
 
@@ -372,6 +374,9 @@ class ChatCompletionResponse(OpenAIBaseModel):
     model: str
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
+    # Add prompt_tokens_ids to the response to remove the tokenization
+    # in the generation server in disaggreated serving
+    prompt_token_ids: Optional[List[int]] = None
 
 
 class DeltaMessage(OpenAIBaseModel):
@@ -422,6 +427,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
+    # Add prompt_tokens_ids to the request to remove the tokenization
+    # in the generation server in disaggreated serving
+    prompt_token_ids: Optional[List[int]] = None
     model: str
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
