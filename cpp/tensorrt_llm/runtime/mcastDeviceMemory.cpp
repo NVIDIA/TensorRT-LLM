@@ -30,19 +30,6 @@ namespace tensorrt_llm::runtime
 
 namespace
 {
-#define CUCHECK(cmd)                                                                                                   \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        CUresult retval = cmd;                                                                                         \
-        if (retval != CUDA_SUCCESS)                                                                                    \
-        {                                                                                                              \
-            const char* error_string;                                                                                  \
-            cuGetErrorString(retval, &error_string);                                                                   \
-            printf("Failed: Cuda error %s:%d '%s'\n", __FILE__, __LINE__, error_string);                               \
-            exit(EXIT_FAILURE);                                                                                        \
-        }                                                                                                              \
-    } while (0)
-
 // An efficient implementation assuming gran is a power of 2
 inline size_t roundUp(size_t val, size_t gran)
 {
@@ -66,7 +53,7 @@ McastDeviceMemory::McastDeviceMemory(
     cudaSetDevice(mDeviceIdx);
     // Check if the device support multicasting
     int multicast_supported{0};
-    CUCHECK(cuDeviceGetAttribute(&multicast_supported, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, mDeviceIdx));
+    TLLM_CU_CHECK(cuDeviceGetAttribute(&multicast_supported, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, mDeviceIdx));
     if (multicast_supported == 0)
     {
         TLLM_THROW("[McastDeviceMemory] Device does not support multicasting.");
@@ -83,7 +70,7 @@ McastDeviceMemory::McastDeviceMemory(
     {
         // For multi-node, we also need to check if fabric handle is supported
         int fabric_handle_supported{0};
-        CUCHECK(cuDeviceGetAttribute(
+        TLLM_CU_CHECK(cuDeviceGetAttribute(
             &fabric_handle_supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, mDeviceIdx));
         if (fabric_handle_supported == 0)
         {
@@ -142,12 +129,15 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id = mDeviceIdx;
+    prop.allocFlags.gpuDirectRDMACapable = 1;
 
-    size_t granularity{0};
-    TLLM_CU_CHECK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    size_t alloc_granularity{0}, mc_granularity{0};
+    TLLM_CU_CHECK(cuMemGetAllocationGranularity(&alloc_granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
     // Round up the buffer size for grnularity
-    mAllocationSize = roundUp(bufSize + kSIGNAL_PAD_SIZE, granularity);
-
+    mAllocationSize = roundUp(bufSize + kSIGNAL_PAD_SIZE, alloc_granularity);
+    CUmulticastObjectProp mcProp = {.numDevices = mGroupSize, .size = mAllocationSize, .handleTypes = handle_type};
+    TLLM_CU_CHECK(cuMulticastGetGranularity(&mc_granularity, &mcProp, CU_MULTICAST_GRANULARITY_RECOMMENDED));
+    mAllocationSize = roundUp(mAllocationSize, mc_granularity);
     mUcHandles.resize(mGroupSize);
     // Allocates local gpu memory
     TLLM_CU_CHECK(cuMemCreate(&(mUcHandles[mGroupRank]), mAllocationSize, &prop, 0));
@@ -170,8 +160,6 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
     cudaFreeHost(exphndl);
 
     // Initialize multicasting
-    CUmulticastObjectProp mcProp
-        = {.numDevices = mGroupSize, .size = mAllocationSize, .handleTypes = CU_MEM_HANDLE_TYPE_FABRIC};
     CUmemFabricHandle* fabric_handle;
     cudaMallocHost(&fabric_handle, sizeof(CUmemFabricHandle));
     if (mGroupRank == 0)
@@ -192,7 +180,7 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
     // Bind memory addresses
     mUcPtrs.resize(mGroupSize);
     CUdeviceptr ptr;
-    TLLM_CU_CHECK(cuMemAddressReserve(&ptr, mAllocationSize * mGroupSize, 0, 0, 0));
+    TLLM_CU_CHECK(cuMemAddressReserve(&ptr, mAllocationSize * mGroupSize, mc_granularity, 0ULL, 0));
     CUmemAccessDesc accessDesc = {};
     accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
@@ -206,7 +194,7 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
     TLLM_CU_CHECK(cuMemSetAccess(ptr, mAllocationSize * mGroupSize, &accessDesc, 1));
 
     // Bind MC Pointers
-    TLLM_CU_CHECK(cuMemAddressReserve(&mMcPtr, mAllocationSize, 0, 0U, 0));
+    TLLM_CU_CHECK(cuMemAddressReserve(&mMcPtr, mAllocationSize, mc_granularity, 0ULL, 0));
     TLLM_CU_CHECK(cuMemMap(mMcPtr, mAllocationSize, 0, mMcHandle, 0));
     TLLM_CU_CHECK(cuMemSetAccess(mMcPtr, mAllocationSize, &accessDesc, 1));
 
