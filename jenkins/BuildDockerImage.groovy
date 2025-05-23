@@ -335,7 +335,7 @@ def launchBuildJobs(pipeline) {
                 config[defaultKey] = defaultValue
             }
         }
-        config.podConfig = createKubernetesPodConfig("build", config.arch, config.lws)
+        config.podConfig = createKubernetesPodConfig("build", config.arch, config.build_wheel)
     }
     echo "Build configs:"
     println buildConfigs
