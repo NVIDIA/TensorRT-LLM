@@ -41,6 +41,7 @@ In the generation phase, there will be a little difference. The predicted token 
 <figure>
   <img src="../media/tech_blog2_mtp_eagle.png" alt="tech_blog2_mtp_eagle" width="640" height="auto">
 </figure>
+</div>
 <p align="center"><small><em>Figure 3. MTP Eagle, using the same notation as Figure 2</em></small></p>
 
 MTP Eagle can be viewed as a variant of Eagle speculative decoding method<sup>[2]</sup>, but only supports chain decoding now. It reuses the same MTP module and repeats multiple times to predict draft tokens. MTP Eagle supports the model checkpoint with only one MTP module. The official DeepSeek-V3 and DeepSeek-R1 have only one MTP module in their checkpoints. Another difference with MTP vanilla is the KV cache. In the MTP Eagle method, the MTP module reuses the same KV cache when predicting multiple draft tokens.
@@ -55,7 +56,7 @@ TensorRT-LLM has two different paths for MTP, one for MTP Vanilla and another fo
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog2_overall_workflow.png" alt="tech_blog2_overall_workflow" width="1024" height="auto">
+  <img src="../media/tech_blog2_overall_workflow.png" alt="tech_blog2_overall_workflow" width="800" height="auto">
 </figure>
 </div>
 <p align="center"><small><em>Figure 4. MTP workflow in TensorRT-LLM</em></small></p>
@@ -129,6 +130,7 @@ DeepSeek-R1 is a reasoning model that first outputs some thinking tokens, after 
 <figure>
   <img src="../media/tech_blog2_relaxed_acceptance.png" alt="tech_blog2_relaxed_acceptance" width="1024" height="auto">
 </figure>
+</div>
 <p align="center"><small><em>Figure 6. Relaxed Acceptance example. Use MTP nextn=4 and top-3 in this example.</em></small></p>
 
 In previous verification and acceptance, we will use a top-1 to sample from the logits the main model to get the “expected” tokens as shown in Figure 1. There will be only one choice to compare with the draft tokens, which we call “Strict Acceptance”.
