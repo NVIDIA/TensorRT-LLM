@@ -97,7 +97,7 @@ def register_input_processor(processor_cls: Type[InputProcessor],
         if not out_of_tree:
             assert model_type in ALL_SUPPORTED_MULTIMODAL_MODELS, \
                 f"Model type {model_type} not in {ALL_SUPPORTED_MULTIMODAL_MODELS}.\n" \
-                "Please see the inputs/utils.py file for more information."
+                "Please see the tensorrt_llm/inputs/utils.py file for more information."
 
         return model_cls
 

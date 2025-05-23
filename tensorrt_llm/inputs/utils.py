@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import enum
 import tempfile
 from collections import defaultdict
 from io import BytesIO
@@ -13,10 +14,11 @@ import requests
 import torch
 from PIL import Image
 from torchvision.transforms import ToTensor
-from transformers import AutoProcessor, AutoTokenizer, ProcessorMixin
+from transformers import AutoProcessor, ProcessorMixin
 from transformers.utils import logging
 
-from tensorrt_llm.llmapi.tokenizer import TokenizerBase
+from tensorrt_llm.llmapi.llm_utils import ModelLoader
+from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 
 logger = logging.get_logger(__name__)
 
@@ -196,6 +198,23 @@ HF_CHAT_TEMPLATE_EXCEPTIONS = ["llava_llama"]
 PLACEHOLDER_EXCEPTIONS = ["llava_next"]
 
 
+class MultimodalPlaceholderPlacement(enum.Enum):
+    INVALID = -1
+    BEFORE_TEXT = 0
+    AFTER_TEXT = 1
+
+
+PLACEHOLDER_PLACEMENT_MAP = {
+    "qwen2_vl": MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    "qwen2_5_vl": MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    "llava_llama": MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    "llava_next": MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    "llama4": MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    "mllama": MultimodalPlaceholderPlacement.BEFORE_TEXT,
+}
+assert len(PLACEHOLDER_PLACEMENT_MAP) == len(ALL_SUPPORTED_MULTIMODAL_MODELS)
+
+
 def retrieve_multimodal_placeholder(model_type: str, modality: str,
                                     current_count: int) -> Optional[str]:
     """
@@ -250,39 +269,38 @@ class MultimodalDataTracker:
     """Tracks and manages multimodal data for both sync and async processing."""
 
     def __init__(self, model_type: str):
-        self.model_type = model_type
-        self.mm_data = defaultdict[str](list)
-        self.mm_placeholder_counts = defaultdict[str](int)
+        self._model_type = model_type
+        self._data = defaultdict[str](list)
+        self._placeholder_counts = defaultdict[str](int)
 
-    async def retrieve_all_mm_data_async(
-            self) -> Optional[Dict[str, List[Any]]]:
+    async def retrieve_all_async(self) -> Optional[Dict[str, List[Any]]]:
         """Retrieve all collected multimodal data."""
-        if not self.mm_data:
+        if not self._data:
             return None
 
         return {
             modality: await asyncio.gather(*items)
-            for modality, items in self.mm_data.items()
+            for modality, items in self._data.items()
         }
 
-    def retrieve_all_mm_data_sync(self) -> Optional[Dict[str, List[Any]]]:
+    def retrieve_all_sync(self) -> Optional[Dict[str, List[Any]]]:
         """Retrieve all collected multimodal data."""
-        if not self.mm_data:
+        if not self._data:
             return None
 
-        return {modality: items for modality, items in self.mm_data.items()}
+        return {modality: items for modality, items in self._data.items()}
 
-    def add_mm_data(self, media_type: str, data: Union[Coroutine, Any]):
-        current_count = len(self.mm_data[media_type]) + 1
-        placeholder = retrieve_multimodal_placeholder(self.model_type,
+    def add_data(self, media_type: str, data: Union[Coroutine, Any]):
+        current_count = len(self._data[media_type]) + 1
+        placeholder = retrieve_multimodal_placeholder(self._model_type,
                                                       media_type, current_count)
-        self.mm_data[media_type].append(data)
+        self._data[media_type].append(data)
         if placeholder:
-            self.mm_placeholder_counts[placeholder] += 1
+            self._placeholder_counts[placeholder] += 1
 
-    def mm_data_counts(self) -> Dict[str, int]:
+    def placeholder_counts(self) -> Dict[str, int]:
         """Get the count of multimodal placeholders."""
-        return dict(self.mm_placeholder_counts)
+        return dict(self._placeholder_counts)
 
 
 def add_multimodal_placeholders(model_type: str, text_prompt: str,
@@ -294,7 +312,15 @@ def add_multimodal_placeholders(model_type: str, text_prompt: str,
     placeholders = []
     for placeholder in mm_placeholder_counts:
         placeholders.extend([placeholder] * mm_placeholder_counts[placeholder])
-    return "\n".join(placeholders + [text_prompt])
+    parts = []
+    match PLACEHOLDER_PLACEMENT_MAP[model_type]:
+        case MultimodalPlaceholderPlacement.BEFORE_TEXT:
+            parts.extend(placeholders)
+            parts.append(text_prompt)
+        case MultimodalPlaceholderPlacement.AFTER_TEXT:
+            parts.append(text_prompt)
+            parts.extend(placeholders)
+    return "\n".join(parts)
 
 
 def resolve_hf_chat_template(
@@ -317,8 +343,8 @@ def resolve_hf_chat_template(
     try:
         return tokenizer.get_chat_template(chat_template, tools=tools)
     except Exception:
-        logger.debug("Failed to load AutoTokenizer chat template for %s",
-                     tokenizer.name_or_path)
+        logger.warning("Failed to load AutoTokenizer chat template for %s",
+                       tokenizer.name_or_path)
     return None
 
 
@@ -338,7 +364,7 @@ def handle_placeholder_exceptions(model_type: str,
 def apply_chat_template(
     *,
     model_type: str,
-    tokenizer: TokenizerBase,
+    tokenizer: Union[TransformersTokenizer, TokenizerBase],
     processor: ProcessorMixin,
     conversation: list[ConversationMessage],
     add_generation_prompt: bool,
@@ -353,6 +379,8 @@ def apply_chat_template(
     if model_type in HF_CHAT_TEMPLATE_EXCEPTIONS:
         # special path for models like llava-llama
         return "".join([conv["content"] for conv in conversation])
+    if isinstance(tokenizer, TransformersTokenizer):
+        tokenizer = tokenizer.tokenizer  # we need the TokenizerBase for apply_chat_template
 
     hf_chat_template = resolve_hf_chat_template(tokenizer, processor,
                                                 chat_template, tools)
@@ -377,7 +405,7 @@ def apply_chat_template(
 
 def default_multimodal_input_loader(
         *,
-        tokenizer: Optional[TokenizerBase],
+        tokenizer: Optional[Union[TransformersTokenizer, TokenizerBase]],
         model_dir: str,
         model_type: str,
         modality: str,
@@ -418,7 +446,7 @@ def default_multimodal_input_loader(
     assert len(media) == len(prompts)
 
     if tokenizer is None and model_type not in HF_CHAT_TEMPLATE_EXCEPTIONS:
-        tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
+        tokenizer = ModelLoader.load_hf_tokenizer(model_dir, use_fast=True)
 
     processor = None
     if model_type not in HF_CHAT_TEMPLATE_EXCEPTIONS:
@@ -429,8 +457,8 @@ def default_multimodal_input_loader(
         conv = convert_to_conversation_message(prompt, media, modality)
         mm_data_tracker = MultimodalDataTracker(model_type)
         for mdata in conv["media"]:
-            mm_data_tracker.add_mm_data(mdata["modality"], mdata["data"])
-        mm_placeholder_counts = mm_data_tracker.mm_data_counts()
+            mm_data_tracker.add_data(mdata["modality"], mdata["data"])
+        mm_placeholder_counts = mm_data_tracker.placeholder_counts()
         prompt = conv["content"]
         if mm_placeholder_counts:
             conv["content"] = add_multimodal_placeholders(
@@ -443,10 +471,8 @@ def default_multimodal_input_loader(
                 add_generation_prompt=True,
                 mm_placeholder_counts=mm_placeholder_counts)
         inputs.append({
-            "prompt":
-            prompt,
-            "multi_modal_data":
-            mm_data_tracker.retrieve_all_mm_data_sync()
+            "prompt": prompt,
+            "multi_modal_data": mm_data_tracker.retrieve_all_sync()
         })
 
     return inputs

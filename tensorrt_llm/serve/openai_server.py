@@ -49,13 +49,16 @@ class OpenAIServer:
                  model: str):
         self.llm = llm
         self.tokenizer = llm.tokenizer
+        hf_tokenizer_path = llm._hf_model_dir or self.tokenizer.tokenizer.name_or_path
         try:
-            hf_tokenizer_path = llm._hf_model_dir or self.tokenizer.tokenizer.name_or_path
             self.processor = AutoProcessor.from_pretrained(hf_tokenizer_path)
-            self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path)
         except Exception:
             logger.debug("Failed to load AutoProcessor or AutoConfig for %s", hf_tokenizer_path)
             self.processor = None
+        try:
+            self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path)
+        except Exception:
+            logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
             self.model_config = None
 
         model_dir = Path(model)
