@@ -1551,20 +1551,19 @@ def test_ptq_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
 
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("model_name,model_path", [
-    pytest.param('DeepSeek-V3', 'DeepSeek-V3', marks=skip_pre_hopper),
-])
+@skip_pre_hopper
+@skip_post_blackwell
+@pytest.mark.parametrize("model_path", ['DeepSeek-V3'])
 def test_ptp_quickstart_advanced_deepseek_v3_2nodes_8gpus(
-        llm_root, llm_venv, model_name, model_path):
+        llm_root, llm_venv, model_path):
     # "RCCA https://nvbugs/5163844"
-    print(f"Testing {model_name}.")
+    print(f"Testing {model_path}.")
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
     run_cmd = [
         "trtllm-llmapi-launch",
         "python3",
         str(example_root / "quickstart_advanced.py"),
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
+        f"--model_dir={llm_models_root()}/{model_path}",
         "--moe_ep_size=8",
         "--tp_size=16",
         "--use_cuda_graph",
@@ -2061,6 +2060,32 @@ def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
         f"--jsonl_file={input_file}",
         "--threshold=0.5",
     ])
+
+
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("model_path", [
+    pytest.param('llama-3.3-models/Llama-3.3-70B-Instruct',
+                 marks=skip_pre_hopper),
+    pytest.param('Llama-4-Maverick-17B-128E-Instruct', marks=skip_pre_hopper),
+])
+def test_ptp_quickstart_advanced_llama_2nodes(llm_root, llm_venv, model_path):
+    print(f"Testing {model_path}.")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    run_cmd = [
+        "trtllm-llmapi-launch",
+        "python3",
+        str(example_root / "quickstart_advanced.py"),
+        f"--model_dir={llm_models_root()}/{model_path}",
+        "--moe_ep_size=8",
+        "--tp_size=16",
+        "--use_cuda_graph",
+        f"--kv_cache_fraction={_MEM_FRACTION_50}",
+        "--max_batch_size=32",
+        "--max_num_tokens=2048",
+        "--disable_kv_cache_reuse",
+    ]
+    check_call(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
 
 
 # End of Pivot-To-Python examples

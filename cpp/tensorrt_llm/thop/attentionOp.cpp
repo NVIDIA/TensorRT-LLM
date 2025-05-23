@@ -375,7 +375,8 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
     std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim,
     torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
-    std::optional<torch::Tensor> mla_context_paged_kv, std::optional<torch::Tensor> mla_context_kv_cache_block_offsets)
+    std::optional<torch::Tensor> mla_context_paged_kv, std::optional<torch::Tensor> mla_context_kv_cache_block_offsets,
+    std::optional<int64_t> attention_chunk_size)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -464,6 +465,8 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
     op->mRotaryEmbeddingMaxPositions = rotary_embedding_max_positions;
     op->mRotaryEmbeddingOriginalMaxPositions = rotary_embedding_original_max_positions;
     op->mPagedContextFMHA = use_paged_context_fmha;
+
+    op->mAttentionChunkSize = attention_chunk_size;
 
     if (is_mla_enable)
     {
@@ -667,6 +670,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor? mrope_position_deltas"
         ", Tensor? mla_context_paged_kv"
         ", Tensor? mla_context_kv_cache_block_offsets"
+        ", int? attention_chunk_size"
         ") -> ()");
 }
 

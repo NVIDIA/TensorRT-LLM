@@ -57,7 +57,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     def test_chunked_prefill(self, attn_backend):
-        pytest.skip("https://nvbugspro.nvidia.com/bug/5285881")
         pytorch_config = PyTorchConfig(attn_backend=attn_backend, )
         llm = LLM(self.MODEL_PATH,
                   enable_chunked_prefill=True,
@@ -463,8 +462,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if torch_compile and attention_dp:
             pytest.skip("https://nvbugs/5252559")
         # OOM on H100 with default free_gpu_memory_fraction=0.9
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
-                                        enable_block_reuse=not fp8kv)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         pytorch_config = PyTorchConfig(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
@@ -545,8 +543,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if torch_compile and pp_size > 1:
             pytest.skip("PP with torch.compile is not supported yet.")
         # OOM on H100 with default free_gpu_memory_fraction=0.9
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
-                                        enable_block_reuse=not fp8kv)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         pytorch_config = PyTorchConfig(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
@@ -598,8 +595,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                    torch_compile):
         if torch_compile and attention_dp:
             pytest.skip("https://nvbugs/5252559")
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
-                                        enable_block_reuse=not fp8kv)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
 
         pytorch_config = PyTorchConfig(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -651,8 +647,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("https://nvbugs/5252559")
         if torch_compile and pp_size > 1:
             pytest.skip("PP with torch.compile is not supported yet.")
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
-                                        enable_block_reuse=not fp8kv)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         pytorch_config = PyTorchConfig(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
@@ -776,8 +771,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          attention_dp, cuda_graph, overlap_scheduler,
                          batch_size, moe_backend):
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
-                                        enable_block_reuse=not fp8kv)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
         pytorch_config = PyTorchConfig(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph)
@@ -890,6 +884,7 @@ class TestNemotronNas(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@pytest.mark.skip_less_device_memory(80000)
 class TestNemotronSuper(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Llama-3_3-Nemotron-Super-49B-v1"
     MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1"
@@ -1030,14 +1025,32 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
-        [(1, 1, 1, True, True, True)],
-        ids=["latency"])
-    def test_nvfp4(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
-                   overlap_scheduler):
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
+        [
+            (1, 1, 1, True, True, True, "CUTLASS"),
+            # TODO: enable TRTLLM backend
+            # (1, 1, 1, True, True, True, "TRTLLM"),
+        ],
+        ids=[
+            "latency_moe_cutlass",
+            # "latency_moe_trtllm",
+        ],
+    )
+    def test_nvfp4(
+        self,
+        tp_size,
+        pp_size,
+        ep_size,
+        attention_dp,
+        cuda_graph,
+        overlap_scheduler,
+        moe_backend,
+    ):
         pytorch_config = PyTorchConfig(
             disable_overlap_scheduler=not overlap_scheduler,
-            use_cuda_graph=cuda_graph)
+            use_cuda_graph=cuda_graph,
+            moe_backend=moe_backend,
+        )
 
         llm = LLM(
             f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf",

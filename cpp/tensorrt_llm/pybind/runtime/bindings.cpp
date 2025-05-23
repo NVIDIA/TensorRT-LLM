@@ -35,6 +35,7 @@
 #include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
 #include "tensorrt_llm/runtime/loraCache.h"
+#include "tensorrt_llm/runtime/mcastGPUBuffer.h"
 #include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
@@ -48,8 +49,6 @@
 #include <torch/extension.h>
 
 namespace tr = tensorrt_llm::runtime;
-namespace tle = tensorrt_llm::executor;
-using CudaStreamPtr = std::shared_ptr<tr::CudaStream>;
 
 class PyITensor : public tensorrt_llm::runtime::ITensor
 {
@@ -368,7 +367,10 @@ void initBindings(pybind11::module_& m)
             py::arg("world_config"))
         .def("forward_async", &tr::GptDecoderBatched::forwardAsync, py::arg("output"), py::arg("input"))
         .def("underlying_decoder", &tr::GptDecoderBatched::getUnderlyingDecoder, py::return_value_policy::reference)
-        .def_property_readonly("stream_ptr", &tr::GptDecoderBatched::getDecoderStream)
+        .def_property_readonly(
+            "decoder_stream",
+            [](tr::GptDecoderBatched& self) -> tr::CudaStream const& { return *self.getDecoderStream(); },
+            py::return_value_policy::reference)
         .def_property_readonly(
             "decoder_state", py::overload_cast<>(&tr::GptDecoderBatched::getDecoderState, py::const_));
 
@@ -399,6 +401,11 @@ void initBindings(pybind11::module_& m)
         "max_workspace_size_lowprecision",
         [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
         "Calculate the maximum workspace size needed for low precision all-reduce operations");
+
+    py::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
+        .def(py::init<size_t, uint32_t, uint32_t, at::Device, bool>())
+        .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer)
+        .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer);
 
     py::enum_<tensorrt_llm::kernels::AllReduceFusionOp>(m, "AllReduceFusionOp")
         .value("NONE", tensorrt_llm::kernels::AllReduceFusionOp::NONE)
