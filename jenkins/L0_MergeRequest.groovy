@@ -390,18 +390,21 @@ def launchReleaseCheck(pipeline)
                 }
             }
         }
-        stage("Scan") {
-            sh "whoami"
-            trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, true, true)
-            sh "cd ${SCAN_ROOT} && pip3 install -e ."
-            try {
-                sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f) 2>&1 | tee scan.log"
-            } catch (Exception e) {
-                echo "Scan failed. Error: ${e.message}"
+        def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+        if (env.alternativeTRT || isOfficialPostMergeJob) {
+            stage("Scan") {
+                sh "whoami"
+                trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, true, true)
+                sh "cd ${SCAN_ROOT} && pip3 install -e ."
+                try {
+                    sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f) 2>&1 | tee scan.log"
+                } catch (Exception e) {
+                    echo "Scan failed. Error: ${e.message}"
+                }
+                sh "cd ${LLM_ROOT} && cat scan.log"
+                trtllm_utils.uploadArtifacts("${LLM_ROOT}/scan.log", "${UPLOAD_PATH}/scan-results/")
+                echo "Scan results: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/scan-results/scan.log"
             }
-            sh "cd ${LLM_ROOT} && cat scan.log"
-            trtllm_utils.uploadArtifacts("${LLM_ROOT}/scan.log", "${UPLOAD_PATH}/scan-results/")
-            echo "Scan results: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/scan-results/scan.log"
         }
     })
 }
