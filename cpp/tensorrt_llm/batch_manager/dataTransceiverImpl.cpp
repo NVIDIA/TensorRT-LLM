@@ -67,7 +67,8 @@ DataSenderImpl::DataSenderImpl(executor::kv_cache::ConnectionManager* manager,
     auto requestId = info.getRequestId();
     TLLM_CHECK_WITH_INFO(
         mFormatter->inquireSupport(mSelfState.getCacheState().value(), info.getTransState().getCacheState().value()),
-        "Disagg server does not currently support these cacheState.");
+        "Disagg server does not currently support these cacheState, please check the cacheState of the context and gen "
+        "executors");
     auto peerRelativeRanks = executor::kv_cache::targetIRanks(info.getTransState().getCacheState().value(),
         mSelfState.getCacheState().value(), mSelfState.getCommState().value().getSelfIdx())
                                  .mIRanks;
