@@ -200,6 +200,7 @@ class TestNemotronMini4BInstruct(CliFlowAccuracyTestHarness):
         self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
 
 
+@skip_post_blackwell
 class TestPhi2(CliFlowAccuracyTestHarness):
     MODEL_NAME = "microsoft/phi-2"
     MODEL_PATH = f"{llm_models_root()}/phi-2"
@@ -215,6 +216,7 @@ class TestPhi2(CliFlowAccuracyTestHarness):
         self.run(tp_size=2)
 
 
+@skip_post_blackwell
 class TestPhi3Mini4kInstruct(CliFlowAccuracyTestHarness):
     MODEL_NAME = "microsoft/Phi-3-mini-4k-instruct"
     MODEL_PATH = f"{llm_models_root()}/Phi-3/Phi-3-mini-4k-instruct"
@@ -224,6 +226,7 @@ class TestPhi3Mini4kInstruct(CliFlowAccuracyTestHarness):
         self.run(dtype='auto')
 
 
+@skip_post_blackwell
 class TestPhi3Mini128kInstruct(CliFlowAccuracyTestHarness):
     MODEL_NAME = "microsoft/Phi-3-mini-128k-instruct"
     MODEL_PATH = f"{llm_models_root()}/Phi-3/Phi-3-mini-128k-instruct"
@@ -233,6 +236,7 @@ class TestPhi3Mini128kInstruct(CliFlowAccuracyTestHarness):
         self.run(dtype='auto')
 
 
+@skip_post_blackwell
 class TestPhi3Small8kInstruct(CliFlowAccuracyTestHarness):
     MODEL_NAME = "microsoft/Phi-3-small-8k-instruct"
     MODEL_PATH = f"{llm_models_root()}/Phi-3/Phi-3-small-8k-instruct"
@@ -242,6 +246,7 @@ class TestPhi3Small8kInstruct(CliFlowAccuracyTestHarness):
         self.run(dtype='auto')
 
 
+@skip_post_blackwell
 class TestPhi3Small128kInstruct(CliFlowAccuracyTestHarness):
     MODEL_NAME = "microsoft/Phi-3-small-128k-instruct"
     MODEL_PATH = f"{llm_models_root()}/Phi-3/Phi-3-small-128k-instruct"
@@ -251,6 +256,7 @@ class TestPhi3Small128kInstruct(CliFlowAccuracyTestHarness):
         self.run(dtype='auto')
 
 
+@skip_post_blackwell
 class TestPhi3_5MiniInstruct(CliFlowAccuracyTestHarness):
     MODEL_NAME = "microsoft/Phi-3.5-mini-instruct"
     MODEL_PATH = f"{llm_models_root()}/Phi-3.5/Phi-3.5-mini-instruct"
