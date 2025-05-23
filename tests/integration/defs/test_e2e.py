@@ -511,6 +511,7 @@ class BenchRunner:
                          ids=["pytorch_backend", "trt_backend"])
 def test_trtllm_bench_llmapi_launch(llm_root, llm_venv, model_name,
                                     model_subdir, use_pytorch_backend):
+    pytest.skip(reason="https://nvbugs/5301636")
     runner = BenchRunner(llm_root=llm_root,
                          llm_venv=llm_venv,
                          model_name=model_name,
