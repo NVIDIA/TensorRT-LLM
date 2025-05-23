@@ -16,7 +16,7 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 
 from ...quantization.utils.fp4_utils import float4_sf_dtype
 from ..distributed import allgather, reducescatter
-from ..model_config import ModelConfig
+from ..model_config import ModelConfig, MoeLoadBalancerConfig
 from ..utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
                      reswizzle_sf, swizzle_sf, unswizzle_sf)
 from .linear import TensorParallelMode, load_weight_shard
@@ -367,6 +367,7 @@ class FusedMoE(nn.Module):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         enable_alltoall: bool = False,
+        layer_idx: Optional[int] = None,
     ):
         from ..distributed import AllReduce
 
@@ -404,25 +405,18 @@ class FusedMoE(nn.Module):
 
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
-        # self.expert_slots_per_partition will be replaced with real slots_per_partition to enable redundant expert slots
-        self.expert_slots_per_partition = num_experts // self.ep_size
-        assert self.expert_slots_per_partition * self.ep_size >= num_experts, "total slots should be at lease num_experts"
-        if self.smart_router:
-            assert self.expert_slots_per_partition == num_experts // self.ep_size,\
-                "Smart router should not have redundant slots"
-        self.num_slots = self.expert_slots_per_partition * self.ep_size
-        # Here the meaning of expert_size_per_partition is the number of expert slots that each rank has.
-        self.expert_size_per_partition = self.expert_slots_per_partition
-        self.slot_start = self.ep_rank * self.expert_size_per_partition
-        self.slot_end = self.slot_start + self.expert_size_per_partition
+        moe_load_balancer = model_config.moe_load_balancer
+        if moe_load_balancer is None:
+            moe_load_balancer = MoeLoadBalancerConfig()
 
-        self.initial_global_assignments = [
-            (ep_rank * self.num_experts // self.ep_size + local_slot_id) %
-            self.num_experts for ep_rank in range(self.ep_size)
-            for local_slot_id in range(self.expert_slots_per_partition)
-        ]
-        self.initial_local_expert_ids = self.initial_global_assignments[
-            self.slot_start:self.slot_end]
+        self.num_slots = num_experts
+        if moe_load_balancer.num_slots is not None:
+            self.num_slots = moe_load_balancer.num_slots
+        self.initial_local_expert_ids = moe_load_balancer.get_initial_local_expert_ids(
+            num_experts, self.ep_rank, self.ep_size, layer_idx)
+        self.expert_size_per_partition = self.num_slots // self.ep_size
+        assert len(
+            self.initial_local_expert_ids) == self.expert_size_per_partition
 
         max_num_tokens = model_config.max_num_tokens
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled

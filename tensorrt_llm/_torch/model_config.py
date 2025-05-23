@@ -15,6 +15,33 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 
 
+@dataclass
+class MoeLoadBalancerConfig:
+    num_slots: Optional[int] = None
+    initial_global_assignments: Optional[Dict[int, List[int]]] = None
+    layer_updates_per_iter: int = 0
+
+    def get_initial_local_expert_ids(self, num_experts: int, ep_rank: int,
+                                     ep_size: int, layer_idx: int) -> List[int]:
+        num_slots = num_experts if self.num_slots is None else self.num_slots
+        assert num_slots >= num_experts
+        assert num_slots % ep_size == 0
+        num_local_slots = num_slots // ep_size
+
+        if self.initial_global_assignments is None:
+            return [(ep_rank * num_experts // ep_size + i) % num_experts
+                    for i in range(num_local_slots)]
+        else:
+            assert layer_idx in self.initial_global_assignments
+            assert len(self.initial_global_assignments[layer_idx]) == num_slots
+            assert set(self.initial_global_assignments[layer_idx]) == set(
+                range(num_experts))
+            slot_start = ep_rank * num_local_slots
+            slot_end = slot_start + num_local_slots
+            return self.initial_global_assignments[layer_idx][
+                slot_start:slot_end]
+
+
 @dataclass(kw_only=True)
 class ModelConfig(Generic[TConfig]):
     pretrained_config: Optional[TConfig] = None
@@ -28,6 +55,7 @@ class ModelConfig(Generic[TConfig]):
     is_generation: bool = True
     max_num_tokens: int = 8192
     moe_max_num_tokens: Optional[int] = None
+    moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
