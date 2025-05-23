@@ -27,7 +27,6 @@ import torch.nn.functional as F
 from PIL import Image
 from safetensors.torch import save_file
 from transformers import CLIPImageProcessor
-from .modeling_nvlm_d2 import NVLM_D_Model
 
 
 def add_multimodal_arguments(parser):
@@ -52,7 +51,7 @@ def add_multimodal_arguments(parser):
                             'mllama',
                             'internvl',
                             'qwen2_vl',
-                            'cosmos-8b',
+                            'nvlm_d2',
                         ],
                         help="Model type")
     parser.add_argument(
@@ -136,7 +135,7 @@ class VisionEngineBuilder:
             build_internvl_engine(args)
         elif args.model_type == 'qwen2_vl':
             build_qwen2_vl_engine(args)
-        elif args.model_type == "cosmos-8b":
+        elif args.model_type == "nvlm_d2":
             build_cosmos_8b_engine(args)
         else:
             raise RuntimeError(f"Invalid model type {args.model_type}")
@@ -1273,47 +1272,31 @@ def build_qwen2_vl_engine(args):
 def build_cosmos_8b_engine(args):
     model = AutoModel.from_pretrained(
         args.model_path,
-        use_flash_attn=False,
+        #use_flash_attn=False,
         trust_remote_code=True,
-        torch_dtype=torch.float16,
+        #torch_dtype=torch.float16,
     )
 
     class RadioWithNeck(torch.nn.Module):
         def __init__(self, model):
             super().__init__()
-            image_size = model.config.force_image_size
-            patch_size = model.config.patch_size
-            self.patch_size = patch_size
-            self.template = model.config.template
-            self.num_image_token = int((image_size // patch_size) ** 2 * (model.config.downsample_ratio ** 2))
-            self.downsample_ratio = model.config.downsample_ratio
-            self.ps_version = model.config.ps_version
-            self.image_tag_type = model.config.image_tag_type
-
+            self.downsample_ratio = model.downsample_ratio
+            self.ps_version = model.ps_version
             self.vision_model = model.vision_model
-            vit_hidden_size = model.config.vision_projection_config.vit_hidden_size
-            vision_projection_hidden_size = model.config.vision_projection_config.hidden_size
-            llm_hidden_size = model.config.vision_projection_config.llm_hidden_size
-
             self.mlp1 = model.mlp1
-            self.mlp1 = self.mlp1.to(model.language_model.config.torch_dtype)
-
-            self.img_context_token_id = None
 
         def pixel_shuffle(self, x, scale_factor=0.5):
             n, w, h, c = x.size()
-            # N, W, H, C --> N, W, H * scale, C // scale
+            # n, w, h, c --> n, w, h * scale, c // scale
             x = x.view(n, w, int(h * scale_factor), int(c / scale_factor))
-            # N, W, H * scale, C // scale --> N, H * scale, W, C // scale
+            # n, w, h * scale, c // scale --> n, h * scale, w, c // scale
             x = x.permute(0, 2, 1, 3).contiguous()
-            # N, H * scale, W, C // scale --> N, H * scale, W * scale, C // (scale ** 2)
+            # n, h * scale, w, c // scale --> n, h * scale, w * scale, c // (scale ** 2)
             x = x.view(n, int(h * scale_factor), int(w * scale_factor),
-                    int(c / (scale_factor * scale_factor)))
+                       int(c / (scale_factor * scale_factor)))
             if self.ps_version == 'v1':
-                logger.warning(
-                    "In ps_version 'v1', the height and width have not been swapped back, "
-                    "which results in a transposed image."
-                )
+                logger.warning("in ps_version 'v1', the height and width have not been swapped back, "
+                               'which results in a transposed image.')
             else:
                 x = x.permute(0, 2, 1, 3).contiguous()
             return x
@@ -1336,7 +1319,7 @@ def build_cosmos_8b_engine(args):
     # temporary fix due to TRT onnx export bug
     for block in wrapper.vision_model.model.blocks:
         block.attn.fused_attn = False
-    image = torch.randn((1, 3, 512, 512), device=args.device, dtype=torch.float16)
+    image = torch.randn((1, 3, 512, 512), device=args.device, dtype=model.dtype) #torch.float16)
     export_onnx(wrapper, image, f'{args.output_dir}/onnx')
     build_trt_engine(
         args.model_type,
@@ -1344,5 +1327,6 @@ def build_cosmos_8b_engine(args):
         f'{args.output_dir}/onnx',
         args.output_dir,
         args.max_batch_size,
-        dtype=torch.bfloat16,engine_name='visual_encoder.engine')
-
+        dtype=model.dtype, #torch.bfloat16,
+        engine_name='visual_encoder.engine',
+    )
